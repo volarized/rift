@@ -3,17 +3,16 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use rift_error::{RiftError, errors};
 pub use rift_protocol::read::{
     Documentation, DocumentationFormat, ExactKind, ExtensionKey, ExtensionValue, Extensions,
     Language, NodeId, PackageIdentity, Signature, SourceKind, SourceLocation, SymbolFacet,
     TypeBinding,
 };
-use serde::Serialize;
 
 use crate::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, IndexRevision, ProviderId, ProviderRevision,
-    ProviderSymbolId, SourceRevision, SourceUnitId, SymbolId, TreeRevision,
-    is_canonical_ascii_name,
+    IndexRevision, ProviderId, ProviderRevision, ProviderSymbolId, SourceRevision, SourceUnitId,
+    SymbolId, TreeRevision, is_canonical_ascii_name,
 };
 
 /// Maximum bytes in one provider-local symbol identity.
@@ -135,13 +134,12 @@ impl SourceRange {
     ///
     /// # Errors
     ///
-    /// Returns [`ContributionError`] when end does not follow start.
-    pub fn new(start: u64, end: u64) -> Result<Self, ContributionError> {
+    /// Returns [`RiftError`] when end does not follow start.
+    pub fn new(start: u64, end: u64) -> Result<Self, RiftError> {
         if start >= end {
-            return Err(contribution_error(
-                ContributionViolation::InvalidSourceRange,
-                "source.range",
-            ));
+            return errors::core::contribution_invalid_source_range()
+                .field("source.range")
+                .fail();
         }
         Ok(Self { start, end })
     }
@@ -205,17 +203,16 @@ impl ContributionOrigin {
     ///
     /// # Errors
     ///
-    /// Returns [`ContributionError`] when synthetic source has a location or other source does not.
+    /// Returns [`RiftError`] when synthetic source has a location or other source does not.
     pub fn new(
         location: Option<SourceLocation>,
         source_kind: SourceKind,
-    ) -> Result<Self, ContributionError> {
+    ) -> Result<Self, RiftError> {
         let synthetic = source_kind == SourceKind::Synthetic;
         if synthetic == location.is_some() {
-            return Err(contribution_error(
-                ContributionViolation::InvalidOrigin,
-                "origin",
-            ));
+            return errors::core::contribution_invalid_origin()
+                .field("origin")
+                .fail();
         }
         Ok(Self {
             location,
@@ -464,21 +461,20 @@ impl SemanticReference {
     ///
     /// # Errors
     ///
-    /// Returns [`ContributionError`] when targets are empty, duplicated, or oversized.
+    /// Returns [`RiftError`] when targets are empty, duplicated, or oversized.
     pub fn new(
         source: DeclarationBinding,
         role: ReferenceRole,
         targets: Vec<ContributionReference>,
-    ) -> Result<Self, ContributionError> {
+    ) -> Result<Self, RiftError> {
         let unique: BTreeSet<_> = targets.iter().collect();
         if targets.is_empty()
             || targets.len() > CONTRIBUTION_FACTS_MAX
             || unique.len() != targets.len()
         {
-            return Err(contribution_error(
-                ContributionViolation::InvalidReference,
-                "references.targets",
-            ));
+            return errors::core::contribution_invalid_reference()
+                .field("references.targets")
+                .fail();
         }
         Ok(Self {
             source,
@@ -723,8 +719,8 @@ impl ContributionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ContributionError`] for invalid facts, bounds, origin, or identity evidence.
-    pub fn build(self) -> Result<Contribution, ContributionError> {
+    /// Returns [`RiftError`] for invalid facts, bounds, origin, or identity evidence.
+    pub fn build(self) -> Result<Contribution, RiftError> {
         validate_contribution(&self.contribution)?;
         Ok(self.contribution)
     }
@@ -755,13 +751,13 @@ impl SymbolRecord {
     ///
     /// # Errors
     ///
-    /// Returns [`ContributionError`] when state, identity, and members disagree.
+    /// Returns [`RiftError`] when state, identity, and members disagree.
     pub fn new(
         index_revision: IndexRevision,
         identity: Option<SymbolId>,
         resolution: SymbolResolution,
         contributions: Vec<ContributionKey>,
-    ) -> Result<Self, ContributionError> {
+    ) -> Result<Self, RiftError> {
         let identity_matches = matches!(
             (resolution, identity.is_some()),
             (SymbolResolution::Established, true)
@@ -771,10 +767,9 @@ impl SymbolRecord {
                 )
         );
         if !identity_matches || contributions.is_empty() {
-            return Err(contribution_error(
-                ContributionViolation::InvalidRecord,
-                "symbol_record",
-            ));
+            return errors::core::contribution_invalid_record()
+                .field("symbol_record")
+                .fail();
         }
         Ok(Self {
             index_revision,
@@ -810,8 +805,7 @@ impl SymbolRecord {
 }
 
 /// Stable Contribution validation failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContributionViolation {
     /// Portable name is empty, oversized, or contains control text.
     InvalidName,
@@ -843,48 +837,7 @@ pub enum ContributionViolation {
     InvalidRecord,
 }
 
-/// Contribution validation failure and field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContributionFault {
-    violation: ContributionViolation,
-    field: &'static str,
-}
-
-impl ContributionFault {
-    /// Returns violated rule.
-    #[must_use]
-    pub const fn violation(&self) -> ContributionViolation {
-        self.violation
-    }
-
-    /// Returns offending field.
-    #[must_use]
-    pub const fn field(&self) -> &'static str {
-        self.field
-    }
-}
-
-impl Fault for ContributionFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::InvalidRequest)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![
-            ErrorContext::new("field", self.field),
-            ErrorContext::new("violation", crate::fault_label(&self.violation)),
-        ]
-    }
-}
-
-/// Invalid Contribution or normalized record.
-pub type ContributionError = Error<ContributionFault>;
-
-fn contribution_error(violation: ContributionViolation, field: &'static str) -> ContributionError {
-    Error::new(ContributionFault { violation, field })
-}
-
-fn validate_contribution(contribution: &Contribution) -> Result<(), ContributionError> {
+fn validate_contribution(contribution: &Contribution) -> Result<(), RiftError> {
     validate_provider_symbol(contribution)?;
     if let Some(facts) = &contribution.facts {
         validate_portable_facts(facts)?;
@@ -894,43 +847,38 @@ fn validate_contribution(contribution: &Contribution) -> Result<(), Contribution
     if contribution.references.len() > CONTRIBUTION_FACTS_MAX
         || contribution.relationships.len() > CONTRIBUTION_FACTS_MAX
     {
-        return Err(contribution_error(
-            ContributionViolation::TooManyFacts,
-            "references",
-        ));
+        return errors::core::contribution_too_many_facts()
+            .field("references")
+            .fail();
     }
     validate_namespaced(&contribution.namespaced)
 }
 
-fn validate_provider_symbol(contribution: &Contribution) -> Result<(), ContributionError> {
+fn validate_provider_symbol(contribution: &Contribution) -> Result<(), RiftError> {
     let value = contribution.key.reference.symbol.as_str();
     if value.len() > PROVIDER_SYMBOL_ID_BYTES_MAX {
-        return Err(contribution_error(
-            ContributionViolation::InvalidName,
-            "provider_symbol",
-        ));
+        return errors::core::contribution_invalid_name()
+            .field("provider_symbol")
+            .fail();
     }
     Ok(())
 }
 
-fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), ContributionError> {
+fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError> {
     if !is_portable_name(&facts.name) || !is_portable_name(&facts.qualified_name) {
-        return Err(contribution_error(
-            ContributionViolation::InvalidName,
-            "facts.name",
-        ));
+        return errors::core::contribution_invalid_name()
+            .field("facts.name")
+            .fail();
     }
     if !valid_language(&facts.language) {
-        return Err(contribution_error(
-            ContributionViolation::InvalidLanguage,
-            "facts.language",
-        ));
+        return errors::core::contribution_invalid_language()
+            .field("facts.language")
+            .fail();
     }
     if !facts.kind.is_valid() {
-        return Err(contribution_error(
-            ContributionViolation::InvalidKind,
-            "facts.kind",
-        ));
+        return errors::core::contribution_invalid_kind()
+            .field("facts.kind")
+            .fail();
     }
     let counts = [
         facts.facets.len(),
@@ -943,87 +891,77 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), Contributi
         .into_iter()
         .any(|count| count > CONTRIBUTION_FACTS_MAX)
     {
-        return Err(contribution_error(
-            ContributionViolation::TooManyFacts,
-            "facts",
-        ));
+        return errors::core::contribution_too_many_facts()
+            .field("facts")
+            .fail();
     }
     let unique: BTreeSet<_> = facts.facets.iter().copied().collect();
     if unique.len() != facts.facets.len() {
-        return Err(contribution_error(
-            ContributionViolation::DuplicateFact,
-            "facts.facets",
-        ));
+        return errors::core::contribution_duplicate_fact()
+            .field("facts.facets")
+            .fail();
     }
     Ok(())
 }
 
-fn validate_source_and_origin(contribution: &Contribution) -> Result<(), ContributionError> {
+fn validate_source_and_origin(contribution: &Contribution) -> Result<(), RiftError> {
     if contribution.identity_anchor.is_some() && contribution.source.is_none() {
-        return Err(contribution_error(
-            ContributionViolation::UnboundIdentity,
-            "identity_anchor",
-        ));
+        return errors::core::contribution_unbound_identity()
+            .field("identity_anchor")
+            .fail();
     }
     let synthetic = contribution.origin.source_kind == SourceKind::Synthetic;
     if contribution.source.is_some() && synthetic {
-        return Err(contribution_error(
-            ContributionViolation::InvalidOrigin,
-            "source",
-        ));
+        return errors::core::contribution_invalid_origin()
+            .field("source")
+            .fail();
     }
     Ok(())
 }
 
-fn validate_evidence(contribution: &Contribution) -> Result<(), ContributionError> {
+fn validate_evidence(contribution: &Contribution) -> Result<(), RiftError> {
     if contribution.equivalence.len() > CONTRIBUTION_EVIDENCE_MAX {
-        return Err(contribution_error(
-            ContributionViolation::TooMuchEvidence,
-            "equivalence",
-        ));
+        return errors::core::contribution_too_much_evidence()
+            .field("equivalence")
+            .fail();
     }
     Ok(())
 }
 
-fn validate_namespaced(namespaced: &Extensions) -> Result<(), ContributionError> {
+fn validate_namespaced(namespaced: &Extensions) -> Result<(), RiftError> {
     if namespaced.0.len() > CONTRIBUTION_NAMESPACES_MAX {
-        return Err(contribution_error(
-            ContributionViolation::TooManyNamespacedFacts,
-            "namespaced",
-        ));
+        return errors::core::contribution_too_many_namespaced_facts()
+            .field("namespaced")
+            .fail();
     }
     for (key, value) in &namespaced.0 {
         validate_namespace(key)?;
         if value.version == 0 {
-            return Err(contribution_error(
-                ContributionViolation::InvalidNamespaceVersion,
-                "namespaced.version",
-            ));
+            return errors::core::contribution_invalid_namespace_version()
+                .field("namespaced.version")
+                .fail();
         }
         let bytes = serde_json::to_vec(value).map_err(|_| {
-            contribution_error(
-                ContributionViolation::TooManyNamespacedFacts,
-                "namespaced.data",
-            )
+            errors::core::contribution_too_many_namespaced_facts()
+                .field("namespaced.data")
+                .error()
         })?;
         if bytes.len() > CONTRIBUTION_NAMESPACE_BYTES_MAX {
-            return Err(contribution_error(
-                ContributionViolation::TooManyNamespacedFacts,
-                "namespaced.data",
-            ));
+            return errors::core::contribution_too_many_namespaced_facts()
+                .field("namespaced.data")
+                .fail();
         }
     }
     Ok(())
 }
 
-fn validate_namespace(key: &ExtensionKey) -> Result<(), ContributionError> {
+fn validate_namespace(key: &ExtensionKey) -> Result<(), RiftError> {
     if valid_namespace(&key.0) {
         return Ok(());
     }
-    Err(contribution_error(
-        ContributionViolation::InvalidNamespace,
-        "namespaced.key",
-    ))
+    errors::core::contribution_invalid_namespace()
+        .field("namespaced.key")
+        .fail()
 }
 
 /// Whether the Contribution contract accepts `value` as a portable name: nonempty, at
@@ -1081,9 +1019,9 @@ mod tests {
     use super::{
         CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
         CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionKey, ContributionOrigin,
-        ContributionReference, ContributionRelationship, ContributionViolation,
-        EquivalenceEvidence, PortableSymbolFacts, ReferenceRole, RelationshipKind,
-        SemanticReference, SourceApplicability, SourceRange, SymbolRecord, SymbolResolution,
+        ContributionReference, ContributionRelationship, EquivalenceEvidence, PortableSymbolFacts,
+        ReferenceRole, RelationshipKind, SemanticReference, SourceApplicability, SourceRange,
+        SymbolRecord, SymbolResolution,
     };
     use crate::{
         IndexRevision, ProviderId, ProviderRevision, ProviderSymbolId, SourcePath,
@@ -1224,20 +1162,41 @@ mod tests {
     fn invalid_ranges_and_origins_name_their_fields() {
         let range_error = SourceRange::new(4, 4).expect_err("empty range");
         assert_eq!(
-            range_error.fault().violation(),
-            ContributionViolation::InvalidSourceRange
+            range_error.slug().as_str(),
+            "rift.core.contribution_invalid_source_range"
         );
-        assert_eq!(range_error.fault().field(), "source.range");
-        assert_eq!(range_error.context()[0].key(), "field");
+        assert_eq!(
+            range_error
+                .context()
+                .find(|(key, _)| *key == "field")
+                .map(|(_, value)| value)
+                .expect("field evidence"),
+            "source.range"
+        );
+        assert_eq!(
+            range_error
+                .context()
+                .next()
+                .map(|(key, _)| key)
+                .expect("field evidence"),
+            "field"
+        );
         assert!(range_error.to_string().contains("source.range"));
 
         let origin_error =
             ContributionOrigin::new(None, SourceKind::Authored).expect_err("missing location");
         assert_eq!(
-            origin_error.fault().violation(),
-            ContributionViolation::InvalidOrigin
+            origin_error.slug().as_str(),
+            "rift.core.contribution_invalid_origin"
         );
-        assert_eq!(origin_error.fault().field(), "origin");
+        assert_eq!(
+            origin_error
+                .context()
+                .find(|(key, _)| *key == "field")
+                .map(|(_, value)| value)
+                .expect("field evidence"),
+            "origin"
+        );
     }
 
     #[test]
@@ -1258,8 +1217,8 @@ mod tests {
         .build()
         .expect_err("unbound identity");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::UnboundIdentity
+            error.slug().as_str(),
+            "rift.core.contribution_unbound_identity"
         );
 
         let source = super::DeclarationBinding::new(
@@ -1281,8 +1240,8 @@ mod tests {
         .build()
         .expect_err("synthetic source binding");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::InvalidOrigin
+            error.slug().as_str(),
+            "rift.core.contribution_invalid_origin"
         );
     }
 
@@ -1341,8 +1300,8 @@ mod tests {
         .build()
         .expect_err("duplicate facets");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::DuplicateFact
+            error.slug().as_str(),
+            "rift.core.contribution_duplicate_fact"
         );
     }
 
@@ -1359,7 +1318,7 @@ mod tests {
                     "Beacon",
                     ExactKind("struct".to_owned()),
                 ),
-                ContributionViolation::InvalidName,
+                "rift.core.contribution_invalid_name",
             ),
             (
                 PortableSymbolFacts::new(
@@ -1371,7 +1330,7 @@ mod tests {
                     "Beacon",
                     ExactKind("struct".to_owned()),
                 ),
-                ContributionViolation::InvalidLanguage,
+                "rift.core.contribution_invalid_language",
             ),
             (
                 PortableSymbolFacts::new(
@@ -1383,7 +1342,7 @@ mod tests {
                     "Beacon",
                     ExactKind("struct".to_owned()),
                 ),
-                ContributionViolation::InvalidLanguage,
+                "rift.core.contribution_invalid_language",
             ),
             (
                 PortableSymbolFacts::new(
@@ -1395,10 +1354,10 @@ mod tests {
                     "Beacon",
                     ExactKind("9struct".to_owned()),
                 ),
-                ContributionViolation::InvalidKind,
+                "rift.core.contribution_invalid_kind",
             ),
         ];
-        for (facts, violation) in cases {
+        for (facts, expected_slug) in cases {
             let error = Contribution::builder(
                 ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
                 SourceApplicability::Independent,
@@ -1407,7 +1366,7 @@ mod tests {
             )
             .build()
             .expect_err("invalid portable facts");
-            assert_eq!(error.fault().violation(), violation);
+            assert_eq!(error.slug().as_str(), expected_slug);
         }
 
         let error = Contribution::builder(
@@ -1419,8 +1378,8 @@ mod tests {
         .build()
         .expect_err("portable fact bound");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::TooManyFacts
+            error.slug().as_str(),
+            "rift.core.contribution_too_many_facts"
         );
     }
 
@@ -1447,8 +1406,8 @@ mod tests {
         );
         let error = build(invalid_key).expect_err("invalid namespace");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::InvalidNamespace
+            error.slug().as_str(),
+            "rift.core.contribution_invalid_namespace"
         );
 
         let mut zero_version = BTreeMap::new();
@@ -1461,8 +1420,8 @@ mod tests {
         );
         let error = build(zero_version).expect_err("zero namespace version");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::InvalidNamespaceVersion
+            error.slug().as_str(),
+            "rift.core.contribution_invalid_namespace_version"
         );
 
         let mut oversized = BTreeMap::new();
@@ -1475,8 +1434,8 @@ mod tests {
         );
         let error = build(oversized).expect_err("oversized namespace value");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::TooManyNamespacedFacts
+            error.slug().as_str(),
+            "rift.core.contribution_too_many_namespaced_facts"
         );
 
         let too_many = (0..=CONTRIBUTION_NAMESPACES_MAX)
@@ -1492,8 +1451,8 @@ mod tests {
             .collect();
         let error = build(too_many).expect_err("namespace count bound");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::TooManyNamespacedFacts
+            error.slug().as_str(),
+            "rift.core.contribution_too_many_namespaced_facts"
         );
     }
 
@@ -1511,8 +1470,8 @@ mod tests {
         .build()
         .expect_err("evidence bound");
         assert_eq!(
-            error.fault().violation(),
-            ContributionViolation::TooMuchEvidence
+            error.slug().as_str(),
+            "rift.core.contribution_too_much_evidence"
         );
     }
 
@@ -1531,8 +1490,8 @@ mod tests {
         )
         .expect_err("duplicate target");
         assert_eq!(
-            duplicate.fault().violation(),
-            ContributionViolation::InvalidReference
+            duplicate.slug().as_str(),
+            "rift.core.contribution_invalid_reference"
         );
 
         let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
@@ -1557,6 +1516,56 @@ mod tests {
             value.relationships()[0].kind(),
             RelationshipKind::Implementation
         );
+    }
+
+    #[test]
+    fn reference_and_relationship_counts_accept_the_bound_and_refuse_one_more() {
+        // Issue #535: both collections must retain the count-bound refusal evidence.
+        let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
+        let binding = super::DeclarationBinding::new(
+            source_unit(),
+            SourceRange::new(20, 26).expect("range"),
+            None,
+        );
+        let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
+            .expect("reference");
+        let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);
+        let build = |references, relationships| {
+            Contribution::fact_builder(
+                ContributionKey::new(
+                    provider("native"),
+                    publication(1),
+                    provider_symbol("Caller"),
+                ),
+                SourceApplicability::Independent,
+                ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+            )
+            .references(references)
+            .relationships(relationships)
+            .build()
+        };
+        let accepted = build(
+            vec![reference.clone(); CONTRIBUTION_FACTS_MAX],
+            vec![relationship.clone(); CONTRIBUTION_FACTS_MAX],
+        )
+        .expect("counts at the bound are accepted");
+        assert_eq!(accepted.references().len(), CONTRIBUTION_FACTS_MAX);
+        assert_eq!(accepted.relationships().len(), CONTRIBUTION_FACTS_MAX);
+        for (references, relationships) in [
+            (vec![reference; CONTRIBUTION_FACTS_MAX + 1], Vec::new()),
+            (Vec::new(), vec![relationship; CONTRIBUTION_FACTS_MAX + 1]),
+        ] {
+            let error = build(references, relationships).expect_err("count exceeds the bound");
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.core.contribution_too_many_facts"
+            );
+            assert_eq!(
+                error.context().collect::<Vec<_>>(),
+                [("field", "references".to_owned())]
+            );
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
@@ -1593,10 +1602,17 @@ mod tests {
         )
         .expect_err("conflicting record with identity");
         assert_eq!(
-            invalid.fault().violation(),
-            ContributionViolation::InvalidRecord
+            invalid.slug().as_str(),
+            "rift.core.contribution_invalid_record"
         );
-        assert_eq!(invalid.fault().field(), "symbol_record");
+        assert_eq!(
+            invalid
+                .context()
+                .find(|(key, _)| *key == "field")
+                .map(|(_, value)| value)
+                .expect("field evidence"),
+            "symbol_record"
+        );
 
         let empty = SymbolRecord::new(
             index_revision,
@@ -1606,8 +1622,8 @@ mod tests {
         )
         .expect_err("record without contributions");
         assert_eq!(
-            empty.fault().violation(),
-            ContributionViolation::InvalidRecord
+            empty.slug().as_str(),
+            "rift.core.contribution_invalid_record"
         );
     }
 }

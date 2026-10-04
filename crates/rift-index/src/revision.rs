@@ -11,19 +11,15 @@ use std::path::{Path, PathBuf};
 
 use rift_core::constants::WORKSPACE_IGNORED_DIRECTORIES;
 use rift_core::{CompositionId, ProjectPath, SourceVisibility};
-use rift_history::{
-    HistoryError, REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile,
-};
+use rift_error::{RiftError, errors};
+use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile};
 use rift_protocol::source::SOURCE_FILES_FIELD;
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
 
 use crate::language::ClassifiedPath;
-use crate::workspace::IndexFailure;
 use crate::workspace::{
-    IndexContents, ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, component, composition_error, index_error_at, index_error_caused_by,
-    index_error_over_limit,
+    IndexContents, ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexLimits, component,
 };
 use rift_analysis::PathMatcher;
 
@@ -33,7 +29,7 @@ pub(crate) struct RevisionFiles;
 /// Reads one committed file's bytes under the per-file byte bound it is handed; `None`
 /// leaves the file out.
 type CommittedBytes<'read> =
-    dyn FnMut(&TreeFile, usize) -> Result<Option<Vec<u8>>, HistoryError> + 'read;
+    dyn FnMut(&TreeFile, usize) -> Result<Option<Vec<u8>>, RiftError> + 'read;
 
 impl WorkspaceIndex {
     /// Builds read index over one committed tree.
@@ -43,13 +39,13 @@ impl WorkspaceIndex {
     ///
     /// # Errors
     ///
-    /// Returns `WorkspaceIndexError` for invalid paths, bounds, history reads, or syntax.
+    /// Returns `RiftError` for invalid paths, bounds, history reads, or syntax.
     pub fn at_revision(
         repository: &Repository,
         revision: &ResolvedRevision,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, RiftError> {
         Self::at_revision_with_languages(
             repository,
             revision,
@@ -69,7 +65,7 @@ impl WorkspaceIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
+    /// Returns [`RiftError`] for invalid paths, configuration,
     /// bounds, history reads, or syntax.
     pub fn at_revision_with_languages(
         repository: &Repository,
@@ -78,7 +74,7 @@ impl WorkspaceIndex {
         visibility: &SourceVisibility,
         text_inclusion: &rift_core::TextFileInclusion,
         languages: &rift_core::LanguageFileSelections,
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, RiftError> {
         Self::at_revision_with_selection(
             repository,
             revision,
@@ -100,7 +96,7 @@ impl WorkspaceIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
+    /// Returns [`RiftError`] for invalid paths, configuration,
     /// bounds, history reads, or syntax.
     pub fn at_revision_with_selection(
         repository: &Repository,
@@ -110,7 +106,7 @@ impl WorkspaceIndex {
         text_inclusion: &rift_core::TextFileInclusion,
         languages: &rift_core::LanguageFileSelections,
         selection: &dyn Fn(&str) -> bool,
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, RiftError> {
         Self::at_revision_with_blob_reader(
             repository,
             revision,
@@ -132,7 +128,7 @@ impl WorkspaceIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
+    /// Returns [`RiftError`] for invalid paths, configuration,
     /// bounds, history reads, or syntax.
     pub fn at_revision_with_blob_reader(
         repository: &Repository,
@@ -145,7 +141,7 @@ impl WorkspaceIndex {
         ),
         selection: &dyn Fn(&str) -> bool,
         read: &mut CommittedBytes<'_>,
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, RiftError> {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let language = std::sync::Arc::new(crate::WorkspaceLanguagePolicy::build(
@@ -155,31 +151,26 @@ impl WorkspaceIndex {
         )?);
         let visible = RevisionPaths::build(&root, visibility)?;
         let includes = |path: &str| visible.includes(path) && selection(path);
-        let listed = repository
-            .tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)
-            .map_err(history_error)?;
+        let listed = repository.tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)?;
         let mut catalog_bytes = 0_usize;
         let mut contents = IndexContents::default();
         for tree_file in &listed {
             let context_path = PathBuf::from(tree_file.path());
             if directory_depth(tree_file.path()) > limits.directory_depth_max() {
-                return Err(index_error_at(
-                    WorkspaceIndexViolation::TooDeep,
-                    &context_path,
-                ));
+                return errors::index::workspace_too_deep()
+                    .path(&context_path)
+                    .field("source.directory_depth")
+                    .observed(directory_depth(tree_file.path()))
+                    .maximum(limits.directory_depth_max())
+                    .fail();
             }
             let bytes = match read(tree_file, limits.file_bytes_max()) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
-                Err(error)
-                    if matches!(
-                        error.fault(),
-                        rift_history::HistoryFault::BlobTooLarge { .. }
-                    ) =>
-                {
+                Err(error) if error.slug() == rift_error::errors::history::blob_too_large::SLUG => {
                     continue;
                 }
-                Err(error) => return Err(history_error(error)),
+                Err(error) => return error.fail(),
             };
             if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
                 continue;
@@ -191,20 +182,18 @@ impl WorkspaceIndex {
                 continue;
             }
             if contents.held_count() >= limits.files_max() {
-                return Err(index_error_over_limit(
-                    WorkspaceIndexViolation::TooManyFiles,
-                    &context_path,
-                    SOURCE_FILES_FIELD,
-                    contents.held_count().saturating_add(1),
-                    limits.files_max(),
-                ));
+                return errors::index::workspace_too_many_files()
+                    .path(&context_path)
+                    .field(SOURCE_FILES_FIELD)
+                    .observed(contents.held_count().saturating_add(1))
+                    .maximum(limits.files_max())
+                    .fail();
             }
             let project_path = ProjectPath::new(tree_file.path().to_owned()).map_err(|error| {
-                index_error_caused_by(
-                    WorkspaceIndexViolation::InvalidPath,
-                    Some(&context_path),
-                    error,
-                )
+                errors::index::workspace_invalid_path()
+                    .path(&context_path)
+                    .cause(error)
+                    .error()
             })?;
             let text_file = super::workspace::included_text_file(
                 project_path,
@@ -238,12 +227,6 @@ impl WorkspaceIndex {
     }
 }
 
-/// Wraps one version-control failure, which keeps its own registry identity
-/// and evidence through the `History` violation's delegation.
-fn history_error(error: rift_history::HistoryError) -> WorkspaceIndexError {
-    index_error_caused_by(WorkspaceIndexViolation::History, None, error)
-}
-
 /// The committed paths one revision read may hold: the hard floor every
 /// workspace applies, then the workspace's `[source]` policy.
 ///
@@ -261,8 +244,8 @@ impl RevisionPaths {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for an invalid `[source]` pattern.
-    pub fn build(root: &Path, visibility: &SourceVisibility) -> Result<Self, WorkspaceIndexError> {
+    /// Returns [`RiftError`] for an invalid `[source]` pattern.
+    pub fn build(root: &Path, visibility: &SourceVisibility) -> Result<Self, RiftError> {
         Ok(Self {
             root: root.to_path_buf(),
             matcher: PathMatcher::build_with_force_include(
@@ -270,8 +253,7 @@ impl RevisionPaths {
                 visibility.include(),
                 visibility.exclude(),
                 visibility.force_include(),
-            )
-            .map_err(IndexFailure::index_error)?,
+            )?,
         })
     }
 
@@ -294,17 +276,21 @@ fn directory_depth(path: &str) -> usize {
 
 /// The revision read recipe: the history source resolver supplies committed
 /// bytes to the same syntax and index steps the workspace scan uses.
-fn revision_composition() -> Result<ProviderComposition, WorkspaceIndexError> {
+fn revision_composition() -> Result<ProviderComposition, RiftError> {
     let source = component::<(), RevisionFiles>("git-history-source")?;
     let syntax = component::<RevisionFiles, RustFacts>("rust-tree-sitter")?;
     let index = component::<RustFacts, ReadIndex>("memory-index")?;
     let mut builder = CompositionBuilder::new(
-        CompositionId::new("rust-revision-read").map_err(composition_error)?,
+        CompositionId::new("rust-revision-read")
+            .map_err(|source| errors::index::workspace_composition().cause(source).error())?,
     );
     let files = builder.source("history", &source);
     let facts = builder.then(files, "syntax", &syntax);
     let reads = builder.then(facts, "index", &index);
-    builder.output(reads).build().map_err(composition_error)
+    builder
+        .output(reads)
+        .build()
+        .map_err(|source| errors::index::workspace_composition().cause(source).error())
 }
 
 #[cfg(test)]
@@ -355,7 +341,7 @@ mod tests {
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
-    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+    ) -> Result<WorkspaceIndex, RiftError> {
         let (repository, head) = open_head(root);
         WorkspaceIndex::at_revision(&repository, &head, limits, visibility)
     }
@@ -492,10 +478,7 @@ mod tests {
             &rift_core::LanguageFileSelections::default(),
         )
         .expect_err("an unclosed character class must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::SourcePatternInvalid
-        );
+        assert_eq!(error.slug(), errors::analysis::source_pattern_invalid::SLUG);
     }
 
     /// An empty `[search.text].include` selects no plain text, so a committed
@@ -557,8 +540,8 @@ mod tests {
         let count_error = revision_index(directory.path(), one_file, &SourceVisibility::default())
             .expect_err("two committed sources must refuse a one-file bound");
         assert_eq!(
-            count_error.fault().violation(),
-            WorkspaceIndexViolation::TooManyFiles
+            count_error.slug(),
+            errors::index::workspace_too_many_files::SLUG
         );
 
         fs::create_dir_all(directory.path().join("deep/nest")).expect("directories");
@@ -571,10 +554,7 @@ mod tests {
         let shallow = WorkspaceIndexLimits::new(5, 1_000, 4_000, 1, 5).expect("limits");
         let depth_error = revision_index(directory.path(), shallow, &SourceVisibility::default())
             .expect_err("deep/nest/lowest.rs must refuse a one-level depth bound");
-        assert_eq!(
-            depth_error.fault().violation(),
-            WorkspaceIndexViolation::TooDeep
-        );
+        assert_eq!(depth_error.slug(), errors::index::workspace_too_deep::SLUG);
     }
 
     #[test]
@@ -616,10 +596,7 @@ mod tests {
             &SourceVisibility::default(),
         )
         .expect_err("a committed backslash path must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::InvalidPath
-        );
+        assert_eq!(error.slug(), errors::index::workspace_invalid_path::SLUG);
     }
 
     #[test]

@@ -564,8 +564,14 @@ fn context_rejects_excerpt_longer_than_block_range() {
     context.references[0].excerpt = Some("x".repeat(range_bytes + 1));
 
     let error = validate_documentation_context(&context, &symbol).expect_err("oversized excerpt");
-    assert_eq!(error.fault().violation(), DocumentationViolation::Range);
-    assert_eq!(error.fault().field(), "excerpt");
+    assert_eq!(
+        crate::documentation::failure::violation(&error),
+        DocumentationViolation::Range
+    );
+    assert_eq!(
+        crate::documentation::failure::context_value(&error, "field").as_deref(),
+        Some("excerpt")
+    );
 }
 
 #[test]
@@ -841,7 +847,10 @@ fn supplied_syntax_with_same_path_and_different_bytes_is_refused() {
     let error = input("README.md", text)
         .with_syntax(&syntax)
         .expect_err("unrelated syntax facts");
-    assert_eq!(error.fault().violation(), DocumentationViolation::Format);
+    assert_eq!(
+        crate::documentation::failure::violation(&error),
+        DocumentationViolation::Format
+    );
 }
 
 #[test]

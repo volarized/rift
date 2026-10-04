@@ -18,6 +18,7 @@ mod pattern_tests;
 use body::BodyMatching;
 use documentation::SearchDocumentation;
 pub use pattern::{PatternBounds, accepted_pattern};
+use rift_error::errors;
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -26,8 +27,8 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SYMBOL_URI_PREFIX};
 use rift_core::line;
 use rift_index::{
-    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, PatternCandidates,
-    SymbolMatch, TextSourceFile, WorkspaceIndex,
+    IndexedFile, LexicalChange, PathChanges, PathMatcher, PatternCandidates, SymbolMatch,
+    TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
@@ -45,8 +46,8 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
 use crate::read::{
-    CURRENT_TREE_ALONE, ReadError, ReadFault, ReadService, accepted_limit, excerpt, page,
-    project_path, results_truncation_warning, source_warnings, text_range, validate_common,
+    CURRENT_TREE_ALONE, ReadService, RiftError, accepted_limit, excerpt, page, project_path,
+    results_truncation_warning, source_warnings, text_range, validate_common,
     validate_requested_packages, wire_symbol,
 };
 use crate::read::{file_id, parse_symbol_address};
@@ -191,8 +192,13 @@ impl Default for StoreAnswer {
 /// Every reader parses the same text the same way, so the terms the full-text ranking
 /// matches, the identifiers the identifier ranking extracts, and the excerpt a hit points
 /// at all come from one value.
-fn parsed_query(query: &str) -> Result<ParsedQuery, ReadError> {
-    ParsedQuery::parse(query).map_err(|error| ReadFault::invalid("query", error.detail()))
+fn parsed_query(query: &str) -> Result<ParsedQuery, RiftError> {
+    ParsedQuery::parse(query).map_err(|error| {
+        errors::server::read_invalid()
+            .field("query")
+            .violation(error.detail())
+            .error()
+    })
 }
 
 /// The warning a query the parser narrowed carries: the terms the bound dropped matched
@@ -218,14 +224,14 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
+    /// Returns [`RiftError`] for an invalid `paths` glob, a `force_include` bound crossed,
     /// a scope beyond `local` beside a revision, `global` beside `traversal`, a `packages`
     /// argument the read cannot send, and a query the bounded parser refuses.
     pub fn search(
         &self,
         params: &SearchParams,
         store: &StoreAnswer,
-    ) -> Result<SearchResult, ReadError> {
+    ) -> Result<SearchResult, RiftError> {
         self.search_with_references(params, store, &EngineReferences::default())
     }
 
@@ -239,7 +245,7 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
         references: &EngineReferences,
-    ) -> Result<SearchResult, ReadError> {
+    ) -> Result<SearchResult, RiftError> {
         if params.target == SearchParamsTarget::Commit {
             return self.search_commits(params);
         }
@@ -249,13 +255,15 @@ impl ReadService {
         if params.change.is_some() {
             // One snapshot holds one tree; a comparison needs two, and reaches its own
             // through `search_change`.
-            return Err(ReadFault::unsupported(
-                "a revision comparison on a captured snapshot",
-            ));
+            return errors::server::read_unsupported()
+                .capability("a revision comparison on a captured snapshot")
+                .fail();
         }
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         if self.revision().is_some() && force_include_requested(params) {
-            return Err(ReadFault::unsupported("force_include at a revision"));
+            return errors::server::read_unsupported()
+                .capability("force_include at a revision")
+                .fail();
         }
         let query = accepted_query(params)?;
         let limit = search_page_limit(params)?;
@@ -343,7 +351,7 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
         references: &EngineReferences,
-    ) -> Result<Option<rift_ranking::Pattern>, ReadError> {
+    ) -> Result<Option<rift_ranking::Pattern>, RiftError> {
         rift_core::traced!(component = "search", operation = "search.validate", {
             references.validate_revision(self)?;
             validate_search(params)
@@ -388,7 +396,7 @@ impl ReadService {
         }
     }
 
-    pub(crate) fn validate_engine_search(&self, params: &SearchParams) -> Result<(), ReadError> {
+    pub(crate) fn validate_engine_search(&self, params: &SearchParams) -> Result<(), RiftError> {
         validate_search(params)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         accepted_query(params)?;
@@ -399,8 +407,7 @@ impl ReadService {
                 self.index().root(),
                 &pattern_strings(&selector.force_include),
                 &[],
-            )
-            .map_err(|error| ReadFault::index(error.index_error()))?;
+            )?;
         }
         Ok(())
     }
@@ -429,9 +436,9 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for an invalid glob, or a `force_include` matching more
+    /// Returns [`RiftError`] for an invalid glob, or a `force_include` matching more
     /// files than `FORCE_INCLUDE_FILES_MAX`.
-    fn selected_paths(&self, selector: Option<&PathSelector>) -> Result<SelectedPaths, ReadError> {
+    fn selected_paths(&self, selector: Option<&PathSelector>) -> Result<SelectedPaths, RiftError> {
         let _span = tracing::info_span!(
             "search.selected_paths",
             component = "search",
@@ -446,14 +453,12 @@ impl ReadService {
             .filter(|path| includes(matcher.as_ref(), index.root(), path))
             .count();
         let force_include = match selector {
-            Some(selector) if !selector.force_include.is_empty() => Some(
-                index
-                    .force_include_index(
-                        &pattern_strings(&selector.force_include),
-                        FORCE_INCLUDE_FILES_MAX,
-                    )
-                    .map_err(ReadFault::index)?,
-            ),
+            Some(selector) if !selector.force_include.is_empty() => {
+                Some(index.force_include_index(
+                    &pattern_strings(&selector.force_include),
+                    FORCE_INCLUDE_FILES_MAX,
+                )?)
+            }
             _ => None,
         };
         Ok(SelectedPaths {
@@ -482,7 +487,7 @@ impl ReadService {
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
         (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
-    ) -> Result<Option<usize>, ReadError> {
+    ) -> Result<Option<usize>, RiftError> {
         let _span = tracing::info_span!(
             "search.query_hits",
             component = "search",
@@ -821,21 +826,21 @@ fn lockfile_warning(lockfiles: &[ProjectPath]) -> Option<ReadWarning> {
 ///
 /// Returns `invalid_request` naming `limit` for zero, or for a limit past
 /// `PAGE_LIMIT_MAX`.
-pub fn search_page_limit(params: &SearchParams) -> Result<usize, ReadError> {
+pub fn search_page_limit(params: &SearchParams) -> Result<usize, RiftError> {
     accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
 }
 
-pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
+pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
     validate_common(params.rev.is_some())?;
     validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
     if let Some(conflict) = commit::commit_conflict(params) {
-        return Err(conflict);
+        return conflict.fail();
     }
     if let Some(conflict) = pattern::pattern_conflict(params) {
-        return Err(conflict);
+        return conflict.fail();
     }
     if let Some(change) = params.change.as_ref() {
         validate_change(change, params)?;
@@ -844,15 +849,17 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
         validate_traversal(traversal)?;
         validate_traversal_seed(params, traversal)?;
         if params.rev.is_some() {
-            return Err(ReadFault::unsupported("traversal at a revision"));
+            return errors::server::read_unsupported()
+                .capability("traversal at a revision")
+                .fail();
         }
         // The `all` scope still walks the project graph beside the package
         // declarations; `global` alone leaves the walk nothing to run over.
         if params.scope == SearchScope::Global {
-            return Err(ReadFault::invalid(
-                "traversal",
-                "the relationship graph serves the project alone",
-            ));
+            return errors::server::read_invalid()
+                .field("traversal")
+                .violation("the relationship graph serves the project alone")
+                .fail();
         }
     }
     Ok(())
@@ -873,12 +880,17 @@ pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal bes
 fn validate_traversal_seed(
     params: &SearchParams,
     traversal: &SearchTraversal,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     if params.change.is_some() {
-        return Err(ReadFault::unsupported(CHANGE_TRAVERSAL_CAPABILITY));
+        return errors::server::read_unsupported()
+            .capability(CHANGE_TRAVERSAL_CAPABILITY)
+            .fail();
     }
     if traversal.seed.is_none() {
-        return Err(ReadFault::invalid("seed", "a traversal starts at seed"));
+        return errors::server::read_invalid()
+            .field("seed")
+            .violation("a traversal starts at seed")
+            .fail();
     }
     Ok(())
 }
@@ -893,21 +905,24 @@ fn validate_traversal_seed(
 /// served for the current tree alone. A `traversal` is refused beside a comparison by
 /// [`validate_traversal_seed`], since no lane serves the walk from a comparison's changed
 /// declarations.
-fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
+fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), RiftError> {
     if params.rev.is_some() {
-        return Err(ReadFault::invalid(
-            "change",
-            "change names its own revisions",
-        ));
+        return errors::server::read_invalid()
+            .field("change")
+            .violation("change names its own revisions")
+            .fail();
     }
     if params.query.is_some() {
-        return Err(ReadFault::invalid(
-            "change",
-            "query and change select different result sets",
-        ));
+        return errors::server::read_invalid()
+            .field("change")
+            .violation("query and change select different result sets")
+            .fail();
     }
     if params.scope != SearchScope::Local {
-        return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
+        return errors::server::read_invalid()
+            .field("scope")
+            .violation(CURRENT_TREE_ALONE)
+            .fail();
     }
     let sides = [
         (CHANGE_BASE_FIELD, Some(&change.base)),
@@ -915,7 +930,10 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
     ];
     for (field, revision) in sides {
         if let Some(violation) = revision.and_then(RevisionId::violation) {
-            return Err(ReadFault::invalid(field, violation.as_str()));
+            return errors::server::read_invalid()
+                .field(field)
+                .violation(violation.as_str())
+                .fail();
         }
     }
     Ok(())
@@ -923,7 +941,7 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
 
 /// The lexical `query` the request carries, if any: refused when the request carries
 /// none of `query`, `pattern`, `traversal`, and `change`, and when the query is empty.
-fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
+fn accepted_query(params: &SearchParams) -> Result<Option<&str>, RiftError> {
     let selects = params.pattern.is_some() || params.traversal.is_some() || params.change.is_some();
     if params.query.is_none() && selects {
         return Ok(None);
@@ -932,10 +950,16 @@ fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
 }
 
 /// The `query` a request must carry: refused when it is missing or empty.
-fn required_query(params: &SearchParams) -> Result<&str, ReadError> {
+fn required_query(params: &SearchParams) -> Result<&str, RiftError> {
     match params.query.as_deref() {
-        None => Err(ReadFault::invalid("query", "missing")),
-        Some("") => Err(ReadFault::invalid("query", "empty")),
+        None => errors::server::read_invalid()
+            .field("query")
+            .violation("missing")
+            .fail(),
+        Some("") => errors::server::read_invalid()
+            .field("query")
+            .violation("empty")
+            .fail(),
         Some(query) => Ok(query),
     }
 }
@@ -943,7 +967,7 @@ fn required_query(params: &SearchParams) -> Result<&str, ReadError> {
 /// Refuses `selector` when any `include`, `exclude`, or `force_include` pattern breaks
 /// [`PathPattern`]'s forward-slash-only contract, before it reaches a glob engine that would
 /// otherwise read a stray backslash as an escape.
-fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
+fn validate_path_selector(selector: &PathSelector) -> Result<(), RiftError> {
     let patterns = selector
         .include
         .iter()
@@ -951,7 +975,10 @@ fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
         .chain(&selector.force_include);
     for pattern in patterns {
         if let Some(violation) = pattern.violation() {
-            return Err(ReadFault::invalid("paths", violation.as_str()));
+            return errors::server::read_invalid()
+                .field("paths")
+                .violation(violation.as_str())
+                .fail();
         }
     }
     Ok(())
@@ -964,7 +991,7 @@ fn validate_path_selector(selector: &PathSelector) -> Result<(), ReadError> {
 pub(crate) fn path_matcher(
     root: &Path,
     selector: Option<&PathSelector>,
-) -> Result<Option<PathMatcher>, ReadError> {
+) -> Result<Option<PathMatcher>, RiftError> {
     let Some(selector) = selector else {
         return Ok(None);
     };
@@ -977,7 +1004,6 @@ pub(crate) fn path_matcher(
         &pattern_strings(&selector.exclude),
     )
     .map(Some)
-    .map_err(|error| ReadFault::index(error.index_error()))
 }
 
 fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {
@@ -1006,24 +1032,20 @@ fn identifier_input(
     query: &ParsedQuery,
     sources: IdentifierSources<'_>,
     bound: usize,
-) -> Result<RankingInput, ReadError> {
+) -> Result<RankingInput, RiftError> {
     let mut ranking = IdentifierRanking::new();
     if sources.project {
-        index
-            .observe_identifiers(
-                query,
-                bound,
-                |file| includes(matcher, root, file.path()),
-                &mut ranking,
-            )
-            .map_err(ReadFault::index)?;
+        index.observe_identifiers(
+            query,
+            bound,
+            |file| includes(matcher, root, file.path()),
+            &mut ranking,
+        )?;
     }
     if let Some(extra) = sources.force_include {
         // A force-included file is reached by a glob the request named, so the
         // selector's `exclude` does not take it back.
-        extra
-            .observe_identifiers(query, bound, |_| true, &mut ranking)
-            .map_err(ReadFault::index)?;
+        extra.observe_identifiers(query, bound, |_| true, &mut ranking)?;
     }
     Ok(ranking.into_input(bound))
 }
@@ -1066,7 +1088,7 @@ impl CandidateScreen<'_> {
         inputs: &[RankingInput],
         query: &ParsedQuery,
         phase: QueryPhase,
-    ) -> Result<Vec<RankingInput>, ReadError> {
+    ) -> Result<Vec<RankingInput>, RiftError> {
         let _span = tracing::info_span!(
             "search.projected",
             component = "search",
@@ -1147,7 +1169,7 @@ fn resolve_ranked_hits(
     documentation: Option<&SearchDocumentation<'_>>,
     ranked: &RankedCandidates,
     results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     let mut answered: Vec<ProjectPath> = Vec::new();
     for candidate in ranked.candidates() {
         if let Some(hit) = documentation.and_then(|documentation| documentation.hit(candidate)) {
@@ -1239,7 +1261,7 @@ impl ResolvedCandidate<'_> {
         self,
         criteria: SearchCriteria<'_>,
         candidate: &FusedCandidate,
-    ) -> Result<SearchHit, ReadError> {
+    ) -> Result<SearchHit, RiftError> {
         let score = Some(candidate.score());
         let matched_by = matched_fields(candidate);
         match self {
@@ -1382,7 +1404,7 @@ pub(crate) fn build_symbol_hit(
     score: Option<f64>,
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
-) -> Result<SearchHit, ReadError> {
+) -> Result<SearchHit, RiftError> {
     // A retained disagreement surfaces as a `symbol_disagreement` warning on `get_symbol`
     // (crates/rift-server/src/read.rs); doing the same for a search hit needs the same
     // warnings accumulator threaded through every collector this file merges hits
@@ -1437,7 +1459,7 @@ fn populate_symbol_lines(
     results: &mut [SearchHit],
     index: &WorkspaceIndex,
     force_include: Option<&WorkspaceIndex>,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     let _span = tracing::info_span!(
         "search.symbol_lines",
         component = "search",
@@ -1457,12 +1479,16 @@ fn populate_symbol_lines(
                 hit.range.is_some()
             );
         };
-        let path = ProjectPath::new(path.0.clone())
-            .map_err(|error| ReadFault::invalid("path", error.to_string()))?;
+        let path = ProjectPath::new(path.0.clone()).map_err(|error| {
+            errors::server::read_invalid()
+                .field("path")
+                .violation(error.to_string())
+                .error()
+        })?;
         let file = index
             .file(&path)
             .or_else(|| force_include.and_then(|extra| extra.file(&path)))
-            .ok_or_else(|| ReadFault::not_found(path.as_str()))?;
+            .ok_or_else(|| errors::server::read_not_found().path(path.as_str()).error())?;
         hit.line = Some(line::line_number_at(file.source(), range.start));
     }
     Ok(())
@@ -1698,7 +1724,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use rift_core::{Fault as _, SourceVisibility};
+    use rift_core::SourceVisibility;
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
     use rift_protocol::read::{
@@ -1715,9 +1741,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ByteRange, CandidateScreen, HitPayloads, IdentifierSources, ReadFault, ReadService,
-        Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer, declaration_text,
-        resolve_symbol,
+        ByteRange, CURRENT_TREE_ALONE, CandidateScreen, HitPayloads, IdentifierSources,
+        ReadService, Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
+        declaration_text, resolve_symbol,
     };
     use crate::read::tests::project_fixture;
 
@@ -2810,29 +2836,29 @@ impl Tower {
     fn search_requires_query_rejects_empty_query_and_zero_limit() -> TestResult {
         let (_directory, service) = fixture()?;
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
-        assert!(matches!(
+        assert_eq!(
             service
                 .search(&missing_query, &StoreAnswer::identifier_only())
                 .expect_err("missing query must fail")
-                .fault(),
-            ReadFault::Invalid { .. }
-        ));
+                .slug(),
+            rift_error::errors::server::read_invalid::SLUG
+        );
 
         let empty_query: SearchParams = serde_json::from_value(json!({"query": ""}))?;
-        assert!(matches!(
+        assert_eq!(
             service
                 .search(&empty_query, &StoreAnswer::identifier_only())
                 .expect_err("empty query must fail")
-                .fault(),
-            ReadFault::Invalid { .. }
-        ));
+                .slug(),
+            rift_error::errors::server::read_invalid::SLUG
+        );
 
         let zero_limit: SearchParams =
             serde_json::from_value(json!({"query": "Beacon", "limit": 0}))?;
         let error = service
             .search(&zero_limit, &StoreAnswer::identifier_only())
             .expect_err("zero limit must fail");
-        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
             "the request does not match the documented form: field limit, \
@@ -2853,7 +2879,10 @@ impl Tower {
             .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a comparison on one snapshot must refuse");
 
-        assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unsupported::SLUG
+        );
         assert!(
             error
                 .to_string()
@@ -3270,13 +3299,19 @@ impl Tower {
             "query": "Beacon",
             "paths": {"include": ["["]}
         }))?;
-        assert!(matches!(
-            service
-                .search(&params, &StoreAnswer::identifier_only())
-                .expect_err("an invalid include glob must refuse")
-                .fault(),
-            ReadFault::Index(_)
-        ));
+        let error = service
+            .search(&params, &StoreAnswer::identifier_only())
+            .expect_err("an invalid include glob must refuse");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::analysis::source_pattern_invalid::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
+        assert!(Error::source(&error).is_some());
         Ok(())
     }
 
@@ -3287,13 +3322,13 @@ impl Tower {
             "query": "Beacon",
             "paths": {"include": ["src\\lib.rs"]}
         }))?;
-        assert!(matches!(
+        assert_eq!(
             service
                 .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("a backslash pattern must be refused")
-                .fault(),
-            ReadFault::Invalid { field: "paths", .. }
-        ));
+                .slug(),
+            rift_error::errors::server::read_invalid::SLUG
+        );
         Ok(())
     }
 
@@ -3602,19 +3637,18 @@ impl Tower {
         let error = service
             .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a force_include match count above the bound must refuse");
-        assert!(matches!(error.fault(), ReadFault::Index(_)));
         assert_eq!(
-            error.fault().limit_evidence().map(|evidence| (
-                evidence.field,
-                evidence.limit,
-                evidence.required
-            )),
-            Some((
-                "paths.force_include".to_owned(),
-                super::FORCE_INCLUDE_FILES_MAX as u64,
-                super::FORCE_INCLUDE_FILES_MAX as u64 + 1
-            )),
-            "the refusal carries the bound and the match count"
+            error.slug(),
+            rift_error::errors::index::workspace_too_many_files::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "paths.force_include")
+        );
+        assert!(
+            error.context().any(|(key, value)| key == "maximum"
+                && value == super::FORCE_INCLUDE_FILES_MAX.to_string())
         );
         Ok(())
     }
@@ -3661,13 +3695,19 @@ impl Tower {
             "query": "Beacon",
             "paths": {"force_include": ["["]}
         }))?;
-        assert!(matches!(
-            service
-                .search(&params, &StoreAnswer::identifier_only())
-                .expect_err("an invalid force_include glob must refuse")
-                .fault(),
-            ReadFault::Index(_)
-        ));
+        let error = service
+            .search(&params, &StoreAnswer::identifier_only())
+            .expect_err("an invalid force_include glob must refuse");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::analysis::source_pattern_invalid::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
+        assert!(Error::source(&error).is_some());
         Ok(())
     }
 
@@ -3681,7 +3721,17 @@ impl Tower {
         let error = service
             .validate_engine_search(&params)
             .expect_err("an invalid force_include glob must refuse");
-        assert!(matches!(error.fault(), ReadFault::Index(_)), "{error}");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::analysis::source_pattern_invalid::SLUG,
+            "{error}"
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
+        assert!(Error::source(&error).is_some());
         Ok(())
     }
 
@@ -3947,11 +3997,15 @@ impl Tower {
             .expect_err(
                 "force_include walks the working tree, which a revision search has none of",
             );
-        assert!(matches!(
-            error.fault(),
-            ReadFault::Unsupported { capability }
-            if capability == "force_include at a revision"
-        ));
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unsupported::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "capability" && value == "force_include at a revision")
+        );
         Ok(())
     }
 
@@ -4723,16 +4777,17 @@ impl Tower {
             .expect_err("the relationship graph serves the project alone");
 
         assert!(
-            matches!(
-                error.fault(),
-                ReadFault::Invalid {
-                    field: "traversal",
-                    ..
-                }
-            ),
+            (error.slug() == rift_error::errors::server::read_invalid::SLUG),
             "{error}"
         );
-        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "traversal" })
+        );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation" && value == "the relationship graph serves the project alone"
+        }));
         Ok(())
     }
 
@@ -4747,10 +4802,19 @@ impl Tower {
         let error = super::validate_search(&params).expect_err("the seed rule must refuse");
 
         assert!(
-            matches!(error.fault(), ReadFault::Invalid { field: "seed", .. }),
+            (error.slug() == rift_error::errors::server::read_invalid::SLUG),
             "{arguments}: {error}"
         );
-        assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "seed")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "violation" && value == "a traversal starts at seed")
+        );
     }
 
     /// A configured language engine resolves the references a walk follows, and an engine
@@ -4770,13 +4834,13 @@ impl Tower {
 
             let error = super::validate_search(&params).expect_err("the pairing must refuse");
 
-            assert_eq!(error.descriptor().code(), "capability_unavailable");
-            assert!(
-                error
-                    .to_string()
-                    .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
-                "{error}"
+            assert_eq!(
+                error.slug(),
+                rift_error::errors::server::read_unsupported::SLUG
             );
+            assert!(error.context().any(|(key, value)| {
+                key == "capability" && value == super::CHANGE_TRAVERSAL_CAPABILITY
+            }));
         }
     }
 
@@ -4818,10 +4882,13 @@ impl Tower {
                 .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("the argument has nothing to change");
             assert!(
-                matches!(
-                    error.fault(),
-                    ReadFault::Invalid { field: "packages", violation: found } if found == violation
-                ),
+                error.slug() == rift_error::errors::server::read_invalid::SLUG
+                    && error
+                        .context()
+                        .any(|(key, value)| key == "field" && value == "packages")
+                    && error
+                        .context()
+                        .any(|(key, value)| key == "violation" && value == violation),
                 "{request}: {error}"
             );
         }
@@ -4844,10 +4911,19 @@ impl Tower {
                 .expect_err("rev pairs with the project scope alone");
 
             assert!(
-                matches!(error.fault(), ReadFault::Invalid { field: "scope", .. }),
+                (error.slug() == rift_error::errors::server::read_invalid::SLUG),
                 "scope {scope}: {error}"
             );
-            assert_eq!(error.descriptor().code(), "invalid_request");
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "scope")
+            );
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "violation" && value == CURRENT_TREE_ALONE)
+            );
         }
         Ok(())
     }

@@ -518,6 +518,33 @@ A `PostgreSQL` or REST adapter therefore consumes the same decisions and the sam
 identities rather than copying the algorithms; resolving an identity to a declaration needs the
 store that published it, and deciding which identities win does not.
 
+## Error registry
+
+`crates/rift-error/errors.toml` defines concrete Rift failures and evidence fields. `rift-error-codegen` validates those
+definitions and emits typed builders in `crates/rift-error/src/generated.rs`. That file carries each error's metadata
+and field descriptors; shared macro bodies in `crates/rift-error/src/generated_support.rs` emit the repeated builder,
+field, and setter implementations. The generated file is 4,080 lines and 269,185 bytes, down from 43,343 lines and
+1,597,512 bytes before shared macros.
+
+The generator computes each required field's state transition and each field's Rust bound and conversion. It passes
+the same field descriptors to `__rift_error_field!` and `__rift_error_setter!`: one emits field modules and transitions,
+and the other emits the inherent setter methods. `__rift_error_definition!` emits the builder, `.error()`, `.fail()`,
+and `IntoRiftError` implementation.
+Generated setters accept the Rust type declared for each field. Required fields must be set before `.error()` constructs
+a `RiftError` or `.fail()` returns one; optional fields accept `Option<T>` through `.maybe_<field>()`.
+
+A `source` field retains an underlying Rust error and exposes it through `std::error::Error::source`.
+A `cause` field retains another `RiftError` in that chain. The runtime also converts owned and
+borrowed `RiftError` values, including shared `Arc` values, without dropping their source chains.
+Sensitive evidence is redacted in rendered output.
+
+The registry does not contain transport codes. The MCP adapter maps each slug to its wire code and
+retry directive, then supplies the request phase with `.tool_error(phase)`. Calling `.fail()` on
+that representation returns its JSON-RPC error. `cargo xtask errors generate` updates generated
+Rust. The generator builds a syntax tree, sorts and groups imports at the file top, and formats it
+with `prettyplease`. `cargo xtask errors check` compares generated output without writing it; CI
+runs that check through `just generate-check`.
+
 ## Vector search
 
 <VersionBadge

@@ -137,7 +137,7 @@ mod tests {
 
     use super::*;
     use crate::document::SyntaxDocument;
-    use crate::failure::SyntaxError;
+    use crate::failure::RiftError;
     use crate::language::ShippedLanguage;
     use crate::provider::{SyntaxLimits, SyntaxSource};
 
@@ -238,7 +238,7 @@ mod tests {
             &self,
             source: SyntaxSource<'_>,
             _limits: SyntaxLimits,
-        ) -> Result<SyntaxDocument, SyntaxError> {
+        ) -> Result<SyntaxDocument, RiftError> {
             Ok(SyntaxDocument::new(
                 self.language.clone(),
                 source.path.clone(),

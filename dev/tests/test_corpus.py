@@ -383,12 +383,15 @@ class Decisions(unittest.TestCase):
                 "warnings": [{"code": "lexical_ranking_unavailable", "detail": detail}]
             }
 
-        valid = "field units_max, observed 20001, maximum 20000; resize"
+        valid = (
+            "lexical index received more units than its accepted limit of 20000: "
+            "field units_max, observed 20001; resend the same request after a short delay"
+        )
         self.assertEqual(lexical_breach(answer(valid), 20000), 20001)
         for wrong in (
             valid.replace("units_max", "other"),
             valid.replace("20001", "20000"),
-            valid.replace("maximum 20000", "maximum 200000"),
+            valid.replace("accepted limit of 20000", "accepted limit of 200000"),
             "still committing tree revision 20000",
         ):
             with self.assertRaises(AssertionError):
@@ -1016,9 +1019,15 @@ class SourceBound(unittest.TestCase):
     def refusal() -> JsonObject:
         return {
             "code": "limit_exceeded",
+            "message": (
+                "workspace contains more files than its accepted limit of 20000: "
+                "field source.files, observed 20001, "
+                f"path {Path.cwd() / 'test/e2e/app/page.js'}; "
+                "reduce workspace files below 20000 and retry"
+            ),
+            "retry": "never",
             "phase": "read",
             "limit": {"field": "source.files", "required": 20001, "limit": 20000},
-            "causes": [{"message": "violation too_many_files"}],
         }
 
     def exercise(
@@ -1066,9 +1075,11 @@ class SourceBound(unittest.TestCase):
         self.assertEqual(action["observed"], 20001)
         self.assertEqual(action["maximum"], 20000)
 
-    def test_wrong_refusal_code_phase_field_quantities_and_cause_fail(self) -> None:
+    def test_wrong_refusal_code_retry_message_phase_and_limit_fail(self) -> None:
         variants = [
             {"code": "resource_not_found"},
+            {"retry": "same_request"},
+            {"message": "workspace has too many files"},
             {"phase": "initialize"},
             {
                 "limit": {
@@ -1079,12 +1090,36 @@ class SourceBound(unittest.TestCase):
             },
             {"limit": {"field": "source.files", "required": 20000, "limit": 20000}},
             {"limit": {"field": "source.files", "required": 20001, "limit": 20001}},
-            {"causes": [{"message": "another refusal"}]},
+            {"causes": [{"message": "unexpected nested refusal"}]},
         ]
         for wrong in variants:
             with self.subTest(wrong=wrong), self.assertRaises(AssertionError):
                 self.exercise(
                     [MCPError(-32000, "source limit", {**self.refusal(), **wrong})]
+                )
+
+    def test_missing_or_wrong_source_path_and_action_fail(self) -> None:
+        message = cast(str, self.refusal()["message"])
+        path = str(Path.cwd() / "test/e2e/app/page.js")
+        action = "; reduce workspace files below 20000 and retry"
+        variants = [
+            message.replace(f", path {path}", ""),
+            message.replace(path, ""),
+            message.replace(path, " "),
+            message.replace(path, str(Path.cwd().parent / "outside.js")),
+            message.replace(path, str(Path.cwd() / ".." / "outside.js")),
+            message.replace(action, ""),
+            message.replace(action, "; reduce workspace files below 20001 and retry"),
+            message.replace("observed 20001", "observed 20000"),
+        ]
+        for wrong in variants:
+            with self.subTest(message=wrong), self.assertRaises(AssertionError):
+                self.exercise(
+                    [
+                        MCPError(
+                            -32000, "source limit", {**self.refusal(), "message": wrong}
+                        )
+                    ]
                 )
 
     def test_complete_read_without_refusal_fails(self) -> None:

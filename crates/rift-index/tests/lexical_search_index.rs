@@ -5,11 +5,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
+use rift_core::{ProjectPath, SourceUnitId};
+use rift_error::errors;
 use rift_index::{DatabasePool, FileDigest, WorkspaceDatabase, WorkspaceDigests};
 use rift_index::{
-    LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalRanking,
-    LexicalSearchIndex, LexicalStamp, RevisionScoped,
+    LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
+    LexicalStamp, RevisionScoped,
 };
 use rift_ranking::{
     DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
@@ -506,7 +507,7 @@ async fn test_lexical_search_index_replace_all_over_units_max_refuses_and_prior_
     ];
     let outcome = index.replace_all(&oversized_batch, "revision-2").await;
     let error = outcome.expect_err("batch bound violation must refuse");
-    assert_eq!(error.fault().violation(), LexicalIndexViolation::UnitLimit);
+    assert_eq!(error.slug(), errors::index::lexical_unit_limit::SLUG);
 
     let hits = search_matches(&index, "revision-1", "kept", 10).await?;
     assert_eq!(
@@ -532,11 +533,12 @@ async fn test_lexical_search_index_replace_all_content_over_bytes_max_refuses_na
     let oversized = [text_document("docs/big.md", "too many bytes here")?];
     let outcome = index.replace_all(&oversized, "revision-1").await;
     let error = outcome.expect_err("batch bound violation must refuse");
-    assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::UnitTooLarge
+    assert_eq!(error.slug(), errors::index::lexical_unit_too_large::SLUG);
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == "docs/big.md")
     );
-    assert_eq!(error.fault().path(), Some(Path::new("docs/big.md")));
     Ok(())
 }
 
@@ -575,8 +577,8 @@ async fn test_lexical_search_index_replace_all_refuses_a_document_addressed_by_a
         .await
         .expect_err("a document addressed by a source unit must refuse");
     assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::DocumentLocationUnsupported
+        error.slug(),
+        errors::index::lexical_document_location_unsupported::SLUG
     );
     assert_eq!(
         index.tree_revision().await?,
@@ -605,8 +607,8 @@ async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomic
     let outcome = index.replace_all(&duplicated, "revision-2").await;
     let error = outcome.expect_err("batch bound violation must refuse");
     assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::DuplicateIdentity
+        error.slug(),
+        errors::index::lexical_duplicate_identity::SLUG
     );
 
     assert_eq!(
@@ -1004,8 +1006,8 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses() -> TestR
         .await;
     let error = outcome.expect_err("a stored row with an invalid path must refuse");
     assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::StoredPathInvalid
+        error.slug(),
+        errors::index::lexical_stored_path_invalid::SLUG
     );
     Ok(())
 }
@@ -1036,8 +1038,8 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses() -> TestR
         .await;
     let error = outcome.expect_err("a stored row with an unknown kind must refuse");
     assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::StoredKindInvalid
+        error.slug(),
+        errors::index::lexical_stored_kind_invalid::SLUG
     );
     Ok(())
 }
@@ -1050,11 +1052,15 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
 
     let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
     let error = outcome.expect_err("opening under a missing parent directory must refuse");
-    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
     // The open creates the migration lock file beside the database first, so the refusal
     // names that file, in the same missing directory.
     let lock_path = path.with_file_name("lexical.db.lock");
-    assert_eq!(error.fault().path(), Some(lock_path.as_path()));
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == lock_path.display().to_string())
+    );
     Ok(())
 }
 
@@ -1099,8 +1105,12 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
     let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
     let error =
         outcome.expect_err("migration apply against a pre-existing conflicting table must refuse");
-    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
-    assert_eq!(error.fault().path(), Some(path.as_path()));
+    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == path.display().to_string())
+    );
     assert!(
         std::error::Error::source(&error)
             .is_some_and(|source| source.to_string().contains("lexical_units")),
@@ -1137,8 +1147,7 @@ async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_
     blocker.rollback().await?;
 
     let error = outcome.expect_err("an externally held write lock must surface a storage failure");
-    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
-    assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
     assert!(
         std::error::Error::source(&error).is_some(),
         "storage_error must preserve the underlying toasty/SQLite cause"
@@ -1264,7 +1273,7 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
         .apply(&change, &LexicalStamp::published("revision-two", ""))
         .await
         .expect_err("a resulting set past units_max must refuse");
-    assert_eq!(error.fault().violation(), LexicalIndexViolation::UnitLimit);
+    assert_eq!(error.slug(), errors::index::lexical_unit_limit::SLUG);
     assert_eq!(
         index.tree_revision().await?,
         Some("revision-one".to_owned()),
@@ -1303,8 +1312,8 @@ async fn test_lexical_search_index_apply_refuses_two_documents_sharing_one_ident
         .await
         .expect_err("two documents sharing one identity must refuse");
     assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::DuplicateIdentity
+        error.slug(),
+        errors::index::lexical_duplicate_identity::SLUG
     );
     assert_eq!(
         index.tree_revision().await?,
@@ -1666,7 +1675,7 @@ async fn test_a_later_typed_insert_batch_failure_rolls_back_the_whole_change() -
         )
         .await
         .expect_err("the second insert batch must reach the refusing trigger");
-    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
     assert!(
         std::error::Error::source(&error)
             .is_some_and(|source| source.to_string().contains("later insert batch refused")),
@@ -1794,16 +1803,31 @@ async fn test_lexical_search_index_recorded_files_past_units_max_refuse() -> Tes
         .recorded_files("derivation-a")
         .await
         .expect_err("more recorded files than units_max must refuse, never truncate");
-    assert_eq!(
-        error.fault().violation(),
-        LexicalIndexViolation::RecordLimit
-    );
+    assert_eq!(error.slug(), errors::index::lexical_record_limit::SLUG);
     let evidence = error
-        .fault()
-        .limit_evidence()
-        .expect("a record limit carries its evidence");
-    assert_eq!(evidence.field, "lexical.files");
-    assert_eq!((evidence.limit, evidence.required), (2, 3));
+        .context()
+        .find(|(key, _)| *key == "field")
+        .map(|(_, value)| value)
+        .expect("a record limit names its field");
+    assert_eq!(evidence, "lexical.files");
+    assert_eq!(
+        error
+            .context()
+            .filter(|(key, _)| *key == "maximum")
+            .map(|(_, value)| value)
+            .next()
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        error
+            .context()
+            .filter(|(key, _)| *key == "observed")
+            .map(|(_, value)| value)
+            .next()
+            .as_deref(),
+        Some("3")
+    );
     Ok(())
 }
 

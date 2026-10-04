@@ -4,11 +4,10 @@ use std::fs::{File, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use rift_core::Error;
 use rift_core::constants::RIFT_STATE_DIRECTORY;
+use rift_error::{RiftError, errors};
 
 use crate::database::{StoreFiller, StoreReader, create_schema};
-use crate::error::{StoreError, StoreFault, folder_error};
 use crate::lock::{lock_live, open_lock};
 
 /// The folder inside the common git directory that holds every store file:
@@ -70,13 +69,15 @@ impl StoreLocation {
 
     /// This store in the fallback folder, when `refused` is the common git
     /// directory refusing the folder for want of write access.
-    fn in_worktree(&self, refused: &StoreError) -> Option<Self> {
-        let denied = refused.fault().folder_cause().is_some_and(|cause| {
-            matches!(
-                cause.kind(),
-                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
-            )
-        });
+    fn in_worktree(&self, refused: &RiftError) -> Option<Self> {
+        let denied = std::error::Error::source(refused)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some_and(|cause| {
+                matches!(
+                    cause.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+                )
+            });
         let fallback = self.fallback.as_ref().filter(|_| denied)?;
         Some(Self {
             folder: fallback.clone(),
@@ -103,7 +104,7 @@ impl StoreLocation {
 #[derive(Debug)]
 pub struct WorktreeFallback {
     refused: PathBuf,
-    cause: StoreError,
+    cause: RiftError,
 }
 
 impl WorktreeFallback {
@@ -115,7 +116,7 @@ impl WorktreeFallback {
 
     /// Why it was refused.
     #[must_use]
-    pub const fn cause(&self) -> &StoreError {
+    pub const fn cause(&self) -> &RiftError {
         &self.cause
     }
 }
@@ -124,7 +125,7 @@ impl WorktreeFallback {
 #[derive(Debug, Default)]
 pub struct SweptRevisions {
     deleted: Vec<String>,
-    failures: Vec<StoreError>,
+    failures: Vec<RiftError>,
 }
 
 impl SweptRevisions {
@@ -137,7 +138,7 @@ impl SweptRevisions {
     /// The released revisions the sweep could not take: a live lock it could
     /// not open or try, and a deletion the filesystem refused.
     #[must_use]
-    pub fn failures(&self) -> &[StoreError] {
+    pub fn failures(&self) -> &[RiftError] {
         &self.failures
     }
 }
@@ -160,13 +161,13 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] when neither folder takes the store, the live
+    /// Returns [`RiftError`] when neither folder takes the store, the live
     /// lock cannot be held, or `SQLite` refuses the file.
-    pub fn open(location: &StoreLocation) -> Result<Self, StoreError> {
+    pub fn open(location: &StoreLocation) -> Result<Self, RiftError> {
         match Self::open_in(location) {
             Err(refused) => {
                 let Some(fallback) = location.in_worktree(&refused) else {
-                    return Err(refused);
+                    return refused.fail();
                 };
                 let mut store = Self::open_in(&fallback)?;
                 store.fallback = Some(WorktreeFallback {
@@ -179,9 +180,14 @@ impl HistoryStore {
         }
     }
 
-    fn open_in(location: &StoreLocation) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(&location.folder)
-            .map_err(folder_error(&location.folder, "create store folder"))?;
+    fn open_in(location: &StoreLocation) -> Result<Self, RiftError> {
+        std::fs::create_dir_all(&location.folder).map_err(|source| {
+            errors::history_store::folder()
+                .operation("create store folder")
+                .path(&location.folder)
+                .detail(source)
+                .error()
+        })?;
         let live = lock_live(&location.file(&location.revision, LIVE_LOCK_SUFFIX))?;
         create_schema(&location.database())?;
         Ok(Self {
@@ -216,21 +222,27 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] when the fill lock cannot be opened or tried, or
+    /// Returns [`RiftError`] when the fill lock cannot be opened or tried, or
     /// `SQLite` refuses the write connection.
-    pub fn filler(&self) -> Result<Option<StoreFiller>, StoreError> {
+    pub fn filler(&self) -> Result<Option<StoreFiller>, RiftError> {
         let path = self
             .location
             .file(&self.location.revision, FILL_LOCK_SUFFIX);
-        let lock = open_lock(&path).map_err(folder_error(&path, "open fill lock"))?;
+        let lock = open_lock(&path).map_err(|source| {
+            errors::history_store::folder()
+                .operation("open fill lock")
+                .path(&path)
+                .detail(source)
+                .error()
+        })?;
         match lock.try_lock() {
             Ok(()) => StoreFiller::open(&self.location.database(), lock).map(Some),
             Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(source)) => Err(Error::new(StoreFault::Folder {
-                path,
-                operation: "lock fill",
-                source,
-            })),
+            Err(TryLockError::Error(source)) => errors::history_store::folder()
+                .operation("lock fill")
+                .path(&path)
+                .detail(source)
+                .fail(),
         }
     }
 
@@ -242,17 +254,28 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] when the folder cannot be listed. A live lock the
+    /// Returns [`RiftError`] when the folder cannot be listed. A live lock the
     /// sweep cannot open or try, and a file the filesystem refuses to delete,
     /// are reported in [`SweptRevisions::failures`] and leave the rest of the
     /// sweep running.
-    pub fn sweep(&self) -> Result<SweptRevisions, StoreError> {
+    pub fn sweep(&self) -> Result<SweptRevisions, RiftError> {
         let folder = &self.location.folder;
-        let entries =
-            std::fs::read_dir(folder).map_err(folder_error(folder, "list store folder"))?;
+        let entries = std::fs::read_dir(folder).map_err(|source| {
+            errors::history_store::folder()
+                .operation("list store folder")
+                .path(folder)
+                .detail(source)
+                .error()
+        })?;
         let mut swept = SweptRevisions::default();
         for entry in entries {
-            let entry = entry.map_err(folder_error(folder, "list store folder"))?;
+            let entry = entry.map_err(|source| {
+                errors::history_store::folder()
+                    .operation("list store folder")
+                    .path(folder)
+                    .detail(source)
+                    .error()
+            })?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(revision) = name
                 .strip_prefix(STORE_FILE_PREFIX)
@@ -307,28 +330,34 @@ impl HistoryStore {
 /// when the lock "is held by another handle/process", and
 /// `TryLockError::Error` for "an I/O error on the file", which never carries
 /// `ErrorKind::WouldBlock`.
-fn lock_released(live: &Path) -> Result<Option<File>, StoreError> {
-    let lock = open_lock(live).map_err(folder_error(live, "open swept live lock"))?;
+fn lock_released(live: &Path) -> Result<Option<File>, RiftError> {
+    let lock = open_lock(live).map_err(|source| {
+        errors::history_store::folder()
+            .operation("open swept live lock")
+            .path(live)
+            .detail(source)
+            .error()
+    })?;
     match lock.try_lock() {
         Ok(()) => Ok(Some(lock)),
         Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(source)) => Err(Error::new(StoreFault::Folder {
-            path: live.to_owned(),
-            operation: "lock swept live lock",
-            source,
-        })),
+        Err(TryLockError::Error(source)) => errors::history_store::folder()
+            .operation("lock swept live lock")
+            .path(live)
+            .detail(source)
+            .fail(),
     }
 }
 
 /// Deletes one file of a released revision; an absent file is already gone.
-fn remove_released(file: &Path) -> Result<(), StoreError> {
+fn remove_released(file: &Path) -> Result<(), RiftError> {
     match std::fs::remove_file(file) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::new(StoreFault::Folder {
-            path: file.to_owned(),
-            operation: "delete swept store file",
-            source,
-        })),
+        Err(source) => errors::history_store::folder()
+            .operation("delete swept store file")
+            .path(file)
+            .detail(source)
+            .fail(),
     }
 }

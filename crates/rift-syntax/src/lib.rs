@@ -18,11 +18,10 @@ mod typescript;
 mod yaml;
 
 pub use contribution::{
-    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, SyntaxPublicationError,
-    source_unit, source_unit_for_path,
+    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, source_unit,
+    source_unit_for_path,
 };
 pub use document::{ByteRange, SyntaxDocument, SyntaxFacts, SyntaxNode, SyntaxSymbol};
-pub use failure::{SyntaxBound, SyntaxError, SyntaxFault, SyntaxViolation};
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;
 pub use language::{LanguageDefinition, ShippedLanguage, definitions};
@@ -31,7 +30,7 @@ pub use markdown::{
     MarkdownBlockKind, MarkdownBlockStructure, MarkdownFacts, MarkdownHeadingFact,
     MarkdownLinkFact, MarkdownLinkKind, MarkdownReferenceCandidate, MarkdownSyntaxProvider,
 };
-pub use provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
+pub use provider::{SyntaxBound, SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};
 pub use toml::TomlSyntaxProvider;

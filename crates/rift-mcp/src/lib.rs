@@ -2,6 +2,7 @@
 
 mod election;
 mod failure;
+pub use failure::{wire_code_for_error, wire_code_for_slug};
 mod global;
 mod history;
 mod http;
@@ -21,20 +22,21 @@ mod transport;
 mod validation;
 
 pub use election::{
-    ElectedServer, ElectionError, ElectionFault, ElectionGuard, ServerPresence, StaleReason, claim,
-    document_path, probe, probe_state_directory, read_serving, serve_elected,
-    serve_elected_with_storage, serve_repository_elected,
+    ElectedServer, ElectionGuard, ServerPresence, StaleReason, claim, document_path, probe,
+    probe_state_directory, read_serving, serve_elected, serve_elected_with_storage,
+    serve_repository_elected,
 };
+pub use failure::{McpErrorExt, McpErrorFailExt, McpFailure};
 pub use http::{
-    DeferredDatabaseShutdown, HttpServeError, HttpServeFault, HttpServer, STOP_REQUEST_TIMEOUT,
-    StopRequestFailure, TokenCheck, request_stop, serve_http,
+    DeferredDatabaseShutdown, HttpServer, STOP_REQUEST_TIMEOUT, StopRequestFailure, TokenCheck,
+    request_stop, serve_http,
 };
 pub use identity::{BuildCheckout, product_identity_of};
 pub use logs::{
     LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogSettlement, LogSink,
     PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture, logs_configuration,
 };
-pub use proxy::{ProxyFault, ProxyServeError, forward_budget, serve_proxy};
+pub use proxy::{forward_budget, serve_proxy};
 pub use server::RiftMcp;
 pub use spawn::{
     BoundedStderr, BoundedWriter, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BYTES_MAX,

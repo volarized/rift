@@ -28,7 +28,7 @@ use tokenizers::models::ModelWrapper;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::embedding::QueryTransformation;
-use crate::error::{SearchError, SearchFault, SearchViolation};
+use rift_error::{RiftError, errors};
 
 /// The file a model's architecture and dimensions are read from.
 pub(crate) const CONFIGURATION_FILE: &str = "config.json";
@@ -90,7 +90,7 @@ impl ModelFiles {
     /// absent, so an operator learns which file to supply rather than that the
     /// directory was rejected, or the file's own read violation when one
     /// cannot be digested.
-    pub fn in_directory(directory: &Path) -> Result<Self, SearchError> {
+    pub fn in_directory(directory: &Path) -> Result<Self, RiftError> {
         let files = Self::at(directory, String::new())?;
         let revision = files.digest()?;
         Ok(Self { revision, ..files })
@@ -106,7 +106,7 @@ impl ModelFiles {
     ///
     /// Returns `model_file_missing` naming the first of the three that is
     /// absent.
-    pub fn in_snapshot(directory: &Path, commit: &str) -> Result<Self, SearchError> {
+    pub fn in_snapshot(directory: &Path, commit: &str) -> Result<Self, RiftError> {
         Self::at(directory, commit.to_owned())
     }
 
@@ -124,7 +124,7 @@ impl ModelFiles {
     }
 
     /// The three paths below `directory`, refusing the first one absent.
-    fn at(directory: &Path, revision: String) -> Result<Self, SearchError> {
+    fn at(directory: &Path, revision: String) -> Result<Self, RiftError> {
         let files = Self {
             configuration: directory.join(CONFIGURATION_FILE),
             tokenizer: directory.join(TOKENIZER_FILE),
@@ -134,44 +134,60 @@ impl ModelFiles {
         let missing = files
             .in_load_order()
             .into_iter()
-            .find(|(path, _)| !path.is_file());
+            .find(|path| !path.is_file());
         match missing {
-            Some((path, _)) => Err(SearchError::new(
-                SearchFault::new(SearchViolation::ModelFileMissing)
-                    .about(path.display().to_string()),
-            )),
+            Some(path) => errors::search::model_file_missing().subject(path).fail(),
             None => Ok(files),
         }
     }
 
-    /// The three files in load order, each with the violation its own read
-    /// failure classifies as.
-    fn in_load_order(&self) -> [(&PathBuf, SearchViolation); 3] {
-        [
-            (
-                &self.configuration,
-                SearchViolation::ModelConfigurationInvalid,
-            ),
-            (&self.tokenizer, SearchViolation::TokenizerUnreadable),
-            (&self.weights, SearchViolation::WeightsUnreadable),
-        ]
+    /// The three files in load order.
+    fn in_load_order(&self) -> [&PathBuf; 3] {
+        [&self.configuration, &self.tokenizer, &self.weights]
     }
 
     /// The digest over the three files' names and bytes, in load order.
-    fn digest(&self) -> Result<String, SearchError> {
+    fn digest(&self) -> Result<String, RiftError> {
         let mut hasher = Sha256::new();
         let mut chunk = vec![0_u8; MODEL_DIGEST_CHUNK_BYTES];
-        for (path, violation) in self.in_load_order() {
+        for path in self.in_load_order() {
             let name = path.file_name().unwrap_or_default();
             hasher.update(name.as_encoded_bytes());
             hasher.update([0]);
-            let file =
-                std::fs::File::open(path).map_err(|error| failure(violation, path, error))?;
+            let file = std::fs::File::open(path).map_err(|error| {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some(CONFIGURATION_FILE) => errors::search::model_configuration_invalid()
+                        .path(path)
+                        .source(error)
+                        .error(),
+                    Some(TOKENIZER_FILE) => errors::search::tokenizer_unreadable()
+                        .path(path)
+                        .source(error)
+                        .error(),
+                    _ => errors::search::weights_unreadable()
+                        .path(path)
+                        .source(error)
+                        .error(),
+                }
+            })?;
             let mut reader = std::io::BufReader::new(file);
             loop {
-                let read = reader
-                    .read(&mut chunk)
-                    .map_err(|error| failure(violation, path, error))?;
+                let read = reader.read(&mut chunk).map_err(|error| {
+                    match path.file_name().and_then(|name| name.to_str()) {
+                        Some(CONFIGURATION_FILE) => errors::search::model_configuration_invalid()
+                            .path(path)
+                            .source(error)
+                            .error(),
+                        Some(TOKENIZER_FILE) => errors::search::tokenizer_unreadable()
+                            .path(path)
+                            .source(error)
+                            .error(),
+                        _ => errors::search::weights_unreadable()
+                            .path(path)
+                            .source(error)
+                            .error(),
+                    }
+                })?;
                 if read == 0 {
                     break;
                 }
@@ -275,13 +291,12 @@ impl Encoder {
     ///
     /// Returns `model_configuration_invalid`, `tokenizer_unreadable`, or
     /// `weights_unreadable` naming the file that could not be read.
-    pub fn load(files: &ModelFiles, limits: EncoderLimits) -> Result<Self, SearchError> {
+    pub fn load(files: &ModelFiles, limits: EncoderLimits) -> Result<Self, RiftError> {
         let text = std::fs::read_to_string(&files.configuration).map_err(|error| {
-            failure(
-                SearchViolation::ModelConfigurationInvalid,
-                &files.configuration,
-                error,
-            )
+            errors::search::model_configuration_invalid()
+                .path(&files.configuration)
+                .source(error)
+                .error()
         })?;
         if names_static_path(&text, &files.configuration)? {
             Self::load_static(files, &text, limits)
@@ -292,25 +307,24 @@ impl Encoder {
 
     /// Loads the BERT path: the architecture from `config.json`, then every
     /// tensor that architecture names.
-    fn load_bert(
-        files: &ModelFiles,
-        text: &str,
-        limits: EncoderLimits,
-    ) -> Result<Self, SearchError> {
+    fn load_bert(files: &ModelFiles, text: &str, limits: EncoderLimits) -> Result<Self, RiftError> {
         let configuration: Config = serde_json::from_str(text).map_err(|error| {
-            failure(
-                SearchViolation::ModelConfigurationInvalid,
-                &files.configuration,
-                error,
-            )
+            errors::search::model_configuration_invalid()
+                .path(&files.configuration)
+                .source(error)
+                .error()
         })?;
         let tokenizer = read_bert_tokenizer(&files.tokenizer, limits.tokens_max())?;
         let device = Device::Cpu;
         let weights = read_weights(&files.weights, &device)?;
         let variables = VarBuilder::from_tensors(weights, DType::F32, &device);
         let dimension = configuration.hidden_size;
-        let model = BertModel::load(variables, &configuration)
-            .map_err(|error| failure(SearchViolation::WeightsUnreadable, &files.weights, error))?;
+        let model = BertModel::load(variables, &configuration).map_err(|error| {
+            errors::search::weights_unreadable()
+                .path(&files.weights)
+                .source(error)
+                .error()
+        })?;
         Ok(Self {
             model: Model::Bert(Box::new(model)),
             tokenizer,
@@ -334,13 +348,12 @@ impl Encoder {
         files: &ModelFiles,
         text: &str,
         limits: EncoderLimits,
-    ) -> Result<Self, SearchError> {
+    ) -> Result<Self, RiftError> {
         let configuration: StaticConfiguration = serde_json::from_str(text).map_err(|error| {
-            failure(
-                SearchViolation::ModelConfigurationInvalid,
-                &files.configuration,
-                error,
-            )
+            errors::search::model_configuration_invalid()
+                .path(&files.configuration)
+                .source(error)
+                .error()
         })?;
         let tokenizer = read_static_tokenizer(&files.tokenizer)?;
         let weights = StaticWeights::read(
@@ -350,13 +363,13 @@ impl Encoder {
         )?;
         let declared = configuration.hidden_dim.unwrap_or(weights.width);
         if declared != weights.width {
-            return Err(SearchError::new(
-                SearchFault::new(SearchViolation::ModelConfigurationInvalid).about(format!(
-                    "{}: hidden_dim {declared}, the weights hold {} columns",
-                    files.configuration.display(),
+            return errors::search::model_configuration_invalid()
+                .path(&files.configuration)
+                .source(std::io::Error::other(format!(
+                    "hidden_dim {declared}, weights hold {} columns",
                     weights.width
-                )),
-            ));
+                )))
+                .fail();
         }
         let dimension = weights.width;
         Ok(Self {
@@ -402,7 +415,7 @@ impl Encoder {
     /// # Errors
     ///
     /// Returns `encode_failed` when tokenizing or the forward pass fails.
-    pub fn embed_query(&self, query: &str) -> Result<Vec<f32>, SearchError> {
+    pub fn embed_query(&self, query: &str) -> Result<Vec<f32>, RiftError> {
         let text = match &self.model {
             Model::Bert(_) => format!("{QUERY_PREFIX}{query}"),
             Model::Static(_) => query.to_owned(),
@@ -410,10 +423,9 @@ impl Encoder {
         let mut embedded = self.embed_documents(std::slice::from_ref(&text))?;
         match embedded.pop() {
             Some(vector) => Ok(vector),
-            None => Err(SearchError::new(
-                SearchFault::new(SearchViolation::EncodeFailed)
-                    .about("one query produced no vector"),
-            )),
+            None => errors::search::encode_failed()
+                .stage("one query produced no vector")
+                .fail(),
         }
     }
 
@@ -432,15 +444,12 @@ impl Encoder {
     ///
     /// Returns `text_limit` when the call carries more texts than
     /// [`EncoderLimits::texts_max`], and `encode_failed` when a pass fails.
-    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SearchError> {
+    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, RiftError> {
         if texts.len() > self.limits.texts_max() {
-            return Err(SearchError::new(
-                SearchFault::new(SearchViolation::TextLimit).about(format!(
-                    "{} texts, {} allowed",
-                    texts.len(),
-                    self.limits.texts_max()
-                )),
-            ));
+            return errors::search::text_limit()
+                .observed(texts.len())
+                .limit(self.limits.texts_max())
+                .fail();
         }
         let mut vectors = Vec::with_capacity(texts.len());
         for batch in texts.chunks(self.limits.batch_declarations()) {
@@ -450,7 +459,7 @@ impl Encoder {
     }
 
     /// One batch through the path this encoder loaded.
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, SearchError> {
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, RiftError> {
         match &self.model {
             Model::Bert(model) => self.embed_batch_bert(model, texts),
             Model::Static(weights) => self.embed_batch_static(weights, texts),
@@ -462,19 +471,23 @@ impl Encoder {
         &self,
         model: &BertModel,
         texts: &[String],
-    ) -> Result<Vec<Vec<f32>>, SearchError> {
+    ) -> Result<Vec<Vec<f32>>, RiftError> {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
-            .map_err(|error| boxed_encode_failure("tokenizing a batch", error.as_ref()))?;
+            .map_err(|error| {
+                errors::search::encode_failed()
+                    .stage("tokenizing a batch")
+                    .source(error)
+                    .error()
+            })?;
         let width = encodings
             .first()
             .map_or(0, |encoding| encoding.get_ids().len());
         if width == 0 {
-            return Err(SearchError::new(
-                SearchFault::new(SearchViolation::EncodeFailed)
-                    .about("the tokenizer produced no tokens"),
-            ));
+            return errors::search::encode_failed()
+                .stage("the tokenizer produced no tokens")
+                .fail();
         }
         let shape = (texts.len(), width);
         let ids: Vec<u32> = encodings
@@ -498,11 +511,16 @@ impl Encoder {
         &self,
         weights: &StaticWeights,
         texts: &[String],
-    ) -> Result<Vec<Vec<f32>>, SearchError> {
+    ) -> Result<Vec<Vec<f32>>, RiftError> {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), false)
-            .map_err(|error| boxed_encode_failure("tokenizing a batch", error.as_ref()))?;
+            .map_err(|error| {
+                errors::search::encode_failed()
+                    .stage("tokenizing a batch")
+                    .source(error)
+                    .error()
+            })?;
         let mut vectors = Vec::with_capacity(encodings.len());
         for encoding in &encodings {
             vectors.push(weights.embed(encoding.get_ids(), self.limits.tokens_max())?);
@@ -520,25 +538,50 @@ impl Encoder {
         ids: &[u32],
         mask: &[u32],
         shape: (usize, usize),
-    ) -> Result<Vec<Vec<f32>>, SearchError> {
+    ) -> Result<Vec<Vec<f32>>, RiftError> {
         let build = |values: &[u32]| Tensor::from_slice(values, shape, &self.device);
-        let ids = build(ids).map_err(|error| encode_failure("building the token tensor", error))?;
-        let mask =
-            build(mask).map_err(|error| encode_failure("building the mask tensor", error))?;
-        let types = ids
-            .zeros_like()
-            .map_err(|error| encode_failure("building the token-type tensor", error))?;
-        let hidden = model
-            .forward(&ids, &types, Some(&mask))
-            .map_err(|error| encode_failure("the forward pass", error))?;
+        let ids = build(ids).map_err(|error| {
+            errors::search::encode_failed()
+                .stage("building the token tensor")
+                .source(error)
+                .error()
+        })?;
+        let mask = build(mask).map_err(|error| {
+            errors::search::encode_failed()
+                .stage("building the mask tensor")
+                .source(error)
+                .error()
+        })?;
+        let types = ids.zeros_like().map_err(|error| {
+            errors::search::encode_failed()
+                .stage("building the token-type tensor")
+                .source(error)
+                .error()
+        })?;
+        let hidden = model.forward(&ids, &types, Some(&mask)).map_err(|error| {
+            errors::search::encode_failed()
+                .stage("the forward pass")
+                .source(error)
+                .error()
+        })?;
         let pooled = hidden
             .i((.., 0))
             .and_then(|cls| cls.broadcast_div(&cls.sqr()?.sum_keepdim(1)?.sqrt()?))
-            .map_err(|error| encode_failure("pooling the CLS vector", error))?;
+            .map_err(|error| {
+                errors::search::encode_failed()
+                    .stage("pooling the CLS vector")
+                    .source(error)
+                    .error()
+            })?;
         pooled
             .to_dtype(DType::F32)
             .and_then(|pooled| pooled.to_vec2::<f32>())
-            .map_err(|error| encode_failure("reading the pooled vectors", error))
+            .map_err(|error| {
+                errors::search::encode_failed()
+                    .stage("reading the pooled vectors")
+                    .source(error)
+                    .error()
+            })
     }
 }
 
@@ -582,33 +625,41 @@ impl StaticWeights {
     /// the static path addresses rows by index and runs no kernel over them, so
     /// holding the table as a tensor would cost a candle call per token and buy
     /// nothing.
-    fn read(path: &Path, normalize: bool, unknown_token: Option<u32>) -> Result<Self, SearchError> {
+    fn read(path: &Path, normalize: bool, unknown_token: Option<u32>) -> Result<Self, RiftError> {
         let device = Device::Cpu;
         let mut tensors = read_weights(path, &device)?;
         let table = tensors.remove(STATIC_WEIGHTS_TENSOR).ok_or_else(|| {
-            SearchError::new(
-                SearchFault::new(SearchViolation::WeightsUnreadable).about(format!(
-                    "{}: the weights hold no `{STATIC_WEIGHTS_TENSOR}` tensor",
-                    path.display()
-                )),
-            )
+            errors::search::weights_unreadable()
+                .path(path)
+                .source(std::io::Error::other(format!(
+                    "weights hold no `{STATIC_WEIGHTS_TENSOR}` tensor"
+                )))
+                .error()
         })?;
-        let (count, width) = table
-            .dims2()
-            .map_err(|error| failure(SearchViolation::WeightsUnreadable, path, error))?;
+        let (count, width) = table.dims2().map_err(|error| {
+            errors::search::weights_unreadable()
+                .path(path)
+                .source(error)
+                .error()
+        })?;
         if count == 0 || width == 0 {
-            return Err(SearchError::new(
-                SearchFault::new(SearchViolation::WeightsUnreadable).about(format!(
-                    "{}: the `{STATIC_WEIGHTS_TENSOR}` tensor is {count} by {width}",
-                    path.display()
-                )),
-            ));
+            return errors::search::weights_unreadable()
+                .path(path)
+                .source(std::io::Error::other(format!(
+                    "`{STATIC_WEIGHTS_TENSOR}` tensor is {count} by {width}"
+                )))
+                .fail();
         }
         let rows = table
             .to_dtype(DType::F32)
             .and_then(|table| table.flatten_all())
             .and_then(|table| table.to_vec1::<f32>())
-            .map_err(|error| failure(SearchViolation::WeightsUnreadable, path, error))?;
+            .map_err(|error| {
+                errors::search::weights_unreadable()
+                    .path(path)
+                    .source(error)
+                    .error()
+            })?;
         Ok(Self {
             rows,
             count,
@@ -630,7 +681,7 @@ impl StaticWeights {
     ///
     /// The loop is bounded by that cut: it runs `tokens_max` times at most,
     /// whatever the tokenizer returned.
-    fn embed(&self, ids: &[u32], tokens_max: usize) -> Result<Vec<f32>, SearchError> {
+    fn embed(&self, ids: &[u32], tokens_max: usize) -> Result<Vec<f32>, RiftError> {
         let mut total = vec![0.0_f32; self.width];
         let mut kept = 0.0_f32;
         let carried = ids
@@ -660,7 +711,7 @@ impl StaticWeights {
     /// A tokenizer whose vocabulary outruns the table it was shipped with
     /// addresses a row that is not there, and the encoder reports that rather
     /// than skipping the token or indexing past the buffer.
-    fn row(&self, id: u32) -> Result<&[f32], SearchError> {
+    fn row(&self, id: u32) -> Result<&[f32], RiftError> {
         let start = usize::try_from(id)
             .ok()
             .and_then(|index| index.checked_mul(self.width));
@@ -668,20 +719,21 @@ impl StaticWeights {
             .and_then(|start| Some(start..start.checked_add(self.width)?))
             .and_then(|range| self.rows.get(range));
         row.ok_or_else(|| {
-            SearchError::new(
-                SearchFault::new(SearchViolation::EncodeFailed).about(format!(
-                    "token {id} is past the {} rows the weights hold",
-                    self.count
-                )),
-            )
+            errors::search::encode_failed()
+                .stage(format!("token {id} is past {} weight rows", self.count))
+                .error()
         })
     }
 }
 
 /// Whether a `config.json` names a static embedding model.
-fn names_static_path(text: &str, path: &Path) -> Result<bool, SearchError> {
-    let named: ModelType = serde_json::from_str(text)
-        .map_err(|error| failure(SearchViolation::ModelConfigurationInvalid, path, error))?;
+fn names_static_path(text: &str, path: &Path) -> Result<bool, RiftError> {
+    let named: ModelType = serde_json::from_str(text).map_err(|error| {
+        errors::search::model_configuration_invalid()
+            .path(path)
+            .source(error)
+            .error()
+    })?;
     Ok(named.model_type.as_deref() == Some(STATIC_MODEL_TYPE))
 }
 
@@ -711,9 +763,13 @@ fn unknown_token(tokenizer: &Tokenizer) -> Option<u32> {
 }
 
 /// The tensors of one model, read once into memory.
-fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>, SearchError> {
-    candle_core::safetensors::load(path, device)
-        .map_err(|error| failure(SearchViolation::WeightsUnreadable, path, error))
+fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>, RiftError> {
+    candle_core::safetensors::load(path, device).map_err(|error| {
+        errors::search::weights_unreadable()
+            .path(path)
+            .source(error)
+            .error()
+    })
 }
 
 /// The model's tokenizer, padding to the batch's longest and truncating at
@@ -722,7 +778,7 @@ fn read_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>,
 /// The BERT path runs one rectangle of tokens through the model, so every
 /// sequence in a pass is padded to one width and the mask tells the model which
 /// positions the padding filled.
-fn read_bert_tokenizer(path: &Path, tokens_max: usize) -> Result<Tokenizer, SearchError> {
+fn read_bert_tokenizer(path: &Path, tokens_max: usize) -> Result<Tokenizer, RiftError> {
     let mut tokenizer = open_tokenizer(path)?;
     tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
@@ -733,7 +789,12 @@ fn read_bert_tokenizer(path: &Path, tokens_max: usize) -> Result<Tokenizer, Sear
             max_length: tokens_max,
             ..TruncationParams::default()
         }))
-        .map_err(|error| tokenizer_failure(path, error.as_ref()))?;
+        .map_err(|error| {
+            errors::search::tokenizer_unreadable()
+                .path(path)
+                .source(error)
+                .error()
+        })?;
     Ok(tokenizer)
 }
 
@@ -743,58 +804,26 @@ fn read_bert_tokenizer(path: &Path, tokens_max: usize) -> Result<Tokenizer, Sear
 /// a mean it does not belong in. Truncating here would cut real tokens before
 /// the unknown ids are dropped, and the encoder cuts after that drop instead.
 /// What the tokenizer returns is bounded by the text the caller handed over.
-fn read_static_tokenizer(path: &Path) -> Result<Tokenizer, SearchError> {
+fn read_static_tokenizer(path: &Path) -> Result<Tokenizer, RiftError> {
     let mut tokenizer = open_tokenizer(path)?;
     tokenizer.with_padding(None);
-    tokenizer
-        .with_truncation(None)
-        .map_err(|error| tokenizer_failure(path, error.as_ref()))?;
+    tokenizer.with_truncation(None).map_err(|error| {
+        errors::search::tokenizer_unreadable()
+            .path(path)
+            .source(error)
+            .error()
+    })?;
     Ok(tokenizer)
 }
 
 /// The model's tokenizer, as the file states it.
-fn open_tokenizer(path: &Path) -> Result<Tokenizer, SearchError> {
-    Tokenizer::from_file(path).map_err(|error| tokenizer_failure(path, error.as_ref()))
-}
-
-/// One file-reading failure, naming the file and its cause.
-fn failure(
-    violation: SearchViolation,
-    path: &Path,
-    source: impl std::error::Error + Send + Sync + 'static,
-) -> SearchError {
-    SearchError::new(
-        SearchFault::new(violation)
-            .about(path.display().to_string())
-            .caused_by(source),
-    )
-}
-
-/// One tokenizer failure, whose cause is boxed rather than typed upstream.
-fn tokenizer_failure(path: &Path, source: &(dyn std::error::Error + Send + Sync)) -> SearchError {
-    SearchError::new(
-        SearchFault::new(SearchViolation::TokenizerUnreadable)
-            .about(format!("{}: {source}", path.display())),
-    )
-}
-
-/// One encoding failure whose cause is boxed rather than typed upstream.
-fn boxed_encode_failure(
-    stage: &str,
-    source: &(dyn std::error::Error + Send + Sync),
-) -> SearchError {
-    SearchError::new(
-        SearchFault::new(SearchViolation::EncodeFailed).about(format!("{stage}: {source}")),
-    )
-}
-
-/// One encoding failure, naming the stage that failed.
-fn encode_failure(stage: &str, source: candle_core::Error) -> SearchError {
-    SearchError::new(
-        SearchFault::new(SearchViolation::EncodeFailed)
-            .about(stage.to_owned())
-            .caused_by(source),
-    )
+fn open_tokenizer(path: &Path) -> Result<Tokenizer, RiftError> {
+    Tokenizer::from_file(path).map_err(|error| {
+        errors::search::tokenizer_unreadable()
+            .path(path)
+            .source(error)
+            .error()
+    })
 }
 
 #[cfg(test)]
@@ -807,8 +836,8 @@ mod tests {
     use tokenizers::processors::bert::BertProcessing;
     use tokenizers::{Tokenizer, normalizers, pre_tokenizers};
 
-    use super::{Encoder, EncoderLimits, ModelFiles, boxed_encode_failure, encode_failure};
-    use crate::error::SearchViolation;
+    use super::{Encoder, EncoderLimits, ModelFiles};
+    use rift_error::errors;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
     type Loaded = Result<Encoder, Box<dyn std::error::Error + Send + Sync>>;
@@ -1088,28 +1117,39 @@ mod tests {
     #[test]
     fn test_encode_failure_names_its_stage_and_keeps_the_candle_cause() {
         let cause = candle_core::Error::Msg("shape mismatch".to_owned());
-        let error = encode_failure("the forward pass", cause);
-        assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
-        let rendered = error.to_string();
-        assert!(rendered.contains("encode_failed"), "{rendered}");
-        assert!(rendered.contains("the forward pass"), "{rendered}");
+        let error = errors::search::encode_failed()
+            .stage("the forward pass")
+            .source(cause)
+            .error();
+        assert_eq!(error.slug(), errors::search::encode_failed::SLUG);
+        assert_eq!(error.message(), "text encoding failed");
         assert!(
-            std::error::Error::source(&error).is_some(),
-            "the candle failure rides as the source"
+            error
+                .context()
+                .any(|(key, value)| key == "stage" && value == "the forward pass")
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.to_string().contains("shape mismatch")),
+            "the Candle source keeps its shape mismatch"
         );
     }
 
     #[test]
-    fn test_boxed_encode_failure_folds_its_cause_into_the_subject() {
+    fn test_boxed_encode_failure_keeps_its_cause_as_source() {
         let cause = std::io::Error::other("vocabulary missing");
-        let error = boxed_encode_failure("tokenizing a batch", &cause);
-        assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
+        let error = errors::search::encode_failed()
+            .stage("tokenizing a batch")
+            .source(cause)
+            .error();
+        assert_eq!(error.slug(), errors::search::encode_failed::SLUG);
         let rendered = error.to_string();
         assert!(rendered.contains("tokenizing a batch"), "{rendered}");
         assert!(
             rendered.contains("vocabulary missing"),
-            "a boxed cause has no typed source, so it is folded into the subject: {rendered}"
+            "the source remains available in rendering: {rendered}"
         );
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -1197,10 +1237,13 @@ mod tests {
         let error = encoder
             .embed_documents(&["beta".to_owned()])
             .expect_err("the beta row is not in the table");
-        assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
-        let rendered = error.to_string();
-        assert!(rendered.contains("token 4"), "{rendered}");
-        assert!(rendered.contains("4 rows"), "{rendered}");
+        assert_eq!(error.slug(), errors::search::encode_failed::SLUG);
+        assert_eq!(error.message(), "text encoding failed");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "stage" && value == "token 4 is past 4 weight rows" })
+        );
         Ok(())
     }
 
@@ -1212,8 +1255,8 @@ mod tests {
         let error = Encoder::load(&files, limits())
             .expect_err("the configuration and the weights state two widths");
         assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelConfigurationInvalid
+            error.slug(),
+            errors::search::model_configuration_invalid::SLUG
         );
         let rendered = error.to_string();
         assert!(rendered.contains("hidden_dim 8"), "{rendered}");
@@ -1233,10 +1276,7 @@ mod tests {
         candle_core::safetensors::save(&tensors, directory.path().join("model.safetensors"))?;
         let files = ModelFiles::in_directory(directory.path())?;
         let error = Encoder::load(&files, limits()).expect_err("the table is under another name");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::WeightsUnreadable
-        );
+        assert_eq!(error.slug(), errors::search::weights_unreadable::SLUG);
         assert!(error.to_string().contains("`embeddings`"), "{error}");
         Ok(())
     }
@@ -1249,10 +1289,7 @@ mod tests {
         let files = ModelFiles::in_directory(directory.path())?;
         let error = Encoder::load(&files, limits())
             .expect_err("the BERT path needs every tensor its architecture names");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::WeightsUnreadable
-        );
+        assert_eq!(error.slug(), errors::search::weights_unreadable::SLUG);
         Ok(())
     }
 

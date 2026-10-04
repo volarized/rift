@@ -1,19 +1,16 @@
-use std::error::Error as StdError;
-use std::fmt;
 use std::sync::Arc;
 
 use rift_core::{
-    ContributionError, ContributionReference, IndexRevision, ProjectPath, ProviderId,
-    ProviderRevision, ProviderSymbolId, RevisionError, SourceRevision, SourceUnitIdError,
-    TreeRevision,
+    ContributionReference, IndexRevision, ProjectPath, ProviderId, ProviderRevision,
+    ProviderSymbolId, SourceRevision, TreeRevision,
 };
+use rift_error::{ErrorContext, ErrorValue, RiftError};
 use rift_provider::{
-    AssembledSymbol, NormalizedGraph, Normalizer, PROVIDERS_MAX_DEFAULT, PublicationError,
-    PublicationLimits, PublicationSet, SymbolAssembler,
+    AssembledSymbol, NormalizedGraph, Normalizer, PROVIDERS_MAX_DEFAULT, PublicationLimits,
+    PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
     DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxFacts, SyntaxPublicationBuilder,
-    SyntaxPublicationError,
 };
 
 use crate::relationship::RelationshipStore;
@@ -26,15 +23,9 @@ use crate::relationship::RelationshipStore;
 ///
 /// # Errors
 ///
-/// Returns [`WorkspaceSemanticError`] when `declarations_max` is zero.
-fn publication_limits(
-    declarations_max: usize,
-) -> Result<PublicationLimits, WorkspaceSemanticError> {
-    Ok(PublicationLimits::new(
-        PROVIDERS_MAX_DEFAULT,
-        declarations_max,
-        declarations_max,
-    )?)
+/// Returns [`RiftError`] when `declarations_max` is zero.
+fn publication_limits(declarations_max: usize) -> Result<PublicationLimits, RiftError> {
+    PublicationLimits::new(PROVIDERS_MAX_DEFAULT, declarations_max, declarations_max)
 }
 
 /// One syntax document and the placement its declarations are filed under.
@@ -73,7 +64,7 @@ pub struct BuiltSemantics {
     /// The documents the publication had no room for, in the order they were offered.
     pub beyond_declaration_bound: Vec<ProjectPath>,
     /// Documents whose Contribution the publication refused.
-    pub refused_contributions: Vec<(ProjectPath, &'static str)>,
+    pub refused_contributions: Vec<(ProjectPath, RiftError)>,
 }
 
 impl WorkspaceSemantics {
@@ -90,7 +81,7 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, RiftError> {
         let placed = documents
             .into_iter()
             .map(|document| {
@@ -99,7 +90,7 @@ impl WorkspaceSemantics {
                     placement: DocumentPlacement::project(document)?,
                 })
             })
-            .collect::<Result<Vec<_>, SyntaxPublicationError>>()?;
+            .collect::<Result<Vec<_>, RiftError>>()?;
         Self::build_placed(&placed, declarations_max, revision, previous)
     }
 
@@ -123,7 +114,7 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, RiftError> {
         let facts = documents
             .iter()
             .map(|placed| PlacedFacts {
@@ -147,7 +138,7 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, RiftError> {
         let placed = documents
             .into_iter()
             .map(|(facts, path)| {
@@ -157,7 +148,7 @@ impl WorkspaceSemantics {
                     placement: DocumentPlacement::project_path(path)?,
                 })
             })
-            .collect::<Result<Vec<_>, SyntaxPublicationError>>()?;
+            .collect::<Result<Vec<_>, RiftError>>()?;
         Self::build_facts_placed_inner(&placed, declarations_max, revision, previous, true)
     }
 
@@ -171,7 +162,7 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, RiftError> {
         Self::build_facts_placed_inner(documents, declarations_max, revision, previous, false)
     }
 
@@ -181,7 +172,7 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
         collect_refused_contributions: bool,
-    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+    ) -> Result<BuiltSemantics, RiftError> {
         let index_revision = IndexRevision::new(revision)?;
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
@@ -205,16 +196,23 @@ impl WorkspaceSemantics {
             }
             match builder.add_facts_placed(placed.facts, &placed.placement) {
                 Ok(()) => {}
-                Err(SyntaxPublicationError::Contribution(error))
-                    if collect_refused_contributions =>
+                Err(error)
+                    if collect_refused_contributions
+                        && error.slug().as_str().starts_with("rift.core.contribution_") =>
                 {
-                    refused_contributions.push((placed.path.clone(), error.fault().field()));
+                    let error = error.with(ErrorContext::new(
+                        "path",
+                        ErrorValue::path(placed.path.as_str()),
+                    ));
+                    refused_contributions.push((placed.path.clone(), error));
                 }
                 Err(error) => {
-                    return Err(WorkspaceSemanticError::Document {
-                        path: placed.path.clone(),
-                        error,
-                    });
+                    return error
+                        .with(ErrorContext::new(
+                            "path",
+                            ErrorValue::path(placed.path.as_str()),
+                        ))
+                        .fail();
                 }
             }
         }
@@ -232,8 +230,7 @@ impl WorkspaceSemantics {
             semantics: Self {
                 graph,
                 relationships,
-                syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)
-                    .map_err(SyntaxPublicationError::Identity)?,
+                syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
             },
             beyond_declaration_bound,
             refused_contributions,
@@ -268,104 +265,6 @@ impl WorkspaceSemantics {
     }
 }
 
-/// Semantic publication failure inside workspace index build.
-#[derive(Debug)]
-pub enum WorkspaceSemanticError {
-    /// Provider revision could not be constructed.
-    Revision(RevisionError),
-    /// Syntax document could not be published.
-    Syntax(SyntaxPublicationError),
-    /// One document's declarations refused publication; `path` names the document,
-    /// so the index can leave that one file out instead of failing the build.
-    Document {
-        /// Package-relative path of the document.
-        path: ProjectPath,
-        /// Syntax publication failure for the document.
-        error: SyntaxPublicationError,
-    },
-    /// Provider publication could not be constructed.
-    Publication(PublicationError),
-    /// Normalized contribution graph could not be built.
-    Normalization(ContributionError),
-}
-
-impl WorkspaceSemanticError {
-    /// The document whose declarations were refused, when the failure names one.
-    #[must_use]
-    pub const fn document_path(&self) -> Option<&ProjectPath> {
-        match self {
-            Self::Document { path, .. } => Some(path),
-            _ => None,
-        }
-    }
-
-    /// The Contribution the syntax publication refused for one document, when that
-    /// is the failure.
-    #[must_use]
-    pub const fn refused_contribution(&self) -> Option<&ContributionError> {
-        match self {
-            Self::Document {
-                error: SyntaxPublicationError::Contribution(error),
-                ..
-            } => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for WorkspaceSemanticError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Revision(error) => error.fmt(formatter),
-            Self::Syntax(error) => error.fmt(formatter),
-            Self::Document { path, error } => write!(formatter, "{}: {error}", path.as_str()),
-            Self::Publication(error) => error.fmt(formatter),
-            Self::Normalization(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl StdError for WorkspaceSemanticError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Revision(error) => Some(error),
-            Self::Syntax(error) | Self::Document { error, .. } => Some(error),
-            Self::Publication(error) => Some(error),
-            Self::Normalization(error) => Some(error),
-        }
-    }
-}
-
-impl From<RevisionError> for WorkspaceSemanticError {
-    fn from(error: RevisionError) -> Self {
-        Self::Revision(error)
-    }
-}
-
-impl From<SyntaxPublicationError> for WorkspaceSemanticError {
-    fn from(error: SyntaxPublicationError) -> Self {
-        Self::Syntax(error)
-    }
-}
-
-impl From<PublicationError> for WorkspaceSemanticError {
-    fn from(error: PublicationError) -> Self {
-        Self::Publication(error)
-    }
-}
-
-impl From<ContributionError> for WorkspaceSemanticError {
-    fn from(error: ContributionError) -> Self {
-        Self::Normalization(error)
-    }
-}
-
-impl From<SourceUnitIdError> for WorkspaceSemanticError {
-    fn from(error: SourceUnitIdError) -> Self {
-        Self::Syntax(SyntaxPublicationError::from(error))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
@@ -373,9 +272,7 @@ mod tests {
     use rift_core::ProjectPath;
     use rift_syntax::{DocumentPlacement, SyntaxLimits, SyntaxSource, registry};
 
-    use super::{
-        PlacedDocument, PlacedFacts, WorkspaceSemanticError, WorkspaceSemantics, publication_limits,
-    };
+    use super::{PlacedDocument, PlacedFacts, WorkspaceSemantics, publication_limits};
 
     fn document() -> rift_syntax::SyntaxDocument {
         let path = ProjectPath::new("src/lib.rs").expect("path");
@@ -464,11 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn zero_revision_is_typed_failure() {
+    fn zero_revision_has_registered_identity() {
         let error =
             WorkspaceSemantics::build(std::iter::empty(), 1, 0, None).expect_err("zero revision");
-        assert!(matches!(error, WorkspaceSemanticError::Revision(_)));
-        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.slug().as_str(), "rift.core.revision_zero");
         assert!(!error.to_string().is_empty());
     }
 
@@ -521,17 +417,23 @@ mod tests {
     #[test]
     fn test_zero_declaration_bound_is_a_typed_failure() {
         let error = publication_limits(0).expect_err("a zero bound is refused");
-        assert!(matches!(error, WorkspaceSemanticError::Publication(_)));
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.publication_zero_limit"
+        );
         assert!(!error.to_string().is_empty());
     }
 
     #[test]
-    fn test_source_unit_error_converts_to_the_syntax_variant() {
+    fn test_source_unit_error_keeps_registered_identity() {
         let unit_error = rift_core::SourceUnitId::parse("not-a-source-unit")
             .expect_err("a malformed unit identity is refused");
-        let error = WorkspaceSemanticError::from(unit_error);
-        assert!(matches!(error, WorkspaceSemanticError::Syntax(_)));
-        assert!(!error.to_string().is_empty());
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(
+            unit_error
+                .slug()
+                .as_str()
+                .starts_with("rift.core.source_unit_id_")
+        );
+        assert!(!unit_error.to_string().is_empty());
     }
 }

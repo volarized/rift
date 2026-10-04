@@ -10,6 +10,7 @@ generate:
 
 generate-check:
     {{ rift_dev }} generate --check
+    cargo xtask errors check
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
@@ -107,7 +108,9 @@ coldstart-test *args:
 integration-test:
     {{ rift_dev }} integration-test
 
-rust-gate: format dashes generate-check check clippy docs doctest audit test release-test installer-test testing-check
+quick-gate: format dashes generate-check check clippy
+
+rust-gate: quick-gate docs doctest audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now; pushing it starts
 # `rift-release`.

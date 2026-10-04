@@ -29,7 +29,7 @@ use rift_syntax::SyntaxSymbol;
 
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::{
-    ReadError, ReadFault, ReadService, file_id, page, project_path, results_truncation_warning,
+    ReadService, RiftError, file_id, page, project_path, results_truncation_warning,
     source_warnings, wire_index_warning,
 };
 use crate::search::{
@@ -45,7 +45,7 @@ use crate::search::{
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when the request combines `change` with a field that
+/// Returns [`RiftError`] when the request combines `change` with a field that
 /// selects another result set, when a revision spelling breaks its contract or
 /// resolves to no commit, when the workspace has no version-control repository,
 /// or when one side's changed paths cannot be indexed within bounds.
@@ -57,7 +57,7 @@ pub fn search_change(
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
     (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
-) -> Result<SearchResult, ReadError> {
+) -> Result<SearchResult, RiftError> {
     validate_search(params)?;
     let limit = search_page_limit(params)?;
     let compared = ComparedRevisions::open(
@@ -161,12 +161,10 @@ impl<'current> ComparedRevisions<'current> {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
-    ) -> Result<Self, ReadError> {
-        let repository = Repository::open(root).map_err(ReadFault::history)?;
-        let base = repository
-            .resolve(&change.base.0)
-            .map_err(ReadFault::history)?;
-        let visible = RevisionPaths::build(root, visibility).map_err(ReadFault::index)?;
+    ) -> Result<Self, RiftError> {
+        let repository = Repository::open(root)?;
+        let base = repository.resolve(&change.base.0)?;
+        let visible = RevisionPaths::build(root, visibility)?;
         let requested = path_matcher(root, selector)?;
         let compared = |path: &str| {
             visible.includes(path)
@@ -184,12 +182,11 @@ impl<'current> ComparedRevisions<'current> {
                 (limits, visibility, (text_inclusion, languages)),
             );
         };
-        let head = repository.resolve(&head.0).map_err(ReadFault::history)?;
+        let head = repository.resolve(&head.0)?;
         let changed =
             rift_core::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_files(&base, &head, &compared, paths_max)
-            })
-            .map_err(ReadFault::history)?;
+            })?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let holds = |path: &str| selected.contains(path);
         let index_side = |revision| {
@@ -202,7 +199,6 @@ impl<'current> ComparedRevisions<'current> {
                 languages,
                 &holds,
             )
-            .map_err(ReadFault::index)
         };
         let base_index =
             rift_core::traced!(component = "search", operation = "search.change_base", {
@@ -242,7 +238,7 @@ impl<'current> ComparedRevisions<'current> {
             &SourceVisibility,
             (&TextFileInclusion, &LanguageFileSelections),
         ),
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let root = repository.root();
         let served: HashSet<&str> = published
             .files()
@@ -257,10 +253,9 @@ impl<'current> ComparedRevisions<'current> {
         let changed =
             rift_core::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_working_files(base, &served_paths, &listed, paths_max)
-            })
-            .map_err(ReadFault::history)?;
+            })?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
-        let mut forms = repository.working_forms().map_err(ReadFault::history)?;
+        let mut forms = repository.working_forms()?;
         let mut unconverted: BTreeMap<String, Unconverted> = BTreeMap::new();
         let base_index =
             rift_core::traced!(component = "search", operation = "search.change_base", {
@@ -284,8 +279,7 @@ impl<'current> ComparedRevisions<'current> {
                         }
                     },
                 )
-            })
-            .map_err(ReadFault::index)?;
+            })?;
         let kept: Vec<String> = changed
             .paths()
             .iter()
@@ -315,7 +309,7 @@ impl<'current> ComparedRevisions<'current> {
     ///
     /// `target: "file"` answers none of them, the way a traversal does: a
     /// comparison reaches declarations alone.
-    fn hits(&self, params: &SearchParams) -> Result<Vec<SearchHit>, ReadError> {
+    fn hits(&self, params: &SearchParams) -> Result<Vec<SearchHit>, RiftError> {
         if params.target == SearchParamsTarget::File {
             return Ok(Vec::new());
         }
@@ -339,7 +333,7 @@ impl<'current> ComparedRevisions<'current> {
         payloads: HitPayloads,
         results: &mut Vec<SearchHit>,
         unpaired: &mut UnpairedDeclarations<'sides>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         match (self.base.file(path), self.head().file(path)) {
             (Some(base_file), Some(head_file)) => {
                 self.compare_files(path, (base_file, head_file), payloads, results, unpaired)
@@ -366,7 +360,7 @@ impl<'current> ComparedRevisions<'current> {
         payloads: HitPayloads,
         results: &mut Vec<SearchHit>,
         unpaired: &mut UnpairedDeclarations<'sides>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         let base = declarations(base_file);
         let head = declarations(head_file);
         for (key, head_symbol) in &head {
@@ -563,7 +557,7 @@ impl UnpairedDeclarations<'_> {
     /// additions, two removals, or one of each in the same path - leaves both
     /// sides standing on their own, because no evidence says which addition
     /// answers which removal.
-    fn resolve(self, payloads: HitPayloads, results: &mut Vec<SearchHit>) -> Result<(), ReadError> {
+    fn resolve(self, payloads: HitPayloads, results: &mut Vec<SearchHit>) -> Result<(), RiftError> {
         let mut groups: HashMap<MoveKey, MoveGroup> = HashMap::new();
         for (position, added) in self.added.iter().enumerate() {
             groups.entry(added.move_key()).or_default().0.push(position);
@@ -634,7 +628,7 @@ fn changed_hit(
     declaration: &Declaration<'_>,
     change: SymbolChange,
     payloads: HitPayloads,
-) -> Result<SearchHit, ReadError> {
+) -> Result<SearchHit, RiftError> {
     let matched = SymbolMatch {
         file: declaration.file,
         symbol: declaration.symbol,
@@ -688,7 +682,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use rift_core::{ErrorCode, ErrorName, Fault as _};
+    use rift_error::errors;
     use rift_history::fixture::{commit_all, git, init};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath as WireProjectPath;
@@ -748,7 +742,7 @@ mod tests {
 
         /// Answers the comparison `params` asks for over this fixture, against a
         /// current index built from the working tree as it stands.
-        fn search(&self, params: &serde_json::Value) -> Result<SearchResult, ReadError> {
+        fn search(&self, params: &serde_json::Value) -> Result<SearchResult, RiftError> {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
@@ -772,7 +766,7 @@ mod tests {
         }
 
         /// The comparison of `baseline` against `HEAD`, with no other criteria.
-        fn baseline_to_head(&self) -> Result<SearchResult, ReadError> {
+        fn baseline_to_head(&self) -> Result<SearchResult, RiftError> {
             self.search(&json!({"change": {"base": "baseline"}}))
         }
     }
@@ -812,10 +806,6 @@ mod tests {
     /// One wire string, read as the payload spells it.
     fn text(value: &Value) -> String {
         value.as_str().unwrap_or_default().to_owned()
-    }
-
-    fn wire_code(error: &ReadError) -> ErrorName {
-        error.fault().name()
     }
 
     #[test]
@@ -1619,8 +1609,27 @@ mod tests {
             .baseline_to_head()
             .expect_err("the base side crosses the depth bound");
 
-        assert_eq!(wire_code(&error), ErrorName::Wire(ErrorCode::LimitExceeded));
-        assert!(error.to_string().contains("a/b/c/deep.rs"), "{error}");
+        assert_eq!(error.slug(), errors::index::workspace_too_deep::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == "a/b/c/deep.rs" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "source.directory_depth" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "observed" && value == "3")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "maximum" && value == "2")
+        );
         Ok(())
     }
 
@@ -1640,8 +1649,27 @@ mod tests {
             .baseline_to_head()
             .expect_err("the head side crosses the depth bound");
 
-        assert_eq!(wire_code(&error), ErrorName::Wire(ErrorCode::LimitExceeded));
-        assert!(error.to_string().contains("a/b/c/deep.rs"), "{error}");
+        assert_eq!(error.slug(), errors::index::workspace_too_deep::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == "a/b/c/deep.rs" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "source.directory_depth" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "observed" && value == "3")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "maximum" && value == "2")
+        );
         Ok(())
     }
 
@@ -1655,16 +1683,16 @@ mod tests {
             .search(&request)
             .expect_err("a commit search beside change must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
-        );
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         assert!(
             error
-                .to_string()
-                .contains("a commit search answers commits"),
-            "{error}"
+                .context()
+                .any(|(key, value)| key == "field" && value == "change")
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation"
+                && value == "a comparison answers declarations, and a commit search answers commits"
+        }));
         Ok(())
     }
 
@@ -1677,14 +1705,15 @@ mod tests {
             .search(&json!({"change": {"base": "baseline"}, "rev": "main"}))
             .expect_err("change beside rev must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
-        );
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         assert!(
-            error.to_string().contains("change names its own revisions"),
-            "{error}"
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "change")
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation" && value == "change names its own revisions"
+        }));
         Ok(())
     }
 
@@ -1697,16 +1726,15 @@ mod tests {
             .search(&json!({"change": {"base": "baseline"}, "query": "kept"}))
             .expect_err("change beside query must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
-        );
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         assert!(
             error
-                .to_string()
-                .contains("query and change select different result sets"),
-            "{error}"
+                .context()
+                .any(|(key, value)| key == "field" && value == "change")
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation" && value == "query and change select different result sets"
+        }));
         Ok(())
     }
 
@@ -1720,16 +1748,15 @@ mod tests {
             let error = fixture
                 .search(&json!({"change": {"base": "baseline"}, "scope": scope}))
                 .expect_err("change beside a wider scope must refuse");
-            assert_eq!(
-                wire_code(&error),
-                ErrorName::Wire(ErrorCode::InvalidRequest)
-            );
+            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
             assert!(
                 error
-                    .to_string()
-                    .contains("package facts are served for the current tree alone"),
-                "{error}"
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "scope")
             );
+            assert!(error.context().any(|(key, value)| {
+                key == "violation" && value == "package facts are served for the current tree alone"
+            }));
         }
         Ok(())
     }
@@ -1779,9 +1806,11 @@ mod tests {
             .search(&json!({"change": {"base": "no-such-branch"}}))
             .expect_err("an unknown revision must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::ResourceNotFound)
+        assert_eq!(error.slug(), errors::history::revision_unknown::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "rev" && value == "no-such-branch" })
         );
         Ok(())
     }
@@ -1797,10 +1826,11 @@ mod tests {
             .baseline_to_head()
             .expect_err("a workspace with no repository must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-        );
+        assert_eq!(error.slug(), errors::history::unversioned::SLUG);
+        let canonical = fs::canonicalize(fixture.directory.path())?;
+        assert!(error.context().any(|(key, value)| {
+            key == "workspace" && value == canonical.display().to_string()
+        }));
         Ok(())
     }
 
@@ -1812,11 +1842,17 @@ mod tests {
             .search(&json!({"change": {"base": "HEAD@{1}"}}))
             .expect_err("a spelling outside the charset must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "change.base" })
         );
-        assert!(error.to_string().contains("change.base"), "{error}");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "violation" && value == "charset_forbidden" })
+        );
         Ok(())
     }
 
@@ -1840,7 +1876,17 @@ mod tests {
         let error = fixture
             .search(&json!({"change": {"base": "HEAD~1/src"}}))
             .expect_err("a suffix past the digits must refuse");
-        assert!(error.to_string().contains("ancestry_invalid"), "{error}");
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "change.base" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "violation" && value == "ancestry_invalid" })
+        );
         Ok(())
     }
 
@@ -1880,16 +1926,10 @@ mod tests {
             }))
             .expect_err("a walk beside a comparison must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("relationship traversal beside a comparison"),
-            "{error}"
-        );
+        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
+        assert!(error.context().any(|(key, value)| {
+            key == "capability" && value == "relationship traversal beside a comparison"
+        }));
         Ok(())
     }
 }

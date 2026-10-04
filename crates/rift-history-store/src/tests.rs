@@ -2,12 +2,13 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
+use rift_error::errors;
 use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
 
 use crate::lock::{LIVE_LOCK_ATTEMPTS_MAX, lock_live_checked};
 use crate::{
     ChangedPath, CommitRecord, DeclarationChange, HistoryStore, MovedDeclaration, RenamedPath,
-    STORE_FOLDER_NAME, StoreFault, StoreLocation,
+    STORE_FOLDER_NAME, StoreLocation,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -64,6 +65,283 @@ fn filled(folder: &Path, revision: &str) -> Result<HistoryStore, Box<dyn Error>>
         commit("c3", Some("c2"), 30, "Fix lexical ranking"),
     ])?;
     Ok(store)
+}
+
+fn sqlite_refusal<'error>(
+    error: &'error rift_error::RiftError,
+    operation: &str,
+) -> &'error rusqlite::Error {
+    assert_eq!(error.slug(), errors::history_store::database::SLUG);
+    assert_eq!(error.action(), "check the history store database and retry");
+    assert_eq!(
+        error
+            .context()
+            .find(|(key, _)| *key == "operation")
+            .map(|(_, value)| value)
+            .as_deref(),
+        Some(operation)
+    );
+    let source = error
+        .source()
+        .expect("SQLite failure is retained")
+        .downcast_ref::<rusqlite::Error>()
+        .expect("original SQLite error type");
+    assert!(error.message().contains(&source.to_string()));
+    source
+}
+
+fn stored_row_counts(connection: &rusqlite::Connection) -> rusqlite::Result<Vec<i64>> {
+    [
+        "commits",
+        "changed_paths",
+        "renamed_paths",
+        "moved_declarations",
+        "changed_declarations",
+    ]
+    .into_iter()
+    .map(|table| {
+        connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+    })
+    .collect()
+}
+
+#[test]
+fn missing_store_tables_retain_each_read_operation_and_sqlite_source() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = filled(folder.path(), "aa")?;
+    let reads = store.reader().connect()?;
+    let head = reads.commit("c3")?.ok_or("c3 is held")?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    filler.connection().execute_batch(
+        "DROP TABLE changed_declarations; DROP TABLE renamed_paths;
+         DROP TABLE moved_declarations; DROP TABLE changed_paths;",
+    )?;
+    for (error, operation, table) in [
+        (
+            reads
+                .declaration_change(&head, "src/lib.rs", "parse")
+                .expect_err("missing table"),
+            "read declaration change",
+            "changed_declarations",
+        ),
+        (
+            reads
+                .renamed_from(&head, "new.rs")
+                .expect_err("missing table"),
+            "read renamed path",
+            "renamed_paths",
+        ),
+        (
+            reads
+                .moved_from(&head, "src/lib.rs", "helper")
+                .expect_err("missing table"),
+            "read moved declaration",
+            "moved_declarations",
+        ),
+        (
+            reads.changed_paths(&head, 10).expect_err("missing table"),
+            "read changed paths",
+            "changed_paths",
+        ),
+    ] {
+        assert_eq!(
+            sqlite_refusal(&error, operation).to_string(),
+            format!("no such table: {table}")
+        );
+    }
+    filler.connection().execute_batch("DROP TABLE commits")?;
+    for (error, operation) in [
+        (
+            reads.commit("c3").expect_err("missing table"),
+            "read commit",
+        ),
+        (
+            reads.chain_head().expect_err("missing table"),
+            "read chain head",
+        ),
+        (
+            reads.held().expect_err("missing table"),
+            "read held commits",
+        ),
+        (
+            filler
+                .write_batch(&[commit("c4", Some("c3"), 40, "New commit")])
+                .expect_err("missing table"),
+            "read held commit",
+        ),
+        (
+            filler.trim(&BTreeSet::new()).expect_err("missing table"),
+            "read held commits",
+        ),
+    ] {
+        assert_eq!(
+            sqlite_refusal(&error, operation).to_string(),
+            "no such table: commits"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_stored_column_retains_conversion_error_for_commit_and_held_reads() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = filled(folder.path(), "aa")?;
+    let filler = store.filler()?.ok_or("no other filler runs")?;
+    filler
+        .connection()
+        .execute("UPDATE commits SET boundary = x'00' WHERE id = 'c2'", [])?;
+    let reads = store.reader().connect()?;
+    for (error, operation) in [
+        (
+            reads.commit("c2").expect_err("blob is not a boolean"),
+            "read commit",
+        ),
+        (
+            reads.held().expect_err("blob is not a boolean"),
+            "read held commits",
+        ),
+        (
+            filler.held().expect_err("blob is not a boolean"),
+            "read held commits",
+        ),
+    ] {
+        assert!(
+            matches!(sqlite_refusal(&error, operation), rusqlite::Error::InvalidColumnType(_, name, rusqlite::types::Type::Blob) if name == "boundary")
+        );
+    }
+    assert!(
+        reads.commit("c1")?.is_some(),
+        "other stored rows remain readable"
+    );
+    Ok(())
+}
+
+#[test]
+fn refused_child_writes_roll_back_prior_commits_and_message_index_entries() -> TestResult {
+    for (table, operation) in [
+        ("changed_paths", "write changed path"),
+        ("renamed_paths", "write renamed path"),
+        ("moved_declarations", "write moved declaration"),
+        ("changed_declarations", "write changed declaration"),
+    ] {
+        let folder = tempfile::tempdir()?;
+        let store = filled(folder.path(), "aa")?;
+        let mut filler = store.filler()?.ok_or("no other filler runs")?;
+        let before = stored_row_counts(filler.connection())?;
+        filler.connection().execute_batch(&format!(
+            "CREATE TRIGGER refuse_child BEFORE INSERT ON {table}
+             WHEN NEW.commit_row = (SELECT row FROM commits WHERE id = 'c5')
+             BEGIN SELECT RAISE(ABORT, 'refused child write'); END;"
+        ))?;
+        let error = filler
+            .write_batch(&[
+                commit("c4", Some("c3"), 40, "Unpublished fourth"),
+                commit("c5", Some("c4"), 50, "Unpublished fifth"),
+            ])
+            .expect_err("second commit child write is refused");
+        let source = sqlite_refusal(&error, operation);
+        assert!(
+            matches!(source, rusqlite::Error::SqliteFailure(_, Some(message)) if message == "refused child write")
+        );
+        assert_eq!(stored_row_counts(filler.connection())?, before);
+        filler.check_message_index()?;
+        let reads = store.reader().connect()?;
+        assert!(reads.commit("c4")?.is_none());
+        assert!(reads.commit("c5")?.is_none());
+        assert!(reads.search_messages("Unpublished", 10)?.is_empty());
+        assert_eq!(reads.search_messages("lexical", 10)?, ["c3", "c1"]);
+    }
+    Ok(())
+}
+
+#[test]
+fn refused_child_deletes_roll_back_trim_and_commit_replacement() -> TestResult {
+    for table in [
+        "changed_paths",
+        "renamed_paths",
+        "moved_declarations",
+        "changed_declarations",
+    ] {
+        let folder = tempfile::tempdir()?;
+        let store = filled(folder.path(), "aa")?;
+        let mut filler = store.filler()?.ok_or("no other filler runs")?;
+        let before = stored_row_counts(filler.connection())?;
+        filler.connection().execute_batch(&format!(
+            "CREATE TRIGGER refuse_child BEFORE DELETE ON {table}
+             WHEN OLD.commit_row = (SELECT row FROM commits WHERE id = 'c2')
+             BEGIN SELECT RAISE(ABORT, 'refused child delete'); END;"
+        ))?;
+        let trim = filler
+            .trim(&BTreeSet::new())
+            .expect_err("child delete is refused");
+        assert_eq!(
+            sqlite_refusal(&trim, "delete commit rows").to_string(),
+            "refused child delete"
+        );
+        assert_eq!(stored_row_counts(filler.connection())?, before);
+        filler.check_message_index()?;
+
+        let replace = filler
+            .write_batch(&[commit("c2", Some("c1"), 20, "Replacement")])
+            .expect_err("replacement child delete is refused");
+        assert_eq!(
+            sqlite_refusal(&replace, "delete commit rows").to_string(),
+            "refused child delete"
+        );
+        assert_eq!(stored_row_counts(filler.connection())?, before);
+        filler.check_message_index()?;
+        let reads = store.reader().connect()?;
+        assert_eq!(reads.search_messages("release", 10)?, ["c2"]);
+        assert!(reads.search_messages("Replacement", 10)?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn missing_message_index_refuses_batch_and_trim_without_changing_rows() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = filled(folder.path(), "aa")?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    let before = stored_row_counts(filler.connection())?;
+    filler
+        .connection()
+        .execute_batch("DROP TABLE commit_text")?;
+    let write = filler
+        .write_batch(&[commit("c4", Some("c3"), 40, "New commit")])
+        .expect_err("message index is absent");
+    assert_eq!(
+        sqlite_refusal(&write, "index commit message").to_string(),
+        "no such table: commit_text"
+    );
+    assert_eq!(stored_row_counts(filler.connection())?, before);
+    let trim = filler
+        .trim(&BTreeSet::new())
+        .expect_err("message index is absent");
+    assert_eq!(
+        sqlite_refusal(&trim, "delete message index entry").to_string(),
+        "no such table: commit_text"
+    );
+    assert_eq!(stored_row_counts(filler.connection())?, before);
+    Ok(())
+}
+
+#[test]
+fn incompatible_store_table_refuses_schema_creation_with_sqlite_source() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let location = StoreLocation::new(folder.path(), "aa");
+    std::fs::create_dir_all(location.folder())?;
+    let connection = rusqlite::Connection::open(location.database())?;
+    connection.execute_batch("CREATE TABLE changed_paths(unrelated TEXT)")?;
+    drop(connection);
+    let error = HistoryStore::open(&location).expect_err("required column is missing");
+    assert!(
+        sqlite_refusal(&error, "create store tables")
+            .to_string()
+            .contains("no such column: commit_row")
+    );
+    Ok(())
 }
 
 #[test]
@@ -208,7 +486,7 @@ fn a_delete_without_the_index_command_fails_the_integrity_check() -> TestResult 
     let refused = filler
         .check_message_index()
         .expect_err("the index names a row the table no longer holds");
-    assert!(matches!(refused.fault(), StoreFault::Database { .. }));
+    assert_eq!(refused.slug(), errors::history_store::database::SLUG);
     Ok(())
 }
 
@@ -289,19 +567,23 @@ fn an_opener_refuses_a_lock_file_replaced_on_every_attempt() -> TestResult {
     .expect_err("the path never names the locked file");
 
     assert_eq!(attempts, LIVE_LOCK_ATTEMPTS_MAX);
-    assert!(matches!(
-        refused.fault(),
-        StoreFault::LockUnstable { attempts, .. } if *attempts == LIVE_LOCK_ATTEMPTS_MAX
-    ));
-    assert!(refused.fault().folder_cause().is_none());
+    assert_eq!(refused.slug(), errors::history_store::lock_unstable::SLUG);
+    assert!(
+        refused
+            .context()
+            .any(|(key, value)| key == "attempts" && value == LIVE_LOCK_ATTEMPTS_MAX.to_string())
+    );
     assert!(
         std::error::Error::source(&refused).is_none(),
         "no filesystem call failed, so no cause rides the chain"
     );
     let rendered = refused.to_string();
-    assert!(rendered.contains("lock live store"), "{rendered}");
     assert!(
-        rendered.contains(&format!("attempts {LIVE_LOCK_ATTEMPTS_MAX}")),
+        rendered.contains("history store live lock changed"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("during {LIVE_LOCK_ATTEMPTS_MAX} attempts")),
         "{rendered}"
     );
     Ok(())
@@ -317,9 +599,8 @@ fn a_read_only_common_git_directory_refuses_the_folder_without_a_fallback() -> T
     std::fs::set_permissions(folder.path(), std::fs::Permissions::from_mode(0o755))?;
 
     let refused = opened.expect_err("the folder refuses the store");
-    let cause = refused
-        .fault()
-        .folder_cause()
+    let cause = std::error::Error::source(&refused)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
         .ok_or("the refusal is the folder's")?;
     assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     Ok(())
@@ -345,10 +626,8 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
         .worktree_fallback()
         .ok_or("the store names the refusal")?;
     assert_eq!(fallback.refused(), git.join(STORE_FOLDER_NAME));
-    let cause = fallback
-        .cause()
-        .fault()
-        .folder_cause()
+    let cause = std::error::Error::source(fallback.cause())
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
         .ok_or("the refusal is the folder's")?;
     assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(store.location().folder(), worktree_state);
@@ -377,9 +656,8 @@ fn a_folder_refusal_other_than_access_keeps_the_refusal_without_a_fallback() -> 
 
     let refused = HistoryStore::open(&location).expect_err("no folder is created below a file");
 
-    let cause = refused
-        .fault()
-        .folder_cause()
+    let cause = std::error::Error::source(&refused)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
         .ok_or("the refusal is the folder's")?;
     assert_ne!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(
@@ -408,7 +686,7 @@ fn sweep_reports_a_live_lock_it_cannot_open_and_sweeps_the_rest() -> TestResult 
     let [failure] = swept.failures() else {
         panic!("one lock the sweep cannot open: {:?}", swept.failures());
     };
-    assert!(failure.fault().folder_cause().is_some());
+    assert!(std::error::Error::source(failure).is_some());
     let rendered = failure.to_string();
     assert!(rendered.contains("open swept live lock"), "{rendered}");
     assert!(rendered.contains("store-zz.live.lock"), "{rendered}");
@@ -430,7 +708,7 @@ fn sweep_reports_a_file_it_cannot_delete_and_keeps_the_revisions_live_lock() -> 
     assert!(swept.deleted().is_empty());
     assert_eq!(swept.failures().len(), 1, "one refused deletion");
     let failure = &swept.failures()[0];
-    assert!(failure.fault().folder_cause().is_some());
+    assert!(std::error::Error::source(failure).is_some());
     let rendered = failure.to_string();
     assert!(rendered.contains("delete swept store file"), "{rendered}");
     assert!(

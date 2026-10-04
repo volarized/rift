@@ -4,7 +4,6 @@ pub mod acceptance;
 mod capture;
 mod configuration;
 mod digest;
-mod error;
 mod identity;
 mod limits;
 mod measurement;
@@ -25,37 +24,30 @@ pub use tracing;
 pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{
     LanguageFileSelection, LanguageFileSelections, SourceVisibility, TextFileInclusion,
-    is_absolute_program,
+    configuration_violation_error, is_absolute_program,
 };
 pub use digest::FileDigest;
-pub use error::{
-    CAUSE_DEPTH_MAX, CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault,
-    LimitEvidence, RetryDirective, RiftError, causes, fault_label, render_failure,
-};
 pub use identity::{
-    CompositionId, CompositionRevision, IdError, IdFault, IndexRevision, ModelId, ModelRevision,
-    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId, RevisionError,
-    RevisionFault, SourceResolverId, SourceResolverIdError, SourceResolverIdFault,
-    SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError, SourceUnitIdFault,
-    SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId, encode_path, parse_symbol_identity,
-    symbol_identity,
+    CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision,
+    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId, SourceResolverId,
+    SourceRevision, SourceUnitId, SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId,
+    encode_path, parse_symbol_identity, symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{
     ClockRegression, MonotonicClock, PerformanceMeasurement, SystemMonotonicClock,
 };
 pub use name::is_canonical_ascii_name;
-pub use path::{PathError, PathFault, PathKind, PathViolation, ProjectPath, SourcePath};
+pub use path::{PathKind, PathViolation, ProjectPath, SourcePath};
 pub use semantic::{
     CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
-    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionError,
-    ContributionFault, ContributionKey, ContributionOrigin, ContributionReference,
-    ContributionRelationship, ContributionViolation, DeclarationBinding, Documentation,
-    DocumentationFormat, EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions,
-    Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PackageIdentity, PortableSymbolFacts,
-    ReferenceRole, RelationshipKind, SemanticReference, Signature, SourceApplicability, SourceKind,
-    SourceLocation, SourceRange, SymbolFacet, SymbolRecord, SymbolResolution, TypeBinding,
-    is_portable_name,
+    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionKey,
+    ContributionOrigin, ContributionReference, ContributionRelationship, ContributionViolation,
+    DeclarationBinding, Documentation, DocumentationFormat, EquivalenceEvidence, ExactKind,
+    ExtensionKey, ExtensionValue, Extensions, Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX,
+    PackageIdentity, PortableSymbolFacts, ReferenceRole, RelationshipKind, SemanticReference,
+    Signature, SourceApplicability, SourceKind, SourceLocation, SourceRange, SymbolFacet,
+    SymbolRecord, SymbolResolution, TypeBinding, is_portable_name,
 };
 
 /// Iterates while charging one unit to a loop budget before each body execution.

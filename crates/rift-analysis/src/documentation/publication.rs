@@ -14,9 +14,9 @@ use rift_protocol::documentation::{
 };
 use rift_protocol::read::{Digest, SymbolId, TextRange};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
 use super::identity::{is_digest, is_revision_digest};
 use super::input::{source_selection_digest, validate_identity, validate_source_metadata};
+use rift_error::{RiftError, errors};
 
 /// Validates one read payload without requiring its remote revision to equal this build.
 ///
@@ -27,9 +27,11 @@ use super::input::{source_selection_digest, validate_identity, validate_source_m
 /// Refuses source, block, identity, range, digest, and count violations.
 pub fn validate_documentation_hit(
     hit: &rift_protocol::documentation::DocumentationHit,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     if !is_revision_digest(&hit.documentation_revision) || hit.block.source != hit.source.identity {
-        return Err(refused(DocumentationViolation::Identity, "documentation"));
+        return errors::analysis::documentation_identity_invalid()
+            .field("documentation")
+            .fail();
     }
     validate_source_metadata(&hit.source)?;
     validate_block(&hit.block, &hit.source)
@@ -43,7 +45,7 @@ pub fn validate_documentation_hit(
 pub fn validate_documentation_context(
     context: &rift_protocol::documentation::DocumentationContext,
     symbol: &SymbolId,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     use rift_protocol::documentation::{
         DOCUMENTATION_EXCERPT_BYTES_MAX, DOCUMENTATION_SYMBOL_REFERENCES_MAX,
     };
@@ -52,10 +54,9 @@ pub fn validate_documentation_context(
         || context.references.len() > DOCUMENTATION_SYMBOL_REFERENCES_MAX as usize
         || context.warnings.len() > DOCUMENTATION_WARNINGS_MAX as usize
     {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "documentation",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("documentation")
+            .fail();
     }
     let mut identities = BTreeSet::new();
     let mut sources = BTreeMap::new();
@@ -75,12 +76,16 @@ pub fn validate_documentation_context(
             || !contains(&block.range, &reference.range)
             || hit.documentation.documentation_revision != context.documentation_revision
         {
-            return Err(refused(DocumentationViolation::Identity, "reference"));
+            return errors::analysis::documentation_identity_invalid()
+                .field("reference")
+                .fail();
         }
         if let Some(prior) = sources.insert(&source.identity, source)
             && prior != source
         {
-            return Err(refused(DocumentationViolation::Identity, "source"));
+            return errors::analysis::documentation_identity_invalid()
+                .field("source")
+                .fail();
         }
         let order = (
             reference.evidence,
@@ -90,16 +95,24 @@ pub fn validate_documentation_context(
             reference.range.start,
         );
         if previous.is_some_and(|prior| prior >= order) {
-            return Err(refused(DocumentationViolation::Order, "references"));
+            return errors::analysis::documentation_order_invalid()
+                .field("references")
+                .fail();
         }
         previous = Some(order);
         let bytes = hit.excerpt.as_ref().map_or(0, String::len);
         excerpt_bytes = excerpt_bytes
             .checked_add(bytes)
             .filter(|total| *total <= DOCUMENTATION_EXCERPT_BYTES_MAX as usize)
-            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "excerpt"))?;
+            .ok_or_else(|| {
+                errors::analysis::documentation_limit_exceeded()
+                    .field("excerpt")
+                    .error()
+            })?;
         if bytes as u64 > block.range.end - block.range.start {
-            return Err(refused(DocumentationViolation::Range, "excerpt"));
+            return errors::analysis::documentation_range_invalid()
+                .field("excerpt")
+                .fail();
         }
     }
     // A bounded read may warn about the first reference outside its returned prefix.
@@ -133,14 +146,13 @@ impl DocumentationCollection {
         documentation_revision: Digest,
         mut sources: Vec<DocumentationSource>,
         mut blocks: Vec<DocumentationBlock>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if sources.len() > DOCUMENTATION_SOURCES_MAX as usize
             || blocks.len() > DOCUMENTATION_BLOCKS_MAX as usize
         {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "projection.records",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("projection.records")
+                .fail();
         }
         sources.sort_by(|left, right| left.identity.cmp(&right.identity));
         blocks.sort_by(|left, right| {
@@ -151,8 +163,11 @@ impl DocumentationCollection {
                 &right.identity,
             ))
         });
-        let selected = u32::try_from(sources.len())
-            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+        let selected = u32::try_from(sources.len()).map_err(|_| {
+            errors::analysis::documentation_limit_exceeded()
+                .field("sources")
+                .error()
+        })?;
         let selection_digest = source_selection_digest(sources.iter())?;
         Self::new(DocumentationIndex {
             documentation_revision,
@@ -180,18 +195,19 @@ impl DocumentationCollection {
     /// # Errors
     ///
     /// Returns a typed refusal for invalid identities, ranges, ordering, or relationships.
-    pub fn new(index: DocumentationIndex) -> Result<Self, DocumentationError> {
+    pub fn new(index: DocumentationIndex) -> Result<Self, RiftError> {
         validate_counts(&index)?;
         if index.documentation_revision != super::documentation_revision() {
-            return Err(refused(
-                DocumentationViolation::Revision,
-                "documentation_revision",
-            ));
+            return errors::analysis::documentation_revision_invalid()
+                .field("documentation_revision")
+                .fail();
         }
         let sources = validate_sources(&index)?;
         let selection_digest = source_selection_digest(index.sources.iter())?;
         if index.selection_digest != selection_digest {
-            return Err(refused(DocumentationViolation::Digest, "selection_digest"));
+            return errors::analysis::documentation_digest_mismatch()
+                .field("selection_digest")
+                .fail();
         }
         let blocks = validate_blocks(&index, &sources)?;
         validate_links(&index, &sources, &blocks)?;
@@ -268,12 +284,17 @@ impl DocumentationCollection {
     pub fn with_source_omissions(
         self,
         omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if omissions.len() > DOCUMENTATION_SOURCES_MAX as usize {
-            return Err(refused(DocumentationViolation::LimitExceeded, "sources"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("sources")
+                .fail();
         }
-        let omitted_count = u32::try_from(omissions.len())
-            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+        let omitted_count = u32::try_from(omissions.len()).map_err(|_| {
+            errors::analysis::documentation_limit_exceeded()
+                .field("sources")
+                .error()
+        })?;
         let DocumentationCollection {
             mut index,
             #[cfg(feature = "collector")]
@@ -287,12 +308,20 @@ impl DocumentationCollection {
             .selected
             .checked_add(omitted_count)
             .filter(|count| *count <= DOCUMENTATION_SOURCES_MAX)
-            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+            .ok_or_else(|| {
+                errors::analysis::documentation_limit_exceeded()
+                    .field("sources")
+                    .error()
+            })?;
         index.coverage.omitted = index
             .coverage
             .omitted
             .checked_add(omitted_count)
-            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+            .ok_or_else(|| {
+                errors::analysis::documentation_limit_exceeded()
+                    .field("sources")
+                    .error()
+            })?;
         let warning_slots =
             (DOCUMENTATION_WARNINGS_MAX as usize).saturating_sub(index.warnings.len());
         for (source, kind) in omissions.into_iter().take(warning_slots) {
@@ -553,7 +582,7 @@ fn link_address(link: &DocumentationLink) -> LinkAddress {
     (link.block.clone(), link.range.start, link.range.end)
 }
 
-fn validate_counts(index: &DocumentationIndex) -> Result<(), DocumentationError> {
+fn validate_counts(index: &DocumentationIndex) -> Result<(), RiftError> {
     let counts = [
         ("sources", index.sources.len(), DOCUMENTATION_SOURCES_MAX),
         ("blocks", index.blocks.len(), DOCUMENTATION_BLOCKS_MAX),
@@ -574,16 +603,19 @@ fn validate_counts(index: &DocumentationIndex) -> Result<(), DocumentationError>
         .into_iter()
         .find(|(_, count, bound)| *count > *bound as usize)
     {
-        return Err(refused(DocumentationViolation::LimitExceeded, field));
+        return errors::analysis::documentation_limit_exceeded()
+            .field(field)
+            .fail();
     }
     if !is_revision_digest(&index.documentation_revision) {
-        return Err(refused(
-            DocumentationViolation::Revision,
-            "documentation_revision",
-        ));
+        return errors::analysis::documentation_revision_invalid()
+            .field("documentation_revision")
+            .fail();
     }
     if !is_digest(&index.selection_digest) {
-        return Err(refused(DocumentationViolation::Digest, "selection_digest"));
+        return errors::analysis::documentation_digest_mismatch()
+            .field("selection_digest")
+            .fail();
     }
     let accounted = index.coverage.parsed.checked_add(index.coverage.omitted);
     let counts_match = accounted == Some(index.coverage.selected);
@@ -595,26 +627,34 @@ fn validate_counts(index: &DocumentationIndex) -> Result<(), DocumentationError>
         && retained <= index.coverage.selected
         && index.coverage.selected <= DOCUMENTATION_SOURCES_MAX;
     if !counts_match || !truncation_bounded || !selected_matches {
-        return Err(refused(DocumentationViolation::LimitExceeded, "coverage"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("coverage")
+            .fail();
     }
     Ok(())
 }
 
 fn validate_sources(
     index: &DocumentationIndex,
-) -> Result<BTreeMap<&DocumentationContentIdentity, &DocumentationSource>, DocumentationError> {
+) -> Result<BTreeMap<&DocumentationContentIdentity, &DocumentationSource>, RiftError> {
     let mut sources = BTreeMap::new();
     let mut previous = None;
     let mut total_bytes = 0_u64;
     for source in &index.sources {
         validate_source_metadata(source)?;
         if previous.is_some_and(|identity| identity >= &source.identity) {
-            return Err(refused(DocumentationViolation::Order, "sources"));
+            return errors::analysis::documentation_order_invalid()
+                .field("sources")
+                .fail();
         }
         total_bytes = total_bytes
             .checked_add(source.byte_length)
             .filter(|bytes| *bytes <= DOCUMENTATION_TOTAL_BYTES_MAX)
-            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "source_bytes"))?;
+            .ok_or_else(|| {
+                errors::analysis::documentation_limit_exceeded()
+                    .field("source_bytes")
+                    .error()
+            })?;
         previous = Some(&source.identity);
         sources.insert(&source.identity, source);
     }
@@ -624,13 +664,15 @@ fn validate_sources(
 fn validate_blocks<'index>(
     index: &'index DocumentationIndex,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
-) -> Result<BTreeMap<&'index DocumentationDigest, &'index DocumentationBlock>, DocumentationError> {
+) -> Result<BTreeMap<&'index DocumentationDigest, &'index DocumentationBlock>, RiftError> {
     let mut blocks = BTreeMap::new();
     let mut previous = None;
     for block in &index.blocks {
-        let source = sources
-            .get(&block.source)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.source"))?;
+        let source = sources.get(&block.source).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("block.source")
+                .error()
+        })?;
         validate_block(block, source)?;
         let order = (
             &block.source,
@@ -639,10 +681,14 @@ fn validate_blocks<'index>(
             &block.identity,
         );
         if previous.is_some_and(|prior| prior >= order) {
-            return Err(refused(DocumentationViolation::Order, "blocks"));
+            return errors::analysis::documentation_order_invalid()
+                .field("blocks")
+                .fail();
         }
         if blocks.insert(&block.identity, block).is_some() {
-            return Err(refused(DocumentationViolation::Identity, "block.identity"));
+            return errors::analysis::documentation_identity_invalid()
+                .field("block.identity")
+                .fail();
         }
         previous = Some(order);
     }
@@ -652,14 +698,18 @@ fn validate_blocks<'index>(
 fn validate_block(
     block: &DocumentationBlock,
     source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let range_valid = block.range.end > block.range.start && block.range.end <= source.byte_length;
     let line_valid = block.line > 0 && block.line <= source.byte_length;
     if !range_valid || !line_valid {
-        return Err(refused(DocumentationViolation::Range, "block.range"));
+        return errors::analysis::documentation_range_invalid()
+            .field("block.range")
+            .fail();
     }
     if !is_digest(&block.identity) || !is_digest(&block.content_digest) {
-        return Err(refused(DocumentationViolation::Digest, "block.identity"));
+        return errors::analysis::documentation_digest_mismatch()
+            .field("block.identity")
+            .fail();
     }
     let symbol_valid = block.symbol.as_ref().is_none_or(valid_symbol_identity);
     let attached_comment_matches = (source.format
@@ -671,10 +721,14 @@ fn validate_block(
         .is_none_or(|language| valid_text(language));
     let prose_valid = block.kind != DocumentationBlockKind::Prose || block.language.is_none();
     if !symbol_valid {
-        return Err(refused(DocumentationViolation::Identity, "block.symbol"));
+        return errors::analysis::documentation_identity_invalid()
+            .field("block.symbol")
+            .fail();
     }
     if !attached_comment_matches || !language_valid || !prose_valid {
-        return Err(refused(DocumentationViolation::Format, "block.language"));
+        return errors::analysis::documentation_format_invalid()
+            .field("block.language")
+            .fail();
     }
     validate_headings(block)?;
     validate_chunks(block, source)
@@ -688,19 +742,20 @@ fn valid_symbol_identity(symbol: &SymbolId) -> bool {
     rift_core::parse_symbol_identity(&symbol.0).is_ok()
 }
 
-fn validate_headings(block: &DocumentationBlock) -> Result<(), DocumentationError> {
+fn validate_headings(block: &DocumentationBlock) -> Result<(), RiftError> {
     if block.heading_path.len() > DOCUMENTATION_HEADING_DEPTH_MAX as usize {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "heading_path",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("heading_path")
+            .fail();
     }
     let mut previous_level = 0;
     for heading in &block.heading_path {
         let ordered =
             heading.level > previous_level && heading.level <= DOCUMENTATION_HEADING_DEPTH_MAX;
         if !ordered || !valid_text(&heading.name) {
-            return Err(refused(DocumentationViolation::Order, "heading_path"));
+            return errors::analysis::documentation_order_invalid()
+                .field("heading_path")
+                .fail();
         }
         previous_level = heading.level;
     }
@@ -710,9 +765,11 @@ fn validate_headings(block: &DocumentationBlock) -> Result<(), DocumentationErro
 fn validate_chunks(
     block: &DocumentationBlock,
     source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     if block.chunks.len() > DOCUMENTATION_BLOCKS_MAX as usize {
-        return Err(refused(DocumentationViolation::LimitExceeded, "chunks"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("chunks")
+            .fail();
     }
     let mut identities = BTreeSet::new();
     let mut previous_start = 0;
@@ -724,7 +781,9 @@ fn validate_chunks(
             chunk.range.end > chunk.range.start && chunk.range.end <= source.byte_length;
         let intersects = chunk.range.start < block.range.end && block.range.start < chunk.range.end;
         if !valid_identity || !ordered || !valid_range || !intersects {
-            return Err(refused(DocumentationViolation::Range, "chunks"));
+            return errors::analysis::documentation_range_invalid()
+                .field("chunks")
+                .fail();
         }
         previous_start = chunk.range.start;
     }
@@ -747,17 +806,21 @@ fn validate_links(
     index: &DocumentationIndex,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let mut addresses = BTreeSet::new();
     for link in &index.links {
-        let block = blocks
-            .get(&link.block)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.block"))?;
+        let block = blocks.get(&link.block).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("link.block")
+                .error()
+        })?;
         let unique = addresses.insert(link_address(link));
         let range_valid = contains_link_range(block, &link.range);
         let text_bounded = link.authored.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize;
         if !unique || !range_valid || !text_bounded {
-            return Err(refused(DocumentationViolation::Range, "link"));
+            return errors::analysis::documentation_range_invalid()
+                .field("link")
+                .fail();
         }
         if let DocumentationLinkResolution::Resolved { target } = &link.resolution {
             validate_link_target(target, sources, blocks)?;
@@ -770,21 +833,22 @@ fn validate_link_target(
     target: &DocumentationTarget,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     match target {
         DocumentationTarget::Block { identity } => {
             if blocks.contains_key(identity) {
                 Ok(())
             } else {
-                Err(refused(
-                    DocumentationViolation::MissingTarget,
-                    "link.target.block",
-                ))
+                errors::analysis::documentation_target_missing()
+                    .field("link.target.block")
+                    .fail()
             }
         }
         DocumentationTarget::Source { source, range } => {
             let target = sources.get(source).ok_or_else(|| {
-                refused(DocumentationViolation::MissingTarget, "link.target.source")
+                errors::analysis::documentation_target_missing()
+                    .field("link.target.source")
+                    .error()
             })?;
             let empty_source_range = target.byte_length == 0 && range.start == 0 && range.end == 0;
             let valid_range = range.start <= range.end
@@ -793,17 +857,18 @@ fn validate_link_target(
             if valid_range {
                 Ok(())
             } else {
-                Err(refused(DocumentationViolation::Range, "link.target.range"))
+                errors::analysis::documentation_range_invalid()
+                    .field("link.target.range")
+                    .fail()
             }
         }
         DocumentationTarget::Symbol { symbol } => {
             if valid_symbol_identity(symbol) {
                 Ok(())
             } else {
-                Err(refused(
-                    DocumentationViolation::Identity,
-                    "link.target.symbol",
-                ))
+                errors::analysis::documentation_identity_invalid()
+                    .field("link.target.symbol")
+                    .fail()
             }
         }
     }
@@ -813,16 +878,20 @@ fn validate_warnings(
     warnings: &[DocumentationWarning],
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     complete: bool,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let mut prior = Vec::new();
     for warning in warnings {
         validate_identity(&warning.source)?;
         if warning.count == 0 {
-            return Err(refused(DocumentationViolation::Range, "warning.count"));
+            return errors::analysis::documentation_range_invalid()
+                .field("warning.count")
+                .fail();
         }
         let key = (&warning.source, warning.stage, warning.kind);
         if prior.contains(&key) {
-            return Err(refused(DocumentationViolation::Identity, "warning"));
+            return errors::analysis::documentation_identity_invalid()
+                .field("warning")
+                .fail();
         }
         prior.push(key);
         let may_name_omitted_source = matches!(
@@ -832,10 +901,9 @@ fn validate_warnings(
                 | DocumentationWarningKind::MalformedSource
         );
         if complete && !sources.contains_key(&warning.source) && !may_name_omitted_source {
-            return Err(refused(
-                DocumentationViolation::MissingTarget,
-                "warning.source",
-            ));
+            return errors::analysis::documentation_target_missing()
+                .field("warning.source")
+                .fail();
         }
     }
     Ok(())
@@ -844,14 +912,16 @@ fn validate_warnings(
 fn validate_references(
     index: &DocumentationIndex,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
-) -> Result<BTreeMap<SymbolId, Vec<usize>>, DocumentationError> {
+) -> Result<BTreeMap<SymbolId, Vec<usize>>, RiftError> {
     let mut identities = BTreeSet::new();
     let mut reverse: BTreeMap<SymbolId, Vec<usize>> = BTreeMap::new();
     let mut previous = None;
     for (position, reference) in index.references.iter().enumerate() {
-        let block = blocks
-            .get(&reference.block)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "reference.block"))?;
+        let block = blocks.get(&reference.block).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("reference.block")
+                .error()
+        })?;
         let unique = identities.insert(&reference.identity);
         let symbol_valid = valid_symbol_identity(&reference.target);
         if !unique
@@ -859,13 +929,14 @@ fn validate_references(
             || !valid_text(&reference.authored)
             || !is_digest(&reference.identity)
         {
-            return Err(refused(
-                DocumentationViolation::Identity,
-                "reference.identity",
-            ));
+            return errors::analysis::documentation_identity_invalid()
+                .field("reference.identity")
+                .fail();
         }
         if !contains(&block.range, &reference.range) || block.symbol.is_some() {
-            return Err(refused(DocumentationViolation::Range, "reference.range"));
+            return errors::analysis::documentation_range_invalid()
+                .field("reference.range")
+                .fail();
         }
         let order = (
             reference.evidence,
@@ -874,7 +945,9 @@ fn validate_references(
             &reference.identity,
         );
         if previous.is_some_and(|prior| prior >= order) {
-            return Err(refused(DocumentationViolation::Order, "references"));
+            return errors::analysis::documentation_order_invalid()
+                .field("references")
+                .fail();
         }
         previous = Some(order);
         reverse
@@ -883,9 +956,11 @@ fn validate_references(
             .push(position);
     }
     for candidate in &index.unresolved_references {
-        let block = blocks
-            .get(&candidate.block)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "reference.block"))?;
+        let block = blocks.get(&candidate.block).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("reference.block")
+                .error()
+        })?;
         let language_valid = candidate.language.as_ref().is_none_or(|language| {
             rift_protocol::read::Language::from_identity_segment(&language.identity_segment())
                 .is_ok()
@@ -894,7 +969,9 @@ fn validate_references(
             || !valid_text(&candidate.authored)
             || !language_valid
         {
-            return Err(refused(DocumentationViolation::Range, "reference.range"));
+            return errors::analysis::documentation_range_invalid()
+                .field("reference.range")
+                .fail();
         }
     }
     Ok(reverse)
@@ -915,7 +992,219 @@ mod tests {
 
     use crate::documentation::{content_digest, documentation_revision};
 
-    use super::{DocumentationCollection, DocumentationViolation};
+    use super::DocumentationCollection;
+    use crate::documentation::DocumentationViolation;
+
+    fn reference_collection(text: &str) -> (DocumentationCollection, SymbolId) {
+        let mut candidate = index(vec![source("README.md", text)]);
+        candidate.blocks[0].range.end = text.len() as u64;
+        let symbol = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "Thing"));
+        for start in [0, 6] {
+            candidate.references.push(DocumentationReference {
+                identity: content_digest(&[u8::try_from(start).expect("fixture reference offset")]),
+                block: candidate.blocks[0].identity.clone(),
+                target: symbol.clone(),
+                range: TextRange {
+                    start,
+                    end: start + 5,
+                },
+                authored: "Thing".to_owned(),
+                evidence: DocumentationReferenceEvidence::UniqueName,
+            });
+        }
+        (
+            DocumentationCollection::new(candidate).expect("valid references"),
+            symbol,
+        )
+    }
+
+    fn assert_refusal(
+        error: &rift_error::RiftError,
+        violation: DocumentationViolation,
+        field: &str,
+    ) {
+        assert_eq!(crate::documentation::failure::violation(error), violation);
+        assert_eq!(
+            crate::documentation::failure::context_value(error, "field").as_deref(),
+            Some(field)
+        );
+        assert!(std::error::Error::source(error).is_none());
+    }
+
+    #[test]
+    fn context_refuses_mismatched_reference_facts_and_source_metadata() {
+        let text = "Thing Thing";
+        let (collection, symbol) = reference_collection(text);
+        let context =
+            crate::documentation::documentation_context(&collection, &symbol, |_| Some(text));
+        super::validate_documentation_context(&context, &symbol).expect("valid context");
+
+        let mut wrong_target = context.clone();
+        wrong_target.references[0].reference.target =
+            SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "Other"));
+        let mut wrong_block = context.clone();
+        wrong_block.references[0].reference.block = content_digest(b"other block");
+        let mut wrong_revision = context.clone();
+        wrong_revision.references[0]
+            .documentation
+            .documentation_revision = Digest("0".repeat(rift_core::constants::DIGEST_WIRE_CHARS));
+        let mut repeated_identity = context.clone();
+        repeated_identity.references[1].reference.identity =
+            repeated_identity.references[0].reference.identity.clone();
+        let mut outside_block = context.clone();
+        outside_block.references[0].reference.range.end = text.len() as u64 + 1;
+        for refused in [
+            wrong_target,
+            wrong_block,
+            wrong_revision,
+            repeated_identity,
+            outside_block,
+        ] {
+            let error = super::validate_documentation_context(&refused, &symbol)
+                .expect_err("mismatched reference");
+            assert_refusal(&error, DocumentationViolation::Identity, "reference");
+        }
+
+        let mut inconsistent_source = context.clone();
+        inconsistent_source.references[1]
+            .documentation
+            .source
+            .revision = content_digest(b"another tree");
+        let error = super::validate_documentation_context(&inconsistent_source, &symbol)
+            .expect_err("different metadata for one source");
+        assert_refusal(&error, DocumentationViolation::Identity, "source");
+
+        let mut reversed = context;
+        reversed.references.reverse();
+        let error = super::validate_documentation_context(&reversed, &symbol)
+            .expect_err("references out of order");
+        assert_refusal(&error, DocumentationViolation::Order, "references");
+    }
+
+    #[test]
+    fn context_refuses_invalid_revision_symbol_and_reference_count() {
+        let (collection, symbol) = reference_collection("Thing Thing");
+        let context = crate::documentation::documentation_context(&collection, &symbol, |_| None);
+        let mut bad_revision = context.clone();
+        bad_revision.documentation_revision = Digest("invalid".to_owned());
+        let mut too_many = context.clone();
+        too_many.references =
+            vec![
+                context.references[0].clone();
+                rift_protocol::documentation::DOCUMENTATION_SYMBOL_REFERENCES_MAX as usize + 1
+            ];
+        for (refused, target) in [
+            (&bad_revision, &symbol),
+            (&too_many, &symbol),
+            (&context, &SymbolId("invalid".to_owned())),
+        ] {
+            let error = super::validate_documentation_context(refused, target)
+                .expect_err("invalid context bounds");
+            assert_refusal(
+                &error,
+                DocumentationViolation::LimitExceeded,
+                "documentation",
+            );
+        }
+    }
+
+    #[test]
+    fn context_accepts_exact_excerpt_budget_and_refuses_one_more_byte() {
+        let text =
+            "x".repeat(rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize);
+        let (collection, symbol) = reference_collection(&text);
+        let mut context =
+            crate::documentation::documentation_context(&collection, &symbol, |_| Some(&text));
+        assert_eq!(
+            context.references[0].excerpt.as_deref(),
+            Some(text.as_str())
+        );
+        assert!(context.references[1].excerpt.is_none());
+        super::validate_documentation_context(&context, &symbol).expect("exact excerpt budget");
+        context.references[1].excerpt = Some("x".to_owned());
+        let error = super::validate_documentation_context(&context, &symbol)
+            .expect_err("total excerpt budget exceeded");
+        assert_refusal(&error, DocumentationViolation::LimitExceeded, "excerpt");
+    }
+
+    #[cfg(feature = "collector")]
+    #[test]
+    fn source_omissions_accept_exact_count_and_refuse_additional_sources() {
+        use rift_protocol::documentation::{DOCUMENTATION_SOURCES_MAX, DocumentationWarningKind};
+
+        let omitted = source("missing.md", "").identity;
+        let mut candidate = index(Vec::new());
+        candidate.coverage.selected = DOCUMENTATION_SOURCES_MAX - 1;
+        candidate.coverage.omitted = DOCUMENTATION_SOURCES_MAX - 1;
+        let collection = DocumentationCollection::new(candidate)
+            .expect("bounded omitted sources")
+            .with_source_omissions(vec![(
+                omitted.clone(),
+                DocumentationWarningKind::SourceUnavailable,
+            )])
+            .expect("exact source bound");
+        assert_eq!(
+            collection.index().coverage.selected,
+            DOCUMENTATION_SOURCES_MAX
+        );
+        assert_eq!(
+            collection.index().coverage.omitted,
+            DOCUMENTATION_SOURCES_MAX
+        );
+        assert_eq!(collection.index().warnings[0].source, omitted);
+        let error = collection
+            .with_source_omissions(vec![(
+                omitted.clone(),
+                DocumentationWarningKind::SourceUnavailable,
+            )])
+            .expect_err("one source above the bound");
+        assert_refusal(&error, DocumentationViolation::LimitExceeded, "sources");
+
+        let error = DocumentationCollection::new(index(Vec::new()))
+            .expect("empty collection")
+            .with_source_omissions(vec![
+                (omitted, DocumentationWarningKind::SourceUnavailable);
+                DOCUMENTATION_SOURCES_MAX as usize + 1
+            ])
+            .expect_err("omission list above the bound");
+        assert_refusal(&error, DocumentationViolation::LimitExceeded, "sources");
+    }
+
+    #[test]
+    fn publication_refuses_missing_reference_targets_and_reversed_references() {
+        let (collection, _) = reference_collection("Thing Thing");
+        let base = collection.index().clone();
+        let mut missing = base.clone();
+        missing.references[0].block = content_digest(b"missing block");
+        let error = DocumentationCollection::new(missing).expect_err("missing reference target");
+        assert_refusal(
+            &error,
+            DocumentationViolation::MissingTarget,
+            "reference.block",
+        );
+
+        let mut unresolved = base.clone();
+        unresolved
+            .unresolved_references
+            .push(DocumentationReferenceCandidate {
+                block: content_digest(b"missing block"),
+                range: TextRange { start: 0, end: 5 },
+                authored: "Thing".to_owned(),
+                language: None,
+                reason: DocumentationUnresolvedReason::Missing,
+            });
+        let error = DocumentationCollection::new(unresolved).expect_err("missing candidate block");
+        assert_refusal(
+            &error,
+            DocumentationViolation::MissingTarget,
+            "reference.block",
+        );
+
+        let mut reversed = base;
+        reversed.references.reverse();
+        let error = DocumentationCollection::new(reversed).expect_err("references out of order");
+        assert_refusal(&error, DocumentationViolation::Order, "references");
+    }
 
     fn source(path: &str, text: &str) -> DocumentationSource {
         DocumentationSource {
@@ -992,7 +1281,10 @@ mod tests {
 
     fn refused_field(candidate: DocumentationIndex, expected: &str) {
         let error = DocumentationCollection::new(candidate).expect_err("invalid candidate");
-        assert_eq!(error.fault().field(), expected);
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -1006,40 +1298,36 @@ mod tests {
         let mut missing_link_block = candidate.clone();
         missing_link_block.links[0].block = content_digest(b"missing");
         assert_eq!(
-            DocumentationCollection::new(missing_link_block)
-                .expect_err("missing link block")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(missing_link_block).expect_err("missing link block")
+            ),
             DocumentationViolation::MissingTarget
         );
 
         let mut invalid_source = candidate.clone();
         invalid_source.sources[0].origin.location = None;
         assert_eq!(
-            DocumentationCollection::new(invalid_source)
-                .expect_err("invalid source origin")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(invalid_source).expect_err("invalid source origin")
+            ),
             DocumentationViolation::Origin
         );
 
         let mut bad_selection = candidate.clone();
         bad_selection.selection_digest = content_digest(b"other selection");
         assert_eq!(
-            DocumentationCollection::new(bad_selection)
-                .expect_err("mismatched selection")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(bad_selection).expect_err("mismatched selection")
+            ),
             DocumentationViolation::Digest
         );
 
         let mut bad_revision = candidate.clone();
         bad_revision.documentation_revision = Digest("invalid".to_owned());
         assert_eq!(
-            DocumentationCollection::new(bad_revision)
-                .expect_err("stale revision")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(bad_revision).expect_err("stale revision")
+            ),
             DocumentationViolation::Revision
         );
     }
@@ -1059,7 +1347,10 @@ mod tests {
                 count: 0,
             });
         match DocumentationCollection::new(candidate) {
-            Err(error) => assert_eq!(error.fault().violation(), DocumentationViolation::Range),
+            Err(error) => assert_eq!(
+                crate::documentation::failure::violation(&error),
+                DocumentationViolation::Range
+            ),
             Ok(replacement) => active = replacement,
         }
         assert_eq!(active.index(), &prior);
@@ -1089,10 +1380,9 @@ mod tests {
 
         candidate.references[0].target = SymbolId("invalid".to_owned());
         assert_eq!(
-            DocumentationCollection::new(candidate)
-                .expect_err("invalid symbol")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(candidate).expect_err("invalid symbol")
+            ),
             DocumentationViolation::Identity
         );
     }
@@ -1132,10 +1422,9 @@ mod tests {
             },
         };
         assert_eq!(
-            DocumentationCollection::new(invalid_target)
-                .expect_err("invalid symbol target")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(invalid_target).expect_err("invalid symbol target")
+            ),
             DocumentationViolation::Identity
         );
 
@@ -1143,10 +1432,9 @@ mod tests {
         let warning = duplicate_warning.warnings[0].clone();
         duplicate_warning.warnings.push(warning);
         assert_eq!(
-            DocumentationCollection::new(duplicate_warning)
-                .expect_err("duplicate warning")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(duplicate_warning).expect_err("duplicate warning")
+            ),
             DocumentationViolation::Identity
         );
     }
@@ -1202,10 +1490,9 @@ mod tests {
         }
         let candidate = index(sources);
         assert_eq!(
-            DocumentationCollection::new(candidate)
-                .expect_err("aggregate bytes over bound")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(candidate).expect_err("aggregate bytes over bound")
+            ),
             DocumentationViolation::LimitExceeded
         );
     }

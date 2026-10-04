@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
-use rift_core::{Error, ProjectPath};
+use rift_core::ProjectPath;
+use rift_error::errors;
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range, Tree};
 
 use crate::document::{ByteRange, SyntaxDocument};
 use crate::extract;
-use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
 /// Maximum Tree-sitter progress callbacks for one Markdown source.
@@ -275,7 +276,7 @@ pub(crate) fn parse_markdown_trees(
     source: SyntaxSource<'_>,
     limits: SyntaxLimits,
     bounds: MarkdownParseBounds,
-) -> Result<MarkdownTrees, SyntaxError> {
+) -> Result<MarkdownTrees, RiftError> {
     let block_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
     let inline_language: tree_sitter::Language = tree_sitter_md::INLINE_LANGUAGE.into();
     let mut callback_budget = ProgressBudget::new(bounds.progress_callbacks_max);
@@ -305,11 +306,15 @@ fn parse_block_tree(
     source: SyntaxSource<'_>,
     language: &tree_sitter::Language,
     callback_budget: &mut ProgressBudget,
-) -> Result<Tree, SyntaxError> {
+) -> Result<Tree, RiftError> {
     let mut parser = Parser::new();
-    parser
-        .set_language(language)
-        .map_err(|_| incompatible_grammar(language))?;
+    parser.set_language(language).map_err(|_| {
+        errors::syntax::incompatible_grammar()
+            .grammar_abi_version(language.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error()
+    })?;
     let mut input =
         |byte: usize, _point: Point| source.text.as_bytes().get(byte..).unwrap_or_default();
     let tree = {
@@ -323,11 +328,7 @@ fn parse_block_tree(
     tree.ok_or_else(|| {
         callback_budget
             .exhausted_error(source.path)
-            .unwrap_or_else(|| {
-                Error::new(SyntaxFault::ParseCancelled {
-                    path: Some(source.path.clone()),
-                })
-            })
+            .unwrap_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())
     })
 }
 
@@ -336,7 +337,7 @@ fn inline_range_plan<'tree>(
     block_nodes: &'tree [BoundedNode<'tree>],
     kinds: &MarkdownFactKinds,
     bounds: MarkdownParseBounds,
-) -> Result<(Vec<&'tree BoundedNode<'tree>>, Vec<Vec<Range>>), SyntaxError> {
+) -> Result<(Vec<&'tree BoundedNode<'tree>>, Vec<Vec<Range>>), RiftError> {
     let inline_nodes: Vec<_> = block_nodes
         .iter()
         .filter(|node| {
@@ -349,28 +350,22 @@ fn inline_range_plan<'tree>(
         .collect::<Vec<_>>();
     let count = inline_ranges
         .iter()
-        .try_fold(0_usize, |count, ranges| count.checked_add(ranges.len()))
-        .ok_or_else(|| too_many_inline_ranges(path, bounds.inline_ranges_max, usize::MAX))?;
+        .try_fold(0_usize, |count, ranges| count.checked_add(ranges.len()));
+    let Some(count) = count else {
+        return errors::syntax::too_many_markdown_inline_ranges()
+            .path(path)
+            .inline_ranges_max(bounds.inline_ranges_max)
+            .observed(usize::MAX)
+            .fail();
+    };
     if count > bounds.inline_ranges_max {
-        return Err(too_many_inline_ranges(
-            path,
-            bounds.inline_ranges_max,
-            count,
-        ));
+        return errors::syntax::too_many_markdown_inline_ranges()
+            .path(path)
+            .inline_ranges_max(bounds.inline_ranges_max)
+            .observed(count)
+            .fail();
     }
     Ok((inline_nodes, inline_ranges))
-}
-
-fn too_many_inline_ranges(
-    path: &ProjectPath,
-    inline_ranges_max: usize,
-    observed: usize,
-) -> SyntaxError {
-    Error::new(SyntaxFault::TooManyMarkdownInlineRanges {
-        path: path.clone(),
-        inline_ranges_max,
-        observed,
-    })
 }
 
 fn parse_inline_trees(
@@ -379,11 +374,15 @@ fn parse_inline_trees(
     inline_nodes: Vec<&BoundedNode<'_>>,
     inline_ranges: Vec<Vec<Range>>,
     callback_budget: &mut ProgressBudget,
-) -> Result<Vec<InlineTreeFact>, SyntaxError> {
+) -> Result<Vec<InlineTreeFact>, RiftError> {
     let mut parser = Parser::new();
-    parser
-        .set_language(language)
-        .map_err(|_| incompatible_grammar(language))?;
+    parser.set_language(language).map_err(|_| {
+        errors::syntax::incompatible_grammar()
+            .grammar_abi_version(language.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error()
+    })?;
     let mut inline = Vec::with_capacity(inline_nodes.len());
     for (node, ranges) in inline_nodes.into_iter().zip(inline_ranges) {
         let Some(tree) = parse_inline_tree(source, &mut parser, &ranges, callback_budget)? else {
@@ -404,14 +403,14 @@ fn parse_inline_tree(
     parser: &mut Parser,
     ranges: &[Range],
     callback_budget: &mut ProgressBudget,
-) -> Result<Option<Tree>, SyntaxError> {
+) -> Result<Option<Tree>, RiftError> {
     if ranges.is_empty() {
         return Ok(None);
     }
     parser.set_included_ranges(ranges).map_err(|_| {
-        Error::new(SyntaxFault::InvalidMarkdownRanges {
-            path: source.path.clone(),
-        })
+        errors::syntax::invalid_markdown_ranges()
+            .path(source.path)
+            .error()
     })?;
     let mut input =
         |byte: usize, _point: Point| source.text.as_bytes().get(byte..).unwrap_or_default();
@@ -426,11 +425,7 @@ fn parse_inline_tree(
     tree.map(Some).ok_or_else(|| {
         callback_budget
             .exhausted_error(source.path)
-            .unwrap_or_else(|| {
-                Error::new(SyntaxFault::ParseCancelled {
-                    path: Some(source.path.clone()),
-                })
-            })
+            .unwrap_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())
     })
 }
 
@@ -439,7 +434,7 @@ fn check_combined_node_bound(
     limits: SyntaxLimits,
     mut node_count: usize,
     inline: &[InlineTreeFact],
-) -> Result<(), SyntaxError> {
+) -> Result<(), RiftError> {
     for tree in inline {
         let nodes = bounded_tree_nodes(
             tree.tree.root_node(),
@@ -459,7 +454,7 @@ pub(crate) fn extract_markdown_facts(
     trees: &MarkdownTrees,
     syntax: &SyntaxDocument,
     limits: SyntaxLimits,
-) -> Result<MarkdownFacts, SyntaxError> {
+) -> Result<MarkdownFacts, RiftError> {
     let block_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
     let inline_language: tree_sitter::Language = tree_sitter_md::INLINE_LANGUAGE.into();
     let kinds = markdown_fact_kinds(&block_language, &inline_language);
@@ -508,7 +503,7 @@ fn extract_block_facts(
     syntax: &SyntaxDocument,
     limits: SyntaxLimits,
     kinds: &MarkdownFactKinds,
-) -> Result<MarkdownBlockExtraction, SyntaxError> {
+) -> Result<MarkdownBlockExtraction, RiftError> {
     let block_nodes = bounded_tree_nodes(
         trees.block.root_node(),
         0,
@@ -614,7 +609,7 @@ fn extract_authored_facts(
     limits: SyntaxLimits,
     kinds: &MarkdownFactKinds,
     node_blocks: &HashMap<usize, ByteRange>,
-) -> Result<MarkdownAuthoredExtraction, SyntaxError> {
+) -> Result<MarkdownAuthoredExtraction, RiftError> {
     let mut links = Vec::new();
     let mut reference_candidates = Vec::new();
     let mut error_ranges = tree_error_ranges(trees.block.root_node())?;
@@ -688,12 +683,12 @@ impl ProgressBudget {
         ControlFlow::Continue(())
     }
 
-    fn exhausted_error(self, path: &ProjectPath) -> Option<SyntaxError> {
+    fn exhausted_error(self, path: &ProjectPath) -> Option<RiftError> {
         self.exhausted.then(|| {
-            Error::new(SyntaxFault::MarkdownProgressExceeded {
-                path: path.clone(),
-                progress_callbacks_max: self.callbacks_max,
-            })
+            errors::syntax::markdown_progress_exceeded()
+                .path(path)
+                .progress_callbacks_max(self.callbacks_max)
+                .error()
         })
     }
 }
@@ -829,15 +824,6 @@ impl NodeBound {
             syntax_nodes_max,
         }
     }
-
-    /// The refusal for a walk that crossed this bound, naming the configured
-    /// bound rather than what was left of it.
-    fn exceeded(self, path: &ProjectPath) -> SyntaxError {
-        Error::new(SyntaxFault::TooManyNodes {
-            path: path.clone(),
-            syntax_nodes_max: self.syntax_nodes_max,
-        })
-    }
 }
 
 fn bounded_tree_nodes<'tree>(
@@ -846,19 +832,22 @@ fn bounded_tree_nodes<'tree>(
     path: &ProjectPath,
     bound: NodeBound,
     depth_max: usize,
-) -> Result<Vec<BoundedNode<'tree>>, SyntaxError> {
+) -> Result<Vec<BoundedNode<'tree>>, RiftError> {
     let mut result = Vec::new();
     let mut pending = vec![(root, base_depth, None)];
     let mut cursor = root.walk();
     while let Some((node, depth, parent)) = pending.pop() {
         if depth > depth_max {
-            return Err(Error::new(SyntaxFault::TooDeep {
-                path: path.clone(),
-                syntax_depth_max: depth_max,
-            }));
+            return errors::syntax::too_deep()
+                .path(path)
+                .syntax_depth_max(depth_max)
+                .fail();
         }
         if result.len() == bound.remaining {
-            return Err(bound.exceeded(path));
+            return errors::syntax::too_many_nodes()
+                .path(path)
+                .syntax_nodes_max(bound.syntax_nodes_max)
+                .fail();
         }
         let index = result.len();
         result.push(BoundedNode {
@@ -867,7 +856,10 @@ fn bounded_tree_nodes<'tree>(
             parent,
         });
         if result.len() + pending.len() + node.named_child_count() > bound.remaining {
-            return Err(bound.exceeded(path));
+            return errors::syntax::too_many_nodes()
+                .path(path)
+                .syntax_nodes_max(bound.syntax_nodes_max)
+                .fail();
         }
         extract::push_named_children(&mut pending, &mut cursor, node, |child| {
             (child, depth + 1, Some(index))
@@ -948,7 +940,7 @@ fn add_heading(
     source: &str,
     heading_symbols: &HashMap<u64, usize>,
     headings: &mut Vec<MarkdownHeadingFact>,
-) -> Result<Option<usize>, SyntaxError> {
+) -> Result<Option<usize>, RiftError> {
     let range = extract::byte_range(node)?;
     let Some(&symbol_index) = heading_symbols.get(&range.start) else {
         return Ok(None);
@@ -1055,7 +1047,7 @@ fn collect_inline_link(
     source: &str,
     kinds: &MarkdownFactKinds,
     links: &mut Vec<MarkdownLinkFact>,
-) -> Result<(), SyntaxError> {
+) -> Result<(), RiftError> {
     let node = inline.node();
     let kind = node.kind_id();
     if kind == kinds.link_destination {
@@ -1095,7 +1087,7 @@ fn collect_block_links(
     source: &str,
     kinds: &MarkdownFactKinds,
     links: &mut Vec<MarkdownLinkFact>,
-) -> Result<(), SyntaxError> {
+) -> Result<(), RiftError> {
     let mut pending = vec![root];
     let mut cursor = root.walk();
     while let Some(node) = pending.pop() {
@@ -1124,7 +1116,7 @@ fn child_node(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
         .find(|child| child.kind_id() == kind)
 }
 
-fn child_range(node: Node<'_>, kind: u16) -> Result<Option<ByteRange>, SyntaxError> {
+fn child_range(node: Node<'_>, kind: u16) -> Result<Option<ByteRange>, RiftError> {
     child_node(node, kind).map(extract::byte_range).transpose()
 }
 
@@ -1144,7 +1136,7 @@ fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
     })
 }
 
-fn code_span_content_range(node: Node<'_>, delimiter_kind: u16) -> Result<ByteRange, SyntaxError> {
+fn code_span_content_range(node: Node<'_>, delimiter_kind: u16) -> Result<ByteRange, RiftError> {
     let mut first = None;
     let mut last = None;
     let mut cursor = node.walk();
@@ -1165,13 +1157,13 @@ fn code_span_content_range(node: Node<'_>, delimiter_kind: u16) -> Result<ByteRa
     })
 }
 
-fn tree_error_ranges(root: Node<'_>) -> Result<Vec<ByteRange>, SyntaxError> {
+fn tree_error_ranges(root: Node<'_>) -> Result<Vec<ByteRange>, RiftError> {
     let mut ranges = Vec::new();
     append_tree_errors(root, &mut ranges)?;
     Ok(ranges)
 }
 
-fn append_tree_errors(root: Node<'_>, ranges: &mut Vec<ByteRange>) -> Result<(), SyntaxError> {
+fn append_tree_errors(root: Node<'_>, ranges: &mut Vec<ByteRange>) -> Result<(), RiftError> {
     let mut pending = vec![root];
     let mut cursor = root.walk();
     while let Some(node) = pending.pop() {
@@ -1324,7 +1316,7 @@ fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
 mod tests {
     use super::*;
     use crate::provider::SyntaxProvider;
-    use rift_core::{ErrorContext, Fault};
+    use rift_error::errors;
 
     #[test]
     fn inline_parser_handles_empty_invalid_and_exhausted_ranges() {
@@ -1357,30 +1349,30 @@ mod tests {
         )
         .expect_err("overlapping ranges refused");
         assert_eq!(
-            invalid.fault().violation(),
-            crate::SyntaxViolation::InvalidMarkdownRanges
+            invalid.slug(),
+            rift_error::errors::syntax::invalid_markdown_ranges::SLUG
         );
         assert_eq!(
-            invalid.context(),
-            vec![ErrorContext::new("path", "docs/facts.md")]
+            invalid.context().collect::<Vec<_>>(),
+            vec![("path", "docs/facts.md".to_owned())]
         );
         let exhausted =
             parse_inline_tree(source, &mut parser, &[range], &mut ProgressBudget::new(0))
                 .expect_err("inline parse exceeds shared callback bound");
         assert_eq!(
-            exhausted.fault().violation(),
-            crate::SyntaxViolation::MarkdownProgressExceeded
+            exhausted.slug(),
+            rift_error::errors::syntax::markdown_progress_exceeded::SLUG
         );
         assert_eq!(
-            exhausted.context(),
+            exhausted.context().collect::<Vec<_>>(),
             vec![
-                ErrorContext::new("path", "docs/facts.md"),
-                ErrorContext::new("progress_callbacks_max", "0"),
+                ("path", "docs/facts.md".to_owned()),
+                ("progress_callbacks_max", "0".to_owned())
             ]
         );
         assert_eq!(
-            exhausted.fault().name(),
-            rift_core::ErrorName::Wire(rift_core::ErrorCode::LimitExceeded)
+            exhausted.slug(),
+            errors::syntax::markdown_progress_exceeded::SLUG
         );
     }
 
@@ -1438,8 +1430,8 @@ mod tests {
             panic!("root exceeds zero node bound");
         };
         assert_eq!(
-            error.fault().violation(),
-            crate::SyntaxViolation::TooManyNodes
+            error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
     }
 
@@ -1539,23 +1531,18 @@ mod tests {
         )
         .expect_err("the inline trees cross the bound the block tree left");
         assert_eq!(
-            error.fault().violation(),
-            crate::SyntaxViolation::TooManyNodes
+            error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
+        let context = error.context().collect::<Vec<_>>();
         assert!(
-            error.context().contains(&ErrorContext::new(
-                "syntax_nodes_max",
-                syntax_nodes_max.to_string()
-            )),
-            "the refusal must name the configured bound: context={:?}",
-            error.context()
+            context
+                .iter()
+                .any(|(key, value)| *key == "syntax_nodes_max"
+                    && value == &syntax_nodes_max.to_string()),
+            "the refusal must name the configured bound: context={context:?}"
         );
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("syntax_nodes_max {syntax_nodes_max}")),
-            "the message must name the configured bound: {error}"
-        );
+        assert!(error.to_string().contains(&syntax_nodes_max.to_string()));
     }
 
     #[test]
@@ -1573,25 +1560,14 @@ mod tests {
         )
         .expect_err("inline ranges exceed zero limit");
         assert_eq!(
-            error.fault().violation(),
-            crate::SyntaxViolation::TooManyMarkdownInlineRanges
+            error.slug(),
+            rift_error::errors::syntax::too_many_markdown_inline_ranges::SLUG
         );
-        assert_eq!(
-            error.context(),
-            vec![
-                ErrorContext::new("path", "docs/facts.md"),
-                ErrorContext::new("inline_ranges_max", "0"),
-                ErrorContext::new("observed", "1"),
-            ]
-        );
-        assert!(matches!(
-            error.fault(),
-            SyntaxFault::TooManyMarkdownInlineRanges {
-                inline_ranges_max: 0,
-                observed: 1..,
-                ..
-            }
-        ));
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("path", "docs/facts.md".to_owned())));
+        assert!(context.contains(&("inline_ranges_max", "0".to_owned())));
+        assert!(context.contains(&("observed", "1".to_owned())));
+        assert!(error.to_string().contains('1'));
     }
 
     #[test]
@@ -1611,12 +1587,10 @@ mod tests {
             },
         )
         .expect_err("block parser exceeds zero callbacks");
-        assert!(matches!(
-            error.fault(),
-            SyntaxFault::MarkdownProgressExceeded {
-                progress_callbacks_max: 0,
-                ..
-            }
-        ));
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "progress_callbacks_max" && value == "0")
+        );
     }
 }

@@ -12,7 +12,7 @@ use rift_protocol::documentation::{
 use rift_protocol::read::{Language, TextRange};
 use tree_sitter::{Language as Grammar, Node, Parser, Tree};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use rift_error::{RiftError, errors};
 
 const DOCUMENT_KIND: &str = "document";
 const OBJECT_KIND: &str = "object";
@@ -155,7 +155,7 @@ struct SelectedCell<'tree> {
 pub fn decode_notebook(
     source: &str,
     notebook_identity: &DocumentationContentIdentity,
-) -> Result<NotebookContent, DocumentationError> {
+) -> Result<NotebookContent, RiftError> {
     validate_input(source, notebook_identity)?;
     let tree = parse_tree(source)?;
     decode_tree(tree.root_node(), source)
@@ -164,53 +164,68 @@ pub fn decode_notebook(
 fn validate_input(
     source: &str,
     notebook_identity: &DocumentationContentIdentity,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     if source.len() > DOCUMENTATION_SOURCE_BYTES_MAX as usize {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "notebook.source_bytes",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("notebook.source_bytes")
+            .fail();
     }
     if notebook_identity.cell.is_some() {
-        return Err(refused(
-            DocumentationViolation::Notebook,
-            "notebook.identity",
-        ));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("notebook.identity")
+            .fail();
     }
     Ok(())
 }
 
-fn parse_tree(source: &str) -> Result<Tree, DocumentationError> {
+fn parse_tree(source: &str) -> Result<Tree, RiftError> {
     let kinds = json_kinds();
     let mut parser = Parser::new();
     let grammar: Grammar = tree_sitter_json::LANGUAGE.into();
-    parser
-        .set_language(&grammar)
-        .map_err(|_| refused(DocumentationViolation::Notebook, "notebook.grammar"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.parse"))?;
+    parser.set_language(&grammar).map_err(|_| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.grammar")
+            .error()
+    })?;
+    let tree = parser.parse(source, None).ok_or_else(|| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.parse")
+            .error()
+    })?;
     let root = tree.root_node();
     validate_tree(root)?;
     if root.has_error() || root.kind_id() != kinds.document {
-        return Err(refused(DocumentationViolation::Notebook, "notebook.json"));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("notebook.json")
+            .fail();
     }
     Ok(tree)
 }
 
-fn decode_tree(root: Node<'_>, source: &str) -> Result<NotebookContent, DocumentationError> {
+fn decode_tree(root: Node<'_>, source: &str) -> Result<NotebookContent, RiftError> {
     let kinds = json_kinds();
     let document = root
         .named_child(0)
         .filter(|node| node.kind_id() == kinds.object)
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.object"))?;
+        .ok_or_else(|| {
+            errors::analysis::documentation_notebook_invalid()
+                .field("notebook.object")
+                .error()
+        })?;
     let cells_node = object_value(document, "cells", source, kinds)?
         .filter(|node| node.kind_id() == kinds.array)
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.cells"))?;
+        .ok_or_else(|| {
+            errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cells")
+                .error()
+        })?;
     let language = notebook_language(document, source, kinds)?;
     let cells = decode_cells(cells_node, language.as_ref(), source, kinds)?;
-    let selected_count = u32::try_from(cells.len())
-        .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.cells"))?;
+    let selected_count = u32::try_from(cells.len()).map_err(|_| {
+        errors::analysis::documentation_limit_exceeded()
+            .field("notebook.cells")
+            .error()
+    })?;
     Ok(NotebookContent {
         cells,
         coverage: DocumentationCoverage {
@@ -227,7 +242,7 @@ fn decode_cells(
     language: Option<&Language>,
     source: &str,
     kinds: &JsonKinds,
-) -> Result<Vec<NotebookCellContent>, DocumentationError> {
+) -> Result<Vec<NotebookCellContent>, RiftError> {
     let selected = selected_cells(cells_node, source, kinds)?;
     let id_counts = authored_id_counts(&selected, source, kinds)?;
     let mut cells = Vec::with_capacity(selected.len());
@@ -249,7 +264,7 @@ fn decode_cell(
     language: Option<&Language>,
     source: &str,
     kinds: &JsonKinds,
-) -> Result<NotebookCellContent, DocumentationError> {
+) -> Result<NotebookCellContent, RiftError> {
     let authored_id = selected
         .id
         .map(|node| decode_string(source, node, kinds))
@@ -269,25 +284,25 @@ fn decode_cell(
     })
 }
 
-fn validate_tree(root: Node<'_>) -> Result<(), DocumentationError> {
+fn validate_tree(root: Node<'_>) -> Result<(), RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut nodes_seen = 0_usize;
     let mut cursor = root.walk();
     while let Some((node, depth)) = pending.pop() {
-        nodes_seen = nodes_seen
-            .checked_add(1)
-            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "notebook.nodes"))?;
+        nodes_seen = nodes_seen.checked_add(1).ok_or_else(|| {
+            errors::analysis::documentation_limit_exceeded()
+                .field("notebook.nodes")
+                .error()
+        })?;
         if nodes_seen > SOURCE_NODES_MAX {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "notebook.nodes",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("notebook.nodes")
+                .fail();
         }
         if depth > SOURCE_DEPTH_MAX {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "notebook.depth",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("notebook.depth")
+                .fail();
         }
         pending.extend(node.children(&mut cursor).map(|child| (child, depth + 1)));
     }
@@ -298,14 +313,19 @@ fn selected_cells<'tree>(
     cells: Node<'tree>,
     source: &str,
     kinds: &JsonKinds,
-) -> Result<Vec<SelectedCell<'tree>>, DocumentationError> {
+) -> Result<Vec<SelectedCell<'tree>>, RiftError> {
     let mut selected = Vec::new();
     let mut cursor = cells.walk();
     for (index, cell) in cells.named_children(&mut cursor).enumerate() {
-        let cell_index = u32::try_from(index)
-            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.cells"))?;
+        let cell_index = u32::try_from(index).map_err(|_| {
+            errors::analysis::documentation_limit_exceeded()
+                .field("notebook.cells")
+                .error()
+        })?;
         if cell.kind_id() != kinds.object {
-            return Err(refused(DocumentationViolation::Notebook, "notebook.cell"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cell")
+                .fail();
         }
         let cell_type = object_value(cell, "cell_type", source, kinds)?;
         let kind = match cell_type {
@@ -318,13 +338,15 @@ fn selected_cells<'tree>(
             }
             _ => continue,
         };
-        let source_node = object_value(cell, "source", source, kinds)?
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.cell.source"))?;
+        let source_node = object_value(cell, "source", source, kinds)?.ok_or_else(|| {
+            errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cell.source")
+                .error()
+        })?;
         if source_node.kind_id() != kinds.string && source_node.kind_id() != kinds.array {
-            return Err(refused(
-                DocumentationViolation::Notebook,
-                "notebook.cell.source",
-            ));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cell.source")
+                .fail();
         }
         selected.push(SelectedCell {
             source: source_node,
@@ -341,7 +363,7 @@ fn authored_id_counts(
     selected: &[SelectedCell<'_>],
     source: &str,
     kinds: &JsonKinds,
-) -> Result<BTreeMap<String, u32>, DocumentationError> {
+) -> Result<BTreeMap<String, u32>, RiftError> {
     let mut counts = BTreeMap::new();
     for cell in selected {
         let Some(id) = cell.id else {
@@ -351,7 +373,9 @@ fn authored_id_counts(
         if valid_authored_id(&id) {
             let count = counts.entry(id).or_insert(0_u32);
             *count = count.checked_add(1).ok_or_else(|| {
-                refused(DocumentationViolation::LimitExceeded, "notebook.cell.id")
+                errors::analysis::documentation_limit_exceeded()
+                    .field("notebook.cell.id")
+                    .error()
             })?;
         }
     }
@@ -383,7 +407,7 @@ fn decode_source(
     source_node: Node<'_>,
     source: &str,
     kinds: &JsonKinds,
-) -> Result<(String, Vec<TextRange>), DocumentationError> {
+) -> Result<(String, Vec<TextRange>), RiftError> {
     let mut decoded = String::new();
     let mut physical_ranges = Vec::new();
     if source_node.kind_id() == kinds.string {
@@ -399,7 +423,9 @@ fn decode_source(
     let mut cursor = source_node.walk();
     for child in source_node.named_children(&mut cursor) {
         if child.kind_id() != kinds.string {
-            return Err(refused(DocumentationViolation::Notebook, "notebook.source"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.source")
+                .fail();
         }
         append_string(child, source, kinds, &mut decoded, &mut physical_ranges)?;
     }
@@ -412,19 +438,17 @@ fn append_string(
     kinds: &JsonKinds,
     decoded: &mut String,
     physical_ranges: &mut Vec<TextRange>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     decoded.push_str(&decode_string(source, node, kinds)?);
     let start = u64::try_from(node.start_byte()).map_err(|_| {
-        refused(
-            DocumentationViolation::LimitExceeded,
-            "notebook.source_range",
-        )
+        errors::analysis::documentation_limit_exceeded()
+            .field("notebook.source_range")
+            .error()
     })?;
     let end = u64::try_from(node.end_byte()).map_err(|_| {
-        refused(
-            DocumentationViolation::LimitExceeded,
-            "notebook.source_range",
-        )
+        errors::analysis::documentation_limit_exceeded()
+            .field("notebook.source_range")
+            .error()
     })?;
     physical_ranges.push(TextRange { start, end });
     Ok(())
@@ -434,7 +458,7 @@ fn notebook_language(
     document: Node<'_>,
     source: &str,
     kinds: &JsonKinds,
-) -> Result<Option<Language>, DocumentationError> {
+) -> Result<Option<Language>, RiftError> {
     let Some(metadata) = object_value(document, "metadata", source, kinds)? else {
         return Ok(None);
     };
@@ -463,7 +487,7 @@ fn object_value<'tree>(
     name: &str,
     source: &str,
     kinds: &JsonKinds,
-) -> Result<Option<Node<'tree>>, DocumentationError> {
+) -> Result<Option<Node<'tree>>, RiftError> {
     if object.kind_id() != kinds.object {
         return Ok(None);
     }
@@ -471,18 +495,23 @@ fn object_value<'tree>(
     let mut cursor = object.walk();
     for pair in object.named_children(&mut cursor) {
         if pair.kind_id() != kinds.pair {
-            return Err(refused(DocumentationViolation::Notebook, "notebook.object"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.object")
+                .fail();
         }
         let key = pair
             .child_by_field_id(kinds.key.get())
             .filter(|node| node.kind_id() == kinds.string)
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.object.key"))?;
+            .ok_or_else(|| {
+                errors::analysis::documentation_notebook_invalid()
+                    .field("notebook.object.key")
+                    .error()
+            })?;
         if decode_string(source, key, kinds)? == name {
             if value.is_some() {
-                return Err(refused(
-                    DocumentationViolation::Notebook,
-                    "notebook.duplicate_field",
-                ));
+                return errors::analysis::documentation_notebook_invalid()
+                    .field("notebook.duplicate_field")
+                    .fail();
             }
             value = pair.child_by_field_id(kinds.value.get());
         }
@@ -490,19 +519,22 @@ fn object_value<'tree>(
     Ok(value)
 }
 
-fn decode_string(
-    source: &str,
-    node: Node<'_>,
-    kinds: &JsonKinds,
-) -> Result<String, DocumentationError> {
+fn decode_string(source: &str, node: Node<'_>, kinds: &JsonKinds) -> Result<String, RiftError> {
     if node.kind_id() != kinds.string {
-        return Err(refused(DocumentationViolation::Notebook, "notebook.string"));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("notebook.string")
+            .fail();
     }
-    let token = source
-        .get(node.byte_range())
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.string.range"))?;
-    serde_json::from_str(token)
-        .map_err(|_| refused(DocumentationViolation::Notebook, "notebook.string"))
+    let token = source.get(node.byte_range()).ok_or_else(|| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.string.range")
+            .error()
+    })?;
+    serde_json::from_str(token).map_err(|_| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.string")
+            .error()
+    })
 }
 
 #[cfg(test)]
@@ -611,6 +643,84 @@ mod tests {
         assert!(decode_notebook(invalid_source, &notebook_identity()).is_err());
     }
 
+    fn assert_notebook_refusal(source: &str, field: &str) {
+        let error = decode_notebook(source, &notebook_identity())
+            .expect_err("invalid notebook returns no partial cells");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.documentation_notebook_invalid"
+        );
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some(field),
+            "{source}"
+        );
+        assert_eq!(
+            error.message(),
+            format!("documentation field {field} has an invalid notebook shape")
+        );
+        assert_eq!(
+            error.action(),
+            format!("correct notebook field {field} and retry")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn notebook_requires_top_level_object_and_cells_array() {
+        for source in ["null", "[]", "42", "\"notebook\""] {
+            assert_notebook_refusal(source, "notebook.object");
+        }
+        for source in [
+            "{}",
+            r#"{"cells":null}"#,
+            r#"{"cells":{}}"#,
+            r#"{"cells":"text"}"#,
+        ] {
+            assert_notebook_refusal(source, "notebook.cells");
+        }
+        let empty = decode_notebook(r#"{"cells":[]}"#, &notebook_identity())
+            .expect("empty cell array is valid");
+        assert!(empty.cells().is_empty());
+    }
+
+    #[test]
+    fn selected_cell_without_source_refuses_prior_valid_cells() {
+        for source in [
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"markdown"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code"}]}"#,
+        ] {
+            assert_notebook_refusal(source, "notebook.cell.source");
+        }
+        let unselected = decode_notebook(
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"raw"}]}"#,
+            &notebook_identity(),
+        )
+        .expect("unselected raw cell does not require source");
+        assert_eq!(unselected.cells().len(), 1);
+        assert_eq!(unselected.cells()[0].text(), "kept");
+    }
+
+    #[test]
+    fn unpaired_unicode_escapes_refuse_notebook_without_partial_cells() {
+        for source in [
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"\uD800"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"\uDC00"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"text","id":"\uD800"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"}],"metadata":{"language_info":{"name":"\uD800"}}}"#,
+        ] {
+            super::parse_tree(source).expect("lexical JSON parser accepts the escape");
+            assert_notebook_refusal(source, "notebook.string");
+        }
+        let paired = decode_notebook(
+            r#"{"cells":[{"cell_type":"markdown","source":"\uD83D\uDE80"}]}"#,
+            &notebook_identity(),
+        )
+        .expect("paired UTF-16 escapes decode to one Unicode character");
+        assert_eq!(paired.cells().len(), 1);
+        assert_eq!(paired.cells()[0].text(), "\u{1f680}");
+    }
+
     #[test]
     fn a_cell_source_line_or_member_of_another_kind_refuses_the_notebook() {
         // tree-sitter-json reads a comment as a named node beside the values, and nbformat
@@ -629,7 +739,11 @@ mod tests {
         for (source, field) in cases {
             let error = decode_notebook(source, &notebook_identity())
                 .expect_err("a value of another kind refuses the notebook");
-            assert_eq!(error.fault().field(), field, "{source}");
+            assert_eq!(
+                crate::documentation::failure::context_value(&error, "field").as_deref(),
+                Some(field),
+                "{source}"
+            );
         }
     }
 
@@ -638,7 +752,10 @@ mod tests {
         let duplicate = r#"{"cells":[],"cells":[],"metadata":{}}"#;
         let duplicate_error =
             decode_notebook(duplicate, &notebook_identity()).expect_err("duplicate cells field");
-        assert_eq!(duplicate_error.fault().field(), "notebook.duplicate_field");
+        assert_eq!(
+            crate::documentation::failure::context_value(&duplicate_error, "field").as_deref(),
+            Some("notebook.duplicate_field")
+        );
 
         let nested = format!(
             "{{\"cells\":[],\"metadata\":{{}},\"extra\":{}0{}}}",
@@ -646,7 +763,10 @@ mod tests {
             "]".repeat(SOURCE_DEPTH_MAX + 1),
         );
         let depth_error = decode_notebook(&nested, &notebook_identity()).expect_err("depth bound");
-        assert_eq!(depth_error.fault().field(), "notebook.depth");
+        assert_eq!(
+            crate::documentation::failure::context_value(&depth_error, "field").as_deref(),
+            Some("notebook.depth")
+        );
     }
 
     #[test]
@@ -660,7 +780,10 @@ mod tests {
         assert!(source.len() < DOCUMENTATION_SOURCE_BYTES_MAX as usize);
 
         let error = decode_notebook(&source, &notebook_identity()).expect_err("node bound");
-        assert_eq!(error.fault().field(), "notebook.nodes");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("notebook.nodes")
+        );
     }
 
     #[test]
@@ -668,7 +791,10 @@ mod tests {
         let too_large = " ".repeat(DOCUMENTATION_SOURCE_BYTES_MAX as usize + 1);
         let error = decode_notebook(&too_large, &notebook_identity())
             .expect_err("source byte bound is enforced before parsing");
-        assert_eq!(error.fault().field(), "notebook.source_bytes");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("notebook.source_bytes")
+        );
 
         let mut with_cell_identity = notebook_identity();
         with_cell_identity.cell = Some(rift_protocol::documentation::NotebookCell {
@@ -677,7 +803,10 @@ mod tests {
         });
         let error = decode_notebook("{}", &with_cell_identity)
             .expect_err("input identity must name source, not one decoded cell");
-        assert_eq!(error.fault().field(), "notebook.identity");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("notebook.identity")
+        );
 
         let long_id =
             "a".repeat(rift_protocol::documentation::NOTEBOOK_CELL_ID_BYTES_MAX as usize + 1);

@@ -5,18 +5,16 @@ use std::sync::{Arc, OnceLock};
 
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
-use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, LimitEvidence,
-    SourceVisibility, TextFileInclusion, fault_label, line,
-};
+use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion, line};
 use rift_dependency::{DependencyContext, StandardLibrary};
-use rift_history::{HistoryError, Repository};
-use rift_history_store::StoreError;
+pub(crate) use rift_error::RiftError;
+use rift_error::errors;
+use rift_history::Repository;
 use rift_index::{
     FileDigest, FileRecord, IndexRead, IndexedFile, PathChange, PathChanges, ReadableSymbol,
     RelationshipStore, SymbolMatch, WorkspaceContentCache, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexPreparation,
-    WorkspaceIndexWarning, WorkspaceSourcePolicy,
+    WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexWarning,
+    WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::dependencies::{
@@ -33,349 +31,6 @@ use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry}
 use sha2::{Digest as _, Sha256};
 
 use crate::history::{StoredHistory, SymbolTimelines};
-
-/// One read-service failure: what was asked, and why it cannot be served.
-///
-/// An indexing failure keeps the classification of the
-/// [`WorkspaceIndexError`] it wraps, so a crossed parse bound surfaces as
-/// `limit_exceeded` rather than as an unclassified failure.
-#[derive(Debug)]
-pub enum ReadFault {
-    /// Workspace could not be indexed.
-    Index(WorkspaceIndexError),
-    /// The workspace's version control could not serve the requested revision.
-    History(HistoryError),
-    /// The history store refused a read. The failure is boxed so the read fault stays
-    /// small on every `Result` it rides.
-    HistoryStore(Box<StoreError>),
-    /// A language engine failed while serving the request.
-    Engine(rift_lsp::session::EngineError),
-    /// A language engine answered about bytes the served revision does not carry, so
-    /// its answer cannot be mapped into the tree this read serves. The engine holds an
-    /// older revision of the file, and no resend of the same request changes that: a
-    /// read that meets this drops the engine's contribution, keeps the indexed answer,
-    /// and warns.
-    EngineAnswer {
-        /// The engine operation whose answer could not be mapped.
-        operation: &'static str,
-        /// What did not fit the served bytes.
-        detail: String,
-    },
-
-    /// Documentation metadata could not answer the requested projection.
-    Documentation(Box<rift_index::DocumentationError>),
-    /// Request uses functionality this release does not serve, where configuring the
-    /// workspace could serve it.
-    Unsupported {
-        /// The unserved capability the request named.
-        capability: String,
-    },
-    /// A path's extension carries no shipped syntax provider, so no workspace
-    /// configuration can ever serve a syntax read at this path.
-    UnclaimedExtension {
-        /// The extension named, or a statement that the path carries none.
-        extension: String,
-    },
-    /// Request is invalid for direct workspace reads.
-    Invalid {
-        /// The rejected request field.
-        field: &'static str,
-        /// The rule the field's value broke.
-        violation: String,
-    },
-    /// Requested source does not exist.
-    NotFound {
-        /// The path the request addressed.
-        path: String,
-    },
-    /// The index left a claimed source path out, so no file is held there.
-    SourceUnavailable {
-        /// The path the request addressed.
-        path: String,
-    },
-    /// Workspace files could not be read or written.
-    Storage {
-        /// The path being read or written.
-        path: String,
-        /// The filesystem operation that failed.
-        operation: &'static str,
-        /// The rendered I/O failure.
-        io: String,
-    },
-    /// Tokio could not run or join one bounded blocking operation.
-    Task {
-        /// Operation submitted to the blocking executor.
-        operation: &'static str,
-        /// Runtime failure account.
-        detail: String,
-    },
-    /// Current workspace index cannot be validated within its deadline.
-    Unavailable {
-        /// Operation waiting for a validated state.
-        operation: &'static str,
-        /// Bounded failure account.
-        detail: String,
-    },
-    /// A blocking operation waited past its configured queue bound.
-    CapacityTimeout {
-        /// Operation waiting for blocking capacity.
-        operation: &'static str,
-        /// Configured queue wait bound in milliseconds.
-        timeout_ms: u64,
-    },
-    /// Blocking work stopped at a file boundary.
-    Cancelled,
-}
-
-impl Fault for ReadFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::Index(source) => source.descriptor().name(),
-            Self::History(source) => source.descriptor().name(),
-            Self::HistoryStore(source) => source.name(),
-            Self::Engine(source) => source.name(),
-
-            Self::Documentation(source) => source.name(),
-            Self::Unsupported { .. } | Self::UnclaimedExtension { .. } => {
-                ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-            }
-            Self::Invalid { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
-            Self::NotFound { .. } => ErrorName::Wire(ErrorCode::ResourceNotFound),
-            Self::SourceUnavailable { .. } | Self::EngineAnswer { .. } => {
-                ErrorName::Wire(ErrorCode::ContentUnavailable)
-            }
-            Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-            Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
-            Self::Unavailable { .. } | Self::CapacityTimeout { .. } => {
-                ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
-            }
-            Self::Cancelled => ErrorName::Wire(ErrorCode::Cancelled),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Index(source) => source.context(),
-            Self::History(source) => source.context(),
-            Self::HistoryStore(source) => source.context(),
-            Self::Engine(source) => source.context(),
-
-            Self::Documentation(source) => source.context(),
-            Self::Unsupported { capability } => {
-                vec![ErrorContext::new("capability", capability.clone())]
-            }
-            Self::UnclaimedExtension { extension } => {
-                vec![ErrorContext::new("capability", extension.clone())]
-            }
-            Self::Invalid { field, violation } => vec![
-                ErrorContext::new("field", *field),
-                ErrorContext::new("violation", violation.clone()),
-            ],
-            Self::NotFound { path } | Self::SourceUnavailable { path } => {
-                vec![ErrorContext::new("path", path.clone())]
-            }
-            Self::Storage {
-                path,
-                operation,
-                io,
-            } => vec![
-                ErrorContext::new("path", path.clone()),
-                ErrorContext::new("operation", *operation),
-                ErrorContext::new("io", io.clone()),
-            ],
-            Self::Task { operation, detail }
-            | Self::Unavailable { operation, detail }
-            | Self::EngineAnswer { operation, detail } => vec![
-                ErrorContext::new("operation", *operation),
-                ErrorContext::new("detail", detail.clone()),
-            ],
-            Self::CapacityTimeout {
-                operation,
-                timeout_ms,
-            } => vec![
-                ErrorContext::new("operation", *operation),
-                ErrorContext::new("timeout_ms", timeout_ms.to_string()),
-            ],
-            Self::Cancelled => Vec::new(),
-        }
-    }
-
-    fn limit_evidence(&self) -> Option<LimitEvidence> {
-        match self {
-            Self::Index(source) => source.fault().limit_evidence(),
-            Self::History(source) => source.fault().limit_evidence(),
-            Self::HistoryStore(source) => source.fault().limit_evidence(),
-            Self::Engine(source) => source.fault().limit_evidence(),
-
-            Self::Documentation(source) => source.fault().limit_evidence(),
-            Self::Unsupported { .. }
-            | Self::UnclaimedExtension { .. }
-            | Self::Invalid { .. }
-            | Self::NotFound { .. }
-            | Self::SourceUnavailable { .. }
-            | Self::Storage { .. }
-            | Self::Task { .. }
-            | Self::Unavailable { .. }
-            | Self::EngineAnswer { .. }
-            | Self::CapacityTimeout { .. }
-            | Self::Cancelled => None,
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Index(source) => Some(source),
-            Self::History(source) => Some(source),
-            Self::HistoryStore(source) => Some(source.as_ref()),
-            Self::Engine(source) => Some(source),
-
-            Self::Documentation(source) => Some(source.as_ref()),
-            Self::Unsupported { .. }
-            | Self::UnclaimedExtension { .. }
-            | Self::Invalid { .. }
-            | Self::NotFound { .. }
-            | Self::SourceUnavailable { .. }
-            | Self::Storage { .. }
-            | Self::Task { .. }
-            | Self::Unavailable { .. }
-            | Self::EngineAnswer { .. }
-            | Self::CapacityTimeout { .. }
-            | Self::Cancelled => None,
-        }
-    }
-
-    /// Two faults the registry's own action would send to the wrong place. A path whose
-    /// extension no shipped provider parses can never be served: unlike
-    /// [`Self::Unsupported`], which also classifies a capability the operator could turn
-    /// on, no `rift.toml` table adds a syntax grammar this release does not ship. And the
-    /// `content_unavailable` action names a body-less read, which answers a source file
-    /// that is not UTF-8; an engine holding an older revision of a file is cleared by the
-    /// engine reading the new bytes, not by a narrower request.
-    fn action_override(&self) -> Option<&'static str> {
-        match self {
-            Self::UnclaimedExtension { .. } => Some("address a path a shipped provider parses"),
-            Self::EngineAnswer { .. } => {
-                Some("read the request again once the engine has read the served revision")
-            }
-            _ => None,
-        }
-    }
-}
-
-impl ReadFault {
-    /// Classifies blocking work stopped at a file boundary.
-    #[must_use]
-    pub fn cancelled() -> ReadError {
-        Error::new(Self::Cancelled)
-    }
-
-    pub(crate) fn unsupported(capability: impl Into<String>) -> ReadError {
-        Error::new(Self::Unsupported {
-            capability: capability.into(),
-        })
-    }
-
-    /// Classifies a path whose extension no shipped provider parses.
-    pub(crate) fn unclaimed_extension(extension: impl Into<String>) -> ReadError {
-        Error::new(Self::UnclaimedExtension {
-            extension: extension.into(),
-        })
-    }
-
-    pub(crate) fn invalid(field: &'static str, violation: impl Into<String>) -> ReadError {
-        Error::new(Self::Invalid {
-            field,
-            violation: violation.into(),
-        })
-    }
-
-    pub(crate) fn not_found(path: impl Into<String>) -> ReadError {
-        Error::new(Self::NotFound { path: path.into() })
-    }
-
-    /// Classifies a claimed source path the index left out, so this is
-    /// `content_unavailable` rather than `not_found`.
-    pub(crate) fn source_unavailable(path: impl Into<String>) -> ReadError {
-        Error::new(Self::SourceUnavailable { path: path.into() })
-    }
-
-    pub(crate) fn storage(
-        path: impl Into<String>,
-        operation: &'static str,
-        io: &std::io::Error,
-    ) -> ReadError {
-        Error::new(Self::Storage {
-            path: path.into(),
-            operation,
-            io: io.to_string(),
-        })
-    }
-
-    /// Keeps an indexing failure's registry identity in one read failure.
-    #[must_use]
-    pub fn index(source: WorkspaceIndexError) -> ReadError {
-        Error::new(Self::Index(source))
-    }
-
-    pub(crate) fn engine(source: rift_lsp::session::EngineError) -> ReadError {
-        Error::new(Self::Engine(source))
-    }
-
-    pub(crate) fn history(source: HistoryError) -> ReadError {
-        Error::new(Self::History(source))
-    }
-
-    /// Keeps a history store failure's registry identity in one read failure.
-    #[must_use]
-    pub fn history_store(source: StoreError) -> ReadError {
-        Error::new(Self::HistoryStore(Box::new(source)))
-    }
-
-    pub(crate) fn documentation(source: rift_index::DocumentationError) -> ReadError {
-        Error::new(Self::Documentation(Box::new(source)))
-    }
-
-    /// Classifies a Tokio blocking-executor failure.
-    pub fn task(operation: &'static str, detail: impl Into<String>) -> ReadError {
-        Error::new(Self::Task {
-            operation,
-            detail: detail.into(),
-        })
-    }
-
-    /// Classifies validation work that cannot finish within its deadline.
-    pub fn unavailable(operation: &'static str, detail: impl Into<String>) -> ReadError {
-        Error::new(Self::Unavailable {
-            operation,
-            detail: detail.into(),
-        })
-    }
-
-    /// Classifies an engine answer the served revision's bytes cannot carry.
-    ///
-    /// The caller that meets this refusal cannot clear it by resending: the engine
-    /// answers about the revision it holds until it has read the new bytes. Callers
-    /// inside the engine tier degrade to the indexed answer instead of surfacing it.
-    #[must_use]
-    pub fn engine_answer(operation: &'static str, detail: impl Into<String>) -> ReadError {
-        Error::new(Self::EngineAnswer {
-            operation,
-            detail: detail.into(),
-        })
-    }
-
-    /// Classifies exhausted wait for bounded blocking capacity.
-    #[must_use]
-    pub fn capacity_timeout(operation: &'static str, timeout_ms: u64) -> ReadError {
-        Error::new(Self::CapacityTimeout {
-            operation,
-            timeout_ms,
-        })
-    }
-}
-
-/// Opaque read-service failure.
-pub type ReadError = Error<ReadFault>;
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -435,14 +90,14 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when root cannot be indexed within bounds.
+    /// Returns [`RiftError`] when root cannot be indexed within bounds.
     pub fn build(
         root: &Path,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
         history: HistoryConfiguration,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Self::build_with_languages(
             root,
             limits,
@@ -464,7 +119,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when configuration or root cannot be indexed
+    /// Returns [`RiftError`] when configuration or root cannot be indexed
     /// within bounds.
     pub fn build_with_languages(
         root: &Path,
@@ -474,7 +129,7 @@ impl ReadService {
         languages: &LanguageFileSelections,
         history: HistoryConfiguration,
         dependencies: DependenciesConfiguration,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let cancelled = || false;
         Self::build_with_languages_cancellable(ReadServiceBuild {
             root,
@@ -493,11 +148,11 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when configuration or root cannot be indexed within bounds,
+    /// Returns [`RiftError`] when configuration or root cannot be indexed within bounds,
     /// or when indexing is cancelled.
     pub fn build_with_languages_cancellable(
         build: ReadServiceBuild<'_>,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let ReadServiceBuild {
             root,
             limits,
@@ -529,9 +184,8 @@ impl ReadService {
             &cache,
             cancelled,
         )
-        .map_err(|source| {
+        .inspect_err(|_| {
             span.record("outcome", "error");
-            ReadFault::index(source)
         })?;
         let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
             root,
@@ -541,9 +195,8 @@ impl ReadService {
             languages,
             cancelled,
         )
-        .map_err(|source| {
+        .inspect_err(|_| {
             span.record("outcome", "error");
-            ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
         let context = Arc::new(resolved_context(root, &source_policy, &dependencies)?);
@@ -594,13 +247,13 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] if the policy cannot list visible paths or dependency
+    /// Returns [`RiftError`] if the policy cannot list visible paths or dependency
     /// resolution refuses its configured input.
     pub fn dependency_context_for_policy(
         root: &Path,
         source_policy: &WorkspaceSourcePolicy,
         dependencies: &DependenciesConfiguration,
-    ) -> Result<DependencyContext, ReadError> {
+    ) -> Result<DependencyContext, RiftError> {
         resolved_context(root, source_policy, dependencies)
     }
 
@@ -664,21 +317,23 @@ impl ReadService {
     fn filesystem_policy(
         &self,
         operation: &'static str,
-    ) -> Result<&WorkspaceSourcePolicy, ReadError> {
-        self.source_policy
-            .as_deref()
-            .ok_or_else(|| ReadFault::task(operation, "a revision snapshot has no filesystem tree"))
+    ) -> Result<&WorkspaceSourcePolicy, RiftError> {
+        self.source_policy.as_deref().ok_or_else(|| {
+            errors::server::read_task()
+                .operation(operation)
+                .detail("a revision snapshot has no filesystem tree")
+                .error()
+        })
     }
 
     /// Returns every visible regular file's content digest.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when this is a revision snapshot or capture fails.
-    pub fn visible_workspace_digests(&self) -> Result<WorkspaceDigests, ReadError> {
+    /// Returns [`RiftError`] when this is a revision snapshot or capture fails.
+    pub fn visible_workspace_digests(&self) -> Result<WorkspaceDigests, RiftError> {
         self.filesystem_policy("capture visible workspace digests")?
             .visible_digests()
-            .map_err(ReadFault::index)
     }
 
     /// The digest of the bytes this snapshot indexed at `path`, or nothing when it indexes
@@ -730,7 +385,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the root, the policy, or a visible file cannot be indexed
+    /// Returns [`RiftError`] when the root, the policy, or a visible file cannot be indexed
     /// within bounds.
     pub fn rescanned(
         &self,
@@ -738,7 +393,7 @@ impl ReadService {
         visibility: &SourceVisibility,
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         self.rescanned_cancellable(root, visibility, text_inclusion, languages, &|| false)
     }
 
@@ -746,7 +401,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the root, policy, or a visible file cannot be indexed
+    /// Returns [`RiftError`] when the root, policy, or a visible file cannot be indexed
     /// within bounds, or when indexing is cancelled.
     pub fn rescanned_cancellable(
         &self,
@@ -755,7 +410,7 @@ impl ReadService {
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -779,9 +434,8 @@ impl ReadService {
                 )?;
                 Ok((index, source_policy))
             });
-        let (index, source_policy) = built.map_err(|source| {
+        let (index, source_policy) = built.inspect_err(|_| {
             span.record("outcome", "error");
-            ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
         let context = Arc::new(resolved_context(
@@ -813,10 +467,10 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when this is a revision snapshot, which has no filesystem tree
+    /// Returns [`RiftError`] when this is a revision snapshot, which has no filesystem tree
     /// to read the named paths from, or when a named path cannot be read or indexed within
     /// bounds.
-    pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, ReadError> {
+    pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, RiftError> {
         self.rebuilt_cancellable(changes, &|| false)
     }
 
@@ -824,13 +478,13 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when a named path cannot be indexed within bounds, or when
+    /// Returns [`RiftError`] when a named path cannot be indexed within bounds, or when
     /// indexing is cancelled.
     pub fn rebuilt_cancellable(
         &self,
         changes: &PathChanges,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let source_policy = self.filesystem_policy("incremental rebuild")?;
         let span = tracing::info_span!(
             "index.build",
@@ -844,9 +498,8 @@ impl ReadService {
         let index = self
             .index
             .rebuilt_cancellable(changes, cancelled)
-            .map_err(|source| {
+            .inspect_err(|_| {
                 span.record("outcome", "error");
-                ReadFault::index(source)
             })?;
         let revisions = captured_revisions(&index);
         let context = self.context_after(source_policy, changes, &index)?;
@@ -879,7 +532,7 @@ impl ReadService {
         source_policy: &WorkspaceSourcePolicy,
         changes: &PathChanges,
         index: &WorkspaceIndex,
-    ) -> Result<Arc<DependencyContext>, ReadError> {
+    ) -> Result<Arc<DependencyContext>, RiftError> {
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
             self.context.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
@@ -955,7 +608,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the spelling breaks the advertised
+    /// Returns [`RiftError`] when the spelling breaks the advertised
     /// charset, the workspace has no repository, the revision does not
     /// resolve to a commit, or the revision tree cannot be indexed within
     /// bounds.
@@ -965,7 +618,7 @@ impl ReadService {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         history: HistoryConfiguration,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Self::at_revision_with_languages(
             root,
             rev,
@@ -981,7 +634,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when revision or configuration cannot be served.
+    /// Returns [`RiftError`] when revision or configuration cannot be served.
     pub fn at_revision_with_languages(
         root: &Path,
         rev: &RevisionId,
@@ -990,12 +643,15 @@ impl ReadService {
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
         history: HistoryConfiguration,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         if let Some(violation) = rev.violation() {
-            return Err(ReadFault::invalid("rev", violation.as_str()));
+            return errors::server::read_invalid()
+                .field("rev")
+                .violation(violation.as_str())
+                .fail();
         }
-        let repository = Repository::open(root).map_err(ReadFault::history)?;
-        let resolved = repository.resolve(&rev.0).map_err(ReadFault::history)?;
+        let repository = Repository::open(root)?;
+        let resolved = repository.resolve(&rev.0)?;
         let index = WorkspaceIndex::at_revision_with_languages(
             &repository,
             &resolved,
@@ -1003,8 +659,7 @@ impl ReadService {
             visibility,
             text_inclusion,
             languages,
-        )
-        .map_err(ReadFault::index)?;
+        )?;
         let revisions = captured_revisions(&index);
         Ok(Self {
             index,
@@ -1028,7 +683,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] for an invalid target, read, syntax, bound, or
+    /// Returns [`RiftError`] for an invalid target, read, syntax, bound, or
     /// cancellation.
     ///
     /// # Panics
@@ -1039,7 +694,7 @@ impl ReadService {
         preparation: &mut WorkspaceIndexPreparation,
         target: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+    ) -> Result<WorkspaceIndex, RiftError> {
         preparation.advance_to_with_previous(target, Some(&self.index), cancelled)
     }
 
@@ -1102,7 +757,7 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] naming `packages` for an argument the read cannot send:
+    /// Returns [`RiftError`] naming `packages` for an argument the read cannot send:
     /// beside the `local` scope, beside `rev`, past `REQUESTED_PACKAGES_MAX` entries, or
     /// with an entry outside its advertised lengths.
     pub fn read_context(
@@ -1110,7 +765,7 @@ impl ReadService {
         scope: SearchScope,
         rev: Option<&RevisionId>,
         packages: &[RequestedPackage],
-    ) -> Result<Arc<DependencyContext>, ReadError> {
+    ) -> Result<Arc<DependencyContext>, RiftError> {
         validate_requested_packages(scope, rev.is_some(), packages)?;
         if packages.is_empty() {
             return Ok(Arc::clone(&self.context));
@@ -1192,12 +847,16 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for invalid paths, missing files, or a `position` at or past the
+    /// Returns [`RiftError`] for invalid paths, missing files, or a `position` at or past the
     /// file's byte length.
-    pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
+    pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, RiftError> {
         validate_common(params.rev.is_some())?;
         let path = CoreProjectPath::new(params.path.0).map_err(|error| {
-            ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
+            errors::server::read_invalid()
+                .field("path")
+                .violation(error.detail())
+                .cause(error)
+                .error()
         })?;
         let file = self
             .index
@@ -1206,8 +865,7 @@ impl ReadService {
         validate_node_position(file, params.position)?;
         let nodes = self
             .index
-            .nodes(&path, params.position)
-            .map_err(ReadFault::index)?
+            .nodes(&path, params.position)?
             .ok_or_else(|| self.missing_file_fault(&path))?;
         Ok(nodes_at_file(file, &nodes, self.revisions.warnings()))
     }
@@ -1218,28 +876,36 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for an invalid or absent path, a path outside the selected source
+    /// Returns [`RiftError`] for an invalid or absent path, a path outside the selected source
     /// set, a parse refusal, or a source that changed during the read.
-    pub fn nodes_for_preparation(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
+    pub fn nodes_for_preparation(&self, params: NodesParams) -> Result<NodesResult, RiftError> {
         validate_common(params.rev.is_some())?;
         let path = CoreProjectPath::new(params.path.0.clone()).map_err(|error| {
-            ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
+            errors::server::read_invalid()
+                .field("path")
+                .violation(error.detail())
+                .cause(error)
+                .error()
         })?;
         if self.file_record(&path).is_some() {
             return self.nodes(params);
         }
         let Some(policy) = self.source_policy.as_deref() else {
-            return Err(ReadFault::unavailable(
-                "nodes",
-                "workspace discovery has not selected a source path",
-            ));
+            return errors::server::read_unavailable()
+                .operation("nodes")
+                .detail("workspace discovery has not selected a source path")
+                .fail();
         };
         let absolute = self.index.root().join(path.as_str());
         let before = policy.visible_digest(&absolute).map_err(|error| {
-            if error.fault().left_out_file(path.clone()).is_some() {
-                ReadFault::source_unavailable(path.as_str())
+            if error.slug() == errors::index::workspace_file_too_large::SLUG
+                || self.index_names_omission(&path)
+            {
+                errors::server::read_source_unavailable()
+                    .path(path.as_str())
+                    .error()
             } else {
-                ReadFault::index(error)
+                error
             }
         })?;
         let Some(before) = before else {
@@ -1247,27 +913,35 @@ impl ReadService {
         };
         let Some(parsed) = self
             .index
-            .parse_source_file_with_nodes(&path, params.position)
-            .map_err(ReadFault::index)?
+            .parse_source_file_with_nodes(&path, params.position)?
         else {
             return self.nodes(params);
         };
         let parsed = match parsed {
             IndexRead::Included(parsed) => parsed,
-            IndexRead::Skipped(_) => return Err(ReadFault::source_unavailable(path.as_str())),
+            IndexRead::Skipped(_) => {
+                return errors::server::read_source_unavailable()
+                    .path(path.as_str())
+                    .fail();
+            }
         };
         let after = policy.visible_digest(&absolute).map_err(|error| {
-            if error.fault().left_out_file(path.clone()).is_some() {
-                ReadFault::unavailable("nodes", "source changed during the targeted read")
+            if error.slug() == errors::index::workspace_file_too_large::SLUG
+                || self.index_names_omission(&path)
+            {
+                errors::server::read_unavailable()
+                    .operation("nodes")
+                    .detail("source changed during the targeted read")
+                    .error()
             } else {
-                ReadFault::index(error)
+                error
             }
         })?;
         if before != parsed.file.digest() || after != Some(before) {
-            return Err(ReadFault::unavailable(
-                "nodes",
-                "source changed during the targeted read",
-            ));
+            return errors::server::read_unavailable()
+                .operation("nodes")
+                .detail("source changed during the targeted read")
+                .fail();
         }
         validate_node_position(&parsed.file, params.position)?;
         Ok(nodes_at_file(
@@ -1280,18 +954,24 @@ impl ReadService {
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
     /// this snapshot's warnings name an omission, the capability a syntax read lacks when
     /// this snapshot can confirm the path is real, and `not_found` otherwise.
-    fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
+    fn missing_file_fault(&self, path: &CoreProjectPath) -> RiftError {
         if self.index_names_omission(path) {
-            return ReadFault::source_unavailable(path.as_str());
+            return errors::server::read_source_unavailable()
+                .path(path.as_str())
+                .error();
         }
         match self.unserved_syntax(path) {
             Ok(Some(UnservedSyntax::Configurable(capability))) => {
-                ReadFault::unsupported(capability)
+                errors::server::read_unsupported()
+                    .capability(capability)
+                    .error()
             }
             Ok(Some(UnservedSyntax::Unclaimed(extension))) => {
-                ReadFault::unclaimed_extension(extension)
+                errors::server::read_unclaimed_extension()
+                    .extension(extension)
+                    .error()
             }
-            Ok(None) => ReadFault::not_found(path.as_str()),
+            Ok(None) => errors::server::read_not_found().path(path.as_str()).error(),
             Err(storage_fault) => storage_fault,
         }
     }
@@ -1309,9 +989,9 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when two language entries match `path`, or when the
+    /// Returns [`RiftError`] when two language entries match `path`, or when the
     /// filesystem cannot answer whether it exists.
-    fn unserved_syntax(&self, path: &CoreProjectPath) -> Result<Option<UnservedSyntax>, ReadError> {
+    fn unserved_syntax(&self, path: &CoreProjectPath) -> Result<Option<UnservedSyntax>, RiftError> {
         let Some(reason) = self.unserved_syntax_reason(path)? else {
             return Ok(None);
         };
@@ -1323,12 +1003,11 @@ impl ReadService {
     fn unserved_syntax_reason(
         &self,
         path: &CoreProjectPath,
-    ) -> Result<Option<UnservedSyntax>, ReadError> {
+    ) -> Result<Option<UnservedSyntax>, RiftError> {
         let claim = self
             .index
             .language_policy()
-            .language_for_path(Path::new(path.as_str()))
-            .map_err(ReadFault::index)?;
+            .language_for_path(Path::new(path.as_str()))?;
         Ok(match claim {
             Some(language) if language.enabled() && language.has_syntax() => None,
             Some(language) => Some(UnservedSyntax::Configurable(format!(
@@ -1343,7 +1022,7 @@ impl ReadService {
     /// current tree the `[source]` policy has to make `path` visible and the
     /// filesystem has to hold it; a revision snapshot carries no filesystem policy,
     /// so the tree it was built from is the answer.
-    fn path_is_real(&self, path: &CoreProjectPath) -> Result<bool, ReadError> {
+    fn path_is_real(&self, path: &CoreProjectPath) -> Result<bool, RiftError> {
         let Some(policy) = self.source_policy.as_deref() else {
             return Ok(true);
         };
@@ -1351,9 +1030,13 @@ impl ReadService {
         if !policy.visible(&absolute) {
             return Ok(false);
         }
-        absolute
-            .try_exists()
-            .map_err(|error| ReadFault::storage(path.as_str(), "stat", &error))
+        absolute.try_exists().map_err(|error| {
+            errors::server::read_storage()
+                .path(path.as_str())
+                .operation("stat")
+                .io(&error)
+                .error()
+        })
     }
 
     /// Finds declarations by name, with each hit's version-control timeline
@@ -1364,10 +1047,10 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a scope beyond `local` beside `rev`, a `packages`
+    /// Returns [`RiftError`] for a scope beyond `local` beside `rev`, a `packages`
     /// argument the read cannot send, and symbol history the workspace's version control
     /// cannot serve.
-    pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
+    pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, RiftError> {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
         validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
@@ -1379,9 +1062,7 @@ impl ReadService {
         let mut candidates = if params.scope == SearchScope::Global {
             Vec::new()
         } else {
-            self.index
-                .symbols(&params.name, results_max)
-                .map_err(ReadFault::index)?
+            self.index.symbols(&params.name, results_max)?
         };
         let bound_reached = candidates.len() >= results_max;
         if let Some(language) = &params.language {
@@ -1433,18 +1114,21 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] naming `scope` for a scope beyond `local` beside a
+    /// Returns [`RiftError`] naming `scope` for a scope beyond `local` beside a
     /// revision.
     pub(crate) fn validate_dependency_scope(
         &self,
         scope: SearchScope,
         rev: Option<&RevisionId>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         if scope == SearchScope::Local {
             return Ok(());
         }
         if rev.is_some() || self.revision.is_some() {
-            return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
+            return errors::server::read_invalid()
+                .field("scope")
+                .violation(CURRENT_TREE_ALONE)
+                .fail();
         }
         Ok(())
     }
@@ -1456,7 +1140,7 @@ impl ReadService {
         matched: SymbolMatch<'_>,
         include_source: bool,
         timelines: Option<&mut SymbolTimelines>,
-    ) -> Result<(GetSymbolHit, Option<ReadWarning>), ReadError> {
+    ) -> Result<(GetSymbolHit, Option<ReadWarning>), RiftError> {
         let history = match timelines {
             Some(timelines) => Some(
                 timelines.timeline(language_provider(matched.file.syntax().language()), matched)?,
@@ -1485,10 +1169,10 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when `[providers.history]` is disabled, the
+    /// Returns [`RiftError`] when `[providers.history]` is disabled, the
     /// workspace's version control cannot serve a start, or the attached
     /// store cannot be read.
-    fn symbol_timelines(&self) -> Result<SymbolTimelines, ReadError> {
+    fn symbol_timelines(&self) -> Result<SymbolTimelines, RiftError> {
         SymbolTimelines::open(
             self.index.root(),
             self.revision.as_ref(),
@@ -1506,15 +1190,18 @@ impl ReadService {
 ///
 /// Returns `invalid_request` naming `limit` for zero, or for a limit past
 /// `PAGE_LIMIT_MAX`.
-pub fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
+pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
     if requested == 0 {
-        return Err(ReadFault::invalid("limit", "zero"));
+        return errors::server::read_invalid()
+            .field("limit")
+            .violation("zero")
+            .fail();
     }
     if requested > PAGE_LIMIT_MAX {
-        return Err(ReadFault::invalid(
-            "limit",
-            format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"),
-        ));
+        return errors::server::read_invalid()
+            .field("limit")
+            .violation(format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"))
+            .fail();
     }
     let Ok(limit) = usize::try_from(requested) else {
         unreachable!("a limit at or under PAGE_LIMIT_MAX fits usize: requested={requested}")
@@ -1533,7 +1220,7 @@ const _: () = assert!(PAGE_LIMIT_MAX <= usize::MAX as u64);
     reason = "kept as Result for symmetry with every other read validation, which every call \
               site propagates with `?`"
 )]
-pub(crate) fn validate_common(_rev: bool) -> Result<(), ReadError> {
+pub(crate) fn validate_common(_rev: bool) -> Result<(), RiftError> {
     Ok(())
 }
 
@@ -1553,14 +1240,17 @@ const LOCAL_SCOPE_ALONE: &str = "the local scope reads the project alone";
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] naming `packages` for the first rule the argument breaks.
+/// Returns [`RiftError`] naming `packages` for the first rule the argument breaks.
 pub(crate) fn validate_requested_packages(
     scope: SearchScope,
     rev: bool,
     packages: &[RequestedPackage],
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     match requested_packages_violation(scope, rev, packages) {
-        Some(violation) => Err(ReadFault::invalid("packages", violation)),
+        Some(violation) => errors::server::read_invalid()
+            .field("packages")
+            .violation(violation)
+            .fail(),
         None => Ok(()),
     }
 }
@@ -1583,7 +1273,7 @@ fn requested_packages_violation(
         _ => packages.iter().enumerate().find_map(|(index, package)| {
             package
                 .violation()
-                .map(|violation| format!("entry {index} breaks {}", fault_label(&violation)))
+                .map(|violation| format!("entry {index} breaks {}", violation.as_ref()))
         }),
     }
 }
@@ -1672,8 +1362,8 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
 pub(crate) fn wire_symbol(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
-) -> Result<(Symbol, Option<ReadWarning>), ReadError> {
-    let readable = index.assembled_symbol(matched).map_err(ReadFault::index)?;
+) -> Result<(Symbol, Option<ReadWarning>), RiftError> {
+    let readable = index.assembled_symbol(matched)?;
     let symbol = assembled_wire_symbol(&readable);
     let disagreement = symbol_disagreement_warning(readable.assembled());
     Ok((symbol, disagreement))
@@ -1915,13 +1605,15 @@ fn nodes_at_file(
     }
 }
 
-fn validate_node_position(file: &IndexedFile, position: u64) -> Result<(), ReadError> {
+fn validate_node_position(file: &IndexedFile, position: u64) -> Result<(), RiftError> {
     let source_len = file.source().len() as u64;
     if position >= source_len {
-        return Err(ReadFault::invalid(
-            "position",
-            format!("{position} is at or past the file's byte length {source_len}"),
-        ));
+        return errors::server::read_invalid()
+            .field("position")
+            .violation(format!(
+                "{position} is at or past the file's byte length {source_len}"
+            ))
+            .fail();
     }
     Ok(())
 }
@@ -2000,10 +1692,9 @@ fn resolved_context(
     root: &Path,
     source_policy: &WorkspaceSourcePolicy,
     configuration: &DependenciesConfiguration,
-) -> Result<DependencyContext, ReadError> {
+) -> Result<DependencyContext, RiftError> {
     let visible: Vec<ProjectPath> = source_policy
-        .visible_paths()
-        .map_err(ReadFault::index)?
+        .visible_paths()?
         .iter()
         .map(project_path)
         .collect();
@@ -2144,20 +1835,51 @@ impl SymbolAddress {
 /// Splits `rift://symbol/<language>/<path>/<qualified-name>` into its
 /// decoded parts. The language segment is taken as spelled; resolution
 /// verifies it against the addressed file's document.
-pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, ReadError> {
-    let malformed = || ReadFault::invalid("symbol", "not a rift symbol address");
+pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, RiftError> {
     let remainder = address
         .strip_prefix(rift_core::constants::SYMBOL_URI_PREFIX)
-        .ok_or_else(malformed)?;
-    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(malformed)?;
+        .ok_or_else(|| {
+            errors::server::read_invalid()
+                .field("symbol")
+                .violation("not a rift symbol address")
+                .error()
+        })?;
+    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
     if language_segment.is_empty() {
-        return Err(malformed());
+        return errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .fail();
     }
-    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(malformed)?;
-    let path = decoded(encoded_path).ok_or_else(malformed)?;
-    let qualified_name = decoded(encoded_name).ok_or_else(malformed)?;
+    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
+    let path = decoded(encoded_path).ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
+    let qualified_name = decoded(encoded_name).ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
     let path = CoreProjectPath::new(path).map_err(|error| {
-        ReadFault::invalid("symbol", rift_core::fault_label(&error.fault().violation()))
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation(error.detail())
+            .cause(error)
+            .error()
     })?;
     Ok(SymbolAddress {
         language_segment: language_segment.to_owned(),
@@ -2198,8 +1920,8 @@ pub(crate) mod tests {
 
     use super::{
         Arc, DependenciesConfiguration, DependencyResolution, HistoryConfiguration,
-        REQUESTED_PACKAGES_MAX, ReadError, ReadFault, ReadService, RequestedPackage,
-        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, excerpt, file_id,
+        REQUESTED_PACKAGES_MAX, ReadService, RequestedPackage, RiftError, WorkspaceIndex,
+        WorkspaceIndexLimits, accepted_limit, errors, excerpt, file_id,
         validate_requested_packages, wire_node,
     };
 
@@ -2207,17 +1929,45 @@ pub(crate) mod tests {
 
     #[test]
     fn symbol_address_refuses_empty_language_and_decoded_invalid_paths() {
-        for (address, expected) in [
-            ("rift://symbol//lib.rs/beacon", "not a rift symbol address"),
-            ("rift://symbol/rust/%2Flib.rs/beacon", "absolute"),
-            ("rift://symbol/rust/src%2F..%2Flib.rs/beacon", "dot_segment"),
+        for (address, expected_violation, expected_cause) in [
+            (
+                "rift://symbol//lib.rs/beacon",
+                Some("not a rift symbol address"),
+                None,
+            ),
+            (
+                "rift://symbol/rust/%2Flib.rs/beacon",
+                None,
+                Some(rift_error::errors::core::path_absolute::SLUG),
+            ),
+            (
+                "rift://symbol/rust/src%2F..%2Flib.rs/beacon",
+                None,
+                Some(rift_error::errors::core::path_dot_segment::SLUG),
+            ),
         ] {
             let error = super::parse_symbol_address(address)
                 .map(|_| ())
                 .expect_err("invalid address");
+            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
             assert!(
-                matches!(error.fault(), ReadFault::Invalid { field: "symbol", violation } if violation == expected)
+                error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "symbol")
             );
+            if let Some(expected) = expected_violation {
+                assert!(
+                    error
+                        .context()
+                        .any(|(key, value)| key == "violation" && value == expected)
+                );
+            }
+            if let Some(expected) = expected_cause {
+                let cause = std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<RiftError>())
+                    .expect("invalid path error remains its cause");
+                assert_eq!(cause.slug(), expected);
+            }
         }
     }
 
@@ -2228,7 +1978,7 @@ pub(crate) mod tests {
         limits: WorkspaceIndexLimits,
         text_inclusion: &rift_core::TextFileInclusion,
         languages: &LanguageFileSelections,
-    ) -> Result<ReadService, super::ReadError> {
+    ) -> Result<ReadService, super::RiftError> {
         ReadService::build_with_languages(
             root,
             limits,
@@ -2451,11 +2201,11 @@ pub(crate) mod tests {
             })
             .expect_err("a language entry that is turned off serves no syntax");
 
-        let fault = error.fault();
+        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
         assert!(
-            matches!(fault, ReadFault::Unsupported { capability } if capability == "rust files"),
-            "an entry the workspace can turn back on refuses as a capability, not as an \
-             unclaimed extension: {fault:?}"
+            error
+                .context()
+                .any(|(key, value)| { key == "capability" && value == "rust files" })
         );
         Ok(())
     }
@@ -2475,10 +2225,11 @@ pub(crate) mod tests {
         let error = reads_with(directory.path(), limits, &text_inclusion, &languages)
             .expect_err("an ignore chain past the file bound cannot be compiled");
 
-        let fault = error.fault();
+        assert_eq!(error.slug(), errors::index::workspace_too_many_files::SLUG);
         assert!(
-            matches!(fault, ReadFault::Index(_)),
-            "unexpected fault {fault:?}"
+            error
+                .context()
+                .any(|(key, value)| key == "maximum" && value == "1")
         );
         Ok(())
     }
@@ -2900,16 +2651,14 @@ pub fn compute() -> i32 {
             let settled_error = settled
                 .nodes(params)
                 .expect_err("settled index omits the same source");
-            assert!(matches!(
-                partial_error.fault(),
-                ReadFault::SourceUnavailable { .. }
-            ));
-            assert!(matches!(
-                settled_error.fault(),
-                ReadFault::SourceUnavailable { .. }
-            ));
-            assert_eq!(partial_error.descriptor().code(), "content_unavailable");
-            assert_eq!(settled_error.descriptor().code(), "content_unavailable");
+            assert_eq!(
+                partial_error.slug(),
+                errors::server::read_source_unavailable::SLUG
+            );
+            assert_eq!(
+                settled_error.slug(),
+                errors::server::read_source_unavailable::SLUG
+            );
         }
 
         let large_directory = tempfile::tempdir()?;
@@ -2936,8 +2685,31 @@ pub fn compute() -> i32 {
         let settled_error = settled
             .nodes(params)
             .expect_err("settled index leaves the same file out");
-        assert_eq!(partial_error.descriptor().code(), "content_unavailable");
-        assert_eq!(settled_error.descriptor().code(), "content_unavailable");
+        assert_eq!(
+            partial_error.slug(),
+            errors::server::read_source_unavailable::SLUG
+        );
+        assert_eq!(
+            settled_error.slug(),
+            errors::server::read_source_unavailable::SLUG
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nodes_preparation_preserves_unrelated_source_read_errors() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let partial = partial_nodes_service(directory.path(), WorkspaceIndexLimits::default())?;
+        fs::create_dir(directory.path().join("blocked.rs"))?;
+        let error = partial
+            .nodes_for_preparation(NodesParams {
+                path: ProjectPath("blocked.rs".to_owned()),
+                position: 0,
+                rev: None,
+            })
+            .expect_err("reading a directory as source fails");
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
         Ok(())
     }
 
@@ -2987,7 +2759,7 @@ pub fn compute() -> i32 {
         let error = settled
             .nodes_for_preparation(params)
             .expect_err("a recorded declaration-bound omission must not be reparsed");
-        assert_eq!(error.descriptor().code(), "content_unavailable");
+        assert_eq!(error.slug(), errors::server::read_source_unavailable::SLUG);
         Ok(())
     }
 
@@ -3005,10 +2777,12 @@ pub fn compute() -> i32 {
                     rev: None,
                 })
                 .expect_err("a position at or past the file's byte length must refuse");
-            let ReadFault::Invalid { field, .. } = error.fault() else {
-                panic!("expected Invalid, got {:?}", error.fault());
-            };
-            assert_eq!(*field, "position");
+            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "position")
+            );
         }
         Ok(())
     }
@@ -3339,8 +3113,7 @@ pub fn compute() -> i32 {
         let error = service
             .get_symbol(&params)
             .expect_err("a workspace without a repository cannot serve history");
-        assert!(matches!(error.fault(), ReadFault::History(_)));
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert_eq!(error.slug(), errors::history::unversioned::SLUG);
         Ok(())
     }
 
@@ -3362,10 +3135,10 @@ pub fn compute() -> i32 {
         let error = service
             .get_symbol(&params)
             .expect_err("a disabled history provider must refuse");
-        let ReadFault::Unsupported { capability } = error.fault() else {
-            panic!("expected Unsupported, got {:?}", error.fault());
-        };
-        assert_eq!(capability, "symbol history (providers.history disabled)");
+        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
+        assert!(error.context().any(|(key, value)| {
+            key == "capability" && value == "symbol history (providers.history disabled)"
+        }));
         Ok(())
     }
 
@@ -3564,10 +3337,10 @@ pub fn compute() -> i32 {
             position: 0,
             rev: None,
         });
-        assert!(matches!(
-            missing.expect_err("missing source must fail").fault(),
-            ReadFault::NotFound { .. }
-        ));
+        assert_eq!(
+            missing.expect_err("missing source must fail").slug(),
+            rift_error::errors::server::read_not_found::SLUG
+        );
         Ok(())
     }
 
@@ -3576,7 +3349,7 @@ pub fn compute() -> i32 {
     fn nodes_service(
         directory: &std::path::Path,
         visibility: &SourceVisibility,
-    ) -> Result<ReadService, super::ReadError> {
+    ) -> Result<ReadService, super::RiftError> {
         let limits = WorkspaceIndexLimits::default();
         let inclusion = rift_core::TextFileInclusion::default();
         ReadService::build(
@@ -3588,7 +3361,7 @@ pub fn compute() -> i32 {
         )
     }
 
-    fn nodes_at_root(service: &ReadService, path: &str) -> Result<NodesResult, super::ReadError> {
+    fn nodes_at_root(service: &ReadService, path: &str) -> Result<NodesResult, super::RiftError> {
         service.nodes(NodesParams {
             path: ProjectPath(path.to_owned()),
             position: 0,
@@ -3603,11 +3376,12 @@ pub fn compute() -> i32 {
         let service = nodes_service(directory.path(), &SourceVisibility::default())?;
         let error = nodes_at_root(&service, "Cargo.lock")
             .expect_err("an unparsed extension must be rejected");
-        let ReadFault::UnclaimedExtension { extension } = error.fault() else {
-            panic!("expected UnclaimedExtension, got {:?}", error.fault());
-        };
-        assert_eq!(extension, "lock files", "the refusal names the extension");
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert_eq!(error.slug(), errors::server::read_unclaimed_extension::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "extension" && value == "lock files")
+        );
         assert!(
             !error.to_string().contains("configure a provider"),
             "no configuration can ever add a shipped grammar, so the message must not \
@@ -3625,10 +3399,9 @@ pub fn compute() -> i32 {
         let error =
             nodes_at_root(&service, "Cargo.lock").expect_err("an excluded path must be rejected");
         assert!(
-            matches!(error.fault(), ReadFault::NotFound { .. }),
+            (error.slug() == rift_error::errors::server::read_not_found::SLUG),
             "the workspace asked for this path to be invisible, so nodes cannot name a \
-             capability for it: {:?}",
-            error.fault()
+             capability for it: {error}"
         );
         Ok(())
     }
@@ -3640,9 +3413,8 @@ pub fn compute() -> i32 {
         let error =
             nodes_at_root(&service, "absent.lock").expect_err("an absent path must be rejected");
         assert!(
-            matches!(error.fault(), ReadFault::NotFound { .. }),
-            "no file stands at that path, so there is no capability to name: {:?}",
-            error.fault()
+            (error.slug() == rift_error::errors::server::read_not_found::SLUG),
+            "no file stands at that path, so there is no capability to name: {error}"
         );
         Ok(())
     }
@@ -3654,12 +3426,11 @@ pub fn compute() -> i32 {
         let service = nodes_service(directory.path(), &SourceVisibility::default())?;
         let error = nodes_at_root(&service, "justfile")
             .expect_err("an unparsed extension must be rejected");
-        let ReadFault::UnclaimedExtension { extension } = error.fault() else {
-            panic!("expected UnclaimedExtension, got {:?}", error.fault());
-        };
-        assert_eq!(
-            extension, "files with no extension",
-            "justfile carries no extension at all"
+        assert_eq!(error.slug(), errors::server::read_unclaimed_extension::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "extension" && value == "files with no extension" })
         );
         Ok(())
     }
@@ -3677,28 +3448,26 @@ pub fn compute() -> i32 {
 
         let invalid = nodes_at_root(&service, "src/invalid.rs")
             .expect_err("the addressed file exists but cannot be read");
-        let invalid_fault = invalid.fault();
         assert!(
-            matches!(invalid_fault, ReadFault::SourceUnavailable { .. }),
-            "an invalid-UTF-8 path answers content_unavailable, not not_found: {invalid_fault:?}"
+            invalid.slug() == rift_error::errors::server::read_source_unavailable::SLUG,
+            "an invalid-UTF-8 path answers content_unavailable, not not_found: {invalid}"
         );
-        assert_eq!(
-            invalid.descriptor().code(),
-            "content_unavailable",
-            "the wire code names the omitted content, not a missing path"
+        assert!(
+            invalid
+                .context()
+                .any(|(key, value)| { key == "path" && value == "src/invalid.rs" })
         );
 
         let absent = nodes_at_root(&service, "src/missing.rs")
             .expect_err("a path nothing claims must still fail");
-        let absent_fault = absent.fault();
         assert!(
-            matches!(absent_fault, ReadFault::NotFound { .. }),
-            "a genuinely absent sibling path is unaffected: {absent_fault:?}"
+            absent.slug() == rift_error::errors::server::read_not_found::SLUG,
+            "an absent sibling path is unaffected: {absent}"
         );
-        assert_eq!(
-            absent.descriptor().code(),
-            "resource_not_found",
-            "a genuinely absent path keeps its own wire code"
+        assert!(
+            absent
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/missing.rs")
         );
 
         let kept = nodes_at_root(&service, "src/lib.rs")?;
@@ -3800,22 +3569,31 @@ pub fn compute() -> i32 {
         )
         .expect_err("missing root must fail");
 
-        assert!(matches!(error.fault(), ReadFault::Index(_)));
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::index::workspace_invalid_root::SLUG
+        );
         assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
     fn nodes_rejects_path_outside_project_root() -> TestResult {
         let (_directory, service) = fixture()?;
-        let result = service.nodes(NodesParams {
-            path: ProjectPath("/etc/passwd".to_owned()),
-            position: 0,
-            rev: None,
-        });
-        assert!(matches!(
-            result.expect_err("absolute path must fail").fault(),
-            ReadFault::Invalid { .. }
-        ));
+        let error = service
+            .nodes(NodesParams {
+                path: ProjectPath("/etc/passwd".to_owned()),
+                position: 0,
+                rev: None,
+            })
+            .expect_err("absolute path must fail");
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<RiftError>())
+                .expect("path validation error remains its cause")
+                .slug(),
+            rift_error::errors::core::path_absolute::SLUG
+        );
         Ok(())
     }
 
@@ -3924,10 +3702,10 @@ pub fn compute() -> i32 {
                 .expect_err("rev pairs with the project scope alone");
 
             assert!(
-                matches!(error.fault(), ReadFault::Invalid { field: "scope", .. }),
+                (error.slug() == rift_error::errors::server::read_invalid::SLUG),
                 "scope {scope}: {error}"
             );
-            assert_eq!(error.descriptor().code(), "invalid_request");
+            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         }
         Ok(())
     }
@@ -3941,14 +3719,17 @@ pub fn compute() -> i32 {
         Ok(serde_json::from_value(request)?)
     }
 
-    fn packages_violation(error: &ReadError) -> Option<&str> {
-        match error.fault() {
-            ReadFault::Invalid {
-                field: "packages",
-                violation,
-            } => Some(violation.as_str()),
-            _ => None,
+    fn packages_violation(error: &RiftError) -> Option<String> {
+        if error.slug() != errors::server::read_invalid::SLUG
+            || !error
+                .context()
+                .any(|(key, value)| key == "field" && value == "packages")
+        {
+            return None;
         }
+        error
+            .context()
+            .find_map(|(key, value)| (key == "violation").then_some(value))
     }
 
     /// A `local` read consults no package, so `packages` beside it, spelled or omitted,
@@ -3966,10 +3747,10 @@ pub fn compute() -> i32 {
                 .expect_err("a local read names no package");
             assert_eq!(
                 packages_violation(&error),
-                Some("the local scope reads the project alone"),
+                Some("the local scope reads the project alone".to_owned()),
                 "{request}: {error}"
             );
-            assert_eq!(error.descriptor().code(), "invalid_request");
+            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         }
         Ok(())
     }
@@ -3990,7 +3771,7 @@ pub fn compute() -> i32 {
                 .expect_err("a revision read names no package");
             assert_eq!(
                 packages_violation(&error),
-                Some("package facts are served for the current tree alone"),
+                Some("package facts are served for the current tree alone".to_owned()),
                 "scope {scope}: {error}"
             );
         }
@@ -4015,7 +3796,7 @@ pub fn compute() -> i32 {
             .expect_err("one entry past the bound refuses");
         assert_eq!(
             packages_violation(&error),
-            Some("65 entries exceed the maximum 64")
+            Some("65 entries exceed the maximum 64".to_owned())
         );
 
         let error = validate_requested_packages(
@@ -4026,7 +3807,7 @@ pub fn compute() -> i32 {
         .expect_err("an empty name refuses");
         assert_eq!(
             packages_violation(&error),
-            Some("entry 1 breaks name_length")
+            Some("entry 1 breaks name_length".to_owned())
         );
     }
 
@@ -4059,30 +3840,25 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn a_documentation_fault_keeps_its_identity_evidence_and_source() -> TestResult {
-        use rift_core::Fault;
-
+    fn documentation_error_keeps_its_identity_and_evidence() {
         let failure = rift_index::DocumentationCollection::from_candidate_blocks(
             rift_protocol::read::Digest("00000000".to_owned()),
             Vec::new(),
             Vec::new(),
         )
         .expect_err("incompatible documentation revision");
-        let expected_name = failure.name();
-        let expected_context = failure.context();
-        let expected_text = failure.to_string();
-        let expected_limit = failure.fault().limit_evidence();
+        let error = failure;
 
-        let error = ReadFault::documentation(failure);
-
-        assert!(matches!(error.fault(), ReadFault::Documentation(_)));
-        assert_eq!(error.name(), expected_name);
-        assert_eq!(error.context(), expected_context);
-        assert_eq!(error.fault().limit_evidence(), expected_limit);
-        let source =
-            std::error::Error::source(&error).ok_or("a documentation fault carries a source")?;
-        assert_eq!(source.to_string(), expected_text);
-        Ok(())
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::analysis::documentation_revision_invalid::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "documentation_revision" })
+        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -4126,24 +3902,28 @@ pub fn compute() -> i32 {
     #[test]
     fn storage_fault_renders_path_operation_and_io_in_order() {
         let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "sealed");
-        let error = ReadFault::storage("src/lib.rs", "stage", &io);
-        assert_eq!(error.descriptor().code(), "storage_failure");
-        let context = error.context();
-        let keys: Vec<&str> = context.iter().map(rift_core::ErrorContext::key).collect();
-        assert_eq!(keys, ["path", "operation", "io"]);
-        assert_eq!(context[0].value(), "src/lib.rs");
-        assert_eq!(context[2].value(), "sealed");
+        let error = errors::server::read_storage()
+            .path("src/lib.rs")
+            .operation("stage")
+            .io(&io)
+            .error();
+        assert_eq!(error.slug(), errors::server::read_storage::SLUG);
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("path", "src/lib.rs".to_owned())));
+        assert!(context.contains(&("operation", "stage".to_owned())));
+        assert!(context.contains(&("io", "sealed".to_owned())));
     }
 
     #[test]
     fn task_fault_is_internal_and_names_the_blocking_operation() {
-        let error = ReadFault::task("initial index build", "worker panicked");
-        assert_eq!(error.descriptor().code(), "internal_error");
-        let context = error.context();
-        assert_eq!(context[0].key(), "operation");
-        assert_eq!(context[0].value(), "initial index build");
-        assert_eq!(context[1].key(), "detail");
-        assert_eq!(context[1].value(), "worker panicked");
+        let error = errors::server::read_task()
+            .operation("initial index build")
+            .detail("worker panicked")
+            .error();
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("operation", "initial index build".to_owned())));
+        assert!(context.contains(&("detail", "worker panicked".to_owned())));
     }
 
     /// Every internal `SourceLocation` variant maps to its wire `SourceLocationKind`.
@@ -4778,7 +4558,7 @@ pub fn compute() -> i32 {
     fn revision_service(
         root: &std::path::Path,
         rev: &str,
-    ) -> Result<ReadService, super::ReadError> {
+    ) -> Result<ReadService, super::RiftError> {
         ReadService::at_revision(
             root,
             &RevisionId(rev.to_owned()),
@@ -4797,14 +4577,10 @@ pub fn compute() -> i32 {
             .visible_workspace_digests()
             .expect_err("a revision snapshot has no filesystem tree to digest");
 
-        let digests_fault = digests.fault();
-        assert!(
-            matches!(
-                digests_fault,
-                ReadFault::Task { operation, .. } if *operation == "capture visible workspace digests"
-            ),
-            "unexpected fault {digests_fault:?}"
-        );
+        assert_eq!(digests.slug(), rift_error::errors::server::read_task::SLUG);
+        assert!(digests.context().any(|(key, value)| {
+            key == "operation" && value == "capture visible workspace digests"
+        }));
         Ok(())
     }
 
@@ -4823,12 +4599,16 @@ pub fn compute() -> i32 {
             .rebuilt(&rift_index::PathChanges::between(&before, &after))
             .expect_err("a revision snapshot has no filesystem tree to rebuild from");
 
-        let context = rift_core::Fault::context(error.fault());
-        assert_eq!(error.descriptor().code(), "internal_error");
-        assert_eq!(
-            context[0],
-            rift_core::ErrorContext::new("operation", "incremental rebuild")
+        let context = error.context().collect::<Vec<_>>();
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
+        assert!(
+            context
+                .iter()
+                .any(|(key, value)| { *key == "operation" && value == "incremental rebuild" })
         );
+        assert!(context.iter().any(|(key, value)| {
+            *key == "detail" && value == "a revision snapshot has no filesystem tree"
+        }));
         Ok(())
     }
 
@@ -4843,11 +4623,13 @@ pub fn compute() -> i32 {
                 rev: Some(RevisionId("main".to_owned())),
             })
             .expect_err("an unparsed extension must be rejected at a revision too");
-        let ReadFault::UnclaimedExtension { extension } = error.fault() else {
-            panic!("expected UnclaimedExtension, got {:?}", error.fault());
-        };
+        assert_eq!(error.slug(), errors::server::read_unclaimed_extension::SLUG);
         assert_eq!(
-            extension, "lock files",
+            error
+                .context()
+                .find(|(key, _)| *key == "extension")
+                .map(|(_, value)| value),
+            Some("lock files".to_owned()),
             "a revision snapshot carries no filesystem policy, so the extension alone \
              decides: nodes can never serve an unclaimed one, whatever tree it reads"
         );
@@ -4986,15 +4768,21 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let error = revision_service(directory.path(), "main")
             .expect_err("a workspace without a repository must refuse");
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert_eq!(error.slug(), errors::history::unversioned::SLUG);
+        let context = error.context().collect::<Vec<_>>();
         let canonical = fs::canonicalize(directory.path())?;
+        assert!(context.contains(&("workspace", canonical.display().to_string())));
+        assert!(
+            context
+                .iter()
+                .any(|(key, value)| { *key == "requires" && value.contains("run `git init`") })
+        );
         assert_eq!(
             error.to_string(),
             format!(
-                "no configured provider serves this request: workspace {}, \
+                "workspace has no git repository: {}: \
                  requires a git repository - run `git init`, or omit `rev` to \
-                 read the current tree; adjust the request to a served \
-                 capability, or configure a provider that serves it",
+                 read the current tree; run `git init`, or omit `rev` to read current tree",
                 canonical.display()
             )
         );
@@ -5006,13 +4794,11 @@ pub fn compute() -> i32 {
     /// cannot have, and no resend of the same request clears it.
     #[test]
     fn an_unmappable_engine_answer_classifies_as_content_the_request_cannot_have() {
-        let error = ReadFault::engine_answer("engine references", "character out of range");
-        assert_eq!(error.descriptor().code(), "content_unavailable");
-        assert_eq!(
-            error.descriptor().retry(),
-            rift_protocol::error::RetryDirective::Never,
-            "no resend reaches bytes the engine has not read yet"
-        );
+        let error = errors::server::read_engine_answer()
+            .operation("engine references")
+            .detail("character out of range")
+            .error();
+        assert_eq!(error.slug(), errors::server::read_engine_answer::SLUG);
         assert_eq!(
             error.to_string(),
             "the addressed content exists but its bytes cannot be served: \
@@ -5030,7 +4816,12 @@ pub fn compute() -> i32 {
         let directory = committed_fixture()?;
         let error = revision_service(directory.path(), "feature/absent")
             .expect_err("an unknown revision must refuse");
-        assert_eq!(error.descriptor().code(), "resource_not_found");
+        assert_eq!(error.slug(), errors::history::revision_unknown::SLUG);
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("rev", "feature/absent".to_owned())));
+        assert!(context.iter().any(|(key, value)| {
+            *key == "requires" && value.contains("branch, tag, or commit id")
+        }));
         Ok(())
     }
 
@@ -5144,7 +4935,7 @@ pub fn compute() -> i32 {
         );
         let error =
             accepted_limit(PAGE_LIMIT_MAX + 1).expect_err("one over the maximum must refuse");
-        assert!(matches!(error.fault(), ReadFault::Invalid { .. }));
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
             "the request does not match the documented form: field limit, violation 10001 \

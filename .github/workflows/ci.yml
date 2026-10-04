@@ -92,7 +92,7 @@ jobs:
   # the test jobs wait for instead of ahead of them.
   checks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -129,19 +129,14 @@ jobs:
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
         run: uv run --locked --project dev rift-dev build-cache
 
-      - run: just format
-        timeout-minutes: 1
-      - run: just dashes
-        timeout-minutes: 1
+      - run: uv run --locked --project dev pre-commit run --all-files
+        timeout-minutes: 30
       - run: just audit
         timeout-minutes: 1
       - run: just testing-check
         timeout-minutes: 1
-      # These checks invoke the compiler. Their cold builds belong within the
-      # build budget, so correctness does not depend on finding a previous cache.
-      - run: just generate-check
-      - run: just check
-      - run: just clippy
+      # The pre-commit quick gate runs generated checks, the all-features
+      # workspace compile, and strict Clippy. Their cold builds belong within the build budget.
       - run: just docs
       - run: just doctest
       - name: Test release tooling

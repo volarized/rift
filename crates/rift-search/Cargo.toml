@@ -18,6 +18,7 @@ data-encoding.workspace = true
 rayon.workspace = true
 reqwest.workspace = true
 rift-core.workspace = true
+rift-error.workspace = true
 rift-index.workspace = true
 rift-ranking.workspace = true
 rig-core.workspace = true

@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use rayon::prelude::*;
 use rift_index::StoredVector;
 
-use crate::error::{SearchError, SearchFault, SearchViolation};
+use rift_error::{RiftError, errors};
 
 /// One vector the vector ranking returned, addressed by the digest of the
 /// text it was built from.
@@ -71,13 +71,12 @@ pub fn nearest(
     query: &[f32],
     corpus: &[StoredVector],
     keep_max: usize,
-) -> Result<Vec<VectorMatch>, SearchError> {
+) -> Result<Vec<VectorMatch>, RiftError> {
     if let Some((query_width, stored_width)) = width_refusal(query, corpus) {
-        return Err(SearchError::new(
-            SearchFault::new(SearchViolation::VectorWidthMismatch).about(format!(
-                "query width {query_width}, stored width {stored_width}"
-            )),
-        ));
+        return errors::search::vector_width_mismatch()
+            .query_width(query_width)
+            .stored_width(stored_width)
+            .fail();
     }
     if keep_max == 0 {
         return Ok(Vec::new());

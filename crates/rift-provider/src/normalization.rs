@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rift_core::{
-    Contribution, ContributionError, ContributionKey, ContributionReference, DeclarationBinding,
-    EquivalenceEvidence, IndexRevision, ReferenceRole, RelationshipKind, SourceApplicability,
-    SourceRevision, SourceUnitId, SymbolId, SymbolRecord, SymbolResolution, TreeRevision,
-    symbol_identity,
+    Contribution, ContributionKey, ContributionReference, DeclarationBinding, EquivalenceEvidence,
+    IndexRevision, ReferenceRole, RelationshipKind, SourceApplicability, SourceRevision,
+    SourceUnitId, SymbolId, SymbolRecord, SymbolResolution, TreeRevision, symbol_identity,
 };
+
+use rift_error::RiftError;
 
 use crate::PublicationSet;
 
@@ -322,7 +323,7 @@ impl Normalizer {
     ///
     /// # Errors
     ///
-    /// Returns [`ContributionError`] when record construction detects invalid
+    /// Returns [`RiftError`] when record construction detects invalid
     /// normalization output.
     pub fn normalize(
         index_revision: IndexRevision,
@@ -330,7 +331,7 @@ impl Normalizer {
         tree_revision: TreeRevision,
         publications: &Arc<PublicationSet>,
         previous: Option<&NormalizedGraph>,
-    ) -> Result<NormalizedGraph, ContributionError> {
+    ) -> Result<NormalizedGraph, RiftError> {
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
         let references = reference_index(&contributions);
@@ -624,7 +625,7 @@ fn build_records(
     anchors: &[BTreeSet<SymbolId>],
     groups: &mut UnionFind,
     conflicting: &BTreeSet<usize>,
-) -> Result<(Vec<SymbolRecord>, BTreeMap<ContributionReference, usize>), ContributionError> {
+) -> Result<(Vec<SymbolRecord>, BTreeMap<ContributionReference, usize>), RiftError> {
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
     for index in 0..contributions.len() {
         members.entry(groups.find(index)).or_default().push(index);
@@ -704,7 +705,7 @@ fn normalize_edges(
     (references, relationships)
 }
 
-fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, ContributionError> {
+fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
     let GraphBuild {
         index_revision,
         source_revision,

@@ -56,14 +56,14 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU16;
 
-use rift_core::Error;
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
+use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
 use crate::extract::{self, Declaration, GrammarRules, Visited};
-use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
 /// Grammar spelling of a `function_declaration`.
@@ -754,7 +754,7 @@ impl EcmaScriptRules<'_> {
         &self,
         statement: Visited<'_, '_>,
         text: &str,
-    ) -> Result<(Vec<Documentation>, Vec<ByteRange>), SyntaxError> {
+    ) -> Result<(Vec<Documentation>, Vec<ByteRange>), RiftError> {
         let mut run = self.jsdoc_run(statement, text);
         run.reverse();
         let mut blocks = Vec::with_capacity(run.len());
@@ -825,7 +825,7 @@ impl EcmaScriptRules<'_> {
         &self,
         node: Node<'_>,
         kind: EcmaScriptSymbolKind,
-    ) -> Result<Option<ByteRange>, SyntaxError> {
+    ) -> Result<Option<ByteRange>, RiftError> {
         let Some(body) = node.child_by_field_id(self.kinds.field(kind.body_field()).get()) else {
             return Ok(None);
         };
@@ -834,7 +834,7 @@ impl EcmaScriptRules<'_> {
 }
 
 impl GrammarRules for EcmaScriptRules<'_> {
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
+    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
             .map(extract::byte_range)
             .transpose()
@@ -844,7 +844,7 @@ impl GrammarRules for EcmaScriptRules<'_> {
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         let Some(kind) = self.kinds.symbol_kind(node) else {
             return Ok(None);
@@ -925,7 +925,7 @@ fn jsdoc_text(comment: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`SyntaxError`] for an oversized source, an incompatible
+/// Returns [`RiftError`] for an oversized source, an incompatible
 /// grammar, cancellation, or an exceeded tree bound.
 pub(crate) fn analyze(
     language: &Language,
@@ -933,23 +933,25 @@ pub(crate) fn analyze(
     kinds: &'static EcmaScriptKinds,
     limits: SyntaxLimits,
     source: SyntaxSource<'_>,
-) -> Result<SyntaxDocument, SyntaxError> {
+) -> Result<SyntaxDocument, RiftError> {
     if source.text.len() > limits.source_bytes_max() {
-        return Err(Error::new(SyntaxFault::SourceTooLarge {
-            path: Some(source.path.clone()),
-            source_bytes: source.text.len(),
-            source_bytes_max: limits.source_bytes_max(),
-        }));
+        return errors::syntax::source_too_large()
+            .path(source.path)
+            .source_bytes(source.text.len())
+            .source_bytes_max(limits.source_bytes_max())
+            .fail();
     }
     let mut parser = Parser::new();
-    parser
-        .set_language(grammar)
-        .map_err(|_| incompatible_grammar(grammar))?;
-    let tree = parser.parse(source.text, None).ok_or_else(|| {
-        Error::new(SyntaxFault::ParseCancelled {
-            path: Some(source.path.clone()),
-        })
+    parser.set_language(grammar).map_err(|_| {
+        errors::syntax::incompatible_grammar()
+            .grammar_abi_version(grammar.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error()
     })?;
+    let tree = parser
+        .parse(source.text, None)
+        .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
     let rules = EcmaScriptRules {
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds),

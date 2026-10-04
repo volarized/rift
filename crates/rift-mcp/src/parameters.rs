@@ -12,7 +12,7 @@
 
 use std::borrow::Cow;
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_error::errors;
 use rift_protocol::error as wire;
 use rift_protocol::schema::{ExpectedShape, document_steps, expected_shape, named_member};
 use rmcp::ErrorData;
@@ -22,7 +22,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::failure::WireFailure;
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
 
 /// The arguments one tool call carries, deserialized into its parameter model.
 pub(crate) struct Parameters<P>(pub P);
@@ -54,37 +54,12 @@ where
             |schema| expected_shape(&Value::Object(schema.as_ref().clone()), &steps),
         );
         let field = named_member(&steps[..shape.followed()]);
-        Err(Error::new(ParameterFault { tool, field, shape }).tool_error(wire::ErrorPhase::Read))
-    }
-}
-
-/// One refused tool call: the arguments do not match the tool's served schema.
-#[derive(Debug)]
-struct ParameterFault {
-    tool: String,
-    field: Option<String>,
-    shape: ExpectedShape,
-}
-
-impl Fault for ParameterFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::InvalidRequest)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("tool", self.tool.clone())];
-        if let Some(field) = &self.field {
-            context.push(ErrorContext::new("field", field.clone()));
-        }
-        if !self.shape.accepted().is_empty() {
-            context.push(ErrorContext::new(
-                "accepted",
-                self.shape.accepted().join(", "),
-            ));
-        }
-        if let Some(example) = self.shape.example() {
-            context.push(ErrorContext::new("example", example.to_string()));
-        }
-        context
+        let refused = errors::mcp::parameter_invalid()
+            .tool(tool)
+            .maybe_field(field)
+            .maybe_accepted((!shape.accepted().is_empty()).then(|| shape.accepted().join(", ")))
+            .maybe_example(shape.example().map(ToString::to_string))
+            .mcp();
+        refused.tool_error(wire::ErrorPhase::Read).fail()
     }
 }

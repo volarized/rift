@@ -17,6 +17,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 rift-analysis = { workspace = true, features = ["collector", "archive", "parallel"] }
 rift-core.workspace = true
+rift-error.workspace = true
 rift-history.workspace = true
 serde.workspace = true
 serde_json.workspace = true

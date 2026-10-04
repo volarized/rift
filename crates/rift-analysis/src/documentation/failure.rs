@@ -1,9 +1,12 @@
-//! Documentation input and publication refusals.
+//! Registered documentation refusals.
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
+#[cfg(test)]
+use rift_error::RiftError;
+#[cfg(test)]
 use serde::Serialize;
 
 /// The invariant a documentation input or publication violates.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentationViolation {
@@ -33,105 +36,29 @@ pub enum DocumentationViolation {
     Encoding,
 }
 
-/// One typed documentation refusal with its bounded field name.
-#[derive(Debug)]
-pub struct DocumentationFault {
-    violation: DocumentationViolation,
-    field: &'static str,
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl DocumentationFault {
-    pub(super) const fn new(violation: DocumentationViolation, field: &'static str) -> Self {
-        Self {
-            violation,
-            field,
-            source: None,
-        }
-    }
-
-    pub(super) fn caused_by(
-        mut self,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        self.source = Some(Box::new(source));
-        self
-    }
-
-    /// Returns the violated documentation rule.
-    #[must_use]
-    pub const fn violation(&self) -> DocumentationViolation {
-        self.violation
-    }
-
-    /// Returns the field the caller must correct.
-    #[must_use]
-    pub const fn field(&self) -> &'static str {
-        self.field
-    }
-}
-
-impl Fault for DocumentationFault {
-    fn name(&self) -> ErrorName {
-        let code = match self.violation {
-            DocumentationViolation::LimitExceeded => ErrorCode::LimitExceeded,
-            DocumentationViolation::MissingTarget => ErrorCode::ResourceNotFound,
-            _ => ErrorCode::InvalidRequest,
-        };
-        ErrorName::Wire(code)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![
-            ErrorContext::new("violation", fault_label(&self.violation)),
-            ErrorContext::new("field", self.field),
-        ]
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
-    }
-}
-
-/// A documentation input or publication refused at the shared boundary.
-pub type DocumentationError = Error<DocumentationFault>;
-
-pub(super) fn refused(
-    violation: DocumentationViolation,
-    field: &'static str,
-) -> DocumentationError {
-    DocumentationFault::new(violation, field).into()
+#[cfg(test)]
+pub(crate) fn context_value(error: &RiftError, key: &str) -> Option<String> {
+    error
+        .context()
+        .find(|(field, _)| *field == key)
+        .map(|(_, value)| value)
 }
 
 #[cfg(test)]
-mod tests {
-    use rift_core::{ErrorCode, ErrorName, Fault};
-
-    use super::{DocumentationFault, DocumentationViolation};
-
-    #[test]
-    fn documentation_fault_maps_wire_codes_and_preserves_cause() {
-        for (violation, expected) in [
-            (
-                DocumentationViolation::LimitExceeded,
-                ErrorCode::LimitExceeded,
-            ),
-            (
-                DocumentationViolation::MissingTarget,
-                ErrorCode::ResourceNotFound,
-            ),
-            (DocumentationViolation::Digest, ErrorCode::InvalidRequest),
-        ] {
-            let fault = DocumentationFault::new(violation, "source")
-                .caused_by(std::io::Error::other("fixture cause"));
-            assert_eq!(fault.name(), ErrorName::Wire(expected));
-            assert_eq!(fault.context()[1].value(), "source");
-            assert_eq!(
-                Fault::source(&fault).expect("cause retained").to_string(),
-                "fixture cause"
-            );
-        }
+pub(crate) fn violation(error: &RiftError) -> DocumentationViolation {
+    match error.slug().as_str() {
+        "rift.analysis.documentation_limit_exceeded" => DocumentationViolation::LimitExceeded,
+        "rift.analysis.documentation_identity_invalid" => DocumentationViolation::Identity,
+        "rift.analysis.documentation_duplicate_source" => DocumentationViolation::DuplicateSource,
+        "rift.analysis.documentation_digest_mismatch" => DocumentationViolation::Digest,
+        "rift.analysis.documentation_origin_invalid" => DocumentationViolation::Origin,
+        "rift.analysis.documentation_format_invalid" => DocumentationViolation::Format,
+        "rift.analysis.documentation_range_invalid" => DocumentationViolation::Range,
+        "rift.analysis.documentation_order_invalid" => DocumentationViolation::Order,
+        "rift.analysis.documentation_target_missing" => DocumentationViolation::MissingTarget,
+        "rift.analysis.documentation_notebook_invalid" => DocumentationViolation::Notebook,
+        "rift.analysis.documentation_revision_invalid" => DocumentationViolation::Revision,
+        "rift.analysis.documentation_encoding_failed" => DocumentationViolation::Encoding,
+        slug => panic!("unknown documentation slug {slug}"),
     }
 }

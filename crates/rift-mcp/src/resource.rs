@@ -13,6 +13,8 @@ use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 use serde_json::{Map, Value, json};
 
+use crate::failure::McpErrorFailExt as _;
+
 /// The whole recorded set, newest first.
 pub(crate) const LOGS_URI: &str = "rift://logs";
 /// The URI prefix a level-restricted read carries.
@@ -101,29 +103,28 @@ pub(crate) fn log_query(uri: &str, page_records: u64) -> Result<LogQuery, ErrorD
     if let Some(level) = uri.strip_prefix(LOGS_LEVEL_PREFIX) {
         let level = level.to_lowercase();
         if !LOG_LEVELS.contains(&level.as_str()) {
-            return Err(ErrorData::invalid_params(
+            return ErrorData::invalid_params(
                 format!(
                     "the level segment must be one of {}, not {level:?}",
                     LOG_LEVELS.join(", ")
                 ),
                 None,
-            ));
+            )
+            .fail();
         }
         return Ok(LogQuery::newest(page).at_level(&level));
     }
     if let Some(component) = uri.strip_prefix(LOGS_COMPONENT_PREFIX) {
         if component.is_empty() || component.contains('/') {
-            return Err(ErrorData::invalid_params(
+            return ErrorData::invalid_params(
                 "the component segment must be one path segment and cannot be empty",
                 None,
-            ));
+            )
+            .fail();
         }
         return Ok(LogQuery::newest(page).for_component(component));
     }
-    Err(ErrorData::resource_not_found(
-        format!("no resource is published at {uri:?}"),
-        None,
-    ))
+    ErrorData::resource_not_found(format!("no resource is published at {uri:?}"), None).fail()
 }
 
 /// Returns whether `uri` addresses the workspace resource family.
@@ -138,25 +139,22 @@ pub(crate) fn workspace_page_index(uri: &str) -> Result<u64, ErrorData> {
         return Ok(0);
     }
     let Some(query) = uri.strip_prefix(WORKSPACE_QUERY_PREFIX) else {
-        return Err(ErrorData::resource_not_found(
-            format!("no resource is published at {uri:?}"),
-            None,
-        ));
+        return ErrorData::resource_not_found(format!("no resource is published at {uri:?}"), None)
+            .fail();
     };
     let Some(value) = query.strip_prefix("page_index=") else {
-        return Err(workspace_page_error(query));
+        return ErrorData::invalid_params(
+            format!("`page_index` must be a zero-based integer, such as 0, not {query:?}"),
+            None,
+        )
+        .fail();
     };
-    value
-        .parse::<u64>()
-        .map_err(|_| workspace_page_error(value))
-}
-
-/// Refusal for a workspace resource query that does not select one page.
-fn workspace_page_error(value: &str) -> ErrorData {
-    ErrorData::invalid_params(
-        format!("`page_index` must be a zero-based integer, such as 0, not {value:?}"),
-        None,
-    )
+    value.parse::<u64>().map_err(|_| {
+        ErrorData::invalid_params(
+            format!("`page_index` must be a zero-based integer, such as 0, not {value:?}"),
+            None,
+        )
+    })
 }
 
 /// The answer one log read returns: the records it selected, newest first.

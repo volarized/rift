@@ -24,6 +24,18 @@ test-group = 'live'
 filter = 'binary(=server_cli) or binary(=mcp_proxy) or binary(=end_to_end) or binary(=logs_resource)'
 test-group = 'election'
 
+# Retain measured probe costs and deadline decisions on every native runner.
+[[profile.default.overrides]]
+filter = 'binary(=rift) and (test(window_when_every_probe_is_slow) or test(a_start_wait_records_synchronous_probe_costs))'
+success-output = "immediate"
+junit.store-success-output = true
+
+# Retain the executed Windows expected-failure record and issue link for #530.
+[[profile.default.overrides]]
+filter = 'binary(=mcp_proxy) and test(=repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings)'
+success-output = "immediate"
+junit.store-success-output = true
+
 # This suite times each syntax shape at two sizes and compares the two times, a
 # comparison that holds only while both sizes meet the same machine load. Tests on
 # the other slots start and end between the two measurements, so the suite reserves

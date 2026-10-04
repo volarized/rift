@@ -5,12 +5,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use rift_core::{ErrorCode, ErrorName, SourceVisibility};
+use rift_core::SourceVisibility;
+use rift_error::{RiftError, errors};
 #[cfg(test)]
 use rift_index::capture_digests_with_languages;
 use rift_index::{
     ChangeSet, LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges,
     WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    is_connection_unavailable,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -32,18 +34,19 @@ use rift_ranking::{
 };
 use rift_search::{
     AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
-    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchError, SearchIndex,
-    SearchIndexLimits, StoreRanking, VectorReadiness,
+    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchIndex, SearchIndexLimits,
+    StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault,
-    ReadService, StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
+    CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadService,
+    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
-    ServerConfig,
+    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -51,7 +54,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::failure::WireFailure;
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::global::{
     GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, callee_declarations,
     merge_patterns, merge_search, merge_symbols, package_patterns, package_search, package_symbols,
@@ -114,7 +117,7 @@ pub(crate) struct BlockingExecutor {
 impl BlockingExecutor {
     /// Sizes the workspace's pool and queue wait from one accepted
     /// `[server]` table.
-    pub(crate) fn for_configuration(server: &ServerConfiguration) -> Result<Self, ReadError> {
+    pub(crate) fn for_configuration(server: &ServerConfiguration) -> Result<Self, RiftError> {
         // Acceptance bounds the value to 1..=SERVER_NUM_WORKERS_MAX, so
         // the clamp only guards the usize conversion.
         let workers = usize::try_from(server.num_workers.min(SERVER_NUM_WORKERS_MAX))
@@ -124,7 +127,12 @@ impl BlockingExecutor {
             .num_threads(workers)
             .thread_name(|index| format!("rift-index-{index}"))
             .build()
-            .map_err(|error| ReadFault::task("index worker pool", error.to_string()))?;
+            .map_err(|error| {
+                errors::server::read_task()
+                    .operation("index worker pool")
+                    .detail(error.to_string())
+                    .error()
+            })?;
         Ok(Self {
             operations: Arc::new(Semaphore::new(workers)),
             queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
@@ -165,8 +173,8 @@ impl BlockingExecutor {
     pub(crate) async fn run<Output>(
         &self,
         operation: &'static str,
-        work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
-    ) -> Result<Output, ReadError>
+        work: impl FnOnce() -> Result<Output, RiftError> + Send + 'static,
+    ) -> Result<Output, RiftError>
     where
         Output: Send + 'static,
     {
@@ -180,8 +188,8 @@ impl BlockingExecutor {
         &self,
         operation: &'static str,
         cancellation: CancellationToken,
-        work: impl FnOnce(&CancellationToken) -> Result<Output, ReadError> + Send + 'static,
-    ) -> Result<Output, ReadError>
+        work: impl FnOnce(&CancellationToken) -> Result<Output, RiftError> + Send + 'static,
+    ) -> Result<Output, RiftError>
     where
         Output: Send + 'static,
     {
@@ -190,26 +198,34 @@ impl BlockingExecutor {
         let acquire = Arc::clone(&self.operations).acquire_owned();
         let queue_timeout_ms = self.queue_timeout_ms;
         let permit_result = async {
+            tracing::debug!(work = operation, queue_timeout_ms, "worker admission started");
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => Err(ReadFault::cancelled()),
+                () = cancellation.cancelled() => errors::server::read_cancelled().fail(),
                 result = tokio::time::timeout(Duration::from_millis(queue_timeout_ms), acquire) => {
                     result
-                        .map_err(|_| ReadFault::capacity_timeout(operation, queue_timeout_ms))?
-                        .map_err(|error| ReadFault::task(operation, error.to_string()))
+                        .map_err(|_| errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error())?
+                        .map_err(|error| errors::server::read_task().operation(operation).detail(error.to_string()).error())
                 }
             }
         }
         .instrument(tracing::debug_span!(
             "worker.queue",
             component = "worker",
-            operation = "worker.queue"
+            operation = "worker.queue",
+            work = operation
         ))
         .await;
         let permit = permit_result?;
+        tracing::debug!(
+            component = "worker",
+            operation = "worker.queue",
+            work = operation,
+            "worker admitted"
+        );
         if cancellation.is_cancelled() {
             drop(permit);
-            return Err(ReadFault::cancelled());
+            return errors::server::read_cancelled().fail();
         }
         let rayon_pool = Arc::clone(&self.rayon_pool);
         async move {
@@ -219,6 +235,7 @@ impl BlockingExecutor {
             tokio::task::spawn_blocking(move || {
                 let result = rayon_pool.install(move || {
                     let _entered = parent.enter();
+                    tracing::debug!(work = operation, "worker execution started");
                     work(&cancellation)
                 });
                 // Explicit success-path release; unwinding also drops the owned permit.
@@ -230,10 +247,16 @@ impl BlockingExecutor {
         .instrument(tracing::debug_span!(
             "worker.run",
             component = "worker",
-            operation = "worker.run"
+            operation = "worker.run",
+            work = operation
         ))
         .await
-        .map_err(|error| ReadFault::task(operation, error.to_string()))?
+        .map_err(|error| {
+            errors::server::read_task()
+                .operation(operation)
+                .detail(error.to_string())
+                .error()
+        })?
     }
 }
 
@@ -256,9 +279,13 @@ impl BlockingExecutor {
 /// and why it refuses `..` in every address below the root.
 ///
 /// [`ProjectPath`]: rift_protocol::path::ProjectPath
-fn absolute_root(root: &Path) -> Result<PathBuf, ReadError> {
-    let absolute = std::path::absolute(root)
-        .map_err(|error| ReadFault::task("workspace root resolution", error.to_string()))?;
+fn absolute_root(root: &Path) -> Result<PathBuf, RiftError> {
+    let absolute = std::path::absolute(root).map_err(|error| {
+        errors::server::read_task()
+            .operation("workspace root resolution")
+            .detail(error.to_string())
+            .error()
+    })?;
     let mut segments: Vec<Component<'_>> = Vec::new();
     for component in absolute.components() {
         match component {
@@ -660,10 +687,7 @@ fn index_supervisor_context(
 
 /// Puts the selected model behind the index: a local encoder is acquired and loaded, a
 /// remote service's client is built from the configuration it already carries.
-async fn held_model(
-    index: &SearchIndex,
-    selection: &EmbeddingSelection,
-) -> Result<(), rift_search::SearchError> {
+async fn held_model(index: &SearchIndex, selection: &EmbeddingSelection) -> Result<(), RiftError> {
     match selection {
         EmbeddingSelection::Local { source, limits } => index.prepare(source, *limits).await,
         EmbeddingSelection::Remote { settings, space } => {
@@ -811,7 +835,7 @@ const WARNING_DETAIL_BYTES_MAX: usize = 4096;
 const STALE_INDEX_PATHS_MAX: usize = 5;
 
 /// What a read must resolve before its next request-time capture.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ReadWait {
     /// The first capture checks content even when observations are ahead.
     Capture,
@@ -961,11 +985,12 @@ fn finish_reconciliation(
             spent.capture_elapsed,
         );
     }
-    Err(ReadFault::unavailable(
-        "current workspace read",
-        "workspace changed across bounded reconciliation attempts",
-    )
-    .tool_error(phase))
+    errors::server::read_unavailable()
+        .operation("current workspace read")
+        .detail("workspace changed across bounded reconciliation attempts")
+        .mcp()
+        .tool_error(phase)
+        .fail()
 }
 
 /// The `stale_index` warning an answer served from `published` carries, naming the tree
@@ -1037,7 +1062,7 @@ pub(crate) fn moved_paths(changes: &PathChanges) -> Option<String> {
 
 /// The request-time capture a test forces in place of reading the tree.
 #[cfg(test)]
-type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError>
     + Send
     + Sync;
 
@@ -1083,7 +1108,7 @@ impl RiftMcp {
     pub(crate) async fn build_settled(
         root: &Path,
         limits: WorkspaceIndexLimits,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self::assemble_settled(
             absolute_root(root)?,
             limits,
@@ -1104,7 +1129,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: WorkspaceStorage,
         checkout: BuildCheckout,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self::assemble_settled(
             absolute_root(root)?,
             limits,
@@ -1134,7 +1159,7 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
         history_gate: Option<AnalysisGate>,
-    ) -> Result<AssembledServer, ReadError> {
+    ) -> Result<AssembledServer, RiftError> {
         let assembled = Self::assemble(
             root,
             limits,
@@ -1154,7 +1179,7 @@ impl RiftMcp {
         &self,
         capture: impl Fn(
             &PublishedWorkspace,
-        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError>
         + Send
         + Sync
         + 'static,
@@ -1169,7 +1194,7 @@ impl RiftMcp {
         delay: Duration,
         capture: impl Fn(
             &PublishedWorkspace,
-        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError>
         + Send
         + Sync
         + 'static,
@@ -1231,7 +1256,7 @@ struct RecordedRebuildFailure {
     epoch: u64,
     /// The filesystem epoch the tree is at now.
     observed_epoch: u64,
-    error: Arc<ReadError>,
+    error: Arc<RiftError>,
 }
 
 impl RecordedRebuildFailure {
@@ -1250,7 +1275,7 @@ impl RecordedRebuildFailure {
             observed = self.observed_epoch,
             error = self.error,
         );
-        for cause in rift_core::causes(&*self.error) {
+        for cause in rift_error::causes(&*self.error) {
             let _ = write!(detail, "; caused by: {cause}");
         }
         detail.push_str("; the next filesystem event retries the rebuild");
@@ -1473,9 +1498,9 @@ enum StoreReadFailure {
     Refused(ErrorData),
 }
 
-impl From<SearchError> for StoreReadFailure {
-    fn from(error: SearchError) -> Self {
-        if error.fault().is_store_connection_unavailable() {
+impl From<RiftError> for StoreReadFailure {
+    fn from(error: RiftError) -> Self {
+        if is_connection_unavailable(&error) {
             tracing::warn!(
                 component = "search",
                 operation = "search.store",
@@ -1484,7 +1509,7 @@ impl From<SearchError> for StoreReadFailure {
             );
             return Self::ConnectionUnavailable;
         }
-        Self::Refused(error.tool_error(wire::ErrorPhase::Read))
+        Self::Refused(error.mcp().tool_error(wire::ErrorPhase::Read))
     }
 }
 
@@ -1720,7 +1745,7 @@ impl RiftMcp {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the root, configuration bounds, or runtime cannot be opened.
+    /// Returns [`RiftError`] when the root, configuration bounds, or runtime cannot be opened.
     /// Discovery and analysis failures are recorded by the background supervisor.
     ///
     /// # Cancel safety
@@ -1730,7 +1755,7 @@ impl RiftMcp {
     ///
     /// The server names itself as [`BuildCheckout::Unversioned`]: no binary's
     /// build script recorded a checkout for a server built in-process.
-    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
+    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, RiftError> {
         Self::build_at(
             absolute_root(root)?,
             limits,
@@ -1747,7 +1772,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: WorkspaceStorage,
         checkout: BuildCheckout,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Self::build_at(absolute_root(root)?, limits, Some(storage), checkout).await
     }
 
@@ -1758,7 +1783,7 @@ impl RiftMcp {
         storage: WorkspaceStorage,
         checkout: BuildCheckout,
         blocking: BlockingExecutor,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let assembled = Self::assemble_with_executor(
             absolute_root(root)?,
             limits,
@@ -1783,11 +1808,16 @@ impl RiftMcp {
     }
 
     /// Accepts startup configuration without blocking the serving runtime.
-    async fn startup_configuration(root: &Path) -> Result<ConfigurationState, ReadError> {
+    async fn startup_configuration(root: &Path) -> Result<ConfigurationState, RiftError> {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || ConfigurationState::accept(&root))
             .await
-            .map_err(|error| ReadFault::task("configuration acceptance", error.to_string()))
+            .map_err(|error| {
+                errors::server::read_task()
+                    .operation("configuration acceptance")
+                    .detail(error.to_string())
+                    .error()
+            })
     }
 
     /// Builds from one resolved root and its process-owned storage.
@@ -1796,7 +1826,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
         checkout: BuildCheckout,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let assembled = Self::assemble(
             root,
             limits,
@@ -1831,7 +1861,7 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
         history_gate: Option<AnalysisGate>,
-    ) -> Result<AssembledServer, ReadError> {
+    ) -> Result<AssembledServer, RiftError> {
         Self::assemble_with_executor(
             root,
             limits,
@@ -1863,10 +1893,15 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
         options: AssembleOptions,
-    ) -> Result<AssembledServer, ReadError> {
+    ) -> Result<AssembledServer, RiftError> {
         let identity = crate::identity::product_identity(options.checkout)
             .await
-            .map_err(|error| ReadFault::task("product identity", error.to_string()))?;
+            .map_err(|error| {
+                errors::server::read_task()
+                    .operation("product identity")
+                    .detail(error.to_string())
+                    .error()
+            })?;
         let analyzer_revision: Arc<str> = Arc::from(rift_analysis::analyzer_digest());
         let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking = match options.blocking {
@@ -1982,7 +2017,7 @@ impl RiftMcp {
         configuration: &ConfigurationState,
         validation: &IndexValidation,
         blocking: &BlockingExecutor,
-    ) -> Result<Arc<PublishedWorkspace>, ReadError> {
+    ) -> Result<Arc<PublishedWorkspace>, RiftError> {
         let root = root.to_path_buf();
         let configuration = configuration.clone();
         let epoch = validation.observed_epoch();
@@ -2017,7 +2052,7 @@ impl RiftMcp {
         validation: &Arc<IndexValidation>,
         blocking: &BlockingExecutor,
         watch: impl WatchWorkspace,
-    ) -> Result<notify::RecommendedWatcher, ReadError> {
+    ) -> Result<notify::RecommendedWatcher, RiftError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
         blocking
@@ -2155,7 +2190,7 @@ impl RiftMcp {
         params: GetSymbolParams,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
         let limit = rift_server::accepted_limit(params.limit)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
@@ -2177,7 +2212,7 @@ impl RiftMcp {
             params.rev.as_ref(),
             &params.packages,
         )
-        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let (route, remote) = self
@@ -2190,7 +2225,7 @@ impl RiftMcp {
             warnings: mut remote_warnings,
         } = remote;
         let mut answer = merge_symbols(&params, limit, local, remote)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         answer.warnings.append(&mut remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
@@ -2263,7 +2298,7 @@ impl RiftMcp {
             .run("commit search", move || reads.search_commits(&params))
             .await
             .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
     }
 
     /// Compares the committed revision `change` names against another revision or the
@@ -2315,7 +2350,7 @@ impl RiftMcp {
                 )
             })
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         answer.warnings.extend(stale);
         Ok(Json(answer))
     }
@@ -2366,6 +2401,7 @@ impl RiftMcp {
                 component = "search",
                 operation = "search.references",
                 {
+                    tracing::debug!("search references started");
                     self.current_tree_references(resolved, ranking, requested, deadline)
                         .await
                 }
@@ -2373,7 +2409,10 @@ impl RiftMcp {
         )
         .await
         .map_err(|_| {
-            ReadFault::unavailable("engine references", "request deadline exceeded")
+            errors::server::read_unavailable()
+                .operation("engine references")
+                .detail("request deadline exceeded")
+                .mcp()
                 .tool_error(wire::ErrorPhase::Read)
         })??;
         let callee_warnings = self
@@ -2435,7 +2474,7 @@ impl RiftMcp {
         };
 
         let limit = rift_server::search_page_limit(&params)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
 
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
@@ -2451,7 +2490,7 @@ impl RiftMcp {
             params.rev.as_ref(),
             &params.packages,
         )
-        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
@@ -2467,7 +2506,7 @@ impl RiftMcp {
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
         let mut answer = merge_search(&params, limit, local, remote)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
@@ -2488,7 +2527,7 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let limit = rift_server::search_page_limit(&params)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
@@ -2503,7 +2542,7 @@ impl RiftMcp {
             params.rev.as_ref(),
             &params.packages,
         )
-        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let (route, remote) = self
@@ -2575,6 +2614,7 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ErrorData> {
         let include_local_preparation = params.scope != SearchScope::Global;
         rift_core::traced_async!(component = "search", operation = "search.read", {
+            tracing::debug!("search read started");
             self.current_tree_read(resolved, include_local_preparation, move |reads| {
                 reads.search_with_references(&params, &answer, &references)
             })
@@ -2605,11 +2645,12 @@ impl RiftMcp {
                 ranking = self.ranking(params, &resolved.published).await?;
             }
         }
-        Err(ReadFault::unavailable(
-            "engine references",
-            "source or configuration kept changing during the bounded reference reads",
-        )
-        .tool_error(wire::ErrorPhase::Read))
+        errors::server::read_unavailable()
+            .operation("engine references")
+            .detail("source or configuration kept changing during the bounded reference reads")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read)
+            .fail()
     }
 
     /// Resolves references against one unchanged current-tree publication.
@@ -2640,7 +2681,7 @@ impl RiftMcp {
         let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
         let engines = self.engine_pool_for(&resolved.published).await;
         if !uses_engine_references(&resolved.published.reads, &engines, params)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?
         {
             return Ok(Some(EngineReferences::default()));
         }
@@ -2654,7 +2695,7 @@ impl RiftMcp {
             (walk_deadline, &roots),
         ))
         .await
-        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         if self.engine_tree_matches(&resolved.published).await? {
             Ok(Some(references))
         } else {
@@ -2684,7 +2725,7 @@ impl RiftMcp {
                 Ok(CalleeRoots::read(&reads, &engines))
             })
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
     }
 
     /// Names the declaration of each callee an outgoing walk found in a package file, in
@@ -2745,7 +2786,7 @@ impl RiftMcp {
         let (digests, configuration) = self
             .capture_tree(published)
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         Ok(digests.fingerprint() == published.fingerprint
             && configuration == published.configuration.fingerprint)
     }
@@ -2801,6 +2842,7 @@ impl RiftMcp {
         };
         let tree_revision = published.reads.tree_revision();
         let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
+            tracing::debug!("search store read started");
             self.store_answer(index, tree_revision, &parsed).await
         })
         .await;
@@ -2812,7 +2854,7 @@ impl RiftMcp {
                     self.ranking_weights,
                 )));
             }
-            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+            Err(StoreReadFailure::Refused(refusal)) => return refusal.fail(),
         };
         Ok(ranking_of(
             searched,
@@ -2872,7 +2914,7 @@ impl RiftMcp {
             Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
             Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
             | Err(StoreReadFailure::ConnectionUnavailable) => None,
-            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+            Err(StoreReadFailure::Refused(refusal)) => return refusal.fail(),
         };
         Ok(SearchRanking::unranked(match selected {
             Some(candidates) => answer.with_pattern_candidates(candidates),
@@ -3043,11 +3085,12 @@ impl RiftMcp {
             .await?;
         let preparation = resolved.published.preparation.as_ref();
         let path = rift_core::ProjectPath::new(params.path.0.clone()).map_err(|error| {
-            ReadError::from(ReadFault::Invalid {
-                field: "path",
-                violation: rift_core::fault_label(&error.fault().violation()),
-            })
-            .tool_error(wire::ErrorPhase::Read)
+            errors::server::read_invalid()
+                .field("path")
+                .violation(error.detail())
+                .cause(error)
+                .mcp()
+                .tool_error(wire::ErrorPhase::Read)
         })?;
         if preparation.is_some_and(|preparation| preparation.total.is_none()) {
             return Ok(Json(nodes_preparing_answer(&resolved)));
@@ -3081,7 +3124,7 @@ impl RiftMcp {
     async fn read_at<Answer>(
         &self,
         rev: Option<rift_protocol::read::RevisionId>,
-        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
     ) -> Result<Json<Answer>, ErrorData>
     where
         Answer: ReadAnswer + Send + 'static,
@@ -3120,7 +3163,7 @@ impl RiftMcp {
             })
             .await
             .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
     }
 
     /// The workspace policy one read of committed source applies, derived once from the
@@ -3133,17 +3176,18 @@ impl RiftMcp {
     fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ErrorData> {
         let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
-            return Err(ReadError::from(ReadFault::Unsupported {
-                capability: "revision reads (providers.history disabled)".to_owned(),
-            })
-            .tool_error(wire::ErrorPhase::Read));
+            return errors::server::read_unsupported()
+                .capability("revision reads (providers.history disabled)")
+                .mcp()
+                .tool_error(wire::ErrorPhase::Read)
+                .fail();
         }
         Ok(RevisionRead {
             root: self.root.clone(),
             limits: published
                 .configuration
                 .index_limits(self.limits)
-                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?,
+                .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?,
             visibility: SourceVisibility::from(&configuration.source),
             text_inclusion: rift_core::TextFileInclusion::from(&configuration),
             languages: rift_core::LanguageFileSelections::from(&configuration),
@@ -3161,7 +3205,7 @@ impl RiftMcp {
         &self,
         resolved: &ResolvedWorkspace,
         include_local_preparation: bool,
-        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
     ) -> Result<Json<Answer>, ErrorData>
     where
         Answer: ReadAnswer + Send + 'static,
@@ -3178,7 +3222,7 @@ impl RiftMcp {
             .blocking
             .run("current workspace read", move || operation(&reads))
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
         if let Some(stale) = resolved.stale.clone() {
             answer.warnings_mut().push(stale);
         }
@@ -3200,7 +3244,7 @@ impl RiftMcp {
         &self,
         resolved: &ResolvedWorkspace,
         deadline: RequestDeadline,
-        operation: impl FnOnce(&ReadService) -> Result<NodesResult, ReadError> + Send + 'static,
+        operation: impl FnOnce(&ReadService) -> Result<NodesResult, RiftError> + Send + 'static,
     ) -> Result<Json<NodesResult>, ErrorData> {
         resolved
             .published
@@ -3214,7 +3258,7 @@ impl RiftMcp {
             cancellation,
             move |cancellation| {
                 if cancellation.is_cancelled() {
-                    return Err(ReadFault::cancelled());
+                    return errors::server::read_cancelled().fail();
                 }
                 operation(&reads)
             },
@@ -3224,7 +3268,7 @@ impl RiftMcp {
                 answer.warnings.extend(nodes_preparing_warnings(resolved));
                 Ok(Json(answer))
             }
-            Ok(Err(error)) => Err(error.tool_error(wire::ErrorPhase::Read)),
+            Ok(Err(error)) => error.mcp().tool_error(wire::ErrorPhase::Read).fail(),
             Err(_) => {
                 timed_cancellation.cancel();
                 Ok(Json(nodes_preparing_answer(resolved)))
@@ -3255,7 +3299,12 @@ impl RiftMcp {
                 detail = detail.as_str(),
                 "a request spent its whole readiness budget"
             );
-            return Err(ReadFault::unavailable("current workspace read", detail).tool_error(phase));
+            return errors::server::read_unavailable()
+                .operation("current workspace read")
+                .detail(detail)
+                .mcp()
+                .tool_error(phase)
+                .fail();
         };
         result
     }
@@ -3299,8 +3348,23 @@ impl RiftMcp {
     /// not, since a deadline this call needs before validation can even
     /// begin cannot itself wait on that validation.
     async fn readiness_timeout(&self) -> Duration {
+        tracing::debug!(
+            component = "index",
+            operation = "index.readiness",
+            "reading request readiness budget"
+        );
         let state = self.published.read().await;
         let (current, _failure) = state.snapshot();
+        tracing::debug!(
+            component = "index",
+            operation = "index.readiness",
+            timeout_ms = current
+                .configuration
+                .server_configuration()
+                .readiness_timeout
+                .milliseconds(),
+            "request readiness budget resolved"
+        );
         Duration::from_millis(
             current
                 .configuration
@@ -3362,10 +3426,12 @@ impl RiftMcp {
             if current.preparation.is_some()
                 && let Some(failure) = rebuild_failure.as_ref()
             {
-                return Err(failure.error.tool_error(phase));
+                return (&failure.error).mcp().tool_error(phase).fail();
             }
             let superseded_seen = self.validation.superseded_epoch();
-            let capture = self.reconciliation_capture(&current, phase).await?;
+            let capture = self
+                .reconciliation_capture(&current, phase, attempts, superseded_seen)
+                .await?;
             let configuration_matches = current.configuration.fingerprint == capture.configuration;
             if capture.tree == current.fingerprint
                 && configuration_matches
@@ -3392,6 +3458,12 @@ impl RiftMcp {
                 previous.awaits_publication(&current, &capture.tree, capture.configuration)
             });
             if configuration_matches && owed_publication {
+                tracing::debug!(
+                    component = "index",
+                    operation = "index.reconcile",
+                    attempts,
+                    "request capture still awaits publication"
+                );
                 wait = ReadWait::Rebuild { superseded_seen };
                 continue;
             }
@@ -3400,7 +3472,7 @@ impl RiftMcp {
                 .filter(|previous| !previous.matches(&capture.tree, capture.configuration));
             attempts += 1;
             let requested_epoch = self
-                .request_rebuild(&current, &changes, configuration_matches, phase)
+                .request_rebuild(&current, &changes, configuration_matches, phase, attempts)
                 .await?;
             if configuration_matches
                 && let Some(previous) = moved_since_previous
@@ -3469,7 +3541,7 @@ impl RiftMcp {
                 ))
             })
             .await
-            .map_err(|error| error.tool_error(phase))
+            .map_err(|error| error.mcp().tool_error(phase))
     }
 
     /// Captures the tree one reconciliation attempt compares with `current`.
@@ -3482,10 +3554,10 @@ impl RiftMcp {
         phase: wire::ErrorPhase,
     ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ErrorData> {
         self.capture_tree(current).await.map_err(|error| {
-            if error.descriptor().name() != ErrorName::Wire(ErrorCode::Cancelled) {
+            if error.slug() != errors::server::read_cancelled::SLUG {
                 let _ = self.validation.observe_whole_workspace();
             }
-            error.tool_error(phase)
+            error.mcp().tool_error(phase)
         })
     }
 
@@ -3495,6 +3567,8 @@ impl RiftMcp {
         &self,
         current: &Arc<PublishedWorkspace>,
         phase: wire::ErrorPhase,
+        attempts: usize,
+        superseded_seen: u64,
     ) -> Result<ReconciliationCapture, ErrorData> {
         let capture_started = tokio::time::Instant::now();
         let (digests, configuration) = self.capture_read(current, phase).await?;
@@ -3502,6 +3576,17 @@ impl RiftMcp {
         let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
             digests.fingerprint()
         });
+        tracing::debug!(
+            component = "index",
+            operation = "index.reconcile",
+            attempts,
+            published_epoch = current.epoch,
+            observed_epoch = self.validation.observed_epoch(),
+            superseded_epoch = superseded_seen,
+            tree_matches = tree == current.fingerprint,
+            configuration_matches = current.configuration.fingerprint == configuration,
+            "request capture compared with publication"
+        );
         Ok(ReconciliationCapture {
             digests,
             configuration,
@@ -3521,6 +3606,7 @@ impl RiftMcp {
         changes: &PathChanges,
         configuration_matches: bool,
         phase: wire::ErrorPhase,
+        attempts: usize,
     ) -> Result<u64, ErrorData> {
         let observed = if configuration_matches
             && self
@@ -3532,7 +3618,15 @@ impl RiftMcp {
         } else {
             self.validation.observe_whole_workspace()
         };
-        observed.map_err(|error| error.tool_error(phase))
+        let requested_epoch = observed.map_err(|error| error.mcp().tool_error(phase))?;
+        tracing::debug!(
+            component = "index",
+            operation = "index.reconcile",
+            attempts,
+            requested_epoch,
+            "request capture requested a rebuild"
+        );
+        Ok(requested_epoch)
     }
 
     /// Whether a rebuild naming the paths in `changes` reaches what the capture that found
@@ -3572,7 +3666,7 @@ impl RiftMcp {
                 Ok(published.rebuild_moves_every(&root, &added_or_removed))
             })
             .await
-            .map_err(|error| error.tool_error(phase))
+            .map_err(|error| error.mcp().tool_error(phase))
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
@@ -3582,7 +3676,7 @@ impl RiftMcp {
     async fn capture_tree(
         &self,
         current: &Arc<PublishedWorkspace>,
-    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError> {
         #[cfg(test)]
         if let Some((forced, delay)) = self.forced_capture.installed() {
             if !delay.is_zero() {
@@ -3615,8 +3709,7 @@ impl RiftMcp {
                     &languages,
                     &last,
                     &|| cancellation.is_cancelled(),
-                )
-                .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                )?;
                 *last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
@@ -3641,7 +3734,7 @@ impl RiftMcp {
     async fn capture_prepared_tree(
         &self,
         current: &Arc<PublishedWorkspace>,
-    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError> {
         let published = Arc::clone(current);
         let root = self.root.clone();
         let last_capture = Arc::clone(&self.last_capture);
@@ -3694,15 +3787,23 @@ impl RiftMcp {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let observed_epoch = self.validation.observed_epoch();
+            tracing::debug!(
+                component = "index",
+                operation = "index.readiness",
+                ?wait,
+                observed_epoch,
+                "request reading publication"
+            );
             let state = self.published.read().await;
             let (current, failure) = state.snapshot();
             drop(state);
             if self.validation.watch_failed.load(Ordering::Acquire) {
-                return Err(ReadFault::unavailable(
-                    "current workspace read",
-                    "filesystem watcher failed",
-                )
-                .tool_error(phase));
+                return errors::server::read_unavailable()
+                    .operation("current workspace read")
+                    .detail("filesystem watcher failed")
+                    .mcp()
+                    .tool_error(phase)
+                    .fail();
             }
             if current.epoch == observed_epoch {
                 return Ok((current, None));
@@ -3711,18 +3812,19 @@ impl RiftMcp {
             // meet again, so waiting for them spends the whole readiness budget to reach
             // the same refusal, once per request, forever.
             if !self.validation.supervisor_running.load(Ordering::Acquire) {
-                return Err(ReadFault::unavailable(
-                    "current workspace read",
-                    format!(
+                return errors::server::read_unavailable()
+                    .operation("current workspace read")
+                    .detail(format!(
                         "the index supervisor stopped, so the index stays {behind} filesystem \
                          events behind the tree (published epoch {published}, observed epoch \
                          {observed_epoch}); restart the workspace server, and read \
                          rift://logs for what it did before it stopped",
                         behind = observed_epoch.saturating_sub(current.epoch),
                         published = current.epoch,
-                    ),
-                )
-                .tool_error(phase));
+                    ))
+                    .mcp()
+                    .tool_error(phase)
+                    .fail();
             }
             if let Some((failed_epoch, error)) = failure
                 && failed_epoch >= current.epoch
@@ -3745,7 +3847,21 @@ impl RiftMcp {
             if capture {
                 return Ok((current, None));
             }
+            tracing::debug!(
+                component = "index",
+                operation = "index.readiness",
+                ?wait,
+                published_epoch = current.epoch,
+                observed_epoch,
+                superseded_epoch = self.validation.superseded_epoch(),
+                "request waiting for publication"
+            );
             changed.as_mut().await;
+            tracing::debug!(
+                component = "index",
+                operation = "index.readiness",
+                "publication wait notified"
+            );
         }
     }
 }
@@ -3776,10 +3892,10 @@ impl RiftMcp {
         };
         match store.recent(&query).await {
             Ok(records) => Ok(resource::rendered_logs(uri, &records)),
-            Err(error) => Err(ErrorData::internal_error(
-                format!("the log store refused the read: {error}"),
-                None,
-            )),
+            Err(error) => {
+                ErrorData::internal_error(format!("the log store refused the read: {error}"), None)
+                    .fail()
+            }
         }
     }
 
@@ -3792,7 +3908,7 @@ impl RiftMcp {
             .configuration
             .accepted
             .as_ref()
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?
             .clone();
         let pool = self.engine_pool_for(&current).await;
         let languages = workspace_languages(&current, &configuration, &pool)?;
@@ -3859,22 +3975,25 @@ impl RiftMcp {
     async fn ensure_workspace_root(&self) -> Result<(), ErrorData> {
         match tokio::fs::metadata(&self.root).await {
             Ok(metadata) if metadata.is_dir() => Ok(()),
-            Ok(_) => Err(ReadError::from(ReadFault::NotFound {
-                path: self.root.display().to_string(),
-            })
-            .tool_error(wire::ErrorPhase::Read)),
+            Ok(_) => errors::server::read_not_found()
+                .path(self.root.display())
+                .mcp()
+                .tool_error(wire::ErrorPhase::Read)
+                .fail(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(ReadError::from(ReadFault::NotFound {
-                    path: self.root.display().to_string(),
-                })
-                .tool_error(wire::ErrorPhase::Read))
+                errors::server::read_not_found()
+                    .path(self.root.display())
+                    .mcp()
+                    .tool_error(wire::ErrorPhase::Read)
+                    .fail()
             }
-            Err(error) => Err(ReadError::from(ReadFault::Storage {
-                path: self.root.display().to_string(),
-                operation: "read workspace root",
-                io: error.to_string(),
-            })
-            .tool_error(wire::ErrorPhase::Read)),
+            Err(error) => errors::server::read_storage()
+                .path(self.root.display())
+                .operation("read workspace root")
+                .io(&error)
+                .mcp()
+                .tool_error(wire::ErrorPhase::Read)
+                .fail(),
         }
     }
 }
@@ -3890,6 +4009,29 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let span = tracing::info_span!(
+            "mcp.request",
+            component = "mcp",
+            operation = "tools/call",
+            request_id = %context.id,
+            tool = %request.name
+        );
+        async {
+            tracing::debug!("tool request started");
+            let tcc = ToolCallContext::new(self, request, context);
+            let result = self.tool_router.call(tcc).await;
+            tracing::debug!(is_error = result.is_err(), "tool request completed");
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -4527,6 +4669,8 @@ done
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use crate::failure::{McpErrorExt as _, WireFailure as _};
+    use rift_error::errors;
     use rift_index::WorkspaceIndexLimits;
 
     use rift_protocol::configuration::{
@@ -4539,7 +4683,7 @@ done
     };
     use rift_ranking::{RankingInputKind, RankingWeights};
     use rift_search::{ModelSource, RevisionScoped, VectorReadiness};
-    use rift_server::{LspProcessKey, ReadError, ReadFault, StoreAnswer};
+    use rift_server::{LspProcessKey, StoreAnswer};
 
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
@@ -4675,9 +4819,23 @@ done
         };
         assert_eq!(data.code, ErrorCode(-32000));
         assert_eq!(
-            data.data.ok_or("invalid path carries wire error data")?["code"],
-            "invalid_request"
+            data.message,
+            "the request does not match the documented form: field path, \
+             violation project path contains a dot segment: cause project path contains a dot segment; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components; \
+             correct the reported field and resend the request"
         );
+        let wire = data.data.ok_or("invalid path carries wire error data")?;
+        assert_eq!(wire["code"], "invalid_request");
+        assert_eq!(wire["retry"], "never");
+        assert_eq!(wire["phase"], "read");
+        assert!(wire["causes"].as_array().is_some_and(|causes| {
+            causes.iter().any(|cause| {
+                cause["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("project path contains a dot segment"))
+            })
+        }));
         Ok(())
     }
 
@@ -5290,20 +5448,14 @@ done
         assert_eq!(wire["limit"]["limit"], SOURCE_FILES_MAX, "{wire}");
         assert_eq!(wire["limit"]["required"], VISIBLE_FILES_REQUIRED, "{wire}");
         assert!(
-            wire["causes"]
-                .as_array()
-                .is_some_and(|causes| causes.iter().any(|cause| {
-                    cause["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains("too_many_files"))
-                })),
-            "the cause names too_many_files: {wire}"
+            wire["message"].as_str().is_some_and(|message| {
+                message.contains("workspace contains more files than its accepted limit of 1000")
+            }),
+            "the refusal names its files bound: {wire}"
         );
         assert!(
-            wire["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("too_many_files")),
-            "the refusal names its files bound: {wire}"
+            wire.get("causes").is_none(),
+            "the registered limit failure has no nested error: {wire}"
         );
 
         fs::remove_file(directory.path().join("unit_0999.rs"))?;
@@ -5351,7 +5503,25 @@ done
         let error = crate::validation::prepare_initial_workspace_from(&assembled.context, initial)
             .await
             .expect_err("a missing selected file must refuse its preparation batch");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
+        );
+        assert_eq!(
+            crate::failure::wire_code_for_error(&error).as_deref(),
+            Some("temporarily_unavailable")
+        );
+        let wire = error
+            .mcp()
+            .wire_error(rift_protocol::error::ErrorPhase::Read);
+        assert_eq!(
+            wire.code,
+            rift_protocol::error::ErrorCode::TemporarilyUnavailable
+        );
+        assert_eq!(
+            wire.retry,
+            rift_protocol::error::RetryDirective::SameRequest
+        );
         let partial = Arc::clone(&assembled.server.published.read().await.current);
         assert_eq!(
             partial.preparation.as_ref().map(|state| state.prepared),
@@ -5522,8 +5692,12 @@ done
     #[tokio::test]
     async fn build_serves_the_warning_of_a_file_past_max_file_under_each_strategy() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
-        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"1b\"\n")?;
+        let wide = "pub fn wide() {}\n";
+        let max_file_bytes = 1_usize;
+        assert!(wide.len() > max_file_bytes);
+        fs::write(directory.path().join("wide.rs"), wide)?;
+        let configuration = format!("[providers.syntax]\nmax_file = \"{max_file_bytes}b\"\n");
+        super::hermetic_workspace(directory.path(), &configuration)?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         let result = get_symbol(&server, "wide").await?;
@@ -5536,7 +5710,7 @@ done
         drop(server);
 
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
+        fs::write(directory.path().join("wide.rs"), wide)?;
         let configuration =
             "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
         super::hermetic_workspace(directory.path(), configuration)?;
@@ -5544,11 +5718,21 @@ done
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         let result = get_symbol(&server, "wide").await?;
         assert!(result.hits.is_empty());
-        assert!(result.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                if unit.0.ends_with("/wide.rs") && detail.contains("file byte limit")
-        )));
+        let expected_limit =
+            format!("wide.rs source file exceeds its accepted byte limit of {max_file_bytes}");
+        let expected_observed = format!("observed {}", max_file_bytes + 1);
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::SourceUnavailable { unit: Some(unit), detail }
+                    if unit.0 == "rift://file/wide.rs"
+                        && detail.contains(expected_limit.as_str())
+                        && detail.contains("field source.file_bytes")
+                        && detail.contains(expected_observed.as_str())
+            )),
+            "{:?}",
+            result.warnings
+        );
         Ok(())
     }
 
@@ -5640,21 +5824,34 @@ done
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
-        let configuration =
-            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
-        super::hermetic_workspace(directory.path(), configuration)?;
+        let max_file_bytes = 60_usize;
+        let configuration = format!(
+            "[providers.syntax]\nmax_file = \"{max_file_bytes}b\"\n\n[search.text]\nlarge_files = \"skip\"\n"
+        );
+        super::hermetic_workspace(directory.path(), &configuration)?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
+        assert!(oversized.len() > max_file_bytes);
+        let expected_limit =
+            format!("lib.rs source file exceeds its accepted byte limit of {max_file_bytes}");
+        let expected_observed = format!("observed {}", max_file_bytes + 1);
         fs::write(&path, oversized)?;
         let skipped = get_symbol(&server, "oversized").await?;
         assert!(skipped.hits.is_empty());
-        assert!(skipped.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::SourceUnavailable { unit: Some(unit), detail }
-                if unit.0.ends_with("/lib.rs") && detail.contains("file byte limit")
-        )));
+        assert!(
+            skipped.warnings.iter().any(|warning| matches!(
+                warning,
+                ReadWarning::SourceUnavailable { unit: Some(unit), detail }
+                    if unit.0 == "rift://file/lib.rs"
+                        && detail.contains(expected_limit.as_str())
+                        && detail.contains("field source.file_bytes")
+                        && detail.contains(expected_observed.as_str())
+            )),
+            "{:?}",
+            skipped.warnings
+        );
 
         fs::write(&path, "pub fn recovered() {}\n")?;
         let mut recovered = false;
@@ -5913,7 +6110,7 @@ done
             })
             .await
             .expect_err("pre-cancelled work must not dispatch");
-        assert!(matches!(error.fault(), ReadFault::Cancelled));
+        assert_eq!(error.slug(), errors::server::read_cancelled::SLUG);
         assert!(!started.load(Ordering::SeqCst));
         executor
             .run("operation after cancellation", || Ok(()))
@@ -5972,7 +6169,7 @@ done
             .await
             .expect("cancelled queued task must join")
             .expect_err("cancelled queue wait must fail");
-        assert!(matches!(error.fault(), ReadFault::Cancelled));
+        assert_eq!(error.slug(), errors::server::read_cancelled::SLUG);
         assert!(!started.load(Ordering::SeqCst));
 
         release_sender
@@ -6024,17 +6221,17 @@ done
             .await
             .expect("queued task must join")
             .expect_err("queue wait beyond timeout must fail");
-        assert!(matches!(
-            error.fault(),
-            ReadFault::CapacityTimeout {
-                operation: "queued operation",
-                timeout_ms: QUEUE_TIMEOUT_MS,
-            }
-        ));
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
-        let context = error.context();
-        assert_eq!(context[0].value(), "queued operation");
-        assert_eq!(context[1].value(), QUEUE_TIMEOUT_MS.to_string());
+        assert_eq!(error.slug(), errors::server::read_capacity_timeout::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "queued operation")
+        );
+        assert!(
+            error.context().any(|(key, value)| {
+                key == "timeout_ms" && value == QUEUE_TIMEOUT_MS.to_string()
+            })
+        );
 
         release_sender
             .send(())
@@ -6052,14 +6249,17 @@ done
     async fn blocking_executor_preserves_work_error() {
         let executor = BlockingExecutor::isolated(1, 1_000);
         let error = executor
-            .run("refused operation", || -> Result<(), ReadError> {
-                Err(ReadError::from(ReadFault::Unsupported {
-                    capability: "probe".to_owned(),
-                }))
-            })
+            .run(
+                "refused operation",
+                || -> Result<(), rift_error::RiftError> {
+                    errors::server::read_unsupported()
+                        .capability("probe")
+                        .fail()
+                },
+            )
             .await
             .expect_err("work refusal must survive blocking executor");
-        assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
+        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
     }
 
     #[tokio::test]
@@ -6106,15 +6306,21 @@ done
         let error = executor
             .run(
                 "panicking operation",
-                || -> Result<(), rift_server::ReadError> { panic!("test blocking worker panic") },
+                || -> Result<(), rift_server::RiftError> { panic!("test blocking worker panic") },
             )
             .await
             .expect_err("worker panic must become task failure");
-        let ReadFault::Task { operation, detail } = error.fault() else {
-            panic!("worker panic must classify as task failure: {error:?}");
-        };
-        assert_eq!(*operation, "panicking operation");
-        assert!(detail.contains("panic"), "{detail}");
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "operation" && value == "panicking operation" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "detail" && value.contains("panic"))
+        );
         executor
             .run("operation after panic", || Ok(()))
             .await
@@ -6129,7 +6335,7 @@ done
             .run("closed queue operation", || Ok(()))
             .await
             .expect_err("closed semaphore must fail acceptance");
-        assert!(matches!(error.fault(), ReadFault::Task { .. }));
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
     }
 
     #[tokio::test]
@@ -6510,6 +6716,12 @@ done
         );
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
+        assert_eq!(wire["phase"], json!("read"));
+        assert!(
+            wire.get("causes").is_none(),
+            "a failure with no causal chain must omit causes"
+        );
         Ok(())
     }
 
@@ -6530,9 +6742,9 @@ done
         assert_eq!(data.code, ErrorCode(-32000));
         assert_eq!(
             data.message.as_ref(),
-            "the request does not match the documented form: tool search, field paths, \
-             accepted exclude, force_include, include, \
-             example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}; \
+            "tool arguments do not match the served schema: accepted exclude, force_include, \
+             include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
+             field paths, tool search; \
              correct the reported field and resend the request"
         );
         let wire = data.data.ok_or("wire error data must be present")?;
@@ -6549,17 +6761,20 @@ done
             failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
         let message = data.message.as_ref();
         assert!(
-            message.starts_with(
-                "the request does not match the documented form: tool search, accepted "
-            ),
+            message.starts_with("tool arguments do not match the served schema: accepted "),
             "{message}"
         );
+        assert!(message.contains("tool search"), "{message}");
         assert!(message.contains("paths"), "{message}");
         assert!(message.contains("example {"), "{message}");
         assert!(
             !message.contains("unknown field") && !message.contains("struct"),
             "a refusal never speaks serde's grammar: {message}"
         );
+        assert_eq!(data.code, ErrorCode(-32000));
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
         Ok(())
     }
 
@@ -6569,13 +6784,19 @@ done
         let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
         let message = data.message.as_ref();
         assert!(
-            message.contains("field target, accepted all, commit, documentation, file, symbol"),
+            message.contains("accepted all, commit, documentation, file, symbol"),
             "{message}"
         );
+        assert!(message.contains("field target"), "{message}");
+        assert!(message.contains("tool search"), "{message}");
         assert!(
             !message.contains("unknown variant"),
             "a refusal never speaks serde's grammar: {message}"
         );
+        assert_eq!(data.code, ErrorCode(-32000));
+        let wire = data.data.ok_or("wire error data must be present")?;
+        assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
         Ok(())
     }
 
@@ -6989,7 +7210,10 @@ done
                 &published,
                 &validation,
                 epoch,
-                ReadFault::unavailable("test rebuild", "injected failure"),
+                errors::server::read_unavailable()
+                    .operation("test rebuild")
+                    .detail("injected failure")
+                    .error(),
             )
         })
         .await?;
@@ -7509,7 +7733,7 @@ done
     fn captured_tree(
         root: &std::path::Path,
         current: &super::PublishedWorkspace,
-    ) -> Result<(super::WorkspaceDigests, super::ConfigurationFingerprint), super::ReadError> {
+    ) -> Result<(super::WorkspaceDigests, super::ConfigurationFingerprint), super::RiftError> {
         let limits = current
             .configuration
             .index_limits(WorkspaceIndexLimits::default())?;
@@ -7523,8 +7747,7 @@ done
             &text_inclusion,
             &languages,
             &super::LastCapture::default(),
-        )
-        .map_err(|error| super::ReadError::from(ReadFault::Index(error)))?;
+        )?;
         Ok((digests, super::configuration_fingerprint(root)))
     }
 
@@ -7650,10 +7873,10 @@ done
     async fn a_read_whose_capture_fails_refuses() -> TestResult {
         let (_directory, server) = fixture().await?;
         server.force_capture(|_current| {
-            Err(ReadFault::unavailable(
-                "test capture",
-                "injected capture failure",
-            ))
+            errors::server::read_unavailable()
+                .operation("test capture")
+                .detail("injected capture failure")
+                .fail()
         });
 
         let refusal = tokio::time::timeout(RECONCILED_READ_MAX, get_symbol(&server, "beacon"))
@@ -8625,6 +8848,13 @@ done
     /// whole budget the request was given.
     #[tokio::test]
     async fn a_publication_wait_ends_at_the_deadline_the_request_carries() -> TestResult {
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(log.reopen()?)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         // The tree moves past the publication, so the read waits for a rebuild that the
@@ -8656,6 +8886,27 @@ done
                 .message
                 .contains(&format!("{}ms", STALLED_PUBLICATION_BUDGET.as_millis())),
             "the refusal names the whole budget the request was given: {error:?}"
+        );
+        let records = fs::read_to_string(log.path())?;
+        for event in [
+            "request capture compared with publication",
+            "request capture requested a rebuild",
+            "request waiting for publication",
+            "a request spent its whole readiness budget",
+        ] {
+            assert!(
+                records.contains(event),
+                "the wait records its active stage: {event}\n{records}"
+            );
+        }
+        let waiting = records
+            .lines()
+            .find(|line| line.contains("request waiting for publication"))
+            .ok_or("the request records its publication wait before the deadline")?;
+        assert!(waiting.contains("published_epoch=0"), "{waiting}");
+        assert!(
+            waiting.contains("observed_epoch=") && waiting.contains("superseded_epoch="),
+            "{waiting}"
         );
         Ok(())
     }
@@ -8986,7 +9237,7 @@ done
         assert!(
             text.contains("file left out of the index")
                 && text.contains("src/deep.rs")
-                && text.contains("too_deep"),
+                && text.contains("syntax tree depth exceeds accepted limit 512"),
             "the logs must name the left-out file and its bound: {text}"
         );
         Ok(())
@@ -9020,6 +9271,7 @@ done
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         let wide = format!("pub fn wide() {{}}\n{}", "// wide_marker\n".repeat(8));
+        let wide_bytes = wide.len();
         fs::write(directory.path().join("src/wide.rs"), wide)?;
         super::hermetic_workspace(
             directory.path(),
@@ -9083,7 +9335,9 @@ done
             assert_eq!(record["operation"], "index.build", "{record:#}");
             let reason = record["fields"]["reason"].as_str().unwrap_or_default();
             assert!(
-                reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
+                reason.contains(&format!(
+                    "source bytes {wide_bytes} exceed accepted limit 128"
+                )),
                 "the record names the bound the file crossed: {record:#}"
             );
         }

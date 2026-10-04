@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::http::{HeaderName, HeaderValue};
+use rift_core::CapturedStream;
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
-use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_error::{RiftError, errors};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
@@ -28,15 +29,15 @@ use rmcp::model::{
 };
 use rmcp::service::{
     Peer, PeerRequestOptions, QuitReason, RequestContext, RoleClient, RoleServer, RunningService,
-    ServerInitializeError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
+use tracing::Instrument as _;
 
 use crate::election::{ServerPresence, StaleReason, probe, probe_state_directory};
-use crate::failure::WireFailure as _;
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
 use crate::repository::{
@@ -58,52 +59,6 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// rendered and to travel back to the proxy.
 const FORWARD_ANSWER_GRACE: Duration = Duration::from_secs(10);
 
-/// Failure while starting or running the stdio MCP proxy.
-pub type ProxyServeError = Error<ProxyFault>;
-
-/// One proxy failure: what stopped `rift mcp` from serving agents.
-#[derive(Debug)]
-pub enum ProxyFault {
-    /// Current process identity could not be computed.
-    Identity(std::io::Error),
-    /// MCP initialization over stdio failed.
-    Initialize(Box<ServerInitializeError>),
-    /// The MCP service task failed.
-    Task(tokio::task::JoinError),
-    /// The MCP service ended unexpectedly.
-    UnexpectedQuit,
-}
-
-impl Fault for ProxyFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::Initialize(_) => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
-            Self::Identity(_) | Self::Task(_) | Self::UnexpectedQuit => {
-                ErrorName::Wire(ErrorCode::InternalError)
-            }
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let detail = match self {
-            Self::Identity(_) => "product identity failed",
-            Self::Initialize(_) => "MCP initialization failed",
-            Self::Task(_) => "MCP service task failed",
-            Self::UnexpectedQuit => "MCP service ended unexpectedly",
-        };
-        vec![ErrorContext::new("detail", detail)]
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Identity(source) => Some(source),
-            Self::Initialize(source) => Some(source.as_ref()),
-            Self::Task(source) => Some(source),
-            Self::UnexpectedQuit => None,
-        }
-    }
-}
-
 /// Serves agents over stdio MCP, forwarding every request to the
 /// workspace's elected server, as the build `checkout` describes.
 ///
@@ -115,17 +70,17 @@ impl Fault for ProxyFault {
 ///
 /// # Errors
 ///
-/// Returns [`ProxyServeError`] for initialization or service-task failure.
+/// Returns a registered error for initialization or service-task failure.
 ///
 /// # Cancel safety
 ///
 /// Dropping this future closes the owned MCP service and the upstream
 /// connection; the detached server keeps serving the workspace.
-pub async fn serve_proxy(root: &Path, checkout: BuildCheckout) -> Result<(), ProxyServeError> {
+pub async fn serve_proxy(root: &Path, checkout: BuildCheckout) -> Result<(), RiftError> {
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
     let identity = crate::identity::product_identity(checkout)
         .await
-        .map_err(|error| Error::new(ProxyFault::Identity(error)))?;
+        .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
     let proxy = RiftProxy::new(root, identity);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
     let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
@@ -141,19 +96,20 @@ pub async fn serve_proxy(root: &Path, checkout: BuildCheckout) -> Result<(), Pro
 async fn serve_connection<Transport, TransportError, Adapter>(
     proxy: RiftProxy,
     transport: Transport,
-) -> Result<(), ProxyServeError>
+) -> Result<(), RiftError>
 where
     Transport: rmcp::transport::IntoTransport<RoleServer, TransportError, Adapter>,
     TransportError: std::error::Error + Send + Sync + 'static,
 {
-    let service = proxy
-        .serve(transport)
-        .await
-        .map_err(|error| Error::new(ProxyFault::Initialize(Box::new(error))))?;
+    let service = proxy.serve(transport).await.map_err(|error| {
+        errors::mcp::proxy_initialization_failed()
+            .source(error)
+            .error()
+    })?;
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy ready");
     let reason = service.waiting().await;
     let outcome = reason
-        .map_err(|error| Error::new(ProxyFault::Task(error)))
+        .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())
         .and_then(quit_reason_result);
     tracing::info!(
         component = "mcp",
@@ -168,11 +124,11 @@ where
 ///
 /// Split from [`serve_connection`] so the mapping is testable without live
 /// stdio I/O.
-fn quit_reason_result(reason: QuitReason) -> Result<(), ProxyServeError> {
+fn quit_reason_result(reason: QuitReason) -> Result<(), RiftError> {
     match reason {
         QuitReason::Closed | QuitReason::Cancelled => Ok(()),
-        QuitReason::JoinError(error) => Err(Error::new(ProxyFault::Task(error))),
-        _ => Err(Error::new(ProxyFault::UnexpectedQuit)),
+        QuitReason::JoinError(error) => errors::mcp::proxy_task_failed().source(error).fail(),
+        _ => errors::mcp::proxy_unexpected_quit().fail(),
     }
 }
 
@@ -381,7 +337,7 @@ impl RiftProxy {
     /// another kind than `answer` reads refuses as an unexpected response.
     /// Each send is bounded by the proxy's forward budget, and a send that
     /// outlives it is cancelled on the server and refuses as
-    /// [`ForwardFault::Unanswered`].
+    /// the registered forwarding error.
     ///
     /// # Cancel safety
     ///
@@ -396,7 +352,7 @@ impl RiftProxy {
         let failure = match self.answered(&peer, request.clone()).await? {
             Ok(result) => return answered_as(result, answer),
             Err(error) if transport_failed(&error) => error,
-            Err(error) => return Err(forwarded_error(error)),
+            Err(error) => return forwarded_error(error).fail(),
         };
         tracing::info!(
             component = "mcp",
@@ -434,7 +390,16 @@ impl RiftProxy {
             .send_cancellable_request(request, PeerRequestOptions::with_timeout(budget))
             .await
         {
-            Ok(handle) => handle.await_response().await,
+            Ok(handle) => {
+                tracing::debug!(component = "mcp", upstream_request_id = %handle.id, "forwarded request awaiting response");
+                let result = handle.await_response().await;
+                tracing::debug!(
+                    component = "mcp",
+                    is_error = result.is_err(),
+                    "forwarded request completed"
+                );
+                result
+            }
             Err(error) => Err(error),
         };
         match answer {
@@ -445,8 +410,11 @@ impl RiftProxy {
                     "the workspace server did not answer a forwarded request within its budget; \
                      the request is cancelled"
                 );
-                Err(Error::new(ForwardFault::Unanswered { budget })
-                    .tool_error(wire::ErrorPhase::Read))
+                errors::mcp::forward_unanswered()
+                    .waited(budget)
+                    .mcp()
+                    .tool_error(wire::ErrorPhase::Read)
+                    .fail()
             }
             answered => Ok(answered),
         }
@@ -504,34 +472,6 @@ fn answered_as<Value>(
     answer: fn(ServerResult) -> Option<Value>,
 ) -> Result<Value, ErrorData> {
     answer(result).ok_or_else(|| forwarded_error(ServiceError::UnexpectedResponse))
-}
-
-/// Why a forwarded request produced no answer from the upstream.
-#[derive(Debug)]
-enum ForwardFault {
-    /// The workspace server did not answer within the forward budget.
-    Unanswered {
-        /// The budget the forward waited out.
-        budget: Duration,
-    },
-}
-
-impl Fault for ForwardFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Unanswered { budget } => vec![
-                ErrorContext::new(
-                    "detail",
-                    "the workspace's rift server did not answer the forwarded request",
-                ),
-                ErrorContext::new("waited", format!("{budget:?}")),
-            ],
-        }
-    }
 }
 
 /// Whether a request may reuse the slot's current upstream instead of
@@ -620,7 +560,7 @@ async fn connect_upstream(
         }
         match spawns.poll(adopted, election_held) {
             SpawnPollOutcome::Ready(running) => return Ok(running),
-            SpawnPollOutcome::Failed(capture) => return Err(server_start_failed(&capture)),
+            SpawnPollOutcome::Failed(capture) => return server_start_failed(&capture).fail(),
             SpawnPollOutcome::ElectionUnheld => spawns.spawn_captured(root),
             SpawnPollOutcome::Waiting => {}
         }
@@ -630,10 +570,10 @@ async fn connect_upstream(
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
     if let Some(refusal) = still_serving {
-        return Err(refusal);
+        return refusal.fail();
     }
     let closed = DatabaseActivity::observed(root).await;
-    Err(start_window_refusal(building && opened != closed))
+    start_window_refusal(building && opened != closed).fail()
 }
 
 /// What the workspace database's files looked like at one instant: each
@@ -687,36 +627,19 @@ impl DatabaseActivity {
 /// operator's next step otherwise.
 fn start_window_refusal(building: bool) -> ErrorData {
     if building {
-        return Error::new(StartFault::Building).tool_error(wire::ErrorPhase::Read);
+        return errors::mcp::start_building()
+            .waited(START_WAIT_MAX)
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
     }
-    upstream_unavailable()
-}
-
-/// Why the start window closed without a server that answers, when the
-/// caller can resend the request.
-#[derive(Debug)]
-enum StartFault {
-    /// The workspace's server holds the election, has published no lock
-    /// document yet, and wrote to the workspace database during the window.
-    Building,
-}
-
-impl Fault for StartFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Building => vec![
-                ErrorContext::new(
-                    "detail",
-                    "the workspace's rift server is still building its first index",
-                ),
-                ErrorContext::new("waited", format!("{START_WAIT_MAX:?}")),
-            ],
-        }
-    }
+    ErrorData::internal_error(
+        format!(
+            "no rift server answered for this workspace within {START_WAIT_MAX:?}; the \
+             workspace has no server this caller can reach, and starting one is an \
+             operator action on this host"
+        ),
+        None,
+    )
 }
 
 /// The refusal a request gets when the spawned server exited before it
@@ -726,60 +649,15 @@ impl Fault for StartFault {
 /// has no shell channel of its own, so it learns what actually failed
 /// instead of being pointed at a command it cannot run.
 fn server_start_failed(capture: &CapturedStream) -> ErrorData {
-    let fault = if capture.text.is_empty() {
-        SpawnFault::NoOutput
+    let failure = if capture.text.is_empty() {
+        errors::mcp::spawn_no_output().mcp()
     } else {
-        SpawnFault::CapturedStderr {
-            text: capture.text.clone(),
-            truncated: capture.truncated,
-        }
+        errors::mcp::spawn_failed()
+            .stderr(capture.text.clone())
+            .stderr_truncated(capture.truncated)
+            .mcp()
     };
-    Error::new(fault).tool_error(wire::ErrorPhase::Read)
-}
-
-/// Why a detached server spawn failed to start serving.
-#[derive(Debug)]
-enum SpawnFault {
-    /// The spawned server exited before publishing its lock document, and
-    /// wrote nothing to its own standard error.
-    NoOutput,
-    /// The spawned server exited before publishing its lock document; its
-    /// captured standard error names what happened.
-    CapturedStderr {
-        /// The captured prefix.
-        text: String,
-        /// Whether the capture stopped short of the full stream.
-        truncated: bool,
-    },
-}
-
-impl Fault for SpawnFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::NoOutput => vec![ErrorContext::new(
-                "detail",
-                "the spawned server exited before it started serving, with no output on its \
-                 standard error",
-            )],
-            Self::CapturedStderr { text, truncated } => {
-                let mut context = vec![
-                    ErrorContext::new(
-                        "detail",
-                        "the spawned server exited before it started serving",
-                    ),
-                    ErrorContext::new("stderr", text.clone()),
-                ];
-                if *truncated {
-                    context.push(ErrorContext::new("stderr_truncated", "true"));
-                }
-                context
-            }
-        }
-    }
+    failure.tool_error(wire::ErrorPhase::Read)
 }
 
 /// The recorded serving server as a live connection, when both halves hold.
@@ -855,7 +733,7 @@ async fn adopt_presence(
             replacement.replace(&lock, identity).await?;
             return Ok(None);
         }
-        ServerStanding::Refuse => return Err(identity_refusal(identity, &lock)),
+        ServerStanding::Refuse => return identity_refusal(identity, &lock).fail(),
     }
     match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, root).await {
         Ok(running) => {
@@ -1010,7 +888,7 @@ impl Replacement {
     ) -> Result<(), ErrorData> {
         match &self.asked {
             Some(asked) if names_one_server(asked, lock) => return Ok(()),
-            Some(_) => return Err(identity_refusal(identity, lock)),
+            Some(_) => return identity_refusal(identity, lock).fail(),
             None => {}
         }
         match request_stop(lock).await {
@@ -1028,7 +906,7 @@ impl Replacement {
                     failure = ?failure,
                     "the workspace server did not accept the stop request"
                 );
-                return Err(identity_refusal(identity, lock));
+                return identity_refusal(identity, lock).fail();
             }
         }
         let server_version = lock.identity.version.as_str();
@@ -1153,19 +1031,6 @@ fn transport_failed(error: &ServiceError) -> bool {
     )
 }
 
-/// The refusal a request gets when no server answered within the start
-/// window.
-fn upstream_unavailable() -> ErrorData {
-    ErrorData::internal_error(
-        format!(
-            "no rift server answered for this workspace within {START_WAIT_MAX:?}; the \
-             workspace has no server this caller can reach, and starting one is an \
-             operator action on this host"
-        ),
-        None,
-    )
-}
-
 /// The JSON-RPC error a downstream client gets for one upstream failure.
 ///
 /// A refusal the server classified travels unchanged, refusal code and
@@ -1244,17 +1109,34 @@ impl ServerHandler for RiftProxy {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-        self.forward(request, |result| match result {
-            ServerResult::CallToolResult(result) => Some(CallToolResponse::Complete(result)),
-            ServerResult::InputRequiredResult(result) => {
-                Some(CallToolResponse::InputRequired(result))
-            }
-            ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
-            _ => None,
-        })
+        let span = tracing::info_span!(
+            "mcp.forward",
+            component = "mcp",
+            operation = "tools/call",
+            request_id = %context.id,
+            tool = %request.name
+        );
+        async {
+            tracing::debug!("tool forward started");
+            let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+            let result = self
+                .forward(request, |result| match result {
+                    ServerResult::CallToolResult(result) => {
+                        Some(CallToolResponse::Complete(result))
+                    }
+                    ServerResult::InputRequiredResult(result) => {
+                        Some(CallToolResponse::InputRequired(result))
+                    }
+                    ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
+                    _ => None,
+                })
+                .await;
+            tracing::debug!(is_error = result.is_err(), "tool forward completed");
+            result
+        }
+        .instrument(span)
         .await
     }
 
@@ -1337,13 +1219,15 @@ mod tests {
     use tokio::io::AsyncBufReadExt as _;
 
     use super::{
-        ConnectAttemptFailure, ProxyFault, Replacement, RiftProxy, ServerStanding, Upstream,
-        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, fallback_info,
-        forwarded_error, identity_refusal, mirrored_info, quit_reason_result, reuse_current,
-        serve_connection, server_start_failed, transport_failed, upstream_unavailable,
+        ConnectAttemptFailure, Replacement, RiftProxy, ServerStanding, Upstream, UpstreamSlot,
+        adopt_serving, connect_recorded, connect_upstream, fallback_info, forwarded_error,
+        identity_refusal, mirrored_info, quit_reason_result, reuse_current, serve_connection,
+        server_start_failed, start_window_refusal, transport_failed,
     };
     use crate::election::{ServerPresence, StaleReason, claim};
-    use rift_core::{CapturedStream, Error};
+    use rift_core::CapturedStream;
+    use rift_error::errors;
+    use rift_protocol::error as wire;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1814,7 +1698,7 @@ mod tests {
 
     #[test]
     fn unavailable_refusal_names_the_window_without_a_shell_command_the_caller_cannot_run() {
-        let refusal = upstream_unavailable();
+        let refusal = start_window_refusal(false);
         assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
         assert!(refusal.message.contains("30s"), "{}", refusal.message);
         assert!(
@@ -1830,25 +1714,61 @@ mod tests {
     }
 
     #[test]
-    fn server_start_failed_names_no_output_when_stderr_was_empty() {
+    fn server_start_failed_names_empty_standard_error() {
         let refusal = server_start_failed(&CapturedStream::default());
-        assert!(refusal.message.contains("no output"), "{}", refusal.message);
+        assert!(
+            refusal.message.contains("wrote no standard error"),
+            "{}",
+            refusal.message
+        );
+        let data: wire::ErrorData = serde_json::from_value(
+            refusal
+                .data
+                .clone()
+                .expect("wire failure data must be present"),
+        )
+        .expect("wire failure data must match schema");
+        assert_eq!(data.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(data.retry, wire::RetryDirective::SameRequest);
     }
 
     #[test]
-    fn server_start_failed_carries_the_captured_stderr_text() {
+    fn server_start_failed_redacts_captured_stderr() {
         let capture = CapturedStream {
             text: "panicked at src/main.rs:1".to_owned(),
             captured_bytes: 26,
             total_bytes: 26,
             truncated: false,
         };
+        let registered = errors::mcp::spawn_failed()
+            .stderr(capture.text.clone())
+            .stderr_truncated(capture.truncated)
+            .error();
+        assert!(
+            registered
+                .context()
+                .any(|(key, value)| { key == "stderr" && value == "[redacted]" })
+        );
+        assert!(
+            registered.to_string().contains("[redacted]")
+                && !registered.to_string().contains(&capture.text)
+        );
         let refusal = server_start_failed(&capture);
         assert!(
-            refusal.message.contains("panicked at src/main.rs:1"),
+            refusal.message.contains("[redacted]"),
             "{}",
             refusal.message
         );
+        assert!(!refusal.message.contains(&capture.text));
+        let data: wire::ErrorData = serde_json::from_value(
+            refusal
+                .data
+                .clone()
+                .expect("wire failure data must be present"),
+        )
+        .expect("wire failure data must match schema");
+        assert_eq!(data.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(data.retry, wire::RetryDirective::SameRequest);
         assert!(
             !refusal.message.contains('`'),
             "the caller has no shell to run a command in: {}",
@@ -1910,27 +1830,26 @@ mod tests {
     }
 
     #[test]
-    fn proxy_faults_carry_registry_codes_and_sources() {
-        let quit = Error::new(ProxyFault::UnexpectedQuit);
-        assert_eq!(quit.descriptor().code(), "internal_error");
+    fn proxy_errors_carry_registered_slugs_and_sources() {
+        let quit = errors::mcp::proxy_unexpected_quit().error();
+        assert_eq!(quit.slug(), errors::mcp::proxy_unexpected_quit::SLUG);
         let rendered = quit.to_string();
-        assert!(
-            rendered.contains("MCP service ended unexpectedly"),
-            "{rendered}"
+        assert_eq!(
+            rendered,
+            "MCP service ended unexpectedly; report this internal failure with its full context"
         );
         assert!(std::error::Error::source(&quit).is_none());
 
-        let initialize = Error::new(ProxyFault::Initialize(Box::new(
-            rmcp::service::ServerInitializeError::Cancelled,
-        )));
+        let initialize = errors::mcp::proxy_initialization_failed()
+            .source(rmcp::service::ServerInitializeError::Cancelled)
+            .error();
         assert_eq!(
-            initialize.descriptor().code(),
-            "temporarily_unavailable",
-            "an initialization failure must classify as transient"
+            initialize.slug(),
+            errors::mcp::proxy_initialization_failed::SLUG
         );
         let rendered_initialize = initialize.to_string();
         assert!(
-            rendered_initialize.contains("MCP initialization failed"),
+            rendered_initialize.contains("MCP proxy initialization failed"),
             "{rendered_initialize}"
         );
         assert!(std::error::Error::source(&initialize).is_some());
@@ -2121,7 +2040,14 @@ mod tests {
         let refusal = connect_upstream(directory.path(), &test_identity())
             .await
             .expect_err("a holder that never publishes must exhaust the start window");
-        assert_eq!(refusal.message, upstream_unavailable().message);
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            refusal
+                .message
+                .contains("no rift server answered for this workspace within 30s"),
+            "{}",
+            refusal.message
+        );
         Ok(())
     }
 
@@ -2147,7 +2073,16 @@ mod tests {
             .ok_or("the refusal carries its classification")?;
         assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
         assert!(
-            refusal.message.contains("still building its first index"),
+            refusal
+                .message
+                .contains("did not finish building its first index within 30s"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            refusal
+                .message
+                .contains("resend the same request after a short delay"),
             "{}",
             refusal.message
         );
@@ -2160,12 +2095,35 @@ mod tests {
     fn the_start_window_refusal_follows_the_evidence() {
         let building = super::start_window_refusal(true);
         assert!(
-            building.message.contains("still building"),
+            building
+                .message
+                .contains("did not finish building its first index within 30s"),
+            "{}",
+            building.message
+        );
+        let data: wire::ErrorData = serde_json::from_value(
+            building
+                .data
+                .clone()
+                .expect("wire failure data must be present"),
+        )
+        .expect("wire failure data must match schema");
+        assert_eq!(data.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(data.retry, wire::RetryDirective::SameRequest);
+        assert!(
+            building
+                .message
+                .contains("resend the same request after a short delay"),
             "{}",
             building.message
         );
         let wedged = super::start_window_refusal(false);
-        assert_eq!(wedged.message, upstream_unavailable().message);
+        assert_eq!(wedged.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            wedged.message.contains("operator action on this host"),
+            "{}",
+            wedged.message
+        );
     }
 
     /// Database activity reads each file's length and modification time, and
@@ -2211,7 +2169,14 @@ mod tests {
         let refusal = connect_upstream(&missing, &test_identity())
             .await
             .expect_err("a workspace nobody serves must exhaust the start window");
-        assert_eq!(refusal.message, upstream_unavailable().message);
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            refusal
+                .message
+                .contains("no rift server answered for this workspace within 30s"),
+            "{}",
+            refusal.message
+        );
         Ok(())
     }
 
@@ -2231,13 +2196,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_fault_preserves_the_join_source() {
+    async fn task_error_preserves_the_join_source() {
         let task = tokio::spawn(async { panic!("test join failure") });
         let join = task.await.expect_err("test task must fail");
         let error = quit_reason_result(QuitReason::JoinError(join))
             .expect_err("join error quit reason must fail");
-        assert_eq!(error.descriptor().code(), "internal_error");
-        assert!(error.to_string().contains("MCP service task failed"));
+        assert_eq!(error.slug(), errors::mcp::proxy_task_failed::SLUG);
+        assert!(error.to_string().contains("MCP proxy service task failed"));
         assert!(std::error::Error::source(&error).is_some());
     }
 
@@ -2252,8 +2217,132 @@ mod tests {
         ))
         .await
         .expect_err("a closed transport must fail initialization");
-        assert!(matches!(error.fault(), ProxyFault::Initialize(_)));
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(error.slug(), errors::mcp::proxy_initialization_failed::SLUG);
+    }
+
+    #[tokio::test]
+    async fn tool_diagnostics_correlate_proxy_and_server_requests() -> TestResult {
+        use rmcp::ServiceExt as _;
+
+        // Issue #483 needs the request still awaiting an answer to retain its IDs.
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("rift=info,rift_mcp=debug,rift_server=debug,rift_index=info")
+            .with_ansi(false)
+            .with_writer(log.reopen()?)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        let server = crate::server::RiftMcp::build_settled(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+        )
+        .await?;
+        let (server_transport, upstream_transport) = tokio::io::duplex(64 * 1024);
+        let (serving, upstream) =
+            tokio::join!(server.serve(server_transport), ().serve(upstream_transport));
+        let serving = serving?;
+        let upstream = upstream?;
+        // Advance the upstream's IDs so matching the downstream ID cannot pass by chance.
+        upstream.list_tools(None).await?;
+        let proxy = RiftProxy::new(directory.path(), test_identity());
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running: upstream,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let (proxy_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let (forwarding, client) =
+            tokio::join!(proxy.serve(proxy_transport), ().serve(client_transport));
+        let forwarding = forwarding?;
+        let client = client?;
+        let params = super::CallToolRequestParams::new("search").with_arguments(
+            serde_json::from_value(json!({"query": "zzdiagnosticsecret", "scope": "local"}))?,
+        );
+        let request = super::ClientRequest::CallToolRequest(super::CallToolRequest::new(params));
+        let handle = client
+            .send_cancellable_request(request, super::PeerRequestOptions::default())
+            .await?;
+        let request_id = handle.id.to_string();
+        let result = handle.await_response().await?;
+        let ServerResult::CallToolResult(result) = result else {
+            return Err("search must return a tool result".into());
+        };
+        assert_ne!(result.is_error, Some(true));
+        let invalid = client
+            .call_tool(super::CallToolRequestParams::new("nodes").with_arguments(
+                serde_json::from_value(json!({"path": "../outside.rs", "position": 0}))?,
+            ))
+            .await
+            .expect_err("invalid paths retain the wire refusal");
+        let ServiceError::McpError(invalid) = invalid else {
+            return Err("invalid paths must return an MCP error".into());
+        };
+        assert_eq!(
+            invalid.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!("invalid_request"))
+        );
+        let records = std::fs::read_to_string(log.path())?;
+        assert_tool_diagnostics(&records, &request_id)?;
+        client.cancel().await?;
+        forwarding.cancel().await?;
+        serving.cancel().await?;
+        Ok(())
+    }
+
+    fn assert_tool_diagnostics(records: &str, request_id: &str) -> TestResult {
+        let forwarded = records
+            .lines()
+            .find(|line| {
+                line.contains("forwarded request awaiting response")
+                    && line.contains(&format!("request_id={request_id}"))
+                    && line.contains("tool=search")
+            })
+            .ok_or("the proxy records the active forward and downstream request ID")?;
+        let upstream_id = forwarded
+            .split("upstream_request_id=")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or("the forward records its upstream request ID")?;
+        assert_ne!(upstream_id, request_id);
+        for event in [
+            "tool request started",
+            "worker admission started",
+            "worker admitted",
+            "request capture compared with publication",
+            "tool request completed",
+        ] {
+            assert!(
+                records.lines().any(|line| {
+                    line.contains("mcp.request{")
+                        && line.contains(&format!("request_id={upstream_id}"))
+                        && line.contains(event)
+                }),
+                "the server event retains the upstream request ID: {event}\n{records}"
+            );
+        }
+        assert!(
+            records
+                .lines()
+                .any(|line| line.contains("tool request completed")
+                    && line.contains("is_error=false"))
+        );
+        assert!(
+            records
+                .lines()
+                .any(|line| line.contains("tool request completed")
+                    && line.contains("is_error=true"))
+        );
+        assert!(
+            !records.contains("zzdiagnosticsecret"),
+            "request arguments stay out of diagnostics: {records}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,10 +1,7 @@
-//! Registry conformance for the configuration model's fault types, and the
-//! policy values `rift-index` reads out of it.
+//! Configuration error conversion and policy values `rift-index` reads.
 //!
 //! The `rift.toml` model lives in `rift-protocol`, below this crate, so its
-//! fault types cannot implement [`Fault`] where they are defined. This module
-//! implements the registry trait over them, giving every configuration
-//! refusal the registry's identity, explanation, and rendering. It also
+//! errors are represented by registered Rift errors in this module. It also
 //! holds [`SourceVisibility`]: `rift-index` has no dependency on
 //! `rift-protocol`, so the workspace's `[source]` table is translated into
 //! this plain value here, beside the wire type it comes from. For the same
@@ -13,14 +10,16 @@
 
 pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
-    ConfigurationViolation, EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, LargeFileStrategy,
-    UnitParseError, WorkspaceConfiguration,
+    EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, LargeFileStrategy, WorkspaceConfiguration,
 };
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
 
-use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
-use rift_protocol::error::ErrorCode;
+use rift_error::errors::core::configuration_port_selection_conflict;
+use rift_error::{ErrorContext, RiftError, errors};
+use rift_protocol::configuration::ConfigurationViolation::{self, PortSelectionConflict};
+#[cfg(test)]
+use rift_protocol::configuration::UnitParseError;
 
 /// Which files below a workspace root the index may see: the resolved
 /// `[source]` policy, independent of the wire model it was read from.
@@ -294,39 +293,121 @@ impl From<&WorkspaceConfiguration> for TextFileInclusion {
     }
 }
 
-impl Fault for UnitParseError {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![
-            ErrorContext::new("value", self.value()),
-            ErrorContext::new("expected", self.expected()),
-        ]
-    }
+#[cfg(test)]
+pub(crate) fn unit_parse_error(error: &UnitParseError) -> RiftError {
+    errors::core::configuration_unit_parse()
+        .value(error.value())
+        .expected(error.expected())
+        .error()
 }
 
-impl Fault for ConfigurationViolation {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+/// Converts one accepted configuration violation to its registered error.
+#[must_use]
+pub fn configuration_violation_error(violation: &ConfigurationViolation) -> RiftError {
+    macro_rules! build {
+        ($builder:expr) => {{
+            let mut builder = $builder;
+            for (key, value) in violation.evidence() {
+                builder = builder.with(ErrorContext::new(key, value));
+            }
+            builder.error()
+        }};
     }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("violation", fault_label(self))];
-        context.extend(
-            self.evidence()
-                .into_iter()
-                .map(|(key, value)| ErrorContext::new(key, value)),
-        );
-        context
+    match violation {
+        ConfigurationViolation::LimitOutOfRange { .. } => {
+            build!(errors::core::configuration_limit_out_of_range())
+        }
+        ConfigurationViolation::LanguageIdentityInvalid { .. } => {
+            build!(errors::core::configuration_language_identity_invalid())
+        }
+        ConfigurationViolation::LanguageLspUnknown { .. } => {
+            build!(errors::core::configuration_language_lsp_unknown())
+        }
+        ConfigurationViolation::LanguageIncludeDuplicate { .. } => {
+            build!(errors::core::configuration_language_include_duplicate())
+        }
+        ConfigurationViolation::EmbeddingModelInvalid { .. } => {
+            build!(errors::core::configuration_embedding_model_invalid())
+        }
+        ConfigurationViolation::EmbeddingEndpointInvalid { .. } => {
+            build!(errors::core::configuration_embedding_endpoint_invalid())
+        }
+        ConfigurationViolation::EmbeddingIdentifierInvalid { .. } => {
+            build!(errors::core::configuration_embedding_identifier_invalid())
+        }
+        ConfigurationViolation::SearchWeightsInvalid { .. } => {
+            build!(errors::core::configuration_search_weights_invalid())
+        }
+        ConfigurationViolation::CommandProgramEmpty { .. } => {
+            build!(errors::core::configuration_command_program_empty())
+        }
+        ConfigurationViolation::CommandProgramWhitespace { .. } => {
+            build!(errors::core::configuration_command_program_whitespace())
+        }
+        ConfigurationViolation::CommandProgramAbsolute { .. } => {
+            build!(errors::core::configuration_command_program_absolute())
+        }
+        ConfigurationViolation::CommandProgramDotSegment { .. } => {
+            build!(errors::core::configuration_command_program_dot_segment())
+        }
+        ConfigurationViolation::CommandArgumentOversized { .. } => {
+            build!(errors::core::configuration_command_argument_oversized())
+        }
+        ConfigurationViolation::CommandProgramOversized { .. } => {
+            build!(errors::core::configuration_command_program_oversized())
+        }
+        ConfigurationViolation::LspNameInvalid { .. } => {
+            build!(errors::core::configuration_lsp_name_invalid())
+        }
+        ConfigurationViolation::LspEnvironmentKeyInvalid { .. } => {
+            build!(errors::core::configuration_lsp_environment_key_invalid())
+        }
+        ConfigurationViolation::LspInitializationOptionsNotObject { .. } => {
+            build!(errors::core::configuration_lsp_initialization_options_not_object())
+        }
+        ConfigurationViolation::LspEngineSelectionConflict { .. } => {
+            build!(errors::core::configuration_lsp_engine_selection_conflict())
+        }
+        ConfigurationViolation::LspEngineMissing { .. } => {
+            build!(errors::core::configuration_lsp_engine_missing())
+        }
+        ConfigurationViolation::LspEmbeddedExtras { .. } => {
+            build!(errors::core::configuration_lsp_embedded_extras())
+        }
+        ConfigurationViolation::PathPatternInvalid { .. } => {
+            build!(errors::core::configuration_path_pattern_invalid())
+        }
+        ConfigurationViolation::FileNameInvalid { .. } => {
+            build!(errors::core::configuration_file_name_invalid())
+        }
+        ConfigurationViolation::PackageSelectorInvalid { .. } => {
+            build!(errors::core::configuration_package_selector_invalid())
+        }
+        ConfigurationViolation::LogCaptureInvalid { .. } => {
+            build!(errors::core::configuration_log_capture_invalid())
+        }
+        PortSelectionConflict => build!(configuration_port_selection_conflict()),
+        ConfigurationViolation::PortRangeInverted { .. } => {
+            build!(errors::core::configuration_port_range_inverted())
+        }
+        ConfigurationViolation::HistoryCpuShareInvalid { .. } => {
+            build!(errors::core::configuration_history_cpu_share_invalid())
+        }
+        ConfigurationViolation::HistoryReleasesMissing => {
+            build!(errors::core::configuration_history_releases_missing())
+        }
+        ConfigurationViolation::HistoryReleasesOutsideSelective => {
+            build!(errors::core::configuration_history_releases_outside_selective())
+        }
+        ConfigurationViolation::HistoryReleasePatternInvalid { .. } => {
+            build!(errors::core::configuration_history_release_pattern_invalid())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
     use rift_protocol::configuration::{ByteSize, Duration};
     use rift_protocol::read::PathPattern;
 
@@ -397,16 +478,17 @@ mod tests {
     #[test]
     fn test_unit_parse_failure_renders_through_the_registry() {
         let fault = ByteSize::parse("16KiB").expect_err("an uppercase unit must be refused");
-        let error = Error::from(fault);
-        assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-        );
+        let error = unit_parse_error(&fault);
+        assert_eq!(error.slug().as_str(), "rift.core.configuration_unit_parse");
         let message = error.to_string();
         assert!(
-            message.contains("the workspace configuration failed validation")
-                && message.contains("value 16KiB")
-                && message.contains("16kb")
+            message.contains("configuration value does not use its required unit form")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "value" && value == "16KiB")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "expected" && value.contains("16kb"))
                 && message.contains("correct the reported configuration field"),
             "the render must carry explanation, evidence, and action: {message}"
         );
@@ -418,28 +500,369 @@ mod tests {
             field: "languages.rust.lsp.command",
             program: "/bin/cargo".to_owned(),
         };
-        let error = Error::from(violation);
+        let error = configuration_violation_error(&violation);
         assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+            error.slug().as_str(),
+            "rift.core.configuration_command_program_absolute"
         );
         let message = error.to_string();
         assert!(
-            message.contains("violation command_program_absolute")
-                && message.contains("field languages.rust.lsp.command")
-                && message.contains("program /bin/cargo")
+            message.contains("configured command executable is an absolute path")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "languages.rust.lsp.command")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "program" && value == "/bin/cargo")
                 && message.contains("correct the reported configuration field"),
             "the render must carry the serde label, the evidence, and the action: {message}"
         );
     }
 
     #[test]
+    fn test_configuration_violations_preserve_registered_identity_and_evidence() {
+        // Issue #535: every protocol violation retains its registered error and evidence.
+        struct Case {
+            violation: ConfigurationViolation,
+            slug: &'static str,
+            message: &'static str,
+            evidence: &'static [(&'static str, &'static str)],
+        }
+        let cases = [
+            Case {
+                violation: ConfigurationViolation::LimitOutOfRange {
+                    field: "source.files",
+                    value: 2,
+                    min: 3,
+                    max: 9,
+                },
+                slug: "rift.core.configuration_limit_out_of_range",
+                message: "numeric configuration value is outside its documented range",
+                evidence: &[
+                    ("field", "source.files"),
+                    ("value", "2"),
+                    ("range", "3..=9"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::LanguageIdentityInvalid {
+                    language: "Rust".to_owned(),
+                },
+                slug: "rift.core.configuration_language_identity_invalid",
+                message: "language table key is not a canonical language identity",
+                evidence: &[("language", "Rust")],
+            },
+            Case {
+                violation: ConfigurationViolation::LanguageLspUnknown {
+                    language: "rust".to_owned(),
+                    lsp: "missing".to_owned(),
+                },
+                slug: "rift.core.configuration_language_lsp_unknown",
+                message: "language names an LSP process that is not declared",
+                evidence: &[("language", "rust"), ("lsp", "missing")],
+            },
+            Case {
+                violation: ConfigurationViolation::LanguageIncludeDuplicate {
+                    pattern: "src/**".to_owned(),
+                    first: "rust".to_owned(),
+                    second: "python".to_owned(),
+                },
+                slug: "rift.core.configuration_language_include_duplicate",
+                message: "two language entries use same include pattern",
+                evidence: &[
+                    ("pattern", "src/**"),
+                    ("first", "rust"),
+                    ("second", "python"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::EmbeddingModelInvalid {
+                    field: "search.vector.embedding.model",
+                    value: String::new(),
+                },
+                slug: "rift.core.configuration_embedding_model_invalid",
+                message: "embedding model value does not match its configured kind",
+                evidence: &[("field", "search.vector.embedding.model"), ("value", "")],
+            },
+            Case {
+                violation: ConfigurationViolation::EmbeddingEndpointInvalid {
+                    field: "search.vector.embedding.endpoint",
+                    value: "relative".to_owned(),
+                },
+                slug: "rift.core.configuration_embedding_endpoint_invalid",
+                message: "embedding endpoint is not an accepted URL",
+                evidence: &[
+                    ("field", "search.vector.embedding.endpoint"),
+                    ("value", "relative"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::EmbeddingIdentifierInvalid {
+                    field: "search.vector.embedding.revision",
+                    value: String::new(),
+                },
+                slug: "rift.core.configuration_embedding_identifier_invalid",
+                message: "embedding identifier value is empty or too long",
+                evidence: &[("field", "search.vector.embedding.revision"), ("value", "")],
+            },
+            Case {
+                violation: ConfigurationViolation::SearchWeightsInvalid {
+                    identifier: 0.0,
+                    lexical: 0.0,
+                    vector: 0.0,
+                },
+                slug: "rift.core.configuration_search_weights_invalid",
+                message: "search ranking weights are not a usable set",
+                evidence: &[
+                    ("identifier_weight", "0"),
+                    ("lexical_weight", "0"),
+                    ("vector_weight", "0"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::CommandProgramEmpty {
+                    field: "lsp.rust.command",
+                },
+                slug: "rift.core.configuration_command_program_empty",
+                message: "configured command has no executable",
+                evidence: &[("field", "lsp.rust.command")],
+            },
+            Case {
+                violation: ConfigurationViolation::CommandProgramWhitespace {
+                    field: "lsp.rust.command",
+                    program: "cargo check".to_owned(),
+                },
+                slug: "rift.core.configuration_command_program_whitespace",
+                message: "configured command executable contains whitespace",
+                evidence: &[("field", "lsp.rust.command"), ("program", "cargo check")],
+            },
+            Case {
+                violation: ConfigurationViolation::CommandProgramAbsolute {
+                    field: "lsp.rust.command",
+                    program: "/bin/cargo".to_owned(),
+                },
+                slug: "rift.core.configuration_command_program_absolute",
+                message: "configured command executable is an absolute path",
+                evidence: &[("field", "lsp.rust.command"), ("program", "/bin/cargo")],
+            },
+            Case {
+                violation: ConfigurationViolation::CommandProgramDotSegment {
+                    field: "lsp.rust.command",
+                    program: "../cargo".to_owned(),
+                },
+                slug: "rift.core.configuration_command_program_dot_segment",
+                message: "configured command executable contains a dot segment",
+                evidence: &[("field", "lsp.rust.command"), ("program", "../cargo")],
+            },
+            Case {
+                violation: ConfigurationViolation::CommandArgumentOversized {
+                    field: "lsp.rust.command",
+                    bytes: 4097,
+                },
+                slug: "rift.core.configuration_command_argument_oversized",
+                message: "configured command argument exceeds its byte limit",
+                evidence: &[
+                    ("field", "lsp.rust.command"),
+                    ("bytes", "4097"),
+                    ("bytes_max", "4096"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::CommandProgramOversized {
+                    field: "lsp.rust.command",
+                    bytes: 4097,
+                },
+                slug: "rift.core.configuration_command_program_oversized",
+                message: "configured command executable exceeds its byte limit",
+                evidence: &[
+                    ("field", "lsp.rust.command"),
+                    ("bytes", "4097"),
+                    ("bytes_max", "4096"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::LspNameInvalid {
+                    name: "Rust".to_owned(),
+                },
+                slug: "rift.core.configuration_lsp_name_invalid",
+                message: "LSP process name is not a lowercase word",
+                evidence: &[("name", "Rust")],
+            },
+            Case {
+                violation: ConfigurationViolation::LspEnvironmentKeyInvalid {
+                    lsp: "rust".to_owned(),
+                    key: "A=B".to_owned(),
+                },
+                slug: "rift.core.configuration_lsp_environment_key_invalid",
+                message: "LSP environment key is empty or contains a forbidden character",
+                evidence: &[("lsp", "rust"), ("key", "A=B")],
+            },
+            Case {
+                violation: ConfigurationViolation::LspInitializationOptionsNotObject {
+                    lsp: "rust".to_owned(),
+                },
+                slug: "rift.core.configuration_lsp_initialization_options_not_object",
+                message: "LSP initialization options are not a JSON object",
+                evidence: &[("lsp", "rust")],
+            },
+            Case {
+                violation: ConfigurationViolation::LspEngineSelectionConflict {
+                    lsp: "rust".to_owned(),
+                },
+                slug: "rift.core.configuration_lsp_engine_selection_conflict",
+                message: "LSP table selects command and embedded engines",
+                evidence: &[("lsp", "rust"), ("fields", "command, embedded")],
+            },
+            Case {
+                violation: ConfigurationViolation::LspEngineMissing {
+                    lsp: "rust".to_owned(),
+                },
+                slug: "rift.core.configuration_lsp_engine_missing",
+                message: "LSP table selects no engine",
+                evidence: &[("lsp", "rust"), ("fields", "command, embedded")],
+            },
+            Case {
+                violation: ConfigurationViolation::LspEmbeddedExtras {
+                    lsp: "rust".to_owned(),
+                    field: "environment",
+                },
+                slug: "rift.core.configuration_lsp_embedded_extras",
+                message: "embedded LSP engine has a spawned-process setting",
+                evidence: &[("lsp", "rust"), ("field", "environment")],
+            },
+            Case {
+                violation: ConfigurationViolation::PathPatternInvalid {
+                    field: "source.include",
+                    pattern: "../src/**".to_owned(),
+                },
+                slug: "rift.core.configuration_path_pattern_invalid",
+                message: "configuration path pattern breaks forward-slash path rules",
+                evidence: &[("field", "source.include"), ("pattern", "../src/**")],
+            },
+            Case {
+                violation: ConfigurationViolation::FileNameInvalid {
+                    field: "search.text.excluded_lockfiles",
+                    name: "dir/Cargo.lock".to_owned(),
+                },
+                slug: "rift.core.configuration_file_name_invalid",
+                message: "excluded lockfile value is not one file name",
+                evidence: &[
+                    ("field", "search.text.excluded_lockfiles"),
+                    ("name", "dir/Cargo.lock"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::PackageSelectorInvalid {
+                    field: "dependencies.packages",
+                    package: "cargo/serde".to_owned(),
+                },
+                slug: "rift.core.configuration_package_selector_invalid",
+                message: "dependency package has conflicting or missing version selector",
+                evidence: &[
+                    ("field", "dependencies.packages"),
+                    ("package", "cargo/serde"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::LogCaptureInvalid {
+                    capture: "rift=unknown".to_owned(),
+                    detail: "invalid filter directive".to_owned(),
+                },
+                slug: "rift.core.configuration_log_capture_invalid",
+                message: "logs.capture is not a tracing filter directive",
+                evidence: &[
+                    ("field", "logs.capture"),
+                    ("capture", "rift=unknown"),
+                    ("detail", "invalid filter directive"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::PortSelectionConflict,
+                slug: "rift.core.configuration_port_selection_conflict",
+                message: "server selects port and port range together",
+                evidence: &[("fields", "server.port, server.port_range")],
+            },
+            Case {
+                violation: ConfigurationViolation::PortRangeInverted {
+                    min: 9001,
+                    max: 9000,
+                },
+                slug: "rift.core.configuration_port_range_inverted",
+                message: "server port range maximum is below minimum",
+                evidence: &[("min", "9001"), ("max", "9000")],
+            },
+            Case {
+                violation: ConfigurationViolation::HistoryCpuShareInvalid { share: 1.5 },
+                slug: "rift.core.configuration_history_cpu_share_invalid",
+                message: "history CPU share is outside its accepted range",
+                evidence: &[("field", "providers.history.cpu_share"), ("share", "1.5")],
+            },
+            Case {
+                violation: ConfigurationViolation::HistoryReleasesMissing,
+                slug: "rift.core.configuration_history_releases_missing",
+                message: "selective history strategy has no release pattern",
+                evidence: &[(
+                    "fields",
+                    "providers.history.strategy, providers.history.releases",
+                )],
+            },
+            Case {
+                violation: ConfigurationViolation::HistoryReleasesOutsideSelective,
+                slug: "rift.core.configuration_history_releases_outside_selective",
+                message: "history release patterns require selective strategy",
+                evidence: &[(
+                    "fields",
+                    "providers.history.strategy, providers.history.releases",
+                )],
+            },
+            Case {
+                violation: ConfigurationViolation::HistoryReleasePatternInvalid {
+                    pattern: "v[1".to_owned(),
+                    detail: "unclosed character class".to_owned(),
+                },
+                slug: "rift.core.configuration_history_release_pattern_invalid",
+                message: "history release pattern is invalid",
+                evidence: &[
+                    ("field", "providers.history.releases"),
+                    ("pattern", "v[1"),
+                    ("detail", "unclosed character class"),
+                ],
+            },
+        ];
+        for case in cases {
+            let error = configuration_violation_error(&case.violation);
+            assert_eq!(error.slug().as_str(), case.slug, "{:?}", case.violation);
+            assert_eq!(error.message(), case.message, "{}", case.slug);
+            assert_eq!(
+                error.action(),
+                "correct the reported configuration field, then retry",
+                "{}",
+                case.slug
+            );
+            let actual: std::collections::BTreeMap<_, _> = error.context().collect();
+            let expected = case
+                .evidence
+                .iter()
+                .map(|(key, value)| (*key, (*value).to_owned()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(actual, expected, "{}", case.slug);
+            assert_eq!(
+                error.context().count(),
+                case.evidence.len(),
+                "{}",
+                case.slug
+            );
+            assert!(std::error::Error::source(&error).is_none(), "{}", case.slug);
+        }
+    }
+
+    #[test]
     fn test_duration_parse_failure_carries_its_own_expected_form() {
         let fault = Duration::parse("30 s").expect_err("an inner space must be refused");
-        let context = fault.context();
-        let keys: Vec<&str> = context.iter().map(ErrorContext::key).collect();
-        assert_eq!(keys, ["value", "expected"]);
-        let expected = context[1].value();
+        let context = unit_parse_error(&fault).context().collect::<Vec<_>>();
+        let keys: Vec<&str> = context.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys, ["expected", "value"]);
+        let expected = &context[0].1;
         assert!(
             expected.contains("30s"),
             "the expected form must name 30s: {expected}"

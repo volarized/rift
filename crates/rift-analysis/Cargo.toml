@@ -19,6 +19,7 @@ parallel = ["dep:rayon"]
 [dependencies]
 ignore = { workspace = true, optional = true }
 rift-core.workspace = true
+rift-error.workspace = true
 rift-protocol.workspace = true
 rift-provider = { workspace = true, optional = true }
 rift-ranking.workspace = true

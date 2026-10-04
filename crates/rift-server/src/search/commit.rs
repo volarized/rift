@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use rift_error::errors;
 use rift_history_store::StoreReads;
 use rift_protocol::read::{
     COMMIT_MESSAGE_BYTES_MAX, COMMIT_PATHS_MAX, CommitHit, ProjectPath, ReadWarning, RevisionId,
@@ -13,7 +14,7 @@ use rift_ranking::{ParsedQuery, QueryPhase};
 
 use super::{parsed_query, query_narrowing_warning, required_query, search_page_limit};
 use crate::history::StoredHistory;
-use crate::read::{ReadError, ReadFault, ReadService, page, results_truncation_warning};
+use crate::read::{ReadService, RiftError, page, results_truncation_warning};
 
 /// The capability a commit search names when no history store answers it.
 const COMMIT_SEARCH_CAPABILITY: &str = "commit search";
@@ -21,7 +22,7 @@ const COMMIT_SEARCH_CAPABILITY: &str = "commit search";
 /// Why a commit search cannot take a field the request also names: each selects
 /// declarations, file text, or another tree, and the global index holds no project
 /// history. `None` for a request whose target is not `commit`, or one naming none of them.
-pub(super) fn commit_conflict(params: &SearchParams) -> Option<ReadError> {
+pub(super) fn commit_conflict(params: &SearchParams) -> Option<RiftError> {
     if params.target != SearchParamsTarget::Commit {
         return None;
     }
@@ -62,9 +63,14 @@ pub(super) fn commit_conflict(params: &SearchParams) -> Option<ReadError> {
             "the global index holds no project history",
         ),
     ];
-    conflicts
-        .into_iter()
-        .find_map(|(field, present, reason)| present.then(|| ReadFault::invalid(field, reason)))
+    conflicts.into_iter().find_map(|(field, present, reason)| {
+        present.then(|| {
+            errors::server::read_invalid()
+                .field(field)
+                .violation(reason)
+                .error()
+        })
+    })
 }
 
 impl ReadService {
@@ -81,9 +87,9 @@ impl ReadService {
     /// `local`, and naming `query` when it is missing, empty, or refused by the bounded
     /// parser; `unsupported` when `[providers.history]` is disabled or no history store is
     /// attached; and the store fault when the store cannot be read.
-    pub fn search_commits(&self, params: &SearchParams) -> Result<SearchResult, ReadError> {
+    pub fn search_commits(&self, params: &SearchParams) -> Result<SearchResult, RiftError> {
         if let Some(conflict) = commit_conflict(params) {
-            return Err(conflict);
+            return conflict.fail();
         }
         let query = required_query(params)?;
         let limit = search_page_limit(params)?;
@@ -117,14 +123,17 @@ impl ReadService {
     }
 
     /// The attached history store a commit search reads.
-    fn commit_store(&self) -> Result<&StoredHistory, ReadError> {
+    fn commit_store(&self) -> Result<&StoredHistory, RiftError> {
         if !self.history_configuration().enabled {
-            return Err(ReadFault::unsupported(
-                "commit search (providers.history disabled)",
-            ));
+            return errors::server::read_unsupported()
+                .capability("commit search (providers.history disabled)")
+                .fail();
         }
-        self.stored_history()
-            .ok_or_else(|| ReadFault::unsupported(COMMIT_SEARCH_CAPABILITY))
+        self.stored_history().ok_or_else(|| {
+            errors::server::read_unsupported()
+                .capability(COMMIT_SEARCH_CAPABILITY)
+                .error()
+        })
     }
 }
 
@@ -144,7 +153,7 @@ fn matched_commits(
     reads: &StoreReads,
     query: &ParsedQuery,
     results_max: usize,
-) -> Result<MatchedCommits, ReadError> {
+) -> Result<MatchedCommits, RiftError> {
     let fetch = results_max.saturating_add(1);
     let precise = query.render(QueryPhase::Precise);
     let broad = query
@@ -154,9 +163,7 @@ fn matched_commits(
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
     for expression in [precise, broad].into_iter().flatten() {
-        let matched = reads
-            .search_messages(&expression, fetch)
-            .map_err(ReadFault::history_store)?;
+        let matched = reads.search_messages(&expression, fetch)?;
         append_unseen(&mut ids, &mut seen, matched, fetch);
     }
     let truncated = ids.len() > results_max;
@@ -183,13 +190,11 @@ fn append_unseen(
 
 /// One matched commit as a hit, or `None` when a trim deleted it between the match and
 /// this read.
-pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHit>, ReadError> {
-    let Some(commit) = reads.commit(id).map_err(ReadFault::history_store)? else {
+pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHit>, RiftError> {
+    let Some(commit) = reads.commit(id)? else {
         return Ok(None);
     };
-    let mut paths = reads
-        .changed_paths(&commit, COMMIT_PATHS_MAX.saturating_add(1))
-        .map_err(ReadFault::history_store)?;
+    let mut paths = reads.changed_paths(&commit, COMMIT_PATHS_MAX.saturating_add(1))?;
     let paths_truncated = paths.len() > COMMIT_PATHS_MAX;
     paths.truncate(COMMIT_PATHS_MAX);
     let (message, message_truncated) = bounded_message(&commit.message);

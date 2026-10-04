@@ -20,9 +20,10 @@ use rift_core::ProjectPath;
 use rift_protocol::read::PathPattern;
 
 use crate::analyzer::PackageLanguage;
-use crate::glob::{PathMatcher, SourcePatternError};
+use crate::glob::PathMatcher;
+use rift_error::RiftError;
 
-pub use context7::{CONTEXT7_FILE, Context7, Context7Error, Context7Fault, Context7Violation};
+pub use context7::{CONTEXT7_FILE, Context7};
 pub use documentation::{
     DOCUMENTATION_EXCLUDED_FILES, DOCUMENTATION_EXCLUDED_FOLDERS, DocumentationSelection,
     documentation_format,
@@ -57,12 +58,12 @@ impl PackageFileSelection {
     ///
     /// # Errors
     ///
-    /// Returns [`SourcePatternError`] when an `exclude` pattern is not a valid glob.
+    /// Returns [`RiftError`] when an `exclude` pattern is not a valid glob.
     pub fn new(
         language: PackageLanguage,
         exclude: &[PathPattern],
         documentation: DocumentationSelection,
-    ) -> Result<Self, SourcePatternError> {
+    ) -> Result<Self, RiftError> {
         let exclude = exclude
             .iter()
             .map(|pattern| pattern.0.clone())
@@ -317,6 +318,9 @@ mod tests {
             documentation,
         )
         .expect_err("an unclosed character class is refused");
-        assert_eq!(error.fault().pattern(), Some("["));
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "pattern").as_deref(),
+            Some("[")
+        );
     }
 }

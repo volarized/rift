@@ -17,14 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use rift_core::ProjectPath;
+use rift_error::{RiftError, errors};
 use rift_ranking::Prefilter;
 use toasty::Executor;
 use toasty::stmt::{Type, Value};
 
-use crate::lexical::{
-    LexicalIndexError, LexicalIndexViolation, bound_as_usize, file_row_count,
-    lexical_error_caused_by, single_i64, storage_error, stored_file_range,
-};
+use crate::lexical::{bound_as_usize, file_row_count, single_i64, stored_file_range};
 
 /// The rows the trigram index holds once it has caught up: every row that stores text. A
 /// symbol row holds none, and `columnsize=0` is what lets the index skip it: under the
@@ -47,7 +45,7 @@ const TRIGRAM_INDEXED: &str = "NOT EXISTS (SELECT 1 FROM lexical_trigram_pending
 pub(crate) async fn delete_path(
     executor: &mut dyn Executor,
     path: &ProjectPath,
-) -> Result<(), LexicalIndexError> {
+) -> Result<(), RiftError> {
     toasty::sql::statement(format!(
         "INSERT INTO lexical_documents_trigram(lexical_documents_trigram, rowid, file_content) \
          SELECT 'delete', id, file_content FROM lexical_documents \
@@ -56,7 +54,7 @@ pub(crate) async fn delete_path(
     .bind(path.as_str().to_owned())
     .exec(&mut *executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     toasty::sql::statement(
         "DELETE FROM lexical_trigram_pending \
          WHERE id IN (SELECT id FROM lexical_documents WHERE path = ?1)",
@@ -64,7 +62,7 @@ pub(crate) async fn delete_path(
     .bind(path.as_str().to_owned())
     .exec(executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
@@ -72,17 +70,17 @@ pub(crate) async fn delete_path(
 ///
 /// `'delete-all'` clears an external-content index without reading a typed row: FTS5
 /// offers it "only with external content and contentless tables".
-pub(crate) async fn clear(executor: &mut dyn Executor) -> Result<(), LexicalIndexError> {
+pub(crate) async fn clear(executor: &mut dyn Executor) -> Result<(), RiftError> {
     toasty::sql::statement(
         "INSERT INTO lexical_documents_trigram(lexical_documents_trigram) VALUES('delete-all')",
     )
     .exec(&mut *executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     toasty::sql::statement("DELETE FROM lexical_trigram_pending")
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
@@ -91,7 +89,7 @@ pub(crate) async fn clear(executor: &mut dyn Executor) -> Result<(), LexicalInde
 pub(crate) async fn file_rows_above(
     executor: &mut dyn Executor,
     last: i64,
-) -> Result<(), LexicalIndexError> {
+) -> Result<(), RiftError> {
     toasty::sql::statement(format!(
         "INSERT INTO lexical_trigram_pending(id) \
          SELECT id FROM lexical_documents WHERE id > ?1 AND {TRIGRAM_ROWS}"
@@ -99,7 +97,7 @@ pub(crate) async fn file_rows_above(
     .bind(last)
     .exec(executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
@@ -110,7 +108,7 @@ pub(crate) async fn candidates(
     prefilter: &Prefilter,
     line_bound: bool,
     rows_max: u32,
-) -> Result<PatternCandidates, LexicalIndexError> {
+) -> Result<PatternCandidates, RiftError> {
     let Some(selection) = selected_rows(&mut *executor, prefilter, line_bound, rows_max).await?
     else {
         return Ok(PatternCandidates::cut(rows_max));
@@ -130,7 +128,7 @@ pub(crate) async fn index_batch(
     executor: &mut dyn Executor,
     rows_max: usize,
     bytes_max: u64,
-) -> Result<TrigramBatch, LexicalIndexError> {
+) -> Result<TrigramBatch, RiftError> {
     let oldest = oldest_pending_rows(&mut *executor, rows_max.max(1)).await?;
     let Some((through, indexed)) = trigram_batch_end(&oldest, bytes_max) else {
         return Ok(TrigramBatch::default());
@@ -276,7 +274,7 @@ type FileRows = Vec<(ProjectPath, Range<u64>)>;
 
 /// The rows one bounded read answered, or `None` when it answered the row past
 /// `rows_max`: every row of the read's shape is a file and the bytes of the file it holds.
-fn within_rows(rows: &[Value], rows_max: u32) -> Result<Option<FileRows>, LexicalIndexError> {
+fn within_rows(rows: &[Value], rows_max: u32) -> Result<Option<FileRows>, RiftError> {
     if rows.len() > bound_as_usize(rows_max) {
         return Ok(None);
     }
@@ -301,7 +299,7 @@ async fn trigram_rows(
     executor: &mut dyn Executor,
     expression: &str,
     rows_max: u32,
-) -> Result<Option<FileRows>, LexicalIndexError> {
+) -> Result<Option<FileRows>, RiftError> {
     let rows = toasty::sql::query(
         "SELECT lexical_documents.path, lexical_documents.byte_offset, \
          lexical_documents.byte_length \
@@ -315,7 +313,7 @@ async fn trigram_rows(
     .column_types(FILE_ROW_COLUMNS)
     .exec(executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     within_rows(&rows, rows_max)
 }
 
@@ -325,7 +323,7 @@ async fn trigram_rows(
 async fn pending_rows(
     executor: &mut dyn Executor,
     rows_max: u32,
-) -> Result<Option<FileRows>, LexicalIndexError> {
+) -> Result<Option<FileRows>, RiftError> {
     let rows = toasty::sql::query(
         "SELECT lexical_documents.path, lexical_documents.byte_offset, \
          lexical_documents.byte_length \
@@ -337,12 +335,12 @@ async fn pending_rows(
     .column_types(FILE_ROW_COLUMNS)
     .exec(executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     within_rows(&rows, rows_max)
 }
 
 /// One trigram row as its file and the bytes of the file it holds.
-fn decode_trigram_row(row: &Value) -> Result<(ProjectPath, Range<u64>), LexicalIndexError> {
+fn decode_trigram_row(row: &Value) -> Result<(ProjectPath, Range<u64>), RiftError> {
     let Value::Record(record) = row else {
         unreachable!("trigram row must be a record: row={row:?}");
     };
@@ -350,7 +348,9 @@ fn decode_trigram_row(row: &Value) -> Result<(ProjectPath, Range<u64>), LexicalI
         unreachable!("trigram row must match its declared column types: row={row:?}");
     };
     let path = ProjectPath::new(path.clone()).map_err(|source| {
-        lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
+        errors::index::lexical_stored_path_invalid()
+            .source(source)
+            .error()
     })?;
     Ok((path, stored_file_range(*offset, *length)?))
 }
@@ -367,7 +367,7 @@ async fn selected_rows(
     prefilter: &Prefilter,
     line_bound: bool,
     rows_max: u32,
-) -> Result<Option<Selection>, LexicalIndexError> {
+) -> Result<Option<Selection>, RiftError> {
     let Some(expression) = prefilter.row_expression().filter(|_| line_bound) else {
         return literal_rows(executor, prefilter, rows_max).await;
     };
@@ -390,7 +390,7 @@ async fn literal_rows(
     executor: &mut dyn Executor,
     prefilter: &Prefilter,
     rows_max: u32,
-) -> Result<Option<Selection>, LexicalIndexError> {
+) -> Result<Option<Selection>, RiftError> {
     let mut remaining = rows_max;
     let mut holding: BTreeMap<&BTreeSet<String>, BTreeSet<ProjectPath>> = BTreeMap::new();
     for literal in prefilter.literals() {
@@ -430,7 +430,7 @@ async fn unindexed_rows(
     selection: &Selection,
     line_bound: bool,
     rows_max: u32,
-) -> Result<Option<UnindexedRows>, LexicalIndexError> {
+) -> Result<Option<UnindexedRows>, RiftError> {
     let pending = pending_trigram_count(&mut *executor).await?;
     if pending == 0 {
         return Ok(None);
@@ -451,7 +451,7 @@ async fn unindexed_rows(
 }
 
 /// How many file rows the trigram index lacks right now.
-async fn pending_trigram_count(executor: &mut dyn Executor) -> Result<u64, LexicalIndexError> {
+async fn pending_trigram_count(executor: &mut dyn Executor) -> Result<u64, RiftError> {
     let counted = single_i64(
         executor,
         "SELECT count(*) FROM lexical_trigram_pending",
@@ -509,7 +509,7 @@ fn trigram_batch_end(oldest: &[(i64, u64)], bytes_max: u64) -> Option<(i64, u64)
 async fn oldest_pending_rows(
     executor: &mut dyn Executor,
     rows_max: usize,
-) -> Result<Vec<(i64, u64)>, LexicalIndexError> {
+) -> Result<Vec<(i64, u64)>, RiftError> {
     let rows = toasty::sql::query(
         "SELECT lexical_trigram_pending.id, coalesce(lexical_documents.byte_length, 0) \
          FROM lexical_trigram_pending \
@@ -520,7 +520,7 @@ async fn oldest_pending_rows(
     .column_types([Type::I64, Type::I64])
     .exec(executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(rows.iter().map(decode_pending_size).collect())
 }
 
@@ -537,10 +537,7 @@ fn decode_pending_size(row: &Value) -> (i64, u64) {
 
 /// Indexes every file row the trigram index lacks up to id `through`, and takes those rows
 /// off the pending set.
-async fn index_pending_through(
-    executor: &mut dyn Executor,
-    through: i64,
-) -> Result<(), LexicalIndexError> {
+async fn index_pending_through(executor: &mut dyn Executor, through: i64) -> Result<(), RiftError> {
     toasty::sql::statement(format!(
         "INSERT INTO lexical_documents_trigram(rowid, file_content) \
          SELECT lexical_documents.id, lexical_documents.file_content \
@@ -551,12 +548,12 @@ async fn index_pending_through(
     .bind(through)
     .exec(&mut *executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     toasty::sql::statement("DELETE FROM lexical_trigram_pending WHERE id <= ?1")
         .bind(through)
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
@@ -565,7 +562,6 @@ mod tests {
     use super::{
         TRIGRAM_ROWS, decode_pending_size, decode_trigram_row, grouped, trigram_batch_end,
     };
-    use crate::lexical::LexicalIndexViolation;
     use rift_core::ProjectPath;
     use toasty::stmt::Value;
 
@@ -590,8 +586,8 @@ mod tests {
         ]);
         let error = decode_trigram_row(&row).expect_err("a path above the root refuses");
         assert_eq!(
-            error.fault().violation(),
-            LexicalIndexViolation::StoredPathInvalid
+            error.slug().as_str(),
+            "rift.index.lexical_stored_path_invalid"
         );
     }
 

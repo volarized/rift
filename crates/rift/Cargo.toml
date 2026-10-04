@@ -43,6 +43,7 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+rift-error.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
 rift-mcp.workspace = true

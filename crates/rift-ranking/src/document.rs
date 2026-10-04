@@ -20,7 +20,7 @@ use rift_core::constants::{DIGEST_WIRE_CHARS, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_U
 use rift_core::{Language, PackageIdentity, ProjectPath, SourceUnitId};
 use sha2::{Digest as _, Sha256};
 
-use crate::error::{RankingError, RankingViolation, refuse, refuse_over_limit};
+use rift_error::{RiftError, errors};
 
 /// Bytes one document identity may hold.
 ///
@@ -294,21 +294,22 @@ impl DocumentIdentity {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] when the value is empty or runs past
+    /// Returns [`RiftError`] when the value is empty or runs past
     /// [`IDENTITY_BYTES_MAX`].
-    pub fn new(value: impl Into<String>) -> Result<Self, RankingError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, RiftError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(refuse(RankingViolation::DocumentIdentityEmpty, "identity"));
+            return errors::ranking::document_identity_empty()
+                .subject("identity")
+                .fail();
         }
         if value.len() > IDENTITY_BYTES_MAX {
-            return Err(refuse_over_limit(
-                RankingViolation::DocumentFieldLength,
-                "identity",
-                "document.identity",
-                IDENTITY_BYTES_MAX,
-                value.len(),
-            ));
+            return errors::ranking::document_field_length()
+                .subject("identity")
+                .field("document.identity")
+                .limit(IDENTITY_BYTES_MAX)
+                .required(value.len())
+                .fail();
         }
         Ok(Self(value))
     }
@@ -322,8 +323,8 @@ impl DocumentIdentity {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] when the spelling runs past [`IDENTITY_BYTES_MAX`].
-    pub fn for_unit(unit: &SourceUnitId, qualified_name: &str) -> Result<Self, RankingError> {
+    /// Returns [`RiftError`] when the spelling runs past [`IDENTITY_BYTES_MAX`].
+    pub fn for_unit(unit: &SourceUnitId, qualified_name: &str) -> Result<Self, RiftError> {
         Self::new(format!("{unit}{UNIT_QUALIFIER_SEPARATOR}{qualified_name}"))
     }
 
@@ -331,8 +332,8 @@ impl DocumentIdentity {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] when the identity runs past [`IDENTITY_BYTES_MAX`].
-    pub fn for_documentation_block(digest: &str) -> Result<Self, RankingError> {
+    /// Returns [`RiftError`] when the identity runs past [`IDENTITY_BYTES_MAX`].
+    pub fn for_documentation_block(digest: &str) -> Result<Self, RiftError> {
         Self::new(format!("\u{1f}documentation-block/{digest}"))
     }
 
@@ -499,22 +500,21 @@ impl IndexDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] when a field runs past its own byte bound.
+    /// Returns [`RiftError`] when a field runs past its own byte bound.
     pub fn new(
         identity: DocumentIdentity,
         location: DocumentLocation,
         kind: DocumentKind,
         digest: impl Into<String>,
         fields: DocumentFields,
-    ) -> Result<Self, RankingError> {
+    ) -> Result<Self, RiftError> {
         if let Some((field, bound, observed)) = fields.violation() {
-            return Err(refuse_over_limit(
-                RankingViolation::DocumentFieldLength,
-                field.column(),
-                "document.field",
-                bound,
-                observed,
-            ));
+            return errors::ranking::document_field_length()
+                .subject(field.column())
+                .field("document.field")
+                .limit(bound)
+                .required(observed)
+                .fail();
         }
         Ok(Self {
             identity,
@@ -675,9 +675,10 @@ mod tests {
         CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
         IDENTITY_BYTES_MAX, IndexDocument, NAME_BYTES_MAX, SearchableField,
     };
-    use crate::error::RankingViolation;
     use rift_core::constants::DIGEST_WIRE_CHARS;
     use rift_core::{Language, PackageIdentity, ProjectPath};
+    use rift_error::ErrorSlug;
+    use rift_error::RiftError;
 
     fn identity(value: &str) -> DocumentIdentity {
         DocumentIdentity::new(value).expect("identity must be accepted")
@@ -687,7 +688,7 @@ mod tests {
         DocumentLocation::Project(ProjectPath::new("src/lib.rs").expect("path must be accepted"))
     }
 
-    fn document(fields: DocumentFields) -> Result<IndexDocument, crate::error::RankingError> {
+    fn document(fields: DocumentFields) -> Result<IndexDocument, RiftError> {
         IndexDocument::new(
             identity("rift://symbol/rust/src%2Flib.rs/beacon"),
             location(),
@@ -702,9 +703,8 @@ mod tests {
         assert_eq!(
             DocumentIdentity::new("")
                 .expect_err("an empty identity must be refused")
-                .fault()
-                .violation(),
-            RankingViolation::DocumentIdentityEmpty
+                .slug(),
+            ErrorSlug::new("rift.ranking.document_identity_empty")
         );
     }
 
@@ -713,9 +713,8 @@ mod tests {
         assert_eq!(
             DocumentIdentity::new("i".repeat(IDENTITY_BYTES_MAX + 1))
                 .expect_err("an overlong identity must be refused")
-                .fault()
-                .violation(),
-            RankingViolation::DocumentFieldLength
+                .slug(),
+            ErrorSlug::new("rift.ranking.document_field_length")
         );
     }
 
@@ -874,9 +873,8 @@ mod tests {
         assert_eq!(
             document(fields)
                 .expect_err("an overlong field must be refused")
-                .fault()
-                .violation(),
-            RankingViolation::DocumentFieldLength
+                .slug(),
+            ErrorSlug::new("rift.ranking.document_field_length")
         );
     }
 

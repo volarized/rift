@@ -8,11 +8,12 @@ use rift_analysis::documentation::notebook::{
     NotebookCellContent, NotebookContent, decode_notebook,
 };
 use rift_analysis::documentation::{
-    DocumentationCollection, DocumentationDeclaration, DocumentationError, DocumentationInput,
-    DocumentationSourceSet, check_documentation_source_count, collect_documentation_incremental,
-    content_chunk_identity, content_digest,
+    DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
+    check_documentation_source_count, collect_documentation_incremental, content_chunk_identity,
+    content_digest,
 };
 use rift_core::ProjectPath as CoreProjectPath;
+use rift_error::{RiftError, errors};
 use rift_protocol::documentation::{
     DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX,
     DocumentationChunk, DocumentationContentIdentity, DocumentationDigest,
@@ -30,7 +31,6 @@ use rift_ranking::{
 use crate::chunk::text_chunks;
 use crate::semantic::WorkspaceSemantics;
 use crate::workspace::{IndexedFile, LeftOut, TextSourceFile, document, file_name};
-use crate::{WorkspaceIndexError, WorkspaceIndexViolation};
 
 /// Held notebook cell content, keyed by its canonical owner.
 pub(crate) type NotebookFiles = BTreeMap<CoreProjectPath, HeldNotebook>;
@@ -87,7 +87,7 @@ pub(crate) fn build(
     selection: &DocumentationSelection,
     chunk_bytes_max: usize,
     previous: Option<(&DocumentationCollection, &NotebookFiles)>,
-) -> Result<(DocumentationCollection, NotebookFiles), WorkspaceIndexError> {
+) -> Result<(DocumentationCollection, NotebookFiles), RiftError> {
     rift_core::traced!(
         component = "documentation",
         operation = "documentation.collect",
@@ -168,7 +168,7 @@ fn append_notebook_inputs<'source>(
     source_format: DocumentationSourceFormat,
     chunk_bytes_max: usize,
     collected: &mut CollectedInputs<'source>,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<(), RiftError> {
     for cell in notebook.cells() {
         let identity = project_owner(path, Some(cell.cell().clone()));
         let source = source(&identity, cell, source_format, file.content());
@@ -182,8 +182,7 @@ fn append_notebook_inputs<'source>(
                 .push((identity, DocumentationWarningKind::SourceUnavailable));
             continue;
         }
-        let chunks =
-            content_chunks(&identity, cell.text(), chunk_bytes_max).map_err(documentation_error)?;
+        let chunks = content_chunks(&identity, cell.text(), chunk_bytes_max)?;
         match DocumentationInput::new(source, cell.text())
             .and_then(|input| input.with_chunks(chunks))
         {
@@ -204,7 +203,7 @@ fn append_regular_input<'source>(
     source_format: DocumentationSourceFormat,
     chunk_bytes_max: usize,
     collected: &mut CollectedInputs<'source>,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<(), RiftError> {
     let identity = project_owner(path, None);
     let text = file.content();
     check_next_source_count(path, collected.inputs.len(), collected.omissions.len())?;
@@ -250,17 +249,14 @@ fn finish_collection(
     declarations: &[DeclarationFacts],
     omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     previous: Option<&DocumentationCollection>,
-) -> Result<DocumentationCollection, WorkspaceIndexError> {
-    let sources = DocumentationSourceSet::new(inputs).map_err(documentation_error)?;
+) -> Result<DocumentationCollection, RiftError> {
+    let sources = DocumentationSourceSet::new(inputs)?;
     let declarations = declarations
         .iter()
         .map(DeclarationFacts::validated)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(documentation_error)?;
-    collect_documentation_incremental(previous, &sources, &declarations)
-        .map_err(documentation_error)?
+        .collect::<Result<Vec<_>, _>>()?;
+    collect_documentation_incremental(previous, &sources, &declarations)?
         .with_source_omissions(omissions)
-        .map_err(documentation_error)
 }
 
 fn decode_notebooks(
@@ -268,7 +264,7 @@ fn decode_notebooks(
     selection: &DocumentationSelection,
     previous: Option<&NotebookFiles>,
     omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
-) -> Result<NotebookFiles, WorkspaceIndexError> {
+) -> Result<NotebookFiles, RiftError> {
     let mut notebooks = NotebookFiles::new();
     for (path, file) in text_files.iter().filter(|(path, _)| {
         selection.format(path.as_str()) == Some(DocumentationSourceFormat::Notebook)
@@ -320,7 +316,7 @@ fn append_attached_inputs<'source>(
     input_bytes: &mut u64,
     omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     inputs: &mut Vec<DocumentationInput<'source>>,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<(), RiftError> {
     let attached_symbols = attached_symbols(declarations);
     for (path, file) in files {
         let identity = project_owner(path, None);
@@ -392,7 +388,7 @@ fn has_attached_declaration(
 fn check_regular_source_count(
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
     selection: &DocumentationSelection,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<(), RiftError> {
     let mut count = 0_usize;
     for path in text_files.keys().filter(|path| {
         selection
@@ -400,7 +396,14 @@ fn check_regular_source_count(
             .is_some_and(|source_format| source_format != DocumentationSourceFormat::Notebook)
     }) {
         count = count.saturating_add(1);
-        check_documentation_source_count(count).map_err(|_| source_limit_error(path, count))?;
+        check_documentation_source_count(count).map_err(|_| {
+            errors::index::workspace_documentation_limit()
+                .path(path)
+                .field("sources")
+                .observed(count)
+                .maximum(DOCUMENTATION_SOURCES_MAX as usize)
+                .error()
+        })?;
     }
     Ok(())
 }
@@ -409,19 +412,16 @@ fn check_next_source_count(
     path: &CoreProjectPath,
     inputs: usize,
     omissions: usize,
-) -> Result<(), WorkspaceIndexError> {
+) -> Result<(), RiftError> {
     let count = inputs.saturating_add(omissions).saturating_add(1);
-    check_documentation_source_count(count).map_err(|_| source_limit_error(path, count))
-}
-
-fn source_limit_error(path: &CoreProjectPath, observed: usize) -> WorkspaceIndexError {
-    crate::workspace::index_error_over_limit(
-        WorkspaceIndexViolation::WorkspaceTooLarge,
-        std::path::Path::new(path.as_str()),
-        "sources",
-        observed,
-        DOCUMENTATION_SOURCES_MAX as usize,
-    )
+    check_documentation_source_count(count).map_err(|_| {
+        errors::index::workspace_documentation_limit()
+            .path(path)
+            .field("sources")
+            .observed(count)
+            .maximum(DOCUMENTATION_SOURCES_MAX as usize)
+            .error()
+    })
 }
 
 /// Derives searchable text documents for decoded notebook cells.
@@ -539,7 +539,7 @@ impl DeclarationFacts {
         }
     }
 
-    fn validated(&self) -> Result<DocumentationDeclaration<'_>, DocumentationError> {
+    fn validated(&self) -> Result<DocumentationDeclaration<'_>, RiftError> {
         DocumentationDeclaration::new(
             &self.symbol,
             &self.language,
@@ -653,7 +653,7 @@ fn content_chunks(
     owner: &DocumentationContentIdentity,
     text: &str,
     chunk_bytes_max: usize,
-) -> Result<Vec<DocumentationChunk>, DocumentationError> {
+) -> Result<Vec<DocumentationChunk>, RiftError> {
     text_chunks(text, chunk_bytes_max)
         .iter()
         .enumerate()
@@ -679,13 +679,9 @@ fn chunk_range(start: u64, content: &str) -> TextRange {
     }
 }
 
-fn documentation_error(error: DocumentationError) -> WorkspaceIndexError {
-    crate::workspace::index_error_caused_by(WorkspaceIndexViolation::Syntax, None, error)
-}
-
-fn warning_kind(error: &DocumentationError) -> DocumentationWarningKind {
-    match error.fault().violation() {
-        rift_analysis::documentation::DocumentationViolation::LimitExceeded => {
+fn warning_kind(error: &RiftError) -> DocumentationWarningKind {
+    match error.slug() {
+        errors::analysis::documentation_limit_exceeded::SLUG => {
             DocumentationWarningKind::SourceUnavailable
         }
         _ => DocumentationWarningKind::MalformedSource,
@@ -694,7 +690,7 @@ fn warning_kind(error: &DocumentationError) -> DocumentationWarningKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotebookFiles, cell_documents, cell_documents_for, decode_notebooks};
+    use super::{NotebookFiles, cell_documents, cell_documents_for, decode_notebooks, errors};
     use crate::workspace::TextSourceFile;
     use crate::{WorkspaceIndex, WorkspaceIndexLimits};
     use rift_core::{SourceVisibility, TextFileInclusion};
@@ -755,10 +751,14 @@ mod tests {
         let error = rift_analysis::documentation::check_documentation_source_count(maximum + 1)
             .expect_err("one source past the bound refuses");
         assert_eq!(
-            error.fault().violation(),
-            rift_analysis::documentation::DocumentationViolation::LimitExceeded
+            error.slug(),
+            errors::analysis::documentation_limit_exceeded::SLUG
         );
-        assert_eq!(error.fault().field(), "sources");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "sources")
+        );
     }
 
     fn default_selection() -> rift_analysis::DocumentationSelection {
@@ -807,9 +807,6 @@ mod tests {
 
     #[test]
     fn workspace_documentation_build_refuses_past_source_count() {
-        use crate::WorkspaceIndexViolation;
-        use rift_core::Fault as _;
-
         let mut text_files = BTreeMap::new();
         for index in 0..=rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX {
             let path =
@@ -831,21 +828,27 @@ mod tests {
         .expect_err("source count over bound refuses collection");
 
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::WorkspaceTooLarge
+            error.slug(),
+            errors::index::workspace_documentation_limit::SLUG
         );
-        let evidence = error
-            .fault()
-            .limit_evidence()
-            .expect("source limit evidence");
-        assert_eq!(
-            (evidence.field.as_str(), evidence.limit, evidence.required),
-            (
-                "sources",
-                u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX),
-                u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX) + 1,
-            )
+        let context = error.context().collect::<Vec<_>>();
+        assert!(
+            context
+                .iter()
+                .any(|(key, value)| *key == "field" && value == "sources")
         );
+        assert!(context.iter().any(|(key, value)| {
+            *key == "observed"
+                && value
+                    == &(u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX) + 1)
+                        .to_string()
+        }));
+        assert!(context.iter().any(|(key, value)| {
+            *key == "maximum"
+                && value
+                    == &u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX)
+                        .to_string()
+        }));
     }
 
     #[test]

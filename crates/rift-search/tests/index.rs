@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use candle_core::{DType, Device, Tensor};
 use rift_core::ProjectPath;
+use rift_error::{RiftError, errors};
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{LexicalIndexLimits, LexicalSearchIndex, StoredVector, VectorStore};
 use rift_ranking::{
@@ -16,8 +17,7 @@ use rift_ranking::{
 use rift_search::{
     AcquisitionLimits, Declaration, DescribedUnit, DocumentDigest, Embedding, EmbeddingModels,
     EmbeddingSpace, Encoder, EncoderLimits, LocalEncoder, ModelFiles, ModelSource, RetrievalModels,
-    RevisionScoped, SearchError, SearchIndex, SearchIndexLimits, SearchViolation, StoreRanking,
-    VectorReadiness, document,
+    RevisionScoped, SearchIndex, SearchIndexLimits, StoreRanking, VectorReadiness, document,
 };
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
@@ -560,7 +560,7 @@ async fn whole_pass(
     documents: &[IndexDocument],
     described: &[DescribedUnit<'_>],
     tree_revision: &str,
-) -> Result<(), SearchError> {
+) -> Result<(), RiftError> {
     index.replace_lexical(documents, tree_revision).await?;
     index
         .embed_described(described, Embedding::Every, tree_revision)
@@ -573,7 +573,7 @@ async fn incremental_pass(
     documents: &[IndexDocument],
     described: &[DescribedUnit<'_>],
     tree_revision: &str,
-) -> Result<(), SearchError> {
+) -> Result<(), RiftError> {
     index.replace_lexical(documents, tree_revision).await?;
     index
         .embed_described(described, Embedding::Missing, tree_revision)
@@ -1132,7 +1132,7 @@ async fn a_tier_that_will_not_load_leaves_the_full_text_ranking_serving() -> Tes
         .prepare(&model_source(root.path(), "absent")?, acquisition_limits())
         .await
         .expect_err("the directory holds no model");
-    assert_eq!(error.fault().violation(), SearchViolation::ModelFileMissing);
+    assert_eq!(error.slug(), errors::search::model_file_missing::SLUG);
     assert_eq!(index.pass_readiness(), VectorReadiness::Unavailable);
 
     assert_eq!(
@@ -1445,23 +1445,21 @@ async fn a_store_refusal_carries_the_stores_own_violation() -> TestResult {
     let error = whole_pass(&index, fixture.documents(), &fixture.described(), REVISION)
         .await
         .expect_err("two documents pass the one-document bound");
-    assert_eq!(error.fault().violation(), SearchViolation::StoreFailed);
+    assert_eq!(error.slug(), errors::index::lexical_unit_limit::SLUG);
     let rendered = error.to_string();
-    assert!(rendered.contains("store_failed"), "{rendered}");
     assert!(
-        rendered.contains("unit_limit"),
-        "the lexical tier's own violation rides along: {rendered}"
+        rendered.contains("accepted limit of 1"),
+        "the lexical tier's refusal reaches the caller: {rendered}"
     );
-    assert!(std::error::Error::source(&error).is_some());
+    let context = error
+        .context()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(context.get("field").map(String::as_str), Some("units_max"));
+    assert_eq!(context.get("observed").map(String::as_str), Some("2"));
     Ok(())
 }
 
-/// A bound the store enforced reaches the caller as that bound.
-///
-/// Flattening every store refusal into this tier's own violation told a caller
-/// publishing too many documents that the server had failed, when the caller
-/// could have published fewer. The registry identity and the limit evidence
-/// travel with the failure so the answer stays actionable.
+/// A bound refusal reaches caller with its registered identity and evidence.
 #[tokio::test]
 async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> TestResult {
     let root = workspace()?;
@@ -1474,17 +1472,13 @@ async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> T
         .await
         .expect_err("two documents pass the one-document bound");
 
-    let descriptor = error.descriptor();
-    assert_eq!(
-        descriptor.code(),
-        "limit_exceeded",
-        "the store's own classification reaches the caller, not this tier's"
-    );
-    let evidence = rift_core::Fault::limit_evidence(error.fault())
-        .expect("a limit refusal states the bound and what the request needed");
-    assert_eq!(evidence.field, "units_max");
-    assert_eq!(evidence.limit, 1);
-    assert_eq!(evidence.required, 2);
+    assert_eq!(error.slug(), errors::index::lexical_unit_limit::SLUG);
+    let context = error
+        .context()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(context.get("field").map(String::as_str), Some("units_max"));
+    assert_eq!(context.get("maximum").map(String::as_str), Some("1"));
+    assert_eq!(context.get("observed").map(String::as_str), Some("2"));
     Ok(())
 }
 
@@ -1494,7 +1488,7 @@ async fn opening_a_store_that_cannot_be_created_is_refused() -> TestResult {
     let error = SearchIndex::open(root.path(), limits())
         .await
         .expect_err("a directory is not a database file");
-    assert_eq!(error.fault().violation(), SearchViolation::StoreFailed);
+    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
     Ok(())
 }
 
@@ -1530,10 +1524,8 @@ async fn a_rank_that_meets_a_held_pool_names_the_missing_connection() -> TestRes
         .rank(REVISION, &parsed, QueryPhase::Precise, 10)
         .await
         .expect_err("a rank that meets no free slot refuses");
-    assert!(
-        refused.fault().is_store_connection_unavailable(),
-        "the refusal names the missing connection: {refused}"
-    );
+    assert_eq!(refused.slug(), errors::index::lexical_storage::SLUG);
+    assert!(std::error::Error::source(&refused).is_some());
 
     drop(held);
     let answered = index

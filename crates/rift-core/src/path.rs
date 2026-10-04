@@ -8,7 +8,7 @@ use crate::constants::{
     PROJECT_PATH_BYTES_MAX, RIFT_STATE_DIRECTORY, RIFT_STATE_DIRECTORY_PREFIX,
     SOURCE_PATH_BYTES_MAX,
 };
-use crate::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
+use rift_error::{RiftError, errors};
 use serde::Serialize;
 
 /// Path vocabulary being validated.
@@ -45,43 +45,6 @@ pub enum PathViolation {
     RiftState,
 }
 
-/// One rejected path: which vocabulary refused it, and which rule it broke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PathFault {
-    kind: PathKind,
-    violation: PathViolation,
-}
-
-impl PathFault {
-    /// Returns path vocabulary that rejected input.
-    #[must_use]
-    pub const fn kind(self) -> PathKind {
-        self.kind
-    }
-
-    /// Returns violated path rule.
-    #[must_use]
-    pub const fn violation(self) -> PathViolation {
-        self.violation
-    }
-}
-
-impl Fault for PathFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::UnsupportedPath)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![
-            ErrorContext::new("path_kind", fault_label(&self.kind)),
-            ErrorContext::new("violation", fault_label(&self.violation)),
-        ]
-    }
-}
-
-/// Invalid project or source path.
-pub type PathError = Error<PathFault>;
-
 /// Validated path below a workspace root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectPath(Arc<str>);
@@ -93,21 +56,22 @@ impl ProjectPath {
     ///
     /// # Errors
     ///
-    /// Returns [`PathError`] for non-canonical or unsafe filesystem paths.
-    pub fn new(value: impl Into<String>) -> Result<Self, PathError> {
+    /// Returns [`RiftError`] for non-canonical or unsafe filesystem paths.
+    pub fn new(value: impl Into<String>) -> Result<Self, RiftError> {
         let value = value.into();
         validate_common(&value, PathKind::Project, PROJECT_PATH_BYTES_MAX)?;
         if value.chars().nfc().ne(value.chars()) {
-            return Err(path_error(
-                PathKind::Project,
-                PathViolation::NonCanonicalUnicode,
-            ));
+            return errors::core::path_non_canonical_unicode()
+                .path_kind("project")
+                .fail();
         }
         if value == RIFT_STATE_DIRECTORY || value.starts_with(RIFT_STATE_DIRECTORY_PREFIX) {
-            return Err(path_error(PathKind::Project, PathViolation::RiftState));
+            return errors::core::path_rift_state().path_kind("project").fail();
         }
         if value.split('/').any(str::is_empty) && !value.is_empty() {
-            return Err(path_error(PathKind::Project, PathViolation::EmptySegment));
+            return errors::core::path_empty_segment()
+                .path_kind("project")
+                .fail();
         }
         Ok(Self(Arc::from(value)))
     }
@@ -122,6 +86,12 @@ impl ProjectPath {
 impl fmt::Display for ProjectPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<std::path::Path> for ProjectPath {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(self.as_str())
     }
 }
 
@@ -143,12 +113,12 @@ impl SourcePath {
     ///
     /// # Errors
     ///
-    /// Returns [`PathError`] for empty, absolute, ambiguous, or oversized paths.
-    pub fn new(value: impl Into<String>) -> Result<Self, PathError> {
+    /// Returns [`RiftError`] for empty, absolute, ambiguous, or oversized paths.
+    pub fn new(value: impl Into<String>) -> Result<Self, RiftError> {
         let value = value.into();
         validate_common(&value, PathKind::Source, SOURCE_PATH_BYTES_MAX)?;
         if value.is_empty() {
-            return Err(path_error(PathKind::Source, PathViolation::Empty));
+            return errors::core::path_empty().path_kind("source").fail();
         }
         Ok(Self(Arc::from(value)))
     }
@@ -166,9 +136,39 @@ impl fmt::Display for SourcePath {
     }
 }
 
-fn validate_common(value: &str, kind: PathKind, bytes_max: usize) -> Result<(), PathError> {
+fn validate_common(value: &str, kind: PathKind, bytes_max: usize) -> Result<(), RiftError> {
     match path_violation(value, bytes_max) {
-        Some(violation) => Err(path_error(kind, violation)),
+        Some(violation) => {
+            let path_kind = match kind {
+                PathKind::Project => "project",
+                PathKind::Source => "source",
+            };
+            match violation {
+                PathViolation::Empty => errors::core::path_empty().path_kind(path_kind).fail(),
+                PathViolation::TooLong => errors::core::path_too_long().path_kind(path_kind).fail(),
+                PathViolation::Absolute => {
+                    errors::core::path_absolute().path_kind(path_kind).fail()
+                }
+                PathViolation::DotSegment => {
+                    errors::core::path_dot_segment().path_kind(path_kind).fail()
+                }
+                PathViolation::EmptySegment => errors::core::path_empty_segment()
+                    .path_kind(path_kind)
+                    .fail(),
+                PathViolation::Backslash => {
+                    errors::core::path_backslash().path_kind(path_kind).fail()
+                }
+                PathViolation::ControlCharacter => errors::core::path_control_character()
+                    .path_kind(path_kind)
+                    .fail(),
+                PathViolation::NonCanonicalUnicode => errors::core::path_non_canonical_unicode()
+                    .path_kind(path_kind)
+                    .fail(),
+                PathViolation::RiftState => {
+                    errors::core::path_rift_state().path_kind(path_kind).fail()
+                }
+            }
+        }
         None => Ok(()),
     }
 }
@@ -196,15 +196,11 @@ fn is_dot_segment(segment: &str) -> bool {
     }
 }
 
-fn path_error(kind: PathKind, violation: PathViolation) -> PathError {
-    Error::new(PathFault { kind, violation })
-}
-
 #[cfg(test)]
 mod tests {
     use std::hash::{Hash as _, Hasher as _};
 
-    use super::{PathKind, PathViolation, ProjectPath, SourcePath};
+    use super::{ProjectPath, SourcePath};
 
     #[test]
     fn cloned_paths_share_text_and_keep_value_semantics() {
@@ -214,6 +210,10 @@ mod tests {
         assert_eq!(project, project_clone);
         assert!(project < ProjectPath::new("src/main.rs").expect("valid project path"));
         assert_eq!(project.to_string(), "src/lib.rs");
+        assert_eq!(
+            AsRef::<std::path::Path>::as_ref(&project),
+            std::path::Path::new("src/lib.rs")
+        );
         assert!(ProjectPath::new("src/../lib.rs").is_err());
 
         let mut project_hash = std::collections::hash_map::DefaultHasher::new();
@@ -233,33 +233,36 @@ mod tests {
     #[test]
     fn project_path_accepts_root_and_canonical_unicode() {
         assert_eq!(
-            ProjectPath::new("").map(|path| path.to_string()),
-            Ok(String::new())
+            ProjectPath::new("")
+                .expect("workspace root is valid")
+                .to_string(),
+            String::new()
         );
         assert_eq!(
-            ProjectPath::new("src/caf\u{e9}.rs").map(|path| path.to_string()),
-            Ok(String::from("src/caf\u{e9}.rs"))
+            ProjectPath::new("src/caf\u{e9}.rs")
+                .expect("canonical unicode path is valid")
+                .to_string(),
+            String::from("src/caf\u{e9}.rs")
         );
     }
 
     #[test]
     fn project_path_rejects_every_filesystem_boundary() {
         let cases = [
-            ("/src/lib.rs", PathViolation::Absolute),
-            ("C:/src/lib.rs", PathViolation::Absolute),
-            ("C:src/lib.rs", PathViolation::Absolute),
-            ("src/../lib.rs", PathViolation::DotSegment),
-            ("src//lib.rs", PathViolation::EmptySegment),
-            ("src\\lib.rs", PathViolation::Backslash),
-            ("src/line\n.rs", PathViolation::ControlCharacter),
-            ("src/cafe\u{301}.rs", PathViolation::NonCanonicalUnicode),
-            (".rift/index.db", PathViolation::RiftState),
+            ("/src/lib.rs", "rift.core.path_absolute"),
+            ("C:/src/lib.rs", "rift.core.path_absolute"),
+            ("C:src/lib.rs", "rift.core.path_absolute"),
+            ("src/../lib.rs", "rift.core.path_dot_segment"),
+            ("src//lib.rs", "rift.core.path_empty_segment"),
+            ("src\\lib.rs", "rift.core.path_backslash"),
+            ("src/line\n.rs", "rift.core.path_control_character"),
+            ("src/cafe\u{301}.rs", "rift.core.path_non_canonical_unicode"),
+            (".rift/index.db", "rift.core.path_rift_state"),
         ];
 
-        for (value, violation) in cases {
+        for (value, expected_slug) in cases {
             let error = ProjectPath::new(value).expect_err("fixture must be rejected");
-            assert_eq!(error.fault().kind(), PathKind::Project);
-            assert_eq!(error.fault().violation(), violation);
+            assert_eq!(error.slug().as_str(), expected_slug);
         }
     }
 
@@ -268,34 +271,36 @@ mod tests {
         assert!(ProjectPath::new("a".repeat(1_000)).is_ok());
         let value = "\u{e9}".repeat(501);
         assert_eq!(
-            ProjectPath::new(value).map_err(|error| error.fault().violation()),
-            Err(PathViolation::TooLong)
+            ProjectPath::new(value).map_err(|error| error.slug().as_str()),
+            Err("rift.core.path_too_long")
         );
     }
 
     #[test]
     fn source_path_preserves_non_project_catalog_names() {
         assert_eq!(
-            SourcePath::new("serde/1.0.197/src//lib.rs").map(|path| path.to_string()),
-            Ok(String::from("serde/1.0.197/src//lib.rs"))
+            SourcePath::new("serde/1.0.197/src//lib.rs")
+                .expect("source catalog path allows repeated separators")
+                .to_string(),
+            String::from("serde/1.0.197/src//lib.rs")
         );
         assert_eq!(
-            SourcePath::new("").map_err(|error| error.fault().violation()),
-            Err(PathViolation::Empty)
+            SourcePath::new("").map_err(|error| error.slug().as_str()),
+            Err("rift.core.path_empty")
         );
         assert_eq!(
-            SourcePath::new("../outside.rs").map_err(|error| error.fault().violation()),
-            Err(PathViolation::DotSegment)
+            SourcePath::new("../outside.rs").map_err(|error| error.slug().as_str()),
+            Err("rift.core.path_dot_segment")
         );
         assert!(SourcePath::new("a".repeat(4_096)).is_ok());
         assert!(SourcePath::new("é".repeat(2_048)).is_ok());
         assert_eq!(
-            SourcePath::new("a".repeat(4_097)).map_err(|error| error.fault().violation()),
-            Err(PathViolation::TooLong)
+            SourcePath::new("a".repeat(4_097)).map_err(|error| error.slug().as_str()),
+            Err("rift.core.path_too_long")
         );
         assert_eq!(
-            SourcePath::new("é".repeat(2_049)).map_err(|error| error.fault().violation()),
-            Err(PathViolation::TooLong)
+            SourcePath::new("é".repeat(2_049)).map_err(|error| error.slug().as_str()),
+            Err("rift.core.path_too_long")
         );
         for value in [
             "/absolute.rs",
@@ -313,40 +318,9 @@ mod tests {
         let error = ProjectPath::new("../outside").expect_err("dot segment is invalid");
         assert_eq!(
             error.to_string(),
-            "the path cannot be addressed by this workspace: \
-             path_kind project, violation dot_segment; \
+            "project path contains a dot segment; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
-    }
-
-    #[test]
-    fn path_violation_labels_are_non_empty_lowercase() {
-        let violations = [
-            PathViolation::Empty,
-            PathViolation::TooLong,
-            PathViolation::Absolute,
-            PathViolation::DotSegment,
-            PathViolation::EmptySegment,
-            PathViolation::Backslash,
-            PathViolation::ControlCharacter,
-            PathViolation::NonCanonicalUnicode,
-            PathViolation::RiftState,
-        ];
-        for violation in violations {
-            let label = crate::fault_label(&violation);
-            assert!(!label.is_empty(), "violation={violation:?}");
-            assert!(
-                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "label must be the serde snake_case name so the rendered line \
-                 and the wire spelling cannot drift: violation={violation:?}, label={label}"
-            );
-        }
-    }
-
-    #[test]
-    fn path_kind_labels_name_each_vocabulary() {
-        assert_eq!(crate::fault_label(&PathKind::Project), "project");
-        assert_eq!(crate::fault_label(&PathKind::Source), "source");
     }
 
     #[test]
@@ -354,16 +328,14 @@ mod tests {
         let project_error = ProjectPath::new("../outside").expect_err("dot segment is invalid");
         assert_eq!(
             project_error.to_string(),
-            "the path cannot be addressed by this workspace: \
-             path_kind project, violation dot_segment; \
+            "project path contains a dot segment; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
 
         let source_error = SourcePath::new("").expect_err("empty source path is invalid");
         assert_eq!(
             source_error.to_string(),
-            "the path cannot be addressed by this workspace: \
-             path_kind source, violation empty; \
+            "source path is empty; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
     }

@@ -10,7 +10,7 @@ use rift_protocol::read::{Language, NodeFacet};
 
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
-use crate::failure::SyntaxError;
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Bounded Tree-sitter JavaScript fact provider.
@@ -39,7 +39,7 @@ impl SyntaxProvider for JavaScriptSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         ecmascript::analyze(
             &self.language,
             &javascript_grammar(),
@@ -71,7 +71,6 @@ mod tests {
     use rift_protocol::read::SymbolFacet;
 
     use super::*;
-    use crate::failure::SyntaxViolation;
 
     fn path() -> ProjectPath {
         ProjectPath::new("src/app.js").expect("valid fixture path")
@@ -606,8 +605,8 @@ mod tests {
             )
             .expect_err("source bound");
         assert_eq!(
-            source_error.fault().violation(),
-            SyntaxViolation::SourceTooLarge
+            source_error.slug(),
+            rift_error::errors::syntax::source_too_large::SLUG
         );
 
         let node_error = JavaScriptSyntaxProvider::default()
@@ -620,8 +619,8 @@ mod tests {
             )
             .expect_err("node bound");
         assert_eq!(
-            node_error.fault().violation(),
-            SyntaxViolation::TooManyNodes
+            node_error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
 
         let depth_error = JavaScriptSyntaxProvider::default()
@@ -633,7 +632,10 @@ mod tests {
                 SyntaxLimits::new(100, 50, 1).expect("positive limits"),
             )
             .expect_err("depth bound");
-        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
+        assert_eq!(
+            depth_error.slug(),
+            rift_error::errors::syntax::too_deep::SLUG
+        );
     }
 
     /// An empty source parses to a bare program node under any positive

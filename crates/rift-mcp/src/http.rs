@@ -14,12 +14,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_error::{RiftError, errors};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rift_search::SearchIndex;
-use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::sync::Notify;
@@ -55,79 +54,6 @@ const TOKEN_ENTROPY_BYTES: usize = 32;
 const BEARER_SCHEME: &str = "Bearer";
 /// The `Host` spellings that name the loopback the server binds.
 const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
-
-/// Failure while starting or running the Streamable-HTTP MCP transport.
-pub type HttpServeError = Error<HttpServeFault>;
-
-/// One HTTP transport failure: what stopped the server from starting or serving.
-#[derive(Debug)]
-pub enum HttpServeFault {
-    /// Workspace snapshot could not be built, or its index supervisor did
-    /// not shut down. Boxed to keep this transport error small beside it.
-    Workspace(Box<ReadError>),
-    /// Every port in the loopback serving range is already bound.
-    PortsExhausted {
-        /// The lowest port that was tried.
-        port_min: u16,
-        /// The highest port that was tried.
-        port_max: u16,
-    },
-    /// The listener could not be prepared, or a serving task failed.
-    Serve {
-        /// The listener or serving operation that failed.
-        operation: &'static str,
-        /// The underlying failure.
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
-impl Fault for HttpServeFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::Workspace(source) => source.name(),
-            Self::PortsExhausted { .. } => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
-            Self::Serve { .. } => ErrorName::Wire(ErrorCode::InternalError),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Workspace(source) => source.context(),
-            Self::PortsExhausted { port_min, port_max } => vec![
-                ErrorContext::new("ports", format!("{port_min}..={port_max}")),
-                ErrorContext::new(
-                    "detail",
-                    "every loopback port in the serving range is bound",
-                ),
-            ],
-            Self::Serve { operation, .. } => vec![ErrorContext::new("operation", *operation)],
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Workspace(source) => Some(source.as_ref()),
-            Self::PortsExhausted { .. } => None,
-            Self::Serve { source, .. } => Some(source.as_ref()),
-        }
-    }
-}
-
-impl HttpServeFault {
-    pub(crate) fn workspace(source: ReadError) -> HttpServeError {
-        Error::new(Self::Workspace(Box::new(source)))
-    }
-
-    pub(crate) fn serve(
-        operation: &'static str,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> HttpServeError {
-        Error::new(Self::Serve {
-            operation,
-            source: Box::new(source),
-        })
-    }
-}
 
 /// Whether the served routes check the minted bearer token.
 ///
@@ -174,7 +100,7 @@ impl TokenCheck {
 ///
 /// # Errors
 ///
-/// Returns [`HttpServeError`] when the workspace cannot be indexed, entropy
+/// Returns [`RiftError`] when the workspace cannot be indexed, entropy
 /// for the token is unavailable, every port in the serving range is bound,
 /// or the listener cannot register with the runtime.
 ///
@@ -191,7 +117,7 @@ pub async fn serve_http(
     root: &Path,
     shutdown: CancellationToken,
     check: TokenCheck,
-) -> Result<HttpServer, HttpServeError> {
+) -> Result<HttpServer, RiftError> {
     let storage = WorkspaceStorage::open(root).await;
     serve_http_with_storage(
         root,
@@ -214,11 +140,9 @@ pub(crate) async fn serve_http_with_storage(
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
-) -> Result<HttpServer, HttpServeError> {
+) -> Result<HttpServer, RiftError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
-    let server = RiftMcp::build_with_storage(root, limits, storage, checkout)
-        .await
-        .map_err(HttpServeFault::workspace)?;
+    let server = RiftMcp::build_with_storage(root, limits, storage, checkout).await?;
     let identity = server.product_identity().clone();
     let search_index = server.search_index_handle();
     let server_table = server.server_configuration().await;
@@ -291,13 +215,15 @@ impl DeferredDatabaseShutdown {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpServeError`] if the SQLite worker fails or cannot stop before the deadline.
-    pub async fn shutdown(self, deadline: Instant) -> Result<(), HttpServeError> {
+    /// Returns [`RiftError`] if the SQLite worker fails or cannot stop before the deadline.
+    pub async fn shutdown(self, deadline: Instant) -> Result<(), RiftError> {
         match self.0 {
-            Some(search_index) => search_index
-                .shutdown(deadline)
-                .await
-                .map_err(|error| HttpServeFault::serve("SQLite worker shutdown", error)),
+            Some(search_index) => search_index.shutdown(deadline).await.map_err(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("SQLite worker shutdown")
+                    .cause(error)
+                    .error()
+            }),
             None => Ok(()),
         }
     }
@@ -353,14 +279,14 @@ impl HttpServer {
     ///
     /// # Errors
     ///
-    /// The second tuple element carries [`HttpServeError`] when the supervisor
+    /// The second tuple element carries [`RiftError`] when the supervisor
     /// or the drain outlasted the deadline, or a serving task failed.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
-    pub async fn stopped(self, budget: Duration) -> (Instant, Result<(), HttpServeError>) {
+    pub async fn stopped(self, budget: Duration) -> (Instant, Result<(), RiftError>) {
         let (deadline, stopped, database) = self.stopped_before_database(budget).await;
         let database = database.shutdown(deadline).await;
         (deadline, stopped.and(database))
@@ -371,11 +297,7 @@ impl HttpServer {
     pub async fn stopped_before_database(
         self,
         budget: Duration,
-    ) -> (
-        Instant,
-        Result<(), HttpServeError>,
-        DeferredDatabaseShutdown,
-    ) {
+    ) -> (Instant, Result<(), RiftError>, DeferredDatabaseShutdown) {
         let mut serving = self.serving;
         let ended_before_the_stop = tokio::select! {
             outcome = &mut serving => Some(outcome),
@@ -395,12 +317,19 @@ impl HttpServer {
         let idle_outcome = self.idle_watch.await;
         let repository_idle_outcome = match self.repository_idle_watch {
             Some(mut watch) => match tokio::time::timeout_at(deadline, &mut watch).await {
-                Ok(outcome) => outcome
-                    .map_err(|error| HttpServeFault::serve("workspace idle watch task", error)),
+                Ok(outcome) => outcome.map_err(|error| {
+                    errors::mcp::http_serve_failed()
+                        .operation("workspace idle watch task")
+                        .source(error)
+                        .error()
+                }),
                 Err(error) => {
                     watch.abort();
                     let _ = watch.await;
-                    Err(HttpServeFault::serve("workspace idle watch task", error))
+                    errors::mcp::http_serve_failed()
+                        .operation("workspace idle watch task")
+                        .source(error)
+                        .fail()
                 }
             },
             None => Ok(()),
@@ -412,10 +341,7 @@ impl HttpServer {
             None => true,
         };
         let supervisor_outcome = if let Some(supervisor) = self.supervisor.as_ref() {
-            supervisor
-                .shutdown(deadline)
-                .await
-                .map_err(HttpServeFault::workspace)
+            supervisor.shutdown(deadline).await
         } else {
             Ok(())
         };
@@ -447,7 +373,12 @@ impl HttpServer {
             .and(repository_idle_outcome)
             .and(serve_result)
             .and_then(|()| {
-                idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
+                idle_outcome.map_err(|error| {
+                    errors::mcp::http_serve_failed()
+                        .operation("idle watch task")
+                        .source(error)
+                        .error()
+                })
             });
         (
             deadline,
@@ -462,11 +393,17 @@ impl HttpServer {
 /// serving task names the task.
 fn classify_serve_outcome(
     outcome: Result<Result<(), std::io::Error>, tokio::task::JoinError>,
-) -> Result<(), HttpServeError> {
+) -> Result<(), RiftError> {
     match outcome {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(HttpServeFault::serve("http serve loop", error)),
-        Err(error) => Err(HttpServeFault::serve("http serve task", error)),
+        Ok(Err(error)) => errors::mcp::http_serve_failed()
+            .operation("http serve loop")
+            .source(error)
+            .fail(),
+        Err(error) => errors::mcp::http_serve_failed()
+            .operation("http serve task")
+            .source(error)
+            .fail(),
     }
 }
 
@@ -481,10 +418,13 @@ fn classify_serve_outcome(
 async fn drained_serve_outcome(
     serving: &mut JoinHandle<Result<(), std::io::Error>>,
     deadline: Instant,
-) -> Result<(), HttpServeError> {
+) -> Result<(), RiftError> {
     match tokio::time::timeout_at(deadline, serving).await {
         Ok(joined) => classify_serve_outcome(joined),
-        Err(elapsed) => Err(HttpServeFault::serve("http serve drain", elapsed)),
+        Err(elapsed) => errors::mcp::http_serve_failed()
+            .operation("http serve drain")
+            .source(elapsed)
+            .fail(),
     }
 }
 
@@ -498,9 +438,14 @@ fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
 /// The encoding fixes the length: `TOKEN_ENTROPY_BYTES` entropy bytes
 /// spell exactly [`rift_protocol::lock::SERVER_TOKEN_LENGTH`] base64url
 /// characters.
-pub(crate) fn mint_token() -> Result<String, HttpServeError> {
+pub(crate) fn mint_token() -> Result<String, RiftError> {
     let mut entropy = [0_u8; TOKEN_ENTROPY_BYTES];
-    getrandom::fill(&mut entropy).map_err(|error| HttpServeFault::serve("token mint", error))?;
+    getrandom::fill(&mut entropy).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("token mint")
+            .source(error)
+            .error()
+    })?;
     Ok(BASE64URL_NOPAD.encode(&entropy))
 }
 
@@ -512,32 +457,39 @@ pub(crate) fn mint_token() -> Result<String, HttpServeError> {
 fn bind_first_free<Listener>(
     ports: RangeInclusive<u16>,
     mut bind: impl FnMut(u16) -> std::io::Result<Listener>,
-) -> Result<(u16, Listener), HttpServeError> {
+) -> Result<(u16, Listener), RiftError> {
     let (port_min, port_max) = (*ports.start(), *ports.end());
     for port in ports {
         if let Ok(listener) = bind(port) {
             return Ok((port, listener));
         }
     }
-    Err(Error::new(HttpServeFault::PortsExhausted {
-        port_min,
-        port_max,
-    }))
+    errors::mcp::http_ports_exhausted()
+        .port_min(port_min)
+        .port_max(port_max)
+        .fail()
 }
 
 /// Binds the first free loopback port of the accepted selection for the
 /// runtime.
 pub(crate) fn bind_loopback_listener(
     ports: RangeInclusive<u16>,
-) -> Result<(u16, tokio::net::TcpListener), HttpServeError> {
+) -> Result<(u16, tokio::net::TcpListener), RiftError> {
     let (port, listener) = bind_first_free(ports, |port| {
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
     })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| HttpServeFault::serve("listener nonblocking mode", error))?;
-    let listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|error| HttpServeFault::serve("listener runtime registration", error))?;
+    listener.set_nonblocking(true).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("listener nonblocking mode")
+            .source(error)
+            .error()
+    })?;
+    let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("listener runtime registration")
+            .source(error)
+            .error()
+    })?;
     Ok((port, listener))
 }
 
@@ -913,19 +865,20 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::{StatusCode, header};
+    use rift_error::errors;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::configuration::ServerConfiguration;
     use rift_protocol::lock::{ProductIdentity, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
-    use rift_server::ReadFault;
     use tokio_util::sync::CancellationToken;
 
     use tokio::time::Instant;
 
+    use crate::failure::{McpErrorExt as _, WireFailure as _};
     use crate::server::EngineHold;
     use crate::validation::{IndexSupervisor, IndexValidation};
 
     use super::{
-        HttpServeFault, HttpServer, IdleTracker, TokenCheck, bearer_authorized, bind_first_free,
+        HttpServer, IdleTracker, TokenCheck, bearer_authorized, bind_first_free,
         classify_serve_outcome, mint_token, stop_outcome_label, unauthorized, watch_idle,
     };
 
@@ -992,49 +945,41 @@ mod tests {
             Err::<u16, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
         })
         .expect_err("an all-busy range must refuse");
-        assert!(matches!(
-            error.fault(),
-            HttpServeFault::PortsExhausted {
-                port_min: 4,
-                port_max: 6,
-            }
-        ));
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
-        let rendered = error.to_string();
-        assert!(rendered.contains("4..=6"), "{rendered}");
-    }
-
-    #[test]
-    fn workspace_fault_keeps_the_read_classification_and_source() {
-        let read = ReadFault::unavailable("probe", "detail");
-        let expected = read.descriptor();
-        let error = HttpServeFault::workspace(read);
-        assert_eq!(error.descriptor(), expected);
+        assert_eq!(error.slug(), errors::mcp::http_ports_exhausted::SLUG);
         assert!(
-            std::error::Error::source(&error).is_some(),
-            "the wrapped read failure must stay on the source chain"
+            error
+                .context()
+                .any(|(key, value)| key == "port_min" && value == "4")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "port_max" && value == "6")
+        );
+        let wire = error
+            .mcp()
+            .wire_error(rift_protocol::error::ErrorPhase::Read);
+        assert_eq!(
+            wire.code,
+            rift_protocol::error::ErrorCode::TemporarilyUnavailable
+        );
+        assert_eq!(
+            wire.retry,
+            rift_protocol::error::RetryDirective::SameRequest
         );
     }
 
     #[test]
-    fn serve_fault_names_its_operation_and_exposes_the_source() {
-        let error = HttpServeFault::serve("http serve loop", std::io::Error::other("socket gone"));
-        assert_eq!(error.descriptor().code(), "internal_error");
+    fn serve_error_names_its_operation_and_exposes_the_source() {
+        let error = errors::mcp::http_serve_failed()
+            .operation("http serve loop")
+            .source(std::io::Error::other("socket gone"))
+            .error();
+        assert_eq!(error.slug(), errors::mcp::http_serve_failed::SLUG);
         let rendered = error.to_string();
         assert!(rendered.contains("http serve loop"), "{rendered}");
         let source = std::error::Error::source(&error).expect("source must be exposed");
         assert_eq!(source.to_string(), "socket gone");
-    }
-
-    #[test]
-    fn workspace_fault_forwards_the_read_context() {
-        let expected = ReadFault::unavailable("probe", "detail").context();
-        assert!(
-            !expected.is_empty(),
-            "the read failure must carry evidence for the forwarding to matter"
-        );
-        let error = HttpServeFault::workspace(ReadFault::unavailable("probe", "detail"));
-        assert_eq!(error.context(), expected);
     }
 
     #[test]
@@ -1201,7 +1146,14 @@ mod tests {
             "the later stages must be given the whole budget"
         );
         let error = stopped.expect_err("a supervisor that never joins must miss the deadline");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert_eq!(
+            error
+                .mcp()
+                .wire_error(rift_protocol::error::ErrorPhase::Read)
+                .code,
+            rift_protocol::error::ErrorCode::TemporarilyUnavailable
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use regex_syntax::hir::{Class, HirKind};
 
 use super::{Pattern, Prefilter, ROW_EXPRESSION_DEPTH_MAX, prefilter};
-use crate::RankingViolation;
 use crate::trigram::trigram_set;
+use rift_error::ErrorSlug;
 
 /// A compiled-size bound far above every pattern these tests write.
 const SIZE_LIMIT: usize = 1 << 20;
@@ -89,7 +89,10 @@ fn small_classes_expand_and_large_ones_close_the_literal() {
 fn a_translator_in_utf8_mode_refuses_a_byte_class_past_ascii() {
     let refused = Pattern::parse(r"(?-u:[\x80\x81])abc", SIZE_LIMIT)
         .expect_err("a byte class past ASCII can match invalid UTF-8");
-    assert_eq!(refused.fault().violation(), RankingViolation::PatternSyntax);
+    assert_eq!(
+        refused.slug(),
+        ErrorSlug::new("rift.ranking.pattern_syntax")
+    );
 }
 
 /// Only a translator with UTF-8 mode off builds a byte class past ASCII, and a debug build
@@ -539,7 +542,7 @@ fn the_formula_never_drops_a_matching_text() {
 mod matcher {
     use super::super::Pattern;
     use super::SIZE_LIMIT;
-    use crate::RankingViolation;
+    use rift_error::ErrorSlug;
 
     /// Each match's start and end offsets.
     fn ranges(pattern: &str, text: &str) -> Vec<(usize, usize)> {
@@ -613,20 +616,23 @@ mod matcher {
     #[test]
     fn a_pattern_past_the_size_limit_or_out_of_syntax_is_refused() {
         let oversized = Pattern::parse(r"\w{1000}", 1024).expect_err("past the size bound");
-        assert_eq!(oversized.fault().violation(), RankingViolation::PatternSize);
+        assert_eq!(
+            oversized.slug(),
+            ErrorSlug::new("rift.ranking.pattern_size")
+        );
         assert!(
             oversized.detail().contains("exceeds 1024 bytes"),
             "{}",
             oversized.detail()
         );
         assert_eq!(
-            oversized.name(),
-            rift_core::ErrorName::Wire(rift_core::ErrorCode::InvalidRequest)
+            oversized.slug(),
+            ErrorSlug::new("rift.ranking.pattern_size")
         );
         let unclosed = Pattern::parse("useState(", SIZE_LIMIT).expect_err("an unclosed group");
         assert_eq!(
-            unclosed.fault().violation(),
-            RankingViolation::PatternSyntax
+            unclosed.slug(),
+            ErrorSlug::new("rift.ranking.pattern_syntax")
         );
         assert!(
             unclosed.detail().contains("unclosed group"),
@@ -654,5 +660,8 @@ fn the_rewrite_leaves_every_class_without_a_line_feed() {
         "no class of the rewritten pattern takes the line feed"
     );
     let refused = Pattern::parse("(", SIZE_LIMIT).expect_err("an unclosed group");
-    assert_eq!(refused.fault().violation(), RankingViolation::PatternSyntax);
+    assert_eq!(
+        refused.slug(),
+        ErrorSlug::new("rift.ranking.pattern_syntax")
+    );
 }

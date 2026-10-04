@@ -1,0 +1,11 @@
+[package]
+name = "rift-error"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Runtime support for registered Rift errors"
+
+[lints]
+workspace = true

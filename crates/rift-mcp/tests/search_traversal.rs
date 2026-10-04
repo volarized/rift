@@ -1294,11 +1294,17 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
             "{structured}"
         );
         assert_eq!(warnings[0]["language"], json!("rust"), "{structured}");
-        assert!(
-            warnings[0]["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("line_out_of_range")),
-            "the engine answered, about a line the served bytes do not hold: {structured}"
+        let operation = if direction == "outgoing" {
+            "engine calls"
+        } else {
+            "engine references"
+        };
+        assert_eq!(
+            warnings[0]["detail"],
+            json!(format!(
+                "the addressed content exists but its bytes cannot be served: operation {operation}, detail position line 50 is outside document line count 6"
+            )),
+            "the engine answer is outside the served document: {structured}"
         );
     }
 

@@ -2,15 +2,12 @@
 
 use std::collections::BTreeSet;
 
-use rift_core::{
-    ContributionOrigin, Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence,
-    ProjectPath, SourceKind, SourceLocation, SourceUnitId, fault_label,
-};
+use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation, SourceUnitId};
+use rift_error::{RiftError, errors};
 use rift_protocol::index::PACKAGE_UNITS_MAX;
 use rift_protocol::read::{Language, PackageIdentity};
 #[cfg(feature = "collector")]
 use rift_syntax::SyntaxLimits;
-use serde::Serialize;
 
 /// Bounds accepted for one exact-package input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +108,7 @@ impl<'input> ExactPackageInput<'input> {
     ///
     /// # Errors
     ///
-    /// Returns [`PackageInputError`] when identity, origin, paths, source count, or source
+    /// Returns [`RiftError`] when identity, origin, paths, source count, or source
     /// bytes violate these rules.
     pub fn new(
         package: &'input PackageIdentity,
@@ -119,45 +116,46 @@ impl<'input> ExactPackageInput<'input> {
         origin: &'input ContributionOrigin,
         files: &'input [PackageSource<'input>],
         limits: ExactPackageLimits,
-    ) -> Result<Self, PackageInputError> {
+    ) -> Result<Self, RiftError> {
         validate_origin(package, origin)?;
         validate_package_identity(package)?;
         let files_bound = limits.files_max.min(PACKAGE_UNITS_MAX);
         let observed_files = u32::try_from(files.len()).unwrap_or(u32::MAX);
         if observed_files > files_bound {
-            return Err(PackageInputFault::new(PackageInputViolation::TooManyFiles)
-                .breached(
-                    "package_files_max",
-                    u64::from(files_bound),
-                    u64::from(observed_files),
-                )
-                .into());
+            return errors::analysis::package_input_too_many_files()
+                .field("package_files_max")
+                .bound(u64::from(files_bound))
+                .observed(u64::from(observed_files))
+                .fail();
         }
         let mut paths = BTreeSet::new();
         let mut bytes = 0_u64;
         for file in files {
             if !paths.insert(file.path) {
-                return Err(PackageInputFault::new(PackageInputViolation::DuplicatePath)
-                    .at(file.path)
-                    .into());
+                return errors::analysis::package_input_duplicate_path()
+                    .path(file.path.as_str())
+                    .fail();
             }
             SourceUnitId::for_package(package, file.path).map_err(|error| {
-                PackageInputFault::new(PackageInputViolation::InvalidIdentity)
-                    .at(file.path)
-                    .caused_by(error)
+                errors::analysis::package_input_identity_invalid()
+                    .path(file.path.as_str())
+                    .cause(error)
+                    .error()
             })?;
             let file_bytes = u64::try_from(file.text.len()).unwrap_or(u64::MAX);
             bytes = bytes.checked_add(file_bytes).ok_or_else(|| {
-                PackageInputFault::new(PackageInputViolation::TooManyBytes).breached(
-                    "package_bytes_max",
-                    limits.bytes_max,
-                    u64::MAX,
-                )
+                errors::analysis::package_input_too_many_bytes()
+                    .field("package_bytes_max")
+                    .bound(limits.bytes_max)
+                    .observed(u64::MAX)
+                    .error()
             })?;
             if bytes > limits.bytes_max {
-                return Err(PackageInputFault::new(PackageInputViolation::TooManyBytes)
-                    .breached("package_bytes_max", limits.bytes_max, bytes)
-                    .into());
+                return errors::analysis::package_input_too_many_bytes()
+                    .field("package_bytes_max")
+                    .bound(limits.bytes_max)
+                    .observed(bytes)
+                    .fail();
             }
         }
         Ok(Self {
@@ -200,128 +198,22 @@ impl<'input> ExactPackageInput<'input> {
     }
 }
 
-/// Package input violation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackageInputViolation {
-    /// Package manager, name, or version cannot form a package source unit.
-    InvalidIdentity,
-    /// Origin does not identify this dependency or standard-library package.
-    InvalidOrigin,
-    /// Source path appears more than once.
-    DuplicatePath,
-    /// Source count exceeds input or publication bound.
-    TooManyFiles,
-    /// Aggregate source bytes exceed input bound.
-    TooManyBytes,
-}
-
-/// Package input failure with path or bound evidence.
-#[derive(Debug)]
-pub struct PackageInputFault {
-    violation: PackageInputViolation,
-    path: Option<String>,
-    breach: Option<(&'static str, u64, u64)>,
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl PackageInputFault {
-    fn new(violation: PackageInputViolation) -> Self {
-        Self {
-            violation,
-            path: None,
-            breach: None,
-            source: None,
-        }
-    }
-
-    fn caused_by(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
-        self.source = Some(Box::new(source));
-        self
-    }
-
-    fn at(mut self, path: &ProjectPath) -> Self {
-        self.path = Some(path.as_str().to_owned());
-        self
-    }
-
-    fn breached(mut self, field: &'static str, bound: u64, observed: u64) -> Self {
-        self.breach = Some((field, bound, observed));
-        self
-    }
-
-    /// Package input violation.
-    #[must_use]
-    pub const fn violation(&self) -> PackageInputViolation {
-        self.violation
-    }
-
-    /// Package-relative path, when one caused the failure.
-    #[must_use]
-    pub fn path(&self) -> Option<&str> {
-        self.path.as_deref()
-    }
-}
-
-impl Fault for PackageInputFault {
-    fn name(&self) -> ErrorName {
-        let code = match self.violation {
-            PackageInputViolation::TooManyFiles | PackageInputViolation::TooManyBytes => {
-                ErrorCode::LimitExceeded
-            }
-            PackageInputViolation::InvalidIdentity
-            | PackageInputViolation::InvalidOrigin
-            | PackageInputViolation::DuplicatePath => ErrorCode::InvalidRequest,
-        };
-        ErrorName::Wire(code)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("violation", fault_label(&self.violation))];
-        if let Some(path) = &self.path {
-            context.push(ErrorContext::new("path", path.clone()));
-        }
-        if let Some((field, bound, observed)) = self.breach {
-            context.push(ErrorContext::new("bound", format!("{field}={bound}")));
-            context.push(ErrorContext::new("observed", observed.to_string()));
-        }
-        context
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn std::error::Error + 'static))
-    }
-
-    fn limit_evidence(&self) -> Option<LimitEvidence> {
-        self.breach.map(|(field, limit, required)| LimitEvidence {
-            field: field.to_owned(),
-            limit,
-            required,
-        })
-    }
-}
-
-/// Opaque package input failure.
-pub type PackageInputError = Error<PackageInputFault>;
-
-fn validate_package_identity(package: &PackageIdentity) -> Result<(), PackageInputError> {
+fn validate_package_identity(package: &PackageIdentity) -> Result<(), RiftError> {
     let path = ProjectPath::new("package")
-        .map_err(|_| PackageInputFault::new(PackageInputViolation::InvalidIdentity))?;
+        .map_err(|_| errors::analysis::package_input_identity_invalid().error())?;
     SourceUnitId::for_package(package, &path)
         .map(|_| ())
-        .map_err(|error| {
-            PackageInputFault::new(PackageInputViolation::InvalidIdentity)
-                .caused_by(error)
-                .into()
+        .map_err(|source| {
+            errors::analysis::package_input_identity_invalid()
+                .cause(source)
+                .error()
         })
 }
 
 fn validate_origin(
     package: &PackageIdentity,
     origin: &ContributionOrigin,
-) -> Result<(), PackageInputError> {
+) -> Result<(), RiftError> {
     let location_matches = match origin.location() {
         Some(SourceLocation::Dependency { package: owner }) => owner == package,
         Some(SourceLocation::Stdlib {}) => true,
@@ -330,15 +222,15 @@ fn validate_origin(
     if location_matches && origin.source_kind() == SourceKind::Authored {
         return Ok(());
     }
-    Err(PackageInputFault::new(PackageInputViolation::InvalidOrigin).into())
+    errors::analysis::package_input_origin_invalid().fail()
 }
 
 #[cfg(test)]
 mod tests {
-    use rift_core::{ContributionOrigin, Fault, ProjectPath, SourceKind, SourceLocation};
+    use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
     use rift_protocol::read::{Language, PackageIdentity};
 
-    use super::{ExactPackageInput, ExactPackageLimits, PackageInputViolation, PackageSource};
+    use super::{ExactPackageInput, ExactPackageLimits, PackageSource};
 
     fn identity() -> PackageIdentity {
         PackageIdentity {
@@ -380,14 +272,12 @@ mod tests {
         .expect_err("source count exceeds bound");
 
         assert_eq!(
-            error.fault().violation(),
-            PackageInputViolation::TooManyFiles
+            error.slug().as_str(),
+            "rift.analysis.package_input_too_many_files"
         );
-        assert_eq!(error.fault().limit_evidence().expect("bound").limit, 0);
-        assert_eq!(
-            error.fault().limit_evidence().expect("observed").required,
-            1
-        );
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("bound", "0".to_owned())));
+        assert!(context.contains(&("observed", "1".to_owned())));
     }
 
     #[test]
@@ -408,14 +298,12 @@ mod tests {
         .expect_err("source bytes exceed bound");
 
         assert_eq!(
-            error.fault().violation(),
-            PackageInputViolation::TooManyBytes
+            error.slug().as_str(),
+            "rift.analysis.package_input_too_many_bytes"
         );
-        assert_eq!(error.fault().limit_evidence().expect("bound").limit, 4);
-        assert_eq!(
-            error.fault().limit_evidence().expect("observed").required,
-            12
-        );
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("bound", "4".to_owned())));
+        assert!(context.contains(&("observed", "12".to_owned())));
     }
 
     #[test]
@@ -439,10 +327,14 @@ mod tests {
         .expect_err("duplicate path");
 
         assert_eq!(
-            error.fault().violation(),
-            PackageInputViolation::DuplicatePath
+            error.slug().as_str(),
+            "rift.analysis.package_input_duplicate_path"
         );
-        assert_eq!(error.fault().path(), Some("src/lib.rs"));
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/lib.rs")
+        );
     }
 
     #[test]
@@ -469,8 +361,8 @@ mod tests {
         .expect_err("package input requires authored dependency origin");
 
         assert_eq!(
-            error.fault().violation(),
-            PackageInputViolation::InvalidOrigin
+            error.slug().as_str(),
+            "rift.analysis.package_input_origin_invalid"
         );
     }
 
@@ -495,8 +387,8 @@ mod tests {
         )
         .expect_err("package input refuses project origin");
         assert_eq!(
-            error.fault().violation(),
-            PackageInputViolation::InvalidOrigin
+            error.slug().as_str(),
+            "rift.analysis.package_input_origin_invalid"
         );
 
         let long_package = PackageIdentity {
@@ -516,8 +408,8 @@ mod tests {
         )
         .expect_err("combined package and path exceed source path bound");
         assert_eq!(
-            error.fault().violation(),
-            PackageInputViolation::InvalidIdentity
+            error.slug().as_str(),
+            "rift.analysis.package_input_identity_invalid"
         );
     }
 }

@@ -5,8 +5,7 @@
 //! bytes of JSON. The codec here turns fed bytes into complete JSON payloads
 //! and wraps outgoing payloads in the header, without performing any I/O.
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, fault_label};
-use serde::Serialize;
+use rift_error::{RiftError, errors};
 
 /// Maximum bytes in one message's header block, terminator included.
 pub const HEADER_BYTES_MAX: usize = 4 << 10;
@@ -25,70 +24,6 @@ const HEADER_LINE_ENDING: &str = "\r\n";
 
 /// The separator between a header name and its value.
 const HEADER_SEPARATOR: char = ':';
-
-/// How one byte stream broke the base protocol.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FramingFault {
-    /// The header block ran past [`HEADER_BYTES_MAX`] without its blank line.
-    HeaderTooLong,
-    /// The header block is not ASCII `Name: value` lines.
-    HeaderMalformed,
-    /// The header block carries no `Content-Length`.
-    ContentLengthMissing,
-    /// The `Content-Length` value is not a decimal byte count.
-    ContentLengthInvalid {
-        /// The value as received.
-        value: String,
-    },
-    /// The announced body size crosses [`MESSAGE_BYTES_MAX`].
-    MessageTooLong {
-        /// The body size the header announced.
-        announced_bytes: usize,
-    },
-}
-
-impl Fault for FramingFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::HeaderTooLong | Self::MessageTooLong { .. } => {
-                ErrorName::Wire(ErrorCode::LimitExceeded)
-            }
-            _ => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("fault", fault_label(self))];
-        match self {
-            Self::ContentLengthInvalid { value } => {
-                context.push(ErrorContext::new("value", value.clone()));
-            }
-            Self::MessageTooLong { announced_bytes } => {
-                context.push(ErrorContext::new(
-                    "announced_bytes",
-                    announced_bytes.to_string(),
-                ));
-            }
-            _ => {}
-        }
-        context
-    }
-
-    fn limit_evidence(&self) -> Option<LimitEvidence> {
-        match self {
-            Self::MessageTooLong { announced_bytes } => Some(LimitEvidence {
-                field: "framing.message_bytes_max".to_owned(),
-                limit: u64::try_from(MESSAGE_BYTES_MAX).unwrap_or(u64::MAX),
-                required: u64::try_from(*announced_bytes).unwrap_or(u64::MAX),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// A byte stream that broke the base protocol.
-pub type FramingError = Error<FramingFault>;
 
 /// Incremental decoder and encoder for base-protocol frames.
 ///
@@ -134,9 +69,9 @@ impl Framing {
     ///
     /// # Errors
     ///
-    /// Returns [`FramingError`] when the stream breaks the base protocol;
+    /// Returns [`RiftError`] when the stream breaks the base protocol;
     /// the codec is then unusable and the engine must be ended.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, FramingError> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, RiftError> {
         self.buffer.extend_from_slice(bytes);
         let mut messages = Vec::new();
         while let Some(message) = self.next_complete()? {
@@ -146,22 +81,25 @@ impl Framing {
     }
 
     /// Extracts the next complete frame from the buffer, if one is there.
-    fn next_complete(&mut self) -> Result<Option<Vec<u8>>, FramingError> {
+    fn next_complete(&mut self) -> Result<Option<Vec<u8>>, RiftError> {
         let Some(terminator) = find(&self.buffer, HEADER_TERMINATOR) else {
             if self.buffer.len() > HEADER_BYTES_MAX {
-                return Err(Error::new(FramingFault::HeaderTooLong));
+                return errors::lsp::framing_header_too_long().fail();
             }
             return Ok(None);
         };
         let header_end = terminator + HEADER_TERMINATOR.len();
         if header_end > HEADER_BYTES_MAX {
-            return Err(Error::new(FramingFault::HeaderTooLong));
+            return errors::lsp::framing_header_too_long().fail();
         }
         let body_bytes = content_length(&self.buffer[..terminator])?;
         if body_bytes > MESSAGE_BYTES_MAX {
-            return Err(Error::new(FramingFault::MessageTooLong {
-                announced_bytes: body_bytes,
-            }));
+            return errors::lsp::framing_message_too_long()
+                .announced_bytes(body_bytes)
+                .field("framing.message_bytes_max")
+                .limit(MESSAGE_BYTES_MAX)
+                .required(body_bytes)
+                .fail();
         }
         if self.buffer.len() < header_end + body_bytes {
             return Ok(None);
@@ -173,23 +111,23 @@ impl Framing {
 }
 
 /// The announced body size from one header block.
-fn content_length(header: &[u8]) -> Result<usize, FramingError> {
+fn content_length(header: &[u8]) -> Result<usize, RiftError> {
     let header =
-        std::str::from_utf8(header).map_err(|_| Error::new(FramingFault::HeaderMalformed))?;
+        std::str::from_utf8(header).map_err(|_| errors::lsp::framing_header_malformed().error())?;
     for line in header.split(HEADER_LINE_ENDING) {
         let Some((name, value)) = line.split_once(HEADER_SEPARATOR) else {
-            return Err(Error::new(FramingFault::HeaderMalformed));
+            return errors::lsp::framing_header_malformed().fail();
         };
         if name.trim().eq_ignore_ascii_case(CONTENT_LENGTH_HEADER) {
             let value = value.trim();
             return value.parse().map_err(|_| {
-                Error::new(FramingFault::ContentLengthInvalid {
-                    value: value.to_owned(),
-                })
+                errors::lsp::framing_content_length_invalid()
+                    .value(value)
+                    .error()
             });
         }
     }
-    Err(Error::new(FramingFault::ContentLengthMissing))
+    errors::lsp::framing_content_length_missing().fail()
 }
 
 /// The first position of `needle` in `haystack`.
@@ -252,7 +190,7 @@ mod tests {
         let error = codec
             .feed(b"not a header\r\n\r\n")
             .expect_err("garbage must be refused");
-        assert_eq!(*error.fault(), FramingFault::HeaderMalformed);
+        assert_eq!(error.slug(), errors::lsp::framing_header_malformed::SLUG);
     }
 
     #[test]
@@ -260,16 +198,18 @@ mod tests {
         let missing = Framing::new()
             .feed(b"Content-Type: application/json\r\n\r\n")
             .expect_err("missing length must be refused");
-        assert_eq!(*missing.fault(), FramingFault::ContentLengthMissing);
+        assert_eq!(
+            missing.slug(),
+            errors::lsp::framing_content_length_missing::SLUG
+        );
         let invalid = Framing::new()
             .feed(b"Content-Length: many\r\n\r\n")
             .expect_err("non-decimal length must be refused");
         assert_eq!(
-            *invalid.fault(),
-            FramingFault::ContentLengthInvalid {
-                value: "many".to_owned()
-            }
+            invalid.slug(),
+            errors::lsp::framing_content_length_invalid::SLUG
         );
+        assert!(invalid.to_string().contains("Content-Length many"));
     }
 
     #[test]
@@ -277,13 +217,19 @@ mod tests {
         let unterminated = Framing::new()
             .feed(&vec![b'a'; HEADER_BYTES_MAX + 1])
             .expect_err("endless header must be refused");
-        assert_eq!(*unterminated.fault(), FramingFault::HeaderTooLong);
+        assert_eq!(
+            unterminated.slug(),
+            errors::lsp::framing_header_too_long::SLUG
+        );
         let mut oversized = format!("Content-Length: 2{}", "\r\nA: b".repeat(900)).into_bytes();
         oversized.extend_from_slice(b"\r\n\r\n{}");
         let terminated = Framing::new()
             .feed(&oversized)
             .expect_err("oversized header must be refused");
-        assert_eq!(*terminated.fault(), FramingFault::HeaderTooLong);
+        assert_eq!(
+            terminated.slug(),
+            errors::lsp::framing_header_too_long::SLUG
+        );
     }
 
     #[test]
@@ -292,14 +238,15 @@ mod tests {
         let error = Framing::new()
             .feed(format!("Content-Length: {announced}\r\n\r\n").as_bytes())
             .expect_err("oversized body must be refused");
+        assert_eq!(error.slug(), errors::lsp::framing_message_too_long::SLUG);
+        let evidence = error
+            .context()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(evidence.get("limit").map(String::as_str), Some("67108864"));
         assert_eq!(
-            *error.fault(),
-            FramingFault::MessageTooLong {
-                announced_bytes: announced
-            }
+            evidence.get("required").map(String::as_str),
+            Some("67108865")
         );
-        assert!(error.fault().limit_evidence().is_some());
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::LimitExceeded));
     }
 
     #[test]
@@ -307,29 +254,38 @@ mod tests {
         let error = Framing::new()
             .feed(b"Content-Length\xff: 2\r\n\r\n{}")
             .expect_err("non-ASCII header must be refused");
-        assert_eq!(*error.fault(), FramingFault::HeaderMalformed);
+        assert_eq!(error.slug(), errors::lsp::framing_header_malformed::SLUG);
     }
 
     #[test]
-    fn fault_rendering_names_the_evidence_for_every_variant() {
-        let malformed = Error::new(FramingFault::HeaderMalformed);
+    fn framing_errors_keep_their_identity_and_context() {
+        let malformed = errors::lsp::framing_header_malformed().error();
         assert_eq!(
-            malformed.name(),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+            malformed.slug(),
+            errors::lsp::framing_header_malformed::SLUG
         );
-        assert!(malformed.fault().limit_evidence().is_none());
-        assert!(malformed.to_string().contains("header_malformed"));
-        let missing = Error::new(FramingFault::ContentLengthMissing);
-        assert!(missing.to_string().contains("content_length_missing"));
-        let invalid = Error::new(FramingFault::ContentLengthInvalid {
-            value: "many".to_owned(),
-        });
-        assert!(invalid.to_string().contains("value many"));
-        let announced = Error::new(FramingFault::MessageTooLong { announced_bytes: 7 });
-        assert!(announced.to_string().contains("announced_bytes 7"));
-        let overlong = Error::new(FramingFault::HeaderTooLong);
-        assert_eq!(overlong.name(), ErrorName::Wire(ErrorCode::LimitExceeded));
-        assert!(overlong.fault().limit_evidence().is_none());
+        let missing = errors::lsp::framing_content_length_missing().error();
+        assert_eq!(
+            missing.slug(),
+            errors::lsp::framing_content_length_missing::SLUG
+        );
+        let invalid = errors::lsp::framing_content_length_invalid()
+            .value("many")
+            .error();
+        assert!(
+            invalid
+                .context()
+                .any(|(key, value)| key == "value" && value == "many")
+        );
+        let announced = errors::lsp::framing_message_too_long()
+            .announced_bytes(7_u64)
+            .field("framing.message_bytes_max")
+            .limit(MESSAGE_BYTES_MAX)
+            .required(7_u64)
+            .error();
+        assert!(announced.to_string().contains("body of 7 bytes"));
+        let overlong = errors::lsp::framing_header_too_long().error();
+        assert_eq!(overlong.slug(), errors::lsp::framing_header_too_long::SLUG);
     }
 
     #[test]

@@ -20,8 +20,9 @@ use rift_core::{PackageIdentity, ProjectPath, SymbolId as CoreSymbolId};
 use rift_dependency::{
     DependencyContext, InstallFolder, InstallLocation, STANDARD_LIBRARY_MANAGER, StandardLibrary,
 };
+use rift_error::{RiftError, errors};
 use rift_lsp::capabilities::PositionEncoding;
-use rift_lsp::uri::{EngineAddress, EngineRoots, PackageRoot, TreeRoot, UriError, UriFault};
+use rift_lsp::uri::{EngineAddress, EngineRoots, PackageRoot, TreeRoot};
 use rift_protocol::read::{
     ExactKind, Language, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
     SymbolOrigin,
@@ -120,20 +121,20 @@ impl CalleeRoots {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] for a URI or root the rules refuse other than one falling
+    /// Returns [`RiftError`] for a URI or root the rules refuse other than one falling
     /// outside every root.
     pub(crate) fn address(
         &self,
         trees: &[&Path],
         uri: &Uri,
-    ) -> Result<Option<EngineAddress>, UriError> {
+    ) -> Result<Option<EngineAddress>, RiftError> {
         for tree in trees {
             let roots =
                 EngineRoots::new(TreeRoot::new(tree)?).with_packages(Arc::clone(&self.packages));
             match roots.address(uri) {
                 Ok(address) => return Ok(Some(address)),
-                Err(error) if matches!(error.fault(), UriFault::OutsideRoot) => {}
-                Err(error) => return Err(error),
+                Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => {}
+                Err(error) => return error.fail(),
             }
         }
         Ok(None)
@@ -466,14 +467,14 @@ pub(crate) enum CalleeFile {
 ///
 /// # Errors
 ///
-/// Returns [`UriError`] for a `file` URI the rules refuse other than one outside every
+/// Returns [`RiftError`] for a `file` URI the rules refuse other than one outside every
 /// root.
 pub(crate) fn callee_file(
     roots: &CalleeRoots,
     trees: &[&Path],
     caller: &CoreSymbolId,
     call: NamedCallee<'_>,
-) -> Result<CalleeFile, UriError> {
+) -> Result<CalleeFile, RiftError> {
     let held = |package: CalleePackage, path: ProjectPath| {
         CalleeFile::Package(PackageCallee {
             caller: caller.clone(),

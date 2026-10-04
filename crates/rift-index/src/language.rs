@@ -4,10 +4,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rift_core::{LanguageFileSelection, LanguageFileSelections, TextFileInclusion};
+use rift_error::{RiftError, errors};
 use rift_syntax::{SyntaxProvider, registry};
 
-use crate::workspace::IndexFailure;
-use crate::workspace::{WorkspaceIndexError, WorkspaceIndexViolation, index_error_caused_by};
 use rift_analysis::PathMatcher;
 
 /// One accepted language entry with expanded path patterns.
@@ -87,13 +86,13 @@ impl WorkspaceLanguagePolicy {
     ///
     /// # Errors
     ///
-    /// Returns `WorkspaceIndexError` for invalid patterns or an unshipped
+    /// Returns `RiftError` for invalid patterns or an unshipped
     /// language without a nonempty include list.
     pub fn build(
         root: &Path,
         selections: &LanguageFileSelections,
         text: &TextFileInclusion,
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, RiftError> {
         let mut languages = Vec::new();
         let mut shipped = BTreeSet::new();
         for (definition, provider) in registry::shipped_languages() {
@@ -136,13 +135,9 @@ impl WorkspaceLanguagePolicy {
                 .include()
                 .filter(|include| !include.is_empty())
                 .ok_or_else(|| {
-                    index_error_caused_by(
-                        WorkspaceIndexViolation::LanguageIncludeRequired,
-                        None,
-                        LanguagePolicyError::IncludeRequired {
-                            language: selection.identity().to_owned(),
-                        },
-                    )
+                    errors::index::workspace_language_include_required()
+                        .language(selection.identity())
+                        .error()
                 })?
                 .to_vec();
             languages.push(Self::entry(
@@ -157,8 +152,7 @@ impl WorkspaceLanguagePolicy {
         let text_inclusion = text;
         let text = (!text.include().is_empty())
             .then(|| PathMatcher::build(root, text.include(), &[]))
-            .transpose()
-            .map_err(IndexFailure::index_error)?;
+            .transpose()?;
         Ok(Self {
             root: root.to_path_buf(),
             languages,
@@ -175,11 +169,10 @@ impl WorkspaceLanguagePolicy {
         (enabled, stdlib): (bool, bool),
         (include, exclude): (Vec<String>, Vec<String>),
         provider: Option<&'static dyn SyntaxProvider>,
-    ) -> Result<EffectiveLanguage, WorkspaceIndexError> {
+    ) -> Result<EffectiveLanguage, RiftError> {
         let matcher = (!include.is_empty())
             .then(|| PathMatcher::build(root, &include, &exclude))
-            .transpose()
-            .map_err(IndexFailure::index_error)?;
+            .transpose()?;
         Ok(EffectiveLanguage {
             identity,
             enabled,
@@ -201,11 +194,8 @@ impl WorkspaceLanguagePolicy {
     ///
     /// # Errors
     ///
-    /// Returns `WorkspaceIndexError` when two language entries match.
-    pub fn language_for_path(
-        &self,
-        path: &Path,
-    ) -> Result<Option<&EffectiveLanguage>, WorkspaceIndexError> {
+    /// Returns `RiftError` when two language entries match.
+    pub fn language_for_path(&self, path: &Path) -> Result<Option<&EffectiveLanguage>, RiftError> {
         let path = self.absolute(path);
         let mut matched = self
             .languages
@@ -213,14 +203,10 @@ impl WorkspaceLanguagePolicy {
             .filter(|language| language.matches(&path));
         let first = matched.next();
         if let (Some(first), Some(second)) = (first, matched.next()) {
-            return Err(index_error_caused_by(
-                WorkspaceIndexViolation::LanguageMatchConflict,
-                Some(&path),
-                LanguagePolicyError::MatchConflict {
-                    first: first.identity.clone(),
-                    second: second.identity.clone(),
-                },
-            ));
+            return errors::index::workspace_language_match_conflict()
+                .path(&path)
+                .language(format!("{}, {}", first.identity, second.identity))
+                .fail();
         }
         Ok(first)
     }
@@ -230,11 +216,11 @@ impl WorkspaceLanguagePolicy {
     ///
     /// # Errors
     ///
-    /// Returns `WorkspaceIndexError` when two language entries match `path`.
+    /// Returns `RiftError` when two language entries match `path`.
     pub fn syntax_provider_for(
         &self,
         path: &Path,
-    ) -> Result<Option<&'static dyn SyntaxProvider>, WorkspaceIndexError> {
+    ) -> Result<Option<&'static dyn SyntaxProvider>, RiftError> {
         Ok(self
             .language_for_path(path)?
             .filter(|language| language.enabled)
@@ -250,11 +236,8 @@ impl WorkspaceLanguagePolicy {
     ///
     /// # Errors
     ///
-    /// Returns `WorkspaceIndexError` when two language entries match `path`.
-    pub(crate) fn classifies(
-        &self,
-        path: &Path,
-    ) -> Result<Option<ClassifiedPath>, WorkspaceIndexError> {
+    /// Returns `RiftError` when two language entries match `path`.
+    pub(crate) fn classifies(&self, path: &Path) -> Result<Option<ClassifiedPath>, RiftError> {
         let path = self.absolute(path);
         if let Some(provider) = self.syntax_provider_for(&path)? {
             return Ok(Some(ClassifiedPath::Source(provider)));
@@ -307,40 +290,6 @@ pub(crate) enum ClassifiedPath {
     Source(&'static dyn SyntaxProvider),
     Text,
 }
-
-#[derive(Debug)]
-pub(crate) enum LanguagePolicyError {
-    IncludeRequired { language: String },
-    MatchConflict { first: String, second: String },
-}
-
-impl LanguagePolicyError {
-    pub(crate) fn evidence(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::IncludeRequired { language } => vec![("language", language.clone())],
-            Self::MatchConflict { first, second } => {
-                vec![("first", first.clone()), ("second", second.clone())]
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for LanguagePolicyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::IncludeRequired { language } => write!(
-                formatter,
-                "unshipped language {language:?} requires a nonempty include list"
-            ),
-            Self::MatchConflict { first, second } => write!(
-                formatter,
-                "one path matches language entries {first:?} and {second:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for LanguagePolicyError {}
 
 #[cfg(test)]
 mod tests {
@@ -416,8 +365,8 @@ mod tests {
         )
         .expect_err("missing include");
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::LanguageIncludeRequired
+            error.slug(),
+            errors::index::workspace_language_include_required::SLUG
         );
     }
 
@@ -437,8 +386,8 @@ mod tests {
         )
         .expect_err("a misspelled shipped name carries no shipped patterns");
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::LanguageIncludeRequired
+            error.slug(),
+            errors::index::workspace_language_include_required::SLUG
         );
         assert!(
             error.to_string().contains("rustt"),
@@ -496,8 +445,8 @@ mod tests {
             .language_for_path(Path::new("src/lib.rs"))
             .expect_err("conflict");
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::LanguageMatchConflict
+            error.slug(),
+            errors::index::workspace_language_match_conflict::SLUG
         );
         let message = error.to_string();
         assert!(message.contains("rust") && message.contains("python"));
@@ -523,33 +472,11 @@ mod tests {
             )
             .expect_err("an unclosed character class must refuse");
             assert_eq!(
-                error.fault().violation(),
-                WorkspaceIndexViolation::SourcePatternInvalid,
+                error.slug(),
+                errors::analysis::source_pattern_invalid::SLUG,
                 "the {identity} entry names the pattern rule it broke"
             );
         }
-    }
-
-    /// Both refusals name the exact keys an operator has to reconcile: the
-    /// language whose entry carries no patterns, and the two entries one path
-    /// matched.
-    #[test]
-    fn test_language_policy_error_display_names_the_keys_to_reconcile() {
-        let include_required = LanguagePolicyError::IncludeRequired {
-            language: "python".to_owned(),
-        };
-        assert_eq!(
-            include_required.to_string(),
-            "unshipped language \"python\" requires a nonempty include list"
-        );
-        let conflict = LanguagePolicyError::MatchConflict {
-            first: "rust".to_owned(),
-            second: "python".to_owned(),
-        };
-        assert_eq!(
-            conflict.to_string(),
-            "one path matches language entries \"rust\" and \"python\""
-        );
     }
 
     /// A `rift://workspace` page reports one entry per shipped provider plus

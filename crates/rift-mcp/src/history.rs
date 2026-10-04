@@ -16,11 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
-use rift_core::{ErrorCode, ErrorName};
+use rift_error::errors;
 use rift_history_store::{HistoryStore, StoreFiller, StoreLocation};
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_server::{
-    AnalyzedCommit, FillPlan, FillProgress, HistoryAnalysis, PendingCommit, ReadError,
+    AnalyzedCommit, FillPlan, FillProgress, HistoryAnalysis, PendingCommit, RiftError,
     StoredHistory,
 };
 use sha2::{Digest as _, Sha256};
@@ -237,8 +237,8 @@ fn observed_plan(store: &HistoryStore, analysis: &HistoryAnalysis) -> Result<Fil
 /// Logs why the history lane did not start. A capability the workspace lacks -
 /// no git repository versions it - is the ordinary case for a folder outside
 /// git, and logs at debug level.
-fn open_failed(operation: &'static str, error: &ReadError) {
-    let unversioned = error.name() == ErrorName::Wire(ErrorCode::CapabilityUnavailable);
+fn open_failed(operation: &'static str, error: &RiftError) {
+    let unversioned = error.slug() == errors::history::unversioned::SLUG;
     if unversioned {
         tracing::debug!(
             component = "history",

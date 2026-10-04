@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use crate::ByteRange;
 use crate::extract::{self, Visited};
-use crate::failure::SyntaxError;
+use crate::failure::RiftError;
 use rift_protocol::read::{Documentation, DocumentationFormat};
 use tree_sitter::Node;
 
@@ -187,7 +187,7 @@ fn is_doc_comment(node: Node<'_>) -> bool {
 pub(super) fn attached_documentation(
     visited: Visited<'_, '_>,
     text: &str,
-) -> Result<(Vec<Documentation>, Vec<ByteRange>), SyntaxError> {
+) -> Result<(Vec<Documentation>, Vec<ByteRange>), RiftError> {
     let mut comments: Vec<&str> = Vec::new();
     let mut ranges = Vec::new();
     for (sibling, sibling_text) in attached_run(visited, text).into_iter().rev() {

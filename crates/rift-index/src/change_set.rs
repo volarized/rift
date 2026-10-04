@@ -364,9 +364,17 @@ mod tests {
     #[test]
     fn test_resolve_tells_a_left_out_file_on_disk_from_one_gone() -> TestResult {
         let too_large = |name: &str| -> TestResult<FileRecord> {
-            Ok(FileRecord::LeftOut(WorkspaceIndexWarning::FileTooLarge(
-                path(name)?,
-            )))
+            let project_path = path(name)?;
+            let error = rift_error::errors::index::workspace_file_too_large()
+                .path(std::path::Path::new(project_path.as_str()))
+                .field("source.file_bytes")
+                .observed(64_usize)
+                .maximum(32_usize)
+                .error();
+            Ok(FileRecord::LeftOut(WorkspaceIndexWarning::FileTooLarge {
+                path: project_path,
+                error: std::sync::Arc::new(error),
+            }))
         };
         let binary = |name: &str| -> TestResult<FileRecord> {
             Ok(FileRecord::LeftOut(WorkspaceIndexWarning::BinarySource(

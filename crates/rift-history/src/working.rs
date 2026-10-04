@@ -12,11 +12,12 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 
 use gix::bstr::ByteSlice as _;
+use rift_error::RiftError;
+use rift_error::errors;
 use sha2::{Digest as _, Sha256};
 
 use crate::repository::{
-    ChangedFiles, HistoryError, Repository, ResolvedRevision, TreeFile, storage,
-    strip_workspace_prefix,
+    ChangedFiles, Repository, ResolvedRevision, TreeFile, strip_workspace_prefix,
 };
 
 /// The `filter` attribute value git-lfs registers.
@@ -83,7 +84,7 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for an unreadable object store, index, or
+    /// Returns [`RiftError`] for an unreadable object store, index, or
     /// attribute file.
     pub fn changed_working_files(
         &self,
@@ -91,13 +92,16 @@ impl Repository {
         published: &[&str],
         includes: &dyn Fn(&str) -> bool,
         paths_max: usize,
-    ) -> Result<ChangedFiles, HistoryError> {
+    ) -> Result<ChangedFiles, RiftError> {
         let repository = self.driver_free()?;
         let base_tree = self.commit_tree(base)?;
         let mut reported = self.status_paths(&repository, &base_tree, includes)?;
-        let index = repository
-            .index_or_empty()
-            .map_err(|error| storage("read index", &error))?;
+        let index = repository.index_or_empty().map_err(|error| {
+            errors::history::storage()
+                .operation("read index")
+                .detail(&error)
+                .error()
+        })?;
         for path in published {
             let tracked = index
                 .entry_by_path(repository_path(&self.prefix, path).as_bytes().as_bstr())
@@ -129,20 +133,35 @@ impl Repository {
         repository: &gix::Repository,
         base_tree: &gix::Tree<'_>,
         includes: &dyn Fn(&str) -> bool,
-    ) -> Result<BTreeMap<String, ReportedBy>, HistoryError> {
+    ) -> Result<BTreeMap<String, ReportedBy>, RiftError> {
         let items = repository
             .status(gix::progress::Discard)
-            .map_err(|error| storage("start status", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("start status")
+                    .detail(&error)
+                    .error()
+            })?
             .untracked_files(gix::status::UntrackedFiles::None)
             .index_worktree_submodules(None)
             .index_worktree_rewrites(None)
             .head_tree(base_tree.id)
             .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
             .into_iter(Vec::<gix::bstr::BString>::new())
-            .map_err(|error| storage("start status", &error))?;
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("start status")
+                    .detail(&error)
+                    .error()
+            })?;
         let mut reported: BTreeMap<String, ReportedBy> = BTreeMap::new();
         for item in items {
-            let item = item.map_err(|error| storage("compare working tree", &error))?;
+            let item = item.map_err(|error| {
+                errors::history::storage()
+                    .operation("compare working tree")
+                    .detail(&error)
+                    .error()
+            })?;
             let Some(path) = strip_workspace_prefix(item.location(), self.prefix.as_bytes())
                 .and_then(|relative| std::str::from_utf8(relative).ok())
                 .filter(|relative| includes(relative))
@@ -164,12 +183,15 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for an unreadable index or attribute file.
-    pub fn working_forms(&self) -> Result<WorkingForms<'_>, HistoryError> {
+    /// Returns [`RiftError`] for an unreadable index or attribute file.
+    pub fn working_forms(&self) -> Result<WorkingForms<'_>, RiftError> {
         let repository = self.driver_free()?;
-        let (pipeline, _index) = repository
-            .filter_pipeline(None)
-            .map_err(|error| storage("build filter pipeline", &error))?;
+        let (pipeline, _index) = repository.filter_pipeline(None).map_err(|error| {
+            errors::history::storage()
+                .operation("build filter pipeline")
+                .detail(&error)
+                .error()
+        })?;
         let (mut pipeline, attributes) = pipeline.into_parts();
         pipeline.options_mut().drivers.clear();
         let selected = attributes
@@ -185,7 +207,7 @@ impl Repository {
 
     /// A copy of this repository whose configuration holds no `filter`
     /// section, so no pipeline built from it knows an external driver.
-    fn driver_free(&self) -> Result<gix::Repository, HistoryError> {
+    fn driver_free(&self) -> Result<gix::Repository, RiftError> {
         let mut repository = self.inner.clone();
         let mut snapshot = repository.config_snapshot_mut();
         let names: Vec<Option<gix::bstr::BString>> = snapshot
@@ -202,9 +224,12 @@ impl Repository {
                 .is_some()
             {}
         }
-        snapshot
-            .commit()
-            .map_err(|error| storage("drop filter configuration", &error))?;
+        snapshot.commit().map_err(|error| {
+            errors::history::storage()
+                .operation("drop filter configuration")
+                .detail(&error)
+                .error()
+        })?;
         Ok(repository)
     }
 }
@@ -249,14 +274,19 @@ impl WorkingForms<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for a blob past `bytes_max`, an unreadable
+    /// Returns [`RiftError`] for a blob past `bytes_max`, an unreadable
     /// object store or attribute file, or a conversion that fails.
-    pub fn form(&mut self, file: &TreeFile, bytes_max: usize) -> Result<WorkingForm, HistoryError> {
+    pub fn form(&mut self, file: &TreeFile, bytes_max: usize) -> Result<WorkingForm, RiftError> {
         let repository_path = repository_path(&self.source.prefix, &file.path);
         let platform = self
             .attributes
             .at_entry(repository_path.as_str(), None, &self.repository.objects)
-            .map_err(|error| storage("read attributes", &error))?;
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read attributes")
+                    .detail(&error)
+                    .error()
+            })?;
         self.selected.reset();
         platform.matching_attributes(&mut self.selected);
         if let Some(driver) = attribute_value(&self.selected, FILTER_ATTRIBUTE) {
@@ -282,10 +312,18 @@ impl WorkingForms<'_> {
                 },
                 gix::filter::plumbing::pipeline::convert::to_worktree::Options::default(),
             )
-            .map_err(|error| storage("convert to working form", &error))?;
-        let converted = converted
-            .as_bytes()
-            .ok_or_else(|| storage("convert to working form", &"a driver answered"))?;
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("convert to working form")
+                    .detail(error)
+                    .error()
+            })?;
+        let converted = converted.as_bytes().ok_or_else(|| {
+            errors::history::storage()
+                .operation("convert to working form")
+                .detail("a driver answered")
+                .error()
+        })?;
         Ok(WorkingForm::Converted(converted.to_vec()))
     }
 }
@@ -308,20 +346,33 @@ impl<'repo> BaseChecks<'repo> {
         repository: &'repo gix::Repository,
         base_tree: &'repo gix::Tree<'repo>,
         prefix: &'repo str,
-    ) -> Result<Self, HistoryError> {
-        let (pipeline, index) = repository
-            .filter_pipeline(None)
-            .map_err(|error| storage("build filter pipeline", &error))?;
+    ) -> Result<Self, RiftError> {
+        let (pipeline, index) = repository.filter_pipeline(None).map_err(|error| {
+            errors::history::storage()
+                .operation("build filter pipeline")
+                .detail(&error)
+                .error()
+        })?;
         let attributes = repository
             .attributes_only(
                 &index,
                 gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
             )
-            .map_err(|error| storage("read attributes", &error))?;
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read attributes")
+                    .detail(&error)
+                    .error()
+            })?;
         let filter = attributes.selected_attribute_matches([FILTER_ATTRIBUTE]);
         let workdir = repository
             .workdir()
-            .ok_or_else(|| storage("read working tree", &"the repository is bare"))?
+            .ok_or_else(|| {
+                errors::history::storage()
+                    .operation("read working tree")
+                    .detail("the repository is bare")
+                    .error()
+            })?
             .to_owned();
         Ok(Self {
             repository,
@@ -338,12 +389,17 @@ impl<'repo> BaseChecks<'repo> {
     /// Whether the working file at `path` holds the base blob's bytes once in
     /// committed form: the clean conversion for a plain path, the computed
     /// git-lfs pointer for an LFS path. Another driver's path never matches.
-    fn working_bytes_match_base(&mut self, path: &str) -> Result<bool, HistoryError> {
+    fn working_bytes_match_base(&mut self, path: &str) -> Result<bool, RiftError> {
         let repository_path = repository_path(self.prefix, path);
         let Some(base) = self
             .base_tree
             .lookup_entry_by_path(&repository_path)
-            .map_err(|error| storage("read base tree", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read base tree")
+                    .detail(&error)
+                    .error()
+            })?
             .filter(|entry| entry.mode().is_blob())
         else {
             return Ok(false);
@@ -354,7 +410,12 @@ impl<'repo> BaseChecks<'repo> {
         self.filter.reset();
         self.attributes
             .at_entry(repository_path.as_str(), None)
-            .map_err(|error| storage("read attributes", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read attributes")
+                    .detail(&error)
+                    .error()
+            })?
             .matching_attributes(&mut self.filter);
         match attribute_value(&self.filter, FILTER_ATTRIBUTE).as_deref() {
             Some(LFS_DRIVER) => self.lfs_file_matches_base(file, base.object_id()),
@@ -371,16 +432,26 @@ impl<'repo> BaseChecks<'repo> {
         file: std::fs::File,
         repository_path: &str,
         base: gix::ObjectId,
-    ) -> Result<bool, HistoryError> {
+    ) -> Result<bool, RiftError> {
         let base_size = self
             .repository
             .find_header(base)
-            .map_err(|error| storage("read blob header", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read blob header")
+                    .detail(&error)
+                    .error()
+            })?
             .size();
         let cleaned = self
             .pipeline
             .convert_to_git(file, std::path::Path::new(repository_path), &self.index)
-            .map_err(|error| storage("convert to committed form", &error))?;
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("convert to committed form")
+                    .detail(&error)
+                    .error()
+            })?;
         let working = blob_id_of_length(cleaned, base_size, base.kind())?;
         Ok(working == Some(base))
     }
@@ -393,21 +464,33 @@ impl<'repo> BaseChecks<'repo> {
         &self,
         mut file: std::fs::File,
         base: gix::ObjectId,
-    ) -> Result<bool, HistoryError> {
+    ) -> Result<bool, RiftError> {
         let size = file
             .metadata()
-            .map_err(|error| storage("read working file", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read working file")
+                    .detail(&error)
+                    .error()
+            })?
             .len();
         let base_size = self
             .repository
             .find_header(base)
-            .map_err(|error| storage("read blob header", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read blob header")
+                    .detail(&error)
+                    .error()
+            })?
             .size();
         if base_size <= LFS_POINTER_BYTES_MAX {
-            let pointer = self
-                .repository
-                .find_object(base)
-                .map_err(|error| storage("read blob", &error))?;
+            let pointer = self.repository.find_object(base).map_err(|error| {
+                errors::history::storage()
+                    .operation("read blob")
+                    .detail(&error)
+                    .error()
+            })?;
             if pointer.data.as_slice() == read_small(&mut file, size)?.as_slice() {
                 return Ok(true);
             }
@@ -417,29 +500,41 @@ impl<'repo> BaseChecks<'repo> {
         }
         rewind(&mut file)?;
         let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher)
-            .map_err(|error| storage("read working file", &error))?;
+        std::io::copy(&mut file, &mut hasher).map_err(|error| {
+            errors::history::storage()
+                .operation("read working file")
+                .detail(&error)
+                .error()
+        })?;
         Ok(pointer_id(&hasher.finalize(), size, base.kind())? == base)
     }
 }
 
 /// The bytes of a file no longer than [`LFS_POINTER_BYTES_MAX`]; empty for a
 /// longer one, which no pointer equals.
-fn read_small(file: &mut std::fs::File, size: u64) -> Result<Vec<u8>, HistoryError> {
+fn read_small(file: &mut std::fs::File, size: u64) -> Result<Vec<u8>, RiftError> {
     if size > LFS_POINTER_BYTES_MAX {
         return Ok(Vec::new());
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| storage("read working file", &error))?;
+    file.read_to_end(&mut bytes).map_err(|error| {
+        errors::history::storage()
+            .operation("read working file")
+            .detail(&error)
+            .error()
+    })?;
     Ok(bytes)
 }
 
 /// Moves `file`'s cursor back to its first byte.
-fn rewind(file: &mut std::fs::File) -> Result<(), HistoryError> {
+fn rewind(file: &mut std::fs::File) -> Result<(), RiftError> {
     use std::io::Seek as _;
-    file.rewind()
-        .map_err(|error| storage("read working file", &error))
+    file.rewind().map_err(|error| {
+        errors::history::storage()
+            .operation("read working file")
+            .detail(&error)
+            .error()
+    })
 }
 
 /// The blob id of the bytes `stream` yields, when it yields exactly
@@ -449,7 +544,7 @@ fn blob_id_of_length(
     stream: impl std::io::Read,
     length: u64,
     kind: gix::hash::Kind,
-) -> Result<Option<gix::ObjectId>, HistoryError> {
+) -> Result<Option<gix::ObjectId>, RiftError> {
     let mut hasher = gix::hash::hasher(kind);
     hasher.update(&gix::objs::encode::loose_header(
         gix::objs::Kind::Blob,
@@ -459,9 +554,12 @@ fn blob_id_of_length(
     let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
     let mut read_total = 0_u64;
     loop {
-        let read = bounded
-            .read(&mut chunk)
-            .map_err(|error| storage("read working file", &error))?;
+        let read = bounded.read(&mut chunk).map_err(|error| {
+            errors::history::storage()
+                .operation("read working file")
+                .detail(&error)
+                .error()
+        })?;
         if read == 0 {
             break;
         }
@@ -471,10 +569,12 @@ fn blob_id_of_length(
     if read_total != length {
         return Ok(None);
     }
-    hasher
-        .try_finalize()
-        .map(Some)
-        .map_err(|error| storage("hash working file", &error))
+    hasher.try_finalize().map(Some).map_err(|error| {
+        errors::history::storage()
+            .operation("hash working file")
+            .detail(&error)
+            .error()
+    })
 }
 
 /// The blob id of the git-lfs spec v1 pointer for content with the SHA-256
@@ -484,11 +584,15 @@ fn pointer_id(
     digest: &sha2::digest::Output<Sha256>,
     size: u64,
     kind: gix::hash::Kind,
-) -> Result<gix::ObjectId, HistoryError> {
+) -> Result<gix::ObjectId, RiftError> {
     let pointer =
         format!("version https://git-lfs.github.com/spec/v1\noid sha256:{digest:x}\nsize {size}\n");
-    gix::objs::compute_hash(kind, gix::objs::Kind::Blob, pointer.as_bytes())
-        .map_err(|error| storage("hash lfs pointer", &error))
+    gix::objs::compute_hash(kind, gix::objs::Kind::Blob, pointer.as_bytes()).map_err(|error| {
+        errors::history::storage()
+            .operation("hash lfs pointer")
+            .detail(&error)
+            .error()
+    })
 }
 
 /// The length an LFS pointer's `size` line records.

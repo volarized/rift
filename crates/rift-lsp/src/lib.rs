@@ -15,9 +15,9 @@ pub mod position;
 pub mod session;
 pub mod uri;
 
-pub use capabilities::{Capabilities, CapabilitiesError, CapabilitiesFault, PositionEncoding};
-pub use correlation::{Correlation, CorrelationError, CorrelationFault, RequestId};
-pub use framing::{Framing, FramingError, FramingFault};
-pub use position::{LineIndex, PositionError, PositionFault};
-pub use session::{EngineError, EngineFault, EngineLaunch, EngineSession};
-pub use uri::{EngineAddress, EngineRoots, PackageFile, PackageRoot, TreeRoot, UriError, UriFault};
+pub use capabilities::{Capabilities, PositionEncoding};
+pub use correlation::{Correlation, RequestId};
+pub use framing::Framing;
+pub use position::LineIndex;
+pub use session::{EngineLaunch, EngineSession};
+pub use uri::{EngineAddress, EngineRoots, PackageFile, PackageRoot, TreeRoot};

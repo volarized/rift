@@ -6,11 +6,8 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rift_core::constants::{STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION};
-use rift_core::{
-    CompositionId, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProviderId, fault_label,
-    is_canonical_ascii_name,
-};
-use serde::Serialize;
+use rift_core::{CompositionId, ProviderId, is_canonical_ascii_name};
+use rift_error::{RiftError, errors};
 
 // Process-local builder origin. Mutable allocation remains provider-owned.
 static NEXT_BUILDER_ORIGIN: AtomicU64 = AtomicU64::new(1);
@@ -239,65 +236,6 @@ impl StageDescriptor {
     }
 }
 
-/// Stable composition-build failure classification and context.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompositionFault {
-    /// Stage name is empty or not canonical lowercase syntax.
-    InvalidName,
-    /// Scoped stage path already exists.
-    DuplicateStage(StagePath),
-    /// Handle belongs to another builder.
-    ForeignFlow,
-    /// Edited stage output type does not match replacement input.
-    TypeMismatch(StagePath),
-    /// Requested stage does not exist.
-    StageNotFound(StagePath),
-    /// Removed stage still has a consumer or is composition output.
-    DanglingInput(StagePath),
-    /// Composition has no selected output.
-    MissingOutput,
-}
-
-impl CompositionFault {
-    /// Returns stage path attached to failure when present.
-    #[must_use]
-    pub const fn stage(&self) -> Option<&StagePath> {
-        match self {
-            Self::DuplicateStage(path)
-            | Self::TypeMismatch(path)
-            | Self::StageNotFound(path)
-            | Self::DanglingInput(path) => Some(path),
-            Self::InvalidName | Self::ForeignFlow | Self::MissingOutput => None,
-        }
-    }
-}
-
-impl Fault for CompositionFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let rule = match self {
-            Self::InvalidName => "invalid_name",
-            Self::DuplicateStage(_) => "duplicate_stage",
-            Self::ForeignFlow => "foreign_flow",
-            Self::TypeMismatch(_) => "type_mismatch",
-            Self::StageNotFound(_) => "stage_not_found",
-            Self::DanglingInput(_) => "dangling_input",
-            Self::MissingOutput => "missing_output",
-        };
-        let mut context = vec![ErrorContext::new("rule", rule)];
-        if let Some(stage) = self.stage() {
-            context.push(ErrorContext::new("stage", stage.to_string()));
-        }
-        context
-    }
-}
-
-/// Composition-build failure.
-pub type CompositionError = Error<CompositionFault>;
-
 /// Typed composition builder. Concrete flow types erase only at [`build`](Self::build).
 ///
 /// Stage methods chain without intermediate results; every recorded
@@ -309,7 +247,7 @@ pub struct CompositionBuilder {
     stages: Vec<StageNode>,
     paths: BTreeSet<StagePath>,
     output: Option<usize>,
-    errors: Vec<CompositionError>,
+    errors: Vec<RiftError>,
 }
 
 /// Borrowed builder for one stable nested stage path.
@@ -526,13 +464,13 @@ impl CompositionBuilder {
     ///
     /// Returns the first recorded construction failure: non-canonical name,
     /// duplicate stage path, foreign flow handle, or missing output selection.
-    pub fn build(self) -> Result<ProviderComposition, CompositionError> {
+    pub fn build(self) -> Result<ProviderComposition, RiftError> {
         if let Some(error) = self.errors.into_iter().next() {
-            return Err(error);
+            return error.fail();
         }
         let output = self
             .output
-            .ok_or_else(|| CompositionError::new(CompositionFault::MissingOutput))?;
+            .ok_or_else(|| errors::provider::composition_missing_output().error())?;
         Ok(ProviderComposition::from_nodes(
             self.id,
             self.stages,
@@ -544,10 +482,11 @@ impl CompositionBuilder {
     // a duplicate path is recorded and later reported by build.
     fn add(&mut self, registration: StageRegistration<'_>) -> usize {
         if !self.paths.insert(registration.path.clone()) {
-            self.errors
-                .push(CompositionError::new(CompositionFault::DuplicateStage(
-                    registration.path.clone(),
-                )));
+            self.errors.push(
+                errors::provider::composition_duplicate_stage()
+                    .stage(&registration.path)
+                    .error(),
+            );
         }
         let stage = self.stages.len();
         self.stages.push(StageNode {
@@ -715,7 +654,7 @@ pub struct CompositionEditor {
     id: CompositionId,
     nodes: Vec<StageNode>,
     output: usize,
-    errors: Vec<CompositionError>,
+    errors: Vec<RiftError>,
 }
 
 impl CompositionEditor {
@@ -765,9 +704,9 @@ impl CompositionEditor {
     ///
     /// Returns the first recorded edit failure: missing stage, non-canonical or
     /// duplicate name, incompatible types, or removal of a referenced stage.
-    pub fn build(self) -> Result<ProviderComposition, CompositionError> {
+    pub fn build(self) -> Result<ProviderComposition, RiftError> {
         if let Some(error) = self.errors.into_iter().next() {
-            return Err(error);
+            return error.fail();
         }
         Ok(ProviderComposition::from_nodes(
             self.id,
@@ -781,19 +720,19 @@ impl CompositionEditor {
         path: &str,
         name: &str,
         component: &Component<T, T>,
-    ) -> Result<(), CompositionError> {
+    ) -> Result<(), RiftError> {
         let index = self.index(path)?;
         if self.nodes[index].output.id != TypeId::of::<T>() {
-            return Err(CompositionError::new(CompositionFault::TypeMismatch(
-                self.nodes[index].path.clone(),
-            )));
+            return errors::provider::composition_type_mismatch()
+                .stage(&self.nodes[index].path)
+                .fail();
         }
         validate_name(name)?;
         let new_path = StagePath::root(&self.id, name);
         if self.nodes.iter().any(|node| node.path == new_path) {
-            return Err(CompositionError::new(CompositionFault::DuplicateStage(
-                new_path,
-            )));
+            return errors::provider::composition_duplicate_stage()
+                .stage(&new_path)
+                .fail();
         }
         self.remap_stage_references(|stage| if stage >= index { stage + 1 } else { stage });
         self.nodes.insert(
@@ -815,37 +754,39 @@ impl CompositionEditor {
         &mut self,
         path: &str,
         component: &Component<I, O>,
-    ) -> Result<(), CompositionError> {
+    ) -> Result<(), RiftError> {
         let index = self.index(path)?;
         if self.nodes[index].component_input.id != TypeId::of::<I>()
             || self.nodes[index].output.id != TypeId::of::<O>()
         {
-            return Err(CompositionError::new(CompositionFault::TypeMismatch(
-                self.nodes[index].path.clone(),
-            )));
+            return errors::provider::composition_type_mismatch()
+                .stage(&self.nodes[index].path)
+                .fail();
         }
         self.nodes[index].component = component.id().clone();
         Ok(())
     }
 
-    fn try_remove(&mut self, path: &str) -> Result<(), CompositionError> {
+    fn try_remove(&mut self, path: &str) -> Result<(), RiftError> {
         let index = self.index(path)?;
         if index == self.output || self.nodes.iter().any(|node| node.inputs.contains(&index)) {
-            return Err(CompositionError::new(CompositionFault::DanglingInput(
-                self.nodes[index].path.clone(),
-            )));
+            return errors::provider::composition_dangling_input()
+                .stage(&self.nodes[index].path)
+                .fail();
         }
         self.nodes.remove(index);
         self.remap_stage_references(|stage| if stage > index { stage - 1 } else { stage });
         Ok(())
     }
 
-    fn index(&self, path: &str) -> Result<usize, CompositionError> {
+    fn index(&self, path: &str) -> Result<usize, RiftError> {
         self.nodes
             .iter()
             .position(|node| node.path.as_str() == path)
             .ok_or_else(|| {
-                CompositionError::new(CompositionFault::StageNotFound(StagePath(path.into())))
+                errors::provider::composition_stage_not_found()
+                    .stage(path)
+                    .error()
             })
     }
 
@@ -861,23 +802,23 @@ impl CompositionEditor {
     }
 }
 
-fn validate_name(name: &str) -> Result<(), CompositionError> {
+fn validate_name(name: &str) -> Result<(), RiftError> {
     if !is_canonical_ascii_name(name, STAGE_NAME_BYTES_MAX, STAGE_NAME_PUNCTUATION) {
-        return Err(CompositionError::new(CompositionFault::InvalidName));
+        return errors::provider::composition_invalid_name().fail();
     }
     Ok(())
 }
 
-fn validate_origin(flow_origin: u64, builder_origin: u64) -> Result<(), CompositionError> {
+fn validate_origin(flow_origin: u64, builder_origin: u64) -> Result<(), RiftError> {
     if flow_origin != builder_origin {
-        return Err(CompositionError::new(CompositionFault::ForeignFlow));
+        return errors::provider::composition_foreign_flow().fail();
     }
     Ok(())
 }
 
 // Deferred-validation kernel: chained construction records failures here and
 // build reports the first one.
-fn record_failure(errors: &mut Vec<CompositionError>, result: Result<(), CompositionError>) {
+fn record_failure(errors: &mut Vec<RiftError>, result: Result<(), RiftError>) {
     if let Err(error) = result {
         errors.push(error);
     }
@@ -1003,41 +944,6 @@ pub struct CacheUpdate {
     pub removed: usize,
 }
 
-/// Per-key cache failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheViolation {
-    /// Requested key set exceeds configured cache bound.
-    TooManyKeys,
-}
-
-/// One rejected per-key cache request: which rule it broke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheFault {
-    violation: CacheViolation,
-}
-
-impl CacheFault {
-    /// Returns stable failure classification.
-    #[must_use]
-    pub const fn violation(self) -> CacheViolation {
-        self.violation
-    }
-}
-
-impl Fault for CacheFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::LimitExceeded)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![ErrorContext::new("violation", fault_label(&self.violation))]
-    }
-}
-
-/// Per-key cache failure.
-pub type CacheError = Error<CacheFault>;
-
 /// Bounded-composition proof of revision-keyed reuse.
 #[derive(Debug, Clone)]
 pub struct PerKeyCache<K, V> {
@@ -1059,16 +965,14 @@ impl<K: Clone + Ord, V: Clone> PerKeyCache<K, V> {
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError`] before mutation when key set exceeds configured bound.
+    /// Returns [`RiftError`] before mutation when key set exceeds configured bound.
     pub fn update(
         &mut self,
         revisions: &BTreeMap<K, u64>,
         mut compute: impl FnMut(&K) -> V,
-    ) -> Result<CacheUpdate, CacheError> {
+    ) -> Result<CacheUpdate, RiftError> {
         if revisions.len() > self.max_entries.get() {
-            return Err(CacheError::new(CacheFault {
-                violation: CacheViolation::TooManyKeys,
-            }));
+            return errors::provider::cache_too_many_keys().fail();
         }
         let removed = self
             .entries
@@ -1254,7 +1158,10 @@ mod tests {
             .output(aggregate)
             .build()
             .expect_err("control character in join name must fail");
-        assert_eq!(error.fault(), &CompositionFault::InvalidName);
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.composition_invalid_name"
+        );
     }
 
     #[test]
@@ -1352,17 +1259,8 @@ mod tests {
                 std::string::ToString::to_string,
             )
             .expect_err("cache bound must reject before mutation");
-        assert_eq!(error.fault().violation(), CacheViolation::TooManyKeys);
-        assert_eq!(
-            error.context(),
-            vec![ErrorContext::new("violation", "too_many_keys")]
-        );
-        assert_eq!(
-            error.to_string(),
-            "the request exceeded a declared resource limit: violation too_many_keys; \
-             resize the request below the named limit, or raise that limit \
-             in the workspace configuration"
-        );
+        assert_eq!(error.slug().as_str(), "rift.provider.cache_too_many_keys");
+        assert!(error.context().next().is_none());
         assert_eq!(cache.get(&2).map(String::as_str), Some("2"));
     }
 
@@ -1382,22 +1280,24 @@ mod tests {
             )
             .build()
             .expect_err("replacement input type must match");
-        assert!(matches!(
-            mismatch.fault(),
-            CompositionFault::TypeMismatch(_)
-        ));
+        assert_eq!(
+            mismatch.slug().as_str(),
+            "rift.provider.composition_type_mismatch"
+        );
 
         let error = composition
             .edit()
             .remove("core-syntax.project")
             .build()
             .expect_err("used source cannot be removed");
-        assert!(matches!(error.fault(), CompositionFault::DanglingInput(_)));
         assert_eq!(
-            error.to_string(),
-            "the workspace configuration failed validation: \
-             rule dangling_input, stage core-syntax.project; \
-             correct the reported configuration field, then retry"
+            error.slug().as_str(),
+            "rift.provider.composition_dangling_input"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("composition stage still has a consumer")
         );
 
         let edited = composition
@@ -1478,22 +1378,28 @@ mod tests {
             .output(flow)
             .build()
             .expect_err("duplicate scoped path must fail");
-        assert!(matches!(
-            duplicate.fault(),
-            CompositionFault::DuplicateStage(_)
-        ));
+        assert_eq!(
+            duplicate.slug().as_str(),
+            "rift.provider.composition_duplicate_stage"
+        );
 
         let mut second = CompositionBuilder::new(composition_id("second"));
         let _foreign = second.then(flow, "syntax", &component::<Sources, Syntax>("syntax"));
         let foreign = second
             .build()
             .expect_err("foreign handle must fail before missing output");
-        assert_eq!(foreign.fault(), &CompositionFault::ForeignFlow);
+        assert_eq!(
+            foreign.slug().as_str(),
+            "rift.provider.composition_foreign_flow"
+        );
 
         let missing = CompositionBuilder::new(composition_id("third"))
             .build()
             .expect_err("output is required");
-        assert_eq!(missing.fault(), &CompositionFault::MissingOutput);
+        assert_eq!(
+            missing.slug().as_str(),
+            "rift.provider.composition_missing_output"
+        );
     }
 
     #[test]
@@ -1506,7 +1412,10 @@ mod tests {
                 .output(flow)
                 .build()
                 .expect_err("non-canonical stage name must fail");
-            assert_eq!(error.fault(), &CompositionFault::InvalidName);
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.provider.composition_invalid_name"
+            );
         }
 
         let mut builder = CompositionBuilder::new(composition_id("names"));
@@ -1516,7 +1425,10 @@ mod tests {
             .output(flow)
             .build()
             .expect_err("oversized stage name must fail");
-        assert_eq!(error.fault(), &CompositionFault::InvalidName);
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.composition_invalid_name"
+        );
     }
 
     #[test]
@@ -1543,14 +1455,18 @@ mod tests {
             .build()
             .expect_err("duplicate stage path");
         assert_eq!(
-            duplicate.fault().stage().map(StagePath::as_str),
+            duplicate
+                .context()
+                .find(|(key, _)| *key == "stage")
+                .map(|(_, value)| value)
+                .as_deref(),
             Some("dup.stage")
         );
 
         let missing = CompositionBuilder::new(composition_id("empty"))
             .build()
             .expect_err("missing output");
-        assert!(missing.fault().stage().is_none());
+        assert!(missing.context().all(|(key, _)| key != "stage"));
     }
 
     #[test]
@@ -1580,7 +1496,10 @@ mod tests {
             .output(scoped)
             .build()
             .expect_err("scope name must be canonical");
-        assert_eq!(error.fault(), &CompositionFault::InvalidName);
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.composition_invalid_name"
+        );
     }
 
     #[test]
@@ -1593,7 +1512,10 @@ mod tests {
             .output(flow)
             .build()
             .expect_err("foreign output handle");
-        assert_eq!(error.fault(), &CompositionFault::ForeignFlow);
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.composition_foreign_flow"
+        );
     }
 
     fn project_syntax_composition() -> ProviderComposition {
@@ -1612,12 +1534,16 @@ mod tests {
             .replace("core.absent", &component::<Sources, Syntax>("other"))
             .build()
             .expect_err("unknown stage path");
-        assert!(matches!(
-            not_found.fault(),
-            CompositionFault::StageNotFound(_)
-        ));
         assert_eq!(
-            not_found.fault().stage().map(StagePath::as_str),
+            not_found.slug().as_str(),
+            "rift.provider.composition_stage_not_found"
+        );
+        assert_eq!(
+            not_found
+                .context()
+                .find(|(key, _)| *key == "stage")
+                .map(|(_, value)| value)
+                .as_deref(),
             Some("core.absent")
         );
 
@@ -1630,12 +1556,16 @@ mod tests {
             )
             .build()
             .expect_err("transform type must match stage output");
-        assert!(matches!(
-            mismatch.fault(),
-            CompositionFault::TypeMismatch(_)
-        ));
         assert_eq!(
-            mismatch.fault().stage().map(StagePath::as_str),
+            mismatch.slug().as_str(),
+            "rift.provider.composition_type_mismatch"
+        );
+        assert_eq!(
+            mismatch
+                .context()
+                .find(|(key, _)| *key == "stage")
+                .map(|(_, value)| value)
+                .as_deref(),
             Some("core.project")
         );
 
@@ -1648,10 +1578,10 @@ mod tests {
             )
             .build()
             .expect_err("inserted stage path already exists");
-        assert!(matches!(
-            duplicate.fault(),
-            CompositionFault::DuplicateStage(_)
-        ));
+        assert_eq!(
+            duplicate.slug().as_str(),
+            "rift.provider.composition_duplicate_stage"
+        );
 
         let invalid = composition
             .edit()
@@ -1662,7 +1592,10 @@ mod tests {
             )
             .build()
             .expect_err("inserted stage name must be canonical");
-        assert_eq!(invalid.fault(), &CompositionFault::InvalidName);
+        assert_eq!(
+            invalid.slug().as_str(),
+            "rift.provider.composition_invalid_name"
+        );
     }
 
     #[test]
@@ -1674,7 +1607,10 @@ mod tests {
             .remove("core.absent")
             .build()
             .expect_err("first failure must win");
-        assert!(matches!(error.fault(), CompositionFault::TypeMismatch(_)));
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.composition_type_mismatch"
+        );
     }
 
     #[test]
@@ -1686,8 +1622,8 @@ mod tests {
             .build()
             .expect_err("non-canonical name must fail");
         assert_eq!(
-            invalid_error.context(),
-            vec![ErrorContext::new("rule", "invalid_name")]
+            invalid_error.slug().as_str(),
+            "rift.provider.composition_invalid_name"
         );
 
         let mut builder = CompositionBuilder::new(composition_id("ctx"));
@@ -1698,11 +1634,13 @@ mod tests {
             .build()
             .expect_err("duplicate scoped path must fail");
         assert_eq!(
-            duplicate_error.context(),
-            vec![
-                ErrorContext::new("rule", "duplicate_stage"),
-                ErrorContext::new("stage", "ctx.stage"),
-            ]
+            duplicate_error.slug().as_str(),
+            "rift.provider.composition_duplicate_stage"
+        );
+        assert!(
+            duplicate_error
+                .context()
+                .any(|(key, value)| key == "stage" && value == "ctx.stage")
         );
 
         let mut foreign_source = CompositionBuilder::new(composition_id("foreign"));
@@ -1714,16 +1652,16 @@ mod tests {
             .build()
             .expect_err("foreign output handle must fail");
         assert_eq!(
-            foreign_error.context(),
-            vec![ErrorContext::new("rule", "foreign_flow")]
+            foreign_error.slug().as_str(),
+            "rift.provider.composition_foreign_flow"
         );
 
         let missing_error = CompositionBuilder::new(composition_id("empty"))
             .build()
             .expect_err("missing output must fail");
         assert_eq!(
-            missing_error.context(),
-            vec![ErrorContext::new("rule", "missing_output")]
+            missing_error.slug().as_str(),
+            "rift.provider.composition_missing_output"
         );
 
         let composition = project_syntax_composition();
@@ -1733,11 +1671,13 @@ mod tests {
             .build()
             .expect_err("unknown stage path must fail");
         assert_eq!(
-            not_found_error.context(),
-            vec![
-                ErrorContext::new("rule", "stage_not_found"),
-                ErrorContext::new("stage", "core.absent"),
-            ]
+            not_found_error.slug().as_str(),
+            "rift.provider.composition_stage_not_found"
+        );
+        assert!(
+            not_found_error
+                .context()
+                .any(|(key, value)| key == "stage" && value == "core.absent")
         );
 
         let mismatch_error = composition
@@ -1746,11 +1686,13 @@ mod tests {
             .build()
             .expect_err("incompatible replacement must fail");
         assert_eq!(
-            mismatch_error.context(),
-            vec![
-                ErrorContext::new("rule", "type_mismatch"),
-                ErrorContext::new("stage", "core.syntax"),
-            ]
+            mismatch_error.slug().as_str(),
+            "rift.provider.composition_type_mismatch"
+        );
+        assert!(
+            mismatch_error
+                .context()
+                .any(|(key, value)| key == "stage" && value == "core.syntax")
         );
 
         let dangling_error = composition
@@ -1759,11 +1701,13 @@ mod tests {
             .build()
             .expect_err("used source cannot be removed");
         assert_eq!(
-            dangling_error.context(),
-            vec![
-                ErrorContext::new("rule", "dangling_input"),
-                ErrorContext::new("stage", "core.project"),
-            ]
+            dangling_error.slug().as_str(),
+            "rift.provider.composition_dangling_input"
+        );
+        assert!(
+            dangling_error
+                .context()
+                .any(|(key, value)| key == "stage" && value == "core.project")
         );
     }
 }

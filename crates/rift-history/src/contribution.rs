@@ -1,14 +1,13 @@
 //! History Contribution conversion.
 
-use std::collections::BTreeMap;
-use std::fmt;
-
 use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, ExtensionKey, ExtensionValue, Extensions,
     ProviderId, ProviderRevision, ProviderSymbolId, SourceApplicability, SourceKind,
     SourceLocation, SourcePath,
 };
+use rift_error::{RiftError, errors};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 use crate::PathHistory;
 
@@ -33,25 +32,33 @@ impl HistoryContributionAdapter {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryContributionError`] when a provider symbol, origin, or
+    /// Returns [`RiftError`] when a provider symbol, origin, or
     /// Contribution is invalid.
     pub fn convert(
         &self,
         path: &SourcePath,
         history: &PathHistory,
-    ) -> Result<Vec<Contribution>, HistoryContributionError> {
+    ) -> Result<Vec<Contribution>, RiftError> {
         let origin = ContributionOrigin::new(
             Some(SourceLocation::Project { package: None }),
             SourceKind::Authored,
         )
-        .map_err(|error| history_fact_error(error.to_string()))?;
+        .map_err(|error| {
+            errors::history::contribution_invalid()
+                .detail(error.to_string())
+                .error()
+        })?;
         history
             .revisions()
             .iter()
             .map(|item| {
                 let symbol =
                     ProviderSymbolId::new(format!("{}:{}", item.commit_id(), path.as_str()))
-                        .map_err(|error| history_fact_error(error.to_string()))?;
+                        .map_err(|error| {
+                            errors::history::contribution_invalid()
+                                .detail(error.to_string())
+                                .error()
+                        })?;
                 let blob = item.blob().map(|blob| {
                     json!({
                         "id": blob.blob_id(),
@@ -79,56 +86,13 @@ impl HistoryContributionAdapter {
                 )
                 .namespaced(namespaced)
                 .build()
-                .map_err(|error| history_fact_error(error.to_string()))
+                .map_err(|error| {
+                    errors::history::contribution_invalid()
+                        .detail(error.to_string())
+                        .error()
+                })
             })
             .collect()
-    }
-}
-
-/// Stable history Contribution conversion failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryContributionViolation {
-    /// History fact could not become a Contribution.
-    InvalidFact,
-}
-
-/// Error returned by history Contribution conversion.
-#[derive(Debug)]
-pub struct HistoryContributionError {
-    violation: HistoryContributionViolation,
-    detail: String,
-}
-
-impl HistoryContributionError {
-    /// Returns stable violation.
-    #[must_use]
-    pub const fn violation(&self) -> HistoryContributionViolation {
-        self.violation
-    }
-
-    /// Returns failure detail.
-    #[must_use]
-    pub fn detail(&self) -> &str {
-        &self.detail
-    }
-}
-
-impl fmt::Display for HistoryContributionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "history Contribution conversion rejected {:?}: {}",
-            self.violation, self.detail
-        )
-    }
-}
-
-impl std::error::Error for HistoryContributionError {}
-
-fn history_fact_error(detail: impl Into<String>) -> HistoryContributionError {
-    HistoryContributionError {
-        violation: HistoryContributionViolation::InvalidFact,
-        detail: detail.into(),
     }
 }
 
@@ -138,7 +102,7 @@ mod tests {
 
     use rift_core::{ProviderId, ProviderRevision, SourceApplicability, SourcePath};
 
-    use super::{HistoryContributionAdapter, HistoryContributionViolation, history_fact_error};
+    use super::{HistoryContributionAdapter, errors};
     use crate::{Repository, fixture};
 
     #[test]
@@ -209,10 +173,16 @@ mod tests {
     }
 
     #[test]
-    fn error_exposes_stable_violation_and_detail() {
-        let error = history_fact_error("invalid history fact");
-        assert_eq!(error.violation(), HistoryContributionViolation::InvalidFact);
-        assert_eq!(error.detail(), "invalid history fact");
+    fn error_exposes_registered_identity_and_detail() {
+        let error = errors::history::contribution_invalid()
+            .detail("invalid history fact")
+            .error();
+        assert_eq!(error.slug(), errors::history::contribution_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "detail" && value == "invalid history fact")
+        );
         assert!(error.to_string().contains("invalid history fact"));
         let _: &dyn std::error::Error = &error;
     }

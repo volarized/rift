@@ -1,8 +1,7 @@
 //! Documentation projection over the request's captured project sources.
 
-use rift_index::{
-    DocumentationError, DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
-};
+use rift_error::RiftError;
+use rift_index::{DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget};
 use rift_protocol::documentation::{
     DocumentationContentIdentity, DocumentationSourceIdentity, DocumentationStage,
     DocumentationWarning, DocumentationWarningKind,
@@ -11,9 +10,9 @@ use rift_protocol::read::TextRange;
 
 use super::{
     DocumentIdentity, FusedCandidate, ParsedQuery, Path, PathMatcher, ProjectPath, RankingInput,
-    ReadError, ReadFault, ReadWarning, Resolution, ResolvedCandidate, SearchHit, SearchHitTarget,
-    SearchParamsTarget, SearchScope, WorkspaceIndex, includes, matched_fields, query_line,
-    resolve_candidate, text_range,
+    ReadWarning, Resolution, ResolvedCandidate, SearchHit, SearchHitTarget, SearchParamsTarget,
+    SearchScope, WorkspaceIndex, includes, matched_fields, query_line, resolve_candidate,
+    text_range,
 };
 
 /// Metadata held for one search, without another copy of source content.
@@ -83,25 +82,23 @@ impl<'a> SearchDocumentation<'a> {
         inputs: &[RankingInput],
         target: SearchParamsTarget,
         query: &ParsedQuery,
-    ) -> Result<Vec<RankingInput>, ReadError> {
+    ) -> Result<Vec<RankingInput>, RiftError> {
         let target = match target {
             SearchParamsTarget::Documentation => DocumentationProjectionTarget::Documentation,
             SearchParamsTarget::All => DocumentationProjectionTarget::All,
             _ => return Ok(inputs.to_vec()),
         };
-        self.projection
-            .project(inputs, target, |identity, source| {
-                let range = self.document_range(identity)?;
-                let content = captured_content(self.index, self.resolution, source)?;
-                let start = usize::try_from(range.start).ok()?;
-                let end = usize::try_from(range.end).ok()?;
-                let (_, found, _) = query_line(content.get(start..end)?, query)?;
-                Some(TextRange {
-                    start: range.start.checked_add(found.start)?,
-                    end: range.start.checked_add(found.end)?,
-                })
+        self.projection.project(inputs, target, |identity, source| {
+            let range = self.document_range(identity)?;
+            let content = captured_content(self.index, self.resolution, source)?;
+            let start = usize::try_from(range.start).ok()?;
+            let end = usize::try_from(range.end).ok()?;
+            let (_, found, _) = query_line(content.get(start..end)?, query)?;
+            Some(TextRange {
+                start: range.start.checked_add(found.start)?,
+                end: range.start.checked_add(found.end)?,
             })
-            .map_err(ReadFault::documentation)
+        })
     }
 
     fn document_range(&self, identity: &DocumentIdentity) -> Option<TextRange> {
@@ -150,7 +147,7 @@ impl<'a> JoinedLayers<'a> {
     fn join(
         &mut self,
         documentation: &str,
-        layer: Result<&'a DocumentationLayer<'static>, &DocumentationError>,
+        layer: Result<&'a DocumentationLayer<'static>, &RiftError>,
     ) {
         match layer {
             Ok(layer) => {

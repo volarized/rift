@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 version = "0.0.47"
@@ -14,6 +14,8 @@ async-trait = "=0.1.92"
 rift-analysis = { path = "crates/rift-analysis", default-features = false }
 rift-cloud-client = { path = "crates/rift-cloud-client" }
 rift-core = { path = "crates/rift-core" }
+rift-error = { path = "crates/rift-error" }
+rift-error-codegen = { path = "crates/rift-error-codegen" }
 rift-dependency = { path = "crates/rift-dependency" }
 rift-history = { path = "crates/rift-history" }
 rift-history-store = { path = "crates/rift-history-store" }
@@ -28,6 +30,9 @@ rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
 
 anyhow = "1.0"
+proc-macro2 = "1.0.107"
+prettyplease = "0.2.37"
+quote = "1.0.47"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 candle-core = { version = "0.11.0", default-features = false }
 candle-nn = { version = "0.11.0", default-features = false }
@@ -111,6 +116,8 @@ toasty-driver-sqlite = "=0.10.0"
 # be a duplicate the dependency policy refuses, and could not avoid onig either.
 tokenizers = { version = "0.22.2", default-features = false }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
+syn = { version = "2.0.119", features = ["full"] }
+thiserror = "2.0.20"
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 tracing = "0.1.44"

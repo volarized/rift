@@ -20,10 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use toasty::Executor;
 
-use crate::lexical::{
-    LexicalIndexError, LexicalIndexViolation, batch_limit_error, lexical_error_caused_by,
-    storage_error,
-};
+use rift_error::{RiftError, errors};
 
 /// Encoded documentation metadata one workspace publication stores, at most.
 ///
@@ -126,10 +123,7 @@ impl EncodedDocumentation {
     ///
     /// Encoding runs to the end even past the bound, keeping no source row beyond it, so a
     /// refusal reports the size the metadata measured.
-    fn within(
-        collection: &DocumentationCollection,
-        bytes_max: usize,
-    ) -> Result<Self, LexicalIndexError> {
+    fn within(collection: &DocumentationCollection, bytes_max: usize) -> Result<Self, RiftError> {
         let index = collection.index();
         let manifest = serde_json::to_string(&CollectionFields {
             documentation_revision: &index.documentation_revision,
@@ -137,7 +131,11 @@ impl EncodedDocumentation {
             coverage: &index.coverage,
             warnings: &index.warnings,
         })
-        .map_err(invalid_metadata)?;
+        .map_err(|error| {
+            errors::index::lexical_stored_kind_invalid()
+                .source(error)
+                .error()
+        })?;
         let mut written = manifest.len();
         let mut sources = Vec::with_capacity(index.sources.len());
         for records in source_records(index).into_values() {
@@ -148,11 +146,11 @@ impl EncodedDocumentation {
             }
         }
         if written > bytes_max {
-            return Err(batch_limit_error(
-                "documentation.bytes",
-                written as u64,
-                bytes_max as u64,
-            ));
+            return errors::index::lexical_record_limit()
+                .field("documentation.bytes")
+                .observed(written as u64)
+                .maximum(bytes_max as u64)
+                .fail();
         }
         Ok(Self { manifest, sources })
     }
@@ -218,9 +216,17 @@ fn source_records(
 }
 
 /// Encodes one source's records into its row and the reverse references it files.
-fn encode_source(records: &SourceRecords<'_>) -> Result<EncodedSource, LexicalIndexError> {
-    let identity = serde_json::to_string(&records.source.identity).map_err(invalid_metadata)?;
-    let payload = serde_json::to_string(records).map_err(invalid_metadata)?;
+fn encode_source(records: &SourceRecords<'_>) -> Result<EncodedSource, RiftError> {
+    let identity = serde_json::to_string(&records.source.identity).map_err(|error| {
+        errors::index::lexical_stored_kind_invalid()
+            .source(error)
+            .error()
+    })?;
+    let payload = serde_json::to_string(records).map_err(|error| {
+        errors::index::lexical_stored_kind_invalid()
+            .source(error)
+            .error()
+    })?;
     let digest = Sha256::digest(payload.as_bytes()).to_vec();
     let references = records
         .references
@@ -249,17 +255,17 @@ fn encode_source(records: &SourceRecords<'_>) -> Result<EncodedSource, LexicalIn
 ///
 /// # Errors
 ///
-/// Returns [`LexicalIndexError`] when the metadata cannot be encoded at all.
+/// Returns [`RiftError`] when the metadata cannot be encoded at all.
 pub(crate) fn encode_within(
     documentation: Option<&DocumentationCollection>,
     bytes_max: usize,
-) -> Result<Option<EncodedDocumentation>, LexicalIndexError> {
+) -> Result<Option<EncodedDocumentation>, RiftError> {
     let Some(collection) = documentation else {
         return Ok(None);
     };
     match EncodedDocumentation::within(collection, bytes_max) {
         Ok(encoded) => Ok(Some(encoded)),
-        Err(error) if error.fault().violation() == LexicalIndexViolation::RecordLimit => {
+        Err(error) if error.slug().as_str() == "rift.index.lexical_record_limit" => {
             tracing::warn!(
                 component = "search",
                 operation = "search.commit",
@@ -268,7 +274,7 @@ pub(crate) fn encode_within(
             );
             Ok(None)
         }
-        Err(error) => Err(error),
+        Err(error) => error.fail(),
     }
 }
 
@@ -283,7 +289,7 @@ pub(crate) fn encode_within(
 pub(crate) async fn replace(
     executor: &mut dyn Executor,
     encoded: Option<&EncodedDocumentation>,
-) -> Result<(), LexicalIndexError> {
+) -> Result<(), RiftError> {
     let Some(encoded) = encoded else {
         return clear(executor).await;
     };
@@ -312,41 +318,41 @@ pub(crate) async fn replace(
         .delete()
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     toasty::create!(DocumentationManifestRecord {
         id: MANIFEST_ID,
         payload: encoded.manifest.clone()
     })
     .exec(executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
 /// Deletes every documentation row.
-async fn clear(executor: &mut dyn Executor) -> Result<(), LexicalIndexError> {
+async fn clear(executor: &mut dyn Executor) -> Result<(), RiftError> {
     DocumentationReferenceRecord::all()
         .delete()
         .exec(&mut *executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     DocumentationSourceRecord::all()
         .delete()
         .exec(&mut *executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     DocumentationManifestRecord::all()
         .delete()
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
 /// The digest each stored source row carries, keyed by its identity.
 async fn recorded_sources(
     executor: &mut dyn Executor,
-) -> Result<BTreeMap<String, Vec<u8>>, LexicalIndexError> {
+) -> Result<BTreeMap<String, Vec<u8>>, RiftError> {
     let rows = stored_source_rows(executor).await?;
     Ok(rows
         .into_iter()
@@ -357,38 +363,35 @@ async fn recorded_sources(
 /// Every stored source row, refusing a store holding more than a collection may.
 async fn stored_source_rows(
     executor: &mut dyn Executor,
-) -> Result<Vec<DocumentationSourceRecord>, LexicalIndexError> {
+) -> Result<Vec<DocumentationSourceRecord>, RiftError> {
     let bound = DOCUMENTATION_SOURCES_MAX as usize;
     let rows = DocumentationSourceRecord::all()
         .limit(bound + 1)
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     if rows.len() > bound {
-        return Err(batch_limit_error(
-            "documentation.sources",
-            rows.len() as u64,
-            u64::from(DOCUMENTATION_SOURCES_MAX),
-        ));
+        return errors::index::lexical_record_limit()
+            .field("documentation.sources")
+            .observed(rows.len() as u64)
+            .maximum(u64::from(DOCUMENTATION_SOURCES_MAX))
+            .fail();
     }
     Ok(rows)
 }
 
 /// Deletes one source's row and every reverse reference it filed.
-async fn delete_source(
-    executor: &mut dyn Executor,
-    identity: &str,
-) -> Result<(), LexicalIndexError> {
+async fn delete_source(executor: &mut dyn Executor, identity: &str) -> Result<(), RiftError> {
     DocumentationReferenceRecord::filter_by_source(identity)
         .delete()
         .exec(&mut *executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     DocumentationSourceRecord::filter_by_identity(identity)
         .delete()
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
@@ -396,7 +399,7 @@ async fn delete_source(
 async fn insert_source(
     executor: &mut dyn Executor,
     source: &EncodedSource,
-) -> Result<(), LexicalIndexError> {
+) -> Result<(), RiftError> {
     toasty::create!(DocumentationSourceRecord {
         identity: source.identity.clone(),
         digest: source.digest.clone(),
@@ -404,7 +407,7 @@ async fn insert_source(
     })
     .exec(&mut *executor)
     .await
-    .map_err(storage_error)?;
+    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     for (identity, target, block) in &source.references {
         toasty::create!(DocumentationReferenceRecord {
             identity: identity.clone(),
@@ -414,7 +417,7 @@ async fn insert_source(
         })
         .exec(&mut *executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     }
     Ok(())
 }
@@ -428,12 +431,12 @@ async fn insert_source(
 pub(crate) async fn read(
     executor: &mut dyn Executor,
     bytes_max: usize,
-) -> Result<Option<DocumentationCollection>, LexicalIndexError> {
+) -> Result<Option<DocumentationCollection>, RiftError> {
     let record = DocumentationManifestRecord::filter_by_id(MANIFEST_ID)
         .first()
         .exec(&mut *executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let Some(record) = record else {
         return Ok(None);
     };
@@ -443,23 +446,35 @@ pub(crate) async fn read(
         .map(|row| row.payload.len())
         .fold(record.payload.len(), usize::saturating_add);
     if measured > bytes_max {
-        return Err(batch_limit_error(
-            "documentation.bytes",
-            measured as u64,
-            bytes_max as u64,
-        ));
+        return errors::index::lexical_record_limit()
+            .field("documentation.bytes")
+            .observed(measured as u64)
+            .maximum(bytes_max as u64)
+            .fail();
     }
     let fields: StoredCollectionFields =
-        serde_json::from_str(&record.payload).map_err(invalid_metadata)?;
+        serde_json::from_str(&record.payload).map_err(|error| {
+            errors::index::lexical_stored_kind_invalid()
+                .source(error)
+                .error()
+        })?;
     let mut sources = rows
         .iter()
         .map(|row| serde_json::from_str::<StoredSourceRecords>(&row.payload))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid_metadata)?;
+        .map_err(|error| {
+            errors::index::lexical_stored_kind_invalid()
+                .source(error)
+                .error()
+        })?;
     sources.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
     DocumentationCollection::new(assembled(fields, sources))
         .map(Some)
-        .map_err(invalid_metadata)
+        .map_err(|error| {
+            errors::index::lexical_stored_kind_invalid()
+                .source(error)
+                .error()
+        })
 }
 
 /// One collection's index from its collection-wide fields and its sources' records, in
@@ -499,10 +514,6 @@ fn assembled(
     index
 }
 
-fn invalid_metadata(error: impl std::error::Error + Send + Sync + 'static) -> LexicalIndexError {
-    lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -534,10 +545,7 @@ mod tests {
         let Err(error) = EncodedDocumentation::within(&metadata, measured - 1) else {
             panic!("serialized metadata over bound must be refused");
         };
-        assert_eq!(
-            error.fault().violation(),
-            crate::LexicalIndexViolation::RecordLimit
-        );
+        assert_eq!(error.slug().as_str(), "rift.index.lexical_record_limit");
         assert!(
             error.to_string().contains(&format!("observed {measured}")),
             "refusal must name the measured size {measured}: {error}"
@@ -623,10 +631,7 @@ mod tests {
         let error = replace(&mut transaction, Some(&encoded))
             .await
             .expect_err("replacement must refuse more stored sources than a collection holds");
-        assert_eq!(
-            error.fault().violation(),
-            crate::LexicalIndexViolation::RecordLimit
-        );
+        assert_eq!(error.slug().as_str(), "rift.index.lexical_record_limit");
         Ok(())
     }
 
@@ -684,9 +689,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_read_requires_a_current_corpus_revision()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::{
-            LexicalIndexLimits, LexicalIndexViolation, LexicalSearchIndex, RevisionScoped,
-        };
+        use crate::{LexicalIndexLimits, LexicalSearchIndex, RevisionScoped};
 
         let directory = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
@@ -724,10 +727,7 @@ mod tests {
             .documentation("tree")
             .await
             .expect_err("oversized stored metadata must be refused");
-        assert_eq!(
-            error.fault().violation(),
-            LexicalIndexViolation::RecordLimit
-        );
+        assert_eq!(error.slug().as_str(), "rift.index.lexical_record_limit");
         store
             .replace_all_with_documentation(&[], "tree", &metadata)
             .await?;
@@ -822,9 +822,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_write_failure_rolls_back_lexical_rows_and_revision()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::{
-            LexicalIndexLimits, LexicalIndexViolation, LexicalSearchIndex, RevisionScoped,
-        };
+        use crate::{LexicalIndexLimits, LexicalSearchIndex, RevisionScoped};
         use rift_ranking::{DocumentIdentity, ParsedQuery, QueryPhase};
 
         let temp = tempfile::tempdir()?;
@@ -864,7 +862,7 @@ mod tests {
             .replace_all_with_documentation(&[new_document], "tree-new", &new_metadata)
             .await
             .expect_err("metadata trigger refuses after lexical writes");
-        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        assert_eq!(error.slug().as_str(), "rift.index.lexical_storage");
         assert_eq!(read_reference_rows(&database).await?, old_reference_rows);
 
         let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree-old").await? else {
@@ -1110,8 +1108,8 @@ mod tests {
             .await
             .expect_err("read must refuse corrupt prior metadata");
         assert_eq!(
-            error.fault().violation(),
-            crate::LexicalIndexViolation::StoredKindInvalid
+            error.slug().as_str(),
+            "rift.index.lexical_stored_kind_invalid"
         );
 
         let current = collection("current metadata");

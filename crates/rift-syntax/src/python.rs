@@ -21,13 +21,13 @@
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
-use rift_core::Error;
+use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
 use crate::extract::{self, Declaration, GrammarRules, Visited};
-use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Grammar spelling of a function definition, `async def` included.
@@ -155,7 +155,7 @@ impl PythonRules {
         &self,
         node: Node<'_>,
         text: &str,
-    ) -> Result<(Vec<Documentation>, Vec<crate::ByteRange>), SyntaxError> {
+    ) -> Result<(Vec<Documentation>, Vec<crate::ByteRange>), RiftError> {
         let Some(body) = node.child_by_field_id(self.kinds.body.get()) else {
             return Ok((Vec::new(), Vec::new()));
         };
@@ -201,7 +201,7 @@ impl PythonRules {
         text: &str,
         kind: &'static str,
         facets: Vec<SymbolFacet>,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let Some(name) = self.field_name(node, text) else {
             return Ok(None);
         };
@@ -268,7 +268,7 @@ impl PythonRules {
 }
 
 impl GrammarRules for PythonRules {
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
+    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         node.child_by_field_id(self.kinds.name.get())
             .map(extract::byte_range)
             .transpose()
@@ -278,7 +278,7 @@ impl GrammarRules for PythonRules {
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         if node.kind_id() == self.kinds.function {
             return self.definition_declaration(
@@ -347,12 +347,16 @@ fn python_kinds() -> &'static PythonKinds {
 }
 
 /// A parser speaking the pinned Python grammar.
-fn python_parser() -> Result<Parser, SyntaxError> {
+fn python_parser() -> Result<Parser, RiftError> {
     let grammar = tree_sitter_python::LANGUAGE.into();
     let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|_| incompatible_grammar(&grammar))?;
+    parser.set_language(&grammar).map_err(|_| {
+        errors::syntax::incompatible_grammar()
+            .grammar_abi_version(grammar.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error()
+    })?;
     Ok(parser)
 }
 
@@ -365,14 +369,12 @@ impl SyntaxProvider for PythonSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let mut parser = python_parser()?;
-        let tree = parser.parse(source.text, None).ok_or_else(|| {
-            Error::new(SyntaxFault::ParseCancelled {
-                path: Some(source.path.clone()),
-            })
-        })?;
+        let tree = parser
+            .parse(source.text, None)
+            .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let rules = PythonRules {
             kinds: python_kinds(),
         };

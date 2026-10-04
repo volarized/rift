@@ -13,11 +13,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use rift_error::{RiftError, errors};
 use toasty::db::Connection;
 use toasty::stmt::{Type, Value};
 
 use crate::database::WorkspaceDatabase;
-use crate::lexical::{LexicalIndexError, storage_error};
 
 /// One stored vector: what produced it, what it came from, and its values.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,7 +82,7 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the query fails.
+    /// Returns [`RiftError`] when the query fails.
     ///
     /// # Cancel safety
     ///
@@ -92,7 +92,7 @@ impl VectorStore {
         model: &str,
         dimension: usize,
         max: usize,
-    ) -> Result<Vec<StoredVector>, LexicalIndexError> {
+    ) -> Result<Vec<StoredVector>, RiftError> {
         let mut connection = self.connection().await?;
         let rows = toasty::sql::query(
             "SELECT digest, vector FROM semantic_vectors
@@ -104,7 +104,7 @@ impl VectorStore {
         .column_types([Type::String, Type::Bytes])
         .exec(&mut connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         Ok(rows
             .iter()
             .filter_map(|row| decode_row(row, dimension))
@@ -118,12 +118,12 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the query fails.
+    /// Returns [`RiftError`] when the query fails.
     ///
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; this issues one read-only query.
-    pub async fn digests(&self, model: &str) -> Result<BTreeSet<String>, LexicalIndexError> {
+    pub async fn digests(&self, model: &str) -> Result<BTreeSet<String>, RiftError> {
         let mut connection = self.connection().await?;
         model_digests(&mut connection, model).await
     }
@@ -133,7 +133,7 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when a write fails.
+    /// Returns [`RiftError`] when a write fails.
     ///
     /// # Cancel safety
     ///
@@ -145,7 +145,7 @@ impl VectorStore {
         model: &str,
         dimension: usize,
         vectors: &[StoredVector],
-    ) -> Result<(), LexicalIndexError> {
+    ) -> Result<(), RiftError> {
         if vectors.is_empty() {
             return Ok(());
         }
@@ -166,9 +166,12 @@ impl VectorStore {
             .bind(encode(vector.values()))
             .exec(&mut transaction)
             .await
-            .map_err(storage_error)?;
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         }
-        transaction.commit().await.map_err(storage_error)
+        transaction
+            .commit()
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())
     }
 
     /// Drops every vector this model did not produce, and reports how many.
@@ -178,13 +181,13 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the delete fails.
+    /// Returns [`RiftError`] when the delete fails.
     ///
     /// # Cancel safety
     ///
     /// The count and delete run in one transaction. Dropping this future before commit
     /// leaves every row in place.
-    pub async fn prune_other_models(&self, model: &str) -> Result<u64, LexicalIndexError> {
+    pub async fn prune_other_models(&self, model: &str) -> Result<u64, RiftError> {
         let mut access = self.database.writing().await?;
         let mut transaction = access.transaction().await?;
         let dropped = self.count_other_models(&mut transaction, model).await?;
@@ -192,8 +195,11 @@ impl VectorStore {
             .bind(model.to_owned())
             .exec(&mut transaction)
             .await
-            .map_err(storage_error)?;
-        transaction.commit().await.map_err(storage_error)?;
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         Ok(dropped)
     }
 
@@ -202,7 +208,7 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the query or a delete fails.
+    /// Returns [`RiftError`] when the query or a delete fails.
     ///
     /// # Cancel safety
     ///
@@ -212,7 +218,7 @@ impl VectorStore {
         &self,
         model: &str,
         live: &BTreeSet<String>,
-    ) -> Result<u64, LexicalIndexError> {
+    ) -> Result<u64, RiftError> {
         let mut access = self.database.writing().await?;
         let mut transaction = access.transaction().await?;
         let stale: Vec<String> = model_digests(&mut transaction, model)
@@ -221,7 +227,10 @@ impl VectorStore {
             .filter(|digest| !live.contains(digest))
             .collect();
         if stale.is_empty() {
-            transaction.commit().await.map_err(storage_error)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
             return Ok(0);
         }
         for digest in &stale {
@@ -229,9 +238,12 @@ impl VectorStore {
                 .bind(address(model, digest))
                 .exec(&mut transaction)
                 .await
-                .map_err(storage_error)?;
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         }
-        transaction.commit().await.map_err(storage_error)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         Ok(stale.len() as u64)
     }
 
@@ -240,13 +252,13 @@ impl VectorStore {
         &self,
         executor: &mut impl toasty::Executor,
         model: &str,
-    ) -> Result<u64, LexicalIndexError> {
+    ) -> Result<u64, RiftError> {
         let rows = toasty::sql::query("SELECT COUNT(*) FROM semantic_vectors WHERE model <> ?1")
             .bind(model.to_owned())
             .column_types([Type::I64])
             .exec(executor)
             .await
-            .map_err(storage_error)?;
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         let Some(Value::Record(record)) = rows.first() else {
             return Ok(0);
         };
@@ -257,7 +269,7 @@ impl VectorStore {
     }
 
     /// A pooled connection carrying the workspace database's required pragmas.
-    async fn connection(&self) -> Result<Connection, LexicalIndexError> {
+    async fn connection(&self) -> Result<Connection, RiftError> {
         self.database.connection().await
     }
 }
@@ -266,13 +278,13 @@ impl VectorStore {
 async fn model_digests(
     executor: &mut impl toasty::Executor,
     model: &str,
-) -> Result<BTreeSet<String>, LexicalIndexError> {
+) -> Result<BTreeSet<String>, RiftError> {
     let rows = toasty::sql::query("SELECT digest FROM semantic_vectors WHERE model = ?1")
         .bind(model.to_owned())
         .column_types([Type::String])
         .exec(executor)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(rows.iter().filter_map(digest_of).collect())
 }
 

@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
-use rift_core::Error;
+use rift_error::errors;
 use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
 use tree_sitter::{Node, TreeCursor};
 
 use crate::document::{ByteRange, SyntaxNode, SyntaxSymbol};
-use crate::failure::{SyntaxError, SyntaxFault, position_overflow};
+use crate::failure::{RiftError, position_overflow};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
 /// Pushes one worklist entry per named child of `node`, reversed, so a
@@ -118,13 +118,13 @@ pub(crate) trait GrammarRules {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] when a grammar position cannot fit the wire
+    /// Returns [`RiftError`] when a grammar position cannot fit the wire
     /// width.
     fn declaration(
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError>;
+    ) -> Result<Option<Declaration>, RiftError>;
 
     /// The name child declarations nest under; `None` when `node` opens no
     /// scope.
@@ -135,7 +135,7 @@ pub(crate) trait GrammarRules {
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize;
 
     /// The grammar's exact declaration name field, absent for providers without one.
-    fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, SyntaxError> {
+    fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
         Ok(None)
     }
 
@@ -166,7 +166,7 @@ pub(crate) struct Declaration {
 }
 
 /// Converts one node's span to the wire byte width.
-pub(crate) fn byte_range(node: Node<'_>) -> Result<ByteRange, SyntaxError> {
+pub(crate) fn byte_range(node: Node<'_>) -> Result<ByteRange, RiftError> {
     let start =
         u64::try_from(node.start_byte()).map_err(|source| position_overflow(node, source))?;
     let end = u64::try_from(node.end_byte()).map_err(|source| position_overflow(node, source))?;
@@ -178,7 +178,7 @@ pub(crate) fn byte_range(node: Node<'_>) -> Result<ByteRange, SyntaxError> {
 ///
 /// # Errors
 ///
-/// Returns [`SyntaxError`] when the tree exceeds a bound or a position
+/// Returns [`RiftError`] when the tree exceeds a bound or a position
 /// cannot fit the wire width.
 pub(crate) fn extract(
     root: Node<'_>,
@@ -186,7 +186,7 @@ pub(crate) fn extract(
     limits: SyntaxLimits,
     language: &Language,
     rules: &dyn GrammarRules,
-) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), SyntaxError> {
+) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), RiftError> {
     let text = source.text;
     let mut nodes = Vec::new();
     let mut symbols = Vec::new();
@@ -208,10 +208,10 @@ pub(crate) fn extract(
             follows_named_sibling,
         } = queued;
         if depth > limits.syntax_depth_max() {
-            return Err(Error::new(SyntaxFault::TooDeep {
-                path: source.path.clone(),
-                syntax_depth_max: limits.syntax_depth_max(),
-            }));
+            return errors::syntax::too_deep()
+                .path(source.path)
+                .syntax_depth_max(limits.syntax_depth_max())
+                .fail();
         }
         assert!(
             nodes.len() < limits.syntax_nodes_max(),
@@ -248,7 +248,10 @@ pub(crate) fn extract(
         );
 
         if pending.len() + nodes.len() + node.named_child_count() > limits.syntax_nodes_max() {
-            return Err(too_many_nodes(source, limits));
+            return errors::syntax::too_many_nodes()
+                .path(source.path)
+                .syntax_nodes_max(limits.syntax_nodes_max())
+                .fail();
         }
         queue_children(
             &mut pending,
@@ -313,7 +316,7 @@ fn qualified_symbol(
     item_range: ByteRange,
     language: &Language,
     rules: &dyn GrammarRules,
-) -> Result<SyntaxSymbol, SyntaxError> {
+) -> Result<SyntaxSymbol, RiftError> {
     let node = visited.node();
     let start = rules.declaration_start(visited, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
@@ -404,13 +407,6 @@ fn callable_signature(
     })
 }
 
-fn too_many_nodes(source: SyntaxSource<'_>, limits: SyntaxLimits) -> SyntaxError {
-    Error::new(SyntaxFault::TooManyNodes {
-        path: source.path.clone(),
-        syntax_nodes_max: limits.syntax_nodes_max(),
-    })
-}
-
 fn qualify(separator: &str, parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.into()
@@ -428,7 +424,7 @@ mod tests {
     use tree_sitter::{Node, Parser};
 
     use super::{Declaration, GrammarRules, Visited, extract};
-    use crate::failure::SyntaxError;
+    use crate::failure::RiftError;
     use crate::provider::{SyntaxLimits, SyntaxSource};
 
     /// Rules that compare every visited node's recorded parent and previous
@@ -443,7 +439,7 @@ mod tests {
             &self,
             visited: Visited<'_, '_>,
             text: &str,
-        ) -> Result<Option<Declaration>, SyntaxError> {
+        ) -> Result<Option<Declaration>, RiftError> {
             let node = visited.node();
             let spelling = text.get(node.byte_range()).unwrap_or_default();
             assert_eq!(

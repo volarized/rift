@@ -8,18 +8,17 @@
 //! passes the same shape checks the document alone does; the caller then
 //! checks its bounds.
 
-use rift_protocol::configuration::ConfigurationViolation;
 use rift_protocol::schema::{
-    DeclaredKey, DocumentStep, ExpectedShape, declared_keys, declared_named_keys, declared_tables,
-    document_steps, expected_shape, named_member,
+    DeclaredKey, DocumentStep, declared_keys, declared_named_keys, declared_tables, document_steps,
+    expected_shape, named_member,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::constants::WORKSPACE_CONFIGURATION_FILE;
-use crate::error::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use crate::line::lines_inclusive;
+use rift_error::{RiftError, errors};
 
 /// Bytes a configuration document may hold, at most. The document states
 /// bounded tables and entries; one this large is not configuration.
@@ -30,182 +29,6 @@ pub const ENVIRONMENT_PREFIX: &str = "RIFT";
 
 /// Bytes one variable naming a configuration key may hold, at most.
 const VARIABLE_VALUE_BYTES_MAX: usize = 64 << 10;
-
-/// One configuration failure: why the document or a variable cannot be
-/// accepted.
-#[derive(Debug)]
-pub enum ConfigurationFault {
-    /// The document exists but its bytes could not be read.
-    Unreadable {
-        /// The document's path.
-        path: String,
-        /// The rendered I/O failure.
-        io: String,
-    },
-    /// A directory stands where the configuration document belongs. Reading
-    /// it can never succeed by retrying: the operator must remove or replace
-    /// it with the document.
-    IsDirectory {
-        /// The directory's path.
-        path: String,
-    },
-    /// The document is larger than configuration can be.
-    Oversized {
-        /// The document's size in bytes.
-        bytes: u64,
-        /// The accepted maximum in bytes.
-        bytes_max: u64,
-    },
-    /// The document is not the documented TOML shape: a syntax error, an
-    /// unknown key, a missing required key, or a malformed value.
-    Malformed {
-        /// Where the parser stopped, as `line <n> column <n>`. Absent when
-        /// the parser named no position in the document.
-        location: Option<String>,
-        /// The documented key the parser stopped inside, members joined by
-        /// `.`. Absent when it stopped before reaching one.
-        key: Option<String>,
-        /// What the documented shape accepts there, and a value it takes.
-        /// Boxed so one refusal's evidence does not widen every configuration
-        /// `Result` the crate returns.
-        shape: Box<ExpectedShape>,
-    },
-    /// A variable names a key and holds a value the key's documented shape
-    /// refuses.
-    VariableMalformed {
-        /// The variable's name, such as `RIFT_PROVIDERS_SYNTAX_MAX_NODES`.
-        variable: String,
-        /// The key the variable names, members joined by `.`.
-        key: String,
-        /// What the key accepts, and a value it takes.
-        shape: Box<ExpectedShape>,
-    },
-    /// A variable names a configuration table and no key the table declares.
-    VariableUnknown {
-        /// The variable's name.
-        variable: String,
-        /// The variables the table's keys accept, sorted.
-        accepted: Vec<String>,
-    },
-    /// A variable names a key and holds bytes that are not UTF-8.
-    VariableNotUnicode {
-        /// The variable's name.
-        variable: String,
-    },
-    /// The configuration parsed and one of its values breaks a documented
-    /// bound.
-    Invalid {
-        /// The bound the value breaks.
-        violation: ConfigurationViolation,
-        /// Variables that overrode a document key, sorted; the broken value
-        /// may be one of theirs. With none, the broken value is the
-        /// document's, and the context names the document.
-        variables: Vec<String>,
-    },
-}
-
-impl Fault for ConfigurationFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::Unreadable { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-            Self::IsDirectory { .. }
-            | Self::Oversized { .. }
-            | Self::Malformed { .. }
-            | Self::VariableMalformed { .. }
-            | Self::VariableUnknown { .. }
-            | Self::VariableNotUnicode { .. }
-            | Self::Invalid { .. } => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Unreadable { path, io } => in_file([
-                ErrorContext::new("path", path.clone()),
-                ErrorContext::new("io", io.clone()),
-            ]),
-            Self::IsDirectory { path } => in_file([
-                ErrorContext::new("path", path.clone()),
-                ErrorContext::new("detail", "the path is a directory"),
-            ]),
-            Self::Oversized { bytes, bytes_max } => in_file([
-                ErrorContext::new("bytes", bytes.to_string()),
-                ErrorContext::new("bytes_max", bytes_max.to_string()),
-            ]),
-            Self::Malformed {
-                location,
-                key,
-                shape,
-            } => in_file(
-                key.iter()
-                    .map(|key| ErrorContext::new("key", key.clone()))
-                    .chain(
-                        location
-                            .iter()
-                            .map(|location| ErrorContext::new("location", location.clone())),
-                    )
-                    .chain(shape_context(shape)),
-            ),
-            Self::VariableMalformed {
-                variable,
-                key,
-                shape,
-            } => [
-                ErrorContext::new("variable", variable.clone()),
-                ErrorContext::new("key", key.clone()),
-            ]
-            .into_iter()
-            .chain(shape_context(shape))
-            .collect(),
-            Self::VariableUnknown { variable, accepted } => vec![
-                ErrorContext::new("variable", variable.clone()),
-                ErrorContext::new("accepted", accepted.join(", ")),
-            ],
-            Self::VariableNotUnicode { variable } => vec![
-                ErrorContext::new("variable", variable.clone()),
-                ErrorContext::new("detail", "the value is not UTF-8"),
-            ],
-            Self::Invalid {
-                violation,
-                variables,
-            } if variables.is_empty() => in_file(violation.context()),
-            Self::Invalid {
-                violation,
-                variables,
-            } => violation
-                .context()
-                .into_iter()
-                .chain(std::iter::once(ErrorContext::new(
-                    "variables",
-                    variables.join(", "),
-                )))
-                .collect(),
-        }
-    }
-}
-
-/// One failure of the document, or of the configuration as a whole: the
-/// document's name first, then the failure's own evidence.
-fn in_file(evidence: impl IntoIterator<Item = ErrorContext>) -> Vec<ErrorContext> {
-    std::iter::once(ErrorContext::new("file", WORKSPACE_CONFIGURATION_FILE))
-        .chain(evidence)
-        .collect()
-}
-
-/// What a refused key accepts, and a value it takes.
-fn shape_context(shape: &ExpectedShape) -> Vec<ErrorContext> {
-    let mut context = Vec::new();
-    if !shape.accepted().is_empty() {
-        context.push(ErrorContext::new("accepted", shape.accepted().join(", ")));
-    }
-    if let Some(example) = shape.example() {
-        context.push(ErrorContext::new("example", example.to_string()));
-    }
-    context
-}
-
-/// Opaque configuration failure.
-pub type ConfigurationError = Error<ConfigurationFault>;
 
 /// The variables a configuration may be overridden from: every variable whose
 /// name starts with `RIFT_`.
@@ -315,14 +138,14 @@ pub struct NamedMembers<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`ConfigurationError`] when the document is larger than
+/// Returns [`RiftError`] when the document is larger than
 /// configuration can be or is not the documented shape, or when a variable
 /// naming the model's keys is not UTF-8, is not the key's shape, or names no
 /// key its table declares.
 pub fn accept_configuration<Model>(
     document: Option<&str>,
     environment: &ConfigurationEnvironment,
-) -> Result<AcceptedConfiguration<Model>, ConfigurationError>
+) -> Result<AcceptedConfiguration<Model>, RiftError>
 where
     Model: DeserializeOwned + JsonSchema + Default,
 {
@@ -339,7 +162,7 @@ pub fn accept_configuration_naming<Model>(
     document: Option<&str>,
     environment: &ConfigurationEnvironment,
     named: &[NamedMembers<'_>],
-) -> Result<AcceptedConfiguration<Model>, ConfigurationError>
+) -> Result<AcceptedConfiguration<Model>, RiftError>
 where
     Model: DeserializeOwned + JsonSchema + Default,
 {
@@ -386,7 +209,7 @@ fn matched_overrides(
     schema: &Value,
     environment: &ConfigurationEnvironment,
     named: &[NamedMembers<'_>],
-) -> Result<Vec<Override>, ConfigurationError> {
+) -> Result<Vec<Override>, RiftError> {
     let mut keys = declared_keys(schema);
     for members in named {
         keys.extend(declared_named_keys(schema, members.table, members.names));
@@ -399,9 +222,10 @@ fn matched_overrides(
             continue;
         };
         let Some(text) = value else {
-            return Err(Error::new(ConfigurationFault::VariableNotUnicode {
-                variable: variable.clone(),
-            }));
+            return errors::core::configuration_variable_not_unicode()
+                .variable(variable)
+                .detail("the value is not UTF-8")
+                .fail();
         };
         let value = variable_value(variable, key, text, schema)?;
         overrides.push(Override {
@@ -428,7 +252,7 @@ fn refuse_unknown(
     variable: &str,
     tables: &[String],
     keys: &[DeclaredKey],
-) -> Result<(), ConfigurationError> {
+) -> Result<(), RiftError> {
     let Some(table) = tables
         .iter()
         .find(|table| variable.starts_with(table.as_str()))
@@ -441,10 +265,10 @@ fn refuse_unknown(
         .filter(|name| name.starts_with(table.as_str()))
         .collect();
     accepted.sort();
-    Err(Error::new(ConfigurationFault::VariableUnknown {
-        variable: variable.to_owned(),
-        accepted,
-    }))
+    errors::core::configuration_variable_unknown()
+        .variable(variable)
+        .accepted(accepted.join(", "))
+        .fail()
 }
 
 /// One variable's value in document form: the text itself for a textual key,
@@ -454,9 +278,9 @@ fn variable_value(
     key: &DeclaredKey,
     text: &str,
     schema: &Value,
-) -> Result<toml::Value, ConfigurationError> {
+) -> Result<toml::Value, RiftError> {
     if text.len() > VARIABLE_VALUE_BYTES_MAX {
-        return Err(variable_malformed(variable, key, schema));
+        return variable_malformed(variable, key, schema).fail();
     }
     if key.is_textual() {
         return Ok(toml::Value::String(text.to_owned()));
@@ -501,20 +325,18 @@ fn insert_value(table: &mut toml::Table, path: &[String], value: toml::Value) {
 /// it stopped, what the documented shape accepts there, and a value it takes.
 /// The parser's own account is not carried: it speaks of Rust types and serde
 /// grammar, which name nothing the operator can write.
-fn accept_document<Model: DeserializeOwned>(
-    raw: &str,
-    schema: &Value,
-) -> Result<Model, ConfigurationError> {
+fn accept_document<Model: DeserializeOwned>(raw: &str, schema: &Value) -> Result<Model, RiftError> {
     let bytes = raw.len() as u64;
     if bytes > CONFIGURATION_FILE_BYTES_MAX {
-        return Err(Error::new(ConfigurationFault::Oversized {
-            bytes,
-            bytes_max: CONFIGURATION_FILE_BYTES_MAX,
-        }));
+        return errors::core::configuration_oversized()
+            .file(WORKSPACE_CONFIGURATION_FILE)
+            .bytes(bytes)
+            .bytes_max(CONFIGURATION_FILE_BYTES_MAX)
+            .fail();
     }
     let deserializer = match toml::Deserializer::parse(raw) {
         Ok(deserializer) => deserializer,
-        Err(error) => return Err(malformed_document(raw, error.span(), &[], schema)),
+        Err(error) => return malformed_document(raw, error.span(), &[], schema).fail(),
     };
     serde_path_to_error::deserialize(deserializer).map_err(|refused| {
         let steps = document_steps(refused.path());
@@ -531,7 +353,7 @@ fn accept_merged<Model: DeserializeOwned>(
     first: &Override,
     overrides: &[Override],
     schema: &Value,
-) -> Result<Model, ConfigurationError> {
+) -> Result<Model, RiftError> {
     serde_path_to_error::deserialize(toml::Value::Table(table)).map_err(|refused| {
         let stopped = document_steps(refused.path());
         let culprit = overrides
@@ -558,27 +380,35 @@ fn malformed_document(
     span: Option<std::ops::Range<usize>>,
     steps: &[DocumentStep<'_>],
     schema: &Value,
-) -> ConfigurationError {
+) -> RiftError {
     let shape = expected_shape(schema, steps);
-    Error::new(ConfigurationFault::Malformed {
-        location: span.map(|span| position_of(raw, span.start)),
-        key: named_member(&steps[..shape.followed()]),
-        shape: Box::new(shape),
-    })
+    let accepted = (!shape.accepted().is_empty()).then(|| shape.accepted().join(", "));
+    let example = shape.example().map(std::string::ToString::to_string);
+    errors::core::configuration_malformed()
+        .file(WORKSPACE_CONFIGURATION_FILE)
+        .maybe_location(span.map(|span| position_of(raw, span.start)))
+        .maybe_key(named_member(&steps[..shape.followed()]))
+        .maybe_accepted(accepted)
+        .maybe_example(example)
+        .error()
 }
 
 /// One refusal of a variable's value, described against its key's schema.
-fn variable_malformed(variable: &str, key: &DeclaredKey, schema: &Value) -> ConfigurationError {
+fn variable_malformed(variable: &str, key: &DeclaredKey, schema: &Value) -> RiftError {
     let steps: Vec<DocumentStep<'_>> = key
         .path()
         .iter()
         .map(|member| DocumentStep::Member(member))
         .collect();
-    Error::new(ConfigurationFault::VariableMalformed {
-        variable: variable.to_owned(),
-        key: key.path().join("."),
-        shape: Box::new(expected_shape(schema, &steps)),
-    })
+    let shape = expected_shape(schema, &steps);
+    let accepted = (!shape.accepted().is_empty()).then(|| shape.accepted().join(", "));
+    let example = shape.example().map(std::string::ToString::to_string);
+    errors::core::configuration_variable_malformed()
+        .variable(variable)
+        .key(key.path().join("."))
+        .maybe_accepted(accepted)
+        .maybe_example(example)
+        .error()
 }
 
 /// Where one byte offset stands in the document, counting lines and columns
@@ -603,27 +433,25 @@ mod tests {
     use rift_protocol::schema::{configuration_schema, declared_keys};
 
     use super::{
-        ConfigurationEnvironment, ConfigurationError, ConfigurationFault, NamedMembers,
-        accept_configuration, accept_configuration_naming, variable_name,
+        ConfigurationEnvironment, NamedMembers, RiftError, accept_configuration,
+        accept_configuration_naming, variable_name,
     };
-    use crate::error::{ErrorContext, Fault};
+    use rift_error::ErrorContext;
 
     fn accept(
         document: Option<&str>,
         variables: &[(&str, &str)],
-    ) -> Result<(WorkspaceConfiguration, Vec<String>), ConfigurationError> {
+    ) -> Result<(WorkspaceConfiguration, Vec<String>), RiftError> {
         let environment = ConfigurationEnvironment::from_variables(variables.iter().copied());
         accept_configuration::<WorkspaceConfiguration>(document, &environment)
             .map(super::AcceptedConfiguration::into_parts)
     }
 
-    fn context_value(error: &ConfigurationError, name: &str) -> Option<String> {
+    fn context_value(error: &RiftError, name: &str) -> Option<String> {
         error
-            .fault()
             .context()
-            .into_iter()
-            .find(|entry| entry.key() == name)
-            .map(|entry| entry.value().to_owned())
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
     }
 
     #[test]
@@ -725,7 +553,7 @@ mod tests {
         let error = accept(None, &[("RIFT_DOCUMENTATION_INCLUDE", r#"["docs/**"]"#)])
             .expect_err("the table declares no include key");
         assert!(
-            matches!(error.fault(), ConfigurationFault::VariableUnknown { .. }),
+            error.slug().as_str() == "rift.core.configuration_variable_unknown",
             "{error:?}"
         );
     }
@@ -739,7 +567,7 @@ mod tests {
         ] {
             let error = accept(None, &[(variable, value)]).expect_err(value);
             assert!(
-                matches!(error.fault(), ConfigurationFault::VariableMalformed { .. }),
+                error.slug().as_str() == "rift.core.configuration_variable_malformed",
                 "{error:?}"
             );
             assert_eq!(context_value(&error, "variable").as_deref(), Some(variable));
@@ -772,7 +600,7 @@ mod tests {
         ] {
             let error = accept(None, &[(variable, "1")]).expect_err(variable);
             assert!(
-                matches!(error.fault(), ConfigurationFault::VariableUnknown { .. }),
+                error.slug().as_str() == "rift.core.configuration_variable_unknown",
                 "{error:?}"
             );
         }
@@ -807,10 +635,10 @@ mod tests {
         };
         let error = accept_configuration::<WorkspaceConfiguration>(None, &environment)
             .expect_err("a key's variable must be UTF-8");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::VariableNotUnicode { .. }
-        ));
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.configuration_variable_not_unicode"
+        );
     }
 
     #[test]
@@ -820,10 +648,7 @@ mod tests {
             &[("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "5000000")],
         )
         .expect_err("the document names an unknown key");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::Malformed { .. }
-        ));
+        assert_eq!(error.slug().as_str(), "rift.core.configuration_malformed");
         assert_eq!(
             context_value(&error, "location").as_deref(),
             Some("line 2 column 1")
@@ -835,10 +660,7 @@ mod tests {
         let oversized =
             "#".repeat(usize::try_from(super::CONFIGURATION_FILE_BYTES_MAX + 1).expect("fits"));
         let error = accept(Some(&oversized), &[]).expect_err("oversized");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::Oversized { .. }
-        ));
+        assert_eq!(error.slug().as_str(), "rift.core.configuration_oversized");
     }
 
     #[test]
@@ -858,27 +680,26 @@ mod tests {
 
     #[test]
     fn test_invalid_names_the_variables_that_overrode_keys_or_else_the_file() {
-        let invalid = |variables: &[&str]| ConfigurationFault::Invalid {
-            violation: rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange {
-                field: "providers.syntax.max_nodes",
-                value: 0,
-                min: 1,
-                max: 100_000_000,
-            },
-            variables: variables.iter().map(|name| (*name).to_owned()).collect(),
+        let violation = rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange {
+            field: "providers.syntax.max_nodes",
+            value: 0,
+            min: 1,
+            max: 100_000_000,
         };
-        let file = ErrorContext::new("file", crate::constants::WORKSPACE_CONFIGURATION_FILE);
-
-        let overridden = invalid(&["RIFT_PROVIDERS_SYNTAX_MAX_NODES"]).context();
-        assert!(overridden.contains(&ErrorContext::new(
-            "variables",
-            "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
-        )));
-        assert!(
-            !overridden.contains(&file),
-            "a value a variable may have set is not the document's: {overridden:?}"
+        let overridden = crate::configuration::configuration_violation_error(&violation).with(
+            ErrorContext::new("variables", "RIFT_PROVIDERS_SYNTAX_MAX_NODES"),
         );
-        assert!(invalid(&[]).context().contains(&file));
+        assert!(overridden.context().any(|(key, value)| {
+            key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
+        }));
+        assert!(!overridden.context().any(|(key, _)| key == "file"));
+
+        let file_error = crate::configuration::configuration_violation_error(&violation).with(
+            ErrorContext::new("file", crate::constants::WORKSPACE_CONFIGURATION_FILE),
+        );
+        assert!(file_error.context().any(|(key, value)| {
+            key == "file" && value == crate::constants::WORKSPACE_CONFIGURATION_FILE
+        }));
     }
 
     /// A position is counted the way an editor counts, from one, and a byte
@@ -897,7 +718,7 @@ mod tests {
 
     fn accept_naming(
         variables: &[(&str, &str)],
-    ) -> Result<(WorkspaceConfiguration, Vec<String>), ConfigurationError> {
+    ) -> Result<(WorkspaceConfiguration, Vec<String>), RiftError> {
         let environment = ConfigurationEnvironment::from_variables(variables.iter().copied());
         let named = [NamedMembers {
             table: "languages",
@@ -944,7 +765,7 @@ mod tests {
         ] {
             let error = accept_naming(&[(variable, "false")]).expect_err(variable);
             assert!(
-                matches!(error.fault(), ConfigurationFault::VariableUnknown { .. }),
+                error.slug().as_str() == "rift.core.configuration_variable_unknown",
                 "{error:?}"
             );
             assert!(
@@ -954,9 +775,9 @@ mod tests {
         }
         let error = accept_naming(&[("RIFT_LANGUAGES_RUST_ENABLED", "maybe")])
             .expect_err("a bool key refuses text");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::VariableMalformed { .. }
-        ));
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.configuration_variable_malformed"
+        );
     }
 }

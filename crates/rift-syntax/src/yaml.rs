@@ -42,13 +42,13 @@
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
-use rift_core::Error;
+use rift_error::errors;
 use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
 use crate::extract::{self, Declaration, GrammarRules, Visited};
-use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Grammar spelling of a `document`.
@@ -223,7 +223,7 @@ impl YamlRules {
         &self,
         pair: Node<'_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let Some(name) = self.entry_name(pair, text) else {
             return Ok(None);
         };
@@ -253,7 +253,7 @@ impl YamlRules {
 
     /// The declaration of one document in a multi-document stream, named by
     /// its ordinal, with the content node's span as the body.
-    fn document_declaration(&self, document: Node<'_>) -> Result<Option<Declaration>, SyntaxError> {
+    fn document_declaration(&self, document: Node<'_>) -> Result<Option<Declaration>, RiftError> {
         let Some(ordinal) = self.document_ordinal(document) else {
             return Ok(None);
         };
@@ -269,7 +269,7 @@ impl YamlRules {
     }
 
     /// The document's content span; `None` for a bare `---`.
-    fn document_body_range(&self, document: Node<'_>) -> Result<Option<ByteRange>, SyntaxError> {
+    fn document_body_range(&self, document: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
         let mut cursor = document.walk();
         let content = document.named_children(&mut cursor).find(|child| {
             child.kind_id() == self.kinds.block_node || child.kind_id() == self.kinds.flow_node
@@ -286,7 +286,7 @@ impl GrammarRules for YamlRules {
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         let id = node.kind_id();
         if id == self.kinds.block_mapping_pair || id == self.kinds.flow_pair {
@@ -347,18 +347,20 @@ impl SyntaxProvider for YamlSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let grammar = yaml_grammar();
         let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .map_err(|_| incompatible_grammar(&grammar))?;
-        let tree = parser.parse(source.text, None).ok_or_else(|| {
-            Error::new(SyntaxFault::ParseCancelled {
-                path: Some(source.path.clone()),
-            })
+        parser.set_language(&grammar).map_err(|_| {
+            errors::syntax::incompatible_grammar()
+                .grammar_abi_version(grammar.abi_version())
+                .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+                .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+                .error()
         })?;
+        let tree = parser
+            .parse(source.text, None)
+            .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let rules = YamlRules::new(yaml_kinds(), tree.root_node());
         let (nodes, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
@@ -420,7 +422,6 @@ mod tests {
     use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, ProjectPath};
 
     use super::*;
-    use crate::failure::SyntaxViolation;
 
     fn path() -> ProjectPath {
         ProjectPath::new("deploy/pipeline.yaml").expect("valid fixture path")
@@ -727,8 +728,8 @@ mod tests {
         )
         .expect_err("source bound");
         assert_eq!(
-            source_error.fault().violation(),
-            SyntaxViolation::SourceTooLarge
+            source_error.slug(),
+            rift_error::errors::syntax::source_too_large::SLUG
         );
 
         let node_error = bounded(
@@ -737,8 +738,8 @@ mod tests {
         )
         .expect_err("node bound");
         assert_eq!(
-            node_error.fault().violation(),
-            SyntaxViolation::TooManyNodes
+            node_error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
 
         let depth_error = bounded(
@@ -746,7 +747,10 @@ mod tests {
             "a:\n  b: 1\n",
         )
         .expect_err("depth bound");
-        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
+        assert_eq!(
+            depth_error.slug(),
+            rift_error::errors::syntax::too_deep::SLUG
+        );
     }
 
     /// Deep nesting stays well inside the default depth budget.

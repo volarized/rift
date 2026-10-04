@@ -52,13 +52,13 @@
 
 use std::sync::OnceLock;
 
-use rift_core::Error;
+use rift_error::errors;
 use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
 use crate::extract::{self, Declaration, GrammarRules, Visited};
-use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Grammar spelling of a `pair`, one `key = value` line.
@@ -249,7 +249,7 @@ impl TomlRules {
         &self,
         pair: Node<'_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let (key, value) = self.pair_children(pair);
         let Some(name) = key.and_then(|key| self.key_name(key, text)) else {
             return Ok(None);
@@ -290,7 +290,7 @@ impl GrammarRules for TomlRules {
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         let id = node.kind_id();
         if id == self.kinds.pair {
@@ -352,18 +352,20 @@ impl SyntaxProvider for TomlSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let grammar = toml_grammar();
         let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .map_err(|_| incompatible_grammar(&grammar))?;
-        let tree = parser.parse(source.text, None).ok_or_else(|| {
-            Error::new(SyntaxFault::ParseCancelled {
-                path: Some(source.path.clone()),
-            })
+        parser.set_language(&grammar).map_err(|_| {
+            errors::syntax::incompatible_grammar()
+                .grammar_abi_version(grammar.abi_version())
+                .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+                .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+                .error()
         })?;
+        let tree = parser
+            .parse(source.text, None)
+            .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let rules = TomlRules {
             kinds: toml_kinds(),
         };
@@ -419,7 +421,6 @@ mod tests {
     use rift_core::ProjectPath;
 
     use super::*;
-    use crate::failure::SyntaxViolation;
 
     fn path() -> ProjectPath {
         ProjectPath::new("rift.toml").expect("valid fixture path")
@@ -723,8 +724,8 @@ mod tests {
         )
         .expect_err("source bound");
         assert_eq!(
-            source_error.fault().violation(),
-            SyntaxViolation::SourceTooLarge
+            source_error.slug(),
+            rift_error::errors::syntax::source_too_large::SLUG
         );
 
         let node_error = bounded(
@@ -733,8 +734,8 @@ mod tests {
         )
         .expect_err("node bound");
         assert_eq!(
-            node_error.fault().violation(),
-            SyntaxViolation::TooManyNodes
+            node_error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
 
         let depth_error = bounded(
@@ -742,7 +743,10 @@ mod tests {
             "a = { b = 1 }\n",
         )
         .expect_err("depth bound");
-        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
+        assert_eq!(
+            depth_error.slug(),
+            rift_error::errors::syntax::too_deep::SLUG
+        );
     }
 
     #[test]

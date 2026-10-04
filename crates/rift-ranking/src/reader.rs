@@ -9,9 +9,9 @@
 use std::pin::Pin;
 
 use crate::document::{CorpusRevision, DocumentIdentity, FieldSet, IndexDocument};
-use crate::error::{RankingError, RankingFault, RankingViolation};
 use crate::fusion::{RankingInput, RankingInputKind, RankingInputSet};
 use crate::query::{ParsedQuery, QueryPhase};
+use rift_error::{ErrorContext, RiftError, errors};
 
 /// A future a reader returns. Readers are asynchronous because some of them
 /// hold a database; declaring the future here keeps the contract usable
@@ -115,13 +115,12 @@ impl IndexCapabilities {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] naming the mismatch.
-    pub fn accepts(&self, other: &Self) -> Result<(), RankingError> {
+    /// Returns [`RiftError`] naming the mismatch.
+    pub fn accepts(&self, other: &Self) -> Result<(), RiftError> {
         if let Some(mismatch) = self.mismatch(other) {
-            return Err(RankingError::new(
-                RankingFault::new(RankingViolation::CapabilitiesIncompatible)
-                    .about(mismatch.subject()),
-            ));
+            return errors::ranking::capabilities_incompatible()
+                .with(ErrorContext::new("mismatch", mismatch.subject()))
+                .fail();
         }
         Ok(())
     }
@@ -249,22 +248,22 @@ pub trait IndexReader: Send + Sync {
     fn rank<'a>(
         &'a self,
         request: RankRequest<'a>,
-    ) -> ReaderFuture<'a, Result<RankingInput, RankingError>>;
+    ) -> ReaderFuture<'a, Result<RankingInput, RiftError>>;
 
     /// Reads one document by its stable identity, or `None` when this index
     /// does not hold it.
     fn document<'a>(
         &'a self,
         identity: &'a DocumentIdentity,
-    ) -> ReaderFuture<'a, Result<Option<IndexDocument>, RankingError>>;
+    ) -> ReaderFuture<'a, Result<Option<IndexDocument>, RiftError>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{CapabilityMismatch, IndexCapabilities, PublicationFormat};
     use crate::document::{CorpusRevision, FieldSet, SearchableField};
-    use crate::error::RankingViolation;
     use crate::fusion::{RankingInputKind, RankingInputSet};
+    use rift_error::ErrorSlug;
 
     fn capabilities(format: PublicationFormat, revision: CorpusRevision) -> IndexCapabilities {
         IndexCapabilities::new(
@@ -320,9 +319,8 @@ mod tests {
         assert_eq!(
             held.accepts(&other)
                 .expect_err("another format must be refused")
-                .fault()
-                .violation(),
-            RankingViolation::CapabilitiesIncompatible
+                .slug(),
+            ErrorSlug::new("rift.ranking.capabilities_incompatible")
         );
     }
 

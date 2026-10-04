@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rift_core::causes;
+use rift_error::causes;
 use rift_index::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use rift_protocol::configuration::LogsConfiguration;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
@@ -1342,11 +1342,11 @@ mod tests {
 
     #[test]
     fn a_failure_renders_its_causes_after_its_own_text() {
-        let refused = rift_core::Error::new(crate::election::ElectionFault::Storage {
-            operation: "publish",
-            path: std::path::PathBuf::from(".rift/server.json"),
-            source: std::io::Error::other("disk full"),
-        });
+        let refused = rift_error::errors::mcp::election_storage_failed()
+            .operation("publish")
+            .path(std::path::Path::new(".rift/server.json"))
+            .source(std::io::Error::other("disk full"))
+            .error();
         assert_eq!(caused_by(&refused), ": disk full");
         assert_eq!(caused_by(&std::io::Error::other("disk full")), "");
     }

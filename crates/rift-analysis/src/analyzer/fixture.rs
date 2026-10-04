@@ -6,7 +6,7 @@ use rift_protocol::index::PackagePublication;
 use rift_protocol::read::{Language, PackageIdentity};
 use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
-use super::{PackageAnalysis, PackageAnalysisError, PackageAnalyzer};
+use super::{PackageAnalysis, PackageAnalyzer, RiftError};
 use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
 
 /// The package every fixture is analyzed as.
@@ -45,7 +45,7 @@ pub(super) fn package_result(
     shipped: ShippedLanguage,
     files: Vec<(&str, &str)>,
     syntax: Option<SyntaxLimits>,
-) -> Result<PackageAnalysis, PackageAnalysisError> {
+) -> Result<PackageAnalysis, RiftError> {
     let package = identity();
     let language = language(shipped);
     let origin = origin(&package);

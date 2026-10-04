@@ -15,7 +15,8 @@ use rift_protocol::read::PathPattern;
 
 use super::PACKAGE_ROOT;
 use super::context7::Context7;
-use crate::glob::{PathMatcher, PathVerdict, SourcePatternError};
+use crate::glob::{PathMatcher, PathVerdict};
+use rift_error::RiftError;
 
 /// Documentation file names left out by default, wherever they sit: change logs,
 /// licenses, and codes of conduct.
@@ -113,9 +114,9 @@ impl DocumentationSelection {
     ///
     /// # Errors
     ///
-    /// Returns [`SourcePatternError`] when an `exclude` or `force_include` pattern is not a
+    /// Returns [`RiftError`] when an `exclude` or `force_include` pattern is not a
     /// valid glob.
-    pub fn new(configuration: &DocumentationConfiguration) -> Result<Self, SourcePatternError> {
+    pub fn new(configuration: &DocumentationConfiguration) -> Result<Self, RiftError> {
         Ok(Self {
             enabled: configuration.enabled,
             exclude: GlobList::compile(&pattern_strings(&configuration.exclude))?,
@@ -137,8 +138,8 @@ impl DocumentationSelection {
     ///
     /// # Errors
     ///
-    /// Returns [`SourcePatternError`] when a folder the file names is not a valid glob.
-    pub fn narrowed_by(mut self, context7: &Context7) -> Result<Self, SourcePatternError> {
+    /// Returns [`RiftError`] when a folder the file names is not a valid glob.
+    pub fn narrowed_by(mut self, context7: &Context7) -> Result<Self, RiftError> {
         if context7.disallows() {
             self.enabled = false;
         }
@@ -222,7 +223,7 @@ fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {
 struct GlobList(Option<PathMatcher>);
 
 impl GlobList {
-    fn compile(patterns: &[String]) -> Result<Self, SourcePatternError> {
+    fn compile(patterns: &[String]) -> Result<Self, RiftError> {
         if patterns.is_empty() {
             return Ok(Self(None));
         }
@@ -372,7 +373,10 @@ mod tests {
             ..DocumentationConfiguration::default()
         })
         .expect_err("an unclosed character class is refused");
-        assert_eq!(error.fault().pattern(), Some("docs/[guide"));
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "pattern").as_deref(),
+            Some("docs/[guide")
+        );
     }
 
     /// A package's `context7.json` narrows the selection within the defaults: its folders
@@ -433,6 +437,9 @@ mod tests {
         let error = compiled(&DocumentationConfiguration::default())
             .narrowed_by(&context7)
             .expect_err("an unclosed character class is refused");
-        assert_eq!(error.fault().pattern(), Some("docs/[api"));
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "pattern").as_deref(),
+            Some("docs/[api")
+        );
     }
 }

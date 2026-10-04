@@ -19,10 +19,11 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_dependency::DependencyContext;
+use rift_error::{RiftError, errors};
 use rift_index::{
     ChangeSet, FileRecord, LastCapture, LexicalChange, LexicalStamp, PathChanges, TrigramBatch,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexPreparation, WorkspaceSourcePolicy, capture_digests_with_languages_cancellable,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceIndexPreparation,
+    WorkspaceSourcePolicy, capture_digests_with_languages_cancellable,
     capture_selected_paths_cancellable,
 };
 use rift_protocol::configuration::{
@@ -36,10 +37,9 @@ use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::ReadWarning;
 use rift_protocol::source::SourceConfiguration;
 use rift_ranking::IndexDocument;
-use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
+use rift_search::{Embedding, SearchIndex, VectorReadiness};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
-    ReadService, ReadServiceBuild, load_configuration,
+    CONFIGURATION_FILE_BYTES_MAX, LspProcessKey, ReadService, ReadServiceBuild, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::failure::WireFailure;
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
 use crate::server::{BlockingExecutor, EngineHold};
 
 /// Filesystem events coalesced while one rebuild is pending.
@@ -232,20 +232,23 @@ fn observed_records(
 ///
 /// # Errors
 ///
-/// Returns [`WorkspaceIndexError`] when the read fails for any other reason.
+/// Returns [`RiftError`] when the read fails for any other reason.
 fn observed_record(
     policy: &WorkspaceSourcePolicy,
     root: &Path,
     path: &ProjectPath,
-) -> Result<Option<FileRecord>, WorkspaceIndexError> {
+) -> Result<Option<FileRecord>, RiftError> {
     let absolute = root.join(path.as_str());
     match policy.visible_digest(&absolute) {
         Ok(digest) => Ok(digest.map(FileRecord::Digest)),
         Err(_) if absolute.is_dir() => Ok(None),
-        Err(error) => match error.fault().left_out_file(path.clone()) {
-            Some(warning) => Ok(Some(FileRecord::LeftOut(warning))),
-            None => Err(error),
-        },
+        Err(error) if error.slug() == errors::index::workspace_file_too_large::SLUG => Ok(Some(
+            FileRecord::LeftOut(rift_index::WorkspaceIndexWarning::FileTooLarge {
+                path: path.clone(),
+                error: Arc::new(error),
+            }),
+        )),
+        Err(error) => error.fail(),
     }
 }
 
@@ -316,7 +319,7 @@ impl PublishedWorkspace {
         root: &Path,
         reads: &ReadService,
         paths: &BTreeSet<ProjectPath>,
-    ) -> Result<VisibleWorkspaceFiles, ReadError> {
+    ) -> Result<VisibleWorkspaceFiles, RiftError> {
         if self.preparation.is_some() {
             return Ok(VisibleWorkspaceFiles {
                 digests: Arc::new(reads.content_digests()),
@@ -356,7 +359,7 @@ impl PublishedWorkspace {
                     digests.remove(path);
                     refused.insert(path.clone(), warning);
                 }
-                Err(error) => return Err(ReadFault::index(error)),
+                Err(error) => return error.fail(),
             }
         }
         Ok(VisibleWorkspaceFiles {
@@ -459,12 +462,12 @@ fn publication_map(
 #[derive(Debug)]
 pub(crate) struct IndexState {
     pub(crate) current: Arc<PublishedWorkspace>,
-    pub(crate) failure: Option<(u64, Arc<ReadError>)>,
+    pub(crate) failure: Option<(u64, Arc<RiftError>)>,
 }
 
 impl IndexState {
     /// Clones one validated publication and its latest failure.
-    pub(crate) fn snapshot(&self) -> (Arc<PublishedWorkspace>, Option<(u64, Arc<ReadError>)>) {
+    pub(crate) fn snapshot(&self) -> (Arc<PublishedWorkspace>, Option<(u64, Arc<RiftError>)>) {
         (Arc::clone(&self.current), self.failure.clone())
     }
 
@@ -487,7 +490,7 @@ impl IndexState {
         &mut self,
         epoch: u64,
         observed_epoch: u64,
-        error: ReadError,
+        error: RiftError,
     ) -> bool {
         if epoch != observed_epoch {
             return false;
@@ -562,7 +565,7 @@ pub(crate) struct IndexSupervisorContext {
 /// request and an unchanged one is not re-parsed per call.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigurationState {
-    pub(crate) accepted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
+    pub(crate) accepted: Result<WorkspaceConfiguration, Arc<RiftError>>,
     pub(crate) fingerprint: ConfigurationFingerprint,
 }
 
@@ -584,7 +587,7 @@ impl ConfigurationState {
     ) -> Result<WorkspaceConfiguration, ErrorData> {
         match &self.accepted {
             Ok(configuration) => Ok(configuration.clone()),
-            Err(error) => Err(error.tool_error(phase)),
+            Err(error) => error.mcp().tool_error(phase).fail(),
         }
     }
 
@@ -631,7 +634,7 @@ impl ConfigurationState {
     pub(crate) fn index_limits(
         &self,
         base: WorkspaceIndexLimits,
-    ) -> Result<WorkspaceIndexLimits, ReadError> {
+    ) -> Result<WorkspaceIndexLimits, RiftError> {
         let source = self.source_configuration();
         let files_max = usize::try_from(source.files).unwrap_or(usize::MAX);
         let workspace_bytes_max =
@@ -642,7 +645,6 @@ impl ConfigurationState {
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
             .and_then(|limits| limits.with_syntax_configuration(&syntax))
             .map(|limits| limits.with_large_files(large_files))
-            .map_err(|error| ReadError::from(ReadFault::Index(error)))
     }
 
     /// The `[source]` policy from the last acceptance, or the default policy
@@ -861,7 +863,7 @@ impl IndexValidation {
 
     /// Records one observation that names no path, so the next rebuild reads every visible
     /// file.
-    pub(crate) fn observe_whole_workspace(&self) -> Result<u64, ReadError> {
+    pub(crate) fn observe_whole_workspace(&self) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         publication.escalate();
         let result = self.observe_locked(&mut publication);
@@ -873,7 +875,7 @@ impl IndexValidation {
     pub(crate) fn observe_paths(
         &self,
         paths: impl IntoIterator<Item = ProjectPath>,
-    ) -> Result<u64, ReadError> {
+    ) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         publication.retain(paths, self.paths_max);
         let result = self.observe_locked(&mut publication);
@@ -882,7 +884,7 @@ impl IndexValidation {
     }
 
     /// Marks watcher unhealthy and records invalidation in one critical section.
-    pub(crate) fn observe_watch_failure(&self) -> Result<u64, ReadError> {
+    pub(crate) fn observe_watch_failure(&self) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         self.watch_failed.store(true, Ordering::Release);
         publication.escalate();
@@ -922,7 +924,7 @@ impl IndexValidation {
     }
 
     /// Records one invalidation while caller owns publication lane.
-    fn observe_locked(&self, pending: &mut PendingWork) -> Result<u64, ReadError> {
+    fn observe_locked(&self, pending: &mut PendingWork) -> Result<u64, RiftError> {
         let previous = self
             .observed_epoch
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
@@ -931,7 +933,10 @@ impl IndexValidation {
             .map_err(|_| {
                 self.watch_failed.store(true, Ordering::Release);
                 pending.escalate();
-                ReadFault::unavailable("index observation", "filesystem event epoch exhausted")
+                errors::server::read_unavailable()
+                    .operation("index observation")
+                    .detail("filesystem event epoch exhausted")
+                    .error()
             })?;
         let epoch = previous + 1;
         match self.invalidations.try_send(()) {
@@ -939,10 +944,10 @@ impl IndexValidation {
             Err(mpsc::error::TrySendError::Closed(())) => {
                 self.watch_failed.store(true, Ordering::Release);
                 pending.escalate();
-                return Err(ReadFault::unavailable(
-                    "index observation",
-                    "index supervisor is not running",
-                ));
+                return errors::server::read_unavailable()
+                    .operation("index observation")
+                    .detail("index supervisor is not running")
+                    .fail();
             }
         }
         Ok(epoch)
@@ -987,7 +992,7 @@ impl IndexValidation {
     /// Classifies and observes one event within the publication critical section, so the
     /// paths it names cannot be lost between the classification and the epoch that
     /// promises to cover them.
-    fn observe_event(&self, roots: &WatchRoots, event: &Event) -> Result<Option<u64>, ReadError> {
+    fn observe_event(&self, roots: &WatchRoots, event: &Event) -> Result<Option<u64>, RiftError> {
         let mut publication = self.locked_pending();
         let result = match watch_event_impact(roots, self, event) {
             WatchImpact::None => Ok(None),
@@ -1122,26 +1127,31 @@ impl IndexSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the task panics or outlasts `deadline`.
+    /// Returns [`RiftError`] when the task panics or outlasts `deadline`.
     ///
     /// # Cancel safety
     ///
     /// Cancellation is requested before the join begins. Dropping this future
     /// after it takes task ownership detaches that terminating task.
-    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), ReadError> {
+    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), RiftError> {
         self.validation.cancellation.cancel();
         let Some(mut task) = self.validation.task.lock().await.take() else {
             return Ok(());
         };
         if let Ok(result) = tokio::time::timeout_at(deadline, &mut task).await {
-            result.map_err(|error| ReadFault::task("index supervisor shutdown", error.to_string()))
+            result.map_err(|error| {
+                errors::server::read_task()
+                    .operation("index supervisor shutdown")
+                    .detail(error.to_string())
+                    .error()
+            })
         } else {
             task.abort();
             let _ = task.await;
-            Err(ReadFault::unavailable(
-                "index supervisor shutdown",
-                "shutdown deadline elapsed",
-            ))
+            errors::server::read_unavailable()
+                .operation("index supervisor shutdown")
+                .detail("shutdown deadline elapsed")
+                .fail()
         }
     }
 }
@@ -1166,10 +1176,14 @@ impl WatchRoots {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when `root` cannot be canonicalized.
-    pub(crate) fn resolve(root: &Path) -> Result<Self, ReadError> {
-        let canonical = std::fs::canonicalize(root)
-            .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+    /// Returns [`RiftError`] when `root` cannot be canonicalized.
+    pub(crate) fn resolve(root: &Path) -> Result<Self, RiftError> {
+        let canonical = std::fs::canonicalize(root).map_err(|error| {
+            errors::server::read_unavailable()
+                .operation("workspace watch")
+                .detail(error.to_string())
+                .error()
+        })?;
         Ok(Self {
             git_directory: rift_history::Repository::open(&canonical)
                 .ok()
@@ -1224,14 +1238,14 @@ impl WatchRoots {
 /// One watcher start over a workspace root: the native watcher production runs, or a test's
 /// watcher on no path.
 pub(crate) trait WatchWorkspace:
-    FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, ReadError>
+    FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, RiftError>
     + Send
     + 'static
 {
 }
 
 impl<Watch> WatchWorkspace for Watch where
-    Watch: FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, ReadError>
+    Watch: FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, RiftError>
         + Send
         + 'static
 {
@@ -1241,21 +1255,36 @@ impl<Watch> WatchWorkspace for Watch where
 pub(crate) fn workspace_watcher(
     root: &Path,
     validation: &Arc<IndexValidation>,
-) -> Result<notify::RecommendedWatcher, ReadError> {
+) -> Result<notify::RecommendedWatcher, RiftError> {
     let roots = WatchRoots::resolve(root)?;
     let event_roots = roots.clone();
     let validation = Arc::clone(validation);
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         report_watch_outcome(&event_roots, &validation, result);
     })
-    .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+    .map_err(|error| {
+        errors::server::read_unavailable()
+            .operation("workspace watch")
+            .detail(error.to_string())
+            .error()
+    })?;
     watcher
         .watch(roots.canonical(), RecursiveMode::Recursive)
-        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+        .map_err(|error| {
+            errors::server::read_unavailable()
+                .operation("workspace watch")
+                .detail(error.to_string())
+                .error()
+        })?;
     if let Some(git_directory) = &roots.git_directory {
         watcher
             .watch(git_directory, RecursiveMode::NonRecursive)
-            .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+            .map_err(|error| {
+                errors::server::read_unavailable()
+                    .operation("workspace watch")
+                    .detail(error.to_string())
+                    .error()
+            })?;
     }
     Ok(watcher)
 }
@@ -1269,14 +1298,18 @@ pub(crate) fn workspace_watcher(
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when the platform refuses to create a watcher.
+/// Returns [`RiftError`] when the platform refuses to create a watcher.
 #[cfg(test)]
 pub(crate) fn unwatched(
     _root: &Path,
     _validation: &Arc<IndexValidation>,
-) -> Result<notify::RecommendedWatcher, ReadError> {
-    notify::recommended_watcher(|_: notify::Result<Event>| {})
-        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))
+) -> Result<notify::RecommendedWatcher, RiftError> {
+    notify::recommended_watcher(|_: notify::Result<Event>| {}).map_err(|error| {
+        errors::server::read_unavailable()
+            .operation("workspace watch")
+            .detail(error.to_string())
+            .error()
+    })
 }
 
 /// Observes one watcher callback: a delivered event enters the inclusion filter, and a
@@ -1551,17 +1584,16 @@ pub(crate) fn empty_workspace_preparation(
     configuration: ConfigurationState,
     epoch: u64,
     content_cache: rift_index::WorkspaceContentCache,
-) -> Result<(Arc<PublishedWorkspace>, WorkspaceIndexPreparation), ReadError> {
+) -> Result<(Arc<PublishedWorkspace>, WorkspaceIndexPreparation), RiftError> {
     let limits = configuration.index_limits(limits)?;
     let preparation = WorkspaceIndexPreparation::new(
         root,
         limits,
         &configuration.text_inclusion(),
         &configuration.language_file_selections(),
-    )
-    .map_err(ReadFault::index)?
+    )?
     .with_content_cache(content_cache);
-    let index = preparation.empty_snapshot().map_err(ReadFault::index)?;
+    let index = preparation.empty_snapshot()?;
     let reads = ReadService::from_prepared_index(
         index,
         None,
@@ -1598,7 +1630,7 @@ pub(crate) fn capture_prepared_workspace(
     published: &PublishedWorkspace,
     last: &LastCapture,
     cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<(WorkspaceDigests, LastCapture), ReadError> {
+) -> Result<(WorkspaceDigests, LastCapture), RiftError> {
     let limits = published.reads.workspace_limits();
     if let Some(preparation) = &published.preparation {
         return capture_selected_paths_cancellable(
@@ -1608,8 +1640,7 @@ pub(crate) fn capture_prepared_workspace(
             &preparation.other_paths,
             last,
             cancelled,
-        )
-        .map_err(ReadFault::index);
+        );
     }
     let visibility = published.configuration.source_visibility();
     let text_inclusion = published.configuration.text_inclusion();
@@ -1623,18 +1654,17 @@ pub(crate) fn capture_prepared_workspace(
         last,
         cancelled,
     )
-    .map_err(ReadFault::index)
 }
 
 /// One candidate capture: the whole-workspace scan, or a test's stand-in for it.
 pub(crate) trait CaptureWorkspace:
-    Fn(&Path, WorkspaceIndexLimits, &RebuildRequest) -> Result<WorkspaceCandidate, ReadError>
+    Fn(&Path, WorkspaceIndexLimits, &RebuildRequest) -> Result<WorkspaceCandidate, RiftError>
 {
 }
 
 impl<Capture> CaptureWorkspace for Capture where
     Capture:
-        Fn(&Path, WorkspaceIndexLimits, &RebuildRequest) -> Result<WorkspaceCandidate, ReadError>
+        Fn(&Path, WorkspaceIndexLimits, &RebuildRequest) -> Result<WorkspaceCandidate, RiftError>
 {
 }
 
@@ -1679,7 +1709,7 @@ pub(crate) fn build_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
-) -> Result<WorkspaceCandidate, ReadError> {
+) -> Result<WorkspaceCandidate, RiftError> {
     build_workspace_candidate_with_cache(
         root,
         limits,
@@ -1693,7 +1723,7 @@ fn build_workspace_candidate_with_cache(
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
     content_cache: &rift_index::WorkspaceContentCache,
-) -> Result<WorkspaceCandidate, ReadError> {
+) -> Result<WorkspaceCandidate, RiftError> {
     tracing::debug!(
         component = "index",
         operation = "index.build",
@@ -1773,23 +1803,25 @@ fn complete_visible_digests(
     root: &Path,
     reads: &ReadService,
     policy: &WorkspaceSourcePolicy,
-) -> Result<VisibleWorkspaceFiles, ReadError> {
+) -> Result<VisibleWorkspaceFiles, RiftError> {
     let mut digests = Vec::new();
     let mut refused = BTreeMap::new();
-    for path in policy.visible_paths().map_err(ReadFault::index)? {
+    for path in policy.visible_paths()? {
         let digest = match reads.file_digest(&path) {
             Some(digest) => Some(digest),
             None => match policy.visible_digest(&root.join(path.as_str())) {
                 Ok(digest) => digest,
-                Err(error) if error.fault().left_out_file(path.clone()).is_some() => {
-                    let warning = error
-                        .fault()
-                        .left_out_file(path.clone())
-                        .unwrap_or_else(|| unreachable!("the guard found a left-out file"));
-                    refused.insert(path.clone(), warning);
+                Err(error) if error.slug() == errors::index::workspace_file_too_large::SLUG => {
+                    refused.insert(
+                        path.clone(),
+                        rift_index::WorkspaceIndexWarning::FileTooLarge {
+                            path: path.clone(),
+                            error: Arc::new(error),
+                        },
+                    );
                     None
                 }
-                Err(error) => return Err(ReadFault::index(error)),
+                Err(error) => return error.fail(),
             },
         };
         if let Some(digest) = digest {
@@ -1818,7 +1850,7 @@ fn whole_workspace_candidate(
     sharing: Option<&PublishedWorkspace>,
     cancelled: &(dyn Fn() -> bool + Sync),
     content_cache: &rift_index::WorkspaceContentCache,
-) -> Result<PublishedWorkspace, ReadError> {
+) -> Result<PublishedWorkspace, RiftError> {
     let visibility = configuration.source_visibility();
     let limits = configuration.index_limits(limits)?;
     let text_inclusion = configuration.text_inclusion();
@@ -1884,7 +1916,7 @@ fn shared_workspace_candidate(
     configuration: ConfigurationState,
     epoch: u64,
     cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<PublishedWorkspace, ReadError> {
+) -> Result<PublishedWorkspace, RiftError> {
     if changes.is_empty() && !previous.reads.project_environment_moved() {
         let configuration_changed = previous.configuration.fingerprint != configuration.fingerprint;
         let non_index_configuration_changed = configuration_changed
@@ -2155,14 +2187,14 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
     fn recorded(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, SearchError>> + Send;
+    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, RiftError>> + Send;
 
     /// Deletes every row and recorded digest, and stamps no publication under
     /// `derivation_revision`.
     fn clear(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send;
+    ) -> impl Future<Output = Result<(), RiftError>> + Send;
 
     /// Applies `change` and stamps `stamp` in one transaction, replacing the documentation
     /// metadata with `documentation` when one is given and keeping it otherwise.
@@ -2171,25 +2203,25 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
         change: &LexicalChange,
         stamp: &LexicalStamp,
         documentation: Option<&rift_index::DocumentationCollection>,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send;
+    ) -> impl Future<Output = Result<(), RiftError>> + Send;
 
     /// Indexes the oldest file rows the trigram index lacks in one bounded transaction, and
     /// answers what it indexed and how many rows it still lacks.
-    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, SearchError>> + Send;
+    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, RiftError>> + Send;
 }
 
 impl LexicalStore for SearchIndex {
     fn recorded(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, SearchError>> + Send {
+    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, RiftError>> + Send {
         self.recorded_lexical_files(derivation_revision)
     }
 
     fn clear(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send {
+    ) -> impl Future<Output = Result<(), RiftError>> + Send {
         self.clear_lexical(derivation_revision)
     }
 
@@ -2198,7 +2230,7 @@ impl LexicalStore for SearchIndex {
         change: &LexicalChange,
         stamp: &LexicalStamp,
         documentation: Option<&rift_index::DocumentationCollection>,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         match documentation {
             Some(documentation) => {
                 self.apply_lexical_with_documentation(change, stamp, documentation)
@@ -2208,7 +2240,7 @@ impl LexicalStore for SearchIndex {
         }
     }
 
-    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, SearchError>> + Send {
+    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, RiftError>> + Send {
         SearchIndex::index_trigrams(self)
     }
 }
@@ -2663,7 +2695,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the change could not be derived, when a part failed in
+    /// Returns [`RiftError`] when the change could not be derived, when a part failed in
     /// the store, when its task ended without an answer, or when the lane was cancelled
     /// while it ran. Every one leaves the store owing a whole comparison.
     ///
@@ -2680,7 +2712,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// rows and stamped no publication, so the next start's comparison
     /// (`RebuildRequest::initial` publishes a whole write) writes only the paths the
     /// interrupted write did not reach.
-    async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), ReadError> {
+    async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), RiftError> {
         let LexicalCommit {
             write, published, ..
         } = commit;
@@ -2745,7 +2777,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         write: LexicalWrite,
         published: Arc<PublishedWorkspace>,
         derivation_revision: &str,
-    ) -> Result<LexicalChange, ReadError> {
+    ) -> Result<LexicalChange, RiftError> {
         match write {
             LexicalWrite::Hold => Ok(LexicalChange::default()),
             LexicalWrite::Change(change) => {
@@ -2779,7 +2811,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     async fn recorded_or_cleared(
         &self,
         derivation_revision: &str,
-    ) -> Result<WorkspaceDigests, ReadError> {
+    ) -> Result<WorkspaceDigests, RiftError> {
         let store = Arc::clone(&self.store);
         let derivation = derivation_revision.to_owned();
         let running = tokio::spawn(async move {
@@ -2806,7 +2838,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         documentation: Option<Arc<rift_index::DocumentationCollection>>,
         tree_revision: &str,
         form: &'static str,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         let deadline = commit_deadline(part.replaced().len().saturating_add(part.inserted().len()));
         let store = Arc::clone(&self.store);
         let mut running =
@@ -2815,13 +2847,22 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             ended = wait_for_transaction(&mut running, tree_revision, form, deadline) => ended,
             () = self.cancellation.cancelled() => {
                 abort_transaction(running).await;
-                return Err(lexical_unavailable("the lexical lane ended while the transaction ran"));
+                return errors::server::read_unavailable()
+                    .operation("lexical index commit")
+                    .detail("the lexical lane ended while the transaction ran")
+                    .fail();
             }
         };
         let outcome = match ended {
             Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => ReadFault::unavailable("lexical index commit", error.detail()),
-            Err(_) => lexical_unavailable("the lexical transaction's task ended without an answer"),
+            Ok(Err(error)) => errors::server::read_unavailable()
+                .operation("lexical index commit")
+                .detail(error.detail())
+                .error(),
+            Err(_) => errors::server::read_unavailable()
+                .operation("lexical index commit")
+                .detail("the lexical transaction's task ended without an answer")
+                .error(),
         };
         record_commit_failure(tree_revision, form, &outcome);
         Err(outcome)
@@ -2831,17 +2872,26 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// is cancelled first.
     async fn store_answer<T: Send + 'static>(
         &self,
-        mut running: JoinHandle<Result<T, SearchError>>,
-    ) -> Result<T, ReadError> {
+        mut running: JoinHandle<Result<T, RiftError>>,
+    ) -> Result<T, RiftError> {
         tokio::select! {
             ended = &mut running => match ended {
                 Ok(Ok(answer)) => Ok(answer),
-                Ok(Err(error)) => Err(ReadFault::unavailable("lexical index commit", error.detail())),
-                Err(_) => Err(lexical_unavailable("the lexical store's task ended without an answer")),
+                Ok(Err(error)) => errors::server::read_unavailable()
+                    .operation("lexical index commit")
+                    .detail(error.detail())
+                    .fail(),
+                Err(_) => errors::server::read_unavailable()
+                    .operation("lexical index commit")
+                    .detail("the lexical store's task ended without an answer")
+                    .fail(),
             },
             () = self.cancellation.cancelled() => {
                 abort_transaction(running).await;
-                Err(lexical_unavailable("the lexical lane ended while the store ran"))
+                errors::server::read_unavailable()
+                    .operation("lexical index commit")
+                    .detail("the lexical lane ended while the store ran")
+                    .fail()
             }
         }
     }
@@ -2850,11 +2900,11 @@ impl<Store: LexicalStore> LexicalTask<Store> {
 /// Waits for a transaction, recording its diagnostic deadline once without ending the wait.
 /// The caller races this entire future against cancellation, including the delayed wait.
 async fn wait_for_transaction(
-    running: &mut JoinHandle<Result<(), SearchError>>,
+    running: &mut JoinHandle<Result<(), RiftError>>,
     tree_revision: &str,
     form: &'static str,
     deadline: Duration,
-) -> Result<Result<(), SearchError>, tokio::task::JoinError> {
+) -> Result<Result<(), RiftError>, tokio::task::JoinError> {
     if let Ok(ended) = tokio::time::timeout(deadline, &mut *running).await {
         ended
     } else {
@@ -2888,8 +2938,8 @@ fn record_commit_delay(tree_revision: &str, form: &'static str, deadline: Durati
 }
 
 /// Records one commit the store did not take, with its cause.
-fn record_commit_failure(tree_revision: &str, form: &'static str, error: &ReadError) {
-    let causes = rift_core::causes(error).join("; ");
+fn record_commit_failure(tree_revision: &str, form: &'static str, error: &RiftError) {
+    let causes = rift_error::causes(error).join("; ");
     tracing::error!(
         component = "search",
         operation = "search.commit",
@@ -2900,11 +2950,6 @@ fn record_commit_failure(tree_revision: &str, form: &'static str, error: &ReadEr
         "the lexical commit failed; the next publication compares every file with the \
          digests the store recorded"
     );
-}
-
-/// One lexical commit that could not reach the store, as the lane records it.
-fn lexical_unavailable(detail: &str) -> ReadError {
-    ReadFault::unavailable("lexical index commit", detail)
 }
 
 /// The population lane: one long-lived task owning every search index population, and the
@@ -3053,7 +3098,7 @@ pub(crate) async fn run_index_supervisor(
 #[cfg(test)]
 pub(crate) async fn prepare_initial_workspace(
     context: &IndexSupervisorContext,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     prepare_initial_workspace_with_epoch(context)
         .await
         .map_err(|failure| failure.error)
@@ -3061,7 +3106,7 @@ pub(crate) async fn prepare_initial_workspace(
 
 /// Startup failure and exact invalidation epoch queued for its retry.
 struct InitialPreparationFailure {
-    error: ReadError,
+    error: RiftError,
     queued_epoch: Option<u64>,
 }
 
@@ -3092,7 +3137,7 @@ pub(crate) struct InitialWorkspacePreparation {
 /// Discovers visible paths and publishes their names before reading and parsing files.
 pub(crate) async fn discover_initial_workspace(
     context: &IndexSupervisorContext,
-) -> Result<Option<InitialWorkspacePreparation>, ReadError> {
+) -> Result<Option<InitialWorkspacePreparation>, RiftError> {
     let Some(preparation) = context.validation.take_initial_preparation() else {
         return Ok(None);
     };
@@ -3120,7 +3165,7 @@ pub(crate) async fn discover_initial_workspace(
                 cancellation.clone(),
                 move |token| {
                     let cancelled = || token.is_cancelled();
-                    let empty_index = preparation.empty_snapshot().map_err(ReadFault::index)?;
+                    let empty_index = preparation.empty_snapshot()?;
                     let policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
                         &root,
                         effective_limits,
@@ -3128,15 +3173,10 @@ pub(crate) async fn discover_initial_workspace(
                         &text_inclusion,
                         &languages,
                         &cancelled,
-                    )
-                    .map_err(ReadFault::index)?;
+                    )?;
                     let mut preparation = preparation;
-                    let total = preparation
-                        .discover(&visibility, &cancelled)
-                        .map_err(ReadFault::index)?;
-                    let map_paths = preparation
-                        .discovered_map_paths()
-                        .map_err(ReadFault::index)?;
+                    let total = preparation.discover(&visibility, &cancelled)?;
+                    let map_paths = preparation.discovered_map_paths()?;
                     Ok((
                         preparation,
                         Arc::new(policy),
@@ -3165,7 +3205,7 @@ async fn publish_initial_empty(
     initial: InitialWorkspacePreparation,
     empty_index: rift_index::WorkspaceIndex,
     configuration: ConfigurationState,
-) -> Result<Option<InitialWorkspacePreparation>, ReadError> {
+) -> Result<Option<InitialWorkspacePreparation>, RiftError> {
     let InitialWorkspacePreparation {
         preparation,
         source_policy,
@@ -3206,7 +3246,7 @@ async fn publish_initial_empty(
                     validation.observed_epoch(),
                 )?;
                 if token.is_cancelled() {
-                    return Err(ReadFault::cancelled());
+                    return errors::server::read_cancelled().fail();
                 }
                 let lexical = if total == 0 {
                     lexical.map(|lane| LexicalHandoff::new(lane, LexicalWrite::Whole))
@@ -3242,7 +3282,7 @@ async fn publish_initial_empty(
 pub(crate) async fn prepare_initial_workspace_from(
     context: &IndexSupervisorContext,
     initial: InitialWorkspacePreparation,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     prepare_initial_workspace_from_with_epoch(context, initial)
         .await
         .map_err(|failure| failure.error)
@@ -3256,7 +3296,7 @@ async fn prepare_initial_workspace_from_with_epoch(
     result.map_err(|error| Box::new(initial_preparation_failure(context, error)))
 }
 
-fn schedule_initial_rebuild(context: &IndexSupervisorContext) -> Result<Option<u64>, ReadError> {
+fn schedule_initial_rebuild(context: &IndexSupervisorContext) -> Result<Option<u64>, RiftError> {
     if context.validation.cancellation.is_cancelled() {
         return Ok(None);
     }
@@ -3265,7 +3305,7 @@ fn schedule_initial_rebuild(context: &IndexSupervisorContext) -> Result<Option<u
 
 fn initial_preparation_failure(
     context: &IndexSupervisorContext,
-    error: ReadError,
+    error: RiftError,
 ) -> InitialPreparationFailure {
     match schedule_initial_rebuild(context) {
         Ok(queued_epoch) => InitialPreparationFailure {
@@ -3282,7 +3322,7 @@ fn initial_preparation_failure(
 async fn prepare_initial_workspace_steps(
     context: &IndexSupervisorContext,
     mut initial: InitialWorkspacePreparation,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     let validation = Arc::clone(&context.validation);
     let cancellation = validation.cancellation.clone();
     while let Some(target) = initial.preparation.next_checkpoint() {
@@ -3307,7 +3347,7 @@ async fn prepare_initial_workspace_batch(
     mut initial: InitialWorkspacePreparation,
     target: usize,
     cancellation: CancellationToken,
-) -> Result<(InitialWorkspacePreparation, RebuildOutcome), ReadError> {
+) -> Result<(InitialWorkspacePreparation, RebuildOutcome), RiftError> {
     let root = context.root.clone();
     let state = Arc::clone(&context.published);
     let validation = Arc::clone(&context.validation);
@@ -3363,7 +3403,7 @@ struct InitialWorkspaceBatch {
 fn prepare_initial_batch(
     token: &CancellationToken,
     batch: InitialWorkspaceBatch,
-) -> Result<(WorkspaceIndexPreparation, LastCapture, RebuildOutcome), ReadError> {
+) -> Result<(WorkspaceIndexPreparation, LastCapture, RebuildOutcome), RiftError> {
     let cancelled = || token.is_cancelled();
     let mut preparation = batch.preparation;
     let current = batch.state.blocking_read().snapshot().0;
@@ -3381,32 +3421,24 @@ fn prepare_initial_batch(
         } else {
             preparation.advance_to(batch.target, &cancelled)
         }
-    }
-    .map_err(ReadFault::index)?;
+    }?;
     drop(current);
-    let (captured, mut last) = preparation
-        .capture_prepared_paths(&batch.previous_capture, &cancelled)
-        .map_err(ReadFault::index)?;
+    let (captured, mut last) =
+        preparation.capture_prepared_paths(&batch.previous_capture, &cancelled)?;
     let changes = PathChanges::between(&index.digests(), &captured);
     if !changes.is_empty() {
-        index = index
-            .rebuilt_cancellable(&changes, &cancelled)
-            .map_err(ReadFault::index)?;
+        index = index.rebuilt_cancellable(&changes, &cancelled)?;
         preparation.retain_rebuilt_snapshot(&index);
-        let (verified, refreshed_last) = preparation
-            .capture_prepared_paths(&last, &cancelled)
-            .map_err(ReadFault::index)?;
+        let (verified, refreshed_last) = preparation.capture_prepared_paths(&last, &cancelled)?;
         if !PathChanges::between(&index.digests(), &verified).is_empty() {
-            return Err(ReadFault::unavailable(
-                "initial index preparation",
-                "a selected file kept changing during its capture",
-            ));
+            return errors::server::read_unavailable()
+                .operation("initial index preparation")
+                .detail("a selected file kept changing during its capture")
+                .fail();
         }
         last = refreshed_last;
     }
-    let (source_paths, other_paths) = preparation
-        .prepared_path_classes()
-        .map_err(ReadFault::index)?;
+    let (source_paths, other_paths) = preparation.prepared_path_classes()?;
     let candidate_state = (!batch.complete).then(|| LocalIndexPreparation {
         prepared: preparation.prepared(),
         total: Some(batch.total),
@@ -3447,7 +3479,7 @@ fn preparation_publication(
     configuration: &ConfigurationState,
     preparation: Option<LocalIndexPreparation>,
     epoch: u64,
-) -> Result<Arc<PublishedWorkspace>, ReadError> {
+) -> Result<Arc<PublishedWorkspace>, RiftError> {
     let context = match &preparation {
         Some(_) => DependencyContext::default(),
         None => ReadService::dependency_context_for_policy(
@@ -3650,12 +3682,13 @@ pub(crate) async fn run_index_supervisor_with(
 
 /// Records one failed rebuild under the publication lane and wakes the requests waiting
 /// on it; a failure the pool can no longer record marks the watch unhealthy instead.
-async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, error: ReadError) {
+async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, error: RiftError) {
     tracing::warn!(
         component = "index",
         operation = "index.build",
         epoch,
-        error_code = error.descriptor().code(),
+        error_code = crate::failure::wire_code_for_error(&error)
+            .unwrap_or_else(|| "internal_error".to_owned()),
         "index rebuild failed"
     );
     let failed_state = Arc::clone(&context.published);
@@ -3707,7 +3740,7 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when the capture fails. Nothing publishes then, so a current-tree
+/// Returns [`RiftError`] when the capture fails. Nothing publishes then, so a current-tree
 /// request meets the recorded rebuild failure and answers from the previous snapshot.
 ///
 /// # Cancel safety
@@ -3727,7 +3760,7 @@ pub(crate) async fn rebuild_workspace(
     context: &IndexSupervisorContext,
     request: RebuildRequest,
     capture: impl CaptureWorkspace + Send + 'static,
-) -> Result<RebuildOutcome, ReadError> {
+) -> Result<RebuildOutcome, RiftError> {
     let epoch = request.epoch;
     let root = context.root.clone();
     let limits = context.limits;
@@ -3780,7 +3813,7 @@ pub(crate) async fn rebuild_workspace(
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when the pool refuses the publication.
+/// Returns [`RiftError`] when the pool refuses the publication.
 ///
 /// # Cancel safety
 ///
@@ -3792,7 +3825,7 @@ async fn publish_captured(
     change_set: ChangeSet,
     work: PendingWork,
     lexical: Option<LexicalHandoff>,
-) -> Result<RebuildOutcome, ReadError> {
+) -> Result<RebuildOutcome, RiftError> {
     let root = context.root.clone();
     let published = Arc::clone(&context.published);
     let validation = Arc::clone(&context.validation);
@@ -3874,8 +3907,8 @@ pub(crate) fn capture_rebuild_with(
         &Path,
         WorkspaceIndexLimits,
         &RebuildRequest,
-    ) -> Result<WorkspaceCandidate, ReadError>,
-) -> Result<CapturedRebuild, ReadError> {
+    ) -> Result<WorkspaceCandidate, RiftError>,
+) -> Result<CapturedRebuild, RiftError> {
     if !accept_rebuild(validation, request.epoch)? {
         validation.restore_pending(request.work);
         return Ok(CapturedRebuild::Superseded);
@@ -3893,7 +3926,7 @@ pub(crate) fn capture_rebuild_with(
             if request.cancellation.is_cancelled() || validation.cancellation.is_cancelled() {
                 return Ok(CapturedRebuild::Cancelled);
             }
-            return Err(error);
+            return error.fail();
         }
     };
     let WorkspaceCandidate::Stable {
@@ -3960,12 +3993,12 @@ pub(crate) fn finish_rebuild(
 }
 
 /// Refuses rebuild when watcher failed or candidate epoch already moved.
-pub(crate) fn accept_rebuild(validation: &IndexValidation, epoch: u64) -> Result<bool, ReadError> {
+pub(crate) fn accept_rebuild(validation: &IndexValidation, epoch: u64) -> Result<bool, RiftError> {
     if validation.watch_failed.load(Ordering::Acquire) {
-        return Err(ReadFault::unavailable(
-            "filesystem index rebuild",
-            "filesystem watcher failed",
-        ));
+        return errors::server::read_unavailable()
+            .operation("filesystem index rebuild")
+            .detail("filesystem watcher failed")
+            .fail();
     }
     Ok(validation.observed_epoch() == epoch)
 }
@@ -4140,7 +4173,7 @@ pub(crate) fn record_rebuild_failure(
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
     epoch: u64,
-    error: ReadError,
+    error: RiftError,
 ) -> bool {
     let publication = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
@@ -4171,8 +4204,9 @@ pub(crate) mod lexical_double {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use rift_error::{RiftError, errors};
     use rift_index::{LexicalChange, LexicalStamp, TrigramBatch, WorkspaceDigests};
-    use rift_search::{SearchError, SearchFault, SearchIndex, SearchViolation};
+    use rift_search::SearchIndex;
     use tokio::sync::{Semaphore, watch};
 
     use super::{LexicalLaneBounds, LexicalStore};
@@ -4422,8 +4456,8 @@ pub(crate) mod lexical_double {
             &self,
             form: &'static str,
             tree_revision: &str,
-            through: impl Future<Output = Result<(), SearchError>>,
-        ) -> Result<(), SearchError> {
+            through: impl Future<Output = Result<(), RiftError>>,
+        ) -> Result<(), RiftError> {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4432,10 +4466,11 @@ pub(crate) mod lexical_double {
                 dropped_while_held: &self.dropped_while_held,
                 released: false,
             };
-            let permit =
-                self.permits.acquire().await.map_err(|_| {
-                    SearchError::new(SearchFault::new(SearchViolation::StoreFailed))
-                })?;
+            let permit = self
+                .permits
+                .acquire()
+                .await
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
             held.release();
             permit.forget();
             through.await
@@ -4446,12 +4481,11 @@ pub(crate) mod lexical_double {
         async fn recorded(
             &self,
             derivation_revision: &str,
-        ) -> Result<Option<WorkspaceDigests>, SearchError> {
+        ) -> Result<Option<WorkspaceDigests>, RiftError> {
             if self.refuse_reads.load(Ordering::SeqCst) {
-                return Err(SearchError::new(
-                    SearchFault::new(SearchViolation::StoreFailed)
-                        .about("the double refuses reads"),
-                ));
+                return errors::index::lexical_storage()
+                    .source(std::io::Error::other("the double refuses reads"))
+                    .fail();
             }
             match self.attached() {
                 Some(index) => index.recorded_lexical_files(derivation_revision).await,
@@ -4459,7 +4493,7 @@ pub(crate) mod lexical_double {
             }
         }
 
-        async fn clear(&self, derivation_revision: &str) -> Result<(), SearchError> {
+        async fn clear(&self, derivation_revision: &str) -> Result<(), RiftError> {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4475,13 +4509,12 @@ pub(crate) mod lexical_double {
             change: &LexicalChange,
             stamp: &LexicalStamp,
             documentation: Option<&rift_index::DocumentationCollection>,
-        ) -> Result<(), SearchError> {
+        ) -> Result<(), RiftError> {
             let through = async {
                 if self.refuse_changes.load(Ordering::SeqCst) {
-                    return Err(SearchError::new(
-                        SearchFault::new(SearchViolation::StoreFailed)
-                            .about("the double refuses changes"),
-                    ));
+                    return errors::index::lexical_storage()
+                        .source(std::io::Error::other("the double refuses changes"))
+                        .fail();
                 }
                 match self.attached() {
                     Some(index) => index.apply(change, stamp, documentation).await,
@@ -4496,7 +4529,7 @@ pub(crate) mod lexical_double {
             self.write("apply", tree_revision, through).await
         }
 
-        async fn index_trigrams(&self) -> Result<TrigramBatch, SearchError> {
+        async fn index_trigrams(&self) -> Result<TrigramBatch, RiftError> {
             self.trigram_arrivals.send_modify(|arrived| *arrived += 1);
             let writes = self.applied().len();
             self.trigram_gate
@@ -4504,13 +4537,12 @@ pub(crate) mod lexical_double {
                 .wait_for(|gate| gate.passes(writes))
                 .await
                 .map(drop)
-                .map_err(|_| SearchError::new(SearchFault::new(SearchViolation::StoreFailed)))?;
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
             self.trigram_gate.send_modify(|gate| gate.spend(writes));
             if self.refuse_trigrams.load(Ordering::SeqCst) {
-                return Err(SearchError::new(
-                    SearchFault::new(SearchViolation::StoreFailed)
-                        .about("the double refuses trigram batches"),
-                ));
+                return errors::index::lexical_storage()
+                    .source(std::io::Error::other("the double refuses trigram batches"))
+                    .fail();
             }
             self.trigram_batches.fetch_add(1, Ordering::SeqCst);
             match self.attached() {
@@ -4567,7 +4599,10 @@ impl ConfigurationState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::ConfigurationState;
+    use crate::failure::{McpErrorExt as _, WireFailure as _};
     use rift_core::{ProjectPath, SourceVisibility};
+    use rift_error::errors;
+    use rift_protocol::error as wire;
     use rift_server::LspProcessKey;
     #[test]
     fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
@@ -4643,7 +4678,6 @@ pub(crate) mod tests {
         ParsedQuery, Pattern, QueryPhase, RankingInput, SearchableField,
     };
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, VectorReadiness};
-    use rift_server::ReadFault;
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -5157,9 +5191,27 @@ pub(crate) mod tests {
 
         assert!(!state.publish(Arc::clone(&after), 2));
         assert_workspace_identity(&state.current, &before);
-        assert!(!state.record_failure(1, 2, ReadFault::unavailable("test rebuild", "superseded")));
+        assert!(
+            !state.record_failure(
+                1,
+                2,
+                errors::server::read_unavailable()
+                    .operation("test rebuild")
+                    .detail("superseded")
+                    .error()
+            )
+        );
         assert!(state.failure.is_none());
-        assert!(state.record_failure(1, 1, ReadFault::unavailable("test rebuild", "failed")));
+        assert!(
+            state.record_failure(
+                1,
+                1,
+                errors::server::read_unavailable()
+                    .operation("test rebuild")
+                    .detail("failed")
+                    .error()
+            )
+        );
         assert!(state.failure.is_some());
         assert!(state.publish(Arc::clone(&after), 1));
         assert_workspace_identity(&state.current, &after);
@@ -5196,7 +5248,10 @@ pub(crate) mod tests {
             &state,
             &validation,
             1,
-            ReadFault::unavailable("test rebuild", "superseded failure")
+            errors::server::read_unavailable()
+                .operation("test rebuild")
+                .detail("superseded failure")
+                .error()
         ));
         assert!(state.blocking_read().failure.is_none());
         Ok(())
@@ -5244,11 +5299,17 @@ pub(crate) mod tests {
         let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
         let answer = published.reads.get_symbol(&params)?;
         assert!(answer.hits.is_empty());
-        assert!(answer.warnings.iter().any(|warning| matches!(
-            warning,
-            rift_protocol::read::ReadWarning::SourceUnavailable { detail, .. }
-                if detail.contains("file byte limit")
-        )));
+        assert!(
+            answer.warnings.iter().any(|warning| matches!(
+                warning,
+                rift_protocol::read::ReadWarning::SourceUnavailable { unit: Some(unit), detail }
+                    if unit.0 == "rift://file/lib.rs"
+                        && detail.contains("lib.rs")
+                        && detail.contains("byte limit of 60")
+            )),
+            "the late event must retain file identity and byte-limit warning: {:?}",
+            answer.warnings
+        );
 
         fs::write(&absolute, "pub fn changed() {}\n")?;
         validation.observe_paths([path])?;
@@ -6715,7 +6776,11 @@ pub(crate) mod tests {
             .shutdown(deadline)
             .await
             .expect_err("a stuck supervisor must miss the shutdown deadline");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert_eq!(
+            error.mcp().wire_error(wire::ErrorPhase::Read).code,
+            wire::ErrorCode::TemporarilyUnavailable
+        );
         supervisor
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(30))
             .await
@@ -6834,7 +6899,11 @@ pub(crate) mod tests {
         let _ = validation.observe_watch_failure();
         let error = super::accept_rebuild(&validation, 0)
             .expect_err("a failed watcher must refuse rebuild acceptance");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert_eq!(
+            error.mcp().wire_error(wire::ErrorPhase::Read).code,
+            wire::ErrorCode::TemporarilyUnavailable
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6881,7 +6950,11 @@ pub(crate) mod tests {
         let (failed_epoch, error) = failure.ok_or("rebuild failure must be recorded")?;
         assert_eq!(failed_epoch, epoch);
         // A vanished root refuses at canonical-root resolution.
-        assert_eq!(error.descriptor().code(), "configuration_invalid");
+        assert_eq!(error.slug(), errors::index::workspace_invalid_root::SLUG);
+        assert_eq!(
+            error.mcp().wire_error(wire::ErrorPhase::Read).code,
+            wire::ErrorCode::ConfigurationInvalid
+        );
         validation.cancellation.cancel();
         supervisor.await?;
         Ok(())
@@ -7134,7 +7207,13 @@ pub(crate) mod tests {
         let error = super::prepare_initial_workspace_from(&context, initial)
             .await
             .expect_err("a renamed discovered directory must refuse its selected paths");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
+        );
+        let wire_error = error.mcp().wire_error(wire::ErrorPhase::Read);
+        assert_eq!(wire_error.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(wire_error.retry, wire::RetryDirective::SameRequest);
         let request = context.validation.take_pending();
         assert!(request.work.covers_whole_workspace());
         assert_eq!(
@@ -7220,7 +7299,7 @@ pub(crate) mod tests {
         state: &Arc<RwLock<IndexState>>,
         validation: &Arc<IndexValidation>,
         lexical: Option<LexicalLane>,
-    ) -> Result<RebuildOutcome, rift_server::ReadError> {
+    ) -> Result<RebuildOutcome, rift_server::RiftError> {
         let request = validation.take_pending();
         let context = super::IndexSupervisorContext {
             root: root.to_path_buf(),
@@ -9472,7 +9551,7 @@ pub(crate) mod tests {
                     release_receiver
                         .recv()
                         .expect("test must release the held placeholder");
-                    Ok::<(), rift_server::ReadError>(())
+                    Ok::<(), rift_server::RiftError>(())
                 })
                 .await
         });
@@ -9504,7 +9583,7 @@ pub(crate) mod tests {
         // proving its `accept_rebuild` check (and therefore the Superseded verdict) already
         // landed, without hoping a fixed sleep was long enough.
         blocking
-            .run("sentinel", || Ok::<(), rift_server::ReadError>(()))
+            .run("sentinel", || Ok::<(), rift_server::RiftError>(()))
             .await?;
 
         let state = published.read().await;
@@ -9607,7 +9686,7 @@ pub(crate) mod tests {
 
         // The one slot is free again only once the detached capture thread has ended.
         blocking
-            .run("sentinel", || Ok::<(), rift_server::ReadError>(()))
+            .run("sentinel", || Ok::<(), rift_server::RiftError>(()))
             .await?;
         let state = published.read().await;
         let (snapshot, failure) = state.snapshot();
@@ -9659,7 +9738,7 @@ pub(crate) mod tests {
             .map_err(|_| "the capture must still block when the supervisor ends")?;
 
         blocking
-            .run("sentinel", || Ok::<(), rift_server::ReadError>(()))
+            .run("sentinel", || Ok::<(), rift_server::RiftError>(()))
             .await?;
         let state = published.read().await;
         let (snapshot, failure) = state.snapshot();
@@ -9931,7 +10010,12 @@ pub(crate) mod tests {
             current: before,
             failure: Some((
                 epoch,
-                Arc::new(ReadFault::unavailable("test rebuild", "held failure")),
+                Arc::new(
+                    errors::server::read_unavailable()
+                        .operation("test rebuild")
+                        .detail("held failure")
+                        .error(),
+                ),
             )),
         });
         let error = publication_matching(&state, &validation, &expected)

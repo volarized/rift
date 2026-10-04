@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rift_error::errors;
 use rift_history::fixture::{commit_all, commit_missing_subtree, git, init};
 use rift_history_store::{CommitRecord, HistoryStore, STORE_FOLDER_NAME, StoreLocation};
-use rift_protocol::configuration::{ConfigurationViolation, HistoryConfiguration};
+use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::CommitAuthor;
-use rift_server::{ConfigurationFault, FillProgress};
+use rift_server::FillProgress;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -465,15 +466,24 @@ async fn a_release_pattern_that_does_not_compile_refuses_the_configuration() -> 
     let Err(refused) = &configuration.accepted else {
         return Err("an unclosed class compiles into no matcher, so rift.toml is refused".into());
     };
+    assert_eq!(
+        refused.slug(),
+        errors::core::configuration_history_release_pattern_invalid::SLUG
+    );
     assert!(
-        matches!(
-            refused.fault(),
-            ConfigurationFault::Invalid {
-                violation: ConfigurationViolation::HistoryReleasePatternInvalid { pattern, detail },
-                ..
-            } if pattern == "v[1" && detail.contains("unclosed character class")
-        ),
-        "{refused:?}"
+        refused
+            .context()
+            .any(|(key, value)| { key == "field" && value == "providers.history.releases" })
+    );
+    assert!(
+        refused
+            .context()
+            .any(|(key, value)| key == "pattern" && value == "v[1")
+    );
+    assert!(
+        refused
+            .context()
+            .any(|(key, value)| { key == "detail" && value.contains("unclosed character class") })
     );
     let lane = HistoryLane::start(
         root,

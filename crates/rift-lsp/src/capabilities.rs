@@ -12,8 +12,7 @@ use lsp_types::{
     ReferenceClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
     WorkspaceClientCapabilities,
 };
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
-use serde::Serialize;
+use rift_error::{RiftError, errors};
 
 /// How one byte offset maps to an LSP `character` value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,34 +22,6 @@ pub enum PositionEncoding {
     /// Characters count UTF-16 code units, the protocol default.
     Utf16,
 }
-
-/// An initialize answer outside what the session offered.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilitiesFault {
-    /// The engine picked a position encoding the session never offered.
-    PositionEncodingUnsupported {
-        /// The encoding as answered.
-        encoding: String,
-    },
-}
-
-impl Fault for CapabilitiesFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let Self::PositionEncodingUnsupported { encoding } = self;
-        vec![
-            ErrorContext::new("fault", fault_label(self)),
-            ErrorContext::new("encoding", encoding.clone()),
-        ]
-    }
-}
-
-/// An engine answer the capability record refuses.
-pub type CapabilitiesError = Error<CapabilitiesFault>;
 
 /// What one engine advertised at initialize.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,18 +59,18 @@ impl Capabilities {
     ///
     /// # Errors
     ///
-    /// Returns [`CapabilitiesError`] when the engine picked an encoding the
+    /// Returns [`RiftError`] when the engine picked an encoding the
     /// session never offered.
-    pub fn negotiated(answer: &InitializeResult) -> Result<Self, CapabilitiesError> {
+    pub fn negotiated(answer: &InitializeResult) -> Result<Self, RiftError> {
         let advertised = &answer.capabilities;
         let position_encoding = match advertised.position_encoding.as_ref() {
             None => PositionEncoding::Utf16,
             Some(kind) if *kind == PositionEncodingKind::UTF8 => PositionEncoding::Utf8,
             Some(kind) if *kind == PositionEncodingKind::UTF16 => PositionEncoding::Utf16,
             Some(kind) => {
-                return Err(Error::new(CapabilitiesFault::PositionEncodingUnsupported {
-                    encoding: kind.as_str().to_owned(),
-                }));
+                return errors::lsp::capabilities_position_encoding_unsupported()
+                    .encoding(kind.as_str())
+                    .fail();
             }
         };
         let references = match advertised.references_provider.as_ref() {
@@ -307,14 +278,16 @@ mod tests {
         });
         let error = Capabilities::negotiated(&utf32).expect_err("utf-32 was never offered");
         assert_eq!(
-            *error.fault(),
-            CapabilitiesFault::PositionEncodingUnsupported {
-                encoding: "utf-32".to_owned()
-            }
+            error.slug(),
+            errors::lsp::capabilities_position_encoding_unsupported::SLUG
         );
         assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+            error
+                .context()
+                .find(|(key, _)| *key == "encoding")
+                .expect("unsupported encoding evidence is present")
+                .1,
+            "utf-32"
         );
         assert!(error.to_string().contains("encoding utf-32"));
     }

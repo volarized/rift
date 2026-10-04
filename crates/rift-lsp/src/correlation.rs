@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, fault_label};
+use rift_error::{RiftError, errors};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -35,50 +35,6 @@ impl RequestId {
     }
 }
 
-/// How correlation broke down.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CorrelationFault {
-    /// A new request would cross [`PENDING_REQUESTS_MAX`].
-    PendingRequestsExceeded,
-    /// The engine answered an id no pending request carries.
-    ResponseUnknown {
-        /// The id as received.
-        id: String,
-    },
-}
-
-impl Fault for CorrelationFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::PendingRequestsExceeded => ErrorName::Wire(ErrorCode::LimitExceeded),
-            Self::ResponseUnknown { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("fault", fault_label(self))];
-        if let Self::ResponseUnknown { id } = self {
-            context.push(ErrorContext::new("id", id.clone()));
-        }
-        context
-    }
-
-    fn limit_evidence(&self) -> Option<LimitEvidence> {
-        match self {
-            Self::PendingRequestsExceeded => Some(LimitEvidence {
-                field: "correlation.pending_requests_max".to_owned(),
-                limit: u64::try_from(PENDING_REQUESTS_MAX).unwrap_or(u64::MAX),
-                required: u64::try_from(PENDING_REQUESTS_MAX).unwrap_or(u64::MAX) + 1,
-            }),
-            Self::ResponseUnknown { .. } => None,
-        }
-    }
-}
-
-/// A broken correlation between requests and responses.
-pub type CorrelationError = Error<CorrelationFault>;
-
 /// Allocates request ids and matches responses back to their methods.
 #[derive(Debug, Default)]
 pub struct Correlation {
@@ -97,11 +53,15 @@ impl Correlation {
     ///
     /// # Errors
     ///
-    /// Returns [`CorrelationError`] when [`PENDING_REQUESTS_MAX`] requests
+    /// Returns [`RiftError`] when [`PENDING_REQUESTS_MAX`] requests
     /// already await answers.
-    pub fn begin(&mut self, method: &'static str) -> Result<RequestId, CorrelationError> {
+    pub fn begin(&mut self, method: &'static str) -> Result<RequestId, RiftError> {
         if self.pending.len() >= PENDING_REQUESTS_MAX {
-            return Err(Error::new(CorrelationFault::PendingRequestsExceeded));
+            return errors::lsp::correlation_pending_requests_exceeded()
+                .field("correlation.pending_requests_max")
+                .limit(PENDING_REQUESTS_MAX)
+                .required(PENDING_REQUESTS_MAX + 1)
+                .fail();
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -113,10 +73,14 @@ impl Correlation {
     ///
     /// # Errors
     ///
-    /// Returns [`CorrelationError`] when the id matches no pending request,
+    /// Returns [`RiftError`] when the id matches no pending request,
     /// including any non-numeric id, which this client never allocates.
-    pub fn conclude(&mut self, id: &Value) -> Result<&'static str, CorrelationError> {
-        let unknown = || Error::new(CorrelationFault::ResponseUnknown { id: id.to_string() });
+    pub fn conclude(&mut self, id: &Value) -> Result<&'static str, RiftError> {
+        let unknown = || {
+            errors::lsp::correlation_response_unknown()
+                .id(id.to_string())
+                .error()
+        };
         let id = id.as_u64().ok_or_else(unknown)?;
         self.pending.remove(&id).ok_or_else(unknown)
     }
@@ -238,9 +202,15 @@ mod tests {
         let error = correlation
             .begin("shutdown")
             .expect_err("the bound must refuse");
-        assert_eq!(*error.fault(), CorrelationFault::PendingRequestsExceeded);
-        assert!(error.fault().limit_evidence().is_some());
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::LimitExceeded));
+        assert_eq!(
+            error.slug(),
+            errors::lsp::correlation_pending_requests_exceeded::SLUG
+        );
+        let fields = error
+            .context()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(fields.get("limit").map(String::as_str), Some("32"));
+        assert_eq!(fields.get("required").map(String::as_str), Some("33"));
     }
 
     #[test]
@@ -250,21 +220,21 @@ mod tests {
             .conclude(&serde_json::json!(7))
             .expect_err("never allocated");
         assert_eq!(
-            *unknown.fault(),
-            CorrelationFault::ResponseUnknown { id: "7".to_owned() }
+            unknown.slug(),
+            errors::lsp::correlation_response_unknown::SLUG
+        );
+        assert!(
+            unknown
+                .context()
+                .any(|(key, value)| key == "id" && value == "7")
         );
         let textual = correlation
             .conclude(&serde_json::json!("seven"))
             .expect_err("string ids are never allocated");
-        assert!(matches!(
-            textual.fault(),
-            CorrelationFault::ResponseUnknown { .. }
-        ));
         assert_eq!(
-            textual.name(),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+            textual.slug(),
+            errors::lsp::correlation_response_unknown::SLUG
         );
-        assert!(textual.fault().limit_evidence().is_none());
         assert!(textual.to_string().contains("id \"seven\""));
     }
 

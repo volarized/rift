@@ -7,6 +7,7 @@ use std::ops::Range;
 
 use rift_core::ProjectPath;
 use rift_core::line::{line_of, line_starts, without_ending};
+use rift_error::{ErrorContext, ErrorValue, errors};
 use rift_index::{
     PatternCandidate, PatternCandidates, SymbolMatch, TextSourceFile, UnindexedRows, WorkspaceIndex,
 };
@@ -16,14 +17,14 @@ use rift_protocol::read::{
     SearchHit, SearchHitTarget, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
     TextRange,
 };
-use rift_ranking::{IdentifierMatchClass, Pattern, RankingViolation};
+use rift_ranking::{IdentifierMatchClass, Pattern};
 
 use super::{
     HitPayloads, SelectedPaths, StoreAnswer, bound_hits, build_symbol_hit, includes, order_hits,
     populate_symbol_lines, text_file_hit_target,
 };
 use crate::read::{
-    ReadError, ReadFault, ReadService, file_id, page, project_path, results_truncation_warning,
+    ReadService, RiftError, file_id, page, project_path, results_truncation_warning,
 };
 
 /// The `[search]` bounds one `pattern` search runs under.
@@ -71,7 +72,7 @@ impl Default for PatternBounds {
 /// Why a `pattern` cannot stand beside a field the request also names: the fields that
 /// select another result set, and the ones naming a tree the trigram index does not hold.
 /// `None` for a request naming no `pattern`.
-pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
+pub(super) fn pattern_conflict(params: &SearchParams) -> Option<RiftError> {
     params.pattern.as_ref()?;
     let conflicts = [
         (
@@ -91,9 +92,14 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
             "the trigram index holds the current tree alone",
         ),
     ];
-    conflicts
-        .into_iter()
-        .find_map(|(present, reason)| present.then(|| ReadFault::invalid("pattern", reason)))
+    conflicts.into_iter().find_map(|(present, reason)| {
+        present.then(|| {
+            errors::server::read_invalid()
+                .field("pattern")
+                .violation(reason)
+                .error()
+        })
+    })
 }
 
 /// The request's `pattern`, parsed and compiled under `bounds`, or `None` when it names
@@ -110,39 +116,38 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
 pub fn accepted_pattern(
     params: &SearchParams,
     bounds: PatternBounds,
-) -> Result<Option<Pattern>, ReadError> {
+) -> Result<Option<Pattern>, RiftError> {
     let Some(pattern) = params.pattern.as_deref() else {
         return Ok(None);
     };
     if let Some(conflict) = pattern_conflict(params) {
-        return Err(conflict);
+        return conflict.fail();
     }
     if params.target == SearchParamsTarget::Documentation {
-        return Err(ReadFault::unsupported("pattern with target documentation"));
+        return errors::server::read_unsupported()
+            .capability("pattern with target documentation")
+            .fail();
     }
     match pattern.chars().count() {
-        0 => return Err(ReadFault::invalid("pattern", "empty")),
+        0 => {
+            return errors::server::read_invalid()
+                .field("pattern")
+                .violation("empty")
+                .fail();
+        }
         characters if characters > SEARCH_PATTERN_CHARS_MAX => {
-            return Err(ReadFault::invalid(
-                "pattern",
-                format!("{characters} characters exceeds the maximum {SEARCH_PATTERN_CHARS_MAX}"),
-            ));
+            return errors::server::read_invalid()
+                .field("pattern")
+                .violation(format!(
+                    "{characters} characters exceeds the maximum {SEARCH_PATTERN_CHARS_MAX}"
+                ))
+                .fail();
         }
         _ => {}
     }
     Pattern::parse(pattern, bounds.compiled_bytes_max)
         .map(Some)
-        .map_err(|error| match error.fault().violation() {
-            RankingViolation::PatternSize => ReadFault::invalid(
-                "pattern",
-                format!(
-                    "the compiled pattern exceeds {} bytes, the [search] pattern_compiled_size \
-                     bound; narrow `pattern`",
-                    bounds.compiled_bytes_max
-                ),
-            ),
-            _ => ReadFault::invalid("pattern", error.detail()),
-        })
+        .map_err(|error| error.with(ErrorContext::new("field", ErrorValue::display("pattern"))))
 }
 
 /// One file to verify: the index holding it, and the spans of it the trigram index
@@ -220,21 +225,21 @@ impl Verification {
 
     /// Verifies one candidate's spans, refusing once the pass has read past the
     /// `[search]` key `pattern_verified_size`.
-    fn verify(&mut self, candidate: &Candidate<'_>, pattern: &Pattern) -> Result<(), ReadError> {
+    fn verify(&mut self, candidate: &Candidate<'_>, pattern: &Pattern) -> Result<(), RiftError> {
         let spans = candidate.spans();
         let bytes: usize = spans.iter().map(ExactSizeIterator::len).sum();
         self.verified_bytes = self
             .verified_bytes
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         if self.verified_bytes > self.bounds.verified_bytes_max {
-            return Err(ReadFault::invalid(
-                "pattern",
-                format!(
+            return errors::server::read_invalid()
+                .field("pattern")
+                .violation(format!(
                     "more than {} bytes to verify, the [search] pattern_verified_size bound; \
                      narrow `pattern` or `paths`",
                     self.bounds.verified_bytes_max
-                ),
-            ));
+                ))
+                .fail();
         }
         let text = candidate.file.content();
         let found = spans
@@ -257,7 +262,7 @@ impl Verification {
         &mut self,
         file: &mut FileMatches<'_>,
         matched: &Range<usize>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         let start = u64::try_from(matched.start).unwrap_or(u64::MAX);
         let end = u64::try_from(matched.end).unwrap_or(u64::MAX);
         if self.target != SearchParamsTarget::File
@@ -296,7 +301,7 @@ impl<'a> FileMatches<'a> {
         start: u64,
         end: u64,
         payloads: HitPayloads,
-    ) -> Result<Option<SearchHit>, ReadError> {
+    ) -> Result<Option<SearchHit>, RiftError> {
         let owner = self.candidate.owner;
         let Some(parsed) = owner.file(self.candidate.path()) else {
             return Ok(None);
@@ -391,7 +396,7 @@ impl ReadService {
         params: &SearchParams,
         pattern: &Pattern,
         store: &StoreAnswer,
-    ) -> Result<SearchResult, ReadError> {
+    ) -> Result<SearchResult, RiftError> {
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         let bounds = store.pattern_bounds();
         let limit = super::search_page_limit(params)?;
@@ -443,7 +448,7 @@ impl ReadService {
         selection: Option<&'a PatternCandidates>,
         selected: &'a SelectedPaths,
         bounds: PatternBounds,
-    ) -> Result<(Vec<Candidate<'a>>, Option<ReadWarning>), ReadError> {
+    ) -> Result<(Vec<Candidate<'a>>, Option<ReadWarning>), RiftError> {
         let index = self.index();
         let Some(selection) = selection.filter(|_| pattern.prefilter().is_some()) else {
             let every = index
@@ -453,13 +458,13 @@ impl ReadService {
             return Ok((self.screened(every, selected), None));
         };
         if let Some(rows_max) = selection.truncated_at() {
-            return Err(ReadFault::invalid(
-                "pattern",
-                format!(
+            return errors::server::read_invalid()
+                .field("pattern")
+                .violation(format!(
                     "more than {rows_max} candidate rows, the [search] pattern_candidate_rows \
                      bound; narrow `pattern` or `paths`"
-                ),
-            ));
+                ))
+                .fail();
         }
         let held = self.screened(self.selected_candidates(selection.candidates()), selected);
         let Some(unindexed) = selection.unindexed() else {

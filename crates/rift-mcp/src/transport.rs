@@ -13,7 +13,7 @@
 
 use std::io;
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_error::errors;
 use rift_protocol::error as wire;
 use rmcp::model::ErrorCode as JsonRpcErrorCode;
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ use tokio::io::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::failure::WireFailure as _;
+use crate::failure::{McpErrorExt as _, WireFailure as _};
 
 /// Bytes one inbound frame may hold before the guard refuses it rather
 /// than keep buffering. Large enough for a substantial source read
@@ -340,26 +340,6 @@ fn tools_call_arguments_violation(frame: &Value) -> Option<Value> {
     Some(frame.get("id").cloned().unwrap_or(Value::Null))
 }
 
-/// One condition the guard refuses before rmcp ever sees the frame.
-#[derive(Debug)]
-enum GuardFault {
-    /// A `tools/call` frame's `arguments` member is present and not a
-    /// JSON object.
-    ArgumentsNotObject,
-}
-
-impl Fault for GuardFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::InvalidRequest)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::ArgumentsNotObject => vec![ErrorContext::new("field", "arguments")],
-        }
-    }
-}
-
 /// The `-32700` reply for a frame that failed to parse. JSON-RPC 2.0
 /// requires `id` null here, because no id could be read from the input;
 /// the connection stays open for the next frame.
@@ -379,7 +359,10 @@ fn parse_error_response() -> Vec<u8> {
 /// the same wire shape every other Rift refusal carries, naming the field
 /// that failed, carrying the frame's own `id`.
 fn arguments_not_object_response(id: &Value) -> Vec<u8> {
-    let refusal = Error::new(GuardFault::ArgumentsNotObject).tool_error(wire::ErrorPhase::Read);
+    let refusal = errors::mcp::arguments_not_object()
+        .field("arguments")
+        .mcp()
+        .tool_error(wire::ErrorPhase::Read);
     frame_bytes(&json!({
         "jsonrpc": "2.0",
         "id": id,

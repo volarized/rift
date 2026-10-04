@@ -366,12 +366,122 @@ fn a_working_form_past_the_byte_bound_refuses_the_blob() {
         .form(&files[0], 4)
         .expect_err("the blob is past 4 bytes");
 
-    assert!(matches!(
-        error.fault(),
-        crate::HistoryFault::BlobTooLarge { bytes_max: 4, .. }
-    ));
+    assert_eq!(
+        error.slug(),
+        rift_error::errors::history::blob_too_large::SLUG
+    );
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "bytes_max" && value == "4")
+    );
     let rendered = format!("{converter:?}");
     assert!(rendered.starts_with("WorkingForms"), "{rendered}");
+}
+
+fn assert_storage_refusal(error: &rift_error::RiftError, operation: &str, detail: &str) {
+    assert_eq!(error.slug().as_str(), "rift.history.storage");
+    assert_eq!(
+        error
+            .context()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        std::collections::BTreeMap::from([
+            ("operation", operation.to_owned()),
+            ("detail", detail.to_owned()),
+        ])
+    );
+    assert_eq!(error.context().count(), 2);
+    assert_eq!(
+        error.message(),
+        format!("repository storage failed during {operation}: {detail}")
+    );
+    assert_eq!(error.action(), "check repository storage and retry");
+    assert!(std::error::Error::source(error).is_none());
+}
+
+#[test]
+fn a_corrupt_index_refuses_working_forms_and_status_with_its_decode_detail() {
+    // Issue #535: the two index consumers retain their operation and decode detail.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let root = directory.path();
+    init(root);
+    write(root, &[("lib.rs", "pub fn beacon() {}\n")]);
+    commit_all(root, "base");
+    let index = root.join(".git/index");
+    let original = fs::read(&index).expect("index");
+    // A null checksum leaves the invalid signature for the index decoder to report.
+    fs::write(&index, [0_u8; 32]).expect("corrupt index");
+    let repository = Repository::open(root).expect("repository");
+    let head = repository.resolve("HEAD").expect("head");
+    let detail = "Signature mismatch - this doesn't claim to be a header file";
+
+    let error = repository
+        .working_forms()
+        .expect_err("the index is corrupt");
+    assert_storage_refusal(&error, "build filter pipeline", detail);
+    let error = repository
+        .changed_working_files(&head, &[], &|_| true, 16)
+        .expect_err("status cannot read the corrupt index");
+    assert_storage_refusal(&error, "start status", detail);
+
+    fs::write(&index, original).expect("restore index");
+    let restored = Repository::open(root).expect("repository");
+    restored
+        .working_forms()
+        .expect("the restored index converts");
+    let changed = restored
+        .changed_working_files(&head, &[], &|_| true, 16)
+        .expect("the restored index compares");
+    assert!(changed.paths().is_empty());
+    assert!(!changed.is_truncated());
+}
+
+#[test]
+fn a_boolean_working_tree_encoding_refuses_conversion_with_its_attribute_detail() {
+    // Issue #535: invalid attribute values retain the filter's actual explanation.
+    for attribute in ["working-tree-encoding", "-working-tree-encoding"] {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let root = directory.path();
+        init(root);
+        write(root, &[("lib.rs", "pub fn beacon() {}\n")]);
+        commit_all(root, "base");
+        fs::write(root.join(".gitattributes"), format!("*.rs {attribute}\n")).expect("attributes");
+        let repository = Repository::open(root).expect("repository");
+        let head = repository.resolve("HEAD").expect("head");
+        let files = repository.tree_files(&head, &|_| true, 16).expect("files");
+        let mut converter = repository.working_forms().expect("working forms");
+        let error = converter
+            .form(&files[0], 1024)
+            .expect_err("encoding requires a name");
+        assert_storage_refusal(
+            &error,
+            "convert to working form",
+            "Encodings must be names, like UTF-16, and cannot be booleans.",
+        );
+    }
+}
+
+#[test]
+fn working_file_read_refusals_preserve_the_operating_system_detail() {
+    use std::io::Read as _;
+
+    // Issue #535: a write-only file produces a real read refusal in both readers.
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("working.bin");
+    fs::write(&path, b"working bytes").expect("working file");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("write-only file");
+    let expected = file
+        .read(&mut [0_u8; 1])
+        .expect_err("the file is write-only");
+    let error = super::read_small(&mut file, 13).expect_err("the small read is refused");
+    assert_storage_refusal(&error, "read working file", &expected.to_string());
+    let error = blob_id_of_length(file, 13, gix::hash::Kind::Sha1)
+        .expect_err("the streamed read is refused");
+    assert_storage_refusal(&error, "read working file", &expected.to_string());
+    assert_eq!(fs::read(&path).expect("retained bytes"), b"working bytes");
 }
 
 #[test]

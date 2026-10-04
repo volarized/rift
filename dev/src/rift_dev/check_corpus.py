@@ -834,8 +834,29 @@ class Corpus:
                             refusal = object_value(error.error.data, "source refusal")
                             require(
                                 refusal.get("code") == "limit_exceeded"
-                                and refusal.get("phase") == "read",
+                                and refusal.get("phase") == "read"
+                                and refusal.get("retry") == "never",
                                 f"source bound wrong refusal: {refusal}",
+                            )
+                            message = string_value(
+                                refusal.get("message"), "source refusal message"
+                            )
+                            prefix = (
+                                "workspace contains more files than its accepted limit of 20000: "
+                                "field source.files, observed 20001, path "
+                            )
+                            action = "; reduce workspace files below 20000 and retry"
+                            require(
+                                message.startswith(prefix) and message.endswith(action),
+                                f"source bound wrong message: {message}",
+                            )
+                            path = message[len(prefix) : -len(action)]
+                            require(bool(path.strip()), "source bound omitted its path")
+                            reported = Path(path).resolve()
+                            root = self.root.resolve()
+                            require(
+                                reported != root and reported.is_relative_to(root),
+                                f"source bound path is outside the workspace: {path}",
                             )
                             limit = object_value(refusal.get("limit"), "source limit")
                             require(
@@ -844,15 +865,10 @@ class Corpus:
                                 and limit.get("limit") == 20000,
                                 f"source bound wrong limit: {limit}",
                             )
+                            causes = refusal.get("causes", [])
                             require(
-                                any(
-                                    "too_many_files"
-                                    in string_value(
-                                        cause.get("message"), "source cause"
-                                    )
-                                    for cause in objects(refusal, "causes")
-                                ),
-                                f"source bound missing too_many_files cause: {refusal}",
+                                causes == [],
+                                f"direct source bound has unexpected causes: {causes}",
                             )
                             break
                         require(

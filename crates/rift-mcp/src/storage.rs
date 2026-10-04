@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
+use rift_error::causes;
 use rift_index::{DatabasePool, LogStore, WorkspaceDatabase};
 
 /// One serving process's storage handles for a workspace.
@@ -39,12 +40,12 @@ impl WorkspaceStorage {
     ///
     /// # Errors
     ///
-    /// Returns an election storage failure when `guard` belongs to another workspace
+    /// Returns an election storage error when `guard` belongs to another workspace
     /// or its state directory cannot be read. Neither failure opens the database.
     pub async fn open_elected(
         root: &Path,
         guard: Arc<crate::ElectionGuard>,
-    ) -> Result<Self, crate::ElectionError> {
+    ) -> Result<Self, rift_error::RiftError> {
         guard.validate_workspace(root)?;
         Ok(Self::open_with_owner(root, Some(guard)).await)
     }
@@ -123,7 +124,7 @@ async fn open_workspace_database(
     match WorkspaceDatabase::open_with_owner(&database_path, configured_pool(root), owner).await {
         Ok(database) => Some(database),
         Err(error) => {
-            let causes = rift_core::causes(&error).join(": ");
+            let causes = causes(&error).join(": ");
             tracing::warn!(
                 component = "storage",
                 operation = "database.open",
@@ -139,6 +140,7 @@ async fn open_workspace_database(
 
 #[cfg(test)]
 mod tests {
+    use rift_error::errors;
     use std::sync::Arc;
 
     use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
@@ -183,13 +185,12 @@ mod tests {
         let error = WorkspaceStorage::open_elected(requested.path(), guard)
             .await
             .expect_err("a mismatched guard cannot open the database");
-        assert!(matches!(
-            error.fault(),
-            crate::ElectionFault::Storage {
-                operation: "validate workspace election",
-                ..
-            }
-        ));
+        assert_eq!(error.slug(), errors::mcp::election_storage_failed::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "validate workspace election")
+        );
         assert!(!requested.path().join(".rift/db").exists());
     }
 

@@ -27,8 +27,8 @@ pub use content_cache::WorkspaceContentCache;
 pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
-    LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
-    LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalStamp, PublishedIndex, RevisionScoped,
+    LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
+    LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
 };
 pub use log::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
@@ -37,21 +37,18 @@ pub use log::{
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;
 pub use rift_analysis::documentation::{
-    DocumentationCollection, DocumentationError, documentation_context,
-    documentation_context_with_budget,
+    DocumentationCollection, documentation_context, documentation_context_with_budget,
 };
 pub use rift_analysis::documentation::{
     DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
 };
-pub use rift_analysis::{
-    ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
-};
+pub use rift_analysis::{ForceIncludeReach, PathMatcher, PathVerdict};
+pub use rift_error::RiftError;
 pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexFailure, IndexRead, IndexedFile, IndexedFileNodes, ReadableSymbol, SymbolMatch,
-    TextSourceFile, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault,
-    WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexViolation,
+    IndexRead, IndexedFile, IndexedFileNodes, ReadableSymbol, SymbolMatch, TextSourceFile,
+    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation,
     WorkspaceIndexWarning, WorkspaceMapPaths, WorkspaceSourcePolicy, capture_digests,
     capture_digests_with_languages, capture_digests_with_languages_cancellable,
     capture_selected_paths_cancellable, capture_visible_digests_with_languages_cancellable,

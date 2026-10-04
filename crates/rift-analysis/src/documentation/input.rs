@@ -15,19 +15,28 @@ use rift_protocol::documentation::{
 };
 use rift_protocol::read::{Language, SourceKind, SourceLocationKind};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
 use super::identity::{canonical_digest, content_digest, is_digest};
+use rift_error::{RiftError, errors};
 
 pub(super) fn slice<'a>(
     text: &'a str,
     range: &rift_protocol::read::TextRange,
-) -> Result<&'a str, DocumentationError> {
-    let start = usize::try_from(range.start)
-        .map_err(|_| refused(DocumentationViolation::Range, "range"))?;
-    let end =
-        usize::try_from(range.end).map_err(|_| refused(DocumentationViolation::Range, "range"))?;
-    text.get(start..end)
-        .ok_or_else(|| refused(DocumentationViolation::Range, "range"))
+) -> Result<&'a str, RiftError> {
+    let start = usize::try_from(range.start).map_err(|_| {
+        errors::analysis::documentation_range_invalid()
+            .field("range")
+            .error()
+    })?;
+    let end = usize::try_from(range.end).map_err(|_| {
+        errors::analysis::documentation_range_invalid()
+            .field("range")
+            .error()
+    })?;
+    text.get(start..end).ok_or_else(|| {
+        errors::analysis::documentation_range_invalid()
+            .field("range")
+            .error()
+    })
 }
 
 /// One selected source record paired with the bytes it describes.
@@ -49,10 +58,7 @@ impl<'source> DocumentationInput<'source> {
     /// # Errors
     ///
     /// Returns a typed refusal for invalid identities, origins, formats, digests, or bounds.
-    pub fn new(
-        source: DocumentationSource,
-        text: &'source str,
-    ) -> Result<Self, DocumentationError> {
+    pub fn new(source: DocumentationSource, text: &'source str) -> Result<Self, RiftError> {
         validate_source(&source, text)?;
         Ok(Self {
             source,
@@ -81,10 +87,7 @@ impl<'source> DocumentationInput<'source> {
     /// # Errors
     ///
     /// Returns a refusal if source path, language, or bytes do not match syntax facts.
-    pub fn with_syntax(
-        self,
-        syntax: &rift_syntax::SyntaxDocument,
-    ) -> Result<Self, DocumentationError> {
+    pub fn with_syntax(self, syntax: &rift_syntax::SyntaxDocument) -> Result<Self, RiftError> {
         self.with_syntax_facts(syntax.path(), syntax.shared_facts())
     }
 
@@ -98,7 +101,7 @@ impl<'source> DocumentationInput<'source> {
         self,
         path: &ProjectPath,
         syntax: &Arc<rift_syntax::SyntaxFacts>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         self.with_syntax_facts(path, Arc::clone(syntax))
     }
 
@@ -107,9 +110,11 @@ impl<'source> DocumentationInput<'source> {
         mut self,
         path: &ProjectPath,
         syntax: Arc<rift_syntax::SyntaxFacts>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if !syntax_matches_source(&self.source, self.text, path, &syntax) {
-            return Err(refused(DocumentationViolation::Format, "syntax_source"));
+            return errors::analysis::documentation_format_invalid()
+                .field("syntax_source")
+                .fail();
         }
         self.syntax = Some(syntax);
         Ok(self)
@@ -123,9 +128,11 @@ impl<'source> DocumentationInput<'source> {
     pub fn with_chunks(
         mut self,
         chunks: Vec<rift_protocol::documentation::DocumentationChunk>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if chunks.len() > rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX as usize {
-            return Err(refused(DocumentationViolation::LimitExceeded, "chunks"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("chunks")
+                .fail();
         }
         let mut end = 0;
         let mut identities = BTreeSet::new();
@@ -140,12 +147,16 @@ impl<'source> DocumentationInput<'source> {
             let valid_boundary = start.is_some_and(|offset| self.text.is_char_boundary(offset))
                 && stop.is_some_and(|offset| self.text.is_char_boundary(offset));
             if !accepted_identity || !valid_range || !valid_boundary {
-                return Err(refused(DocumentationViolation::Range, "chunks"));
+                return errors::analysis::documentation_range_invalid()
+                    .field("chunks")
+                    .fail();
             }
             end = chunk.range.end;
         }
         if end != self.source.byte_length {
-            return Err(refused(DocumentationViolation::Range, "chunks"));
+            return errors::analysis::documentation_range_invalid()
+                .field("chunks")
+                .fail();
         }
         self.chunks = chunks;
         Ok(self)
@@ -199,10 +210,12 @@ pub struct DocumentationSourceSet<'source> {
 ///
 /// # Errors
 ///
-/// Returns [`DocumentationError`] when the count exceeds [`DOCUMENTATION_SOURCES_MAX`].
-pub fn check_documentation_source_count(count: usize) -> Result<(), DocumentationError> {
+/// Returns [`RiftError`] when the count exceeds [`DOCUMENTATION_SOURCES_MAX`].
+pub fn check_documentation_source_count(count: usize) -> Result<(), RiftError> {
     if count > DOCUMENTATION_SOURCES_MAX as usize {
-        Err(refused(DocumentationViolation::LimitExceeded, "sources"))
+        errors::analysis::documentation_limit_exceeded()
+            .field("sources")
+            .fail()
     } else {
         Ok(())
     }
@@ -217,7 +230,7 @@ impl<'source> DocumentationSourceSet<'source> {
     /// # Errors
     ///
     /// Returns a typed refusal for duplicate identities or aggregate bounds.
-    pub fn new(mut sources: Vec<DocumentationInput<'source>>) -> Result<Self, DocumentationError> {
+    pub fn new(mut sources: Vec<DocumentationInput<'source>>) -> Result<Self, RiftError> {
         check_documentation_source_count(sources.len())?;
         sources.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
         let mut bytes = 0_u64;
@@ -226,9 +239,15 @@ impl<'source> DocumentationSourceSet<'source> {
             bytes = bytes
                 .checked_add(source.source.byte_length)
                 .filter(|total| *total <= DOCUMENTATION_TOTAL_BYTES_MAX)
-                .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "source_bytes"))?;
+                .ok_or_else(|| {
+                    errors::analysis::documentation_limit_exceeded()
+                        .field("source_bytes")
+                        .error()
+                })?;
             if previous == Some(&source.source.identity) {
-                return Err(refused(DocumentationViolation::DuplicateSource, "identity"));
+                return errors::analysis::documentation_duplicate_source()
+                    .field("identity")
+                    .fail();
             }
             previous = Some(&source.source.identity);
         }
@@ -252,51 +271,55 @@ impl<'source> DocumentationSourceSet<'source> {
     }
 }
 
-fn validate_source(source: &DocumentationSource, text: &str) -> Result<(), DocumentationError> {
+fn validate_source(source: &DocumentationSource, text: &str) -> Result<(), RiftError> {
     validate_source_metadata(source)?;
     let size_accepted = text.len() <= DOCUMENTATION_SOURCE_BYTES_MAX as usize;
     let length_matches = source.byte_length == text.len() as u64;
     let digest_matches = source.content_digest == content_digest(text.as_bytes());
     match () {
-        () if !size_accepted => Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "source_bytes",
-        )),
-        () if !length_matches => Err(refused(DocumentationViolation::Range, "byte_length")),
-        () if !digest_matches => Err(refused(DocumentationViolation::Digest, "content_digest")),
+        () if !size_accepted => errors::analysis::documentation_limit_exceeded()
+            .field("source_bytes")
+            .fail(),
+        () if !length_matches => errors::analysis::documentation_range_invalid()
+            .field("byte_length")
+            .fail(),
+        () if !digest_matches => errors::analysis::documentation_digest_mismatch()
+            .field("content_digest")
+            .fail(),
         () => Ok(()),
     }
 }
 
-pub(super) fn validate_source_metadata(
-    source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+pub(super) fn validate_source_metadata(source: &DocumentationSource) -> Result<(), RiftError> {
     validate_identity(&source.identity)?;
     validate_origin(source)?;
     validate_format(source)?;
     validate_selection(source)?;
     validate_license(source)?;
     if source.byte_length > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX) {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "source_bytes",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("source_bytes")
+            .fail();
     }
     if !is_digest(&source.revision) || !is_digest(&source.content_digest) {
-        return Err(refused(DocumentationViolation::Digest, "source.digest"));
+        return errors::analysis::documentation_digest_mismatch()
+            .field("source.digest")
+            .fail();
     }
     let language_valid = source.language.as_ref().is_none_or(|language| {
         Language::from_identity_segment(&language.identity_segment()).is_ok()
     });
     if !language_valid {
-        return Err(refused(DocumentationViolation::Format, "source.language"));
+        return errors::analysis::documentation_format_invalid()
+            .field("source.language")
+            .fail();
     }
     validate_physical_ranges(source)
 }
 
 pub(super) fn source_selection_digest<'source>(
     sources: impl IntoIterator<Item = &'source DocumentationSource>,
-) -> Result<DocumentationDigest, DocumentationError> {
+) -> Result<DocumentationDigest, RiftError> {
     let selected: Vec<_> = sources
         .into_iter()
         .map(|source| {
@@ -311,9 +334,7 @@ pub(super) fn source_selection_digest<'source>(
     canonical_digest(&selected)
 }
 
-pub(super) fn validate_identity(
-    identity: &DocumentationContentIdentity,
-) -> Result<(), DocumentationError> {
+pub(super) fn validate_identity(identity: &DocumentationContentIdentity) -> Result<(), RiftError> {
     let accepted = match &identity.source {
         DocumentationSourceIdentity::Project { path } => {
             !path.0.is_empty() && ProjectPath::new(&path.0).is_ok()
@@ -321,7 +342,9 @@ pub(super) fn validate_identity(
         DocumentationSourceIdentity::Package { unit } => SourceUnitId::parse(&unit.0).is_ok(),
     };
     if !accepted {
-        return Err(refused(DocumentationViolation::Identity, "source"));
+        return errors::analysis::documentation_identity_invalid()
+            .field("source")
+            .fail();
     }
     let Some(cell) = &identity.cell else {
         return Ok(());
@@ -332,13 +355,15 @@ pub(super) fn validate_identity(
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte));
         if !valid_length || !valid_characters {
-            return Err(refused(DocumentationViolation::Notebook, "cell.identity"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("cell.identity")
+                .fail();
         }
     }
     Ok(())
 }
 
-fn validate_origin(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_origin(source: &DocumentationSource) -> Result<(), RiftError> {
     let origin = &source.origin;
     let authored_location =
         origin.source_kind != SourceKind::Synthetic && origin.location.is_some();
@@ -353,25 +378,31 @@ fn validate_origin(source: &DocumentationSource) -> Result<(), DocumentationErro
         || (origin.package.is_some() && !package_location)
         || (package_required && origin.package.is_none())
     {
-        return Err(refused(DocumentationViolation::Origin, "origin"));
+        return errors::analysis::documentation_origin_invalid()
+            .field("origin")
+            .fail();
     }
     match &source.identity.source {
         DocumentationSourceIdentity::Project { .. }
             if origin.location != Some(SourceLocationKind::Project) =>
         {
-            Err(refused(DocumentationViolation::Origin, "origin.location"))
+            errors::analysis::documentation_origin_invalid()
+                .field("origin.location")
+                .fail()
         }
         DocumentationSourceIdentity::Package { .. }
             if origin.location != Some(SourceLocationKind::Dependency) =>
         {
-            Err(refused(DocumentationViolation::Origin, "origin.location"))
+            errors::analysis::documentation_origin_invalid()
+                .field("origin.location")
+                .fail()
         }
         DocumentationSourceIdentity::Package { unit } => validate_package_origin(unit, source),
         DocumentationSourceIdentity::Project { .. } => Ok(()),
     }
 }
 
-fn validate_selection(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_selection(source: &DocumentationSource) -> Result<(), RiftError> {
     use DocumentationSelectionReason as Selection;
     let valid = match source.selection {
         Selection::Workspace => {
@@ -391,38 +422,53 @@ fn validate_selection(source: &DocumentationSource) -> Result<(), DocumentationE
     if valid {
         Ok(())
     } else {
-        Err(refused(DocumentationViolation::Origin, "selection"))
+        errors::analysis::documentation_origin_invalid()
+            .field("selection")
+            .fail()
     }
 }
 
 fn validate_package_origin(
     unit: &rift_protocol::read::SourceUnitId,
     source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
-    let parsed = SourceUnitId::parse(&unit.0)
-        .map_err(|_| refused(DocumentationViolation::Identity, "source.unit"))?;
+) -> Result<(), RiftError> {
+    let parsed = SourceUnitId::parse(&unit.0).map_err(|_| {
+        errors::analysis::documentation_identity_invalid()
+            .field("source.unit")
+            .error()
+    })?;
     let Some(package) = &source.origin.package else {
-        return Err(refused(DocumentationViolation::Origin, "origin.package"));
+        return errors::analysis::documentation_origin_invalid()
+            .field("origin.package")
+            .fail();
     };
     let key_prefix = format!("{}@{}/", package.name, package.version);
     let manager_matches = parsed.resolver().as_str() == package.manager;
     let package_matches = parsed.key().as_str().starts_with(&key_prefix);
     if !manager_matches || !package_matches {
-        return Err(refused(DocumentationViolation::Origin, "origin.package"));
+        return errors::analysis::documentation_origin_invalid()
+            .field("origin.package")
+            .fail();
     }
     let path = parsed
         .key()
         .as_str()
         .strip_prefix(&key_prefix)
         .unwrap_or_default();
-    ProjectPath::new(path).map_err(|_| refused(DocumentationViolation::Identity, "source.unit"))?;
+    ProjectPath::new(path).map_err(|_| {
+        errors::analysis::documentation_identity_invalid()
+            .field("source.unit")
+            .error()
+    })?;
     if path.is_empty() {
-        return Err(refused(DocumentationViolation::Identity, "source.unit"));
+        return errors::analysis::documentation_identity_invalid()
+            .field("source.unit")
+            .fail();
     }
     Ok(())
 }
 
-fn validate_format(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_format(source: &DocumentationSource) -> Result<(), RiftError> {
     let path = source_path(&source.identity)?;
     let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     let accepted = match source.format {
@@ -442,56 +488,69 @@ fn validate_format(source: &DocumentationSource) -> Result<(), DocumentationErro
         }
     };
     if !accepted {
-        return Err(refused(DocumentationViolation::Format, "format"));
+        return errors::analysis::documentation_format_invalid()
+            .field("format")
+            .fail();
     }
     let cell_accepted =
         source.identity.cell.is_some() == (source.format == DocumentationSourceFormat::Notebook);
     if !cell_accepted {
-        return Err(refused(DocumentationViolation::Notebook, "cell"));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("cell")
+            .fail();
     }
     Ok(())
 }
 
-pub(super) fn source_path(
-    identity: &DocumentationContentIdentity,
-) -> Result<String, DocumentationError> {
+pub(super) fn source_path(identity: &DocumentationContentIdentity) -> Result<String, RiftError> {
     match &identity.source {
         DocumentationSourceIdentity::Project { path } => Ok(path.0.clone()),
         DocumentationSourceIdentity::Package { unit } => SourceUnitId::parse(&unit.0)
             .map(|unit| unit.key().as_str().to_owned())
-            .map_err(|_| refused(DocumentationViolation::Identity, "source.unit")),
+            .map_err(|_| {
+                errors::analysis::documentation_identity_invalid()
+                    .field("source.unit")
+                    .error()
+            }),
     }
 }
 
-pub(super) fn source_file_path(
-    source: &DocumentationSource,
-) -> Result<ProjectPath, DocumentationError> {
+pub(super) fn source_file_path(source: &DocumentationSource) -> Result<ProjectPath, RiftError> {
     let full_path = source_path(&source.identity)?;
     let path = match &source.identity.source {
         DocumentationSourceIdentity::Project { .. } => full_path.as_str(),
         DocumentationSourceIdentity::Package { .. } => {
-            let package = source
-                .origin
-                .package
-                .as_ref()
-                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?;
+            let package = source.origin.package.as_ref().ok_or_else(|| {
+                errors::analysis::documentation_origin_invalid()
+                    .field("origin.package")
+                    .error()
+            })?;
             full_path
                 .strip_prefix(&format!("{}@{}/", package.name, package.version))
-                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?
+                .ok_or_else(|| {
+                    errors::analysis::documentation_origin_invalid()
+                        .field("origin.package")
+                        .error()
+                })?
         }
     };
-    ProjectPath::new(path).map_err(|_| refused(DocumentationViolation::Identity, "source"))
+    ProjectPath::new(path).map_err(|_| {
+        errors::analysis::documentation_identity_invalid()
+            .field("source")
+            .error()
+    })
 }
 
-fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), RiftError> {
     if source.physical_ranges.len() > NOTEBOOK_SOURCE_RANGES_MAX as usize {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "physical_ranges",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("physical_ranges")
+            .fail();
     }
     if source.identity.cell.is_none() && !source.physical_ranges.is_empty() {
-        return Err(refused(DocumentationViolation::Notebook, "physical_ranges"));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("physical_ranges")
+            .fail();
     }
     let mut previous_end = 0;
     for range in &source.physical_ranges {
@@ -499,14 +558,16 @@ fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), Document
         let nonempty = range.end > range.start;
         let bounded = range.end <= u64::from(DOCUMENTATION_SOURCE_BYTES_MAX);
         if !ordered || !nonempty || !bounded {
-            return Err(refused(DocumentationViolation::Range, "physical_ranges"));
+            return errors::analysis::documentation_range_invalid()
+                .field("physical_ranges")
+                .fail();
         }
         previous_end = range.end;
     }
     Ok(())
 }
 
-fn validate_license(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_license(source: &DocumentationSource) -> Result<(), RiftError> {
     let Some(license) = &source.license else {
         return Ok(());
     };
@@ -515,14 +576,18 @@ fn validate_license(source: &DocumentationSource) -> Result<(), DocumentationErr
         .as_ref()
         .is_none_or(|text| !text.is_empty() && text.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize);
     if !valid_expression || license.files.len() > DOCUMENTATION_LICENSE_FILES_MAX as usize {
-        return Err(refused(DocumentationViolation::LimitExceeded, "license"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("license")
+            .fail();
     }
     let mut paths = BTreeSet::new();
     for file in &license.files {
         let valid_path = !file.path.0.is_empty() && ProjectPath::new(&file.path.0).is_ok();
         let valid_digest = is_digest(&file.digest);
         if !valid_path || !valid_digest || !paths.insert(&file.path) {
-            return Err(refused(DocumentationViolation::Identity, "license.files"));
+            return errors::analysis::documentation_identity_invalid()
+                .field("license.files")
+                .fail();
         }
     }
     Ok(())
@@ -570,10 +635,8 @@ mod tests {
     }
 
     fn violation(source: DocumentationSource, text: &str) -> DocumentationViolation {
-        DocumentationInput::new(source, text)
-            .expect_err("input refused")
-            .fault()
-            .violation()
+        let error = DocumentationInput::new(source, text).expect_err("input refused");
+        crate::documentation::failure::violation(&error)
     }
 
     #[test]
@@ -613,7 +676,7 @@ mod tests {
         let input = DocumentationInput::new(source("a.md", "a"), "a").expect("input");
         let error = DocumentationSourceSet::new(vec![input.clone(), input]).expect_err("duplicate");
         assert_eq!(
-            error.fault().violation(),
+            crate::documentation::failure::violation(&error),
             DocumentationViolation::DuplicateSource
         );
     }
@@ -882,7 +945,10 @@ mod tests {
             .expect("source")
             .with_chunks(chunks)
             .expect_err("chunk count bound");
-        assert_eq!(error.fault().field(), "chunks");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("chunks")
+        );
     }
 
     #[test]
@@ -904,7 +970,10 @@ mod tests {
             })
             .collect();
         let error = DocumentationSourceSet::new(sources).expect_err("total byte bound");
-        assert_eq!(error.fault().field(), "source_bytes");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("source_bytes")
+        );
 
         let mut notebook = source("guide.ipynb", "a");
         notebook.format = DocumentationSourceFormat::Notebook;

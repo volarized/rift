@@ -11,6 +11,7 @@ description = "Domain vocabulary and correctness primitives for Rift"
 sha2.workspace = true
 percent-encoding.workspace = true
 rift-protocol.workspace = true
+rift-error.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

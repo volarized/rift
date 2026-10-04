@@ -10,13 +10,12 @@
 //! same analyzer revision compare byte for byte.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::documentation::{
-    DocumentationDeclaration, DocumentationError, DocumentationInput, DocumentationSourceSet,
-    collect_documentation, content_chunk_identity, content_digest,
+    DocumentationDeclaration, DocumentationInput, DocumentationSourceSet, collect_documentation,
+    content_chunk_identity, content_digest,
 };
 use crate::input::ExactPackageInput;
 use crate::revision::analyzer_revision;
@@ -26,10 +25,10 @@ use crate::source::{FileDigest, IndexedFile};
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::line::{line_of, line_starts};
 use rift_core::{
-    ContributionOrigin, Error, ErrorCode, ErrorContext, ErrorName, Fault,
-    ProjectPath as CoreProjectPath, SourceKind, SourceUnitId as CoreSourceUnitId, fault_label,
-    symbol_identity,
+    ContributionOrigin, ProjectPath as CoreProjectPath, SourceKind,
+    SourceUnitId as CoreSourceUnitId, symbol_identity,
 };
+use rift_error::{ErrorContext, ErrorValue, RiftError, errors};
 use rift_protocol::canonical::canonical_json;
 use rift_protocol::documentation::{
     DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX, DocumentationChunk,
@@ -65,118 +64,9 @@ mod join_tests;
 use join::ModuleRole;
 pub use join::StubForm;
 
-/// Package analysis failure classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackageAnalysisViolation {
-    /// Package identity cannot form a source unit, resolver, or symbol.
-    Identity,
-    /// No shipped provider parses a selected file, or its parse failed.
-    Syntax,
-    /// Semantic publication or normalization failed.
-    Provider,
-    /// A package file exceeded the declaration publication bound.
-    PackageDeclarationsExceeded,
+fn package_label(package: &PackageIdentity) -> String {
+    format!("{}/{}@{}", package.manager, package.name, package.version)
 }
-
-/// One package analysis failure with package, path, and source evidence.
-#[derive(Debug)]
-pub struct PackageAnalysisFault {
-    violation: PackageAnalysisViolation,
-    package: Box<PackageIdentity>,
-    path: Option<CoreProjectPath>,
-    source: Option<Box<dyn StdError + Send + Sync>>,
-}
-
-impl PackageAnalysisFault {
-    fn new(violation: PackageAnalysisViolation, package: &PackageIdentity) -> Self {
-        Self {
-            violation,
-            package: Box::new(package.clone()),
-            path: None,
-            source: None,
-        }
-    }
-
-    fn at(mut self, path: &CoreProjectPath) -> Self {
-        self.path = Some(path.clone());
-        self
-    }
-
-    fn caused_by(mut self, source: impl StdError + Send + Sync + 'static) -> Self {
-        self.source = Some(Box::new(source));
-        self
-    }
-
-    fn into_error(self) -> PackageAnalysisError {
-        Error::new(self)
-    }
-
-    /// Failure classification.
-    #[must_use]
-    pub const fn violation(&self) -> PackageAnalysisViolation {
-        self.violation
-    }
-
-    /// Package identity.
-    #[must_use]
-    pub const fn package(&self) -> &PackageIdentity {
-        &self.package
-    }
-
-    /// Package-relative path, when one caused the failure.
-    #[must_use]
-    pub const fn path(&self) -> Option<&CoreProjectPath> {
-        self.path.as_ref()
-    }
-}
-
-impl Fault for PackageAnalysisFault {
-    /// A syntax failure delegates to the underlying syntax error's identity when the source
-    /// downcasts to one. The declaration bound is a declared resource limit, so the same
-    /// package reaches it on every retry.
-    fn name(&self) -> ErrorName {
-        match self.violation {
-            PackageAnalysisViolation::Syntax => self
-                .source
-                .as_deref()
-                .and_then(|source| source.downcast_ref::<rift_syntax::SyntaxError>())
-                .map_or(ErrorName::Wire(ErrorCode::InternalError), |error| {
-                    error.name()
-                }),
-            PackageAnalysisViolation::PackageDeclarationsExceeded => {
-                ErrorName::Wire(ErrorCode::LimitExceeded)
-            }
-            PackageAnalysisViolation::Identity | PackageAnalysisViolation::Provider => {
-                ErrorName::Wire(ErrorCode::InternalError)
-            }
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let package = format!(
-            "{}/{}@{}",
-            self.package.manager, self.package.name, self.package.version
-        );
-        let mut context = vec![
-            ErrorContext::new("violation", fault_label(&self.violation)),
-            ErrorContext::new("package", package),
-        ];
-        if let Some(path) = &self.path {
-            context.push(ErrorContext::new("path", path.as_str().to_owned()));
-        }
-        context
-    }
-
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn StdError + 'static))
-    }
-}
-
-/// Opaque package analysis failure.
-pub type PackageAnalysisError = Error<PackageAnalysisFault>;
 
 /// One package file as the analyzer holds it: the parsed document, where it is filed, the
 /// public declarations it carries, and what the stub and module join decided for it.
@@ -284,13 +174,13 @@ impl PackageAnalyzer {
     ///
     /// # Errors
     ///
-    /// Returns [`PackageAnalysisError`] when the identity cannot spell a resolver or unit,
+    /// Returns [`RiftError`] when the identity cannot spell a resolver or unit,
     /// when no provider parses a file or its parse fails, or when publication or
     /// normalization refuses the package graph.
     pub fn analyze(
         input: ExactPackageInput<'_>,
         revision: u64,
-    ) -> Result<PackageAnalysis, PackageAnalysisError> {
+    ) -> Result<PackageAnalysis, RiftError> {
         let package = input.package();
         let mut analyzed = Vec::with_capacity(input.files().len());
         for file in input.files() {
@@ -321,17 +211,16 @@ impl PackageAnalyzer {
             None,
         )
         .map_err(|error| {
-            PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package)
-                .caused_by(error)
-                .into_error()
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .cause(error)
+                .error()
         })?;
         if let Some(path) = built.beyond_declaration_bound.first() {
-            return Err(PackageAnalysisFault::new(
-                PackageAnalysisViolation::PackageDeclarationsExceeded,
-                package,
-            )
-            .at(path)
-            .into_error());
+            return errors::analysis::package_declarations_exceeded()
+                .package(package_label(package))
+                .path(path.as_str())
+                .fail();
         }
         let (publication, notebook_cells) = publish(
             package,
@@ -366,7 +255,7 @@ fn publish(
         PackagePublication,
         BTreeMap<DocumentationContentIdentity, String>,
     ),
-    PackageAnalysisError,
+    RiftError,
 > {
     let origin = symbol_origin(package, source_origin)?;
     let mut records = Records::default();
@@ -425,12 +314,17 @@ fn package_documentation(
         rift_protocol::documentation::DocumentationIndex,
         BTreeMap<DocumentationContentIdentity, String>,
     ),
-    PackageAnalysisError,
+    RiftError,
 > {
     let DecodedPackageNotebooks {
         notebooks,
         omissions,
-    } = decode_package_notebooks(analyzed).map_err(|error| documentation_error(error, package))?;
+    } = decode_package_notebooks(analyzed).map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(package))
+            .cause(error)
+            .error()
+    })?;
     let mut inputs = PackageDocumentationInputs {
         inputs: Vec::new(),
         omissions,
@@ -447,14 +341,28 @@ fn package_documentation(
     )?;
     append_regular_inputs(package, origin, analyzed, &mut inputs)?;
     append_attached_comment_inputs(analyzed, origin, package, &mut inputs)?;
-    let sources = DocumentationSourceSet::new(inputs.inputs)
-        .map_err(|error| documentation_error(error, package))?;
+    let sources = DocumentationSourceSet::new(inputs.inputs).map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(package))
+            .cause(error)
+            .error()
+    })?;
     let declarations = package_declarations(package, analyzed, records)?;
     let notebook_cells = package_notebook_cells(analyzed, &notebooks);
     let collection = collect_documentation(&sources, &declarations)
-        .map_err(|error| documentation_error(error, package))?
+        .map_err(|error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .cause(error)
+                .error()
+        })?
         .with_source_omissions(inputs.omissions)
-        .map_err(|error| documentation_error(error, package))?;
+        .map_err(|error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .cause(error)
+                .error()
+        })?;
     Ok((collection.into_index(), notebook_cells))
 }
 
@@ -465,7 +373,7 @@ struct PackageDocumentationInputs<'source> {
 }
 
 impl PackageDocumentationInputs<'_> {
-    fn ensure_next(&self) -> Result<(), DocumentationError> {
+    fn ensure_next(&self) -> Result<(), RiftError> {
         crate::documentation::check_documentation_source_count(
             self.inputs
                 .len()
@@ -478,7 +386,7 @@ impl PackageDocumentationInputs<'_> {
         &mut self,
         identity: DocumentationContentIdentity,
         kind: DocumentationWarningKind,
-    ) -> Result<(), DocumentationError> {
+    ) -> Result<(), RiftError> {
         self.ensure_next()?;
         self.omissions.push((identity, kind));
         Ok(())
@@ -493,7 +401,7 @@ fn append_notebook_inputs<'source>(
     notebooks: &'source [Option<crate::documentation::notebook::NotebookContent>],
     records: &mut Records,
     inputs: &mut PackageDocumentationInputs<'source>,
-) -> Result<(), PackageAnalysisError> {
+) -> Result<(), RiftError> {
     for (held, notebook) in analyzed.iter().zip(notebooks) {
         let Some(notebook) = notebook else {
             continue;
@@ -521,10 +429,13 @@ fn append_notebook_cell<'source>(
     cell: &'source crate::documentation::notebook::NotebookCellContent,
     records: &mut Records,
     inputs: &mut PackageDocumentationInputs<'source>,
-) -> Result<(), PackageAnalysisError> {
-    inputs
-        .ensure_next()
-        .map_err(|error| documentation_error(error, package))?;
+) -> Result<(), RiftError> {
+    inputs.ensure_next().map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(package))
+            .cause(error)
+            .error()
+    })?;
     let unit = wire_unit(held.placement.unit());
     let identity = DocumentationContentIdentity {
         source: DocumentationSourceIdentity::Package { unit: unit.clone() },
@@ -536,7 +447,12 @@ fn append_notebook_cell<'source>(
     {
         inputs
             .omit(identity, DocumentationWarningKind::SourceUnavailable)
-            .map_err(|error| documentation_error(error, package))?;
+            .map_err(|error| {
+                errors::analysis::package_provider_failed()
+                    .package(package_label(package))
+                    .cause(error)
+                    .error()
+            })?;
         return Ok(());
     }
     let source = documentation_source(
@@ -552,7 +468,12 @@ fn append_notebook_cell<'source>(
         Err(error) => {
             inputs
                 .omit(identity, documentation_warning_kind(&error))
-                .map_err(|error| documentation_error(error, package))?;
+                .map_err(|error| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(package))
+                        .cause(error)
+                        .error()
+                })?;
             return Ok(());
         }
     };
@@ -561,7 +482,12 @@ fn append_notebook_cell<'source>(
         Err(error) => {
             inputs
                 .omit(identity, documentation_warning_kind(&error))
-                .map_err(|error| documentation_error(error, package))?;
+                .map_err(|error| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(package))
+                        .cause(error)
+                        .error()
+                })?;
             return Ok(());
         }
     };
@@ -577,7 +503,12 @@ fn append_notebook_cell<'source>(
             Err(error) => {
                 inputs
                     .omit(identity, documentation_warning_kind(&error))
-                    .map_err(|error| documentation_error(error, package))?;
+                    .map_err(|error| {
+                        errors::analysis::package_provider_failed()
+                            .package(package_label(package))
+                            .cause(error)
+                            .error()
+                    })?;
                 return Ok(());
             }
         };
@@ -603,7 +534,7 @@ fn add_notebook_document(
     unit: &SourceUnitId,
     document_id: String,
     records: &mut Records,
-) -> Result<(), PackageAnalysisError> {
+) -> Result<(), RiftError> {
     let language = match cell.cell().kind {
         NotebookCellKind::Markdown => ShippedLanguage::Markdown.language(),
         NotebookCellKind::Code => cell
@@ -637,7 +568,7 @@ fn append_regular_inputs<'source>(
     origin: &SymbolOrigin,
     analyzed: &'source [AnalyzedFile],
     inputs: &mut PackageDocumentationInputs<'source>,
-) -> Result<(), PackageAnalysisError> {
+) -> Result<(), RiftError> {
     for held in analyzed {
         let Some(format) = documentation_format(held.file.path().as_str()) else {
             continue;
@@ -645,9 +576,12 @@ fn append_regular_inputs<'source>(
         if format == DocumentationSourceFormat::Notebook {
             continue;
         }
-        inputs
-            .ensure_next()
-            .map_err(|error| documentation_error(error, package))?;
+        inputs.ensure_next().map_err(|error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .cause(error)
+                .error()
+        })?;
         let identity = DocumentationContentIdentity {
             source: DocumentationSourceIdentity::Package {
                 unit: wire_unit(held.placement.unit()),
@@ -660,7 +594,12 @@ fn append_regular_inputs<'source>(
         {
             inputs
                 .omit(identity, DocumentationWarningKind::SourceUnavailable)
-                .map_err(|error| documentation_error(error, package))?;
+                .map_err(|error| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(package))
+                        .cause(error)
+                        .error()
+                })?;
             continue;
         }
         match package_file_input(origin, held, format) {
@@ -670,7 +609,12 @@ fn append_regular_inputs<'source>(
             }
             Err(error) => inputs
                 .omit(identity, documentation_warning_kind(&error))
-                .map_err(|error| documentation_error(error, package))?,
+                .map_err(|error| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(package))
+                        .cause(error)
+                        .error()
+                })?,
         }
     }
     Ok(())
@@ -680,7 +624,7 @@ fn package_file_input<'source>(
     origin: &SymbolOrigin,
     held: &'source AnalyzedFile,
     format: DocumentationSourceFormat,
-) -> Result<DocumentationInput<'source>, DocumentationError> {
+) -> Result<DocumentationInput<'source>, RiftError> {
     let unit = wire_unit(held.placement.unit());
     let identity = DocumentationContentIdentity {
         source: DocumentationSourceIdentity::Package { unit: unit.clone() },
@@ -714,7 +658,7 @@ struct DecodedPackageNotebooks {
 
 fn decode_package_notebooks(
     analyzed: &[AnalyzedFile],
-) -> Result<DecodedPackageNotebooks, DocumentationError> {
+) -> Result<DecodedPackageNotebooks, RiftError> {
     let mut notebooks = Vec::with_capacity(analyzed.len());
     let mut omissions = Vec::new();
     let mut selected = 0_usize;
@@ -756,7 +700,7 @@ fn append_attached_comment_inputs<'source>(
     origin: &SymbolOrigin,
     package: &PackageIdentity,
     inputs: &mut PackageDocumentationInputs<'source>,
-) -> Result<(), PackageAnalysisError> {
+) -> Result<(), RiftError> {
     for held in analyzed {
         if !held
             .file
@@ -767,9 +711,12 @@ fn append_attached_comment_inputs<'source>(
         {
             continue;
         }
-        inputs
-            .ensure_next()
-            .map_err(|error| documentation_error(error, package))?;
+        inputs.ensure_next().map_err(|error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .cause(error)
+                .error()
+        })?;
         append_attached_comment(held, origin, package, inputs)?;
     }
     Ok(())
@@ -780,7 +727,7 @@ fn append_attached_comment<'source>(
     origin: &SymbolOrigin,
     package: &PackageIdentity,
     inputs: &mut PackageDocumentationInputs<'source>,
-) -> Result<(), PackageAnalysisError> {
+) -> Result<(), RiftError> {
     let source_text = held.file.source();
     let unit = wire_unit(held.placement.unit());
     let identity = DocumentationContentIdentity {
@@ -793,7 +740,12 @@ fn append_attached_comment<'source>(
     {
         inputs
             .omit(identity, DocumentationWarningKind::SourceUnavailable)
-            .map_err(|error| documentation_error(error, package))?;
+            .map_err(|error| {
+                errors::analysis::package_provider_failed()
+                    .package(package_label(package))
+                    .cause(error)
+                    .error()
+            })?;
         return Ok(());
     }
     let source = documentation_source(
@@ -811,7 +763,12 @@ fn append_attached_comment<'source>(
         Err(error) => {
             inputs
                 .omit(identity, documentation_warning_kind(&error))
-                .map_err(|error| documentation_error(error, package))?;
+                .map_err(|error| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(package))
+                        .cause(error)
+                        .error()
+                })?;
             return Ok(());
         }
     };
@@ -827,7 +784,12 @@ fn append_attached_comment<'source>(
             Err(error) => {
                 inputs
                     .omit(identity, documentation_warning_kind(&error))
-                    .map_err(|error| documentation_error(error, package))?;
+                    .map_err(|error| {
+                        errors::analysis::package_provider_failed()
+                            .package(package_label(package))
+                            .cause(error)
+                            .error()
+                    })?;
                 return Ok(());
             }
         };
@@ -841,7 +803,7 @@ fn package_declarations<'declaration>(
     package: &PackageIdentity,
     analyzed: &'declaration [AnalyzedFile],
     records: &'declaration Records,
-) -> Result<Vec<DocumentationDeclaration<'declaration>>, PackageAnalysisError> {
+) -> Result<Vec<DocumentationDeclaration<'declaration>>, RiftError> {
     let languages: BTreeMap<_, _> = analyzed
         .iter()
         .map(|held| {
@@ -853,10 +815,11 @@ fn package_declarations<'declaration>(
         .collect();
     let mut declarations = Vec::with_capacity(records.symbols.len());
     for symbol in &records.symbols {
-        let language = languages
-            .get(&symbol.unit.0)
-            .copied()
-            .ok_or_else(|| documentation_error_for_package(package))?;
+        let language = languages.get(&symbol.unit.0).copied().ok_or_else(|| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .error()
+        })?;
         let identity = DocumentationContentIdentity {
             source: DocumentationSourceIdentity::Package {
                 unit: symbol.unit.clone(),
@@ -872,7 +835,12 @@ fn package_declarations<'declaration>(
                 &identity,
                 symbol.range.clone(),
             )
-            .map_err(|error| documentation_error(error, package))?,
+            .map_err(|error| {
+                errors::analysis::package_provider_failed()
+                    .package(package_label(package))
+                    .cause(error)
+                    .error()
+            })?,
         );
     }
     Ok(declarations)
@@ -940,26 +908,12 @@ fn documentation_source(
     }
 }
 
-fn documentation_error(
-    error: DocumentationError,
-    package: &PackageIdentity,
-) -> PackageAnalysisError {
-    PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package)
-        .caused_by(error)
-        .into_error()
-}
-
-fn documentation_warning_kind(error: &DocumentationError) -> DocumentationWarningKind {
-    match error.fault().violation() {
-        crate::documentation::DocumentationViolation::LimitExceeded => {
-            DocumentationWarningKind::SourceUnavailable
-        }
-        _ => DocumentationWarningKind::MalformedSource,
+fn documentation_warning_kind(error: &RiftError) -> DocumentationWarningKind {
+    if error.slug() == errors::analysis::documentation_limit_exceeded::SLUG {
+        DocumentationWarningKind::SourceUnavailable
+    } else {
+        DocumentationWarningKind::MalformedSource
     }
-}
-
-fn documentation_error_for_package(package: &PackageIdentity) -> PackageAnalysisError {
-    PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package).into_error()
 }
 
 /// The bytes a publication's `source_digest` covers: every unit's path and content digest,
@@ -1000,7 +954,7 @@ impl Records {
         origin: &SymbolOrigin,
         semantics: &WorkspaceSemantics,
         held: &AnalyzedFile,
-    ) -> Result<(), PackageAnalysisError> {
+    ) -> Result<(), RiftError> {
         let language = held.file.syntax().language().clone();
         let path = wire_path(held.file.path());
         let unit = wire_unit(held.placement.unit());
@@ -1045,7 +999,7 @@ impl Records {
         path: &ProjectPath,
         retained: RetainedSource,
         content_digest: Digest,
-    ) -> Result<(), PackageAnalysisError> {
+    ) -> Result<(), RiftError> {
         let name = file_name(path);
         let document = PackageDocument {
             identity: unit.0.clone(),
@@ -1076,7 +1030,7 @@ impl Records {
         held: &AnalyzedFile,
         context: &FileContext<'_>,
         declaration: &SyntaxSymbol,
-    ) -> Result<(), PackageAnalysisError> {
+    ) -> Result<(), RiftError> {
         let FileContext {
             language,
             unit,
@@ -1095,9 +1049,10 @@ impl Records {
         }
         let source = held.file.source();
         let declared = declaration_source(source, declaration).ok_or_else(|| {
-            PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package)
-                .at(held.file.path())
-                .into_error()
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .path(Path::new(held.file.path().as_str()))
+                .error()
         })?;
         let retained = self.retained(declared, path);
         let content_digest = text_digest(&retained.text);
@@ -1114,9 +1069,10 @@ impl Records {
                     .map(|facts| assembled.to_protocol_symbol(facts))
             })
             .ok_or_else(|| {
-                PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package)
-                    .at(held.file.path())
-                    .into_error()
+                errors::analysis::package_provider_failed()
+                    .package(package_label(package))
+                    .path(Path::new(held.file.path().as_str()))
+                    .error()
             })?;
         let signature = if join::lay_join(&mut presentation, semantics, &held.role, declaration) {
             presentation.signatures.first().cloned()
@@ -1174,7 +1130,7 @@ impl Records {
     }
 
     /// Takes one document, or reports the bound once the collection reaches it.
-    fn document(&mut self, mut document: PackageDocument) -> Result<(), PackageAnalysisError> {
+    fn document(&mut self, mut document: PackageDocument) -> Result<(), RiftError> {
         if self.documents.len() >= bound(PACKAGE_DOCUMENTS_MAX) {
             if !self.documents_truncated {
                 self.documents_truncated = true;
@@ -1289,7 +1245,7 @@ fn identifier_terms(names: &[&str]) -> Vec<String> {
 fn symbol_origin(
     package: &PackageIdentity,
     origin: &ContributionOrigin,
-) -> Result<SymbolOrigin, PackageAnalysisError> {
+) -> Result<SymbolOrigin, RiftError> {
     let result = match origin.location() {
         Some(rift_core::SourceLocation::Dependency { package: owner }) if owner == package => {
             SymbolOrigin {
@@ -1304,9 +1260,9 @@ fn symbol_origin(
             source_kind: SourceKind::Authored,
         },
         _ => {
-            return Err(
-                PackageAnalysisFault::new(PackageAnalysisViolation::Identity, package).into_error(),
-            );
+            return errors::analysis::package_identity_invalid()
+                .package(package_label(package))
+                .fail();
         }
     };
     Ok(result)
@@ -1325,26 +1281,23 @@ fn truncation(collection: &str, bound: u64) -> PackageAnalysisWarning {
 ///
 /// The member is dropped rather than left empty so a record's digest covers what the
 /// record says and nothing about the digest field itself.
-fn digest_of<T: Serialize>(
-    record: &T,
-    package: &PackageIdentity,
-) -> Result<Digest, PackageAnalysisError> {
-    let failure = |error| canonical_failure(error, package);
-    let mut value = serde_json::to_value(record).map_err(failure)?;
+fn digest_of<T: Serialize>(record: &T, package: &PackageIdentity) -> Result<Digest, RiftError> {
+    let mut value = serde_json::to_value(record).map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(package))
+            .source(error)
+            .error()
+    })?;
     if let Some(object) = value.as_object_mut() {
         object.remove("digest");
     }
-    let rendered = canonical_json(&value).map_err(failure)?;
+    let rendered = canonical_json(&value).map_err(|error| {
+        errors::analysis::package_provider_failed()
+            .package(package_label(package))
+            .source(error)
+            .error()
+    })?;
     Ok(text_digest(&rendered))
-}
-
-/// The refusal a record that cannot be rendered canonically draws. Every record this
-/// analyzer builds is a plain struct of strings, integers and booleans, so no value it
-/// hands the renderer can fail; the arm exists because the renderer's contract admits it.
-fn canonical_failure(error: serde_json::Error, package: &PackageIdentity) -> PackageAnalysisError {
-    PackageAnalysisFault::new(PackageAnalysisViolation::Provider, package)
-        .caused_by(error)
-        .into_error()
 }
 
 /// One publication bound as the in-memory count a collection compares against.
@@ -1375,7 +1328,7 @@ fn parsed_file(
     package: &PackageIdentity,
     package_language: &Language,
     syntax_limits: SyntaxLimits,
-) -> Result<IndexedFile, PackageAnalysisError> {
+) -> Result<IndexedFile, RiftError> {
     let context = Path::new(file.path().as_str());
     let extension = context
         .extension()
@@ -1387,9 +1340,10 @@ fn parsed_file(
     } else {
         let provider =
             rift_syntax::registry::provider_for_extension(extension).ok_or_else(|| {
-                PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
-                    .at(file.path())
-                    .into_error()
+                errors::analysis::package_syntax_unavailable()
+                    .package(package_label(package))
+                    .path(file.path().as_str())
+                    .error()
             })?;
         provider
             .analyze(
@@ -1400,10 +1354,15 @@ fn parsed_file(
                 syntax_limits,
             )
             .map_err(|error| {
-                PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
-                    .at(file.path())
-                    .caused_by(error)
-                    .into_error()
+                error
+                    .with(ErrorContext::new(
+                        "package",
+                        ErrorValue::formatted(package_label(package)),
+                    ))
+                    .with(ErrorContext::new(
+                        "path",
+                        ErrorValue::path(file.path().as_str()),
+                    ))
             })?
     };
     Ok(IndexedFile::new(
@@ -1439,10 +1398,14 @@ fn placement_of(
     package: &PackageIdentity,
     origin: &ContributionOrigin,
     path: &CoreProjectPath,
-) -> Result<DocumentPlacement, PackageAnalysisError> {
-    let identity_fault = || PackageAnalysisFault::new(PackageAnalysisViolation::Identity, package);
-    let unit = CoreSourceUnitId::for_package(package, path)
-        .map_err(|error| identity_fault().at(path).caused_by(error).into_error())?;
+) -> Result<DocumentPlacement, RiftError> {
+    let unit = CoreSourceUnitId::for_package(package, path).map_err(|error| {
+        errors::analysis::package_identity_invalid()
+            .package(package_label(package))
+            .path(Path::new(path.as_str()))
+            .cause(error)
+            .error()
+    })?;
     let identity_path = format!("{}/{path}", package_segment(package));
     Ok(DocumentPlacement::new(origin.clone(), unit, identity_path))
 }
@@ -1629,8 +1592,9 @@ mod tests {
     use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
     use super::fixture::{analyzed, identity, language, package_analysis, package_result};
-    use super::{PackageAnalyzer, bound};
+    use super::{PackageAnalyzer, RiftError, bound, package_label};
     use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
+    use rift_error::errors;
 
     /// One package of `files` in `shipped`, analyzed, keeping every part of the analysis.
     fn analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> super::PackageAnalysis {
@@ -1638,40 +1602,57 @@ mod tests {
     }
 
     #[test]
-    fn package_failure_preserves_syntax_identity_and_package_context() {
-        use rift_core::{ErrorCode, ErrorContext, ErrorName};
-        use std::error::Error as _;
-
+    fn package_failures_keep_registered_identity_and_ambient_context() {
         let package = identity();
-        let provider =
-            super::PackageAnalysisFault::new(super::PackageAnalysisViolation::Provider, &package)
-                .into_error();
-        assert_eq!(provider.name(), ErrorName::Wire(ErrorCode::InternalError));
-        assert_eq!(
-            provider.context(),
-            [
-                ErrorContext::new("violation", "provider"),
-                ErrorContext::new("package", "cargo/beacon@1.0.0"),
-            ]
+        let child = RiftError::new(
+            rift_error::ErrorSlug::new("rift.analysis.documentation_limit_exceeded"),
+            "documentation limit exceeded",
+            "reduce documentation and retry",
+            vec![],
         );
-        assert!(provider.source().is_none());
+        let provider = errors::analysis::package_provider_failed()
+            .package(package_label(&package))
+            .cause(child)
+            .error();
+        assert_eq!(
+            provider.slug().as_str(),
+            "rift.analysis.package_provider_failed"
+        );
+        assert!(
+            provider
+                .context()
+                .any(|(key, value)| key == "package" && value == "cargo/beacon@1.0.0")
+        );
+        let child = std::error::Error::source(&provider)
+            .and_then(|source| source.downcast_ref::<RiftError>())
+            .expect("provider failure retains registered child");
+        assert_eq!(
+            child.slug().as_str(),
+            "rift.analysis.documentation_limit_exceeded"
+        );
 
-        let path = ProjectPath::new("src/lib.rs").expect("path");
-        let syntax = rift_core::Error::new(rift_syntax::SyntaxFault::ParseCancelled {
-            path: Some(path.clone()),
-        });
-        let syntax_name = syntax.name();
-        let wrapped =
-            super::PackageAnalysisFault::new(super::PackageAnalysisViolation::Syntax, &package)
-                .at(&path)
-                .caused_by(syntax)
-                .into_error();
-        assert_eq!(wrapped.name(), syntax_name);
-        assert_eq!(
-            wrapped.context()[2],
-            ErrorContext::new("path", "src/lib.rs")
+        let path = super::CoreProjectPath::new("src/lib.rs").expect("path");
+        let syntax = RiftError::new(
+            rift_error::ErrorSlug::new("rift.syntax.parse_cancelled"),
+            "parse cancelled",
+            "retry",
+            vec![],
         );
-        assert!(wrapped.source().is_some());
+        let wrapped = syntax
+            .with(rift_error::ErrorContext::new(
+                "package",
+                rift_error::ErrorValue::formatted(package_label(&package)),
+            ))
+            .with(rift_error::ErrorContext::new(
+                "path",
+                rift_error::ErrorValue::path(path.as_str()),
+            ));
+        assert_eq!(wrapped.slug().as_str(), "rift.syntax.parse_cancelled");
+        assert!(
+            wrapped
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/lib.rs")
+        );
 
         let unsupported = super::parsed_file(
             PackageSource::new(&ProjectPath::new("guide.unknown").expect("path"), "source"),
@@ -1681,18 +1662,13 @@ mod tests {
         )
         .expect_err("unsupported source extension");
         assert_eq!(
-            unsupported.name(),
-            ErrorName::Wire(ErrorCode::InternalError)
-        );
-        assert_eq!(
-            unsupported.fault().violation(),
-            super::PackageAnalysisViolation::Syntax
+            unsupported.slug().as_str(),
+            "rift.analysis.package_syntax_unavailable"
         );
     }
 
     #[test]
     fn a_package_past_the_declaration_bound_names_the_limit() {
-        use rift_core::{ErrorCode, ErrorName, RetryDirective};
         use std::fmt::Write as _;
 
         let per_file = super::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT / 2 + 1;
@@ -1706,15 +1682,14 @@ mod tests {
             panic!("a package past the declaration bound must be refused");
         };
         assert_eq!(
-            error.fault().violation(),
-            super::PackageAnalysisViolation::PackageDeclarationsExceeded
+            error.slug().as_str(),
+            "rift.analysis.package_declarations_exceeded"
         );
-        assert_eq!(
-            error.fault().path().map(ProjectPath::as_str),
-            Some("pkg/b.py")
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "path" && value == "pkg/b.py")
         );
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::LimitExceeded));
-        assert_eq!(error.descriptor().retry(), RetryDirective::Never);
     }
 
     #[test]
@@ -1724,10 +1699,7 @@ mod tests {
         let Err(declared) = package_result(ShippedLanguage::Python, files.clone(), None) else {
             panic!("a source past the declared node bound must be refused");
         };
-        assert_eq!(
-            declared.fault().violation(),
-            super::PackageAnalysisViolation::Syntax
-        );
+        assert!(declared.slug().as_str().starts_with("rift.syntax."));
 
         let raised = rift_syntax::SyntaxLimits::new(4 << 20, 1_000_000, 512).expect("bounds");
         assert!(package_result(ShippedLanguage::Python, files, Some(raised)).is_ok());

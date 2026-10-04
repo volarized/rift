@@ -4501,6 +4501,7 @@ dependencies = [
  "regex-syntax",
  "reqwest",
  "rift-core",
+ "rift-error",
  "rift-index",
  "rift-mcp",
  "rift-protocol",
@@ -4536,6 +4537,7 @@ dependencies = [
  "percent-encoding",
  "rayon",
  "rift-core",
+ "rift-error",
  "rift-protocol",
  "rift-provider",
  "rift-ranking",
@@ -4584,6 +4586,7 @@ name = "rift-core"
 version = "0.0.47"
 dependencies = [
  "percent-encoding",
+ "rift-error",
  "rift-protocol",
  "schemars 1.2.2",
  "serde",
@@ -4613,11 +4616,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-error"
+version = "0.0.47"
+
+[[package]]
+name = "rift-error-codegen"
+version = "0.0.47"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rift-error",
+ "serde",
+ "syn 2.0.119",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
 name = "rift-history"
 version = "0.0.47"
 dependencies = [
  "gix",
  "rift-core",
+ "rift-error",
  "serde",
  "serde_json",
  "sha2",
@@ -4629,6 +4651,7 @@ name = "rift-history-store"
 version = "0.0.47"
 dependencies = [
  "rift-core",
+ "rift-error",
  "rift-protocol",
  "rift-ranking",
  "rusqlite",
@@ -4648,6 +4671,7 @@ dependencies = [
  "regex-syntax",
  "rift-analysis",
  "rift-core",
+ "rift-error",
  "rift-history",
  "rift-protocol",
  "rift-provider",
@@ -4676,6 +4700,7 @@ dependencies = [
  "lsp-types",
  "percent-encoding",
  "rift-core",
+ "rift-error",
  "rift-provider",
  "serde",
  "serde_json",
@@ -4699,6 +4724,7 @@ dependencies = [
  "rift-cloud-client",
  "rift-core",
  "rift-dependency",
+ "rift-error",
  "rift-history",
  "rift-history-store",
  "rift-index",
@@ -4742,6 +4768,7 @@ name = "rift-provider"
 version = "0.0.47"
 dependencies = [
  "rift-core",
+ "rift-error",
  "rift-protocol",
  "serde",
  "serde_json",
@@ -4756,6 +4783,7 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "rift-core",
+ "rift-error",
  "serde",
  "sha2",
 ]
@@ -4786,6 +4814,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "rift-core",
+ "rift-error",
  "rift-index",
  "rift-ranking",
  "rig-core",
@@ -4809,6 +4838,7 @@ dependencies = [
  "rayon",
  "rift-core",
  "rift-dependency",
+ "rift-error",
  "rift-history",
  "rift-history-store",
  "rift-index",
@@ -4844,6 +4874,7 @@ name = "rift-syntax"
 version = "0.0.47"
 dependencies = [
  "rift-core",
+ "rift-error",
  "rift-protocol",
  "rift-provider",
  "serde",
@@ -7433,6 +7464,14 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xtask"
+version = "0.0.47"
+dependencies = [
+ "rift-error-codegen",
+ "tempfile",
 ]
 
 [[package]]

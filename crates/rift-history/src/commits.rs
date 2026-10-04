@@ -8,11 +8,10 @@
 use std::path::Path;
 
 use gix::bstr::ByteSlice as _;
-use rift_core::Error;
+use rift_error::{RiftError, errors};
 
 use crate::repository::{
-    ChangedPathRecorder, HistoryError, HistoryFault, Repository, ResolvedRevision, TreeFile,
-    commit_author, storage, tree_entries,
+    ChangedPathRecorder, Repository, ResolvedRevision, TreeFile, commit_author, tree_entries,
 };
 
 /// One first-parent commit a window holds, with the parent it is compared
@@ -181,9 +180,9 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the common git directory's worktree
+    /// Returns [`RiftError`] when the common git directory's worktree
     /// folder cannot be listed.
-    pub fn live_heads(&self) -> Result<Vec<ResolvedRevision>, HistoryError> {
+    pub fn live_heads(&self) -> Result<Vec<ResolvedRevision>, RiftError> {
         let mut heads: Vec<ResolvedRevision> = Vec::new();
         let mut push = |head: Option<gix::ObjectId>| {
             if let Some(commit) = head
@@ -198,10 +197,12 @@ impl Repository {
         {
             push(head_commit(&main));
         }
-        let linked = self
-            .inner
-            .worktrees()
-            .map_err(|error| storage("list worktrees", &error))?;
+        let linked = self.inner.worktrees().map_err(|error| {
+            errors::history::storage()
+                .operation("list worktrees")
+                .detail(&error)
+                .error()
+        })?;
         for proxy in linked {
             let live = proxy.is_locked() || proxy.base().is_ok_and(|base| base.exists());
             if !live {
@@ -220,24 +221,28 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the object store or the `shallow` file
+    /// Returns [`RiftError`] when the object store or the `shallow` file
     /// cannot be read.
     pub fn first_parent_window(
         &self,
         start: &ResolvedRevision,
         commits_max: usize,
-    ) -> Result<Vec<WindowCommit>, HistoryError> {
-        let shallow = self
-            .inner
-            .shallow_commits()
-            .map_err(|error| storage("read shallow file", &error))?;
+    ) -> Result<Vec<WindowCommit>, RiftError> {
+        let shallow = self.inner.shallow_commits().map_err(|error| {
+            errors::history::storage()
+                .operation("read shallow file")
+                .detail(&error)
+                .error()
+        })?;
         let mut window = Vec::new();
         let mut next = Some(start.commit);
         while let Some(id) = next.filter(|_| window.len() < commits_max) {
-            let commit = self
-                .inner
-                .find_commit(id)
-                .map_err(|error| storage("read commit", &error))?;
+            let commit = self.inner.find_commit(id).map_err(|error| {
+                errors::history::storage()
+                    .operation("read commit")
+                    .detail(&error)
+                    .error()
+            })?;
             let boundary = shallow.as_ref().is_some_and(|set| set.contains(&id));
             let parent = if boundary {
                 None
@@ -260,22 +265,35 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the reference store cannot be read, or
+    /// Returns [`RiftError`] when the reference store cannot be read, or
     /// when it holds more than `tags_max` tags.
-    pub fn tagged_commits(&self, tags_max: usize) -> Result<Vec<TaggedCommit>, HistoryError> {
-        let references = self
-            .inner
-            .references()
-            .map_err(|error| storage("read references", &error))?;
-        let tags = references
-            .tags()
-            .map_err(|error| storage("read tags", &error))?;
+    pub fn tagged_commits(&self, tags_max: usize) -> Result<Vec<TaggedCommit>, RiftError> {
+        let references = self.inner.references().map_err(|error| {
+            errors::history::storage()
+                .operation("read references")
+                .detail(&error)
+                .error()
+        })?;
+        let tags = references.tags().map_err(|error| {
+            errors::history::storage()
+                .operation("read tags")
+                .detail(&error)
+                .error()
+        })?;
         let mut tagged = Vec::new();
         for (visited, reference) in tags.enumerate() {
             if visited == tags_max {
-                return Err(Error::new(HistoryFault::TooManyTags { tags_max }));
+                return errors::history::too_many_tags()
+                    .limit("tags_max")
+                    .tags_max(tags_max)
+                    .fail();
             }
-            let mut reference = reference.map_err(|error| storage("read tag", &*error))?;
+            let mut reference = reference.map_err(|error| {
+                errors::history::storage()
+                    .operation("read tag")
+                    .detail(&*error)
+                    .error()
+            })?;
             let name = reference.name().shorten().to_str_lossy().into_owned();
             let Ok(commit) = reference.peel_to_commit() else {
                 continue;
@@ -294,22 +312,35 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the commit cannot be read or decoded.
-    pub fn commit_facts(&self, revision: &ResolvedRevision) -> Result<CommitFacts, HistoryError> {
-        let commit = self
-            .inner
-            .find_commit(revision.commit)
-            .map_err(|error| storage("read commit", &error))?;
+    /// Returns [`RiftError`] when the commit cannot be read or decoded.
+    pub fn commit_facts(&self, revision: &ResolvedRevision) -> Result<CommitFacts, RiftError> {
+        let commit = self.inner.find_commit(revision.commit).map_err(|error| {
+            errors::history::storage()
+                .operation("read commit")
+                .detail(&error)
+                .error()
+        })?;
         let (author_name, author_email) = commit_author(&commit)?;
-        let time = commit
-            .time()
-            .map_err(|error| storage("read commit time", &error))?;
+        let time = commit.time().map_err(|error| {
+            errors::history::storage()
+                .operation("read commit time")
+                .detail(&error)
+                .error()
+        })?;
         let committed_at = time
             .format(gix::date::time::format::ISO8601_STRICT)
-            .map_err(|error| storage("render commit time", &error))?;
-        let message = commit
-            .message_raw()
-            .map_err(|error| storage("read commit message", &error))?;
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("render commit time")
+                    .detail(error)
+                    .error()
+            })?;
+        let message = commit.message_raw().map_err(|error| {
+            errors::history::storage()
+                .operation("read commit message")
+                .detail(error)
+                .error()
+        })?;
         Ok(CommitFacts {
             author_name,
             author_email,
@@ -330,7 +361,7 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for an unreadable object store or a tree
+    /// Returns [`RiftError`] for an unreadable object store or a tree
     /// that cannot be decoded.
     pub fn changed_blobs(
         &self,
@@ -338,7 +369,7 @@ impl Repository {
         head: &ResolvedRevision,
         includes: &dyn Fn(&str) -> bool,
         paths_max: usize,
-    ) -> Result<ChangedBlobs, HistoryError> {
+    ) -> Result<ChangedBlobs, RiftError> {
         let head_tree = self.commit_tree(head)?;
         let base_tree = base.map(|base| self.commit_tree(base)).transpose()?;
         let mut recorder = ChangedPathRecorder::new(self.prefix.as_bytes(), includes, paths_max);
@@ -356,7 +387,12 @@ impl Repository {
         match outcome {
             Ok(()) => {}
             Err(gix::diff::tree::Error::Cancelled) if recorder.truncated => {}
-            Err(error) => return Err(storage("compare commit trees", &error)),
+            Err(error) => {
+                return errors::history::storage()
+                    .operation("compare commit trees")
+                    .detail(&error)
+                    .fail();
+            }
         }
         let truncated = recorder.truncated;
         let blobs = recorder

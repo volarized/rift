@@ -13,7 +13,7 @@ use rift_protocol::read::{Language, NodeFacet};
 
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
-use crate::failure::SyntaxError;
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Which pinned tree-sitter-typescript grammar a provider instance reads.
@@ -90,7 +90,7 @@ impl SyntaxProvider for TypeScriptSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         ecmascript::analyze(
             &self.language,
             &self.dialect.grammar(),
@@ -111,7 +111,6 @@ mod tests {
     use rift_protocol::read::SymbolFacet;
 
     use super::*;
-    use crate::failure::SyntaxViolation;
 
     fn path() -> ProjectPath {
         ProjectPath::new("src/app.ts").expect("valid fixture path")
@@ -516,8 +515,8 @@ mod tests {
         )
         .expect_err("source bound");
         assert_eq!(
-            source_error.fault().violation(),
-            SyntaxViolation::SourceTooLarge
+            source_error.slug(),
+            rift_error::errors::syntax::source_too_large::SLUG
         );
 
         let node_error = bounded(
@@ -526,8 +525,8 @@ mod tests {
         )
         .expect_err("node bound");
         assert_eq!(
-            node_error.fault().violation(),
-            SyntaxViolation::TooManyNodes
+            node_error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
 
         let depth_error = bounded(
@@ -535,7 +534,10 @@ mod tests {
             "function f() { if (x) { y(); } }",
         )
         .expect_err("depth bound");
-        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
+        assert_eq!(
+            depth_error.slug(),
+            rift_error::errors::syntax::too_deep::SLUG
+        );
     }
 
     #[test]

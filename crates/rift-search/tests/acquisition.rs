@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rift_search::{AcquisitionLimits, FetchedFile, ModelSource, SearchViolation, acquire};
+use rift_error::RiftError;
+use rift_error::errors;
+use rift_search::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -50,24 +52,29 @@ fn resolved_directory(
     }
 }
 
-/// The refusal one identifier earned, with its rendered message.
-fn refused(source: Result<ModelSource, rift_search::SearchError>, model: &str) -> String {
+/// The refusal one identifier earned, with its exact evidence and message.
+fn refused(source: Result<ModelSource, RiftError>, model: &str, expected: &str) {
     let error = source.expect_err(&format!("`{model}` must be refused"));
     assert_eq!(
-        error.fault().violation(),
-        SearchViolation::ModelSourceInvalid,
+        error.slug(),
+        errors::search::model_source_invalid::SLUG,
         "`{model}` must be refused as an invalid model source"
     );
+    let message = format!("model source {model} has invalid form; expected {expected}");
+    assert_eq!(
+        error.message(),
+        message,
+        "the refusal states its expected form"
+    );
+    let evidence = error.context().collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 2, "the refusal keeps both evidence fields");
+    assert!(evidence.contains(&("model", model.to_owned())));
+    assert!(evidence.contains(&("expected", expected.to_owned())));
     let rendered = error.to_string();
-    assert!(
-        rendered.contains("model_source_invalid"),
-        "the refusal names its violation: {rendered}"
+    assert_eq!(
+        rendered,
+        format!("{message}; use a model source in the expected form and retry")
     );
-    assert!(
-        rendered.contains(model) || model.is_empty(),
-        "the refusal names the offending value `{model}`: {rendered}"
-    );
-    rendered
 }
 
 #[test]
@@ -94,50 +101,67 @@ fn a_repository_identifier_names_the_revision_after_the_separator() -> TestResul
 
 #[test]
 fn a_repository_identifier_missing_an_owner_or_a_name_is_refused() {
-    for model in ["/name", "owner/", "/", "@main"] {
-        let rendered = refused(ModelSource::repository(model), model);
-        assert!(
-            rendered.contains("expected"),
-            "the refusal states the form expected: {rendered}"
+    for model in ["/name", "owner/", "/"] {
+        refused(
+            ModelSource::repository(model),
+            model,
+            "a non-empty owner and name, as in `BAAI/bge-small-en-v1.5`",
         );
     }
+    refused(
+        ModelSource::repository("@main"),
+        "@main",
+        "the form `owner/name`, as in `BAAI/bge-small-en-v1.5`",
+    );
 }
 
 #[test]
 fn a_repository_identifier_with_the_wrong_segment_count_is_refused() {
     for model in ["name", "owner/name/extra", ""] {
-        let rendered = refused(ModelSource::repository(model), model);
-        assert!(rendered.contains("owner/name"), "{rendered}");
+        refused(
+            ModelSource::repository(model),
+            model,
+            "the form `owner/name`, as in `BAAI/bge-small-en-v1.5`",
+        );
     }
 }
 
 #[test]
 fn a_repository_identifier_with_more_than_one_separator_is_refused() {
-    let rendered = refused(
+    refused(
         ModelSource::repository("owner/name@one@two"),
         "owner/name@one@two",
+        "one `@` at most, as in `owner/name@revision`",
     );
-    assert!(rendered.contains('@'), "{rendered}");
 }
 
 #[test]
 fn a_repository_identifier_with_an_empty_revision_is_refused() {
-    let rendered = refused(ModelSource::repository("owner/name@"), "owner/name@");
-    assert!(rendered.contains("revision"), "{rendered}");
+    refused(
+        ModelSource::repository("owner/name@"),
+        "owner/name@",
+        "a non-empty revision after `@`",
+    );
 }
 
 #[test]
 fn a_repository_identifier_whose_revision_carries_a_separator_is_refused() {
     let model = "owner/name@branch/one";
-    let rendered = refused(ModelSource::repository(model), model);
-    assert!(rendered.contains("revision"), "{rendered}");
+    refused(
+        ModelSource::repository(model),
+        model,
+        "a revision carrying no `/`",
+    );
 }
 
 #[test]
 fn a_repository_identifier_carrying_a_dot_segment_is_refused() {
     for model in ["../name", "owner/..", "./name", "owner/.", "owner/name@.."] {
-        let rendered = refused(ModelSource::repository(model), model);
-        assert!(rendered.contains(".."), "{rendered}");
+        refused(
+            ModelSource::repository(model),
+            model,
+            "no `.` or `..` segment",
+        );
     }
 }
 
@@ -155,18 +179,18 @@ fn a_relative_directory_is_resolved_against_the_workspace_root() -> TestResult {
 #[test]
 fn a_directory_that_is_not_relative_or_not_canonical_is_refused() {
     let root = Path::new("/workspace");
-    for model in [
-        "",
-        "/absolute",
-        "C:/absolute",
-        "models\\bge",
-        "../outside",
-        "models/../bge",
-        "models/./bge",
-        "models//bge",
-        "models/\u{7}bge",
+    for (model, expected) in [
+        ("", "a non-empty path"),
+        ("/absolute", "a path relative to the workspace root"),
+        ("C:/absolute", "a path relative to the workspace root"),
+        ("models\\bge", "`/` as the separator"),
+        ("../outside", "no `.` or `..` segment"),
+        ("models/../bge", "no `.` or `..` segment"),
+        ("models/./bge", "no `.` or `..` segment"),
+        ("models//bge", "no empty segment"),
+        ("models/\u{7}bge", "no control character"),
     ] {
-        refused(ModelSource::directory(model, root), model);
+        refused(ModelSource::directory(model, root), model, expected);
     }
 }
 
@@ -246,7 +270,7 @@ async fn a_directory_source_short_of_one_file_names_the_file_that_is_missing() -
     let error = acquire(&source, limits(1))
         .await
         .expect_err("a directory short of a file cannot load");
-    assert_eq!(error.fault().violation(), SearchViolation::ModelFileMissing);
+    assert_eq!(error.slug(), errors::search::model_file_missing::SLUG);
     assert!(error.to_string().contains("tokenizer.json"), "{error}");
     Ok(())
 }
@@ -286,29 +310,27 @@ fn the_debug_render_names_a_source_a_bound_and_a_fetched_file() -> TestResult {
 #[test]
 fn every_acquisition_violation_renders_its_own_message() {
     let cases = [
-        (SearchViolation::ModelSourceInvalid, "model_source_invalid"),
-        (
-            SearchViolation::ModelCacheUnavailable,
-            "model_cache_unavailable",
-        ),
-        (
-            SearchViolation::ModelDownloadFailed,
-            "model_download_failed",
-        ),
-        (
-            SearchViolation::ModelDownloadTooLarge,
-            "model_download_too_large",
-        ),
+        errors::search::model_source_invalid()
+            .model("test model")
+            .expected("repository")
+            .error(),
+        errors::search::model_cache_unavailable()
+            .variables("HF_HUB_CACHE, HF_HOME, XDG_CACHE_HOME, HOME, USERPROFILE")
+            .error(),
+        errors::search::model_download_failed()
+            .subject("test file")
+            .error(),
+        errors::search::model_download_too_large()
+            .url("https://example.test/model")
+            .bytes_max(64_u64)
+            .error(),
     ];
-    for (violation, label) in cases {
-        let error = rift_search::SearchError::new(
-            rift_search::SearchFault::new(violation).about("the subject it was about"),
-        );
+    for error in cases {
         let rendered = error.to_string();
-        assert!(rendered.contains(label), "{violation:?}: {rendered}");
         assert!(
-            rendered.contains("the subject it was about"),
-            "{violation:?}: {rendered}"
+            error.slug().as_str().starts_with("rift.search."),
+            "registered search slug: {error:?}"
         );
+        assert!(!rendered.is_empty(), "registered error renders its message");
     }
 }

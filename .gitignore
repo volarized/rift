@@ -10,6 +10,7 @@ lcov.info
 .agents/
 .doppel/
 skills-lock.json
+state.lock
 .DS_Store
 .idea/
 .vscode/

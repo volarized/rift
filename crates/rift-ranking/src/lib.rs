@@ -13,7 +13,6 @@
 
 mod body;
 mod document;
-mod error;
 mod fusion;
 mod identifier;
 mod pattern;
@@ -28,7 +27,6 @@ pub use document::{
     DocumentKind, DocumentLocation, FieldSet, IDENTIFIER_TERMS_BYTES_MAX, IDENTITY_BYTES_MAX,
     IndexDocument, NAME_BYTES_MAX, SIGNATURE_BYTES_MAX, SearchableField,
 };
-pub use error::{RankingError, RankingFault, RankingViolation};
 pub use fusion::{
     FUSION_K_MAX, FUSION_K_MIN, FileRowAnswer, FusedCandidate, RankedCandidates, RankedIdentity,
     RankingInput, RankingInputKind, RankingInputSet, RankingWeights, fuse,

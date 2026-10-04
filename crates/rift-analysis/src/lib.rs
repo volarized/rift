@@ -22,19 +22,14 @@ mod source;
 
 #[cfg(feature = "collector")]
 pub use analyzer::{
-    AnalyzedFile, PackageAnalysis, PackageAnalysisError, PackageAnalysisFault,
-    PackageAnalysisViolation, PackageAnalyzer, PackageLanguage, StubForm, public_qualified_names,
+    AnalyzedFile, PackageAnalysis, PackageAnalyzer, PackageLanguage, StubForm,
+    public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
 pub use enclosing::EnclosingDefinitions;
 #[cfg(feature = "collector")]
-pub use glob::{
-    ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
-};
-pub use input::{
-    ExactPackageInput, ExactPackageLimits, PackageInputError, PackageInputFault,
-    PackageInputViolation, PackageSource,
-};
+pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
+pub use input::{ExactPackageInput, ExactPackageLimits, PackageSource};
 #[cfg(feature = "collector")]
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
@@ -43,11 +38,11 @@ pub use revision::{
 };
 #[cfg(feature = "collector")]
 pub use selection::{
-    BUILD_OUTPUT_FOLDERS, CONTEXT7_FILE, Context7, Context7Error, Context7Fault, Context7Violation,
-    DOCUMENTATION_EXCLUDED_FILES, DOCUMENTATION_EXCLUDED_FOLDERS, DocumentationSelection,
-    PackageFileSelection, SelectedFiles, documentation_format,
+    BUILD_OUTPUT_FOLDERS, CONTEXT7_FILE, Context7, DOCUMENTATION_EXCLUDED_FILES,
+    DOCUMENTATION_EXCLUDED_FOLDERS, DocumentationSelection, PackageFileSelection, SelectedFiles,
+    documentation_format,
 };
 #[cfg(feature = "collector")]
-pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemanticError, WorkspaceSemantics};
+pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};

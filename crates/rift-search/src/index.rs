@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
-    LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalSearchIndex, PatternCandidates,
-    RevisionScoped, StoredVector, TrigramBatch, VectorStore,
+    LexicalChange, LexicalIndexLimits, LexicalSearchIndex, PatternCandidates, RevisionScoped,
+    StoredVector, TrigramBatch, VectorStore,
 };
 use rift_ranking::{
     BodyTerms, DocumentIdentity, DocumentLocation, FieldSet, FileRowFrequencies, IndexDocument,
@@ -40,9 +40,9 @@ use crate::embedding::{
     RetrievalModels,
 };
 use crate::encoder::{Encoder, EncoderLimits, ModelFiles};
-use crate::error::{SearchError, SearchFault, SearchViolation};
 use crate::fusion::{DeclarationMatch, spread_per_file};
 use crate::similarity::{VectorMatch, nearest};
+use rift_error::{RiftError, errors};
 
 /// Embedding requests open at once when the caller sets none. A locally run
 /// encoder holds a blocking thread, so it runs one whatever this says.
@@ -513,24 +513,19 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the database cannot be opened or migrated.
+    /// Returns [`RiftError`] when the database cannot be opened or migrated.
     ///
     /// # Cancel safety
     ///
     /// Cancellation may leave the database file created without its schema
     /// applied. Opening again retries safely: the migrations are idempotent.
-    pub async fn open(
-        database_path: &Path,
-        limits: SearchIndexLimits,
-    ) -> Result<Self, SearchError> {
+    pub async fn open(database_path: &Path, limits: SearchIndexLimits) -> Result<Self, RiftError> {
         let lexical_limits = limits.lexical();
         let pool = DatabasePool::new(
             lexical_limits.pool_slots(),
             lexical_limits.busy_timeout_ms(),
         );
-        let database = WorkspaceDatabase::open(database_path, pool)
-            .await
-            .map_err(store_failed)?;
+        let database = WorkspaceDatabase::open(database_path, pool).await?;
         Self::attached(database, limits)
     }
 
@@ -538,11 +533,11 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when a tier refuses the database.
+    /// Returns [`RiftError`] when a tier refuses the database.
     pub fn attached(
         database: Arc<WorkspaceDatabase>,
         limits: SearchIndexLimits,
-    ) -> Result<Self, SearchError> {
+    ) -> Result<Self, RiftError> {
         let lexical = LexicalSearchIndex::attached(Arc::clone(&database), limits.lexical());
         let vectors = VectorStore::attached(Arc::clone(&database));
         Ok(Self {
@@ -563,9 +558,9 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError`] if the worker fails or cannot stop before the deadline.
-    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), SearchError> {
-        self.database.shutdown(deadline).await.map_err(store_failed)
+    /// Returns [`RiftError`] if the worker fails or cannot stop before the deadline.
+    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
+        self.database.shutdown(deadline).await
     }
 
     /// Loads the encoder, so the vector ranking can answer.
@@ -592,7 +587,7 @@ impl SearchIndex {
         &self,
         source: &ModelSource,
         limits: AcquisitionLimits,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         if self.pass_readiness() == VectorReadiness::Disabled {
             return Ok(());
         }
@@ -600,7 +595,7 @@ impl SearchIndex {
             Ok(model) => self.hold(model).await,
             Err(error) => {
                 self.set_readiness(VectorReadiness::Unavailable);
-                Err(error)
+                error.fail()
             }
         }
     }
@@ -616,13 +611,13 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the vector store refuses to drop the
+    /// Returns [`RiftError`] when the vector store refuses to drop the
     /// previous space's rows.
     pub async fn hold_models(
         &self,
         models: EmbeddingModels,
         space: EmbeddingSpace,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         if self.pass_readiness() == VectorReadiness::Disabled {
             return Ok(());
         }
@@ -640,7 +635,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
@@ -649,28 +644,24 @@ impl SearchIndex {
         &self,
         documents: &[IndexDocument],
         tree_revision: &str,
-    ) -> Result<(), SearchError> {
-        self.lexical
-            .replace_all(documents, tree_revision)
-            .await
-            .map_err(store_failed)
+    ) -> Result<(), RiftError> {
+        self.lexical.replace_all(documents, tree_revision).await
     }
 
     /// Replaces lexical documents and their documentation metadata atomically.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses either collection.
+    /// Returns [`RiftError`] when the lexical store refuses either collection.
     pub async fn replace_lexical_with_documentation(
         &self,
         documents: &[IndexDocument],
         tree_revision: &str,
         documentation: &rift_index::DocumentationCollection,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         self.lexical
             .replace_all_with_documentation(documents, tree_revision, documentation)
             .await
-            .map_err(store_failed)
     }
 
     /// The content digest each stored file's lexical rows were derived from, when those
@@ -679,7 +670,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses the read.
+    /// Returns [`RiftError`] when the lexical store refuses the read.
     ///
     /// # Cancel safety
     ///
@@ -687,11 +678,8 @@ impl SearchIndex {
     pub async fn recorded_lexical_files(
         &self,
         derivation_revision: &str,
-    ) -> Result<Option<rift_index::WorkspaceDigests>, SearchError> {
-        self.lexical
-            .recorded_files(derivation_revision)
-            .await
-            .map_err(store_failed)
+    ) -> Result<Option<rift_index::WorkspaceDigests>, RiftError> {
+        self.lexical.recorded_files(derivation_revision).await
     }
 
     /// Deletes every lexical row and recorded digest and stamps no publication under
@@ -699,16 +687,13 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
     /// Cancellation before the commit leaves every row and the stamp intact.
-    pub async fn clear_lexical(&self, derivation_revision: &str) -> Result<(), SearchError> {
-        self.lexical
-            .clear(derivation_revision)
-            .await
-            .map_err(store_failed)
+    pub async fn clear_lexical(&self, derivation_revision: &str) -> Result<(), RiftError> {
+        self.lexical.clear(derivation_revision).await
     }
 
     /// Applies one change set's lexical units and digests and stamps `stamp`, in one
@@ -719,7 +704,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
@@ -728,28 +713,24 @@ impl SearchIndex {
         &self,
         change: &LexicalChange,
         stamp: &rift_index::LexicalStamp,
-    ) -> Result<(), SearchError> {
-        self.lexical
-            .apply(change, stamp)
-            .await
-            .map_err(store_failed)
+    ) -> Result<(), RiftError> {
+        self.lexical.apply(change, stamp).await
     }
 
     /// Applies lexical changes and documentation metadata in one transaction.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses either collection.
+    /// Returns [`RiftError`] when the lexical store refuses either collection.
     pub async fn apply_lexical_with_documentation(
         &self,
         change: &LexicalChange,
         stamp: &rift_index::LexicalStamp,
         documentation: &rift_index::DocumentationCollection,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         self.lexical
             .apply_with_documentation(change, stamp, documentation)
             .await
-            .map_err(store_failed)
     }
 
     /// Embeds the declarations one publication describes, prunes the vectors no live
@@ -765,7 +746,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the vector store refuses, and the encoder's own refusal
+    /// Returns [`RiftError`] when the vector store refuses, and the encoder's own refusal
     /// when a pass fails.
     ///
     /// # Cancel safety
@@ -777,7 +758,7 @@ impl SearchIndex {
         described: &[DescribedUnit<'_>],
         embedding: Embedding,
         tree_revision: &str,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         let Some(model) = self.serving_model() else {
             self.note_nothing_embedded(described.len());
             return Ok(());
@@ -811,7 +792,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when either store refuses, and the encoder's
+    /// Returns [`RiftError`] when either store refuses, and the encoder's
     /// own refusal when the query cannot be embedded.
     ///
     /// # Cancel safety
@@ -823,13 +804,12 @@ impl SearchIndex {
         query: &ParsedQuery,
         phase: QueryPhase,
         limit: u32,
-    ) -> Result<RevisionScoped<StoreRanking>, SearchError> {
+    ) -> Result<RevisionScoped<StoreRanking>, RiftError> {
         let scan = self.vector_scan(tree_revision);
         let lexical = match self
             .lexical
             .search(tree_revision, query, phase, limit)
-            .await
-            .map_err(store_failed)?
+            .await?
         {
             RevisionScoped::Matched(ranking) => ranking,
             RevisionScoped::OtherRevision(stored) => {
@@ -882,7 +862,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
@@ -891,11 +871,10 @@ impl SearchIndex {
         &self,
         tree_revision: &str,
         terms: &BodyTerms,
-    ) -> Result<RevisionScoped<FileRowFrequencies>, SearchError> {
+    ) -> Result<RevisionScoped<FileRowFrequencies>, RiftError> {
         self.lexical
             .file_row_frequencies(tree_revision, terms)
             .await
-            .map_err(store_failed)
     }
 
     /// The files a regex pattern's prefilter selects from the lexical tier's trigram index,
@@ -903,7 +882,7 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
@@ -914,11 +893,10 @@ impl SearchIndex {
         prefilter: &Prefilter,
         line_bound: bool,
         rows_max: u32,
-    ) -> Result<RevisionScoped<PatternCandidates>, SearchError> {
+    ) -> Result<RevisionScoped<PatternCandidates>, RiftError> {
         self.lexical
             .pattern_candidates(tree_revision, prefilter, line_bound, rows_max)
             .await
-            .map_err(store_failed)
     }
 
     /// Indexes the oldest file rows the lexical tier's trigram index lacks, in one bounded
@@ -926,26 +904,26 @@ impl SearchIndex {
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
     /// Cancellation before the commit leaves the index and the lacking rows as they were.
-    pub async fn index_trigrams(&self) -> Result<TrigramBatch, SearchError> {
-        self.lexical.index_trigrams().await.map_err(store_failed)
+    pub async fn index_trigrams(&self) -> Result<TrigramBatch, RiftError> {
+        self.lexical.index_trigrams().await
     }
 
     /// The tree revision the lexical tier is stamped with.
     ///
     /// # Errors
     ///
-    /// Returns `store_failed` when the lexical store refuses.
+    /// Returns [`RiftError`] when the lexical store refuses.
     ///
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; this issues one read-only lookup.
-    pub async fn tree_revision(&self) -> Result<Option<String>, SearchError> {
-        self.lexical.tree_revision().await.map_err(store_failed)
+    pub async fn tree_revision(&self) -> Result<Option<String>, RiftError> {
+        self.lexical.tree_revision().await
     }
 
     /// Acquires the weights and loads the encoder from them.
@@ -953,7 +931,7 @@ impl SearchIndex {
         &self,
         source: &ModelSource,
         limits: AcquisitionLimits,
-    ) -> Result<LoadedModel, SearchError> {
+    ) -> Result<LoadedModel, RiftError> {
         let files = acquire(source, limits).await?;
         let encoder = Encoder::load(&files, self.limits.encoder_limits())?;
         let space = local_embedding_space(
@@ -982,12 +960,11 @@ impl SearchIndex {
     /// emptying lands before the new model does, so no query can read this
     /// model beside the previous one's vectors; the next pass reads the corpus
     /// back under the model held here.
-    async fn hold(&self, model: LoadedModel) -> Result<(), SearchError> {
+    async fn hold(&self, model: LoadedModel) -> Result<(), RiftError> {
         let _dropped = self
             .vectors
             .prune_other_models(&model.space.identity())
-            .await
-            .map_err(store_failed)?;
+            .await?;
         self.publish_held(None);
         let mut held = self.model.lock().unwrap_or_else(PoisonError::into_inner);
         *held = Some(Arc::new(model));
@@ -1013,22 +990,17 @@ impl SearchIndex {
         described: &[DescribedUnit<'_>],
         embedding: Embedding,
         tree_revision: &str,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         let total = as_count(described.len());
         let documents = documents(described, as_usize(total.min(self.limits.max_vectors)));
-        let stored = self
-            .vectors
-            .digests(&model.space.identity())
-            .await
-            .map_err(store_failed)?;
+        let stored = self.vectors.digests(&model.space.identity()).await?;
         self.embed_batches(model, &selected(&documents, &stored, embedding))
             .await?;
         let live: BTreeSet<String> = documents.iter().map(|one| one.digest.clone()).collect();
         let _pruned = self
             .vectors
             .prune_absent(&model.space.identity(), &live)
-            .await
-            .map_err(store_failed)?;
+            .await?;
         let corpus = self.read_corpus(model).await?;
         self.publish(&documents, corpus, tree_revision);
         self.set_pass(reached(as_count(documents.len()), total), total);
@@ -1044,7 +1016,7 @@ impl SearchIndex {
     /// just ran already left the store at that ceiling, so the cut answers
     /// only a store another index wrote to under a wider one: it drops the
     /// tail of the digest order rather than refusing the pass.
-    async fn read_corpus(&self, model: &LoadedModel) -> Result<Corpus, SearchError> {
+    async fn read_corpus(&self, model: &LoadedModel) -> Result<Corpus, RiftError> {
         self.vectors
             .vectors(
                 &model.space.identity(),
@@ -1052,7 +1024,6 @@ impl SearchIndex {
                 as_usize(self.limits.max_vectors),
             )
             .await
-            .map_err(store_failed)
     }
 
     /// Embeds `wanted` in passes of `batch_declarations`, storing each pass
@@ -1073,7 +1044,7 @@ impl SearchIndex {
         &self,
         model: &Arc<LoadedModel>,
         wanted: &[&UnitDocument],
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         let batch = batch_size(self.limits.batch_declarations);
         let in_flight = model
             .models
@@ -1088,8 +1059,7 @@ impl SearchIndex {
             let vectors = paired(chunk, embedded);
             self.vectors
                 .store(&model.space.identity(), model.space.dimensions(), &vectors)
-                .await
-                .map_err(store_failed)?;
+                .await?;
         }
         Ok(())
     }
@@ -1112,7 +1082,7 @@ impl SearchIndex {
         &self,
         query: &str,
         scan: &ScannedCorpus,
-    ) -> Result<RankingInput, SearchError> {
+    ) -> Result<RankingInput, RiftError> {
         let ScannedCorpus { model, corpus } = scan;
         let depth = self.limits.depth();
         let embedded = model.models.embed_query(query).await?;
@@ -1120,7 +1090,7 @@ impl SearchIndex {
         let matched =
             tokio::task::spawn_blocking(move || nearest(&embedded, &scanned.vectors, depth))
                 .await
-                .map_err(task_failed)??;
+                .map_err(|source| errors::search::task_failed().source(source).error())??;
         let placed = placed(&matched, &corpus.addresses);
         let spread = spread_per_file(&placed, as_usize(self.limits.per_file_max));
         let resolved = resolved(&spread, &corpus.addresses, as_usize(self.limits.candidates));
@@ -1382,23 +1352,6 @@ pub fn local_embedding_space(
     EmbeddingSpace::local(kind, model, files.revision(), dimensions, query)
 }
 
-/// One store failure, with that store's own violation riding as the cause.
-fn store_failed(source: LexicalIndexError) -> SearchError {
-    let fault = SearchFault::new(SearchViolation::StoreFailed).carrying(source.fault());
-    SearchError::new(fault.caused_by(source))
-}
-
-/// One blocking task that never returned what it was given to compute.
-///
-/// A join fails only when the task panicked or the runtime shut down under
-/// it, so there is no encoder or store refusal to report and the join failure
-/// itself is the evidence.
-fn task_failed(source: tokio::task::JoinError) -> SearchError {
-    let subject = source.to_string();
-    let fault = SearchFault::new(SearchViolation::TaskFailed).about(subject);
-    SearchError::new(fault.caused_by(source))
-}
-
 /// Declarations one pass takes, never zero: a pass of nothing divides the
 /// work into no passes at all and embeds nothing.
 fn batch_size(batch_declarations: u64) -> usize {
@@ -1425,8 +1378,8 @@ mod tests {
     use crate::acquisition::ModelSource;
     use crate::embedding::QueryTransformation;
     use crate::encoder::ModelFiles;
-    use crate::error::SearchError;
     use rift_core::ProjectPath;
+    use rift_error::RiftError;
     use rift_index::LexicalIndexLimits;
     use rift_ranking::DocumentIdentity;
     use std::collections::BTreeSet;
@@ -1585,7 +1538,7 @@ mod tests {
         let second = root.path().join("two/model");
         model_directory(&first, "weights")?;
         model_directory(&second, "weights")?;
-        let space = |directory: &std::path::Path| -> Result<String, SearchError> {
+        let space = |directory: &std::path::Path| -> Result<String, RiftError> {
             let files = ModelFiles::in_directory(directory)?;
             Ok(local_embedding_space(
                 &ModelSource::Directory(directory.to_path_buf()),
@@ -1650,9 +1603,9 @@ mod tests {
 }
 
 #[cfg(test)]
-mod store_failure_tests {
-    use super::store_failed;
+mod store_error_tests {
     use rift_core::ProjectPath;
+    use rift_error::{RiftError, errors};
     use rift_index::{DatabasePool, LexicalIndexLimits, LexicalSearchIndex, WorkspaceDatabase};
     use rift_ranking::{
         DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
@@ -1686,7 +1639,7 @@ mod store_failure_tests {
         )?)
     }
 
-    async fn refusal() -> Result<String, Box<dyn std::error::Error>> {
+    async fn refusal() -> Result<RiftError, Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database =
             WorkspaceDatabase::open(&directory.path().join("db"), DatabasePool::new(4, 1_000))
@@ -1710,14 +1663,17 @@ mod store_failure_tests {
             .replace_all(&documents, "revision")
             .await
             .expect_err("two documents must cross a units_max of one");
-        Ok(store_failed(refused).to_string())
+        Ok(refused)
     }
 
     #[tokio::test]
-    async fn a_wrapped_store_refusal_states_its_action_once() -> TestResult {
-        let message = refusal().await?;
+    async fn a_store_refusal_keeps_its_action_once() -> TestResult {
+        let error = refusal().await?;
+        assert_eq!(error.slug(), errors::index::lexical_unit_limit::SLUG);
+        let message = error.to_string();
 
-        let action = "resize the request below the named limit";
+        let action = "reduce indexed units below 1 and retry";
+        assert_eq!(error.action(), action);
         assert_eq!(
             message.matches(action).count(),
             1,
@@ -1727,21 +1683,20 @@ mod store_failure_tests {
     }
 
     #[tokio::test]
-    async fn a_wrapped_store_refusal_names_the_field_and_the_numbers() -> TestResult {
-        let message = refusal().await?;
-
-        assert!(message.contains("cause unit_limit"), "{message}");
-        assert!(message.contains("field units_max"), "{message}");
-        assert!(message.contains("observed 2"), "{message}");
-        assert!(message.contains("maximum 1"), "{message}");
+    async fn a_store_refusal_keeps_its_field_and_numbers() -> TestResult {
+        let error = refusal().await?;
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("field", "units_max".to_owned())));
+        assert!(context.contains(&("observed", "2".to_owned())));
+        assert!(context.contains(&("maximum", "1".to_owned())));
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_wrapped_store_refusal_repeats_no_explanation() -> TestResult {
-        let message = refusal().await?;
+    async fn a_store_refusal_renders_its_explanation_once() -> TestResult {
+        let message = refusal().await?.to_string();
 
-        let explanation = "the request exceeded a declared resource limit";
+        let explanation = "lexical index received more units";
         assert_eq!(
             message.matches(explanation).count(),
             1,
