@@ -885,7 +885,7 @@ class PersistedContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
-            with closing(sqlite3.connect(root / ".rift/db")) as fixture:
+            with closing(sqlite3.connect(root / ".rift/index")) as fixture:
                 fixture.execute(DOCUMENTS_TABLE)
                 fixture.execute(BEACON_ROW)
                 fixture.commit()
@@ -918,7 +918,7 @@ class PersistedContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
-            with sqlite3.connect(root / ".rift/db") as connection:
+            with sqlite3.connect(root / ".rift/index") as connection:
                 connection.execute(DOCUMENTS_TABLE)
                 connection.execute(BEACON_ROW)
                 connection.commit()
@@ -942,7 +942,7 @@ class PersistedContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
-            with sqlite3.connect(root / ".rift/db") as connection:
+            with sqlite3.connect(root / ".rift/index") as connection:
                 connection.execute(DOCUMENTS_TABLE)
                 connection.commit()
                 with self.assertRaisesRegex(AssertionError, "empty"):

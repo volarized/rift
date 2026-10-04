@@ -427,13 +427,13 @@ class LexicalContent:
 def lexical_content(root: Path) -> LexicalContent:
     """Hash every ranking column of the ordered document rows.
 
-    The schema is owned by rift-index/src/lexical.rs, whose fifth migration replaced
-    `lexical_units` with `lexical_documents`. Diagnostics and the revision row change on
+    The schema is owned by rift-index/src/lexical.rs, whose index database migration
+    creates `lexical_documents` in `.rift/index`. Diagnostics and the revision row change on
     each publication; unrelated document rows must not.
     """
     digest = hashlib.sha256()
     count = size = 0
-    database = root / ".rift" / "db"
+    database = root / ".rift" / "index"
     with closing(
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
@@ -466,14 +466,14 @@ def lexical_content(root: Path) -> LexicalContent:
 def database_bytes(root: Path) -> JsonObject:
     return {
         name: path.stat().st_size
-        for name in ("db", "db-wal", "db-shm")
+        for name in ("index", "index-wal", "index-shm")
         if (path := root / ".rift" / name).is_file()
     }
 
 
 def probe_units(root: Path) -> int:
     """Count only the probe's persisted units after the lexical lane commits."""
-    database = root / ".rift" / "db"
+    database = root / ".rift" / "index"
     with closing(
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
