@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use percent_encoding::percent_decode_str;
 use rift_cloud_client::{
@@ -15,7 +15,7 @@ use rift_cloud_client::{
     PackagePatternMatch, PackagePatternRequest, PackagePosition, PackageResolutionRequest,
     PackageSearchCandidate, PackageSearchRequest, PackageSearchRequestPhase,
     PackageSearchRequestTarget, PackageSymbolCandidate, PackageSymbolRequest,
-    PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
+    PackageSymbolRequestInclude, PreparedPackageResolutionRequest, QueryTerm, Warning, WarningCode,
 };
 use rift_core::{ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use rift_dependency::DependencyContext;
@@ -41,6 +41,7 @@ use tokio::sync::Mutex;
 #[derive(Default)]
 pub(crate) struct GlobalState {
     client: Mutex<Option<ClientSlot>>,
+    prepared_resolution: Mutex<Option<CachedResolutionRequest>>,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 }
 
@@ -56,6 +57,14 @@ struct ClientSlot {
     config: Config,
     credential: Option<OsString>,
     client: GlobalClient,
+}
+
+struct CachedResolutionRequest {
+    snapshot: Weak<DependencyContext>,
+    requested: Vec<RequestedPackage>,
+    entries_max: usize,
+    context: Arc<DependencyContext>,
+    prepared: Arc<PreparedPackageResolutionRequest>,
 }
 
 /// The dependency context one current-tree read sends, beside the snapshot context and the
@@ -206,8 +215,7 @@ impl GlobalState {
                 Arc::clone(&self.observation),
             );
         }
-        let request = resolution_request(context);
-        if request.entries.is_empty() {
+        if context.entries().is_empty() {
             return GlobalRoute::unanswered(
                 context,
                 RouteState::Available,
@@ -234,13 +242,21 @@ impl GlobalState {
                 );
             }
         };
-        let bounded = read.within(capabilities.dependency_entries_max());
-        let request = if Arc::ptr_eq(&bounded, context) {
-            request
-        } else {
-            resolution_request(&bounded)
+        let (bounded, prepared) = match self
+            .prepared_resolution_request(read, capabilities.dependency_entries_max())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let bounded = read.within(capabilities.dependency_entries_max());
+                return GlobalRoute::unanswered(
+                    &bounded,
+                    failure_state(&error),
+                    Arc::clone(&self.observation),
+                );
+            }
         };
-        match client.resolve_package_context(&request).await {
+        match client.resolve_prepared_package_context(&prepared).await {
             Ok(resolution) => {
                 resolved_route(&bounded, client, resolution, Arc::clone(&self.observation))
             }
@@ -250,6 +266,42 @@ impl GlobalState {
                 Arc::clone(&self.observation),
             ),
         }
+    }
+
+    async fn prepared_resolution_request(
+        &self,
+        read: &ReadContext<'_>,
+        entries_max: usize,
+    ) -> Result<
+        (
+            Arc<DependencyContext>,
+            Arc<PreparedPackageResolutionRequest>,
+        ),
+        ClientError,
+    > {
+        let mut held = self.prepared_resolution.lock().await;
+        if let Some(cached) = held.as_ref()
+            && cached
+                .snapshot
+                .upgrade()
+                .is_some_and(|snapshot| Arc::ptr_eq(&snapshot, read.snapshot))
+            && cached.entries_max == entries_max
+            && cached.requested == read.requested
+        {
+            return Ok((Arc::clone(&cached.context), Arc::clone(&cached.prepared)));
+        }
+        let context = read.within(entries_max);
+        let prepared = Arc::new(PreparedPackageResolutionRequest::new(resolution_request(
+            &context,
+        ))?);
+        *held = Some(CachedResolutionRequest {
+            snapshot: Arc::downgrade(read.snapshot),
+            requested: read.requested.to_vec(),
+            entries_max,
+            context: Arc::clone(&context),
+            prepared: Arc::clone(&prepared),
+        });
+        Ok((context, prepared))
     }
 
     async fn client(
@@ -1951,6 +2003,111 @@ mod tests {
             snapshot: context,
             requested: &[],
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_bounded_resolution_shares_context_and_prepared_request()
+    -> Result<(), rift_cloud_client::ClientError> {
+        let context = context_with_path_dependencies(7);
+        let state = super::GlobalState::default();
+        let read = read_context(&context);
+        let (first_context, first_request) = state.prepared_resolution_request(&read, 2).await?;
+        let (second_context, second_request) = state.prepared_resolution_request(&read, 2).await?;
+        assert_eq!(first_context.entries().len(), 2);
+        assert!(
+            Arc::ptr_eq(&first_context, &second_context),
+            "a repeated bounded read does not derive the context again"
+        );
+        assert!(
+            Arc::ptr_eq(&first_request, &second_request),
+            "a repeated read retains the request and encoded bytes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolution_request_cache_invalidates_on_limit_snapshot_and_requested_packages()
+    -> Result<(), rift_cloud_client::ClientError> {
+        let context = context_with_path_dependencies(7);
+        let state = super::GlobalState::default();
+        let (_, first) = state
+            .prepared_resolution_request(&read_context(&context), 2)
+            .await?;
+        let (_, raised) = state
+            .prepared_resolution_request(&read_context(&context), 3)
+            .await?;
+        assert!(
+            !Arc::ptr_eq(&first, &raised),
+            "a changed advertised limit refills the cache"
+        );
+        let replacement = Arc::new((*context).clone());
+        let (_, replaced) = state
+            .prepared_resolution_request(&read_context(&replacement), 3)
+            .await?;
+        assert!(
+            !Arc::ptr_eq(&raised, &replaced),
+            "a replacement publication context refills the cache"
+        );
+        let requested = [rift_protocol::dependencies::RequestedPackage {
+            manager: "cargo".to_owned(),
+            name: "tokio".to_owned(),
+            version: Some("1.0.0".to_owned()),
+        }];
+        let requested_read = super::ReadContext {
+            context: Arc::new(
+                replacement.with_requested(&requested, rift_dependency::PACKAGES_MAX),
+            ),
+            snapshot: &replacement,
+            requested: &requested,
+        };
+        let (bounded, named) = state
+            .prepared_resolution_request(&requested_read, 3)
+            .await?;
+        assert!(
+            !Arc::ptr_eq(&replaced, &named),
+            "a changed package selection refills the cache"
+        );
+        assert!(bounded.entries().iter().any(|entry| entry.name == "tokio"));
+        let next_read = super::ReadContext {
+            context: Arc::new(
+                replacement.with_requested(&requested, rift_dependency::PACKAGES_MAX),
+            ),
+            snapshot: &replacement,
+            requested: &requested,
+        };
+        let (again, retained) = state.prepared_resolution_request(&next_read, 3).await?;
+        assert!(
+            Arc::ptr_eq(&bounded, &again),
+            "the key follows the snapshot and selection, even when the read built another context"
+        );
+        assert!(Arc::ptr_eq(&named, &retained));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacing_resolution_request_releases_the_previous_bounded_context_and_bytes()
+    -> Result<(), rift_cloud_client::ClientError> {
+        let context = context_with_path_dependencies(7);
+        let state = super::GlobalState::default();
+        let (bounded, prepared) = state
+            .prepared_resolution_request(&read_context(&context), 2)
+            .await?;
+        let old_context = Arc::downgrade(&bounded);
+        let old_request = Arc::downgrade(&prepared);
+        drop(bounded);
+        drop(prepared);
+        let _replacement = state
+            .prepared_resolution_request(&read_context(&context), 3)
+            .await?;
+        assert!(
+            old_context.upgrade().is_none(),
+            "only the latest bounded context remains retained"
+        );
+        assert!(
+            old_request.upgrade().is_none(),
+            "a replaced request releases its encoded bytes"
+        );
+        Ok(())
     }
 
     /// A context with nothing to resolve sends nothing: the route answers the service as

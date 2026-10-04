@@ -465,47 +465,51 @@ fn an_lfs_path_whose_base_holds_its_content_answers_changed_when_edited() {
     assert_eq!(paths, ["kept.bin"]);
 }
 
-// Windows path failure: https://github.com/volarized/rift/issues/478
 #[test]
-#[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/478")]
 fn a_workspace_below_the_repository_root_reads_its_own_paths() {
-    let directory = tempfile::tempdir().expect("temp dir");
-    let root = directory.path();
-    init(root);
-    git(root, &["config", "core.autocrlf", "true"]);
-    fs::create_dir_all(root.join("sub")).expect("workspace folder");
-    write(
-        root,
-        &[
-            ("sub/lib.rs", "pub fn beacon() {}\n"),
-            ("other.rs", "pub fn other() {}\n"),
-        ],
-    );
-    commit_all(root, "base");
-    write(
-        root,
-        &[
-            ("sub/lib.rs", "pub fn beacon(flag: bool) {}\n"),
-            ("sub/new.rs", "pub fn new() {}\n"),
-            ("other.rs", "pub fn other(flag: bool) {}\n"),
-        ],
-    );
-    let repository = Repository::open(&root.join("sub")).expect("repository");
-    let base = repository.resolve("HEAD").expect("base");
+    for (autocrlf, expected) in [
+        ("false", b"pub fn beacon() {}\n".as_slice()),
+        ("true", b"pub fn beacon() {}\r\n".as_slice()),
+    ] {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let root = directory.path();
+        init(root);
+        git(root, &["config", "core.autocrlf", autocrlf]);
+        fs::create_dir_all(root.join("sub")).expect("workspace folder");
+        write(
+            root,
+            &[
+                ("sub/lib.rs", "pub fn beacon() {}\n"),
+                ("other.rs", "pub fn other() {}\n"),
+            ],
+        );
+        commit_all(root, "base");
+        write(
+            root,
+            &[
+                ("sub/lib.rs", "pub fn beacon(flag: bool) {}\n"),
+                ("sub/new.rs", "pub fn new() {}\n"),
+                ("other.rs", "pub fn other(flag: bool) {}\n"),
+            ],
+        );
+        let repository = Repository::open(&root.join("sub")).expect("repository");
+        let base = repository.resolve("HEAD").expect("base");
 
-    let changed = repository
-        .changed_working_files(&base, &["lib.rs", "new.rs"], &|_| true, 512)
-        .expect("working changes");
-    let files = repository.tree_files(&base, &|_| true, 16).expect("files");
-    let mut forms = repository.working_forms().expect("working forms");
-    let form = forms.form(&files[0], 1024).expect("working form");
+        let changed = repository
+            .changed_working_files(&base, &["lib.rs", "new.rs"], &|_| true, 512)
+            .expect("working changes");
+        let files = repository.tree_files(&base, &|_| true, 16).expect("files");
+        let mut forms = repository.working_forms().expect("working forms");
+        let form = forms.form(&files[0], 1024).expect("working form");
 
-    assert_eq!(changed.paths(), ["lib.rs", "new.rs"]);
-    assert_eq!(files.len(), 1, "the workspace holds its own files alone");
-    assert_eq!(
-        form,
-        WorkingForm::Converted(b"pub fn beacon() {}\r\n".to_vec())
-    );
+        assert_eq!(changed.paths(), ["lib.rs", "new.rs"]);
+        assert_eq!(files.len(), 1, "the workspace holds its own files alone");
+        assert_eq!(
+            form,
+            WorkingForm::Converted(expected.to_vec()),
+            "core.autocrlf={autocrlf}"
+        );
+    }
 }
 
 #[test]

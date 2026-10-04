@@ -1,15 +1,16 @@
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use rift_core::{
     Contribution, ContributionError, ContributionKey, ContributionOrigin, ContributionReference,
-    ExactKind, IdError, PortableSymbolFacts, ProviderId, ProviderRevision, ProviderSymbolId,
-    SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
-    SourceUnitIdError, SymbolId, TreeRevision, encode_path, symbol_identity,
+    ExactKind, IdError, PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision,
+    ProviderSymbolId, SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision,
+    SourceUnitId, SourceUnitIdError, SymbolId, TreeRevision, encode_path, symbol_identity,
 };
 use rift_provider::{ProviderPublication, PublicationError, PublicationLimits};
 
-use crate::SyntaxDocument;
+use crate::{SyntaxDocument, SyntaxFacts};
 
 /// Stable identity of built-in syntax Contribution provider.
 pub const SYNTAX_PROVIDER_ID: &str = "syntax";
@@ -110,12 +111,21 @@ impl DocumentPlacement {
     /// Returns [`SyntaxPublicationError`] when the document's path breaks
     /// source-unit rules.
     pub fn project(document: &SyntaxDocument) -> Result<Self, SyntaxPublicationError> {
+        Self::project_path(document.path())
+    }
+
+    /// The project placement for one project-relative path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxPublicationError`] when the path breaks source-unit rules.
+    pub fn project_path(path: &ProjectPath) -> Result<Self, SyntaxPublicationError> {
         let location = SourceLocation::Project { package: None };
         let origin = ContributionOrigin::new(Some(location), SourceKind::Authored)?;
         Ok(Self::new(
             origin,
-            source_unit(document)?,
-            document.path().as_str(),
+            source_unit_for_path(path)?,
+            path.as_str(),
         ))
     }
 
@@ -216,9 +226,22 @@ impl SyntaxPublicationBuilder {
         document: &SyntaxDocument,
         placement: &DocumentPlacement,
     ) -> Result<(), SyntaxPublicationError> {
-        let language_segment = document.language().identity_segment();
-        let mut additions = Vec::with_capacity(document.symbols().len());
-        for symbol in document.symbols() {
+        self.add_facts_placed(document.facts(), placement)
+    }
+
+    /// Adds every declaration from path-independent syntax facts under `placement`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxPublicationError`] when one symbol identity or Contribution is invalid.
+    pub fn add_facts_placed(
+        &mut self,
+        syntax: &SyntaxFacts,
+        placement: &DocumentPlacement,
+    ) -> Result<(), SyntaxPublicationError> {
+        let language_segment = syntax.language().identity_segment();
+        let mut additions = Vec::with_capacity(syntax.symbols().len());
+        for symbol in syntax.symbols() {
             let identity = symbol_identity(
                 &language_segment,
                 placement.identity_path(),
@@ -227,14 +250,14 @@ impl SyntaxPublicationBuilder {
             let identity = SymbolId::new(identity)?;
             let provider_symbol = ProviderSymbolId::new(identity.as_str())?;
             let mut facts = PortableSymbolFacts::new(
-                document.language().clone(),
+                syntax.language().clone(),
                 symbol.name.clone(),
                 symbol.qualified_name.clone(),
                 ExactKind(symbol.kind.to_owned()),
             )
             .facets(symbol.facets.clone())
-            .signatures(symbol.signatures.clone())
-            .documentation(symbol.documentation.clone());
+            .with_shared_signatures(Arc::clone(&symbol.signatures))
+            .with_shared_documentation(Arc::clone(&symbol.documentation));
             if let Some(visibility) = &symbol.visibility {
                 facts = facts.visibility(visibility.clone());
             }
@@ -295,9 +318,18 @@ impl SyntaxPublicationBuilder {
 ///
 /// Returns [`SourceUnitIdError`] when the document's path breaks source-unit rules.
 pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, SourceUnitIdError> {
+    source_unit_for_path(document.path())
+}
+
+/// Mints one project source-unit identity from its canonical project path.
+///
+/// # Errors
+///
+/// Returns [`SourceUnitIdError`] when the path breaks source-unit rules.
+pub fn source_unit_for_path(path: &ProjectPath) -> Result<SourceUnitId, SourceUnitIdError> {
     SourceUnitId::parse(&format!(
         "rift://source/project/{}",
-        encode_path(document.path().as_str())
+        encode_path(path.as_str())
     ))
 }
 
@@ -401,6 +433,54 @@ mod tests {
         builder.add_document(&document).expect("document");
         let publication = builder.build().expect("publication");
         assert_eq!(publication.contributions().len(), 1);
+    }
+
+    #[test]
+    fn contribution_shares_signature_and_documentation_storage_with_syntax_facts() {
+        let provider = RustSyntaxProvider::default();
+        let path = ProjectPath::new("src/lib.rs").expect("path");
+        let document = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "/// Beacon docs.\npub fn beacon(value: u8) -> u8 { value }\n",
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("syntax document");
+        let symbol = document
+            .symbols()
+            .first()
+            .expect("syntax document has one symbol");
+        assert!(!symbol.signatures.is_empty(), "fixture has signature");
+        assert!(
+            !symbol.documentation.is_empty(),
+            "fixture has documentation"
+        );
+
+        let mut builder = SyntaxPublicationBuilder::new(
+            publication(1),
+            source_revision(1),
+            tree_revision(1),
+            rift_provider::PublicationLimits::new(1, 1, 1).expect("limits"),
+        )
+        .expect("builder");
+        builder.add_document(&document).expect("document");
+        let publication = builder.build().expect("publication");
+        let facts = publication.contributions()[0]
+            .facts()
+            .expect("portable facts");
+
+        assert_eq!(facts.signatures_slice(), symbol.signatures.as_ref());
+        assert_eq!(
+            facts.signatures_slice().as_ptr(),
+            symbol.signatures.as_ptr()
+        );
+        assert_eq!(facts.documentation_blocks(), symbol.documentation.as_ref());
+        assert_eq!(
+            facts.documentation_blocks().as_ptr(),
+            symbol.documentation.as_ptr()
+        );
     }
 
     /// A dependency placement files the unit and identity under the package,

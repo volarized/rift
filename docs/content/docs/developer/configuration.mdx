@@ -75,15 +75,16 @@ idle_timeout = "30m"
 readiness_timeout = "30s"
 ```
 
-- `num_workers` caps the workers running blocking operations at once, 1 to 64
+- `num_workers` caps concurrent blocking operations and sizes the parser worker pool, 1 to 64
 - `worker_queue_timeout` bounds one request's wait for a free worker, 1ms to 1h - when it
   expires, the request fails with `temporarily_unavailable` and the client can retry without
   stacking another waiter
 - `idle_timeout` stops the server once no request remains active and that span has passed after
   the last response completed, 1s to 1d; the next `rift mcp` or `rift server start` brings it back
 - `readiness_timeout` bounds one request's waiting, 1s to 1h. A read takes the deadline once,
-  where it enters, and the waits it makes - for the workspace's index, for the full-text tier's
-  transaction, for a language engine's references - each spend what is left of that one budget
+  where it enters. Workspace index validation and language-engine reference waits spend what is
+  left of that one budget. A search that meets a pending lexical commit returns identifier
+  matching with `lexical_ranking_unavailable` instead of waiting for the transaction
 - `port` pins the exact loopback port, 1024 or above; omitted, the server picks the first free
   port from `port_range` - `port_range = { min = 12000, max = 13000 }` is the default - and the
   two keys exclude each other
@@ -91,6 +92,38 @@ readiness_timeout = "30s"
 The worker pool exists before the first request, so the server sizes it once at startup: a
 change to this table applies on the next start, while every other table applies to later
 requests as soon as the file is accepted.
+
+<VersionBadge version="v0.0.47" />
+
+Initial source preparation runs in the background. A local read can return prepared files with
+[`local_index_preparing`](/docs/developer/protocol/mcp#reads); a targeted `nodes` read spends
+its remaining `readiness_timeout` budget preparing the requested file. The warning reports
+incomplete source independently of lexical and vector readiness.
+
+Three additional keys bound background validation and repository serving:
+
+```toml
+[server]
+validation_interval = "30s"
+version_control_timeout = "3s"
+workspaces = 16
+```
+
+- `validation_interval` bounds the interval between background filesystem checks, 1s to 1h.
+  Requests and filesystem events do not reset the deadline; an unchanged check without a recorded
+  failure queues no rebuild.
+- `version_control_timeout` bounds the wait for the worktree's Git `index.lock`, 1ms to 30s.
+  A lock retained past the bound is passed and named in the log; the server leaves the lock in place.
+- `workspaces` caps the workspaces retained by one repository process, 1 to 64.
+  A new workspace is refused once that limit is reached; concurrent admission waits within
+  `worker_queue_timeout` for an available worker.
+
+An explicitly started repository server accepts its `[server]` table from the main Git worktree,
+including environment overrides. A workspace uses that process only when its accepted table
+matches those startup settings; conflicting keys are logged, and the proxy starts a workspace server.
+
+A missing, bare, removed, or unreadable main worktree, or invalid main-worktree configuration,
+also selects a workspace server. Existing connections retain their startup settings until restart.
 
 ## Logs
 

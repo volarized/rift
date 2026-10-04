@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 
 /// Workers the server's blocking pool may hold, at most.
 pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
+/// Maximum workspaces one repository process may retain.
+pub const SERVER_WORKSPACES_MAX: u64 = 64;
+/// Default retained workspace limit for one repository process.
+pub const SERVER_WORKSPACES_DEFAULT: u64 = 16;
 /// Milliseconds one request may wait for a free worker, at most: one hour.
 pub const SERVER_QUEUE_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Milliseconds the server serves after the last request completes before
@@ -40,6 +44,12 @@ pub const SERVER_READINESS_TIMEOUT_MS_MIN: u64 = 1_000;
 pub const SERVER_READINESS_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Milliseconds [`ServerConfiguration::readiness_timeout`] defaults to.
 const SERVER_READINESS_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// Milliseconds between background filesystem validations, at least.
+pub const SERVER_VALIDATION_INTERVAL_MS_MIN: u64 = 1_000;
+/// Milliseconds between background filesystem validations, at most.
+pub const SERVER_VALIDATION_INTERVAL_MS_MAX: u64 = 3_600_000;
+/// Milliseconds publication may wait for a Git index lock, at most.
+pub const SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Records the log store keeps, at least.
 pub const LOGS_RETENTION_RECORDS_MIN: u64 = 100;
 /// Records the log store keeps, at most.
@@ -685,6 +695,9 @@ pub struct ServerConfiguration {
     /// Workers running blocking filesystem and parser operations at once, 1 to 64.
     #[schemars(range(min = 1, max = 64))]
     pub num_workers: u64,
+    /// Workspaces one repository process may retain, 1 to 64.
+    #[schemars(range(min = 1, max = 64))]
+    pub workspaces: u64,
     /// Wall-clock bound one request waits for a free worker, 1ms to 1h.
     pub worker_queue_timeout: Duration,
     /// Wall-clock span after the last served request completes that stops
@@ -696,6 +709,12 @@ pub struct ServerConfiguration {
     /// resolves the languages it needs, waiting on those services spends
     /// what remains of it.
     pub readiness_timeout: Duration,
+    /// Maximum span between background filesystem validations, 1s to 1h.
+    /// Requests and filesystem events do not reset this interval.
+    pub validation_interval: Duration,
+    /// Maximum span publication waits for the worktree's Git index lock,
+    /// 1ms to 30s. A lock retained past this bound is logged and passed.
+    pub version_control_timeout: Duration,
     /// The exact loopback port the server binds, 1024 or above. Excludes
     /// `port_range`; omitted, the server picks from `port_range` or the
     /// default serving range.
@@ -710,9 +729,12 @@ impl Default for ServerConfiguration {
     fn default() -> Self {
         Self {
             num_workers: 4,
+            workspaces: SERVER_WORKSPACES_DEFAULT,
             worker_queue_timeout: Duration::from_millis(30_000),
             idle_timeout: Duration::from_millis(1_800_000),
             readiness_timeout: Duration::from_millis(SERVER_READINESS_TIMEOUT_MS_DEFAULT),
+            validation_interval: Duration::from_millis(30_000),
+            version_control_timeout: Duration::from_millis(3_000),
             port: None,
             port_range: None,
         }
@@ -743,6 +765,12 @@ impl ServerConfiguration {
                 SERVER_NUM_WORKERS_MAX,
             ),
             (
+                "server.workspaces",
+                self.workspaces,
+                1,
+                SERVER_WORKSPACES_MAX,
+            ),
+            (
                 "server.worker_queue_timeout",
                 self.worker_queue_timeout.milliseconds(),
                 1,
@@ -759,6 +787,18 @@ impl ServerConfiguration {
                 self.readiness_timeout.milliseconds(),
                 SERVER_READINESS_TIMEOUT_MS_MIN,
                 SERVER_READINESS_TIMEOUT_MS_MAX,
+            ),
+            (
+                "server.validation_interval",
+                self.validation_interval.milliseconds(),
+                SERVER_VALIDATION_INTERVAL_MS_MIN,
+                SERVER_VALIDATION_INTERVAL_MS_MAX,
+            ),
+            (
+                "server.version_control_timeout",
+                self.version_control_timeout.milliseconds(),
+                1,
+                SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX,
             ),
         ])
         .or_else(|| self.port_violation())
@@ -3673,6 +3713,8 @@ mod tests {
         assert_eq!(table.worker_queue_timeout, Duration::from_millis(30_000));
         assert_eq!(table.idle_timeout, Duration::from_millis(1_800_000));
         assert_eq!(table.readiness_timeout, Duration::from_millis(30_000));
+        assert_eq!(table.validation_interval, Duration::from_millis(30_000));
+        assert_eq!(table.version_control_timeout, Duration::from_millis(3_000));
         assert_eq!(WorkspaceConfiguration::default().validate(), Ok(()));
     }
 
@@ -3891,6 +3933,66 @@ mod tests {
                 ("range", "100..=30000".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn test_repository_workspace_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        assert_eq!(configuration.server.workspaces, SERVER_WORKSPACES_DEFAULT);
+        for value in [0, SERVER_WORKSPACES_MAX + 1] {
+            configuration.server.workspaces = value;
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "server.workspaces",
+                    ..
+                })
+            ));
+        }
+        for value in [1, SERVER_WORKSPACES_MAX] {
+            configuration.server.workspaces = value;
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_background_validation_and_version_control_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for value in [
+            0,
+            SERVER_VALIDATION_INTERVAL_MS_MIN - 1,
+            SERVER_VALIDATION_INTERVAL_MS_MAX + 1,
+        ] {
+            configuration.server.validation_interval = Duration::from_millis(value);
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "server.validation_interval",
+                    ..
+                })
+            ));
+        }
+        for value in [
+            SERVER_VALIDATION_INTERVAL_MS_MIN,
+            SERVER_VALIDATION_INTERVAL_MS_MAX,
+        ] {
+            configuration.server.validation_interval = Duration::from_millis(value);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+        for value in [0, SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX + 1] {
+            configuration.server.version_control_timeout = Duration::from_millis(value);
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "server.version_control_timeout",
+                    ..
+                })
+            ));
+        }
+        for value in [1, SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX] {
+            configuration.server.version_control_timeout = Duration::from_millis(value);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
     }
 
     #[test]
@@ -5630,6 +5732,17 @@ mod tests {
                 "num workers max",
                 &server["num_workers"]["maximum"],
                 json!(SERVER_NUM_WORKERS_MAX),
+            ),
+            ("workspaces min", &server["workspaces"]["minimum"], json!(1)),
+            (
+                "workspaces max",
+                &server["workspaces"]["maximum"],
+                json!(SERVER_WORKSPACES_MAX),
+            ),
+            (
+                "workspaces default",
+                &server["workspaces"]["default"],
+                json!(SERVER_WORKSPACES_DEFAULT),
             ),
             (
                 "concurrent min",

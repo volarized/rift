@@ -16,6 +16,27 @@ suite from one instrumented archive, and the corpus checks there reuse one optim
 rather than compiling their own. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.
 
+<VersionBadge version="v0.0.47" />
+
+Local index regressions compare complete incremental read-service facts with a cold build after
+replacement, deletion, restoration, and case changes. The comparison keeps file digests, map
+values, index documents, documentation metadata, symbol pages, and relationship rows.
+
+Live MCP cases validate partial maps and preparation warnings against the served schema. Worker
+and database cases force queue exhaustion, cancellation, publication ordering, and shutdown;
+resource cases verify published paging without recapturing every source file.
+
+Background validation tests force elapsed deadlines under continuous events and recover edits
+without watcher reports. Git lock cases verify bounded waits, retained-lock expiration, linked
+worktree control paths, and publication equal to a cold build.
+
+A failed rebuild followed by byte-identical restoration must recover without a watcher event,
+retain its read service, and equal the cold digests and derived facts.
+
+Global resolution cases verify repeated bounded reads share their context and request bytes.
+Changed entry bounds, published dependency contexts, and requested packages refill the latest
+cache entry; replacement releases the preceding context and request.
+
 CI compiles through [sccache](https://github.com/mozilla/sccache), which keeps compiled crates in
 the `rift-oss-build-cache` R2 bucket, so a job compiles only the crates whose inputs changed since
 a cached build. On Windows the native jobs link with `/Brepro`: without it, every proc-macro build
@@ -141,8 +162,10 @@ that warning fails. The report records source revisions, warnings, each call's d
 own deadline, its overlapping writes, and each tool's first and maximum duration.
 
 Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
-and failure. `RIFT_CORPUS_REPORT` selects the JSON report location. Harness logs and reports
-stay outside the served checkout.
+and failure, including the complete Python traceback. `RIFT_CORPUS_REPORT` selects the JSON
+report location. Nextest displays the foreground server and MCP proxy diagnostics when each
+corpus test completes. Action records stay in the JSON report. Logs and reports stay outside
+the served checkout.
 
 ## Artifact and agent checks
 

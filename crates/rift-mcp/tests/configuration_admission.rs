@@ -3,6 +3,10 @@
 //! and fixing the file recovers without a restart.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
+
+use workspace_client::{await_workspace_ready, call_retrying_acceptance, tool_request};
 
 use std::error::Error;
 use std::fs;
@@ -113,16 +117,12 @@ async fn fixing_the_file_recovers_without_a_restart() -> TestResult {
     let contents = format!("{}{VALID_CONFIGURATION}", hermetic_search::HERMETIC_TABLES);
     fs::write(directory.path().join("rift.toml"), contents)?;
 
-    let recovered = client
-        .call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
-        )
-        .await?;
-    assert_eq!(
-        recovered.structured_content.ok_or("structured content")?["hits"][0]["symbol"]["name"],
-        json!("beacon")
-    );
+    let recovered = call_retrying_acceptance(
+        &client,
+        tool_request("get_symbol", &json!({"name": "beacon"})),
+    )
+    .await?;
+    assert_eq!(recovered["hits"][0]["symbol"]["name"], json!("beacon"));
 
     client.cancel().await?;
     Ok(())
@@ -132,6 +132,7 @@ async fn fixing_the_file_recovers_without_a_restart() -> TestResult {
 async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     let directory = workspace_with(Some(VALID_CONFIGURATION))?;
     let client = client_for(directory.path()).await?;
+    await_workspace_ready(&client).await?;
 
     let served = client
         .call_tool(
@@ -223,6 +224,7 @@ async fn valid_search_text_configuration_serves_normally() -> TestResult {
     let directory = workspace_with(Some(VALID_TEXT_CONFIGURATION))?;
     fs::write(directory.path().join("guide.rst"), "guide body")?;
     let client = client_for(directory.path()).await?;
+    await_workspace_ready(&client).await?;
 
     let served = client
         .call_tool(
@@ -243,6 +245,7 @@ async fn valid_search_text_configuration_serves_normally() -> TestResult {
 async fn valid_global_configuration_reaches_published_workspace() -> TestResult {
     let directory = workspace_with(Some(VALID_GLOBAL_CONFIGURATION))?;
     let client = client_for(directory.path()).await?;
+    await_workspace_ready(&client).await?;
 
     let served = client
         .call_tool(
@@ -318,6 +321,9 @@ async fn missing_and_valid_files_serve_normally() -> TestResult {
     for configuration in [None, Some(VALID_CONFIGURATION)] {
         let directory = workspace_with(configuration)?;
         let client = client_for(directory.path()).await?;
+        if configuration.is_none() || configuration == Some(VALID_CONFIGURATION) {
+            await_workspace_ready(&client).await?;
+        }
         let served = client
             .call_tool(
                 CallToolRequestParams::new("search")
@@ -377,6 +383,7 @@ async fn out_of_range_source_declarations_fails_reads_naming_the_field() -> Test
 async fn a_declaration_bound_the_workspace_fits_inside_serves_every_read() -> TestResult {
     let directory = workspace_with(Some("[source]\ndeclarations = 10000\n"))?;
     let client = client_for(directory.path()).await?;
+    await_workspace_ready(&client).await?;
 
     let answer = client
         .call_tool(

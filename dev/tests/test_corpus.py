@@ -10,9 +10,15 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus, settled_pattern
+from mcp.shared.exceptions import MCPError
+from rift_dev.check_corpus import (
+    CLEANUP_RESERVE_SECONDS,
+    Corpus,
+    observed,
+    settled_pattern,
+)
 from rift_dev.commands import GitCommand
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
@@ -45,7 +51,13 @@ from rift_dev.corpus_cache import (
     missing_history_objects,
     pins,
 )
-from rift_dev.rift_test_client import Client, JsonObject, object_value
+from rift_dev.rift_test_client import (
+    Client,
+    JsonObject,
+    Server,
+    gate_deadline,
+    object_value,
+)
 
 
 class Measurements(unittest.TestCase):
@@ -937,6 +949,384 @@ class PersistedContent(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, "row count"),
                 ):
                     lexical_content(root)
+
+
+class LogObservation(unittest.TestCase):
+    """Log observation keeps one deadline when the fixture removes poll delay."""
+
+    def test_zero_poll_delay_observes_record_after_pending_reads(self) -> None:
+        client = AsyncMock(spec=Client)
+        found: list[JsonObject] = [{"message": "index rebuild failed"}]
+        client.resource.side_effect = [
+            {"records": []},
+            {"records": []},
+            {"records": found},
+        ]
+        with patch("rift_dev.check_corpus.POLL_SECONDS", 0.0):
+            answer = asyncio.run(
+                observed(cast(Client, client), "rift://logs/component/index", bool)
+            )
+        self.assertEqual(answer, found)
+        self.assertEqual(client.resource.await_count, 3)
+        client.resource.assert_awaited_with("rift://logs/component/index")
+
+    def test_zero_poll_delay_still_times_out_when_record_is_absent(self) -> None:
+        client = AsyncMock(spec=Client)
+        client.resource.return_value = {"records": []}
+        with (
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+            patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            asyncio.run(
+                observed(cast(Client, client), "rift://logs/component/index", bool)
+            )
+        self.assertGreater(client.resource.await_count, 0)
+        client.resource.assert_awaited_with("rift://logs/component/index")
+
+    def test_observation_deadline_cancels_held_resource_read(self) -> None:
+        client = AsyncMock(spec=Client)
+        cancelled = False
+
+        async def held_resource(_uri: str) -> JsonObject:
+            nonlocal cancelled
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled = True
+            raise AssertionError("the held resource read must be cancelled")
+
+        client.resource.side_effect = held_resource
+        with (
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+            patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            asyncio.run(
+                observed(cast(Client, client), "rift://logs/component/index", bool)
+            )
+        self.assertTrue(cancelled)
+        client.resource.assert_awaited_once_with("rift://logs/component/index")
+
+
+class SourceBound(unittest.TestCase):
+    """Discovery refusal remains readable after early server publication (#495)."""
+
+    @staticmethod
+    def refusal() -> JsonObject:
+        return {
+            "code": "limit_exceeded",
+            "phase": "read",
+            "limit": {"field": "source.files", "required": 20001, "limit": 20000},
+            "causes": [{"message": "violation too_many_files"}],
+        }
+
+    def exercise(
+        self, responses: list[JsonObject | MCPError]
+    ) -> tuple[Corpus, MagicMock]:
+        corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+        server = MagicMock(spec=Server)
+        client = AsyncMock(spec=Client)
+        client.call.side_effect = responses
+        client.resource.return_value = {
+            "records": [
+                {
+                    "message": "index rebuild failed",
+                    "fields": {"error_code": "limit_exceeded"},
+                }
+            ]
+        }
+        server.connect.return_value.__aenter__.return_value = client
+        with (
+            patch.object(corpus, "server", return_value=server),
+            patch.object(corpus, "configure") as configure,
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+        ):
+            asyncio.run(corpus.source_bound())
+        configure.assert_any_call("[source]\nfiles = 20000\n")
+        configure.assert_called_with()
+        server.start.assert_called_once_with()
+        server.check_running.assert_called_once_with()
+        server.stop.assert_called_once_with()
+        server.close.assert_called_once_with()
+        client.call.assert_awaited_with("get_symbol", {"name": "corpus_probe"})
+        client.resource.assert_awaited_with("rift://logs/component/index")
+        return corpus, server
+
+    def test_preparing_read_reaches_exact_refusal_and_stops_live_server(self) -> None:
+        corpus, _server = self.exercise(
+            [
+                {"warnings": [{"code": "local_index_preparing"}]},
+                MCPError(-32000, "source limit", self.refusal()),
+            ]
+        )
+        action = object_value(corpus.actions[-1], "source action")
+        self.assertEqual(action["action"], "source_bound")
+        self.assertEqual(action["field"], "source.files")
+        self.assertEqual(action["observed"], 20001)
+        self.assertEqual(action["maximum"], 20000)
+
+    def test_wrong_refusal_code_phase_field_quantities_and_cause_fail(self) -> None:
+        variants = [
+            {"code": "resource_not_found"},
+            {"phase": "initialize"},
+            {
+                "limit": {
+                    "field": "source.workspace_size",
+                    "required": 20001,
+                    "limit": 20000,
+                }
+            },
+            {"limit": {"field": "source.files", "required": 20000, "limit": 20000}},
+            {"limit": {"field": "source.files", "required": 20001, "limit": 20001}},
+            {"causes": [{"message": "another refusal"}]},
+        ]
+        for wrong in variants:
+            with self.subTest(wrong=wrong), self.assertRaises(AssertionError):
+                self.exercise(
+                    [MCPError(-32000, "source limit", {**self.refusal(), **wrong})]
+                )
+
+    def test_complete_read_without_refusal_fails(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "returned a complete read"):
+            self.exercise([{"warnings": []}])
+
+    def test_refusal_wait_keeps_one_deadline_and_closes_on_timeout(self) -> None:
+        corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+        server = MagicMock(spec=Server)
+        client = AsyncMock(spec=Client)
+
+        async def held_read(_name: str, _arguments: JsonObject) -> JsonObject:
+            await asyncio.Event().wait()
+            raise AssertionError("the held read must be cancelled")
+
+        client.call.side_effect = held_read
+        server.connect.return_value.__aenter__.return_value = client
+        with (
+            patch.object(corpus, "server", return_value=server),
+            patch.object(corpus, "configure") as configure,
+            patch(
+                "rift_dev.check_corpus.gate_deadline",
+                side_effect=lambda name, _seconds: gate_deadline(name, 0.01),
+            ) as deadline,
+            self.assertRaises(TimeoutError),
+        ):
+            asyncio.run(corpus.source_bound())
+        deadline.assert_called_once_with("source.files refusal", 180.0)
+        self.assertEqual(corpus.actions, [])
+        server.stop.assert_not_called()
+        server.close.assert_called_once_with()
+        configure.assert_called_with()
+
+    def test_stop_failure_cannot_record_passed_source_bound(self) -> None:
+        corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+        server = MagicMock(spec=Server)
+        server.stop.side_effect = AssertionError("server stop exceeded its deadline")
+        client = AsyncMock(spec=Client)
+        client.call.side_effect = MCPError(-32000, "source limit", self.refusal())
+        client.resource.return_value = {
+            "records": [
+                {
+                    "message": "index rebuild failed",
+                    "fields": {"error_code": "limit_exceeded"},
+                }
+            ]
+        }
+        server.connect.return_value.__aenter__.return_value = client
+        with (
+            patch.object(corpus, "server", return_value=server),
+            patch.object(corpus, "configure") as configure,
+            self.assertRaisesRegex(AssertionError, "server stop exceeded"),
+        ):
+            asyncio.run(corpus.source_bound())
+        self.assertEqual(corpus.actions, [])
+        server.close.assert_called_once_with()
+        configure.assert_called_with()
+
+
+class ChurnPreparation(unittest.TestCase):
+    """Churn observes startup preparation before measuring sustained reads (#504)."""
+
+    def exercise(
+        self,
+        responses: list[JsonObject] | None,
+        failure: type[Exception] | None = None,
+    ) -> tuple[Corpus, MagicMock, AsyncMock, AsyncMock]:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+            corpus.root = Path(directory)
+            server = MagicMock(spec=Server)
+            server.__enter__.return_value = server
+
+            def close(*_arguments: object) -> None:
+                server.close()
+
+            server.__exit__.side_effect = close
+            client = AsyncMock(spec=Client)
+            client.resource.return_value = {"records": []}
+            server.connect.return_value.__aenter__.return_value = client
+
+            async def preparing(_name: str, _request: JsonObject) -> JsonObject:
+                self.assertFalse((corpus.root / PROBE_PATH).exists())
+                if responses is None:
+                    return {"hits": [], "warnings": [{"code": "local_index_preparing"}]}
+                return responses.pop(0)
+
+            client.call.side_effect = preparing
+
+            async def pressure(_client: Client) -> None:
+                self.assertGreater(client.call.await_count, 0)
+                self.assertFalse((corpus.root / PROBE_PATH).exists())
+
+            churn = AsyncMock(side_effect=pressure)
+            with (
+                patch.object(corpus, "server", return_value=server),
+                patch.object(corpus, "churn", churn),
+                patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+                patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+            ):
+                if failure is None:
+                    asyncio.run(corpus.churn_case())
+                else:
+                    with self.assertRaises(failure):
+                        asyncio.run(corpus.churn_case())
+            server.close.assert_called_once_with()
+        return corpus, server, client, churn
+
+    def test_partial_startup_settles_before_probe_creation_and_pressure(self) -> None:
+        corpus, server, client, churn = self.exercise(
+            [
+                {"hits": [], "warnings": [{"code": "local_index_preparing"}]},
+                {"hits": [], "warnings": []},
+            ]
+        )
+        self.assertEqual(client.call.await_count, 2)
+        client.call.assert_awaited_with("get_symbol", {"name": "corpus_probe"})
+        self.assertEqual(client.call.await_args_list[0], client.call.await_args_list[1])
+        churn.assert_awaited_once_with(client)
+        server.stop.assert_called_once_with()
+        action = object_value(corpus.actions[-1], "churn action")
+        self.assertEqual(action["state"], "after_churn")
+
+    def test_complete_empty_startup_still_runs_pressure(self) -> None:
+        _corpus, server, client, churn = self.exercise([{"hits": [], "warnings": []}])
+        self.assertEqual(client.call.await_count, 1)
+        churn.assert_awaited_once_with(client)
+        server.stop.assert_called_once_with()
+
+    def test_continuous_preparation_exhausts_observation_without_starting_pressure(
+        self,
+    ) -> None:
+        _corpus, server, client, churn = self.exercise(None, TimeoutError)
+        self.assertGreater(client.call.await_count, 0)
+        churn.assert_not_awaited()
+        server.stop.assert_not_called()
+        client.resource.assert_not_awaited()
+
+
+class Churn(unittest.TestCase):
+    """Partial local preparation must finish before declaration checks (#504)."""
+
+    @staticmethod
+    def declaration(tool: str) -> JsonObject:
+        source = "pub fn corpus_probe() { let value = 0; }"
+        owner: JsonObject = {"symbol": {"id": "corpus_probe"}}
+        hit: JsonObject = {
+            "path": PROBE_PATH,
+            "source": source,
+            "range": {"start": 0, "end": len(source.encode())},
+        }
+        if tool == "search":
+            hit["hit"] = owner
+        else:
+            hit.update(owner)
+        return {
+            "results" if tool == "search" else "hits": [hit],
+            "warnings": [{"code": "stale_index"}],
+        }
+
+    def exercise(
+        self, responses: list[JsonObject], failure: str
+    ) -> tuple[Corpus, AsyncMock]:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+            corpus.root = Path(directory)
+            client = AsyncMock(spec=Client)
+            client.call.side_effect = responses
+            with (
+                patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+                self.assertRaisesRegex(AssertionError, failure),
+            ):
+                asyncio.run(corpus.churn(cast(Client, client)))
+            self.assertFalse((corpus.root / PROBE_PATH).exists())
+        return corpus, client
+
+    def test_initial_preparation_reaches_declaration_before_pressure(self) -> None:
+        corpus, client = self.exercise(
+            [
+                {"hits": [], "warnings": [{"code": "local_index_preparing"}]},
+                self.declaration("get_symbol"),
+                {"results": [], "warnings": []},
+            ],
+            "search lost probe declaration",
+        )
+        self.assertEqual(client.call.await_count, 3)
+        self.assertEqual(client.call.await_args_list[0], client.call.await_args_list[1])
+        initial = object_value(corpus.actions[0], "initial churn read")
+        self.assertTrue(initial["first"])
+        self.assertEqual(initial["deadline_seconds"], 40.0)
+        self.assertEqual(initial["source_revision"], 0)
+        self.assertEqual(initial["writes"], 0)
+        self.assertEqual(initial["warning_codes"], ["stale_index"])
+
+    def test_steady_preparation_keeps_existing_read_deadline(self) -> None:
+        corpus, client = self.exercise(
+            [
+                self.declaration("get_symbol"),
+                self.declaration("search"),
+                {"hits": [], "warnings": [{"code": "local_index_preparing"}]},
+                self.declaration("get_symbol"),
+                {"nodes": [], "source": [], "warnings": []},
+            ],
+            "nodes lost probe declaration",
+        )
+        self.assertEqual(client.call.await_count, 5)
+        self.assertEqual(client.call.await_args_list[2], client.call.await_args_list[3])
+        steady = object_value(corpus.actions[2], "steady churn read")
+        self.assertFalse(steady["first"])
+        self.assertEqual(steady["deadline_seconds"], 20.0)
+        self.assertEqual(steady["source_revision"], 0)
+
+    def test_settled_missing_declaration_still_fails(self) -> None:
+        _corpus, client = self.exercise(
+            [{"hits": [], "warnings": []}], "get_symbol lost probe declaration"
+        )
+        self.assertEqual(client.call.await_count, 1)
+
+    def test_continuous_preparation_spends_inherited_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+            corpus.root = Path(directory)
+            client = AsyncMock(spec=Client)
+            client.call.return_value = {
+                "hits": [],
+                "warnings": [{"code": "local_index_preparing"}],
+            }
+
+            async def exercise() -> None:
+                async with gate_deadline("churn preparation fixture", 0.01):
+                    await corpus.churn(cast(Client, client))
+
+            with (
+                patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+                self.assertRaises(TimeoutError),
+            ):
+                asyncio.run(exercise())
+            self.assertGreater(client.call.await_count, 1)
+            initial = object_value(corpus.actions[0], "initial churn read")
+            self.assertIsNone(initial["source_revision"])
+            self.assertEqual(initial["deadline_seconds"], 40.0)
+            self.assertFalse((corpus.root / PROBE_PATH).exists())
 
 
 class CaseBudgets(unittest.TestCase):

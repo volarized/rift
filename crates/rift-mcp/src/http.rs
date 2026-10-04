@@ -16,7 +16,9 @@ use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
+use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
+use rift_search::SearchIndex;
 use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -27,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::RiftMcp;
 use crate::identity::BuildCheckout;
+use crate::repository_http::RepositoryWorkspaceRegistry;
+pub(crate) use crate::repository_http::serve_repository_http;
 use crate::server::EngineHold;
 use crate::storage::WorkspaceStorage;
 use crate::validation::IndexSupervisor;
@@ -42,6 +46,8 @@ macro_rules! api_path {
 pub(crate) const MCP_PATH: &str = api_path!("/mcp");
 /// Path an authorized `POST` stops the server through.
 pub(crate) const STOP_PATH: &str = api_path!("/stop");
+/// Header selecting one workspace behind a repository server.
+pub(crate) const WORKSPACE_ROOT_HEADER: &str = "x-rift-workspace-root";
 /// Bytes of entropy behind one minted bearer token.
 const TOKEN_ENTROPY_BYTES: usize = 32;
 /// The authentication scheme: the `WWW-Authenticate` refusal names it, and
@@ -108,11 +114,11 @@ impl Fault for HttpServeFault {
 }
 
 impl HttpServeFault {
-    fn workspace(source: ReadError) -> HttpServeError {
+    pub(crate) fn workspace(source: ReadError) -> HttpServeError {
         Error::new(Self::Workspace(Box::new(source)))
     }
 
-    fn serve(
+    pub(crate) fn serve(
         operation: &'static str,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> HttpServeError {
@@ -214,6 +220,7 @@ pub(crate) async fn serve_http_with_storage(
         .await
         .map_err(HttpServeFault::workspace)?;
     let identity = server.product_identity().clone();
+    let search_index = server.search_index_handle();
     let server_table = server.server_configuration().await;
     let idle_timeout = Duration::from_millis(server_table.idle_timeout.milliseconds());
     let supervisor = server.index_supervisor();
@@ -246,25 +253,54 @@ pub(crate) async fn serve_http_with_storage(
         port,
         token,
         identity,
+        server_configuration: server_table,
         stop,
         serving,
         idle_watch,
-        supervisor,
-        engines,
+        repository_idle_watch: None,
+        supervisor: Some(supervisor),
+        engines: Some(engines),
+        search_index,
+        repository_workspaces: None,
     })
 }
 
 /// One serving HTTP MCP server: its address facts and its serving tasks.
 #[derive(Debug)]
 pub struct HttpServer {
-    port: u16,
-    token: String,
-    identity: ProductIdentity,
-    stop: CancellationToken,
-    serving: JoinHandle<Result<(), std::io::Error>>,
-    idle_watch: JoinHandle<()>,
-    supervisor: IndexSupervisor,
-    engines: Arc<EngineHold>,
+    pub(crate) port: u16,
+    pub(crate) token: String,
+    pub(crate) identity: ProductIdentity,
+    pub(crate) server_configuration: ServerConfiguration,
+    pub(crate) stop: CancellationToken,
+    pub(crate) serving: JoinHandle<Result<(), std::io::Error>>,
+    pub(crate) idle_watch: JoinHandle<()>,
+    pub(crate) repository_idle_watch: Option<JoinHandle<()>>,
+    pub(crate) supervisor: Option<IndexSupervisor>,
+    pub(crate) engines: Option<Arc<EngineHold>>,
+    pub(crate) search_index: Option<Arc<rift_search::SearchIndex>>,
+    pub(crate) repository_workspaces: Option<Arc<RepositoryWorkspaceRegistry>>,
+}
+
+/// SQLite close held until process log writes finish.
+#[doc(hidden)]
+pub struct DeferredDatabaseShutdown(Option<Arc<SearchIndex>>);
+
+impl DeferredDatabaseShutdown {
+    /// Closes process-owned SQLite worker by shared stop deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpServeError`] if the SQLite worker fails or cannot stop before the deadline.
+    pub async fn shutdown(self, deadline: Instant) -> Result<(), HttpServeError> {
+        match self.0 {
+            Some(search_index) => search_index
+                .shutdown(deadline)
+                .await
+                .map_err(|error| HttpServeFault::serve("SQLite worker shutdown", error)),
+            None => Ok(()),
+        }
+    }
 }
 
 impl HttpServer {
@@ -284,6 +320,12 @@ impl HttpServer {
     #[must_use]
     pub(crate) fn product_identity(&self) -> &ProductIdentity {
         &self.identity
+    }
+
+    /// Accepted server settings this process keeps until restart.
+    #[must_use]
+    pub(crate) fn server_configuration(&self) -> &ServerConfiguration {
+        &self.server_configuration
     }
 
     /// Waits until the server stopped and its index supervisor shut down,
@@ -319,6 +361,21 @@ impl HttpServer {
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
     pub async fn stopped(self, budget: Duration) -> (Instant, Result<(), HttpServeError>) {
+        let (deadline, stopped, database) = self.stopped_before_database(budget).await;
+        let database = database.shutdown(deadline).await;
+        (deadline, stopped.and(database))
+    }
+
+    /// Stops serving and index lanes, leaving SQLite open for final log writes.
+    #[doc(hidden)]
+    pub async fn stopped_before_database(
+        self,
+        budget: Duration,
+    ) -> (
+        Instant,
+        Result<(), HttpServeError>,
+        DeferredDatabaseShutdown,
+    ) {
         let mut serving = self.serving;
         let ended_before_the_stop = tokio::select! {
             outcome = &mut serving => Some(outcome),
@@ -336,22 +393,48 @@ impl HttpServer {
             None => drained_serve_outcome(&mut serving, deadline).await,
         };
         let idle_outcome = self.idle_watch.await;
-        let engines_stopped = tokio::time::timeout_at(deadline, self.engines.shutdown())
-            .await
-            .is_ok();
-        let supervisor_outcome = self
-            .supervisor
-            .shutdown(deadline)
-            .await
-            .map_err(HttpServeFault::workspace);
+        let repository_idle_outcome = match self.repository_idle_watch {
+            Some(mut watch) => match tokio::time::timeout_at(deadline, &mut watch).await {
+                Ok(outcome) => outcome
+                    .map_err(|error| HttpServeFault::serve("workspace idle watch task", error)),
+                Err(error) => {
+                    watch.abort();
+                    let _ = watch.await;
+                    Err(HttpServeFault::serve("workspace idle watch task", error))
+                }
+            },
+            None => Ok(()),
+        };
+        let engines_stopped = match self.engines {
+            Some(engines) => tokio::time::timeout_at(deadline, engines.shutdown())
+                .await
+                .is_ok(),
+            None => true,
+        };
+        let supervisor_outcome = if let Some(supervisor) = self.supervisor.as_ref() {
+            supervisor
+                .shutdown(deadline)
+                .await
+                .map_err(HttpServeFault::workspace)
+        } else {
+            Ok(())
+        };
+        let repository_outcome = match self.repository_workspaces {
+            Some(registry) => registry.shutdown(deadline).await,
+            None => Ok(()),
+        };
         // The last supervisor can own the whole published index. Freeing it here
         // would block this future before the caller drains logs and releases its
         // election. Tokio owns the detached release; an embedded runtime reclaims
         // it, and the foreground CLI already exits without waiting on its pool.
-        let retired = self.supervisor;
-        drop(tokio::task::spawn_blocking(move || drop(retired)));
+        if let Some(supervisor) = self.supervisor {
+            drop(tokio::task::spawn_blocking(move || drop(supervisor)));
+        }
         let outcome = stop_outcome_label(
-            supervisor_outcome.is_ok() && serve_result.is_ok() && engines_stopped,
+            supervisor_outcome.is_ok()
+                && repository_outcome.is_ok()
+                && serve_result.is_ok()
+                && engines_stopped,
         );
         tracing::info!(
             component = "mcp",
@@ -359,10 +442,18 @@ impl HttpServer {
             outcome,
             "MCP server stopped"
         );
-        let stopped = supervisor_outcome.and(serve_result).and_then(|()| {
-            idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
-        });
-        (deadline, stopped)
+        let stopped = supervisor_outcome
+            .and(repository_outcome)
+            .and(repository_idle_outcome)
+            .and(serve_result)
+            .and_then(|()| {
+                idle_outcome.map_err(|error| HttpServeFault::serve("idle watch task", error))
+            });
+        (
+            deadline,
+            stopped,
+            DeferredDatabaseShutdown(self.search_index),
+        )
     }
 }
 
@@ -407,7 +498,7 @@ fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
 /// The encoding fixes the length: `TOKEN_ENTROPY_BYTES` entropy bytes
 /// spell exactly [`rift_protocol::lock::SERVER_TOKEN_LENGTH`] base64url
 /// characters.
-fn mint_token() -> Result<String, HttpServeError> {
+pub(crate) fn mint_token() -> Result<String, HttpServeError> {
     let mut entropy = [0_u8; TOKEN_ENTROPY_BYTES];
     getrandom::fill(&mut entropy).map_err(|error| HttpServeFault::serve("token mint", error))?;
     Ok(BASE64URL_NOPAD.encode(&entropy))
@@ -436,7 +527,7 @@ fn bind_first_free<Listener>(
 
 /// Binds the first free loopback port of the accepted selection for the
 /// runtime.
-fn bind_loopback_listener(
+pub(crate) fn bind_loopback_listener(
     ports: RangeInclusive<u16>,
 ) -> Result<(u16, tokio::net::TcpListener), HttpServeError> {
     let (port, listener) = bind_first_free(ports, |port| {
@@ -491,7 +582,7 @@ fn authenticated_router(
 /// one is present; non-browser MCP clients omit `Origin` and pass. The
 /// guard runs before authentication on every route, so the boundary holds
 /// for the stop route as well as the MCP service.
-async fn guard_loopback_boundary(request: Request, next: Next) -> Response {
+pub(crate) async fn guard_loopback_boundary(request: Request, next: Next) -> Response {
     let headers = request.headers();
     let host_accepted = headers
         .get(header::HOST)
@@ -605,10 +696,10 @@ pub async fn request_stop(lock: &ServerLock) -> Result<(), StopRequestFailure> {
 /// present, whether that token is checked at all, and the activity instant
 /// served requests refresh.
 #[derive(Clone, Debug)]
-struct RequestGate {
-    token: Arc<str>,
-    check: TokenCheck,
-    idle: Arc<IdleTracker>,
+pub(crate) struct RequestGate {
+    pub(crate) token: Arc<str>,
+    pub(crate) check: TokenCheck,
+    pub(crate) idle: Arc<IdleTracker>,
 }
 
 /// Refuses requests the token policy does not accept, tracking every
@@ -616,7 +707,7 @@ struct RequestGate {
 ///
 /// The token separates OS users sharing the machine; the loopback bind is
 /// the network boundary.
-async fn authorize_request(
+pub(crate) async fn authorize_request(
     State(gate): State<RequestGate>,
     request: Request,
     next: Next,
@@ -700,6 +791,11 @@ impl IdleTracker {
 
     /// Starts one authorized request. Dropping returned guard records completion.
     pub(crate) fn begin(&self) -> ActiveRequest<'_> {
+        self.start();
+        ActiveRequest { idle: self }
+    }
+
+    pub(crate) fn start(&self) {
         let mut state = self.lock_state();
         state.active_requests = state
             .active_requests
@@ -707,11 +803,10 @@ impl IdleTracker {
             .expect("active authorized request count must fit usize");
         drop(state);
         self.changed.notify_waiters();
-        ActiveRequest { idle: self }
     }
 
     /// Records one authorized request completion.
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         let mut state = self.lock_state();
         state.active_requests = state
             .active_requests
@@ -725,7 +820,7 @@ impl IdleTracker {
     }
 
     /// The instant the server becomes idle, absent while an authorized request remains active.
-    fn idle_deadline(&self, idle_timeout: Duration) -> Option<Instant> {
+    pub(crate) fn idle_deadline(&self, idle_timeout: Duration) -> Option<Instant> {
         let state = self.lock_state();
         (state.active_requests == 0).then_some(state.last_activity + idle_timeout)
     }
@@ -781,7 +876,11 @@ impl Drop for ActiveRequest<'_> {
 /// # Cancel safety
 ///
 /// Dropping this future ends the watch without cancelling `stop`.
-async fn watch_idle(idle: Arc<IdleTracker>, idle_timeout: Duration, stop: CancellationToken) {
+pub(crate) async fn watch_idle(
+    idle: Arc<IdleTracker>,
+    idle_timeout: Duration,
+    stop: CancellationToken,
+) {
     loop {
         let changed = idle.changed.notified();
         tokio::pin!(changed);
@@ -815,6 +914,7 @@ mod tests {
 
     use axum::http::{StatusCode, header};
     use rift_index::WorkspaceIndexLimits;
+    use rift_protocol::configuration::ServerConfiguration;
     use rift_protocol::lock::{ProductIdentity, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock};
     use rift_server::ReadFault;
     use tokio_util::sync::CancellationToken;
@@ -847,6 +947,7 @@ mod tests {
                 version: "0.0.9".to_owned(),
                 schema_digest: "b".repeat(64),
             },
+            server: None,
         };
         assert_eq!(lock.validate(), Ok(()));
     }
@@ -998,15 +1099,19 @@ mod tests {
                     version: "0.0.9".to_owned(),
                     schema_digest: "b".repeat(64),
                 },
+                server_configuration: ServerConfiguration::default(),
                 stop: CancellationToken::new(),
                 serving: tokio::spawn(std::future::ready(Ok::<(), std::io::Error>(()))),
                 idle_watch: tokio::spawn(std::future::ready(())),
-                supervisor: IndexSupervisor { validation },
-                engines: Arc::new(EngineHold::new(
+                repository_idle_watch: None,
+                supervisor: Some(IndexSupervisor { validation }),
+                engines: Some(Arc::new(EngineHold::new(
                     directory.path().to_path_buf(),
                     BTreeMap::new(),
                     BTreeMap::new(),
-                )),
+                ))),
+                search_index: None,
+                repository_workspaces: None,
             };
             let (occupied, ready) = tokio::sync::oneshot::channel();
             let (release, released) = std::sync::mpsc::sync_channel(1);
@@ -1063,18 +1168,22 @@ mod tests {
                 version: "0.0.9".to_owned(),
                 schema_digest: "b".repeat(64),
             },
+            server_configuration: ServerConfiguration::default(),
             stop: CancellationToken::new(),
             serving: tokio::spawn(async {
                 tokio::time::sleep(SERVE_SPAN).await;
                 Ok::<(), std::io::Error>(())
             }),
             idle_watch: tokio::spawn(std::future::ready(())),
-            supervisor: IndexSupervisor { validation },
-            engines: Arc::new(EngineHold::new(
+            repository_idle_watch: None,
+            supervisor: Some(IndexSupervisor { validation }),
+            engines: Some(Arc::new(EngineHold::new(
                 directory.path().to_path_buf(),
                 BTreeMap::new(),
                 BTreeMap::new(),
-            )),
+            ))),
+            search_index: None,
+            repository_workspaces: None,
         };
 
         let started = Instant::now();
@@ -1111,17 +1220,21 @@ mod tests {
                 version: "0.0.9".to_owned(),
                 schema_digest: "b".repeat(64),
             },
+            server_configuration: ServerConfiguration::default(),
             stop: stop.clone(),
             // A request the stop never finishes draining: axum's graceful
             // shutdown holds the serving task until it completes.
             serving: tokio::spawn(std::future::pending::<Result<(), std::io::Error>>()),
             idle_watch: tokio::spawn(std::future::ready(())),
-            supervisor: IndexSupervisor { validation },
-            engines: Arc::new(EngineHold::new(
+            repository_idle_watch: None,
+            supervisor: Some(IndexSupervisor { validation }),
+            engines: Some(Arc::new(EngineHold::new(
                 directory.path().to_path_buf(),
                 BTreeMap::new(),
                 BTreeMap::new(),
-            )),
+            ))),
+            search_index: None,
+            repository_workspaces: None,
         };
 
         let started = Instant::now();

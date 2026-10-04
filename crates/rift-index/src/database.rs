@@ -30,6 +30,7 @@ use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::Instrument as _;
 
+use crate::database_thread::{DatabaseThread, SqliteThreadDriver};
 use crate::documentation_store::{
     DocumentationManifestRecord, DocumentationReferenceRecord, DocumentationSourceRecord,
 };
@@ -108,6 +109,7 @@ impl DatabasePool {
 pub struct WorkspaceDatabase {
     database: Db,
     pool: DatabasePool,
+    thread: Arc<DatabaseThread>,
     /// Serializes the file's writers.
     ///
     /// `SQLite` admits one writer per file. Writes queue here before taking a
@@ -138,6 +140,21 @@ impl WorkspaceDatabase {
         database_path: &Path,
         pool: DatabasePool,
     ) -> Result<Arc<Self>, LexicalIndexError> {
+        Self::open_with_owner(database_path, pool, None).await
+    }
+
+    /// Opens the workspace database while retaining its serving owner until the SQLite worker ends.
+    ///
+    /// Once the worker starts, its owner remains held after a shutdown deadline or a cancelled opening future.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same storage failures as [`Self::open`].
+    pub async fn open_with_owner(
+        database_path: &Path,
+        pool: DatabasePool,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Arc<Self>, LexicalIndexError> {
         let migration_lock = MigrationLock::acquire(database_path, pool).await?;
         let mut builder = Db::builder();
         builder
@@ -158,8 +175,23 @@ impl WorkspaceDatabase {
             .pool_wait_timeout(Some(Duration::from_millis(u64::from(
                 pool.busy_timeout_ms(),
             ))));
+        let sqlite = Arc::new(Sqlite::open(database_path));
+        let thread = DatabaseThread::spawn(
+            Arc::clone(&sqlite),
+            bound_as_usize(pool.slots()),
+            Duration::from_millis(u64::from(pool.busy_timeout_ms())),
+            owner,
+        )
+        .await
+        .map_err(|source| {
+            lexical_error_caused_by(
+                crate::lexical::LexicalIndexViolation::Storage,
+                Some(database_path),
+                source,
+            )
+        })?;
         let database = builder
-            .build(Sqlite::open(database_path))
+            .build(SqliteThreadDriver::new(sqlite, Arc::clone(&thread)))
             .await
             .map_err(|source| {
                 lexical_error_caused_by(
@@ -183,8 +215,20 @@ impl WorkspaceDatabase {
         Ok(Arc::new(Self {
             database,
             pool,
+            thread,
             writes: Mutex::new(()),
         }))
+    }
+
+    /// Stops the SQLite worker by the shared shutdown deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when the worker stops responding or panics.
+    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), LexicalIndexError> {
+        self.thread.shutdown(deadline).await.map_err(|source| {
+            lexical_error_caused_by(crate::lexical::LexicalIndexViolation::Storage, None, source)
+        })
     }
 
     /// Exclusive write access to the file: the file's write turn, and a
@@ -436,20 +480,292 @@ async fn configure_connection(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::Path;
+    use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use rift_core::ProjectPath;
+    use rift_ranking::{
+        DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
+        SearchableField,
+    };
+    use rusqlite::OptionalExtension as _;
     use toasty::stmt::{Type, Value};
     use toasty_driver_sqlite::Sqlite;
 
     use super::{DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase};
+    use crate::lexical::{LexicalIndexLimits, LexicalSearchIndex};
     use crate::log::LogRecordRow;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn pool() -> DatabasePool {
         DatabasePool::new(4, 1_000)
+    }
+
+    const CRASH_CHILD: &str = "RIFT_INDEX_SQLITE_CRASH_CHILD";
+    const CRASH_DATABASE: &str = "RIFT_INDEX_SQLITE_CRASH_DATABASE";
+    const CRASH_MARKER: &str = "RIFT_INDEX_SQLITE_CRASH_MARKER";
+
+    fn crash_document(
+        identity: &str,
+        content: &str,
+    ) -> Result<IndexDocument, Box<dyn std::error::Error>> {
+        let fields = DocumentFields::empty()
+            .with(SearchableField::Name, identity)
+            .with(SearchableField::FileContent, content);
+        Ok(IndexDocument::new(
+            DocumentIdentity::new(identity)?,
+            DocumentLocation::Project(ProjectPath::new(format!("{identity}.md"))?),
+            DocumentKind::TextFile,
+            fields.digest(),
+            fields,
+        )?)
+    }
+
+    fn crash_documents(old: bool) -> Result<Vec<IndexDocument>, Box<dyn std::error::Error>> {
+        if old {
+            Ok(vec![
+                crash_document("old-a", "previous committed text alpha")?,
+                crash_document("old-b", "previous committed text beta")?,
+            ])
+        } else {
+            Ok(vec![
+                crash_document("new-a", "uncommitted replacement text gamma")?,
+                crash_document("new-b", "uncommitted replacement text delta")?,
+            ])
+        }
+    }
+
+    struct ChildGuard(Child);
+
+    impl ChildGuard {
+        fn terminate(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            self.0.kill()?;
+            self.0.wait()
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    async fn crash_child() -> TestResult {
+        let database_path =
+            std::env::var_os(CRASH_DATABASE).ok_or("crash child has no database path")?;
+        let marker_path = std::env::var_os(CRASH_MARKER).ok_or("crash child has no marker path")?;
+        let database = WorkspaceDatabase::open(Path::new(&database_path), pool()).await?;
+        let store =
+            LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
+        let previous = crash_documents(true)?;
+        store.replace_all(&previous, "before-crash").await?;
+
+        let (started, _release) = database.thread.hold_next_commit_for_test().await?;
+        let replacement = crash_documents(false)?;
+        let _replacement_task =
+            tokio::spawn(async move { store.replace_all(&replacement, "during-crash").await });
+        tokio::time::timeout(Duration::from_secs(10), started).await??;
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker_path)?;
+        marker.write_all(b"lexical commit reached actor hold")?;
+        marker.sync_all()?;
+        std::future::pending::<TestResult>().await
+    }
+
+    fn assert_sqlite_and_fts_integrity(path: &Path) -> TestResult {
+        let connection = rusqlite::Connection::open(path)?;
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        assert_eq!(integrity, "ok", "SQLite integrity check");
+        for index in ["lexical_documents_fts", "lexical_documents_trigram"] {
+            connection.execute(
+                &format!("INSERT INTO {index}({index}, rank) VALUES('integrity-check', 1)"),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn assert_documents_equal(
+        actual: &LexicalSearchIndex,
+        expected: &[IndexDocument],
+    ) -> TestResult {
+        for document in expected {
+            assert_eq!(
+                actual.document(document.identity()).await?,
+                Some(document.clone()),
+                "reopened store must match cold store at {}",
+                document.identity().as_str()
+            );
+        }
+        Ok(())
+    }
+
+    async fn catch_up_crash_trigrams(store: &LexicalSearchIndex) -> TestResult {
+        for _ in 0..64 {
+            if store.index_trigrams().await?.pending() == 0 {
+                return Ok(());
+            }
+        }
+        Err("trigram index stayed pending past bounded batches".into())
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct LexicalSnapshot {
+        documents: Vec<Vec<rusqlite::types::Value>>,
+        terms: Vec<(String, String, i64, i64)>,
+        tree_revision: Option<String>,
+        trigram_pending: i64,
+    }
+
+    fn lexical_snapshot(path: &Path) -> Result<LexicalSnapshot, Box<dyn std::error::Error>> {
+        let connection = rusqlite::Connection::open(path)?;
+        let mut statement = connection.prepare(
+            "SELECT identity, path, kind, digest, byte_length, byte_offset, name, \
+             qualified_name, identifier_terms, signature, documentation, file_content \
+             FROM lexical_documents ORDER BY identity",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut documents = Vec::new();
+        while let Some(row) = rows.next()? {
+            documents.push(
+                (0..12)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        let terms = connection
+            .prepare(
+                "SELECT term, col, doc, cnt FROM lexical_documents_vocabulary \
+             ORDER BY term, col",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let tree_revision = connection
+            .query_row(
+                "SELECT tree_revision FROM lexical_index_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let trigram_pending =
+            connection.query_row("SELECT COUNT(*) FROM lexical_trigram_pending", [], |row| {
+                row.get(0)
+            })?;
+        Ok(LexicalSnapshot {
+            documents,
+            terms,
+            tree_revision,
+            trigram_pending,
+        })
+    }
+
+    async fn kill_child_at_lexical_commit(database_path: &Path, marker_path: &Path) -> TestResult {
+        let executable = std::env::current_exe()?;
+        let child = Command::new(executable)
+            .args([
+                "--exact",
+                "database::tests::abrupt_process_exit_before_lexical_commit_recovers_previous_publication",
+                "--nocapture",
+            ])
+            .env(CRASH_CHILD, "1")
+            .env(CRASH_DATABASE, database_path)
+            .env(CRASH_MARKER, marker_path)
+            .stdin(Stdio::null())
+            .spawn()?;
+        let mut child = ChildGuard(child);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if marker_path.exists() {
+                break;
+            }
+            if let Some(status) = child.0.try_wait()? {
+                return Err(format!("crash child exited before commit witness: {status}").into());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("crash child missed bounded commit witness deadline".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = child.terminate()?;
+        assert!(
+            !status.success(),
+            "forced child exit must not report success"
+        );
+        Ok(())
+    }
+
+    async fn assert_crash_recovery_matches_cold(database_path: &Path) -> TestResult {
+        let previous = crash_documents(true)?;
+        let reopened = WorkspaceDatabase::open(database_path, pool()).await?;
+        let recovered =
+            LexicalSearchIndex::attached(Arc::clone(&reopened), LexicalIndexLimits::default());
+        assert_eq!(
+            recovered.tree_revision().await?,
+            Some("before-crash".to_owned())
+        );
+        assert_documents_equal(&recovered, &previous).await?;
+        catch_up_crash_trigrams(&recovered).await?;
+        for replacement in crash_documents(false)? {
+            assert_eq!(recovered.document(replacement.identity()).await?, None);
+        }
+
+        let cold_directory = tempfile::tempdir()?;
+        let cold_path = cold_directory.path().join("db");
+        let cold_database = WorkspaceDatabase::open(&cold_path, pool()).await?;
+        let cold =
+            LexicalSearchIndex::attached(Arc::clone(&cold_database), LexicalIndexLimits::default());
+        cold.replace_all(&previous, "before-crash").await?;
+        catch_up_crash_trigrams(&cold).await?;
+        assert_documents_equal(&cold, &previous).await?;
+
+        let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        reopened.shutdown(shutdown_deadline).await?;
+        cold_database.shutdown(shutdown_deadline).await?;
+        drop(recovered);
+        drop(cold);
+        drop(reopened);
+        drop(cold_database);
+
+        let recovered_snapshot = lexical_snapshot(database_path)?;
+        let cold_snapshot = lexical_snapshot(&cold_path)?;
+        assert_eq!(recovered_snapshot.trigram_pending, 0);
+        assert_eq!(cold_snapshot.trigram_pending, 0);
+        assert_eq!(recovered_snapshot, cold_snapshot);
+        assert_sqlite_and_fts_integrity(database_path)?;
+        assert_sqlite_and_fts_integrity(&cold_path)?;
+        Ok(())
+    }
+
+    /// Kills child process after lexical replacement reaches actor commit, before SQLite
+    /// receives commit. Reopen must expose previous publication, matching cold write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abrupt_process_exit_before_lexical_commit_recovers_previous_publication() -> TestResult
+    {
+        if std::env::var_os(CRASH_CHILD).is_some() {
+            return crash_child().await;
+        }
+
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("db");
+        let marker_path = directory.path().join("commit-reached");
+        kill_child_at_lexical_commit(&database_path, &marker_path).await?;
+        assert_crash_recovery_matches_cold(&database_path).await
     }
 
     /// The busy-wait budget of the one-slot pool a held-slot case reads from: the least
@@ -544,23 +860,23 @@ mod tests {
     /// write lock on the file, the state the process is in while its WAL switch rewrites
     /// the header. A second open whose own WAL switch met that write lock is refused
     /// `database is locked` at once, because `SQLite` calls no busy handler for the
-    /// upgrade the switch makes. The runtime's clock is paused, so the sleep below returns
-    /// only once the contender is parked.
-    #[tokio::test(start_paused = true)]
+    /// upgrade the switch makes. Poll the open once before waiting half a migration-lock
+    /// interval, so the first attempt reaches the held lock before the test releases it.
+    #[tokio::test]
     async fn a_first_open_waits_while_another_process_prepares_the_file() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
         let preparing = MigrationLock::acquire(&path, pool()).await?;
         let (writer, mut writing) = hold_write_lock(&path).await?;
-        let contender_path = path.clone();
-        let contender =
-            tokio::spawn(async move { WorkspaceDatabase::open(&contender_path, pool()).await });
-
-        tokio::time::sleep(MIGRATION_LOCK_POLL / 2).await;
-        assert!(
-            !contender.is_finished(),
-            "the second open must wait while another process prepares the file"
-        );
+        let contender = WorkspaceDatabase::open(&path, pool());
+        tokio::pin!(contender);
+        tokio::select! {
+            biased;
+            result = &mut contender => panic!(
+                "the second open completed while another process prepares the file: {result:?}"
+            ),
+            () = tokio::time::sleep(MIGRATION_LOCK_POLL / 2) => {}
+        }
         toasty::sql::statement("ROLLBACK")
             .exec(&mut writing)
             .await?;
@@ -568,7 +884,7 @@ mod tests {
         drop(writer);
         drop(preparing);
 
-        let database = contender.await??;
+        let database = contender.await?;
         let mut connection = database.connection().await?;
         let tables = toasty::sql::query(
             "SELECT COUNT(*) FROM sqlite_master \
@@ -715,6 +1031,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_write_transaction_rolls_back_before_connection_reuse() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let mut writing = database.writing().await?;
+        let transaction = writing.transaction().await?;
+        drop(transaction);
+
+        let transaction =
+            tokio::time::timeout(Duration::from_secs(1), writing.transaction()).await??;
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_lock_wait_does_not_block_async_runtime() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let database = WorkspaceDatabase::open(&path, pool()).await?;
+        let mut writing = database.writing().await?;
+
+        let lock_path = path.clone();
+        let (locked, is_locked) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(0);
+        let blocker = std::thread::spawn(move || -> Result<(), String> {
+            let connection =
+                rusqlite::Connection::open(lock_path).map_err(|error| error.to_string())?;
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|error| error.to_string())?;
+            locked.send(()).map_err(|error| error.to_string())?;
+            released.recv().map_err(|error| error.to_string())?;
+            connection
+                .execute_batch("ROLLBACK")
+                .map_err(|error| error.to_string())
+        });
+        is_locked.recv_timeout(Duration::from_secs(1))?;
+
+        let mut begin = Box::pin(writing.transaction());
+        let (async_done, async_completed) = tokio::sync::oneshot::channel();
+        let async_work = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            async_done
+                .send(())
+                .expect("async witness must still be listening");
+        });
+        tokio::select! {
+            biased;
+            result = &mut begin => match result {
+                Ok(transaction) => {
+                    drop(transaction);
+                    panic!("SQLite begin succeeded while external lock remained held");
+                }
+                Err(error) => panic!("SQLite begin failed before external lock release: {error}"),
+            },
+            () = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        tokio::time::timeout(Duration::from_millis(100), async_completed).await??;
+        async_work.await?;
+
+        release.send(()).map_err(|error| error.to_string())?;
+        blocker
+            .join()
+            .map_err(|_| "SQLite lock holder panicked")??;
+        let transaction = tokio::time::timeout(Duration::from_secs(2), &mut begin).await??;
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn every_checkout_maps_the_pool_memory_map_size() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
@@ -749,7 +1134,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn write_checkouts_wait_for_the_process_write_turn() -> TestResult {
         let directory = tempfile::tempdir()?;
         let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;

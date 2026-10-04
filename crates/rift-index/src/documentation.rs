@@ -232,7 +232,7 @@ fn append_regular_input<'source>(
         DocumentationSourceFormat::Markdown | DocumentationSourceFormat::Mdx
     ) && let Some(indexed) = indexed
     {
-        match input.with_syntax(indexed.syntax()) {
+        match input.with_indexed_syntax(indexed.path(), indexed.syntax_facts()) {
             Ok(validated) => input = validated,
             Err(error) => {
                 collected.omissions.push((identity, warning_kind(&error)));
@@ -341,7 +341,7 @@ fn append_attached_inputs<'source>(
         let chunks = regular_chunks(path, text, chunk_bytes_max);
         let input = DocumentationInput::new(source, text)
             .and_then(|input| input.with_chunks(chunks))
-            .and_then(|input| input.with_syntax(file.syntax()));
+            .and_then(|input| input.with_indexed_syntax(file.path(), file.syntax_facts()));
         match input {
             Ok(input) => {
                 *input_bytes = (*input_bytes).saturating_add(source_bytes);

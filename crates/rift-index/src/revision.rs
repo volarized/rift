@@ -232,6 +232,8 @@ impl WorkspaceIndex {
             limits,
             language,
             text_inclusion.clone(),
+            super::WorkspaceContentCache::default(),
+            None,
         )
     }
 }
@@ -385,7 +387,11 @@ mod tests {
         assert_eq!(paths, ["src/lib.rs"], "prose files stay outside the index");
         let path = ProjectPath::new("src/lib.rs").expect("path");
         assert!(
-            !index.nodes(&path, 4).expect("indexed path").is_empty(),
+            !index
+                .nodes(&path, 4)
+                .expect("node parse")
+                .expect("indexed path")
+                .is_empty(),
             "syntax nodes parse from committed bytes"
         );
         let lines = index.source_matches("committed", 5).expect("lexical read");

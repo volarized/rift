@@ -4,6 +4,8 @@
 //! while a request selecting it says so.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
 
 use std::error::Error;
 use std::fs;
@@ -12,9 +14,9 @@ use std::path::Path;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
+use workspace_client::{await_workspace_ready, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -28,20 +30,9 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
             .expect("server must initialize");
         service.waiting().await.expect("server must stop cleanly");
     });
-    Ok(().serve(client_transport).await?)
-}
-
-async fn search(client: &RunningService<RoleClient, ()>, arguments: Value) -> TestResult<Value> {
-    let arguments = arguments
-        .as_object()
-        .cloned()
-        .ok_or("search arguments are an object")?;
-    let result = client
-        .call_tool(CallToolRequestParams::new("search").with_arguments(arguments))
-        .await?;
-    result
-        .structured_content
-        .ok_or_else(|| "search must return structured content".into())
+    let client = ().serve(client_transport).await?;
+    await_workspace_ready(&client).await?;
+    Ok(client)
 }
 
 /// Each hit's declared name, or its path for a file hit, in answer order.
@@ -84,7 +75,8 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
     let directory = workspace()?;
     let client = client_for(directory.path()).await?;
 
-    let symbols = search(&client, json!({ "query": "quokka", "target": "symbol" })).await?;
+    let symbol_arguments = json!({ "query": "quokka", "target": "symbol" });
+    let symbols = search_after_population(&client, &symbol_arguments).await?;
     assert_eq!(named(&symbols), ["alpha"], "{symbols:#}");
     assert_eq!(
         symbols["results"][0]["matched_by"],
@@ -92,18 +84,16 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
         "a declaration its body placed answers through its content: {symbols:#}"
     );
 
-    let files = search(&client, json!({ "query": "quokka", "target": "file" })).await?;
+    let file_arguments = json!({ "query": "quokka", "target": "file" });
+    let files = search_after_population(&client, &file_arguments).await?;
     assert_eq!(
         named(&files),
         ["src/lib.rs"],
         "no lockfile answers: {files:#}"
     );
 
-    let selected = search(
-        &client,
-        json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } }),
-    )
-    .await?;
+    let selected_arguments = json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } });
+    let selected = search_after_population(&client, &selected_arguments).await?;
     assert!(named(&selected).is_empty(), "{selected:#}");
     let warning = selected["warnings"]
         .as_array()

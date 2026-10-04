@@ -22,10 +22,10 @@ mod workspace_client;
 use std::fs;
 
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, READ_RESULTS_MAX_DEFAULT};
-use rift_index::WorkspaceIndexLimits;
-use rift_mcp::RiftMcp;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, served_root, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, served_root, served_root_unsettled, served_workspace, tool_request,
+};
 
 /// Polls of one served answer a test waits on before it gives up: two seconds, at
 /// [`ANSWER_POLL`] each.
@@ -317,16 +317,38 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
     configuration.push_str(WORKSPACE_SIZE_CONFIGURATION);
     fs::write(directory.path().join("rift.toml"), configuration)?;
 
-    let refusal = match RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await {
-        Ok(_server) => {
-            return Err("a workspace past workspace_size must refuse to build".into());
+    let (client, server_task) = served_root_unsettled(directory.path()).await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let params = tool_request("get_symbol", &json!({"name": "beacon"}));
+    let refusal = loop {
+        let result = tokio::time::timeout_at(deadline, client.call_tool(params.clone())).await?;
+        match result {
+            Err(rmcp::ServiceError::McpError(error))
+                if error.message.contains("source.workspace_size") =>
+            {
+                break error;
+            }
+            Err(rmcp::ServiceError::McpError(error))
+                if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
         }
-        Err(error) => error.to_string(),
+        tokio::time::sleep(ANSWER_POLL).await;
     };
-    assert!(
-        refusal.contains("source.workspace_size") && refusal.contains("maximum 16777216"),
-        "the refusal must name the key and its maximum: {refusal}"
+    let refusal_text = format!(
+        "{} {}",
+        refusal.message,
+        refusal.data.unwrap_or(Value::Null)
     );
+    assert!(
+        refusal_text.contains("source.workspace_size") && refusal_text.contains("maximum 16777216"),
+        "the read refusal must name the key and its maximum: {refusal_text}"
+    );
+    client.cancel().await?;
+    server_task.await?;
     Ok(())
 }
 

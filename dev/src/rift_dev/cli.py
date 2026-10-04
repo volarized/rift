@@ -6,6 +6,8 @@ import asyncio
 import dataclasses
 import json
 import sys
+import traceback
+from builtins import BaseExceptionGroup
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -39,6 +41,7 @@ ArchiveArgument = Annotated[
 ]
 PathOption = Annotated[Path | None, typer.Option()]
 StringOption = Annotated[str | None, typer.Option()]
+FAILURE_GROUP_DEPTH_MAX = 32
 
 
 @app.command()
@@ -245,3 +248,15 @@ def main() -> None:
     except CommandFailed as failure:
         print(f"error: {failure}", file=sys.stderr)
         raise SystemExit(failure.status) from None
+    except Exception as failure:  # noqa: BLE001 - CLI reports failures without stack frames.
+        print(f"error: {failure_message(failure)}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def failure_message(failure: BaseException) -> str:
+    """Show the primary test failure; reports retain complete groups and stack frames."""
+    for _ in range(FAILURE_GROUP_DEPTH_MAX):
+        if not isinstance(failure, BaseExceptionGroup):
+            break
+        failure = failure.exceptions[0]
+    return "".join(traceback.format_exception_only(failure)).rstrip()

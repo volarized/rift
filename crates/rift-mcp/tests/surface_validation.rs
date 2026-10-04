@@ -8,9 +8,7 @@ mod fake_engine;
 )]
 mod global_api;
 mod hermetic_search;
-// This binary serves its own fixture; the scripted engines reach their workspaces
-// through `workspace_client`, whose relative-root helpers no suite here calls.
-#[cfg(unix)]
+// This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
 
@@ -731,6 +729,7 @@ async fn served_fixture() -> TestResult<(
         service.waiting().await.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
+    workspace_client::await_workspace_ready(&client).await?;
     Ok((
         Fixture {
             _workspace: directory,
@@ -958,6 +957,8 @@ async fn call_tool_retrying_acceptance(
 #[tokio::test]
 async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
     let (_fixture, client, server_task) = served_fixture().await?;
+    // Map readiness covers local file preparation; wait for lexical population before the corpus.
+    workspace_client::search_after_population(&client, &json!({ "query": "beacon" })).await?;
     let tools = client.list_all_tools().await?;
 
     let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();

@@ -2,7 +2,7 @@
 
 [![Rift - agentic development toolkit for codebases](docs/public/og.png)](https://volar.sh/rift/)
 
-Rift is an agentic development toolkit for reading and discovering codebases.
+Rift is an agentic development toolkit for reading, discovering, and editing codebases.
 
 📖 [Read the documentation](https://volar.sh/rift/docs/)
 

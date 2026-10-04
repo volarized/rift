@@ -38,7 +38,8 @@ pub use input::{
 #[cfg(feature = "collector")]
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
-    ManifestError, analyzer_manifest_path, analyzer_revision, render_analyzer_manifest,
+    ManifestError, analyzer_digest, analyzer_manifest_path, analyzer_revision,
+    render_analyzer_manifest,
 };
 #[cfg(feature = "collector")]
 pub use selection::{

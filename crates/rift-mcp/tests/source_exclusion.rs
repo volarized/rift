@@ -8,6 +8,8 @@
 //! the key lands, and `exclude` still decides over it.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
 
 use std::error::Error;
 use std::fs;
@@ -19,6 +21,7 @@ use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
+use workspace_client::{await_workspace_ready, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -32,7 +35,9 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
             .expect("server must initialize");
         service.waiting().await.expect("server must stop cleanly");
     });
-    Ok(().serve(client_transport).await?)
+    let client = ().serve(client_transport).await?;
+    await_workspace_ready(&client).await?;
+    Ok(client)
 }
 
 fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
@@ -90,12 +95,8 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
         "the symbol must be indexed before exclusion: {symbol:#}"
     );
 
-    let prose = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let prose_arguments = json!({ "query": "wandering falcon migrations" });
+    let prose = search_after_population(&client, &prose_arguments).await?;
     assert!(
         prose["results"].as_array().is_some_and(|results| results
             .iter()
@@ -124,12 +125,7 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
         "an excluded symbol must leave get_symbol on the next request: {symbol_after:#}"
     );
 
-    let prose_after = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let prose_after = search_after_population(&client, &prose_arguments).await?;
     assert!(
         prose_after["results"].as_array().is_some_and(Vec::is_empty),
         "an excluded text file must leave the lexical store on the next request: \
@@ -217,12 +213,8 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
     )?;
     let client = client_for(directory.path()).await?;
 
-    let hidden = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let search_arguments = json!({ "query": "wandering falcon migrations" });
+    let hidden = search_after_population(&client, &search_arguments).await?;
     assert!(
         hidden["results"].as_array().is_some_and(|results| !results
             .iter()
@@ -237,12 +229,7 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
     );
     fs::write(directory.path().join("rift.toml"), forcing_configuration)?;
 
-    let reached = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let reached = search_after_population(&client, &search_arguments).await?;
     assert!(
         reached["results"].as_array().is_some_and(|results| results
             .iter()

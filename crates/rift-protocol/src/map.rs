@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::dependencies::PackageContextEntry;
-use crate::read::{Digest, ExactKind, Language, Pagination, ProjectPath, SymbolId};
+use crate::read::{Digest, ExactKind, Language, Pagination, ProjectPath, ReadWarning, SymbolId};
 use crate::schema;
 
 /// Directory depth a [`MapModule`] tree carries, at most. A directory deeper than this folds
@@ -72,6 +72,9 @@ pub struct WorkspaceMap {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 1_000))]
     pub packages: Vec<PackageContextEntry>,
+    /// Conditions that qualify this map. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReadWarning>,
     /// Always the whole map on one page.
     pub pagination: Pagination,
 }
@@ -191,11 +194,18 @@ mod tests {
                 requirement: None,
                 availability: PackageAvailability::Canonical,
             }],
+            warnings: Vec::new(),
             pagination: Pagination {
                 page_index: 0,
                 total_pages: 1,
             },
         }
+    }
+
+    #[test]
+    fn warnings_are_omitted_when_empty() {
+        let value = serde_json::to_value(map()).expect("map serializes");
+        assert!(value.get("warnings").is_none());
     }
 
     #[test]

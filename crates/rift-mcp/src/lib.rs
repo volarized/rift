@@ -9,6 +9,8 @@ mod identity;
 pub mod logs;
 mod parameters;
 mod proxy;
+pub mod repository;
+mod repository_http;
 mod resource;
 pub mod schema;
 mod server;
@@ -20,11 +22,12 @@ mod validation;
 
 pub use election::{
     ElectedServer, ElectionError, ElectionFault, ElectionGuard, ServerPresence, StaleReason, claim,
-    document_path, probe, read_serving, serve_elected, serve_elected_with_storage,
+    document_path, probe, probe_state_directory, read_serving, serve_elected,
+    serve_elected_with_storage, serve_repository_elected,
 };
 pub use http::{
-    HttpServeError, HttpServeFault, HttpServer, STOP_REQUEST_TIMEOUT, StopRequestFailure,
-    TokenCheck, request_stop, serve_http,
+    DeferredDatabaseShutdown, HttpServeError, HttpServeFault, HttpServer, STOP_REQUEST_TIMEOUT,
+    StopRequestFailure, TokenCheck, request_stop, serve_http,
 };
 pub use identity::{BuildCheckout, product_identity_of};
 pub use logs::{

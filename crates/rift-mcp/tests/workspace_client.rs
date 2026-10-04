@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use serde_json::{Value, json};
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -139,6 +139,18 @@ pub(crate) async fn served_root(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
+    let (client, server_task) = served_root_unsettled(root).await?;
+    await_workspace_ready(&client).await?;
+    Ok((client, server_task))
+}
+
+/// Serves `root` without waiting for initial file preparation.
+pub(crate) async fn served_root_unsettled(
+    root: &Path,
+) -> TestResult<(
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -150,6 +162,85 @@ pub(crate) async fn served_root(
     });
     let client = ().serve(client_transport).await?;
     Ok((client, server_task))
+}
+
+/// Reads map through MCP until local file preparation has completed.
+pub(crate) async fn await_workspace_ready(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult<Value> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let answer = tokio::time::timeout_at(
+            deadline,
+            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
+        )
+        .await??;
+        let ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .ok_or("map read answers with one content")?
+        else {
+            return Err("map read answers with text".into());
+        };
+        let body: Value = serde_json::from_str(text)?;
+        let preparing = body["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| warning["code"] == "local_index_preparing");
+        if !preparing {
+            return Ok(body);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("workspace map remained in preparation: {body}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Calls `search` until the lexical population pass has landed.
+///
+/// Workspace map readiness covers local file preparation. The lexical lane commits its
+/// initial write behind that publication, so a search can still return identifier matches
+/// with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
+///
+/// # Errors
+///
+/// Returns an error containing the last answer after 60 polling delays and up to 60
+/// follow-up requests if the store does not rank the answer. The 50 ms delays total at
+/// most three seconds; request time is additional. Each request allows up to eight
+/// attempts for acceptance refusals and has no elapsed-time deadline.
+pub(crate) async fn search_after_population(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: &Value,
+) -> TestResult<Value> {
+    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
+    const SEARCH_TIER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let query = arguments["query"].as_str().unwrap_or("<missing query>");
+    let mut answer = call_retrying_acceptance(client, tool_request("search", arguments)).await?;
+    for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+        let population_pending =
+            answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    matches!(
+                        warning["code"].as_str(),
+                        Some("lexical_ranking_unavailable" | "stale_index")
+                    )
+                });
+        if !population_pending {
+            return Ok(answer);
+        }
+        tokio::time::sleep(SEARCH_TIER_POLL).await;
+        answer = call_retrying_acceptance(client, tool_request("search", arguments)).await?;
+    }
+    Err(format!(
+        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+    )
+    .into())
 }
 
 /// The path from the process working directory to `target`, as one `..`

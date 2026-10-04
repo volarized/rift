@@ -15,6 +15,7 @@ use rift_index::{DatabasePool, LogStore, WorkspaceDatabase};
 pub struct WorkspaceStorage {
     database: Option<Arc<WorkspaceDatabase>>,
     logs: Option<Arc<LogStore>>,
+    election: Option<Arc<crate::ElectionGuard>>,
 }
 
 impl WorkspaceStorage {
@@ -28,11 +29,51 @@ impl WorkspaceStorage {
     /// Cancellation may leave the state directory or database file created. A later open
     /// retries the idempotent schema migrations and never removes the existing file.
     pub async fn open(root: &Path) -> Self {
-        let database = open_workspace_database(root).await;
+        Self::open_with_owner(root, None).await
+    }
+
+    /// Opens storage only while this process holds the workspace election.
+    ///
+    /// The SQLite worker keeps the guard until it exits, including after cancellation
+    /// or a shutdown timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an election storage failure when `guard` belongs to another workspace
+    /// or its state directory cannot be read. Neither failure opens the database.
+    pub async fn open_elected(
+        root: &Path,
+        guard: Arc<crate::ElectionGuard>,
+    ) -> Result<Self, crate::ElectionError> {
+        guard.validate_workspace(root)?;
+        Ok(Self::open_with_owner(root, Some(guard)).await)
+    }
+
+    /// Opens workspace storage with an owner held by its SQLite worker until it ends.
+    pub(crate) async fn open_with_owner(
+        root: &Path,
+        election: Option<Arc<crate::ElectionGuard>>,
+    ) -> Self {
+        let owner = election.as_ref().map(|guard| {
+            let owner: Arc<dyn Send + Sync> = Arc::<crate::ElectionGuard>::clone(guard);
+            owner
+        });
+        let database = open_workspace_database(root, owner).await;
         let logs = database
             .as_ref()
             .map(|database| Arc::new(LogStore::attached(Arc::clone(database))));
-        Self { database, logs }
+        Self {
+            database,
+            logs,
+            election,
+        }
+    }
+
+    /// Whether storage opened under this held election.
+    pub(crate) fn holds_election(&self, guard: &Arc<crate::ElectionGuard>) -> bool {
+        self.election
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, guard))
     }
 
     /// The workspace database, when it opened.
@@ -58,7 +99,10 @@ fn configured_pool(root: &Path) -> DatabasePool {
 }
 
 /// Opens the file without replacing a failed database.
-async fn open_workspace_database(root: &Path) -> Option<Arc<WorkspaceDatabase>> {
+async fn open_workspace_database(
+    root: &Path,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Option<Arc<WorkspaceDatabase>> {
     let state_directory = root.join(RIFT_STATE_DIRECTORY);
     match tokio::fs::create_dir(&state_directory).await {
         Ok(()) => {}
@@ -76,7 +120,7 @@ async fn open_workspace_database(root: &Path) -> Option<Arc<WorkspaceDatabase>> 
         }
     }
     let database_path = state_directory.join(WORKSPACE_DATABASE_FILE_NAME);
-    match WorkspaceDatabase::open(&database_path, configured_pool(root)).await {
+    match WorkspaceDatabase::open_with_owner(&database_path, configured_pool(root), owner).await {
         Ok(database) => Some(database),
         Err(error) => {
             let causes = rift_core::causes(&error).join(": ");
@@ -128,6 +172,25 @@ mod tests {
             database_path.is_dir(),
             "the failed path must not be deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn elected_storage_refuses_another_workspaces_guard_before_opening() {
+        let held = tempfile::tempdir().expect("held workspace");
+        let requested = tempfile::tempdir().expect("requested workspace");
+        let guard = Arc::new(crate::claim(held.path()).expect("held election"));
+        let _requested_guard = crate::claim(requested.path()).expect("requested election");
+        let error = WorkspaceStorage::open_elected(requested.path(), guard)
+            .await
+            .expect_err("a mismatched guard cannot open the database");
+        assert!(matches!(
+            error.fault(),
+            crate::ElectionFault::Storage {
+                operation: "validate workspace election",
+                ..
+            }
+        ));
+        assert!(!requested.path().join(".rift/db").exists());
     }
 
     #[test]

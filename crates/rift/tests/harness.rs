@@ -15,9 +15,10 @@ use std::fs;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ServiceExt as _, transport::child_process::TokioChildProcessBuilder};
@@ -303,7 +304,8 @@ const RELAYED_STDERR_BYTES_MAX: usize = 1 << 20;
 /// run. The relay writes each read as it lands, through `std::io::stderr`,
 /// which no test harness capture intercepts.
 pub(crate) struct RelayedStderr {
-    relay: std::thread::JoinHandle<String>,
+    bytes: Arc<Mutex<Vec<u8>>>,
+    relay: std::thread::JoinHandle<()>,
 }
 
 impl RelayedStderr {
@@ -314,9 +316,21 @@ impl RelayedStderr {
     /// joins every blocking thread, so a read parked there would hold the
     /// test's end until the stream closed.
     fn spawn(stream: impl Read + Send + 'static) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bytes);
         Self {
-            relay: std::thread::spawn(move || relay_until_closed(stream)),
+            bytes,
+            relay: std::thread::spawn(move || relay_until_closed(stream, &captured)),
         }
+    }
+
+    /// Standard error retained so far, before the child closes its stream.
+    pub(crate) fn snapshot(&self) -> String {
+        let retained = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&retained).into_owned()
     }
 
     /// The relayed text, once every holder of the stream's write end has
@@ -325,28 +339,37 @@ impl RelayedStderr {
     /// On Windows a detached server the child started inherits that end,
     /// so the text arrives only when the server leaves too.
     pub(crate) async fn text(self) -> TestResult<String> {
-        let relay = self.relay;
+        let Self { bytes, relay } = self;
         tokio::task::spawn_blocking(move || relay.join())
             .await?
-            .map_err(|_panic| "the stderr relay panicked".into())
+            .map_err(|_panic| "the stderr relay panicked")?;
+        let retained = bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(String::from_utf8_lossy(&retained).into_owned())
     }
 }
 
 /// Copies `stream` onto this process's stderr until end-of-file, keeping
 /// what it copied, both bounded by [`RELAYED_STDERR_BYTES_MAX`].
-fn relay_until_closed(mut stream: impl Read) -> String {
-    let mut kept = Vec::new();
+fn relay_until_closed(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
     let mut buffer = [0_u8; rift_core::STREAM_READ_BYTES];
     loop {
         let read_bytes = match stream.read(&mut buffer) {
             Ok(0) | Err(_) => break,
             Ok(read_bytes) => read_bytes,
         };
-        let relayed = &buffer[..read_bytes.min(RELAYED_STDERR_BYTES_MAX - kept.len())];
+        let relayed = {
+            let mut retained = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let room = RELAYED_STDERR_BYTES_MAX.saturating_sub(retained.len());
+            let relayed = &buffer[..read_bytes.min(room)];
+            retained.extend_from_slice(relayed);
+            relayed
+        };
         let _ = std::io::stderr().write_all(relayed);
-        kept.extend_from_slice(relayed);
     }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 pub(crate) fn arguments(
@@ -371,6 +394,40 @@ pub(crate) async fn proxied_call(
     call_arguments: &serde_json::Value,
 ) -> TestResult<serde_json::Value> {
     proxied_call_within(client, name, call_arguments, PROXIED_CALL_MAX).await
+}
+
+/// Reads map until workspace file preparation finishes, within fixture bound.
+pub(crate) async fn await_workspace_ready(
+    client: &RunningService<RoleClient, ()>,
+) -> TestResult<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = tokio::time::timeout_at(
+            deadline,
+            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
+        )
+        .await??;
+        let ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .ok_or("map read answers with one content")?
+        else {
+            return Err("map read answers with text".into());
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        let preparing = body["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| warning["code"] == "local_index_preparing");
+        if !preparing {
+            return Ok(body);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("workspace map remained in preparation: {body}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// One proxied live-engine call under [`PROXIED_ENGINE_CALL_MAX`].

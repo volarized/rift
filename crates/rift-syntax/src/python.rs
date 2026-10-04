@@ -505,7 +505,7 @@ mod tests {
         let document = analyze(text);
         let function = symbol(&document, "serve");
         assert_eq!(
-            function.documentation,
+            function.documentation.as_ref(),
             [Documentation {
                 format: DocumentationFormat::Plain,
                 text: "Answers one request.".to_owned(),
@@ -527,7 +527,7 @@ mod tests {
             "def serve():\n",
         ] {
             let document = analyze(text);
-            assert_eq!(symbol(&document, "serve").documentation, []);
+            assert!(symbol(&document, "serve").documentation.is_empty());
             assert_eq!(symbol(&document, "serve").documentation_ranges, []);
         }
     }

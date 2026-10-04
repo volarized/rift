@@ -1531,6 +1531,173 @@ fn recorded(
     Ok((ProjectPath::new(path)?, FileDigest::of(bytes)))
 }
 
+/// Mixed declarations and file chunks carrying every stored field across an insert batch.
+fn batch_documents(count: usize) -> Result<Vec<IndexDocument>, Box<dyn std::error::Error>> {
+    (0..count)
+        .map(|number| {
+            let identity = format!("batch/{number}");
+            if number % 2 == 0 {
+                let byte_offset = u64::try_from(number)? * 32;
+                text_chunk(&identity, "docs/batch.md", &format!("batchmarker {number}"))
+                    .map(|document| document.at_byte_offset(byte_offset))
+            } else {
+                document(
+                    &identity,
+                    "src/batch.rs",
+                    DocumentKind::Symbol,
+                    DocumentFields::empty()
+                        .with(SearchableField::Name, "batchmarker")
+                        .with(
+                            SearchableField::QualifiedName,
+                            format!("batchmarker{number}"),
+                        )
+                        .with(SearchableField::IdentifierTerms, "batchmarker")
+                        .with(
+                            SearchableField::Signature,
+                            format!("fn batchmarker{number}()"),
+                        )
+                        .with(
+                            SearchableField::Documentation,
+                            format!("batchmarker {number}"),
+                        ),
+                )
+            }
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_typed_insert_batches_preserve_documents_and_both_indexes() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    for count in [64, 65] {
+        let documents = batch_documents(count)?;
+        index.replace_all(&documents, "revision-one").await?;
+        for document in &documents {
+            assert_eq!(
+                index.document(document.identity()).await?,
+                Some(document.clone()),
+                "every typed field and chunk offset survives the batch"
+            );
+        }
+        assert_eq!(
+            search_matches(&index, "revision-one", "batchmarker", 100)
+                .await?
+                .len(),
+            count,
+            "the word index holds every batch row"
+        );
+        assert_index_matches_rows(&index, &path).await?;
+    }
+    let removal = LexicalChange::new(
+        vec![
+            ProjectPath::new("docs/batch.md")?,
+            ProjectPath::new("src/batch.rs")?,
+        ],
+        Vec::new(),
+    );
+    index
+        .apply(&removal, &LexicalStamp::published("revision-two", ""))
+        .await?;
+    assert!(
+        search_matches(&index, "revision-two", "batchmarker", 100)
+            .await?
+            .is_empty(),
+        "deleting both paths removes every batch row"
+    );
+    assert_index_matches_rows(&index, &path).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_later_typed_insert_batch_failure_rolls_back_the_whole_change() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let prior = text_document("docs/batch.md", "priorcontent")?;
+    let kept = text_document("docs/kept.md", "keptcontent")?;
+    let prior_files = vec![
+        recorded("docs/batch.md", b"priorcontent")?,
+        recorded("docs/kept.md", b"keptcontent")?,
+    ];
+    let baseline = LexicalChange::new(
+        prior_files.iter().map(|(path, _)| path.clone()).collect(),
+        vec![prior.clone(), kept.clone()],
+    )
+    .with_recorded(prior_files.clone());
+    index
+        .apply(
+            &baseline,
+            &LexicalStamp::published("revision-one", "derivation"),
+        )
+        .await?;
+    assert_index_matches_rows(&index, &path).await?;
+    let probe = open_concurrent_probe(&path).await?;
+    let mut connection = probe.connection().await?;
+    toasty::sql::statement(
+        "CREATE TRIGGER refuse_later_batch AFTER INSERT ON lexical_documents \
+         WHEN NEW.identity = 'batch/64' \
+         BEGIN SELECT RAISE(ABORT, 'later insert batch refused'); END",
+    )
+    .exec(&mut connection)
+    .await?;
+    drop(connection);
+
+    let changed_files = vec![
+        recorded("docs/batch.md", b"changedcontent")?,
+        recorded("src/batch.rs", b"changedsource")?,
+    ];
+    let replacement = LexicalChange::new(
+        changed_files.iter().map(|(path, _)| path.clone()).collect(),
+        batch_documents(65)?,
+    )
+    .with_recorded(changed_files);
+    let error = index
+        .apply(
+            &replacement,
+            &LexicalStamp::published("revision-two", "derivation"),
+        )
+        .await
+        .expect_err("the second insert batch must reach the refusing trigger");
+    assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string().contains("later insert batch refused")),
+        "the failure must identify the second batch's trigger: {error:?}"
+    );
+    assert_eq!(
+        index.tree_revision().await?,
+        Some("revision-one".to_owned())
+    );
+    assert_eq!(
+        index.recorded_files("derivation").await?,
+        Some(WorkspaceDigests::new(prior_files)),
+        "the failed change keeps the previous recorded digests"
+    );
+    for document in [&prior, &kept] {
+        assert_eq!(
+            index.document(document.identity()).await?,
+            Some(document.clone())
+        );
+    }
+    assert_eq!(index.document(&identity("batch/0")?).await?, None);
+    assert!(
+        search_matches(&index, "revision-one", "batchmarker", 100)
+            .await?
+            .is_empty(),
+        "the failed change contributes no word-index rows"
+    );
+    assert_index_matches_rows(&index, &path).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lexical_search_index_recorded_files_answer_what_one_derivation_recorded() -> TestResult
 {

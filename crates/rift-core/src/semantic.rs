@@ -1,6 +1,7 @@
 //! Provider Contributions and normalized symbol records.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub use rift_protocol::read::{
     Documentation, DocumentationFormat, ExactKind, ExtensionKey, ExtensionValue, Extensions,
@@ -247,8 +248,8 @@ pub struct PortableSymbolFacts {
     modifiers: Vec<String>,
     visibility: Option<String>,
     types: Vec<TypeBinding>,
-    signatures: Vec<Signature>,
-    documentation: Vec<Documentation>,
+    signatures: Arc<[Signature]>,
+    documentation: Arc<[Documentation]>,
     document_local: bool,
 }
 
@@ -271,8 +272,8 @@ impl PortableSymbolFacts {
             modifiers: Vec::new(),
             visibility: None,
             types: Vec::new(),
-            signatures: Vec::new(),
-            documentation: Vec::new(),
+            signatures: Arc::from([]),
+            documentation: Arc::from([]),
             document_local: false,
         }
     }
@@ -308,6 +309,13 @@ impl PortableSymbolFacts {
     /// Sets callable signatures.
     #[must_use]
     pub fn signatures(mut self, signatures: Vec<Signature>) -> Self {
+        self.signatures = Arc::from(signatures);
+        self
+    }
+
+    /// Sets shared callable signatures.
+    #[must_use]
+    pub fn with_shared_signatures(mut self, signatures: Arc<[Signature]>) -> Self {
         self.signatures = signatures;
         self
     }
@@ -322,6 +330,13 @@ impl PortableSymbolFacts {
     /// Sets documentation blocks.
     #[must_use]
     pub fn documentation(mut self, documentation: Vec<Documentation>) -> Self {
+        self.documentation = Arc::from(documentation);
+        self
+    }
+
+    /// Sets shared documentation blocks.
+    #[must_use]
+    pub fn with_shared_documentation(mut self, documentation: Arc<[Documentation]>) -> Self {
         self.documentation = documentation;
         self
     }

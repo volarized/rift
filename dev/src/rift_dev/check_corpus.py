@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import traceback
@@ -44,6 +45,7 @@ from rift_dev.corpus_assertions import (
     warnings,
 )
 from rift_dev.corpus_cache import Pin, git
+from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.rift_test_client import (
     Client,
     Json,
@@ -145,7 +147,6 @@ class Corpus:
             "elapsed_seconds": time.monotonic() - self.started,
         }
         self.actions.append(entry)
-        print(json.dumps(entry), flush=True)
 
     def server(self, root: Path | None = None) -> Server:
         self.sequence += 1
@@ -154,6 +155,7 @@ class Corpus:
             root or self.root,
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
+            output=sys.stderr.buffer,
             env={
                 "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info",
                 "NO_COLOR": "1",
@@ -241,7 +243,8 @@ class Corpus:
     async def baseline(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                answer = await client.call(
+                answer = await settled_local(
+                    client,
                     "search",
                     {
                         "query": "test",
@@ -633,6 +636,9 @@ class Corpus:
         """Run sustained reads and edits in their own required bounded case."""
         with self.server() as server:
             async with server.connect() as client:
+                # Listener readiness precedes file preparation. Observe the existing
+                # startup budget before measuring reads against external writes.
+                await settled_local(client, "get_symbol", CHURN_REQUESTS["get_symbol"])
                 await self.churn(client)
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
@@ -669,7 +675,13 @@ class Corpus:
             revision: int | None = None
             try:
                 async with gate_deadline(f"churn {name}", budget):
-                    answer = await client.call(name, CHURN_REQUESTS[name])
+                    answer = await read_settled_local(
+                        client,
+                        name,
+                        CHURN_REQUESTS[name],
+                        seconds=budget,
+                        poll_seconds=POLL_SECONDS,
+                    )
                 codes = [
                     string_value(warning.get("code"), "warning code")
                     for warning in warnings(answer)
@@ -768,7 +780,9 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
-                answer = await client.call("search", {"query": "test", "limit": 1})
+                answer = await settled_local(
+                    client, "search", {"query": "test", "limit": 1}
+                )
                 require(
                     bool(objects(answer, "results")),
                     "symlink root has no search results",
@@ -784,7 +798,8 @@ class Corpus:
         self.configure(root=root)
         with self.server(root) as server:
             async with server.connect() as client:
-                found = await client.call(
+                found = await settled_local(
+                    client,
                     "get_symbol",
                     {"name": "FastAPI", "include": ["history"], "limit": 5},
                 )
@@ -803,22 +818,65 @@ class Corpus:
         self.record("shallow_history", complete=False, depth=1)
 
     async def source_bound(self) -> None:
+        # https://github.com/volarized/rift/issues/495
         self.configure("[source]\nfiles = 20000\n")
         server = self.server()
         try:
-            server.start(wait_for_publication=False)
-            await asyncio.to_thread(server.process.wait, timeout=180.0)
-            require(
-                server.process.returncode != 0, "source.files overflow started a server"
-            )
-            detail = server.read_log()
-            expected = "field source.files, observed 20001, maximum 20000"
-            require(
-                expected in detail, f"source bound refusal missing {expected}: {detail}"
-            )
-            self.record(
-                "source_bound", field="source.files", observed=20001, maximum=20000
-            )
+            async with gate_deadline("source.files refusal", 180.0):
+                server.start()
+                async with server.connect() as client:
+                    while True:
+                        try:
+                            answer = await client.call(
+                                "get_symbol", {"name": "corpus_probe"}
+                            )
+                        except MCPError as error:
+                            refusal = object_value(error.error.data, "source refusal")
+                            require(
+                                refusal.get("code") == "limit_exceeded"
+                                and refusal.get("phase") == "read",
+                                f"source bound wrong refusal: {refusal}",
+                            )
+                            limit = object_value(refusal.get("limit"), "source limit")
+                            require(
+                                limit.get("field") == "source.files"
+                                and limit.get("required") == 20001
+                                and limit.get("limit") == 20000,
+                                f"source bound wrong limit: {limit}",
+                            )
+                            require(
+                                any(
+                                    "too_many_files"
+                                    in string_value(
+                                        cause.get("message"), "source cause"
+                                    )
+                                    for cause in objects(refusal, "causes")
+                                ),
+                                f"source bound missing too_many_files cause: {refusal}",
+                            )
+                            break
+                        require(
+                            any(
+                                warning.get("code") == "local_index_preparing"
+                                for warning in warnings(answer)
+                            ),
+                            f"source.files overflow returned a complete read: {answer}",
+                        )
+                        await asyncio.sleep(POLL_SECONDS)
+                    await observed(
+                        client,
+                        "rift://logs/component/index",
+                        lambda rows: any(
+                            row.get("message") == "index rebuild failed"
+                            and fields(row).get("error_code") == "limit_exceeded"
+                            for row in rows
+                        ),
+                    )
+                server.check_running()
+                server.stop()
+                self.record(
+                    "source_bound", field="source.files", observed=20001, maximum=20000
+                )
         finally:
             server.close()
             self.configure()
@@ -876,22 +934,14 @@ class Corpus:
         await self.stop_during_history_fill()
 
     async def stop_during_rebuild(self) -> None:
-        """Observe synchronous output while the rebuild can hold the database writer."""
+        """Observe filesystem rebuild output without a proxy that restarts a stopped server."""
         with self.server() as server:
-            async with server.connect() as client:
-                startup = await observed_output(server, 0, STARTUP_PUBLICATION)
-                (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
-                pending = asyncio.create_task(
-                    client.call("search", {"query": "corpus_probe"})
-                )
-                try:
-                    output = await observed_output(
-                        server, len(startup), "index capture started"
-                    )
-                    await self.stop_observed(server, "rebuild", output)
-                finally:
-                    pending.cancel()
-                    await asyncio.gather(pending, return_exceptions=True)
+            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
+            (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
+            output = await observed_output(
+                server, len(startup), "index capture started"
+            )
+            await self.stop_observed(server, "rebuild", output)
         (self.root / PROBE_PATH).unlink(missing_ok=True)
 
     async def stop_during_history_fill(self) -> None:
@@ -900,18 +950,18 @@ class Corpus:
         A fill analyzes only the commits the history store lacks, so the case first
         deletes the store the earlier servers filled, in the `.rift` folder of the common
         git directory: this server's fill then owes every commit its plan selects. The
-        fill starts after the startup publication with no request, and while the server
-        runs none, each batch starts as soon as the one before it ends.
+        fill starts independently of source preparation with no request. The owned
+        server document establishes listener readiness; observe the fill from the start
+        of this server's output because it can finish before startup publication.
         """
         common = git(self.root, "rev-parse", "--git-common-dir").output().strip()
         store = self.root / common / ".rift"
         if store.exists():
             shutil.rmtree(store)
         with self.server() as server:
-            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
             output = await observed_state(
                 server,
-                startup.index(STARTUP_PUBLICATION),
+                0,
                 "a history store batch with pending commits",
                 lambda text: open_history_batch(text) is not None,
             )
@@ -952,6 +1002,17 @@ async def observed_state(
     )
 
 
+async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
+    """Resend partial local reads within the existing corpus observation budget."""
+    return await read_settled_local(
+        client,
+        name,
+        request,
+        seconds=OBSERVATION_SECONDS,
+        poll_seconds=POLL_SECONDS,
+    )
+
+
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
     """Resend a `pattern` search until the trigram index covers every stored row.
 
@@ -982,11 +1043,10 @@ def objects(answer: JsonObject, key: str) -> list[JsonObject]:
 async def observed(
     client: Client, uri: str, predicate: Callable[[list[JsonObject]], bool]
 ) -> list[JsonObject]:
-    """Wait for the log drain under the documented asynchronous logging contract."""
+    """Wait for the log drain under one deadline, including resource calls and polls."""
     async with asyncio.timeout(OBSERVATION_SECONDS):
-        for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
+        while True:
             found = records(await client.resource(uri))
             if predicate(found):
                 return found
             await asyncio.sleep(POLL_SECONDS)
-    raise AssertionError(f"required record never reached {uri}")

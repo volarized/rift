@@ -9,6 +9,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::configuration::ServerConfiguration;
+
 /// The lowest port of the default serving range, used when `rift.toml`
 /// selects no port.
 pub const SERVER_PORT_MIN: u16 = 12_000;
@@ -69,6 +71,9 @@ pub struct ServerLock {
     pub pid: u32,
     /// Exact identity of the serving process and MCP tools.
     pub identity: ProductIdentity,
+    /// Accepted `[server]` values held by the serving process, absent in older lock files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerConfiguration>,
 }
 
 impl ServerLock {
@@ -214,6 +219,7 @@ mod tests {
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
             identity: valid_identity(),
+            server: None,
         }
     }
 
@@ -393,6 +399,30 @@ mod tests {
         let lock = valid_lock();
         let text = serde_json::to_string(&lock).expect("lock must serialize");
         let restored: ServerLock = serde_json::from_str(&text).expect("lock must deserialize");
+        assert_eq!(restored, lock);
+    }
+
+    #[test]
+    fn older_lock_without_server_settings_remains_readable() {
+        let mut recorded = serde_json::to_value(valid_lock()).expect("lock serializes");
+        recorded
+            .as_object_mut()
+            .expect("lock is an object")
+            .remove("server");
+
+        let lock: ServerLock = serde_json::from_value(recorded).expect("older lock parses");
+
+        assert_eq!(lock.server, None);
+    }
+
+    #[test]
+    fn lock_round_trip_preserves_accepted_server_settings() {
+        let mut lock = valid_lock();
+        lock.server = Some(crate::configuration::ServerConfiguration::default());
+        let text = serde_json::to_string(&lock).expect("lock serializes");
+
+        let restored: ServerLock = serde_json::from_str(&text).expect("lock parses");
+
         assert_eq!(restored, lock);
     }
 

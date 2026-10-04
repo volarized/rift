@@ -36,15 +36,16 @@ mod rust_engine;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use harness::{
     FIXTURE_READINESS_TIMEOUT, FIXTURE_WORKER_QUEUE_TIMEOUT, LIBRARY, PROXIED_CALL_MAX,
-    PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
-    proxied_engine_call, proxy_client, relayed_proxy_client, require_success, run_rift,
-    rust_engine_workspace, within, workspace,
+    PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, await_workspace_ready,
+    laid_out_workspace, proxied_call, proxied_engine_call, proxy_client, relayed_proxy_client,
+    require_success, run_rift, rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{
     BuildCheckout, ElectionGuard, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim,
@@ -157,11 +158,341 @@ async fn wait_for<T>(
 async fn beacon_lookup(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<serde_json::Value> {
+    await_workspace_ready(client).await?;
     proxied_call(client, "get_symbol", &json!({"name": "beacon"})).await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
     assert_eq!(lookup["hits"][0]["symbol"]["name"], json!("beacon"));
+}
+
+/// Retains only the foreground child this fixture started.
+struct RepositoryForeground(Child);
+
+impl Drop for RepositoryForeground {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn fixture_git(root: &Path, arguments: &[&str]) -> TestResult {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Rift fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@rift.test")
+        .env("GIT_COMMITTER_NAME", "Rift fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@rift.test")
+        .output()?;
+    require_success(&output, "repository fixture Git command")
+}
+
+async fn repository_foreground(
+    root: &Path,
+    state_directory: &Path,
+) -> TestResult<(RepositoryForeground, ServerLock)> {
+    let mut child = RepositoryForeground(
+        Command::new(harness::rift_binary())
+            .args(["server", "start", "--foreground", "--repository"])
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+    let serving = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "repository foreground startup",
+        || {
+            if child.0.try_wait().ok().flatten().is_some() {
+                return None;
+            }
+            match rift_mcp::probe_state_directory(state_directory) {
+                ServerPresence::Serving(lock) if lock.pid == child.0.id() => Some(lock),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    Ok((child, serving))
+}
+
+async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForeground) -> TestResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let stopped = tokio::time::timeout_at(
+        deadline,
+        run_rift(root, &["server", "stop", "--repository"]),
+    )
+    .await??;
+    require_success(&stopped, "repository foreground stop")?;
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            assert!(
+                status.success(),
+                "repository foreground exits cleanly: {status:?}"
+            );
+            return Ok(());
+        }
+        tokio::time::timeout_at(deadline, tokio::time::sleep(PRESENCE_POLL_INTERVAL)).await?;
+    }
+}
+
+async fn repository_workspace_reads(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    name: &str,
+    names: &[&str],
+) -> TestResult<String> {
+    let map = await_workspace_ready(client)
+        .await
+        .map_err(|error| format!("map resource: {error:?}"))?;
+    let revision = map["revision"]
+        .as_str()
+        .ok_or("map carries its revision")?
+        .to_owned();
+    let lookup = proxied_call(client, "get_symbol", &json!({"name": name}))
+        .await
+        .map_err(|error| format!("positive get_symbol: {error:?}"))?;
+    assert_eq!(lookup["hits"][0]["symbol"]["name"], name, "{lookup}");
+    let other = names
+        .iter()
+        .find(|other| **other != name)
+        .ok_or("fixture has another symbol")?;
+    let absent = proxied_call(client, "get_symbol", &json!({"name": other}))
+        .await
+        .map_err(|error| format!("negative get_symbol: {error:?}"))?;
+    assert!(
+        absent["hits"]
+            .as_array()
+            .ok_or("lookup carries hits")?
+            .is_empty(),
+        "{absent}"
+    );
+    let search = proxied_call(
+        client,
+        "search",
+        &json!({"query": name, "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("search: {error:?}"))?;
+    assert!(
+        search["results"]
+            .as_array()
+            .ok_or("search carries results")?
+            .iter()
+            .any(|hit| hit["hit"]["symbol"]["name"] == name),
+        "{search}"
+    );
+    let nodes = proxied_call(client, "nodes", &json!({"path": "lib.rs", "position": 8}))
+        .await
+        .map_err(|error| format!("nodes: {error:?}"))?;
+    assert!(
+        nodes["source"]
+            .as_array()
+            .ok_or("nodes carries source")?
+            .iter()
+            .any(|source| source.as_str().is_some_and(|source| source.contains(name))),
+        "{nodes}"
+    );
+    Ok(revision)
+}
+
+async fn repository_workspace_resource_digest(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult<String> {
+    let mut digest = None;
+    for uri in ["rift://workspace", "rift://logs"] {
+        let answer = within(
+            "repository resource",
+            client.read_resource(rmcp::model::ReadResourceRequestParams::new(uri)),
+        )
+        .await??;
+        let Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) =
+            answer.contents.first()
+        else {
+            return Err("repository resource carries text".into());
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        assert!(body.is_object(), "{uri}: {body}");
+        if uri == "rift://workspace" {
+            let source = body["source"]
+                .as_array()
+                .ok_or("workspace carries source catalog")?
+                .iter()
+                .find(|source| source["path"] == "lib.rs")
+                .ok_or("workspace catalog carries lib.rs")?;
+            digest = Some(
+                source["digest"]
+                    .as_str()
+                    .ok_or("source carries digest")?
+                    .to_owned(),
+            );
+        }
+    }
+    digest.ok_or_else(|| "workspace source digest was read".into())
+}
+
+async fn a_competing_foreground_start_preserves_repository_logs(
+    root: &Path,
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult {
+    let before = within(
+        "repository logs before competing start",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://logs")),
+    )
+    .await??;
+    let refused = within(
+        "competing foreground start",
+        run_rift(root, &["server", "start", "--foreground"]),
+    )
+    .await??;
+    assert!(
+        !refused.status.success(),
+        "a repository owns this workspace"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("server_already_serving"), "{stderr}");
+    let after = within(
+        "repository logs after competing start",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://logs")),
+    )
+    .await??;
+    assert_eq!(
+        before.contents, after.contents,
+        "a refused process cannot write diagnostics into the owner's database"
+    );
+    Ok(())
+}
+
+async fn repository_workspace_facts(
+    root: &Path,
+    name: &str,
+    names: &[&str],
+) -> TestResult<(
+    rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    String,
+    String,
+)> {
+    let workspace = format!("workspace {name} at {}", root.display());
+    let client = proxy_client(root)
+        .await
+        .map_err(|error| format!("{workspace} proxy startup: {error:?}"))?;
+    let revision = repository_workspace_reads(&client, name, names)
+        .await
+        .map_err(|error| format!("{workspace} read: {error:?}"))?;
+    let source_digest = repository_workspace_resource_digest(&client)
+        .await
+        .map_err(|error| format!("{workspace} resource digest: {error:?}"))?;
+    assert!(claim(root).is_err(), "repository owns this workspace store");
+    assert!(
+        !document_path(root).exists(),
+        "workspace has no separate serving document"
+    );
+    Ok((client, revision, source_digest))
+}
+
+/// All internal root routes share one elected process and retain separate workspace facts.
+#[tokio::test]
+async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
+-> TestResult {
+    let names = ["amber", "cedar", "indigo", "quartz"];
+    let main = laid_out_workspace(
+        &[("lib.rs", "pub fn amber() {}\n")],
+        &harness::assigned_port_key()?,
+    )?;
+    fixture_git(main.path(), &["init", "-q"])?;
+    fixture_git(main.path(), &["add", "lib.rs", "rift.toml"])?;
+    fixture_git(
+        main.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "add workspace sources",
+        ],
+    )?;
+    let linked_parent = tempfile::tempdir()?;
+    let mut roots = vec![main.path().to_path_buf()];
+    for name in names.iter().skip(1) {
+        let root = linked_parent.path().join(format!("worktree-é-{name}"));
+        fixture_git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                root.to_str().ok_or("fixture path must be UTF-8")?,
+                "HEAD",
+            ],
+        )?;
+        fs::write(root.join("lib.rs"), format!("pub fn {name}() {{}}\n"))?;
+        roots.push(root);
+    }
+    let common = rift_mcp::repository::discover_common_directory(main.path())
+        .ok_or("fixture repository has a common Git directory")?;
+    let state_directory =
+        rift_mcp::repository::repository_election_directory(&common, &rift_binary_identity()?)?;
+    // The linked workspace starts first; authority still comes from the main worktree.
+    let (mut child, before) = repository_foreground(&roots[3], &state_directory).await?;
+    let mut clients = Vec::new();
+    let mut revisions = std::collections::BTreeSet::new();
+    let mut source_digests = std::collections::BTreeSet::new();
+    for (root, name) in roots.iter().zip(names) {
+        let (client, revision, source_digest) =
+            repository_workspace_facts(root, name, &names).await?;
+        revisions.insert(revision);
+        source_digests.insert(source_digest);
+        clients.push(client);
+    }
+    a_competing_foreground_start_preserves_repository_logs(&roots[0], &clients[0]).await?;
+    assert_eq!(revisions.len(), 4, "map revisions follow workspace bytes");
+    assert_eq!(
+        source_digests.len(),
+        4,
+        "source catalog follows workspace bytes"
+    );
+    let after = match rift_mcp::probe_state_directory(&state_directory) {
+        ServerPresence::Serving(lock) => lock,
+        other => return Err(format!("repository must remain serving: {other:?}").into()),
+    };
+    assert_eq!(
+        before.pid, after.pid,
+        "all proxies adopt one repository process"
+    );
+    let changed = fs::read_to_string(main.path().join("rift.toml"))?
+        .replace("[server]\n", "[server]\nnum_workers = 2\n");
+    fs::write(main.path().join("rift.toml"), &changed)?;
+    let pinned = proxied_call(&clients[3], "get_symbol", &json!({"name": "quartz"}))
+        .await
+        .map_err(|error| format!("workspace quartz after settings change get_symbol: {error:?}"))?;
+    assert_eq!(pinned["hits"][0]["symbol"]["name"], "quartz", "{pinned}");
+    require_success(
+        &run_rift(&roots[3], &["server", "status", "--repository"]).await?,
+        "status after authority settings change",
+    )?;
+    for client in clients {
+        client.cancel().await?;
+    }
+    stop_repository_foreground(&roots[3], &mut child).await?;
+    for root in &roots {
+        assert!(
+            claim(root).is_ok(),
+            "stopped process releases workspace store"
+        );
+        fs::write(root.join("rift.toml"), &changed)?;
+    }
+    let (mut reopened, serving) = repository_foreground(&roots[1], &state_directory).await?;
+    assert_eq!(
+        serving
+            .server
+            .ok_or("repository records accepted server settings")?
+            .num_workers,
+        2
+    );
+    stop_repository_foreground(&roots[1], &mut reopened).await?;
+    Ok(())
 }
 
 /// A loopback port inside the serving range that currently refuses
@@ -285,6 +616,7 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
         token: "a".repeat(SERVER_TOKEN_LENGTH),
         pid: 1,
         identity: rift_binary_identity()?,
+        server: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -304,27 +636,9 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
 /// locking it exclusively.
 const ELECTION_FILE_NAME: &str = "server.lock";
 
-/// The record a spawned server writes when its claim meets a lock and it exits.
-const LOST_ELECTION_RECORD: &str =
-    "another rift server already serves this workspace; this process exits";
-
-/// Reads of `rift server logs` while waiting for one record, at
-/// [`PRESENCE_POLL_INTERVAL`] between reads: each read is a process start, so
-/// the wait stays well inside the proxy's start window.
+/// Polls the proxy's stderr while waiting for a spawned server's refusal,
+/// at [`PRESENCE_POLL_INTERVAL`], inside the proxy's start window.
 const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
-
-/// Polls `rift server logs` until it prints `record`, bounded by
-/// [`RECORD_READ_ATTEMPT_COUNT`] reads.
-async fn await_record(root: &Path, record: &str) -> TestResult {
-    for _ in 0..RECORD_READ_ATTEMPT_COUNT {
-        let printed = run_rift(root, &["server", "logs"]).await?;
-        if String::from_utf8_lossy(&printed.stdout).contains(record) {
-            return Ok(());
-        }
-        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
-    }
-    Err(format!("no {record:?} record within {RECORD_READ_ATTEMPT_COUNT} reads").into())
-}
 
 /// A claim that meets any lock on the election file loses the start election,
 /// a shared one included. This test keeps a shared lock on the file the way a
@@ -332,6 +646,7 @@ async fn await_record(root: &Path, record: &str) -> TestResult {
 /// locks lazily, so the proxy's first spawned server loses an election no
 /// process holds and exits. Once the lock goes, the proxy spawns again inside
 /// its start window, and the call is served.
+// Startup refusal observation: https://github.com/volarized/rift/issues/490
 #[tokio::test]
 async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     let directory = workspace()?;
@@ -346,12 +661,26 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
         .open(root.join(".rift").join(ELECTION_FILE_NAME))?;
     lingering.try_lock_shared()?;
 
-    let client = proxy_client(root).await?;
+    let (client, stderr) = relayed_proxy_client(root).await?;
     let released = async {
-        let lost = await_record(root, LOST_ELECTION_RECORD).await;
+        let lost = wait_for(
+            RECORD_READ_ATTEMPT_COUNT,
+            "the lost election's stderr refusal",
+            || {
+                let printed = stderr.snapshot();
+                printed
+                    .contains("error[server_already_serving]")
+                    .then_some(printed)
+            },
+        )
+        .await;
+        assert!(
+            !root.join(".rift/db").exists(),
+            "a refused child cannot open the held workspace database"
+        );
         lingering.unlock()?;
         drop(lingering);
-        lost
+        lost.map(|_stderr| ())
     };
     let (lookup, lost) = tokio::join!(beacon_lookup(&client), released);
     lost?;
@@ -672,6 +1001,7 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         token: "a".repeat(SERVER_TOKEN_LENGTH),
         pid: 1,
         identity: rift_binary_identity()?,
+        server: None,
     })?;
 
     let (client, stderr) = relayed_proxy_client(root).await?;
@@ -810,6 +1140,7 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     rust_engine::require_rust_analyzer(root);
     let _cleanup = StopOnDrop::new(root);
     let client = proxy_client(root).await?;
+    await_workspace_ready(&client).await?;
     let declaration = proxied_call(&client, "get_symbol", &json!({"name": "beacon"})).await?;
     let seed = declaration["hits"][0]["symbol"]["id"]
         .as_str()

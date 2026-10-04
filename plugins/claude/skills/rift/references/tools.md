@@ -32,8 +32,13 @@ Lists the syntax nodes covering one UTF-8 byte position in one file,
 outermost first. Each identity carries a witness, so an address taken
 from this listing refuses cleanly once the file's bytes drift. `rev`
 lists the nodes as of a version-control revision instead of the
-current tree. A visible path no syntax provider parses refuses
-`capability_unavailable`, naming the extension.
+current tree. If discovery is incomplete or a targeted read spends the
+request's remaining time, the result has empty `nodes` and `source` and
+carries `local_index_preparing`. A selected source path can answer
+within that remaining time, with the same warning until the publication
+records the path: workspace byte and declaration bounds remain unchecked.
+Per-file refusals keep their typed errors. A visible path no syntax
+provider parses refuses `capability_unavailable`, naming the extension.
 
 Parameters:
 

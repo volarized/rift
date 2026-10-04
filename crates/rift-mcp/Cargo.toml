@@ -28,14 +28,17 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-server",
 ] }
 rift-core.workspace = true
+rift-analysis.workspace = true
 rift-cloud-client.workspace = true
 rift-dependency.workspace = true
+rift-history.workspace = true
 rift-history-store.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-search.workspace = true
 rift-server.workspace = true
+rayon.workspace = true
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
@@ -45,8 +48,12 @@ sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "net"] }
 tokio-util.workspace = true
+tower-service = "0.3.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-spawn.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }

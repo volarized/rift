@@ -38,6 +38,7 @@ enum FixtureMode {
 #[derive(Clone)]
 enum OperationFixture {
     Valid,
+    EchoResolution,
     InvalidResolutionAccounting,
     SearchPages,
     MismatchedCursor,
@@ -176,7 +177,7 @@ async fn fixture_handler(
         method: parts.method,
         path: path.clone(),
         query: query.clone(),
-        body,
+        body: body.clone(),
     });
 
     let request_number = state.requests.fetch_add(1, Ordering::SeqCst);
@@ -198,7 +199,7 @@ async fn fixture_handler(
         _ => None,
     };
     let response = if let Some(mode) = operation_mode {
-        operation_response(&mode, &path, query.as_deref(), request_number)
+        operation_response(&mode, &path, query.as_deref(), request_number, &body)
     } else {
         match &state.mode {
             FixtureMode::Capabilities | FixtureMode::CapabilitiesDelay(_) => {
@@ -318,6 +319,7 @@ fn operation_response(
     path: &str,
     query: Option<&str>,
     request_number: usize,
+    request_body: &[u8],
 ) -> Response {
     if path.ends_with("/capabilities") {
         return operation_capabilities_response(mode);
@@ -326,7 +328,7 @@ fn operation_response(
         return problem_response(*status);
     }
     if path.ends_with("/resolutions") {
-        return operation_resolution_response(mode);
+        return operation_resolution_response(mode, request_body);
     }
     if path.ends_with("/search") {
         return operation_search_response(mode, query, request_number);
@@ -397,7 +399,36 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     })
 }
 
-fn operation_resolution_response(mode: &OperationFixture) -> Response {
+fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -> Response {
+    if matches!(mode, OperationFixture::EchoResolution) {
+        let request: serde_json::Value =
+            serde_json::from_slice(request_body).expect("resolution request fixture");
+        let entries = request["entries"]
+            .as_array()
+            .expect("resolution entries fixture");
+        let mut available_exact = Vec::new();
+        let mut missing_requirements = Vec::new();
+        for entry in entries {
+            if let Some(version) = entry["version"].as_str() {
+                available_exact.push(serde_json::json!({
+                    "manager": entry["manager"],
+                    "name": entry["name"],
+                    "version": version,
+                }));
+            } else {
+                missing_requirements.push(entry.clone());
+            }
+        }
+        return json_response(
+            &serde_json::json!({
+                "available_exact": available_exact,
+                "resolved_requirements": [],
+                "missing_exact": [],
+                "missing_requirements": missing_requirements,
+            }),
+            Some("max-age=60"),
+        );
+    }
     if let Some(body) = resolution::substitution_response(mode) {
         return json_response(&body, Some("max-age=60"));
     }

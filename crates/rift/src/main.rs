@@ -519,6 +519,7 @@ mod tests {
                 command:
                     super::server::ServerCommand::Start {
                         foreground: parsed_flag,
+                        repository: false,
                         auth,
                     },
             }) = parsed.command
@@ -532,12 +533,28 @@ mod tests {
                 "an unflagged start checks its token"
             );
         }
+        assert!(Cli::try_parse_from(["rift", "server", "start", "--repository"]).is_err());
+        let repository_start =
+            Cli::try_parse_from(["rift", "server", "start", "--foreground", "--repository"])
+                .expect("hidden repository foreground start must parse");
+        assert!(matches!(
+            repository_start.command,
+            Some(CliCommand::Server {
+                command: super::server::ServerCommand::Start {
+                    foreground: true,
+                    repository: true,
+                    ..
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["rift", "server", "stop", "--repository"]).is_ok());
+        assert!(Cli::try_parse_from(["rift", "server", "status", "--repository"]).is_ok());
         assert!(matches!(
             Cli::try_parse_from(["rift", "server", "stop"])
                 .expect("stop must parse")
                 .command,
             Some(CliCommand::Server {
-                command: super::server::ServerCommand::Stop
+                command: super::server::ServerCommand::Stop { repository: false }
             })
         ));
         assert!(matches!(
@@ -553,7 +570,7 @@ mod tests {
                 .expect("status must parse")
                 .command,
             Some(CliCommand::Server {
-                command: super::server::ServerCommand::Status
+                command: super::server::ServerCommand::Status { repository: false }
             })
         ));
         assert!(
@@ -588,6 +605,7 @@ mod tests {
             command:
                 super::server::ServerCommand::Start {
                     foreground: true,
+                    repository: false,
                     auth: super::server::AuthMode::Skip,
                 },
         }) = parsed.command

@@ -13,9 +13,10 @@ use rift_dependency::{DependencyContext, StandardLibrary};
 use rift_history::{HistoryError, Repository};
 use rift_history_store::StoreError;
 use rift_index::{
-    FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
-    RelationshipStore, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex,
-    WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
+    FileDigest, FileRecord, IndexRead, IndexedFile, PathChange, PathChanges, ReadableSymbol,
+    RelationshipStore, SymbolMatch, WorkspaceContentCache, WorkspaceDigests, WorkspaceFingerprint,
+    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexPreparation,
+    WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::dependencies::{
@@ -87,8 +88,7 @@ pub enum ReadFault {
         /// The path the request addressed.
         path: String,
     },
-    /// A claimed path's bytes are not valid UTF-8: the path is real, but the index could
-    /// not read it and holds no file there.
+    /// The index left a claimed source path out, so no file is held there.
     SourceUnavailable {
         /// The path the request addressed.
         path: String,
@@ -123,6 +123,8 @@ pub enum ReadFault {
         /// Configured queue wait bound in milliseconds.
         timeout_ms: u64,
     },
+    /// Blocking work stopped at a file boundary.
+    Cancelled,
 }
 
 impl Fault for ReadFault {
@@ -147,6 +149,7 @@ impl Fault for ReadFault {
             Self::Unavailable { .. } | Self::CapacityTimeout { .. } => {
                 ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
             }
+            Self::Cancelled => ErrorName::Wire(ErrorCode::Cancelled),
         }
     }
 
@@ -193,6 +196,7 @@ impl Fault for ReadFault {
                 ErrorContext::new("operation", *operation),
                 ErrorContext::new("timeout_ms", timeout_ms.to_string()),
             ],
+            Self::Cancelled => Vec::new(),
         }
     }
 
@@ -213,7 +217,8 @@ impl Fault for ReadFault {
             | Self::Task { .. }
             | Self::Unavailable { .. }
             | Self::EngineAnswer { .. }
-            | Self::CapacityTimeout { .. } => None,
+            | Self::CapacityTimeout { .. }
+            | Self::Cancelled => None,
         }
     }
 
@@ -234,7 +239,8 @@ impl Fault for ReadFault {
             | Self::Task { .. }
             | Self::Unavailable { .. }
             | Self::EngineAnswer { .. }
-            | Self::CapacityTimeout { .. } => None,
+            | Self::CapacityTimeout { .. }
+            | Self::Cancelled => None,
         }
     }
 
@@ -257,6 +263,12 @@ impl Fault for ReadFault {
 }
 
 impl ReadFault {
+    /// Classifies blocking work stopped at a file boundary.
+    #[must_use]
+    pub fn cancelled() -> ReadError {
+        Error::new(Self::Cancelled)
+    }
+
     pub(crate) fn unsupported(capability: impl Into<String>) -> ReadError {
         Error::new(Self::Unsupported {
             capability: capability.into(),
@@ -281,9 +293,8 @@ impl ReadFault {
         Error::new(Self::NotFound { path: path.into() })
     }
 
-    /// Classifies a claimed path whose bytes are not valid UTF-8: the index confirmed the
-    /// path is real by naming it in its own warnings, so this is `content_unavailable`
-    /// rather than `not_found`.
+    /// Classifies a claimed source path the index left out, so this is
+    /// `content_unavailable` rather than `not_found`.
     pub(crate) fn source_unavailable(path: impl Into<String>) -> ReadError {
         Error::new(Self::SourceUnavailable { path: path.into() })
     }
@@ -366,6 +377,28 @@ impl ReadFault {
 /// Opaque read-service failure.
 pub type ReadError = Error<ReadFault>;
 
+/// Inputs for one cancellable current-tree read-service build.
+pub struct ReadServiceBuild<'a> {
+    /// Workspace root to index.
+    pub root: &'a Path,
+    /// Limits applied while indexing and reading.
+    pub limits: WorkspaceIndexLimits,
+    /// Accepted path visibility policy.
+    pub visibility: &'a SourceVisibility,
+    /// Accepted text and documentation file selection.
+    pub text_inclusion: &'a TextFileInclusion,
+    /// Accepted language path selections.
+    pub languages: &'a LanguageFileSelections,
+    /// History behavior served from this snapshot.
+    pub history: HistoryConfiguration,
+    /// Dependency context inputs and version probe behavior.
+    pub dependencies: DependenciesConfiguration,
+    /// Returns true when indexing work should stop.
+    pub cancelled: &'a (dyn Fn() -> bool + Sync),
+    /// Shared source and syntax facts cache for workspace builds.
+    pub content_cache: Option<&'a WorkspaceContentCache>,
+}
+
 /// Immutable direct-filesystem workspace read service.
 #[derive(Debug)]
 pub struct ReadService {
@@ -442,6 +475,40 @@ impl ReadService {
         history: HistoryConfiguration,
         dependencies: DependenciesConfiguration,
     ) -> Result<Self, ReadError> {
+        let cancelled = || false;
+        Self::build_with_languages_cancellable(ReadServiceBuild {
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            history,
+            dependencies,
+            cancelled: &cancelled,
+            content_cache: None,
+        })
+    }
+
+    /// Builds one current-tree snapshot, checking `cancelled` between files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when configuration or root cannot be indexed within bounds,
+    /// or when indexing is cancelled.
+    pub fn build_with_languages_cancellable(
+        build: ReadServiceBuild<'_>,
+    ) -> Result<Self, ReadError> {
+        let ReadServiceBuild {
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            history,
+            dependencies,
+            cancelled,
+            content_cache,
+        } = build;
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -452,23 +519,27 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let index = WorkspaceIndex::build_with_languages(
+        let cache = content_cache.cloned().unwrap_or_default();
+        let index = WorkspaceIndex::build_with_languages_cancellable_and_cache(
             root,
             limits,
             visibility,
             text_inclusion,
             languages,
+            &cache,
+            cancelled,
         )
         .map_err(|source| {
             span.record("outcome", "error");
             ReadFault::index(source)
         })?;
-        let source_policy = WorkspaceSourcePolicy::build_with_languages(
+        let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
             root,
             limits,
             visibility,
             text_inclusion,
             languages,
+            cancelled,
         )
         .map_err(|source| {
             span.record("outcome", "error");
@@ -493,6 +564,46 @@ impl ReadService {
         })
     }
 
+    /// Serves one prepared immutable index without walking or reading the workspace again.
+    ///
+    /// The caller supplies the source policy and dependency context captured for the same
+    /// selected file set. Partial publications use an empty dependency context until their
+    /// full selected set is prepared.
+    #[must_use]
+    pub fn from_prepared_index(
+        index: WorkspaceIndex,
+        source_policy: Option<Arc<WorkspaceSourcePolicy>>,
+        context: Arc<DependencyContext>,
+        history: HistoryConfiguration,
+        dependencies: DependenciesConfiguration,
+    ) -> Self {
+        let revisions = captured_revisions(&index);
+        Self {
+            index,
+            revisions,
+            revision: None,
+            history,
+            source_policy,
+            context,
+            dependency_configuration: dependencies,
+            stored_history: OnceLock::new(),
+        }
+    }
+
+    /// Reads dependency context through one compiled source policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] if the policy cannot list visible paths or dependency
+    /// resolution refuses its configured input.
+    pub fn dependency_context_for_policy(
+        root: &Path,
+        source_policy: &WorkspaceSourcePolicy,
+        dependencies: &DependenciesConfiguration,
+    ) -> Result<DependencyContext, ReadError> {
+        resolved_context(root, source_policy, dependencies)
+    }
+
     /// Every file's digest this snapshot indexed, in project-path order.
     ///
     /// A request that captured the tree itself compares its capture with this to name the
@@ -500,6 +611,12 @@ impl ReadService {
     #[must_use]
     pub fn workspace_digests(&self) -> WorkspaceDigests {
         self.index.digests()
+    }
+
+    /// Effective bounds this index was built under.
+    #[must_use]
+    pub const fn workspace_limits(&self) -> WorkspaceIndexLimits {
+        self.index.limits()
     }
 
     /// Every file's content digest this snapshot indexed, the files it left out included,
@@ -519,6 +636,17 @@ impl ReadService {
             &self.context,
             self.revisions.wire_index_tree_revision(),
         )
+    }
+
+    /// Builds file counts for paths already selected by workspace discovery. Symbol facts
+    /// and dependency entries remain empty until the prepared index is complete.
+    #[must_use]
+    pub fn workspace_preparation_map(
+        &self,
+        source: &[(CoreProjectPath, Language)],
+        text: &[CoreProjectPath],
+    ) -> WorkspaceMap {
+        crate::map::build_preparation_map(source, text, self.revisions.wire_index_tree_revision())
     }
 
     /// The symbol reference adjacency built from this snapshot's normalized graph: which
@@ -611,6 +739,23 @@ impl ReadService {
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
     ) -> Result<Self, ReadError> {
+        self.rescanned_cancellable(root, visibility, text_inclusion, languages, &|| false)
+    }
+
+    /// Rescans one current-tree snapshot, checking `cancelled` between files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the root, policy, or a visible file cannot be indexed
+    /// within bounds, or when indexing is cancelled.
+    pub fn rescanned_cancellable(
+        &self,
+        root: &Path,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, ReadError> {
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -620,16 +765,20 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let built = self.index.rescanned(visibility).and_then(|index| {
-            let source_policy = WorkspaceSourcePolicy::build_with_languages(
-                root,
-                self.index.limits(),
-                visibility,
-                text_inclusion,
-                languages,
-            )?;
-            Ok((index, source_policy))
-        });
+        let built = self
+            .index
+            .rescanned_cancellable(visibility, cancelled)
+            .and_then(|index| {
+                let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+                    root,
+                    self.index.limits(),
+                    visibility,
+                    text_inclusion,
+                    languages,
+                    cancelled,
+                )?;
+                Ok((index, source_policy))
+            });
         let (index, source_policy) = built.map_err(|source| {
             span.record("outcome", "error");
             ReadFault::index(source)
@@ -668,6 +817,20 @@ impl ReadService {
     /// to read the named paths from, or when a named path cannot be read or indexed within
     /// bounds.
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, ReadError> {
+        self.rebuilt_cancellable(changes, &|| false)
+    }
+
+    /// Rebuilds the named paths, checking `cancelled` between files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a named path cannot be indexed within bounds, or when
+    /// indexing is cancelled.
+    pub fn rebuilt_cancellable(
+        &self,
+        changes: &PathChanges,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, ReadError> {
         let source_policy = self.filesystem_policy("incremental rebuild")?;
         let span = tracing::info_span!(
             "index.build",
@@ -678,10 +841,13 @@ impl ReadService {
             outcome = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let index = self.index.rebuilt(changes).map_err(|source| {
-            span.record("outcome", "error");
-            ReadFault::index(source)
-        })?;
+        let index = self
+            .index
+            .rebuilt_cancellable(changes, cancelled)
+            .map_err(|source| {
+                span.record("outcome", "error");
+                ReadFault::index(source)
+            })?;
         let revisions = captured_revisions(&index);
         let context = self.context_after(source_policy, changes, &index)?;
         span.record("files_count", index.file_count());
@@ -857,6 +1023,26 @@ impl ReadService {
         &self.index
     }
 
+    /// Advances local workspace preparation, reusing derived data from this snapshot when
+    /// its accepted workspace inputs match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for an invalid target, read, syntax, bound, or
+    /// cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Panics before discovery or when `target` moves backward or exceeds selected files.
+    pub fn advance_workspace_preparation(
+        &self,
+        preparation: &mut WorkspaceIndexPreparation,
+        target: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+        preparation.advance_to_with_previous(target, Some(&self.index), cancelled)
+    }
+
     /// Returns this snapshot's compiled `[source]` policy: the hard floor, the
     /// `[source]` matcher, and the workspace's `.gitignore` chain. `None` for a
     /// revision snapshot, which has no filesystem tree to be visible in.
@@ -980,6 +1166,12 @@ impl ReadService {
         self.index.index_documents()
     }
 
+    /// Symbol documents grouped by file for vector population.
+    #[must_use]
+    pub fn symbol_index_documents_by_file(&self) -> Vec<Arc<[rift_ranking::IndexDocument]>> {
+        self.index.symbol_index_documents_by_file()
+    }
+
     /// Shares this captured tree's validated documentation metadata for atomic publication.
     #[must_use]
     pub fn documentation_snapshot(&self) -> Arc<rift_index::DocumentationCollection> {
@@ -1011,36 +1203,85 @@ impl ReadService {
             .index
             .file(&path)
             .ok_or_else(|| self.missing_file_fault(&path))?;
-        let source_len = file.source().len() as u64;
-        if params.position >= source_len {
-            return Err(ReadFault::invalid(
-                "position",
-                format!(
-                    "{} is at or past the file's byte length {source_len}",
-                    params.position
-                ),
+        validate_node_position(file, params.position)?;
+        let nodes = self
+            .index
+            .nodes(&path, params.position)
+            .map_err(ReadFault::index)?
+            .ok_or_else(|| self.missing_file_fault(&path))?;
+        Ok(nodes_at_file(file, &nodes, self.revisions.warnings()))
+    }
+
+    /// Reads syntax nodes for a path selected by workspace discovery but not yet included in
+    /// this partial index. The captured source policy validates the path before and after the
+    /// bounded parse, and the parsed digest must match both reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for an invalid or absent path, a path outside the selected source
+    /// set, a parse refusal, or a source that changed during the read.
+    pub fn nodes_for_preparation(&self, params: NodesParams) -> Result<NodesResult, ReadError> {
+        validate_common(params.rev.is_some())?;
+        let path = CoreProjectPath::new(params.path.0.clone()).map_err(|error| {
+            ReadFault::invalid("path", rift_core::fault_label(&error.fault().violation()))
+        })?;
+        if self.file_record(&path).is_some() {
+            return self.nodes(params);
+        }
+        let Some(policy) = self.source_policy.as_deref() else {
+            return Err(ReadFault::unavailable(
+                "nodes",
+                "workspace discovery has not selected a source path",
+            ));
+        };
+        let absolute = self.index.root().join(path.as_str());
+        let before = policy.visible_digest(&absolute).map_err(|error| {
+            if error.fault().left_out_file(path.clone()).is_some() {
+                ReadFault::source_unavailable(path.as_str())
+            } else {
+                ReadFault::index(error)
+            }
+        })?;
+        let Some(before) = before else {
+            return self.nodes(params);
+        };
+        let Some(parsed) = self
+            .index
+            .parse_source_file_with_nodes(&path, params.position)
+            .map_err(ReadFault::index)?
+        else {
+            return self.nodes(params);
+        };
+        let parsed = match parsed {
+            IndexRead::Included(parsed) => parsed,
+            IndexRead::Skipped(_) => return Err(ReadFault::source_unavailable(path.as_str())),
+        };
+        let after = policy.visible_digest(&absolute).map_err(|error| {
+            if error.fault().left_out_file(path.clone()).is_some() {
+                ReadFault::unavailable("nodes", "source changed during the targeted read")
+            } else {
+                ReadFault::index(error)
+            }
+        })?;
+        if before != parsed.file.digest() || after != Some(before) {
+            return Err(ReadFault::unavailable(
+                "nodes",
+                "source changed during the targeted read",
             ));
         }
-        let matched = file.syntax().nodes_at(params.position);
-        let nodes = matched.iter().map(|node| wire_node(file, node)).collect();
-        let source = matched
-            .iter()
-            .map(|node| excerpt(file, node.range))
-            .collect();
-        Ok(NodesResult {
-            nodes,
-            source,
-            warnings: self.warnings(),
-        })
+        validate_node_position(&parsed.file, params.position)?;
+        Ok(nodes_at_file(
+            &parsed.file,
+            &parsed.nodes,
+            self.revisions.warnings(),
+        ))
     }
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
-    /// this snapshot's own warnings name `path` as holding invalid UTF-8 - the file exists
-    /// but could not be read - the capability a syntax read lacks when this snapshot can
-    /// confirm the path is real, and `not_found` for everything else, including a claimed
-    /// path the index simply has not read.
+    /// this snapshot's warnings name an omission, the capability a syntax read lacks when
+    /// this snapshot can confirm the path is real, and `not_found` otherwise.
     fn missing_file_fault(&self, path: &CoreProjectPath) -> ReadError {
-        if self.index_names_invalid_utf8(path) {
+        if self.index_names_omission(path) {
             return ReadFault::source_unavailable(path.as_str());
         }
         match self.unserved_syntax(path) {
@@ -1055,9 +1296,8 @@ impl ReadService {
         }
     }
 
-    /// Whether this snapshot's own warnings name `path` as holding bytes that are not
-    /// UTF-8: the one condition the index confirms without the path being indexed.
-    fn index_names_invalid_utf8(&self, path: &CoreProjectPath) -> bool {
+    /// Whether this snapshot's own warnings name `path` as left out of the index.
+    fn index_names_omission(&self, path: &CoreProjectPath) -> bool {
         self.index
             .warnings()
             .iter()
@@ -1386,15 +1626,19 @@ pub(crate) fn results_truncation_warning(results_max: usize) -> ReadWarning {
 }
 
 fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
+    wire_node_facts(file, node.range, node.kind)
+}
+
+fn wire_node_facts(file: &IndexedFile, range: ByteRange, kind: &'static str) -> Node {
     let language = file.syntax().language();
     Node {
-        id: node_id(file, node),
-        symbol: symbol_for_range(file, node.range).map(|symbol| symbol_id(file, symbol)),
+        id: node_id(file, range),
+        symbol: symbol_for_range(file, range).map(|symbol| symbol_id(file, symbol)),
         unit: file_id(file.path()),
         language: language.clone(),
-        kind: wire_kind(&node.kind),
-        facets: language_provider(language).node_facets(&node.kind),
-        range: text_range(node.range),
+        kind: wire_kind(kind),
+        facets: language_provider(language).node_facets(kind),
+        range: text_range(range),
         regions: Vec::new(),
         parent: None,
         extensions: Extensions(BTreeMap::new()),
@@ -1402,13 +1646,7 @@ fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
 }
 
 fn symbol_node(matched: SymbolMatch<'_>) -> Node {
-    let node = matched
-        .file
-        .syntax()
-        .nodes()
-        .iter()
-        .find(|node| node.range == matched.symbol.range);
-    node.map_or_else(
+    matched.symbol.node_kind.map_or_else(
         || {
             let language = matched.file.syntax().language();
             Node {
@@ -1424,7 +1662,7 @@ fn symbol_node(matched: SymbolMatch<'_>) -> Node {
                 extensions: Extensions(BTreeMap::new()),
             }
         },
-        |node| wire_node(matched.file, node),
+        |kind| wire_node_facts(matched.file, matched.symbol.range, kind),
     )
 }
 
@@ -1660,8 +1898,36 @@ pub(crate) fn symbol_id(file: &IndexedFile, symbol: &SyntaxSymbol) -> SymbolId {
     ))
 }
 
-fn node_id(file: &IndexedFile, node: &SyntaxNode) -> NodeId {
-    NodeId(node_address(file, node.range))
+fn nodes_at_file(
+    file: &IndexedFile,
+    matched: &[SyntaxNode],
+    warnings: Vec<ReadWarning>,
+) -> NodesResult {
+    let nodes = matched.iter().map(|node| wire_node(file, node)).collect();
+    let source = matched
+        .iter()
+        .map(|node| excerpt(file, node.range))
+        .collect();
+    NodesResult {
+        nodes,
+        source,
+        warnings,
+    }
+}
+
+fn validate_node_position(file: &IndexedFile, position: u64) -> Result<(), ReadError> {
+    let source_len = file.source().len() as u64;
+    if position >= source_len {
+        return Err(ReadFault::invalid(
+            "position",
+            format!("{position} is at or past the file's byte length {source_len}"),
+        ));
+    }
+    Ok(())
+}
+
+fn node_id(file: &IndexedFile, range: ByteRange) -> NodeId {
+    NodeId(node_address(file, range))
 }
 
 fn node_address(file: &IndexedFile, range: ByteRange) -> String {
@@ -1910,22 +2176,31 @@ fn decoded(encoded: &str) -> Option<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::error::Error;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use rift_core::{LanguageFileSelections, SourceVisibility};
+    use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
+    use rift_index::{
+        LastCapture, WorkspaceIndexPreparation, WorkspaceSourcePolicy,
+        capture_digests_with_languages,
+    };
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
         GetSymbolInclude, GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult,
         PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX,
         SearchScope,
     };
+    use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
         Arc, DependenciesConfiguration, DependencyResolution, HistoryConfiguration,
         REQUESTED_PACKAGES_MAX, ReadError, ReadFault, ReadService, RequestedPackage,
-        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id, validate_requested_packages,
+        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, excerpt, file_id,
+        validate_requested_packages, wire_node,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -2382,6 +2657,337 @@ pub fn compute() -> i32 {
             value.get("warnings").is_none(),
             "a live nodes result must omit warnings when there is nothing to warn about"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_reparse_captured_source_with_selected_provider_and_bounds() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source_directory = directory.path().join("src");
+        fs::create_dir(&source_directory)?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let source = "pub struct Beacon;\nimpl Beacon { pub fn signal(&self) {} }\n";
+        let source_path = directory.path().join(path.as_str());
+        fs::write(&source_path, source)?;
+        let syntax_limits = SyntaxLimits::new(128, 64, 16)?;
+        let limits = WorkspaceIndexLimits::default().with_syntax(syntax_limits);
+        let service = ReadService::build(
+            directory.path(),
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let file = service
+            .index()
+            .file(&path)
+            .ok_or("indexed source missing")?;
+        let provider = registry::provider_for_language(file.syntax().language())
+            .ok_or("selected syntax provider missing")?;
+        let complete = provider.analyze(
+            SyntaxSource {
+                path: &path,
+                text: file.source(),
+            },
+            syntax_limits,
+        )?;
+        let position = 12;
+        let matched = complete.nodes_at(position);
+        let expected_nodes = matched
+            .iter()
+            .map(|node| wire_node(file, node))
+            .collect::<Vec<_>>();
+        let expected_source = matched
+            .iter()
+            .map(|node| excerpt(file, node.range))
+            .collect::<Vec<_>>();
+
+        fs::write(&source_path, "pub fn replacement() {}\n".repeat(40))?;
+        let actual = service.nodes(NodesParams {
+            path: ProjectPath(path.as_str().to_owned()),
+            position,
+            rev: None,
+        })?;
+
+        assert_eq!(actual.nodes, expected_nodes);
+        assert_eq!(actual.source, expected_source);
+        assert!(actual.source.iter().any(|part| part.contains("Beacon")));
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_reparse_with_path_selected_typescript_dialect() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source_directory = directory.path().join("src");
+        fs::create_dir(&source_directory)?;
+        let path = rift_core::ProjectPath::new("src/View.tsx")?;
+        let source = "const View = () => <section />;\n";
+        fs::write(directory.path().join(path.as_str()), source)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let file = service
+            .index()
+            .file(&path)
+            .ok_or("indexed TSX source missing")?;
+        assert_eq!(file.syntax().language().dialect.as_deref(), Some("tsx"));
+        let provider = registry::provider_for_language(file.syntax().language())
+            .ok_or("selected TSX provider missing")?;
+        let complete = provider.analyze(
+            SyntaxSource {
+                path: &path,
+                text: file.source(),
+            },
+            service.index().limits().syntax(),
+        )?;
+        let position = u64::try_from(source.find("section").ok_or("fixture tag missing")?)?;
+        let matched = complete.nodes_at(position);
+        let expected_nodes = matched
+            .iter()
+            .map(|node| wire_node(file, node))
+            .collect::<Vec<_>>();
+        let actual = service.nodes(NodesParams {
+            path: ProjectPath(path.as_str().to_owned()),
+            position,
+            rev: None,
+        })?;
+
+        assert_eq!(actual.nodes, expected_nodes);
+        assert!(
+            actual
+                .nodes
+                .iter()
+                .any(|node| node.language.dialect.as_deref() == Some("tsx"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_parse_a_discovered_source_before_its_batch_is_prepared() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() { let value = 1; }\n",
+        )?;
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let mut preparation =
+            WorkspaceIndexPreparation::new(directory.path(), limits, &text, &languages)?;
+        preparation.discover(&visibility, &|| false)?;
+        let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+            directory.path(),
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &|| false,
+        )?;
+        let partial = ReadService::from_prepared_index(
+            preparation.empty_snapshot()?,
+            Some(Arc::new(source_policy)),
+            Arc::new(rift_dependency::DependencyContext::default()),
+            HistoryConfiguration::default(),
+            DependenciesConfiguration {
+                resolution: DependencyResolution::Static,
+                ..DependenciesConfiguration::default()
+            },
+        );
+        let settled = reads_with(directory.path(), limits, &text, &languages)?;
+        let params: NodesParams = serde_json::from_value(json!({
+            "path": "lib.rs",
+            "position": 8
+        }))?;
+
+        let actual = partial.nodes_for_preparation(params.clone())?;
+        let expected = settled.nodes(params)?;
+        assert_eq!(actual.nodes, expected.nodes);
+        assert_eq!(actual.source, expected.source);
+        assert!(!actual.nodes.is_empty());
+        Ok(())
+    }
+
+    fn partial_nodes_service(root: &Path, limits: WorkspaceIndexLimits) -> TestResult<ReadService> {
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let mut preparation = WorkspaceIndexPreparation::new(root, limits, &text, &languages)?;
+        preparation.discover(&visibility, &|| false)?;
+        let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+            root,
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &|| false,
+        )?;
+        Ok(ReadService::from_prepared_index(
+            preparation.empty_snapshot()?,
+            Some(Arc::new(source_policy)),
+            Arc::new(rift_dependency::DependencyContext::default()),
+            HistoryConfiguration::default(),
+            DependenciesConfiguration {
+                resolution: DependencyResolution::Static,
+                ..DependenciesConfiguration::default()
+            },
+        ))
+    }
+
+    #[test]
+    fn nodes_results_match_with_unrelated_invalid_and_unparsed_sources() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/kept.rs"), "pub fn kept() {}\n")?;
+        fs::write(directory.path().join("src/invalid.rs"), [0xff])?;
+        fs::write(
+            directory.path().join("src/large.rs"),
+            format!("// {}\npub fn large() {{}}\n", "x".repeat(256)),
+        )?;
+        let syntax = SyntaxLimits::new(64, 4_096, 64)?;
+        let limits = WorkspaceIndexLimits::default().with_syntax(syntax);
+        let partial = partial_nodes_service(directory.path(), limits)?;
+        let settled = reads_with(
+            directory.path(),
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )?;
+        let params = NodesParams {
+            path: ProjectPath("src/kept.rs".to_owned()),
+            position: 0,
+            rev: None,
+        };
+
+        let actual = partial.nodes_for_preparation(params.clone())?;
+        let expected = settled.nodes(params)?;
+        assert_eq!(actual, expected);
+        assert!(actual.warnings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_preparation_returns_content_unavailable_for_own_skipped_source() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("invalid.rs"), [0xff])?;
+        fs::write(
+            directory.path().join("large.rs"),
+            format!("// {}\npub fn large() {{}}\n", "x".repeat(256)),
+        )?;
+        let syntax = SyntaxLimits::new(64, 4_096, 64)?;
+        let limits = WorkspaceIndexLimits::default().with_syntax(syntax);
+        let partial = partial_nodes_service(directory.path(), limits)?;
+        let settled = reads_with(
+            directory.path(),
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )?;
+
+        for path in ["invalid.rs", "large.rs"] {
+            let params = NodesParams {
+                path: ProjectPath(path.to_owned()),
+                position: 0,
+                rev: None,
+            };
+            let partial_error = partial
+                .nodes_for_preparation(params.clone())
+                .expect_err("an omitted source cannot answer nodes");
+            let settled_error = settled
+                .nodes(params)
+                .expect_err("settled index omits the same source");
+            assert!(matches!(
+                partial_error.fault(),
+                ReadFault::SourceUnavailable { .. }
+            ));
+            assert!(matches!(
+                settled_error.fault(),
+                ReadFault::SourceUnavailable { .. }
+            ));
+            assert_eq!(partial_error.descriptor().code(), "content_unavailable");
+            assert_eq!(settled_error.descriptor().code(), "content_unavailable");
+        }
+
+        let large_directory = tempfile::tempdir()?;
+        fs::write(
+            large_directory.path().join("large.rs"),
+            "pub fn large() {}\n",
+        )?;
+        let limits = WorkspaceIndexLimits::new(64, 8, 8_388_608, 16, 64)?;
+        let partial = partial_nodes_service(large_directory.path(), limits)?;
+        let settled = reads_with(
+            large_directory.path(),
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )?;
+        let params = NodesParams {
+            path: ProjectPath("large.rs".to_owned()),
+            position: 0,
+            rev: None,
+        };
+        let partial_error = partial
+            .nodes_for_preparation(params.clone())
+            .expect_err("a file past the catalog byte bound cannot answer nodes");
+        let settled_error = settled
+            .nodes(params)
+            .expect_err("settled index leaves the same file out");
+        assert_eq!(partial_error.descriptor().code(), "content_unavailable");
+        assert_eq!(settled_error.descriptor().code(), "content_unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_keep_stale_index_warning_without_unrelated_source_warnings() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("kept.rs"), "pub fn kept() {}\n")?;
+        fs::write(directory.path().join("invalid.rs"), [0xff])?;
+        let mut service = nodes_service(directory.path(), &SourceVisibility::default())?;
+        service.revisions = super::CapturedRevisions {
+            tree_revision: "bb".repeat(32),
+            index_tree_revision: "aa".repeat(32),
+        };
+
+        let result = nodes_at_root(&service, "kept.rs")?;
+        assert_eq!(result.warnings, service.revisions.warnings());
+        assert!(matches!(
+            result.warnings.as_slice(),
+            [ReadWarning::StaleIndex { .. }]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn nodes_for_preparation_refuses_a_known_declaration_bound_omission() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("a.rs"), "pub fn first() {}\n")?;
+        fs::write(directory.path().join("b.rs"), "pub fn later() {}\n")?;
+        let limits = WorkspaceIndexLimits::new(64, 1_048_576, 8_388_608, 16, 64)?
+            .with_workspace_bounds(64, 8_388_608, 1)?;
+        let settled = reads_with(
+            directory.path(),
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )?;
+        let params = NodesParams {
+            path: ProjectPath("b.rs".to_owned()),
+            position: 0,
+            rev: None,
+        };
+        assert!(
+            settled
+                .file_record(&rift_core::ProjectPath::new("b.rs")?)
+                .is_some()
+        );
+        let error = settled
+            .nodes_for_preparation(params)
+            .expect_err("a recorded declaration-bound omission must not be reparsed");
+        assert_eq!(error.descriptor().code(), "content_unavailable");
         Ok(())
     }
 
@@ -3060,8 +3666,7 @@ pub fn compute() -> i32 {
 
     /// A workspace holding one UTF-8-invalid source file beside a valid one: addressing
     /// the invalid file directly answers `content_unavailable`, a genuinely absent sibling
-    /// path still answers `not_found`, and reading the valid file still serves normally
-    /// while carrying a warning naming the invalid one.
+    /// path still answers `not_found`, and a valid file's node result names neither.
     #[test]
     fn nodes_distinguishes_invalid_utf8_from_absent_and_still_serves_and_warns() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -3097,17 +3702,7 @@ pub fn compute() -> i32 {
         );
 
         let kept = nodes_at_root(&service, "src/lib.rs")?;
-        let invalid_path = rift_core::ProjectPath::new("src/invalid.rs")?;
-        assert!(
-            kept.warnings.contains(&ReadWarning::SourceUnavailable {
-                unit: Some(file_id(&invalid_path)),
-                detail: "src/invalid.rs holds bytes that are not valid UTF-8, so the file is \
-                         absent from the index"
-                    .to_owned(),
-            }),
-            "the valid file still serves and its result names the skipped one: {:?}",
-            kept.warnings
-        );
+        assert!(kept.warnings.is_empty());
         Ok(())
     }
 
@@ -4798,5 +5393,468 @@ pub fn compute() -> i32 {
         let assembled = disagreeing_assembly(None);
         assert!(!assembled.disagreements().is_empty());
         assert_eq!(super::symbol_disagreement_warning(&assembled), None);
+    }
+
+    const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+    const GIT_CAPTURE_BYTES: usize = 32 << 10;
+
+    fn bounded_git(
+        root: &Path,
+        global_config: &Path,
+        options: &[&str],
+        arguments: &[&str],
+    ) -> TestResult<String> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", global_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_AUTHOR_NAME", "Rift Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@rift.invalid")
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00 +0000")
+            .env("GIT_COMMITTER_NAME", "Rift Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@rift.invalid")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00 +0000")
+            .args([
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+            ]);
+        for option in options {
+            command.args(["-c", option]);
+        }
+        command.args(arguments);
+
+        let run = crate::process::run_bounded(&mut command, GIT_TIMEOUT, GIT_CAPTURE_BYTES)?;
+        assert!(!run.timed_out, "git {arguments:?} exceeded {GIT_TIMEOUT:?}");
+        assert!(
+            !run.stdout.truncated && !run.stderr.truncated,
+            "git {:?} output exceeded {GIT_CAPTURE_BYTES} bytes: stdout={:?}, stderr={:?}",
+            arguments,
+            run.stdout,
+            run.stderr
+        );
+        let status = run.exit?;
+        assert!(
+            status.success(),
+            "git {:?} failed with {status}: stdout={:?}, stderr={:?}",
+            arguments,
+            run.stdout.text,
+            run.stderr.text
+        );
+        Ok(run.stdout.text)
+    }
+
+    fn set_modified(path: &Path, modified: SystemTime) -> TestResult {
+        OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_modified(modified)?;
+        assert_eq!(
+            fs::metadata(path)?.modified()?,
+            modified,
+            "filesystem retains exact requested modification time for {}",
+            path.display()
+        );
+        Ok(())
+    }
+
+    fn git_cached_modified(root: &Path, global_config: &Path) -> TestResult<SystemTime> {
+        let debug = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["ls-files", "--debug", "--", "source.rs"],
+        )?;
+        let value = debug
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("mtime:"))
+            .ok_or("git ls-files --debug omitted cached mtime")?
+            .trim();
+        let (seconds, nanoseconds) = value
+            .split_once(':')
+            .ok_or("git ls-files --debug returned malformed cached mtime")?;
+        let modified = UNIX_EPOCH
+            .checked_add(Duration::new(seconds.parse()?, nanoseconds.parse()?))
+            .ok_or("cached mtime is outside SystemTime range")?;
+        Ok(modified)
+    }
+
+    fn paired_capture(
+        root: &Path,
+        last: &LastCapture,
+        git_status: &str,
+        case: &str,
+    ) -> TestResult<(rift_index::WorkspaceDigests, LastCapture)> {
+        let (captured, next) = capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            last,
+        )?;
+        let cold = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        assert_eq!(
+            captured,
+            cold.digests(),
+            "incremental capture must match cold build after {case}; Git status={git_status:?}"
+        );
+        Ok((captured, next))
+    }
+
+    fn stage_source(root: &Path, global_config: &Path) -> TestResult {
+        bounded_git(root, global_config, &[], &["add", "-A"])?;
+        Ok(())
+    }
+
+    fn commit_staged(root: &Path, global_config: &Path, allow_empty: bool) -> TestResult {
+        let mut arguments = vec!["commit", "--quiet", "-m", "fixture"];
+        if allow_empty {
+            arguments.push("--allow-empty");
+        }
+        bounded_git(root, global_config, &[], &arguments)?;
+        Ok(())
+    }
+
+    fn commit_source(root: &Path, global_config: &Path, allow_empty: bool) -> TestResult {
+        stage_source(root, global_config)?;
+        commit_staged(root, global_config, allow_empty)
+    }
+
+    fn check_ordinary_git_edit(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        previous: &mut rift_index::WorkspaceDigests,
+        last: &mut LastCapture,
+    ) -> TestResult {
+        let same_size = fs::metadata(source)?.len();
+        fs::write(source, b"fn bravo() {}\n")?;
+        assert_eq!(
+            fs::metadata(source)?.len(),
+            same_size,
+            "ordinary edit retains file size"
+        );
+        let ordinary_status = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            !ordinary_status.is_empty(),
+            "ordinary edit must appear in Git status: {ordinary_status:?}"
+        );
+        let (captured, next) = paired_capture(root, last, &ordinary_status, "ordinary edit")?;
+        assert_ne!(
+            captured, *previous,
+            "ordinary edit changes captured digests"
+        );
+        *previous = captured;
+        *last = next;
+        eprintln!("paired Git status, ordinary edit: {ordinary_status:?}");
+        commit_source(root, global_config, false)
+    }
+
+    fn check_racy_git_baseline(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        previous: &mut rift_index::WorkspaceDigests,
+        last: &mut LastCapture,
+    ) -> TestResult<SystemTime> {
+        let racy_time = UNIX_EPOCH + Duration::from_secs(1_750_000_000);
+        set_modified(source, racy_time)?;
+        commit_source(root, global_config, true)?;
+        assert_eq!(git_cached_modified(root, global_config)?, racy_time);
+        let index = root.join(".git/index");
+        set_modified(&index, racy_time)?;
+        assert_eq!(fs::metadata(&index)?.modified()?, racy_time);
+        let racy_options = ["core.trustctime=false"];
+        let racy_baseline = bounded_git(
+            root,
+            global_config,
+            &racy_options,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            racy_baseline.is_empty(),
+            "racy Git baseline={racy_baseline:?}"
+        );
+        assert_eq!(
+            git_cached_modified(root, global_config)?,
+            racy_time,
+            "Git cached mtime remains exact before racy rewrite"
+        );
+        assert_eq!(
+            fs::metadata(source)?.modified()?,
+            fs::metadata(&index)?.modified()?,
+            "source mtime equals index mtime before racy rewrite"
+        );
+        let (baseline_capture, next) =
+            paired_capture(root, last, &racy_baseline, "racy control baseline")?;
+        assert_eq!(
+            baseline_capture, *previous,
+            "racy setup preserves file contents"
+        );
+        *previous = baseline_capture;
+        *last = next;
+        Ok(racy_time)
+    }
+
+    fn check_racy_git_rewrite(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        racy_time: SystemTime,
+        previous: &mut rift_index::WorkspaceDigests,
+        last: &mut LastCapture,
+    ) -> TestResult {
+        let index = root.join(".git/index");
+        let racy_size = fs::metadata(source)?.len();
+        fs::write(source, b"fn delta() {}\n")?;
+        assert_eq!(
+            fs::metadata(source)?.len(),
+            racy_size,
+            "racy rewrite retains file size"
+        );
+        set_modified(source, racy_time)?;
+        assert_eq!(
+            fs::metadata(source)?.modified()?,
+            fs::metadata(&index)?.modified()?,
+            "source mtime equals index mtime after racy rewrite"
+        );
+        assert_eq!(git_cached_modified(root, global_config)?, racy_time);
+        let racy_options = ["core.trustctime=false"];
+        let racy_status = bounded_git(
+            root,
+            global_config,
+            &racy_options,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            !racy_status.is_empty(),
+            "Git racy content check must report equal-stat rewrite: {racy_status:?}"
+        );
+        let (captured, next) = paired_capture(root, last, &racy_status, "racy rewrite")?;
+        assert_ne!(captured, *previous, "racy rewrite changes captured digests");
+        *previous = captured;
+        *last = next;
+        eprintln!("paired Git status, racy rewrite: {racy_status:?}");
+        commit_source(root, global_config, false)
+    }
+
+    fn check_old_mtime_baseline(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        old_time: SystemTime,
+        previous: &mut rift_index::WorkspaceDigests,
+        last: &mut LastCapture,
+    ) -> TestResult {
+        set_modified(source, old_time)?;
+        commit_source(root, global_config, true)?;
+        let index = root.join(".git/index");
+        let old_mtime_index_time = fs::metadata(&index)?.modified()?;
+        assert!(old_time < old_mtime_index_time);
+        assert_eq!(git_cached_modified(root, global_config)?, old_time);
+        let old_baseline = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            old_baseline.is_empty(),
+            "old-mtime baseline={old_baseline:?}"
+        );
+        let (baseline_capture, next) =
+            paired_capture(root, last, &old_baseline, "old-mtime baseline")?;
+        assert_eq!(
+            baseline_capture, *previous,
+            "old-mtime setup preserves file contents"
+        );
+        *previous = baseline_capture;
+        *last = next;
+        Ok(())
+    }
+
+    fn check_restored_old_mtime_rewrite(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        old_time: SystemTime,
+        previous: &mut rift_index::WorkspaceDigests,
+        last: &mut LastCapture,
+    ) -> TestResult {
+        let old_mtime_size = fs::metadata(source)?.len();
+        fs::write(source, b"fn gamma() {}\n")?;
+        assert_eq!(
+            fs::metadata(source)?.len(),
+            old_mtime_size,
+            "old-mtime rewrite retains file size"
+        );
+        set_modified(source, old_time)?;
+        let old_mtime_status = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert_eq!(fs::metadata(source)?.modified()?, old_time);
+        assert_eq!(git_cached_modified(root, global_config)?, old_time);
+        let (captured, next) = paired_capture(root, last, &old_mtime_status, "restored old mtime")?;
+        assert_ne!(
+            captured, *previous,
+            "restored old-mtime rewrite changes captured digests"
+        );
+        *previous = captured;
+        *last = next;
+        eprintln!("paired Git status, restored old mtime: {old_mtime_status:?}");
+        Ok(())
+    }
+
+    fn repair_old_mtime_git_status(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        old_time: SystemTime,
+    ) -> TestResult {
+        let refreshed_time = old_time + Duration::from_secs(1);
+        set_modified(source, refreshed_time)?;
+        assert_ne!(
+            fs::metadata(source)?.modified()?,
+            git_cached_modified(root, global_config)?,
+            "commit repair must move source mtime past stale cached stat"
+        );
+        stage_source(root, global_config)?;
+        let staged_status = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            !staged_status.is_empty(),
+            "Git stages changed bytes after mtime moves past cached stat: {staged_status:?}"
+        );
+        commit_staged(root, global_config, false)?;
+        let repaired_status = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            repaired_status.is_empty(),
+            "Git status after old-mtime fixture repair={repaired_status:?}"
+        );
+        Ok(())
+    }
+
+    fn check_case_only_rename(
+        root: &Path,
+        global_config: &Path,
+        source: &Path,
+        previous: &mut rift_index::WorkspaceDigests,
+        last: &mut LastCapture,
+    ) -> TestResult {
+        let (baseline_capture, next) = paired_capture(root, last, "", "case-rename baseline")?;
+        assert_eq!(
+            baseline_capture, *previous,
+            "commit preserves capture contents"
+        );
+        *previous = baseline_capture;
+        *last = next;
+        let temporary_name = root.join("temporary.rs");
+        let case_name = root.join("Source.rs");
+        fs::rename(source, &temporary_name)?;
+        fs::rename(&temporary_name, &case_name)?;
+        let case_status = bounded_git(
+            root,
+            global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        let (captured, _) = paired_capture(root, last, &case_status, "case-only rename")?;
+        assert_ne!(
+            captured, *previous,
+            "case-only rename changes captured digests"
+        );
+        eprintln!("paired Git status, case-only rename: {case_status:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn retained_capture_matches_git_and_cold_build_across_file_mutations() -> TestResult {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("workspace");
+        fs::create_dir(&root)?;
+        let global_config = temporary.path().join("empty.gitconfig");
+        fs::write(&global_config, "")?;
+        let source = root.join("source.rs");
+        fs::write(&source, b"fn alpha() {}\n")?;
+        bounded_git(&root, &global_config, &[], &["init", "-q", "-b", "main"])?;
+        fs::write(root.join(".git/info/exclude"), ".rift/\n")?;
+        commit_source(&root, &global_config, false)?;
+        let baseline_status = bounded_git(
+            &root,
+            &global_config,
+            &[],
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(
+            baseline_status.is_empty(),
+            "initial Git status={baseline_status:?}"
+        );
+        let (mut previous, mut last) = paired_capture(
+            &root,
+            &LastCapture::default(),
+            &baseline_status,
+            "initial capture",
+        )?;
+
+        check_ordinary_git_edit(&root, &global_config, &source, &mut previous, &mut last)?;
+        let racy_time =
+            check_racy_git_baseline(&root, &global_config, &source, &mut previous, &mut last)?;
+        check_racy_git_rewrite(
+            &root,
+            &global_config,
+            &source,
+            racy_time,
+            &mut previous,
+            &mut last,
+        )?;
+        let old_time = UNIX_EPOCH + Duration::from_hours(438_288);
+        check_old_mtime_baseline(
+            &root,
+            &global_config,
+            &source,
+            old_time,
+            &mut previous,
+            &mut last,
+        )?;
+        check_restored_old_mtime_rewrite(
+            &root,
+            &global_config,
+            &source,
+            old_time,
+            &mut previous,
+            &mut last,
+        )?;
+        repair_old_mtime_git_status(&root, &global_config, &source, old_time)?;
+        check_case_only_rename(&root, &global_config, &source, &mut previous, &mut last)
     }
 }

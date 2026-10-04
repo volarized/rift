@@ -3,7 +3,9 @@
 mod capture;
 mod change_set;
 mod chunk;
+mod content_cache;
 mod database;
+mod database_thread;
 mod documentation;
 mod documentation_store;
 mod language;
@@ -21,6 +23,7 @@ pub use capture::LastCapture;
 pub use change_set::{
     ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
 };
+pub use content_cache::WorkspaceContentCache;
 pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
@@ -46,11 +49,13 @@ pub use rift_analysis::{
 pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexFailure, IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint,
-    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
-    WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests,
-    capture_digests_with_languages, declaration_identity, relative_path, source_line_matches,
-    symbol_matches, text_line_matches,
+    IndexFailure, IndexRead, IndexedFile, IndexedFileNodes, ReadableSymbol, SymbolMatch,
+    TextSourceFile, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault,
+    WorkspaceIndexLimits, WorkspaceIndexPreparation, WorkspaceIndexViolation,
+    WorkspaceIndexWarning, WorkspaceMapPaths, WorkspaceSourcePolicy, capture_digests,
+    capture_digests_with_languages, capture_digests_with_languages_cancellable,
+    capture_selected_paths_cancellable, capture_visible_digests_with_languages_cancellable,
+    declaration_identity, relative_path, source_line_matches, symbol_matches, text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

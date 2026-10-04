@@ -317,6 +317,36 @@ impl Repository {
         &self.root
     }
 
+    /// The existing canonical root of this repository's main worktree.
+    ///
+    /// Returns `None` when the repository is bare or its main worktree is
+    /// absent, unreadable, or no longer a directory.
+    #[must_use]
+    pub fn main_worktree_root(&self) -> Option<PathBuf> {
+        main_worktree_root(&self.inner)
+    }
+
+    /// The Git index lock for this workspace's worktree.
+    ///
+    /// Linked worktrees have separate index locks in their own Git directories.
+    #[must_use]
+    pub fn index_lock_path(&self) -> PathBuf {
+        self.inner.index_path().with_extension("lock")
+    }
+
+    /// Whether `root` itself is a linked Git worktree, excluding submodules.
+    ///
+    /// Classification examines the root's `.git` entry without discovering a parent.
+    #[must_use]
+    pub fn is_linked_worktree(root: &Path) -> bool {
+        matches!(
+            gix::discover::is_git(&root.join(gix::discover::DOT_GIT_DIR)),
+            Ok(gix::discover::repository::Kind::WorkTree {
+                linked_git_dir: Some(_),
+            })
+        )
+    }
+
     /// Resolves one revision spelling - a branch, tag, or commit id - to
     /// the commit it names.
     ///
@@ -913,6 +943,18 @@ pub(crate) fn storage(operation: &'static str, error: &dyn std::fmt::Display) ->
     })
 }
 
+/// The existing canonical root of `repository`'s main worktree, when it is
+/// a readable directory.
+fn main_worktree_root(repository: &gix::Repository) -> Option<PathBuf> {
+    let main = repository.main_repo().ok()?;
+    if main.is_bare() || !main.worktree()?.dot_git_exists() {
+        return None;
+    }
+    let root = std::fs::canonicalize(main.workdir()?).ok()?;
+    std::fs::read_dir(&root).ok()?;
+    root.is_dir().then_some(root)
+}
+
 use gix::bstr::ByteSlice as _;
 
 #[cfg(test)]
@@ -927,6 +969,113 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n").expect("source");
         commit_all(directory.path(), "introduce beacon");
         directory
+    }
+
+    fn add_linked_worktree(repository: &Path, parent: &Path) -> PathBuf {
+        let linked = parent.join("linked");
+        git(
+            repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().expect("temporary path is UTF-8"),
+                "HEAD",
+            ],
+        );
+        linked
+    }
+
+    #[test]
+    fn linked_worktree_classification_preserves_independent_repositories_and_submodules() {
+        let main = repository_fixture();
+        let linked_parent = tempfile::tempdir().expect("linked parent");
+        let linked = add_linked_worktree(main.path(), linked_parent.path());
+        assert!(Repository::is_linked_worktree(&linked));
+        assert!(!Repository::is_linked_worktree(main.path()));
+        let ordinary = tempfile::tempdir().expect("ordinary folder");
+        assert!(!Repository::is_linked_worktree(ordinary.path()));
+        let independent = repository_fixture();
+        git(
+            main.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                independent
+                    .path()
+                    .to_str()
+                    .expect("temporary path is UTF-8"),
+                "module",
+            ],
+        );
+        assert!(!Repository::is_linked_worktree(&main.path().join("module")));
+    }
+
+    #[test]
+    fn main_worktree_root_is_same_from_main_and_linked_worktrees() {
+        let main = repository_fixture();
+        let linked_parent = tempfile::tempdir().expect("linked parent");
+        let linked = add_linked_worktree(main.path(), linked_parent.path());
+        let canonical_main = fs::canonicalize(main.path()).expect("main root is readable");
+
+        let main_repository = Repository::open(main.path()).expect("main repository");
+        let linked_repository = Repository::open(&linked).expect("linked repository");
+        let main_common = fs::canonicalize(main_repository.common_directory())
+            .expect("main common directory is readable");
+        let linked_common = fs::canonicalize(linked_repository.common_directory())
+            .expect("linked common directory is readable");
+        assert_eq!(
+            main_repository.main_worktree_root(),
+            Some(canonical_main.clone())
+        );
+        assert_eq!(linked_repository.main_worktree_root(), Some(canonical_main));
+        assert_eq!(main_common, linked_common);
+        assert_eq!(
+            main_repository.index_lock_path(),
+            main_repository.common_directory().join("index.lock")
+        );
+        assert_ne!(
+            linked_repository.index_lock_path(),
+            main_repository.index_lock_path()
+        );
+        assert_eq!(
+            linked_repository.index_lock_path(),
+            linked_repository.inner.git_dir().join("index.lock")
+        );
+    }
+
+    #[test]
+    fn main_worktree_root_is_none_for_bare_repository() {
+        let bare = tempfile::tempdir().expect("bare repository");
+        git(bare.path(), &["init", "--bare", "-q"]);
+        let repository = gix::discover(bare.path()).expect("bare repository opens");
+
+        assert!(repository.is_bare());
+        assert_eq!(main_worktree_root(&repository), None);
+    }
+
+    #[test]
+    fn main_worktree_root_is_none_after_main_worktree_is_removed() {
+        let main = repository_fixture();
+        let main_root = main.path().to_path_buf();
+        let linked_parent = tempfile::tempdir().expect("linked parent");
+        let linked = add_linked_worktree(&main_root, linked_parent.path());
+        let repository = Repository::open(&linked).expect("linked repository");
+
+        fs::remove_dir_all(&main_root).expect("remove main worktree");
+
+        assert_eq!(repository.main_worktree_root(), None);
+    }
+
+    #[test]
+    fn repository_open_refuses_an_ordinary_folder() {
+        let directory = tempfile::tempdir().expect("ordinary folder");
+
+        assert!(Repository::open(directory.path()).is_err());
     }
 
     fn include_all(_: &str) -> bool {

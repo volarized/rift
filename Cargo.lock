@@ -2105,7 +2105,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4483,7 +4483,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "axum",
  "clap",
@@ -4528,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "flate2",
  "ignore",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "anyhow",
  "axum",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "percent-encoding",
  "rift-protocol",
@@ -4600,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "ignore",
  "rift-core",
@@ -4614,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "gix",
  "rift-core",
@@ -4626,7 +4626,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history-store"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -4639,9 +4639,11 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
+ "async-trait",
  "ignore",
+ "nix",
  "rayon",
  "regex-syntax",
  "rift-analysis",
@@ -4651,6 +4653,8 @@ dependencies = [
  "rift-provider",
  "rift-ranking",
  "rift-syntax",
+ "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -4666,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4681,7 +4685,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4689,7 +4693,9 @@ dependencies = [
  "jsonschema",
  "notify",
  "percent-encoding",
+ "rayon",
  "reqwest",
+ "rift-analysis",
  "rift-cloud-client",
  "rift-core",
  "rift-dependency",
@@ -4711,13 +4717,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
+ "windows-spawn",
 ]
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
@@ -4731,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -4741,7 +4749,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "data-encoding",
  "regex",
@@ -4754,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "jsonschema",
  "rift-analysis",
@@ -4768,7 +4776,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "axum",
  "candle-core",
@@ -4792,7 +4800,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "globset",
  "ignore",
@@ -4833,7 +4841,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.46"
+version = "0.0.47"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -5899,7 +5907,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7202,6 +7210,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-spawn"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2de3bd5b666ddb82bdd91c438afbe6a413fc21725d10e3e0b8d1d1c4afdd91c6"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

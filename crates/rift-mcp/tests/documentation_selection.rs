@@ -4,6 +4,8 @@
 //! same reconcile path every index-owned table takes.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
 
 use std::error::Error;
 use std::fs;
@@ -12,9 +14,9 @@ use std::path::Path;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
-use serde_json::{Value, json};
+use serde_json::json;
+use workspace_client::{await_workspace_ready, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -28,22 +30,15 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
             .expect("server must initialize");
         service.waiting().await.expect("server must stop cleanly");
     });
-    Ok(().serve(client_transport).await?)
+    let client = ().serve(client_transport).await?;
+    await_workspace_ready(&client).await?;
+    Ok(client)
 }
 
 /// The paths of the documentation hits a `lighthouse` query answers, sorted.
 async fn documentation_paths(client: &RunningService<RoleClient, ()>) -> TestResult<Vec<String>> {
     let arguments = json!({ "query": "lighthouse", "target": "documentation", "limit": 50 });
-    let arguments = arguments
-        .as_object()
-        .cloned()
-        .ok_or("tool arguments must be an object")?;
-    let result = client
-        .call_tool(CallToolRequestParams::new("search").with_arguments(arguments))
-        .await?;
-    let answer: Value = result
-        .structured_content
-        .ok_or("search must return structured content")?;
+    let answer = search_after_population(client, &arguments).await?;
     let mut paths: Vec<String> = answer["results"]
         .as_array()
         .ok_or_else(|| format!("search must answer results: {answer:#}"))?

@@ -1249,7 +1249,7 @@ mod tests {
         assert_eq!(latest[0].record().fields(), "{\"dropped\":8}");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_persistently_refused_batch_is_counted_as_dropped() {
         let (_directory, store) = store().await;
         let (_sink, drain) = log_capture();

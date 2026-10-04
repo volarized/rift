@@ -36,13 +36,18 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 7] = [
+const ANALYZED_SOURCES: [&str; 12] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
-    "crates/rift-index/src/lexical.rs",
+    "crates/rift-history/src/repository.rs",
+    "crates/rift-index/src",
+    "crates/rift-mcp/src/server.rs",
+    "crates/rift-mcp/src/validation.rs",
+    "crates/rift-mcp/src/validation",
     "crates/rift-provider/src",
     "crates/rift-protocol/src",
     "crates/rift-ranking/src",
+    "crates/rift-server/src/read.rs",
     "crates/rift-syntax/src",
 ];
 
@@ -360,8 +365,18 @@ mod tests {
         for expected in [
             "crates/rift-analysis/src/revision/manifest.rs",
             "crates/rift-core/src/identity.rs",
+            "crates/rift-history/src/repository.rs",
+            "crates/rift-index/src/capture.rs",
+            "crates/rift-index/src/content_cache.rs",
+            "crates/rift-index/src/documentation.rs",
+            "crates/rift-index/src/language.rs",
             "crates/rift-index/src/lexical.rs",
+            "crates/rift-index/src/workspace.rs",
+            "crates/rift-mcp/src/server.rs",
+            "crates/rift-mcp/src/validation.rs",
+            "crates/rift-mcp/src/validation/background.rs",
             "crates/rift-provider/src/normalization.rs",
+            "crates/rift-server/src/read.rs",
             "crates/rift-syntax/src/extract.rs",
             "crates/rift-syntax/src/rust.rs",
             "crates/rift-syntax/src/rust/attachment.rs",
@@ -465,6 +480,38 @@ checksum = \"def\"\n";
         let after_grammar =
             super::render_analyzer_manifest(bumped.path()).expect("the manifest renders");
         assert_ne!(rendered, after_grammar);
+    }
+
+    #[test]
+    fn test_each_local_derivation_input_changes_the_manifest() {
+        let root = manifest_root("0.25.10");
+        let sources = [
+            "crates/rift-history/src/repository.rs",
+            "crates/rift-index/src/capture.rs",
+            "crates/rift-index/src/content_cache.rs",
+            "crates/rift-index/src/documentation.rs",
+            "crates/rift-index/src/language.rs",
+            "crates/rift-index/src/lexical.rs",
+            "crates/rift-index/src/workspace.rs",
+            "crates/rift-mcp/src/server.rs",
+            "crates/rift-mcp/src/validation.rs",
+            "crates/rift-mcp/src/validation/background.rs",
+            "crates/rift-server/src/read.rs",
+        ];
+        for source in sources {
+            std::fs::write(root.path().join(source), "// local derivation\n")
+                .expect("the local source is written");
+        }
+        let mut previous =
+            super::render_analyzer_manifest(root.path()).expect("the manifest renders");
+        for source in sources {
+            std::fs::write(root.path().join(source), "// changed local derivation\n")
+                .expect("the local source is rewritten");
+            let current =
+                super::render_analyzer_manifest(root.path()).expect("the manifest renders");
+            assert_ne!(previous, current, "{source} must invalidate local reuse");
+            previous = current;
+        }
     }
 
     #[test]

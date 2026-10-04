@@ -15,10 +15,56 @@ mod harness;
 mod rust_engine;
 
 use harness::{
-    StopOnDrop, TestResult, assigned_port_key, laid_out_workspace, proxied_call, proxy_client,
-    require_success, run_rift,
+    StopOnDrop, TestResult, assigned_port_key, await_workspace_ready, laid_out_workspace,
+    proxied_call, proxy_client, require_success, run_rift, within,
 };
 use serde_json::json;
+use std::time::Duration;
+
+/// Calls `search` until the lexical population pass has landed.
+///
+/// Workspace map readiness covers local file preparation. The lexical lane commits its
+/// initial write behind that publication, so a search can still return identifier matches
+/// with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
+///
+/// # Errors
+///
+/// Returns an error if the store does not rank the answer after 60 polling delays and up
+/// to 60 follow-up requests. The 50 ms delays total at most three seconds; request time
+/// is additional. Each proxied call allows up to eight attempts, each with a 45-second
+/// timeout.
+async fn search_after_population(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    arguments: &serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
+    const SEARCH_TIER_POLL: Duration = Duration::from_millis(50);
+
+    let query = arguments["query"].as_str().unwrap_or("<missing query>");
+    let mut answer = proxied_call(client, "search", arguments).await?;
+    for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+        let population_pending =
+            answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    matches!(
+                        warning["code"].as_str(),
+                        Some("lexical_ranking_unavailable" | "stale_index")
+                    )
+                });
+        if !population_pending {
+            return Ok(answer);
+        }
+        tokio::time::sleep(SEARCH_TIER_POLL).await;
+        answer = proxied_call(client, "search", arguments).await?;
+    }
+    Err(format!(
+        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+    )
+    .into())
+}
 
 // Defect 7 - `TextFileInclusion::includes` matched `path.extension()`, which
 // answers `None` for an extensionless path, so no `[search.text]` entry
@@ -53,10 +99,11 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let client = proxy_client(root).await?;
+    // Issue #511: full-text hits require local file preparation and lexical population.
+    within("workspace preparation", await_workspace_ready(&client)).await??;
 
-    let mdx = proxied_call(
+    let mdx = search_after_population(
         &client,
-        "search",
         &json!({ "query": "agentic development toolkit", "target": "file", "limit": 50 }),
     )
     .await?;
@@ -79,9 +126,8 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
         "a text-lane hit claims the content lane: {mdx:#}"
     );
 
-    let just = proxied_call(
+    let just = search_after_population(
         &client,
-        "search",
         &json!({ "query": "cargo fmt --all --check", "limit": 50 }),
     )
     .await?;

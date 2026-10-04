@@ -7,14 +7,15 @@
 //! lock document live beside the spawn, so every caller shares one meaning
 //! of "the server came up in time".
 
-use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{self, Read, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+mod process;
+use process::{Child, Command, Stdio, detached_command_for, spawn_detached};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CapturedStream, CliCode, ErrorName, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
@@ -61,29 +62,6 @@ pub const START_SPAWN_COUNT_MAX: u32 = 4;
 /// exit: the refusal a server exits on is the last thing it writes there.
 const EXIT_STDERR_TAIL_BYTES: u64 = 8 << 10;
 
-/// Keeps a detached child completely off this process's terminal and
-/// process group (unix half).
-#[cfg(unix)]
-fn detach(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    command.process_group(0);
-}
-
-/// `CreateProcess` flag detaching the child from the parent console.
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x8;
-/// `CreateProcess` flag giving the child its own signal group.
-#[cfg(windows)]
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-
-/// Keeps a detached child completely off this process's console and
-/// process group (windows half).
-#[cfg(windows)]
-fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-}
-
 /// Builds the detached-server command every spawn shares: this binary
 /// again, `server start --foreground`, run inside `root`, off this
 /// process's terminal and process group. Stdin and stdout are always
@@ -100,23 +78,6 @@ fn detached_command(root: &Path) -> Result<Command, io::Error> {
         ["server", "start", "--foreground"],
         root,
     ))
-}
-
-/// The detached shape over any program: run inside `root`, off this
-/// process's terminal and process group, stdin and stdout null.
-fn detached_command_for(
-    program: impl AsRef<OsStr>,
-    arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    root: &Path,
-) -> Command {
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    detach(&mut command);
-    command
 }
 
 /// Spawns `rift server start --foreground` for `root`, fully detached,
@@ -151,7 +112,7 @@ pub fn spawn_detached_server(root: &Path) -> Result<SpawnedServer, io::Error> {
     let destination = stderr_destination(root);
     let stderr = destination.is_some().then(|| stderr_file_path(root));
     command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
-    let child = command.spawn()?;
+    let child = spawn_detached(&mut command)?;
     Ok(SpawnedServer { child, stderr })
 }
 
@@ -287,7 +248,7 @@ pub(crate) fn spawn_detached_server_with_captured_stderr(
 ) -> Result<StartupCapture, io::Error> {
     let mut command = detached_command(root)?;
     command.stderr(Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut child = spawn_detached(&mut command)?;
     let Some(stderr) = child.stderr.take() else {
         return Err(io::Error::other(
             "the spawned server's stderr pipe was not handed over",
@@ -672,7 +633,7 @@ mod tests {
         let stderr = destination.is_some().then(|| stderr_file_path(root));
         command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
         Ok(SpawnedServer {
-            child: command.spawn()?,
+            child: super::spawn_detached(&mut command)?,
             stderr,
         })
     }
