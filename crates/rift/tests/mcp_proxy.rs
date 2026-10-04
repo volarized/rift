@@ -1164,7 +1164,7 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
         )
         .await;
         assert!(
-            !root.join(".rift/db").exists(),
+            !root.join(".rift/index").exists(),
             "a refused child cannot open the held workspace database"
         );
         lingering.unlock()?;

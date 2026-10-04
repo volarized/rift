@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime};
 
 use axum::http::{HeaderName, HeaderValue};
 use rift_core::CapturedStream;
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
+use rift_core::constants::{
+    INDEX_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY, WRITE_AHEAD_LOG_SUFFIX,
+};
 use rift_error::{RiftError, errors};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
@@ -49,10 +51,6 @@ use crate::spawn::{
     StartSpawns, StartupCapture,
 };
 use crate::validation::ConfigurationState;
-
-/// The suffix `SQLite` gives a WAL database's write-ahead log, appended to the
-/// database file's name.
-const WRITE_AHEAD_LOG_SUFFIX: &str = "-wal";
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -618,12 +616,11 @@ async fn connect_upstream(
     start_window_refusal(building && opened != closed).fail()
 }
 
-/// What the workspace database's files looked like at one instant: each
+/// What the index database's files looked like at one instant: each
 /// file's length and modification time, or nothing for an absent file.
 ///
-/// A server records its diagnostics into `.rift/db` from before it claims the
-/// election, while it builds its first index too, and `SQLite` in WAL mode
-/// appends each commit to the write-ahead log. Two readings that differ
+/// A server writes `.rift/index` while it builds its first index, and `SQLite`
+/// in WAL mode appends each commit to the write-ahead log. Two readings that differ
 /// therefore show that a process wrote between them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseActivity {
@@ -650,9 +647,9 @@ impl DatabaseActivity {
     /// Reads the database file and its write-ahead log below `root`.
     fn read(root: &Path) -> Self {
         let state = root.join(RIFT_STATE_DIRECTORY);
-        let database = state.join(WORKSPACE_DATABASE_FILE_NAME);
+        let database = state.join(INDEX_DATABASE_FILE_NAME);
         let log = state.join(format!(
-            "{WORKSPACE_DATABASE_FILE_NAME}{WRITE_AHEAD_LOG_SUFFIX}"
+            "{INDEX_DATABASE_FILE_NAME}{WRITE_AHEAD_LOG_SUFFIX}"
         ));
         Self {
             files: [database, log].map(|path| {
@@ -2113,7 +2110,7 @@ mod tests {
     async fn a_building_holder_refuses_with_a_retryable_refusal() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = claim(directory.path())?;
-        let log = directory.path().join(".rift").join("db-wal");
+        let log = directory.path().join(".rift").join("index-wal");
         let writing = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             std::fs::write(&log, b"a commit the building server wrote")
@@ -2189,10 +2186,13 @@ mod tests {
         let before = super::DatabaseActivity::read(directory.path());
         assert_eq!(before.files, [None, None]);
         std::fs::create_dir_all(directory.path().join(".rift"))?;
-        std::fs::write(directory.path().join(".rift").join("db"), b"pages")?;
+        std::fs::write(directory.path().join(".rift").join("index"), b"pages")?;
         let written = super::DatabaseActivity::read(directory.path());
         assert_ne!(written, before);
-        std::fs::write(directory.path().join(".rift").join("db-wal"), b"a commit")?;
+        std::fs::write(
+            directory.path().join(".rift").join("index-wal"),
+            b"a commit",
+        )?;
         assert_ne!(super::DatabaseActivity::read(directory.path()), written);
         Ok(())
     }

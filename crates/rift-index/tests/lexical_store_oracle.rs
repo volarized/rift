@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
+use rift_index::DatabaseName;
 use rift_index::{
     DatabasePool, LastCapture, LexicalChange, LexicalIndexLimits, LexicalSearchIndex, LexicalStamp,
     PathChanges, RevisionScoped, WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits,
@@ -223,7 +224,7 @@ impl Kept {
         let cold = TempDir::new()?;
         let cold_path = cold.path().join("db");
         let cold_store = LexicalSearchIndex::attached(
-            WorkspaceDatabase::open(&cold_path, pool()).await?,
+            WorkspaceDatabase::open(&cold_path, DatabaseName::Index, pool()).await?,
             LexicalIndexLimits::default(),
         );
         cold_store
@@ -278,7 +279,7 @@ async fn an_incremental_store_equals_a_cold_build_of_the_same_tree() -> TestResu
     let database_directory = TempDir::new()?;
     let database = database_directory.path().join("db");
     let store = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database, pool()).await?,
+        WorkspaceDatabase::open(&database, DatabaseName::Index, pool()).await?,
         LexicalIndexLimits::default(),
     );
     let index = index_of(&root)?;

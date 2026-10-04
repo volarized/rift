@@ -6,18 +6,38 @@
 //! that moves or is renamed keeps its text, so it keeps its vector and the
 //! refresh embeds only what actually changed.
 //!
-//! The rows live in the workspace database the lexical index already owns.
-//! Toasty records applied migrations in one table per file, so one migration
-//! set covers both tiers and each store applies the same idempotent set.
+//! The rows live in the vectors database, a file apart from the index database,
+//! so a vector write never waits on the index database's write turn. No
+//! transaction spans lexical and vector rows: a vector is keyed by model and
+//! digest alone.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rift_error::{RiftError, errors};
 use toasty::db::Connection;
+use toasty::migration::{MigrationFile, MigrationSet};
 use toasty::stmt::{Type, Value};
 
-use crate::database::WorkspaceDatabase;
+use crate::database::{DatabaseName, WorkspaceDatabase};
+
+/// The schema of the vectors database, from its first migration.
+const VECTORS_MIGRATION_FILES: &[MigrationFile] = &[MigrationFile::new(
+    1,
+    "semantic_vectors",
+    "CREATE TABLE semantic_vectors(
+        identity TEXT PRIMARY KEY NOT NULL,
+        model TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        dimension BIGINT NOT NULL,
+        vector BLOB NOT NULL
+    )
+-- #[toasty::breakpoint]
+CREATE INDEX semantic_vectors_model ON semantic_vectors(model)",
+)];
+/// The vectors database's migration set; Toasty records it in the file's own
+/// `__toasty_migrations` table.
+pub(crate) const VECTORS_MIGRATIONS: MigrationSet = MigrationSet::new(VECTORS_MIGRATION_FILES);
 
 /// One stored vector: what produced it, what it came from, and its values.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,12 +79,16 @@ pub struct VectorStore {
 }
 
 impl VectorStore {
-    /// Attaches the vector ranking to one already-open workspace database.
+    /// Attaches the vector ranking to the open vectors database.
     ///
-    /// The pool is shared with the lexical tier and the log store, because
-    /// `SQLite` serializes writers per file rather than per connection.
+    /// # Panics
+    ///
+    /// Panics when `database` is not the vectors database: its file holds no
+    /// `semantic_vectors` table.
     #[must_use]
+    #[track_caller]
     pub fn attached(database: Arc<WorkspaceDatabase>) -> Self {
+        database.name().assert_is(DatabaseName::Vectors);
         Self { database }
     }
 
@@ -367,7 +391,7 @@ pub(crate) struct VectorRecord {
 #[cfg(test)]
 mod tests {
     use super::{StoredVector, VectorStore, address, decode, encode};
-    use crate::DatabasePool;
+    use crate::{DatabaseName, DatabasePool};
     use std::collections::BTreeSet;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -400,7 +424,12 @@ mod tests {
     async fn opened(
         directory: &std::path::Path,
     ) -> Result<VectorStore, Box<dyn std::error::Error>> {
-        let database = crate::WorkspaceDatabase::open(&directory.join("db"), pool()).await?;
+        let database = crate::WorkspaceDatabase::open(
+            &DatabaseName::Vectors.path(directory),
+            DatabaseName::Vectors,
+            pool(),
+        )
+        .await?;
         Ok(VectorStore::attached(database))
     }
 

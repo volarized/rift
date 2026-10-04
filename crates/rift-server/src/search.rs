@@ -1768,6 +1768,7 @@ mod tests {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
             .disable_vector()
             .build();
+        std::fs::create_dir_all(database)?;
         let store = SearchIndex::open(database, limits).await?;
         let documents = service.index_documents();
         store

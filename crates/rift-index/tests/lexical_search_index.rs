@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use rift_core::{ProjectPath, SourceUnitId};
 use rift_error::errors;
+use rift_index::DatabaseName;
 use rift_index::{DatabasePool, FileDigest, WorkspaceDatabase, WorkspaceDigests};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
@@ -157,7 +158,7 @@ async fn test_lexical_search_index_precise_requires_every_term_and_broad_widens_
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -207,7 +208,7 @@ async fn test_lexical_search_index_a_quoted_phrase_stays_one_phrase_in_both_phas
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -236,7 +237,7 @@ async fn test_lexical_search_index_search_names_the_column_that_carried_the_term
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -284,7 +285,7 @@ async fn test_lexical_search_index_search_reaches_a_document_through_any_one_fie
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -346,7 +347,7 @@ async fn test_lexical_search_index_search_orders_better_match_first() -> TestRes
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -376,7 +377,7 @@ async fn test_lexical_search_index_search_limit_and_matches_max_cap_results() ->
     let limits = LexicalIndexLimits::new(100, 1_048_576, 2, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         limits,
     );
 
@@ -407,7 +408,7 @@ async fn test_lexical_search_index_search_names_the_bound_a_match_lies_past() ->
     let limits = LexicalIndexLimits::new(100, 1_048_576, 2, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         limits,
     );
 
@@ -453,7 +454,7 @@ async fn test_lexical_search_index_search_empty_query_returns_empty() -> TestRes
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -471,7 +472,7 @@ async fn test_lexical_search_index_open_with_single_pool_slot_still_serves_searc
     let path = database_path(&directory);
     let limits = LexicalIndexLimits::new(100, 1_048_576, 100, 1, 1_000);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         limits,
     );
 
@@ -494,7 +495,7 @@ async fn test_lexical_search_index_replace_all_over_units_max_refuses_and_prior_
     let limits = LexicalIndexLimits::new(1, 1_048_576, 100, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         limits,
     );
 
@@ -526,7 +527,7 @@ async fn test_lexical_search_index_replace_all_content_over_bytes_max_refuses_na
     let limits = LexicalIndexLimits::new(100, 8, 100, 4, 1_000);
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         limits,
     );
 
@@ -548,7 +549,7 @@ async fn test_lexical_search_index_replace_all_refuses_a_document_addressed_by_a
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     index
@@ -594,7 +595,7 @@ async fn test_lexical_search_index_replace_all_duplicate_identity_refuses_atomic
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -624,7 +625,7 @@ async fn test_lexical_search_index_second_replace_all_fully_supersedes_first() -
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -647,7 +648,7 @@ async fn test_lexical_search_index_tree_revision_none_then_some_after_replace_al
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -664,7 +665,7 @@ async fn test_lexical_search_index_content_returns_each_kind_s_own_field_and_non
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -699,7 +700,7 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows() -> T
     let path = database_path(&directory);
 
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     let documents = [text_document("docs/a.md", "persisted content")?];
@@ -707,7 +708,7 @@ async fn test_lexical_search_index_reopen_from_file_serves_persisted_rows() -> T
     drop(index);
 
     let reopened = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     assert_eq!(
@@ -732,7 +733,7 @@ async fn test_lexical_search_index_symbol_and_text_file_documents_coexist() -> T
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -777,7 +778,7 @@ async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_signature_hit
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -830,7 +831,7 @@ async fn test_lexical_search_index_search_finds_camel_case_name_by_expanded_word
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -898,7 +899,7 @@ async fn test_lexical_search_index_content_sees_only_committed_writes_during_con
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -983,7 +984,7 @@ async fn test_lexical_search_index_search_stored_invalid_path_refuses() -> TestR
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     // The stamp qualifies the query, so the store carries one before the corrupt row
@@ -1017,7 +1018,7 @@ async fn test_lexical_search_index_search_stored_invalid_kind_refuses() -> TestR
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     index.replace_all(&[], "revision-1").await?;
@@ -1050,9 +1051,9 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
     let directory = TempDir::new()?;
     let path = directory.path().join("missing-parent").join("lexical.db");
 
-    let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
+    let outcome = WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await;
     let error = outcome.expect_err("opening under a missing parent directory must refuse");
-    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
+    assert_eq!(error.slug(), errors::index::database_failed::SLUG);
     // The open creates the migration lock file beside the database first, so the refusal
     // names that file, in the same missing directory.
     let lock_path = path.with_file_name("lexical.db.lock");
@@ -1064,11 +1065,11 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
     Ok(())
 }
 
-/// Table shape mirroring the first migration's `lexical_units` so a raw connection can
+/// Table shape mirroring the first migration's `lexical_documents` so a raw connection can
 /// create a conflicting table before the adapter ever opens the path: same table name,
 /// incompatible columns.
 #[derive(Debug, toasty::Model)]
-#[table = "lexical_units"]
+#[table = "lexical_documents"]
 struct ConflictingUnitRecord {
     #[key]
     identity: String,
@@ -1088,24 +1089,24 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
     let directory = TempDir::new()?;
     let path = database_path(&directory);
 
-    // Pre-create a `lexical_units` table with the wrong shape through a raw
+    // Pre-create a `lexical_documents` table with the wrong shape through a raw
     // connection, bypassing the adapter's own migrations entirely. `open`'s
     // own build step succeeds (the file and a connection are perfectly
-    // usable); only the later `MIGRATIONS.apply` call fails, since the first
-    // migration's `CREATE TABLE lexical_units` collides with the one already
+    // usable); only the later migration apply fails, since the first
+    // migration's `CREATE TABLE lexical_documents` collides with the one already
     // present.
     let probe_database = open_conflicting_schema_probe(&path).await?;
     let mut probe_connection = probe_database.connection().await?;
-    toasty::sql::statement("CREATE TABLE lexical_units(id INTEGER PRIMARY KEY)")
+    toasty::sql::statement("CREATE TABLE lexical_documents(id INTEGER PRIMARY KEY)")
         .exec(&mut probe_connection)
         .await?;
     drop(probe_connection);
     drop(probe_database);
 
-    let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
+    let outcome = WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await;
     let error =
         outcome.expect_err("migration apply against a pre-existing conflicting table must refuse");
-    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
+    assert_eq!(error.slug(), errors::index::database_failed::SLUG);
     assert!(
         error
             .context()
@@ -1113,7 +1114,7 @@ async fn test_lexical_search_index_open_migration_apply_conflict_refuses_distinc
     );
     assert!(
         std::error::Error::source(&error)
-            .is_some_and(|source| source.to_string().contains("lexical_units")),
+            .is_some_and(|source| source.to_string().contains("lexical_documents")),
         "migration failure must preserve the underlying SQL conflict, not just a build failure"
     );
     Ok(())
@@ -1125,7 +1126,7 @@ async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, DatabasePool::new(4, 25)).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, DatabasePool::new(4, 25)).await?,
         LexicalIndexLimits::default(),
     );
 
@@ -1159,7 +1160,12 @@ async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_
 async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     let documents = [
@@ -1217,7 +1223,12 @@ async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest() 
 async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_path() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     // A chunked text file files every chunk under its own path, so one delete by path has
@@ -1253,7 +1264,12 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
     let directory = TempDir::new()?;
     let limits = LexicalIndexLimits::new(2, 65_536, 64, 4, 1_000);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         limits,
     );
     index
@@ -1293,7 +1309,12 @@ async fn test_lexical_search_index_apply_refuses_two_documents_sharing_one_ident
 {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     index
@@ -1328,7 +1349,7 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     index
@@ -1344,7 +1365,7 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
     drop(index);
 
     let reopened = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     assert_eq!(
@@ -1370,7 +1391,7 @@ async fn test_lexical_search_index_deletes_one_path_through_its_own_index() -> T
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     drop(index);
@@ -1399,7 +1420,12 @@ async fn test_lexical_search_index_search_under_another_revision_names_the_store
 {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     index
@@ -1424,7 +1450,12 @@ async fn test_lexical_search_index_search_before_any_population_reports_no_revis
 {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
 
@@ -1442,7 +1473,12 @@ async fn test_lexical_search_index_search_before_any_population_reports_no_revis
 async fn test_lexical_search_index_search_qualifies_an_empty_query_by_revision_too() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
 
@@ -1472,7 +1508,12 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_document
 {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     index.replace_all(&[], "revision-one").await?;
@@ -1580,7 +1621,7 @@ async fn test_typed_insert_batches_preserve_documents_and_both_indexes() -> Test
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     for count in [64, 65] {
@@ -1627,7 +1668,7 @@ async fn test_a_later_typed_insert_batch_failure_rolls_back_the_whole_change() -
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     let prior = text_document("docs/batch.md", "priorcontent")?;
@@ -1712,7 +1753,12 @@ async fn test_lexical_search_index_recorded_files_answer_what_one_derivation_rec
 {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     assert_eq!(
@@ -1781,7 +1827,12 @@ async fn test_lexical_search_index_recorded_files_answer_what_one_derivation_rec
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lexical_search_index_recorded_files_past_units_max_refuse() -> TestResult {
     let directory = TempDir::new()?;
-    let database = WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?;
+    let database = WorkspaceDatabase::open(
+        &database_path(&directory),
+        DatabaseName::Index,
+        database_pool(),
+    )
+    .await?;
     let writer = LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
     let files = vec![
         recorded("a.rs", b"a")?,
@@ -1836,7 +1887,12 @@ async fn test_lexical_search_index_a_whole_replace_records_nothing_a_later_write
 -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     let alpha = recorded("alpha.rs", b"pub fn alpha() {}")?;
@@ -1865,7 +1921,12 @@ async fn test_lexical_search_index_an_unpublished_stamp_answers_no_revision_and_
 -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     index
@@ -1903,7 +1964,7 @@ async fn test_lexical_search_index_clear_empties_rows_records_and_the_publicatio
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     let zeta = recorded("zeta.md", b"zeta notes")?;
@@ -1948,7 +2009,7 @@ async fn test_lexical_search_index_keeps_the_full_text_index_in_step_with_the_ro
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     let chunks = [
@@ -2048,7 +2109,12 @@ async fn test_chunk_rows_carry_their_offset_in_the_file() -> TestResult {
     let workspace = chunked_index(tree.path())?;
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     index
@@ -2085,7 +2151,12 @@ async fn test_a_ranked_file_row_states_the_bytes_of_its_file_it_holds() -> TestR
     let workspace = chunked_index(tree.path())?;
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     let mut documents = workspace.index_documents();
@@ -2140,7 +2211,12 @@ async fn test_a_ranked_file_row_states_the_bytes_of_its_file_it_holds() -> TestR
 async fn test_file_row_frequencies_count_file_rows_holding_each_term() -> TestResult {
     let directory = TempDir::new()?;
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database_path(&directory),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     let documents = [
@@ -2179,7 +2255,7 @@ async fn test_the_store_holds_one_copy_of_the_text() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let _index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&path, database_pool()).await?,
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
         LexicalIndexLimits::default(),
     );
     let probe = open_concurrent_probe(&path).await?;

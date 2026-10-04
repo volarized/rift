@@ -7725,6 +7725,7 @@ pub(crate) mod tests {
             defaults.busy_timeout_ms(),
         );
         let limits = SearchIndexLimits::builder(lexical).disable_vector().build();
+        std::fs::create_dir_all(database)?;
         Ok(SearchIndex::open(database, limits).await?)
     }
 
@@ -9228,6 +9229,7 @@ pub(crate) mod tests {
     /// no trace at all, and the lexical stamp now belongs to the lexical lane.
     async fn counting_index(database: &std::path::Path) -> TestResult<SearchIndex> {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default()).build();
+        std::fs::create_dir_all(database)?;
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(
             index.pass_readiness(),
@@ -9511,6 +9513,7 @@ pub(crate) mod tests {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
             .disable_vector()
             .build();
+        std::fs::create_dir_all(database)?;
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
         Ok(index)

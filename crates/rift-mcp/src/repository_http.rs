@@ -143,6 +143,7 @@ struct RepositoryWorkspace {
     supervisor: IndexSupervisor,
     engines: Arc<EngineHold>,
     database: Option<Arc<rift_index::WorkspaceDatabase>>,
+    vectors: Option<Arc<rift_index::LazyDatabase>>,
     logs: Option<Arc<rift_tracing::LogStore>>,
     stop: CancellationToken,
     activity: Arc<IdleTracker>,
@@ -420,6 +421,7 @@ impl RepositoryWorkspaceRegistry {
         let lease = Arc::new(lease);
         let storage = WorkspaceStorage::open_with_owner(&root, Some(Arc::clone(&lease))).await;
         let database = storage.database();
+        let vectors = storage.vectors();
         let logs = storage.logs();
         let server = RiftMcp::build_with_storage_and_executor(
             &root,
@@ -448,6 +450,7 @@ impl RepositoryWorkspaceRegistry {
             supervisor,
             engines,
             database,
+            vectors,
             logs,
             stop: service_stop,
             activity,
@@ -600,16 +603,26 @@ async fn stop_repository_workspace(
                 .error()
         });
     let supervisor = workspace.supervisor.shutdown(deadline).await;
-    let database = if let Some(database) = workspace.database.as_ref() {
-        database.shutdown(deadline).await.map_err(|error| {
-            errors::mcp::http_serve_failed()
-                .operation("SQLite worker shutdown")
-                .cause(error)
-                .error()
-        })
-    } else {
-        Ok(())
-    };
+    let (index, vectors) = tokio::join!(
+        async {
+            match workspace.database.as_ref() {
+                Some(database) => database.shutdown(deadline).await,
+                None => Ok(()),
+            }
+        },
+        async {
+            match workspace.vectors.as_ref() {
+                Some(vectors) => vectors.shutdown(deadline).await,
+                None => Ok(()),
+            }
+        }
+    );
+    let database = index.and(vectors).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("SQLite worker shutdown")
+            .cause(error)
+            .error()
+    });
     let logs = crate::http::close_logs(workspace.logs.as_deref(), deadline).await;
     let outcome = engines.and(supervisor).and(database).and(logs);
     if outcome.is_ok() {

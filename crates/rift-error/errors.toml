@@ -434,6 +434,11 @@ message = "lexical index operation failed"
 action = "check filesystem permissions and free space, then retry"
 fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
 
+[error.index.database_failed]
+message = "index storage failed on the {database} database at {path}"
+action = "check filesystem permissions and free space below the workspace state directory, then retry"
+fields = { database = { type = "string" }, path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
 [error.index.lexical_unit_limit]
 message = "lexical index received more units than its accepted limit of {maximum}"
 action = "reduce indexed units below {maximum} and retry"
