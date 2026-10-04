@@ -27,8 +27,8 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SYMBOL_URI_PREFIX};
 use rift_core::line;
 use rift_index::{
-    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, PatternCandidates,
-    SymbolMatch, TextSourceFile, WorkspaceIndex,
+    IndexedFile, LexicalChange, PathChanges, PathMatcher, PatternCandidates, SymbolMatch,
+    TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
@@ -407,8 +407,7 @@ impl ReadService {
                 self.index().root(),
                 &pattern_strings(&selector.force_include),
                 &[],
-            )
-            .map_err(|error| error.index_error())?;
+            )?;
         }
         Ok(())
     }
@@ -838,10 +837,10 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
         validate_path_selector(selector)?;
     }
     if let Some(conflict) = commit::commit_conflict(params) {
-        return Err(conflict);
+        return conflict.fail();
     }
     if let Some(conflict) = pattern::pattern_conflict(params) {
-        return Err(conflict);
+        return conflict.fail();
     }
     if let Some(change) = params.change.as_ref() {
         validate_change(change, params)?;
@@ -1005,7 +1004,6 @@ pub(crate) fn path_matcher(
         &pattern_strings(&selector.exclude),
     )
     .map(Some)
-    .map_err(|error| error.index_error())
 }
 
 fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {
@@ -1726,7 +1724,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use rift_core::{Fault as _, SourceVisibility};
+    use rift_core::SourceVisibility;
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
     use rift_protocol::read::{
@@ -1743,8 +1741,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ByteRange, CandidateScreen, HitPayloads, IdentifierSources, ReadService, Resolution,
-        SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer, declaration_text, resolve_symbol,
+        ByteRange, CURRENT_TREE_ALONE, CandidateScreen, HitPayloads, IdentifierSources,
+        ReadService, Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
+        declaration_text, resolve_symbol,
     };
     use crate::read::tests::project_fixture;
 
@@ -3302,8 +3301,14 @@ impl Tower {
             .expect_err("an invalid include glob must refuse");
         assert_eq!(
             error.slug(),
-            rift_error::errors::index::workspace_source_pattern_invalid::SLUG
+            rift_error::errors::analysis::source_pattern_invalid::SLUG
         );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
+        assert!(Error::source(&error).is_some());
         Ok(())
     }
 
@@ -3692,8 +3697,14 @@ impl Tower {
             .expect_err("an invalid force_include glob must refuse");
         assert_eq!(
             error.slug(),
-            rift_error::errors::index::workspace_source_pattern_invalid::SLUG
+            rift_error::errors::analysis::source_pattern_invalid::SLUG
         );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
+        assert!(Error::source(&error).is_some());
         Ok(())
     }
 
@@ -3709,9 +3720,15 @@ impl Tower {
             .expect_err("an invalid force_include glob must refuse");
         assert_eq!(
             error.slug(),
-            rift_error::errors::index::workspace_source_pattern_invalid::SLUG,
+            rift_error::errors::analysis::source_pattern_invalid::SLUG,
             "{error}"
         );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
+        assert!(Error::source(&error).is_some());
         Ok(())
     }
 
@@ -4760,7 +4777,14 @@ impl Tower {
             (error.slug() == rift_error::errors::server::read_invalid::SLUG),
             "{error}"
         );
-        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "traversal" })
+        );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation" && value == "the relationship graph serves the project alone"
+        }));
         Ok(())
     }
 
@@ -4778,7 +4802,16 @@ impl Tower {
             (error.slug() == rift_error::errors::server::read_invalid::SLUG),
             "{arguments}: {error}"
         );
-        assert_eq!(error.descriptor().code(), "invalid_request", "{arguments}");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "seed")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "violation" && value == "a traversal starts at seed")
+        );
     }
 
     /// A configured language engine resolves the references a walk follows, and an engine
@@ -4798,13 +4831,13 @@ impl Tower {
 
             let error = super::validate_search(&params).expect_err("the pairing must refuse");
 
-            assert_eq!(error.descriptor().code(), "capability_unavailable");
-            assert!(
-                error
-                    .to_string()
-                    .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
-                "{error}"
+            assert_eq!(
+                error.slug(),
+                rift_error::errors::server::read_unsupported::SLUG
             );
+            assert!(error.context().any(|(key, value)| {
+                key == "capability" && value == super::CHANGE_TRAVERSAL_CAPABILITY
+            }));
         }
     }
 
@@ -4878,7 +4911,16 @@ impl Tower {
                 (error.slug() == rift_error::errors::server::read_invalid::SLUG),
                 "scope {scope}: {error}"
             );
-            assert_eq!(error.descriptor().code(), "invalid_request");
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "scope")
+            );
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "violation" && value == CURRENT_TREE_ALONE)
+            );
         }
         Ok(())
     }

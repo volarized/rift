@@ -207,7 +207,7 @@ fields = { field = { type = "string" } }
 [error.core.configuration_unreadable]
 message = "workspace configuration could not be read"
 action = "check filesystem permissions and free space, then retry"
-fields = { file = { type = "string" }, path = { type = "string" }, io = { type = "string" } }
+fields = { file = { type = "string" }, path = { type = "string" }, io = { type = "string" }, source = { type = "error", role = "source", optional = true } }
 
 [error.core.configuration_is_directory]
 message = "workspace configuration path is a directory"
@@ -472,7 +472,7 @@ fields = { field = { type = "string" }, observed = { type = "unsigned" }, maximu
 [error.index.workspace_zero_limit]
 message = "workspace index bound is zero"
 action = "set every workspace index bound above zero"
-fields = { source = { type = "error", role = "source", optional = true }, field = { type = "string", optional = true } }
+fields = { cause = { type = "rift_error", role = "cause", optional = true }, field = { type = "string", optional = true } }
 
 [error.index.workspace_invalid_root]
 message = "workspace root cannot be read as a directory"
@@ -502,7 +502,7 @@ fields = { path = { type = "path", format = "display", optional = true }, field 
 [error.index.workspace_invalid_path]
 message = "workspace path is not valid project syntax"
 action = "use a canonical project path and retry"
-fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.index.workspace_invalid_source]
 message = "source file bytes are not valid UTF-8"
@@ -527,17 +527,17 @@ fields = { path = { type = "path", format = "display", optional = true } }
 [error.index.workspace_syntax]
 message = "Rust syntax analysis failed"
 action = "correct the source syntax and retry"
-fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.index.workspace_provider]
 message = "provider publication failed"
 action = "report this internal failure with its full context"
-fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.index.workspace_composition]
 message = "workspace composition failed validation"
 action = "report this internal failure with its full context"
-fields = { source = { type = "error", role = "source", optional = true } }
+fields = { cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.index.workspace_result_limit]
 message = "workspace search returned more results than its accepted limit of {maximum}"
@@ -557,7 +557,7 @@ fields = { path = { type = "path", format = "display", optional = true }, langua
 [error.index.workspace_history]
 message = "workspace history operation failed"
 action = "check repository state and retry"
-fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+fields = { path = { type = "path", format = "display", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 [error.lsp.capabilities_position_encoding_unsupported]
 message = "language engine selected unsupported position encoding {encoding}"
 action = "configure the engine to use UTF-8 or UTF-16 positions"
@@ -730,7 +730,7 @@ fields = { subject = { type = "path", format = "display" } }
 [error.search.model_source_invalid]
 message = "model source {model} has invalid form; expected {expected}"
 action = "use a model source in the expected form and retry"
-fields = { model = { type = "string" }, expected = { type = "string" } }
+fields = { model = { type = "string" }, expected = { type = "string" }, source = { type = "error", role = "source", optional = true } }
 [error.search.model_cache_unavailable]
 message = "model cache directory could not be resolved"
 action = "set a model cache directory and retry"
@@ -855,7 +855,7 @@ fields = { package = { type = "string" }, path = { type = "path", format = "disp
 [error.analysis.package_provider_failed]
 message = "package semantic publication failed"
 action = "report this internal failure with its full context"
-fields = { package = { type = "string" }, path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+fields = { package = { type = "string" }, path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.analysis.package_declarations_exceeded]
 message = "package declaration count exceeds its accepted limit"
@@ -930,7 +930,7 @@ fields = { pattern = { type = "string", optional = true }, source = { type = "er
 [error.analysis.package_input_identity_invalid]
 message = "package identity cannot form a source unit"
 action = "correct package identity and retry"
-fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+fields = { path = { type = "path", format = "display", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.analysis.package_input_origin_invalid]
 message = "package source origin does not identify this package"
@@ -1072,7 +1072,7 @@ fields = { port_min = { type = "port" }, port_max = { type = "port" } }
 [error.mcp.http_serve_failed]
 message = "HTTP MCP server failed while serving"
 action = "report this internal failure with its full context"
-fields = { operation = { type = "string" }, source = { type = "error", role = "source" } }
+fields = { operation = { type = "string" }, source = { type = "error", role = "source", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.mcp.proxy_identity_failed]
 message = "MCP proxy could not determine product identity"
@@ -1135,7 +1135,7 @@ fields = { hit = { type = "string" } }
 [error.mcp.project_hit_identity_refused]
 message = "project hit identity was refused by ranking"
 action = "report this internal failure with its full context"
-fields = { hit = { type = "string" } }
+fields = { hit = { type = "string" }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.index.workspace_documentation_limit]
 message = "workspace documentation sources exceed their accepted limit of {maximum}"
@@ -1215,7 +1215,7 @@ fields = { extension = { type = "string" } }
 [error.server.read_invalid]
 message = "request field {field} is invalid: {violation}"
 action = "correct the reported field and resend the request"
-fields = { field = { type = "string" }, violation = { type = "string" } }
+fields = { field = { type = "string" }, violation = { type = "string" }, cause = { type = "rift_error", role = "cause", optional = true } }
 
 [error.server.read_not_found]
 message = "requested source path does not exist: {path}"

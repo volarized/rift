@@ -1,6 +1,6 @@
 use crate::IntoRiftError;
 
-use std::{borrow::Borrow, error::Error, fmt, path::Path, time::Duration};
+use std::{borrow::Borrow, error::Error, fmt, path::Path, sync::Arc, time::Duration};
 
 /// Sources one walk of a failure's `source` chain visits, at most.
 ///
@@ -108,13 +108,14 @@ impl fmt::Display for ErrorSlug {
 }
 
 /// Field value retained by a registered error.
+#[derive(Clone)]
 pub enum ErrorValue {
     /// Human-readable field value.
     Display(String),
     /// Underlying Rust error exposed through `Error::source`.
-    Source(Box<dyn Error + Send + Sync + 'static>),
+    Source(Arc<SourceView>),
     /// Another registered Rift error carried as the cause.
-    Cause(Box<RiftError>),
+    Cause(Arc<RiftError>),
 }
 
 impl ErrorValue {
@@ -175,13 +176,14 @@ impl ErrorValue {
     /// Stores an underlying error as source.
     #[must_use]
     pub fn source(value: impl Into<Box<dyn Error + Send + Sync + 'static>>) -> Self {
-        Self::Source(Box::new(SourceView::new(value.into())))
+        let inner: Arc<dyn Error + Send + Sync + 'static> = Arc::from(value.into());
+        Self::Source(Arc::new(SourceView::new(inner)))
     }
 
     /// Stores another Rift error as cause.
     #[must_use]
     pub fn cause(value: impl IntoRiftError) -> Self {
-        Self::Cause(Box::new(value.into_rift_error()))
+        Self::Cause(Arc::new(value.into_rift_error()))
     }
 
     fn rendered(&self) -> String {
@@ -196,12 +198,10 @@ impl ErrorValue {
         let value = std::mem::replace(self, Self::Display(String::new()));
         *self = match value {
             Self::Source(mut source) => {
-                if let Some(source) = source.downcast_mut::<SourceView>() {
-                    source.redacted = true;
-                }
+                Arc::make_mut(&mut source).redacted = true;
                 Self::Source(source)
             }
-            Self::Cause(cause) => Self::Source(Box::new(SourceView {
+            Self::Cause(cause) => Self::Source(Arc::new(SourceView {
                 inner: cause,
                 redacted: true,
             })),
@@ -220,13 +220,15 @@ impl fmt::Debug for ErrorValue {
     }
 }
 
-struct SourceView {
-    inner: Box<dyn Error + Send + Sync + 'static>,
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct SourceView {
+    inner: Arc<dyn Error + Send + Sync + 'static>,
     redacted: bool,
 }
 
 impl SourceView {
-    fn new(inner: Box<dyn Error + Send + Sync + 'static>) -> Self {
+    fn new(inner: Arc<dyn Error + Send + Sync + 'static>) -> Self {
         Self {
             inner,
             redacted: false,
@@ -273,6 +275,7 @@ impl From<&str> for ErrorValue {
 }
 
 /// One named evidence value attached to an error.
+#[derive(Clone)]
 pub struct ErrorContext {
     key: &'static str,
     value: ErrorValue,
@@ -361,6 +364,7 @@ impl fmt::Debug for ErrorContext {
 }
 
 /// Complete error created by generated registry builders.
+#[derive(Clone)]
 pub struct RiftError {
     slug: ErrorSlug,
     message: String,
@@ -464,6 +468,12 @@ impl RiftError {
         }
     }
 
+    /// Returns this error through a function's result type.
+    #[must_use]
+    pub fn fail<T>(self) -> Result<T, Self> {
+        Err(self)
+    }
+
     /// Returns stable registry identity.
     #[must_use]
     pub const fn slug(&self) -> ErrorSlug {
@@ -494,12 +504,6 @@ impl RiftError {
         context.ambient = true;
         self.fields.push(context);
         self
-    }
-
-    /// Attaches ambient execution context.
-    #[must_use]
-    pub fn with_context(self, context: ErrorContext) -> Self {
-        self.with(context)
     }
 
     /// Returns visible evidence as context strings.
@@ -548,8 +552,7 @@ impl RiftError {
 
     fn source_value(&self) -> Option<&(dyn Error + 'static)> {
         self.fields.iter().find_map(|field| match &field.value {
-            ErrorValue::Source(source) => {
-                let view = source.downcast_ref::<SourceView>()?;
+            ErrorValue::Source(view) => {
                 if view.redacted {
                     Some(view as &(dyn Error + 'static))
                 } else {
@@ -877,6 +880,100 @@ mod tests {
 
         let absent: Option<Box<dyn Error + Send + Sync>> = None;
         assert!(absent.map(ErrorValue::source).is_none());
+    }
+
+    #[derive(Debug)]
+    struct IdentitySource(Arc<()>);
+
+    impl fmt::Display for IdentitySource {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("identity source")
+        }
+    }
+
+    impl Error for IdentitySource {}
+
+    #[test]
+    fn borrowed_conversions_retain_source_identity_and_registered_data() {
+        let identity = Arc::new(());
+        let stored = Arc::new(RiftError::new(
+            ErrorSlug::new("rift.test.stored_source"),
+            "source failed",
+            "retry",
+            vec![
+                ErrorContext::new("operation", "read"),
+                ErrorContext::new(
+                    "source",
+                    ErrorValue::source(IdentitySource(Arc::clone(&identity))),
+                ),
+            ],
+        ));
+
+        let first = (&stored).into_rift_error();
+        let second = (&stored).into_rift_error();
+        assert_eq!(first.slug(), stored.slug());
+        assert!(
+            second
+                .context()
+                .any(|(key, value)| key == "operation" && value == "read")
+        );
+        let first_source = Error::source(&first)
+            .and_then(|source| source.downcast_ref::<IdentitySource>())
+            .expect("converted error retains concrete source");
+        let second_source = Error::source(&second)
+            .and_then(|source| source.downcast_ref::<IdentitySource>())
+            .expect("second conversion retains concrete source");
+        assert!(std::ptr::eq(first_source, second_source));
+        assert!(Arc::ptr_eq(&first_source.0, &identity));
+
+        let unique = Arc::new(RiftError::new(
+            ErrorSlug::new("rift.test.unique"),
+            "unique",
+            "retry",
+            vec![],
+        ));
+        let message_address = unique.message.as_ptr();
+        let unwrapped = unique.into_rift_error();
+        assert_eq!(message_address, unwrapped.message.as_ptr());
+    }
+
+    #[test]
+    fn borrowed_conversions_preserve_hidden_sources_and_nested_causes() {
+        let inner = Arc::new(RiftError::new(
+            ErrorSlug::new("rift.test.inner"),
+            "inner detail",
+            "retry",
+            vec![ErrorContext::new("context", "kept")],
+        ));
+        let outer = Arc::new(RiftError::new(
+            ErrorSlug::new("rift.test.outer"),
+            "failed with {cause} and {source}",
+            "retry",
+            vec![
+                ErrorContext::new("cause", ErrorValue::cause(&inner)),
+                ErrorContext::with_flags(
+                    "source",
+                    ErrorValue::source(std::io::Error::other("private source")),
+                    true,
+                    true,
+                ),
+            ],
+        ));
+
+        let first = (&outer).into_rift_error();
+        let second = Arc::clone(&outer).into_rift_error();
+        for converted in [&first, &second] {
+            assert_eq!(converted.slug(), ErrorSlug::new("rift.test.outer"));
+            assert!(!converted.to_string().contains("private"));
+            assert!(!format!("{converted:?}").contains("private"));
+            let cause = Error::source(converted)
+                .and_then(|source| source.downcast_ref::<RiftError>())
+                .expect("registered cause remains source");
+            assert_eq!(cause.slug(), ErrorSlug::new("rift.test.inner"));
+            assert_eq!(cause.context().next(), Some(("context", "kept".to_owned())));
+        }
+        let cause = Error::source(&first).expect("cause remains source");
+        assert!(Error::source(cause).is_none());
     }
 
     #[test]

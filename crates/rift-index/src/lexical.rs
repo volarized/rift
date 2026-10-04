@@ -56,6 +56,20 @@ use crate::change_set::{FileDigest, WorkspaceDigests};
 use crate::database::WorkspaceDatabase;
 use crate::trigram_store::{PatternCandidates, TrigramBatch};
 
+/// Returns whether one lexical storage error failed to obtain a pooled connection.
+///
+/// Other storage errors remain refusals. Callers may skip this read only when the
+/// connection pool itself could not serve it.
+#[must_use]
+pub fn is_connection_unavailable(error: &RiftError) -> bool {
+    if error.slug() != errors::index::lexical_storage::SLUG {
+        return false;
+    }
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<toasty::Error>())
+        .is_some_and(toasty::Error::is_connection_pool)
+}
+
 /// Default maximum content bytes accepted for one lexical document: the largest chunk
 /// `[search.text] max_chunk` accepts (16 MiB), so the store takes every row the
 /// configuration can derive, whatever `max_chunk` a later reload sets.
@@ -2208,7 +2222,9 @@ impl IndexReader for PublishedIndex<'_> {
             {
                 Ok(RevisionScoped::Matched(input)) => Ok(input),
                 Ok(_) => Ok(RankingInput::unanswered(request.input())),
-                Err(error) => Err(reader_refused(error)),
+                Err(error) => error
+                    .with(ErrorContext::new("operation", "lexical ranking"))
+                    .fail(),
             }
         })
     }
@@ -2217,18 +2233,13 @@ impl IndexReader for PublishedIndex<'_> {
         &'a self,
         identity: &'a DocumentIdentity,
     ) -> ReaderFuture<'a, Result<Option<IndexDocument>, RiftError>> {
-        Box::pin(async move { self.store.document(identity).await.map_err(reader_refused) })
+        Box::pin(async move {
+            self.store
+                .document(identity)
+                .await
+                .map_err(|error| error.with(ErrorContext::new("operation", "lexical ranking")))
+        })
     }
-}
-
-/// One store refusal, as the shared contract's own.
-///
-/// The contract is storage-independent, so it cannot restate this store's violation. What
-/// it does carry is the failure itself, on the source chain, so a caller still reaches the
-/// driver text and the classification the store gave it. Reporting a disk failure as a
-/// capability mismatch would send that caller to compare two publications instead.
-fn reader_refused(error: RiftError) -> RiftError {
-    error.with(ErrorContext::new("operation", "lexical ranking"))
 }
 
 #[cfg(test)]
@@ -2237,9 +2248,9 @@ mod tests {
         LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexLimits,
         LexicalIndexStateRecord, LexicalMatch, LexicalRanking, LexicalSearchIndex, MIGRATION_FILES,
         checked_byte_length, checked_byte_offset, decode_document, decode_lexical_match,
-        decode_recorded, isolated_weights, lexical_search_column_types, lexical_search_sql,
-        matched_fields, project_location, rank_weights, require_pragma_row, searchable_columns,
-        validate_indexed_count, validate_lexical_units,
+        decode_recorded, is_connection_unavailable, isolated_weights, lexical_search_column_types,
+        lexical_search_sql, matched_fields, project_location, rank_weights, require_pragma_row,
+        searchable_columns, validate_indexed_count, validate_lexical_units,
     };
     use crate::trigram_store::TRIGRAM_ROWS;
     use rift_core::{ProjectPath, SourceUnitId};
@@ -2504,6 +2515,21 @@ mod tests {
             .error();
         let source = std::error::Error::source(&error).expect("storage error exposes source");
         assert_eq!(source.to_string(), "disk unavailable");
+    }
+
+    #[test]
+    fn connection_unavailable_requires_toasty_pool_error() {
+        let pooled = errors::index::lexical_storage()
+            .source(toasty::Error::connection_pool(std::io::Error::other(
+                "pool exhausted",
+            )))
+            .error();
+        assert!(is_connection_unavailable(&pooled));
+
+        let storage = errors::index::lexical_storage()
+            .source(std::io::Error::other("disk unavailable"))
+            .error();
+        assert!(!is_connection_unavailable(&storage));
     }
 
     #[test]

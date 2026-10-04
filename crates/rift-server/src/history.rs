@@ -581,7 +581,7 @@ fn parse_blob(
             if error.slug() == errors::history::blob_too_large::SLUG {
                 return Ok(None);
             }
-            return Err(error);
+            return error.fail();
         }
     };
     let Ok(text) = String::from_utf8(bytes) else {
@@ -706,9 +706,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rift_core::SourceVisibility;
+    use rift_error::RiftError;
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::read::{Language, NodeFacet};
-    use rift_syntax::{ByteRange, RustSyntaxProvider, SyntaxError};
+    use rift_syntax::{ByteRange, RustSyntaxProvider};
 
     use super::*;
     use crate::read::ReadService;
@@ -916,7 +917,7 @@ mod tests {
             &self,
             source: SyntaxSource<'_>,
             limits: SyntaxLimits,
-        ) -> Result<SyntaxDocument, SyntaxError> {
+        ) -> Result<SyntaxDocument, RiftError> {
             self.analyzed.fetch_add(1, Ordering::SeqCst);
             self.inner.analyze(source, limits)
         }
@@ -1455,8 +1456,6 @@ mod tests {
 
     #[test]
     fn a_timeline_over_a_store_that_cannot_be_read_refuses_as_a_storage_failure() -> TestResult {
-        use rift_core::{ErrorCode, ErrorName, Fault as _};
-
         let (directory, _service) = shared_path_fixture()?;
         let folder = tempfile::tempdir()?;
         let common = folder.path().join("common");
@@ -1471,9 +1470,7 @@ mod tests {
         let opened = SymbolTimelines::open(directory.path(), None, &history, syntax, Some(&stored));
 
         let refused = opened.expect_err("no folder holds the store's file any more");
-        let fault = refused.fault();
-        assert_eq!(fault.name(), ErrorName::Wire(ErrorCode::StorageFailure));
-        assert!(fault.limit_evidence().is_none());
+        assert_eq!(refused.slug(), errors::history_store::database::SLUG);
         let rendered = refused.to_string();
         assert!(rendered.contains("open store"), "{rendered}");
         assert!(

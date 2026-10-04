@@ -1,16 +1,17 @@
 pub use rift_error::{FieldSet, OptionalFieldSet};
 use rift_error::{
-    BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError, RiftError,
+    BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoInteger,
+    IntoRiftError, IntoUnsigned, RiftError, Set as SetState, Unset,
 };
-use rift_error::ErrorValue;
-use rift_error::{Set as SetState, Unset};
-use std::fmt::Display;
-use rift_error::IntoUnsigned;
-use rift_error::IntoInteger;
-use std::path::Path;
-use std::{borrow::Borrow, time::Duration};
-use std::{boxed::Box, error::Error};
-use std::marker::PhantomData;
+use std::{
+    borrow::Borrow,
+    boxed::Box,
+    error::Error,
+    fmt::Display,
+    marker::PhantomData,
+    path::Path,
+    time::Duration,
+};
 #[doc(hidden)]
 pub const REGISTRY_NAMESPACE: &str = "rift";
 #[doc(hidden)]
@@ -3464,7 +3465,7 @@ pub mod analysis {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod path {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -3472,7 +3473,7 @@ pub mod analysis {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "path", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -3482,7 +3483,42 @@ pub mod analysis {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(0u32 as usize, "path", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
+        pub mod path {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl Set<Builder> for Field {
+                type Output = Builder;
+                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "path", value, true, false);
+                    target
+                }
+            }
+            impl SetOptional<Builder> for Field {
+                type Output = Builder;
+                fn set_optional(
+                    mut target: Builder,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(1u32 as usize, "path", value, true, false);
                     target
                 }
             }
@@ -3499,44 +3535,24 @@ pub mod analysis {
                 value.map(self::value)
             }
         }
-        pub mod source {
-            use super::*;
-            pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
-            pub struct Field;
-            impl Set<Builder> for Field {
-                type Output = Builder;
-                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
-                    target
-                }
-            }
-            impl SetOptional<Builder> for Field {
-                type Output = Builder;
-                fn set_optional(
-                    mut target: Builder,
-                    value: Option<ErrorValue>,
-                ) -> Self::Output {
-                    target
-                        .core
-                        .set_optional(1u32 as usize, "source", value, true, false);
-                    target
-                }
-            }
-            pub fn value<T>(value: T) -> ErrorValue
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                ErrorValue::source(value)
-            }
-            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                value.map(self::value)
-            }
-        }
         impl Builder {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn path<T>(self, value: T) -> <path::Field as path::Set<Self>>::Output
             where
                 T: AsRef<Path>,
@@ -3553,26 +3569,6 @@ pub mod analysis {
                 <path::Field as path::SetOptional<
                     Self,
                 >>::set_optional(self, path::optional_value(value))
-            }
-            pub fn source<T>(
-                self,
-                value: T,
-            ) -> <source::Field as source::Set<Self>>::Output
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                <source::Field as source::Set<Self>>::set(self, source::value(value))
-            }
-            pub fn maybe_source<T>(
-                self,
-                value: Option<T>,
-            ) -> <source::Field as source::SetOptional<Self>>::Output
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                <source::Field as source::SetOptional<
-                    Self,
-                >>::set_optional(self, source::optional_value(value))
             }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
@@ -4085,6 +4081,44 @@ pub mod analysis {
         }
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
+        pub mod cause {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl<State0> Set<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
+                    target.core.set(0u32 as usize, "cause", value, true, false);
+                    Builder::<State0> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            impl<State0> SetOptional<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set_optional(
+                    mut target: Builder<State0>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
         pub mod package {
             use super::*;
             pub use super::FieldSet as Set;
@@ -4093,7 +4127,7 @@ pub mod analysis {
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
                 fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "package", value, true, false);
+                    target.core.set(1u32 as usize, "package", value, true, false);
                     Builder::<SetState> {
                         core: target.core,
                         marker: PhantomData,
@@ -4121,7 +4155,7 @@ pub mod analysis {
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<State0>;
                 fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "path", value, true, false);
+                    target.core.set(2u32 as usize, "path", value, true, false);
                     Builder::<State0> {
                         core: target.core,
                         marker: PhantomData,
@@ -4134,7 +4168,7 @@ pub mod analysis {
                     mut target: Builder<State0>,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(1u32 as usize, "path", value, true, false);
+                    target.core.set_optional(2u32 as usize, "path", value, true, false);
                     target
                 }
             }
@@ -4159,7 +4193,7 @@ pub mod analysis {
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<State0>;
                 fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
-                    target.core.set(2u32 as usize, "source", value, true, false);
+                    target.core.set(3u32 as usize, "source", value, true, false);
                     Builder::<State0> {
                         core: target.core,
                         marker: PhantomData,
@@ -4174,7 +4208,7 @@ pub mod analysis {
                 ) -> Self::Output {
                     target
                         .core
-                        .set_optional(2u32 as usize, "source", value, true, false);
+                        .set_optional(3u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -4192,6 +4226,23 @@ pub mod analysis {
             }
         }
         impl<State0> Builder<State0> {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn package<T>(
                 self,
                 value: T,
@@ -4272,7 +4323,7 @@ pub mod analysis {
                 ErrorSlug::new("rift.analysis.package_provider_failed"),
                 "package semantic publication failed",
                 "report this internal failure with its full context",
-                3usize,
+                4usize,
             ),
             marker: PhantomData,
         }
@@ -16281,6 +16332,50 @@ pub mod core {
                 value.map(self::value)
             }
         }
+        pub mod source {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
+                type Output = Builder<State0, State1, State2>;
+                fn set(
+                    mut target: Builder<State0, State1, State2>,
+                    value: ErrorValue,
+                ) -> Self::Output {
+                    target.core.set(3u32 as usize, "source", value, true, false);
+                    Builder::<State0, State1, State2> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            impl<State0, State1, State2> SetOptional<Builder<State0, State1, State2>>
+            for Field {
+                type Output = Builder<State0, State1, State2>;
+                fn set_optional(
+                    mut target: Builder<State0, State1, State2>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target
+                        .core
+                        .set_optional(3u32 as usize, "source", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                ErrorValue::source(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                value.map(self::value)
+            }
+        }
         impl<State0, State1, State2> Builder<State0, State1, State2> {
             pub fn file<T>(self, value: T) -> <file::Field as file::Set<Self>>::Output
             where
@@ -16299,6 +16394,26 @@ pub mod core {
                 T: Display,
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
+            }
+            pub fn source<T>(
+                self,
+                value: T,
+            ) -> <source::Field as source::Set<Self>>::Output
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                <source::Field as source::Set<Self>>::set(self, source::value(value))
+            }
+            pub fn maybe_source<T>(
+                self,
+                value: Option<T>,
+            ) -> <source::Field as source::SetOptional<Self>>::Output
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                <source::Field as source::SetOptional<
+                    Self,
+                >>::set_optional(self, source::optional_value(value))
             }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
@@ -16338,7 +16453,7 @@ pub mod core {
                 ErrorSlug::new("rift.core.configuration_unreadable"),
                 "workspace configuration could not be read",
                 "check filesystem permissions and free space, then retry",
-                3usize,
+                4usize,
             ),
             marker: PhantomData,
         }
@@ -23229,7 +23344,7 @@ pub mod index {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod source {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -23237,7 +23352,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "source", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -23247,45 +23362,40 @@ pub mod index {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target
-                        .core
-                        .set_optional(0u32 as usize, "source", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
             pub fn value<T>(value: T) -> ErrorValue
             where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+                T: IntoRiftError,
             {
-                ErrorValue::source(value)
+                ErrorValue::cause(value)
             }
             pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
             where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+                T: IntoRiftError,
             {
                 value.map(self::value)
             }
         }
         impl Builder {
-            pub fn source<T>(
-                self,
-                value: T,
-            ) -> <source::Field as source::Set<Self>>::Output
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
             where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+                T: IntoRiftError,
             {
-                <source::Field as source::Set<Self>>::set(self, source::value(value))
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
             }
-            pub fn maybe_source<T>(
+            pub fn maybe_cause<T>(
                 self,
                 value: Option<T>,
-            ) -> <source::Field as source::SetOptional<Self>>::Output
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
             where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+                T: IntoRiftError,
             {
-                <source::Field as source::SetOptional<
+                <cause::Field as cause::SetOptional<
                     Self,
-                >>::set_optional(self, source::optional_value(value))
+                >>::set_optional(self, cause::optional_value(value))
             }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
@@ -24013,7 +24123,7 @@ pub mod index {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod path {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -24021,7 +24131,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "path", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -24031,7 +24141,42 @@ pub mod index {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(0u32 as usize, "path", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
+        pub mod path {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl Set<Builder> for Field {
+                type Output = Builder;
+                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "path", value, true, false);
+                    target
+                }
+            }
+            impl SetOptional<Builder> for Field {
+                type Output = Builder;
+                fn set_optional(
+                    mut target: Builder,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(1u32 as usize, "path", value, true, false);
                     target
                 }
             }
@@ -24048,44 +24193,24 @@ pub mod index {
                 value.map(self::value)
             }
         }
-        pub mod source {
-            use super::*;
-            pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
-            pub struct Field;
-            impl Set<Builder> for Field {
-                type Output = Builder;
-                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
-                    target
-                }
-            }
-            impl SetOptional<Builder> for Field {
-                type Output = Builder;
-                fn set_optional(
-                    mut target: Builder,
-                    value: Option<ErrorValue>,
-                ) -> Self::Output {
-                    target
-                        .core
-                        .set_optional(1u32 as usize, "source", value, true, false);
-                    target
-                }
-            }
-            pub fn value<T>(value: T) -> ErrorValue
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                ErrorValue::source(value)
-            }
-            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                value.map(self::value)
-            }
-        }
         impl Builder {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn path<T>(self, value: T) -> <path::Field as path::Set<Self>>::Output
             where
                 T: AsRef<Path>,
@@ -24102,26 +24227,6 @@ pub mod index {
                 <path::Field as path::SetOptional<
                     Self,
                 >>::set_optional(self, path::optional_value(value))
-            }
-            pub fn source<T>(
-                self,
-                value: T,
-            ) -> <source::Field as source::Set<Self>>::Output
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                <source::Field as source::Set<Self>>::set(self, source::value(value))
-            }
-            pub fn maybe_source<T>(
-                self,
-                value: Option<T>,
-            ) -> <source::Field as source::SetOptional<Self>>::Output
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                <source::Field as source::SetOptional<
-                    Self,
-                >>::set_optional(self, source::optional_value(value))
             }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
@@ -24175,7 +24280,7 @@ pub mod index {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod path {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -24183,7 +24288,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "path", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -24193,7 +24298,42 @@ pub mod index {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(0u32 as usize, "path", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
+        pub mod path {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl Set<Builder> for Field {
+                type Output = Builder;
+                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "path", value, true, false);
+                    target
+                }
+            }
+            impl SetOptional<Builder> for Field {
+                type Output = Builder;
+                fn set_optional(
+                    mut target: Builder,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(1u32 as usize, "path", value, true, false);
                     target
                 }
             }
@@ -24218,7 +24358,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
+                    target.core.set(2u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -24230,7 +24370,7 @@ pub mod index {
                 ) -> Self::Output {
                     target
                         .core
-                        .set_optional(1u32 as usize, "source", value, true, false);
+                        .set_optional(2u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -24248,6 +24388,23 @@ pub mod index {
             }
         }
         impl Builder {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn path<T>(self, value: T) -> <path::Field as path::Set<Self>>::Output
             where
                 T: AsRef<Path>,
@@ -24319,7 +24476,7 @@ pub mod index {
                 ErrorSlug::new("rift.index.workspace_invalid_path"),
                 "workspace path is not valid project syntax",
                 "use a canonical project path and retry",
-                2usize,
+                3usize,
             ),
             marker: PhantomData,
         }
@@ -24943,7 +25100,7 @@ pub mod index {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod path {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -24951,7 +25108,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "path", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -24961,7 +25118,42 @@ pub mod index {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(0u32 as usize, "path", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
+        pub mod path {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl Set<Builder> for Field {
+                type Output = Builder;
+                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "path", value, true, false);
+                    target
+                }
+            }
+            impl SetOptional<Builder> for Field {
+                type Output = Builder;
+                fn set_optional(
+                    mut target: Builder,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(1u32 as usize, "path", value, true, false);
                     target
                 }
             }
@@ -24986,7 +25178,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
+                    target.core.set(2u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -24998,7 +25190,7 @@ pub mod index {
                 ) -> Self::Output {
                     target
                         .core
-                        .set_optional(1u32 as usize, "source", value, true, false);
+                        .set_optional(2u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -25016,6 +25208,23 @@ pub mod index {
             }
         }
         impl Builder {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn path<T>(self, value: T) -> <path::Field as path::Set<Self>>::Output
             where
                 T: AsRef<Path>,
@@ -25087,7 +25296,7 @@ pub mod index {
                 ErrorSlug::new("rift.index.workspace_provider"),
                 "provider publication failed",
                 "report this internal failure with its full context",
-                2usize,
+                3usize,
             ),
             marker: PhantomData,
         }
@@ -25326,7 +25535,7 @@ pub mod index {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod path {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -25334,7 +25543,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "path", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -25344,7 +25553,42 @@ pub mod index {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(0u32 as usize, "path", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
+        pub mod path {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl Set<Builder> for Field {
+                type Output = Builder;
+                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "path", value, true, false);
+                    target
+                }
+            }
+            impl SetOptional<Builder> for Field {
+                type Output = Builder;
+                fn set_optional(
+                    mut target: Builder,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(1u32 as usize, "path", value, true, false);
                     target
                 }
             }
@@ -25369,7 +25613,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
+                    target.core.set(2u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -25381,7 +25625,7 @@ pub mod index {
                 ) -> Self::Output {
                     target
                         .core
-                        .set_optional(1u32 as usize, "source", value, true, false);
+                        .set_optional(2u32 as usize, "source", value, true, false);
                     target
                 }
             }
@@ -25399,6 +25643,23 @@ pub mod index {
             }
         }
         impl Builder {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn path<T>(self, value: T) -> <path::Field as path::Set<Self>>::Output
             where
                 T: AsRef<Path>,
@@ -25470,7 +25731,7 @@ pub mod index {
                 ErrorSlug::new("rift.index.workspace_syntax"),
                 "Rust syntax analysis failed",
                 "correct the source syntax and retry",
-                2usize,
+                3usize,
             ),
             marker: PhantomData,
         }
@@ -26300,7 +26561,7 @@ pub mod index {
         }
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
-        pub mod field {
+        pub mod cause {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
@@ -26308,7 +26569,7 @@ pub mod index {
             impl Set<Builder> for Field {
                 type Output = Builder;
                 fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "field", value, true, false);
+                    target.core.set(0u32 as usize, "cause", value, true, false);
                     target
                 }
             }
@@ -26318,7 +26579,42 @@ pub mod index {
                     mut target: Builder,
                     value: Option<ErrorValue>,
                 ) -> Self::Output {
-                    target.core.set_optional(0u32 as usize, "field", value, true, false);
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
+        pub mod field {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl Set<Builder> for Field {
+                type Output = Builder;
+                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "field", value, true, false);
+                    target
+                }
+            }
+            impl SetOptional<Builder> for Field {
+                type Output = Builder;
+                fn set_optional(
+                    mut target: Builder,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(1u32 as usize, "field", value, true, false);
                     target
                 }
             }
@@ -26335,44 +26631,24 @@ pub mod index {
                 value.map(self::value)
             }
         }
-        pub mod source {
-            use super::*;
-            pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
-            pub struct Field;
-            impl Set<Builder> for Field {
-                type Output = Builder;
-                fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
-                    target
-                }
-            }
-            impl SetOptional<Builder> for Field {
-                type Output = Builder;
-                fn set_optional(
-                    mut target: Builder,
-                    value: Option<ErrorValue>,
-                ) -> Self::Output {
-                    target
-                        .core
-                        .set_optional(1u32 as usize, "source", value, true, false);
-                    target
-                }
-            }
-            pub fn value<T>(value: T) -> ErrorValue
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                ErrorValue::source(value)
-            }
-            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                value.map(self::value)
-            }
-        }
         impl Builder {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn field<T>(self, value: T) -> <field::Field as field::Set<Self>>::Output
             where
                 T: Display,
@@ -26389,26 +26665,6 @@ pub mod index {
                 <field::Field as field::SetOptional<
                     Self,
                 >>::set_optional(self, field::optional_value(value))
-            }
-            pub fn source<T>(
-                self,
-                value: T,
-            ) -> <source::Field as source::Set<Self>>::Output
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                <source::Field as source::Set<Self>>::set(self, source::value(value))
-            }
-            pub fn maybe_source<T>(
-                self,
-                value: Option<T>,
-            ) -> <source::Field as source::SetOptional<Self>>::Output
-            where
-                T: Into<Box<dyn Error + Send + Sync + 'static>>,
-            {
-                <source::Field as source::SetOptional<
-                    Self,
-                >>::set_optional(self, source::optional_value(value))
             }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
@@ -30444,25 +30700,60 @@ pub mod mcp {
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.http_serve_failed");
         pub struct EvidenceTag;
-        pub struct Builder<State0 = Unset, State1 = Unset> {
+        pub struct Builder<State0 = Unset> {
             pub(super) core: BuilderCore,
-            pub(super) marker: PhantomData<(State0, State1)>,
+            pub(super) marker: PhantomData<State0>,
         }
-        pub type EvidenceInput = Builder<Unset, Unset>;
-        pub type EvidenceOutput = Builder<SetState, SetState>;
+        pub type EvidenceInput = Builder<Unset>;
+        pub type EvidenceOutput = Builder<SetState>;
+        pub mod cause {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl<State0> Set<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
+                    target.core.set(0u32 as usize, "cause", value, true, false);
+                    Builder::<State0> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            impl<State0> SetOptional<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set_optional(
+                    mut target: Builder<State0>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
         pub mod operation {
             use super::*;
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
-            impl<State0, State1> Set<Builder<State0, State1>> for Field {
-                type Output = Builder<SetState, State1>;
-                fn set(
-                    mut target: Builder<State0, State1>,
-                    value: ErrorValue,
-                ) -> Self::Output {
-                    target.core.set(0u32 as usize, "operation", value, true, false);
-                    Builder::<SetState, State1> {
+            impl<State0> Set<Builder<State0>> for Field {
+                type Output = Builder<SetState>;
+                fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
+                    target.core.set(1u32 as usize, "operation", value, true, false);
+                    Builder::<SetState> {
                         core: target.core,
                         marker: PhantomData,
                     }
@@ -30486,17 +30777,26 @@ pub mod mcp {
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
-            impl<State0, State1> Set<Builder<State0, State1>> for Field {
-                type Output = Builder<State0, SetState>;
-                fn set(
-                    mut target: Builder<State0, State1>,
-                    value: ErrorValue,
-                ) -> Self::Output {
-                    target.core.set(1u32 as usize, "source", value, true, false);
-                    Builder::<State0, SetState> {
+            impl<State0> Set<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
+                    target.core.set(2u32 as usize, "source", value, true, false);
+                    Builder::<State0> {
                         core: target.core,
                         marker: PhantomData,
                     }
+                }
+            }
+            impl<State0> SetOptional<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set_optional(
+                    mut target: Builder<State0>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target
+                        .core
+                        .set_optional(2u32 as usize, "source", value, true, false);
+                    target
                 }
             }
             pub fn value<T>(value: T) -> ErrorValue
@@ -30512,7 +30812,24 @@ pub mod mcp {
                 value.map(self::value)
             }
         }
-        impl<State0, State1> Builder<State0, State1> {
+        impl<State0> Builder<State0> {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn operation<T>(
                 self,
                 value: T,
@@ -30533,6 +30850,17 @@ pub mod mcp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            pub fn maybe_source<T>(
+                self,
+                value: Option<T>,
+            ) -> <source::Field as source::SetOptional<Self>>::Output
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                <source::Field as source::SetOptional<
+                    Self,
+                >>::set_optional(self, source::optional_value(value))
+            }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30544,7 +30872,7 @@ pub mod mcp {
                 evidence.apply_evidence(self)
             }
         }
-        impl Builder<SetState, SetState> {
+        impl Builder<SetState> {
             pub fn error(self) -> RiftError {
                 self.finish()
             }
@@ -30555,19 +30883,19 @@ pub mod mcp {
                 self.core.finish()
             }
         }
-        impl IntoRiftError for Builder<SetState, SetState> {
+        impl IntoRiftError for Builder<SetState> {
             fn into_rift_error(self) -> RiftError {
                 self.finish()
             }
         }
     }
-    pub fn http_serve_failed() -> http_serve_failed::Builder<Unset, Unset> {
+    pub fn http_serve_failed() -> http_serve_failed::Builder<Unset> {
         http_serve_failed::Builder {
             core: BuilderCore::new(
                 ErrorSlug::new("rift.mcp.http_serve_failed"),
                 "HTTP MCP server failed while serving",
                 "report this internal failure with its full context",
-                2usize,
+                3usize,
             ),
             marker: PhantomData,
         }
@@ -30942,6 +31270,44 @@ pub mod mcp {
         }
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
+        pub mod cause {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl<State0> Set<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
+                    target.core.set(0u32 as usize, "cause", value, true, false);
+                    Builder::<State0> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            impl<State0> SetOptional<Builder<State0>> for Field {
+                type Output = Builder<State0>;
+                fn set_optional(
+                    mut target: Builder<State0>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
         pub mod hit {
             use super::*;
             pub use super::FieldSet as Set;
@@ -30950,7 +31316,7 @@ pub mod mcp {
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
                 fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
-                    target.core.set(0u32 as usize, "hit", value, true, false);
+                    target.core.set(1u32 as usize, "hit", value, true, false);
                     Builder::<SetState> {
                         core: target.core,
                         marker: PhantomData,
@@ -30971,6 +31337,23 @@ pub mod mcp {
             }
         }
         impl<State0> Builder<State0> {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn hit<T>(self, value: T) -> <hit::Field as hit::Set<Self>>::Output
             where
                 T: Display,
@@ -31013,7 +31396,7 @@ pub mod mcp {
                 ErrorSlug::new("rift.mcp.project_hit_identity_refused"),
                 "project hit identity was refused by ranking",
                 "report this internal failure with its full context",
-                1usize,
+                2usize,
             ),
             marker: PhantomData,
         }
@@ -35822,6 +36205,49 @@ pub mod search {
                 value.map(self::value)
             }
         }
+        pub mod source {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl<State0, State1> Set<Builder<State0, State1>> for Field {
+                type Output = Builder<State0, State1>;
+                fn set(
+                    mut target: Builder<State0, State1>,
+                    value: ErrorValue,
+                ) -> Self::Output {
+                    target.core.set(2u32 as usize, "source", value, true, false);
+                    Builder::<State0, State1> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            impl<State0, State1> SetOptional<Builder<State0, State1>> for Field {
+                type Output = Builder<State0, State1>;
+                fn set_optional(
+                    mut target: Builder<State0, State1>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target
+                        .core
+                        .set_optional(2u32 as usize, "source", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                ErrorValue::source(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                value.map(self::value)
+            }
+        }
         impl<State0, State1> Builder<State0, State1> {
             pub fn expected<T>(
                 self,
@@ -35839,6 +36265,26 @@ pub mod search {
                 T: Display,
             {
                 <model::Field as model::Set<Self>>::set(self, model::value(value))
+            }
+            pub fn source<T>(
+                self,
+                value: T,
+            ) -> <source::Field as source::Set<Self>>::Output
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                <source::Field as source::Set<Self>>::set(self, source::value(value))
+            }
+            pub fn maybe_source<T>(
+                self,
+                value: Option<T>,
+            ) -> <source::Field as source::SetOptional<Self>>::Output
+            where
+                T: Into<Box<dyn Error + Send + Sync + 'static>>,
+            {
+                <source::Field as source::SetOptional<
+                    Self,
+                >>::set_optional(self, source::optional_value(value))
             }
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
@@ -35874,7 +36320,7 @@ pub mod search {
                 ErrorSlug::new("rift.search.model_source_invalid"),
                 "model source {model} has invalid form; expected {expected}",
                 "use a model source in the expected form and retry",
-                2usize,
+                3usize,
             ),
             marker: PhantomData,
         }
@@ -37019,6 +37465,47 @@ pub mod server {
         }
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
+        pub mod cause {
+            use super::*;
+            pub use super::FieldSet as Set;
+            pub use super::OptionalFieldSet as SetOptional;
+            pub struct Field;
+            impl<State0, State1> Set<Builder<State0, State1>> for Field {
+                type Output = Builder<State0, State1>;
+                fn set(
+                    mut target: Builder<State0, State1>,
+                    value: ErrorValue,
+                ) -> Self::Output {
+                    target.core.set(0u32 as usize, "cause", value, true, false);
+                    Builder::<State0, State1> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            impl<State0, State1> SetOptional<Builder<State0, State1>> for Field {
+                type Output = Builder<State0, State1>;
+                fn set_optional(
+                    mut target: Builder<State0, State1>,
+                    value: Option<ErrorValue>,
+                ) -> Self::Output {
+                    target.core.set_optional(0u32 as usize, "cause", value, true, false);
+                    target
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: IntoRiftError,
+            {
+                ErrorValue::cause(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: IntoRiftError,
+            {
+                value.map(self::value)
+            }
+        }
         pub mod field {
             use super::*;
             pub use super::FieldSet as Set;
@@ -37030,7 +37517,7 @@ pub mod server {
                     mut target: Builder<State0, State1>,
                     value: ErrorValue,
                 ) -> Self::Output {
-                    target.core.set(0u32 as usize, "field", value, true, false);
+                    target.core.set(1u32 as usize, "field", value, true, false);
                     Builder::<SetState, State1> {
                         core: target.core,
                         marker: PhantomData,
@@ -37061,7 +37548,7 @@ pub mod server {
                     mut target: Builder<State0, State1>,
                     value: ErrorValue,
                 ) -> Self::Output {
-                    target.core.set(1u32 as usize, "violation", value, true, false);
+                    target.core.set(2u32 as usize, "violation", value, true, false);
                     Builder::<State0, SetState> {
                         core: target.core,
                         marker: PhantomData,
@@ -37082,6 +37569,23 @@ pub mod server {
             }
         }
         impl<State0, State1> Builder<State0, State1> {
+            pub fn cause<T>(self, value: T) -> <cause::Field as cause::Set<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::Set<Self>>::set(self, cause::value(value))
+            }
+            pub fn maybe_cause<T>(
+                self,
+                value: Option<T>,
+            ) -> <cause::Field as cause::SetOptional<Self>>::Output
+            where
+                T: IntoRiftError,
+            {
+                <cause::Field as cause::SetOptional<
+                    Self,
+                >>::set_optional(self, cause::optional_value(value))
+            }
             pub fn field<T>(self, value: T) -> <field::Field as field::Set<Self>>::Output
             where
                 T: Display,
@@ -37133,7 +37637,7 @@ pub mod server {
                 ErrorSlug::new("rift.server.read_invalid"),
                 "request field {field} is invalid: {violation}",
                 "correct the reported field and resend the request",
-                2usize,
+                3usize,
             ),
             marker: PhantomData,
         }

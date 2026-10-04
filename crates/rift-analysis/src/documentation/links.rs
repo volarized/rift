@@ -11,9 +11,8 @@ use rift_protocol::documentation::{
 use rift_protocol::read::{ProjectPath, SourceUnitId, TextRange};
 use url::Url;
 
-use super::failure::{DocumentationViolation, refused};
 use super::input::source_file_path;
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 /// One explicit fragment supplied by a format parser, never a generated heading slug.
 #[derive(Clone, Debug)]
@@ -49,7 +48,9 @@ pub fn resolve_links(
         || links.len() > DOCUMENTATION_REFERENCES_MAX as usize
         || fragments.len() > DOCUMENTATION_REFERENCES_MAX as usize
     {
-        return Err(refused(DocumentationViolation::LimitExceeded, "links"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("links")
+            .fail();
     }
     let sources: BTreeMap<_, _> = sources
         .iter()
@@ -61,12 +62,16 @@ pub fn resolve_links(
         .collect();
     let fragments = fragment_index(fragments)?;
     for link in links {
-        let block = blocks
-            .get(&link.block)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.block"))?;
-        let source = sources
-            .get(&block.source)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.source"))?;
+        let block = blocks.get(&link.block).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("link.block")
+                .error()
+        })?;
+        let source = sources.get(&block.source).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("block.source")
+                .error()
+        })?;
         link.resolution = resolve_destination(source, &link.authored, &sources, &fragments)?;
     }
     Ok(())
@@ -164,10 +169,9 @@ pub(super) fn resolve_declaration_links(
 ) -> Result<Vec<rift_protocol::documentation::DocumentationReference>, RiftError> {
     use rift_protocol::documentation::{DocumentationReference, DocumentationReferenceEvidence};
     if declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_MAX as usize {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "declarations",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("declarations")
+            .fail();
     }
     let sources: BTreeMap<_, _> = sources
         .iter()
@@ -181,12 +185,16 @@ pub(super) fn resolve_declaration_links(
     let mut references = Vec::new();
     let mut occurrences = BTreeMap::new();
     for link in links {
-        let block = blocks
-            .get(&link.block)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.block"))?;
-        let source = sources
-            .get(&block.source)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.source"))?;
+        let block = blocks.get(&link.block).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("link.block")
+                .error()
+        })?;
+        let source = sources.get(&block.source).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("block.source")
+                .error()
+        })?;
         let symbol = match names.lookup(source, &link.authored)? {
             DeclarationLinkMatch::Symbol(symbol) => symbol,
             DeclarationLinkMatch::Ambiguous => {
@@ -232,7 +240,9 @@ pub(super) fn fragment_index(
             && fragment.name.len()
                 <= rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize;
         if !valid_name || fragment.range.end <= fragment.range.start {
-            return Err(refused(DocumentationViolation::Range, "fragment"));
+            return errors::analysis::documentation_range_invalid()
+                .field("fragment")
+                .fail();
         }
         index
             .entry((&fragment.source, fragment.name.as_str()))
@@ -356,11 +366,18 @@ fn resolve_fragment(
 }
 
 fn source_base(source: &DocumentationSource) -> Result<Url, RiftError> {
-    let mut base = Url::parse("https://rift.invalid/root/")
-        .map_err(|_| refused(DocumentationViolation::Identity, "source.base"))?;
+    let mut base = Url::parse("https://rift.invalid/root/").map_err(|_| {
+        errors::analysis::documentation_identity_invalid()
+            .field("source.base")
+            .error()
+    })?;
     let path = source_file_path(source)?;
     base.path_segments_mut()
-        .map_err(|()| refused(DocumentationViolation::Identity, "source.base"))?
+        .map_err(|()| {
+            errors::analysis::documentation_identity_invalid()
+                .field("source.base")
+                .error()
+        })?
         .pop_if_empty()
         .extend(path.as_str().split('/'));
     Ok(base)
@@ -375,13 +392,16 @@ fn target_identity(
             path: ProjectPath(path.to_string()),
         },
         DocumentationSourceIdentity::Package { .. } => {
-            let package = source
-                .origin
-                .package
-                .as_ref()
-                .ok_or_else(|| refused(DocumentationViolation::Origin, "origin.package"))?;
-            let unit = rift_core::SourceUnitId::for_package(package, path)
-                .map_err(|_| refused(DocumentationViolation::Identity, "source.unit"))?;
+            let package = source.origin.package.as_ref().ok_or_else(|| {
+                errors::analysis::documentation_origin_invalid()
+                    .field("origin.package")
+                    .error()
+            })?;
+            let unit = rift_core::SourceUnitId::for_package(package, path).map_err(|_| {
+                errors::analysis::documentation_identity_invalid()
+                    .field("source.unit")
+                    .error()
+            })?;
             DocumentationSourceIdentity::Package {
                 unit: SourceUnitId(unit.to_string()),
             }

@@ -682,7 +682,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use rift_core::{ErrorCode, ErrorName, Fault as _};
+    use rift_error::errors;
     use rift_history::fixture::{commit_all, git, init};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath as WireProjectPath;
@@ -806,10 +806,6 @@ mod tests {
     /// One wire string, read as the payload spells it.
     fn text(value: &Value) -> String {
         value.as_str().unwrap_or_default().to_owned()
-    }
-
-    fn wire_code(error: &RiftError) -> ErrorName {
-        error.fault().name()
     }
 
     #[test]
@@ -1613,8 +1609,27 @@ mod tests {
             .baseline_to_head()
             .expect_err("the base side crosses the depth bound");
 
-        assert_eq!(wire_code(&error), ErrorName::Wire(ErrorCode::LimitExceeded));
-        assert!(error.to_string().contains("a/b/c/deep.rs"), "{error}");
+        assert_eq!(error.slug(), errors::index::workspace_too_deep::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == "a/b/c/deep.rs" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "source.directory_depth" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "observed" && value == "3")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "maximum" && value == "2")
+        );
         Ok(())
     }
 
@@ -1634,8 +1649,27 @@ mod tests {
             .baseline_to_head()
             .expect_err("the head side crosses the depth bound");
 
-        assert_eq!(wire_code(&error), ErrorName::Wire(ErrorCode::LimitExceeded));
-        assert!(error.to_string().contains("a/b/c/deep.rs"), "{error}");
+        assert_eq!(error.slug(), errors::index::workspace_too_deep::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == "a/b/c/deep.rs" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "source.directory_depth" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "observed" && value == "3")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "maximum" && value == "2")
+        );
         Ok(())
     }
 
@@ -1649,16 +1683,16 @@ mod tests {
             .search(&request)
             .expect_err("a commit search beside change must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
-        );
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         assert!(
             error
-                .to_string()
-                .contains("a commit search answers commits"),
-            "{error}"
+                .context()
+                .any(|(key, value)| key == "field" && value == "change")
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation"
+                && value == "a comparison answers declarations, and a commit search answers commits"
+        }));
         Ok(())
     }
 
@@ -1671,14 +1705,15 @@ mod tests {
             .search(&json!({"change": {"base": "baseline"}, "rev": "main"}))
             .expect_err("change beside rev must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
-        );
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         assert!(
-            error.to_string().contains("change names its own revisions"),
-            "{error}"
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "change")
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation" && value == "change names its own revisions"
+        }));
         Ok(())
     }
 
@@ -1691,16 +1726,15 @@ mod tests {
             .search(&json!({"change": {"base": "baseline"}, "query": "kept"}))
             .expect_err("change beside query must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
-        );
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
         assert!(
             error
-                .to_string()
-                .contains("query and change select different result sets"),
-            "{error}"
+                .context()
+                .any(|(key, value)| key == "field" && value == "change")
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "violation" && value == "query and change select different result sets"
+        }));
         Ok(())
     }
 
@@ -1714,16 +1748,15 @@ mod tests {
             let error = fixture
                 .search(&json!({"change": {"base": "baseline"}, "scope": scope}))
                 .expect_err("change beside a wider scope must refuse");
-            assert_eq!(
-                wire_code(&error),
-                ErrorName::Wire(ErrorCode::InvalidRequest)
-            );
+            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
             assert!(
                 error
-                    .to_string()
-                    .contains("package facts are served for the current tree alone"),
-                "{error}"
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "scope")
             );
+            assert!(error.context().any(|(key, value)| {
+                key == "violation" && value == "package facts are served for the current tree alone"
+            }));
         }
         Ok(())
     }
@@ -1773,9 +1806,11 @@ mod tests {
             .search(&json!({"change": {"base": "no-such-branch"}}))
             .expect_err("an unknown revision must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::ResourceNotFound)
+        assert_eq!(error.slug(), errors::history::revision_unknown::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "rev" && value == "no-such-branch" })
         );
         Ok(())
     }
@@ -1791,10 +1826,10 @@ mod tests {
             .baseline_to_head()
             .expect_err("a workspace with no repository must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-        );
+        assert_eq!(error.slug(), errors::history::unversioned::SLUG);
+        assert!(error.context().any(|(key, value)| {
+            key == "workspace" && value == fixture.directory.path().display().to_string()
+        }));
         Ok(())
     }
 
@@ -1806,11 +1841,17 @@ mod tests {
             .search(&json!({"change": {"base": "HEAD@{1}"}}))
             .expect_err("a spelling outside the charset must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::InvalidRequest)
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "change.base" })
         );
-        assert!(error.to_string().contains("change.base"), "{error}");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "violation" && value == "charset_forbidden" })
+        );
         Ok(())
     }
 
@@ -1834,7 +1875,17 @@ mod tests {
         let error = fixture
             .search(&json!({"change": {"base": "HEAD~1/src"}}))
             .expect_err("a suffix past the digits must refuse");
-        assert!(error.to_string().contains("ancestry_invalid"), "{error}");
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "change.base" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "violation" && value == "ancestry_invalid" })
+        );
         Ok(())
     }
 
@@ -1874,16 +1925,10 @@ mod tests {
             }))
             .expect_err("a walk beside a comparison must refuse");
 
-        assert_eq!(
-            wire_code(&error),
-            ErrorName::Wire(ErrorCode::CapabilityUnavailable)
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("relationship traversal beside a comparison"),
-            "{error}"
-        );
+        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
+        assert!(error.context().any(|(key, value)| {
+            key == "capability" && value == "relationship traversal beside a comparison"
+        }));
         Ok(())
     }
 }

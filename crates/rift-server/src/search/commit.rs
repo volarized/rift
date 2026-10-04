@@ -89,7 +89,7 @@ impl ReadService {
     /// attached; and the store fault when the store cannot be read.
     pub fn search_commits(&self, params: &SearchParams) -> Result<SearchResult, RiftError> {
         if let Some(conflict) = commit_conflict(params) {
-            return Err(conflict);
+            return conflict.fail();
         }
         let query = required_query(params)?;
         let limit = search_page_limit(params)?;

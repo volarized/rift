@@ -19,11 +19,11 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_dependency::DependencyContext;
-use rift_error::errors;
+use rift_error::{RiftError, errors};
 use rift_index::{
     ChangeSet, FileRecord, LastCapture, LexicalChange, LexicalStamp, PathChanges, TrigramBatch,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceIndexPreparation, WorkspaceSourcePolicy, capture_digests_with_languages_cancellable,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceIndexPreparation,
+    WorkspaceSourcePolicy, capture_digests_with_languages_cancellable,
     capture_selected_paths_cancellable,
 };
 use rift_protocol::configuration::{
@@ -37,10 +37,9 @@ use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::ReadWarning;
 use rift_protocol::source::SourceConfiguration;
 use rift_ranking::IndexDocument;
-use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
+use rift_search::{Embedding, SearchIndex, VectorReadiness};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadService, ReadServiceBuild,
-    RiftError, load_configuration,
+    CONFIGURATION_FILE_BYTES_MAX, LspProcessKey, ReadService, ReadServiceBuild, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -52,7 +51,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use crate::failure::WireFailure;
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
 use crate::server::{BlockingExecutor, EngineHold};
 
 /// Filesystem events coalesced while one rebuild is pending.
@@ -233,20 +232,23 @@ fn observed_records(
 ///
 /// # Errors
 ///
-/// Returns [`WorkspaceIndexError`] when the read fails for any other reason.
+/// Returns [`RiftError`] when the read fails for any other reason.
 fn observed_record(
     policy: &WorkspaceSourcePolicy,
     root: &Path,
     path: &ProjectPath,
-) -> Result<Option<FileRecord>, WorkspaceIndexError> {
+) -> Result<Option<FileRecord>, RiftError> {
     let absolute = root.join(path.as_str());
     match policy.visible_digest(&absolute) {
         Ok(digest) => Ok(digest.map(FileRecord::Digest)),
         Err(_) if absolute.is_dir() => Ok(None),
-        Err(error) => match error.fault().left_out_file(path.clone()) {
-            Some(warning) => Ok(Some(FileRecord::LeftOut(warning))),
-            None => Err(error),
-        },
+        Err(error) if error.slug() == errors::index::workspace_file_too_large::SLUG => Ok(Some(
+            FileRecord::LeftOut(rift_index::WorkspaceIndexWarning::FileTooLarge {
+                path: path.clone(),
+                error: Arc::new(error),
+            }),
+        )),
+        Err(error) => error.fail(),
     }
 }
 
@@ -357,7 +359,7 @@ impl PublishedWorkspace {
                     digests.remove(path);
                     refused.insert(path.clone(), warning);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return error.fail(),
             }
         }
         Ok(VisibleWorkspaceFiles {
@@ -563,7 +565,7 @@ pub(crate) struct IndexSupervisorContext {
 /// request and an unchanged one is not re-parsed per call.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigurationState {
-    pub(crate) accepted: Result<WorkspaceConfiguration, Arc<ConfigurationError>>,
+    pub(crate) accepted: Result<WorkspaceConfiguration, Arc<RiftError>>,
     pub(crate) fingerprint: ConfigurationFingerprint,
 }
 
@@ -585,7 +587,7 @@ impl ConfigurationState {
     ) -> Result<WorkspaceConfiguration, ErrorData> {
         match &self.accepted {
             Ok(configuration) => Ok(configuration.clone()),
-            Err(error) => Err(error.tool_error(phase)),
+            Err(error) => error.mcp().tool_error(phase).fail(),
         }
     }
 
@@ -1809,15 +1811,17 @@ fn complete_visible_digests(
             Some(digest) => Some(digest),
             None => match policy.visible_digest(&root.join(path.as_str())) {
                 Ok(digest) => digest,
-                Err(error) if error.fault().left_out_file(path.clone()).is_some() => {
-                    let warning = error
-                        .fault()
-                        .left_out_file(path.clone())
-                        .unwrap_or_else(|| unreachable!("the guard found a left-out file"));
-                    refused.insert(path.clone(), warning);
+                Err(error) if error.slug() == errors::index::workspace_file_too_large::SLUG => {
+                    refused.insert(
+                        path.clone(),
+                        rift_index::WorkspaceIndexWarning::FileTooLarge {
+                            path: path.clone(),
+                            error: Arc::new(error),
+                        },
+                    );
                     None
                 }
-                Err(error) => return Err(error),
+                Err(error) => return error.fail(),
             },
         };
         if let Some(digest) = digest {
@@ -2183,14 +2187,14 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
     fn recorded(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, SearchError>> + Send;
+    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, RiftError>> + Send;
 
     /// Deletes every row and recorded digest, and stamps no publication under
     /// `derivation_revision`.
     fn clear(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send;
+    ) -> impl Future<Output = Result<(), RiftError>> + Send;
 
     /// Applies `change` and stamps `stamp` in one transaction, replacing the documentation
     /// metadata with `documentation` when one is given and keeping it otherwise.
@@ -2199,25 +2203,25 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
         change: &LexicalChange,
         stamp: &LexicalStamp,
         documentation: Option<&rift_index::DocumentationCollection>,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send;
+    ) -> impl Future<Output = Result<(), RiftError>> + Send;
 
     /// Indexes the oldest file rows the trigram index lacks in one bounded transaction, and
     /// answers what it indexed and how many rows it still lacks.
-    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, SearchError>> + Send;
+    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, RiftError>> + Send;
 }
 
 impl LexicalStore for SearchIndex {
     fn recorded(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, SearchError>> + Send {
+    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, RiftError>> + Send {
         self.recorded_lexical_files(derivation_revision)
     }
 
     fn clear(
         &self,
         derivation_revision: &str,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send {
+    ) -> impl Future<Output = Result<(), RiftError>> + Send {
         self.clear_lexical(derivation_revision)
     }
 
@@ -2226,7 +2230,7 @@ impl LexicalStore for SearchIndex {
         change: &LexicalChange,
         stamp: &LexicalStamp,
         documentation: Option<&rift_index::DocumentationCollection>,
-    ) -> Result<(), SearchError> {
+    ) -> Result<(), RiftError> {
         match documentation {
             Some(documentation) => {
                 self.apply_lexical_with_documentation(change, stamp, documentation)
@@ -2236,7 +2240,7 @@ impl LexicalStore for SearchIndex {
         }
     }
 
-    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, SearchError>> + Send {
+    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, RiftError>> + Send {
         SearchIndex::index_trigrams(self)
     }
 }
@@ -2868,7 +2872,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// is cancelled first.
     async fn store_answer<T: Send + 'static>(
         &self,
-        mut running: JoinHandle<Result<T, SearchError>>,
+        mut running: JoinHandle<Result<T, RiftError>>,
     ) -> Result<T, RiftError> {
         tokio::select! {
             ended = &mut running => match ended {
@@ -2896,11 +2900,11 @@ impl<Store: LexicalStore> LexicalTask<Store> {
 /// Waits for a transaction, recording its diagnostic deadline once without ending the wait.
 /// The caller races this entire future against cancellation, including the delayed wait.
 async fn wait_for_transaction(
-    running: &mut JoinHandle<Result<(), SearchError>>,
+    running: &mut JoinHandle<Result<(), RiftError>>,
     tree_revision: &str,
     form: &'static str,
     deadline: Duration,
-) -> Result<Result<(), SearchError>, tokio::task::JoinError> {
+) -> Result<Result<(), RiftError>, tokio::task::JoinError> {
     if let Ok(ended) = tokio::time::timeout(deadline, &mut *running).await {
         ended
     } else {
@@ -3683,7 +3687,8 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
         component = "index",
         operation = "index.build",
         epoch,
-        error_code = error.descriptor().code(),
+        error_code = crate::failure::wire_code_for_error(&error)
+            .unwrap_or_else(|| "internal_error".to_owned()),
         "index rebuild failed"
     );
     let failed_state = Arc::clone(&context.published);
@@ -3921,7 +3926,7 @@ pub(crate) fn capture_rebuild_with(
             if request.cancellation.is_cancelled() || validation.cancellation.is_cancelled() {
                 return Ok(CapturedRebuild::Cancelled);
             }
-            return Err(error);
+            return error.fail();
         }
     };
     let WorkspaceCandidate::Stable {
@@ -4199,8 +4204,9 @@ pub(crate) mod lexical_double {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use rift_error::{RiftError, errors};
     use rift_index::{LexicalChange, LexicalStamp, TrigramBatch, WorkspaceDigests};
-    use rift_search::{SearchError, SearchFault, SearchIndex, SearchViolation};
+    use rift_search::SearchIndex;
     use tokio::sync::{Semaphore, watch};
 
     use super::{LexicalLaneBounds, LexicalStore};
@@ -4450,8 +4456,8 @@ pub(crate) mod lexical_double {
             &self,
             form: &'static str,
             tree_revision: &str,
-            through: impl Future<Output = Result<(), SearchError>>,
-        ) -> Result<(), SearchError> {
+            through: impl Future<Output = Result<(), RiftError>>,
+        ) -> Result<(), RiftError> {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4460,10 +4466,11 @@ pub(crate) mod lexical_double {
                 dropped_while_held: &self.dropped_while_held,
                 released: false,
             };
-            let permit =
-                self.permits.acquire().await.map_err(|_| {
-                    SearchError::new(SearchFault::new(SearchViolation::StoreFailed))
-                })?;
+            let permit = self
+                .permits
+                .acquire()
+                .await
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
             held.release();
             permit.forget();
             through.await
@@ -4474,12 +4481,11 @@ pub(crate) mod lexical_double {
         async fn recorded(
             &self,
             derivation_revision: &str,
-        ) -> Result<Option<WorkspaceDigests>, SearchError> {
+        ) -> Result<Option<WorkspaceDigests>, RiftError> {
             if self.refuse_reads.load(Ordering::SeqCst) {
-                return Err(SearchError::new(
-                    SearchFault::new(SearchViolation::StoreFailed)
-                        .about("the double refuses reads"),
-                ));
+                return errors::index::lexical_storage()
+                    .source(std::io::Error::other("the double refuses reads"))
+                    .fail();
             }
             match self.attached() {
                 Some(index) => index.recorded_lexical_files(derivation_revision).await,
@@ -4487,7 +4493,7 @@ pub(crate) mod lexical_double {
             }
         }
 
-        async fn clear(&self, derivation_revision: &str) -> Result<(), SearchError> {
+        async fn clear(&self, derivation_revision: &str) -> Result<(), RiftError> {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4503,13 +4509,12 @@ pub(crate) mod lexical_double {
             change: &LexicalChange,
             stamp: &LexicalStamp,
             documentation: Option<&rift_index::DocumentationCollection>,
-        ) -> Result<(), SearchError> {
+        ) -> Result<(), RiftError> {
             let through = async {
                 if self.refuse_changes.load(Ordering::SeqCst) {
-                    return Err(SearchError::new(
-                        SearchFault::new(SearchViolation::StoreFailed)
-                            .about("the double refuses changes"),
-                    ));
+                    return errors::index::lexical_storage()
+                        .source(std::io::Error::other("the double refuses changes"))
+                        .fail();
                 }
                 match self.attached() {
                     Some(index) => index.apply(change, stamp, documentation).await,
@@ -4524,7 +4529,7 @@ pub(crate) mod lexical_double {
             self.write("apply", tree_revision, through).await
         }
 
-        async fn index_trigrams(&self) -> Result<TrigramBatch, SearchError> {
+        async fn index_trigrams(&self) -> Result<TrigramBatch, RiftError> {
             self.trigram_arrivals.send_modify(|arrived| *arrived += 1);
             let writes = self.applied().len();
             self.trigram_gate
@@ -4532,13 +4537,12 @@ pub(crate) mod lexical_double {
                 .wait_for(|gate| gate.passes(writes))
                 .await
                 .map(drop)
-                .map_err(|_| SearchError::new(SearchFault::new(SearchViolation::StoreFailed)))?;
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
             self.trigram_gate.send_modify(|gate| gate.spend(writes));
             if self.refuse_trigrams.load(Ordering::SeqCst) {
-                return Err(SearchError::new(
-                    SearchFault::new(SearchViolation::StoreFailed)
-                        .about("the double refuses trigram batches"),
-                ));
+                return errors::index::lexical_storage()
+                    .source(std::io::Error::other("the double refuses trigram batches"))
+                    .fail();
             }
             self.trigram_batches.fetch_add(1, Ordering::SeqCst);
             match self.attached() {
@@ -4595,7 +4599,10 @@ impl ConfigurationState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::ConfigurationState;
+    use crate::failure::{McpErrorExt as _, WireFailure as _};
     use rift_core::{ProjectPath, SourceVisibility};
+    use rift_error::errors;
+    use rift_protocol::error as wire;
     use rift_server::LspProcessKey;
     #[test]
     fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
@@ -5292,11 +5299,17 @@ pub(crate) mod tests {
         let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
         let answer = published.reads.get_symbol(&params)?;
         assert!(answer.hits.is_empty());
-        assert!(answer.warnings.iter().any(|warning| matches!(
-            warning,
-            rift_protocol::read::ReadWarning::SourceUnavailable { detail, .. }
-                if detail.contains("file byte limit")
-        )));
+        assert!(
+            answer.warnings.iter().any(|warning| matches!(
+                warning,
+                rift_protocol::read::ReadWarning::SourceUnavailable { unit: Some(unit), detail }
+                    if unit.0 == "rift://file/lib.rs"
+                        && detail.contains("lib.rs")
+                        && detail.contains("byte limit of 60")
+            )),
+            "the late event must retain file identity and byte-limit warning: {:?}",
+            answer.warnings
+        );
 
         fs::write(&absolute, "pub fn changed() {}\n")?;
         validation.observe_paths([path])?;
@@ -6763,7 +6776,11 @@ pub(crate) mod tests {
             .shutdown(deadline)
             .await
             .expect_err("a stuck supervisor must miss the shutdown deadline");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert_eq!(
+            error.mcp().wire_error(wire::ErrorPhase::Read).code,
+            wire::ErrorCode::TemporarilyUnavailable
+        );
         supervisor
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(30))
             .await
@@ -6882,7 +6899,11 @@ pub(crate) mod tests {
         let _ = validation.observe_watch_failure();
         let error = super::accept_rebuild(&validation, 0)
             .expect_err("a failed watcher must refuse rebuild acceptance");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert_eq!(
+            error.mcp().wire_error(wire::ErrorPhase::Read).code,
+            wire::ErrorCode::TemporarilyUnavailable
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6929,7 +6950,11 @@ pub(crate) mod tests {
         let (failed_epoch, error) = failure.ok_or("rebuild failure must be recorded")?;
         assert_eq!(failed_epoch, epoch);
         // A vanished root refuses at canonical-root resolution.
-        assert_eq!(error.descriptor().code(), "configuration_invalid");
+        assert_eq!(error.slug(), errors::index::workspace_invalid_root::SLUG);
+        assert_eq!(
+            error.mcp().wire_error(wire::ErrorPhase::Read).code,
+            wire::ErrorCode::ConfigurationInvalid
+        );
         validation.cancellation.cancel();
         supervisor.await?;
         Ok(())
@@ -7182,7 +7207,13 @@ pub(crate) mod tests {
         let error = super::prepare_initial_workspace_from(&context, initial)
             .await
             .expect_err("a renamed discovered directory must refuse its selected paths");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
+        );
+        let wire_error = error.mcp().wire_error(wire::ErrorPhase::Read);
+        assert_eq!(wire_error.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(wire_error.retry, wire::RetryDirective::SameRequest);
         let request = context.validation.take_pending();
         assert!(request.work.covers_whole_workspace());
         assert_eq!(

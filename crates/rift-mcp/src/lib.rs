@@ -2,7 +2,7 @@
 
 mod election;
 mod failure;
-pub use failure::wire_code_for_slug;
+pub use failure::{wire_code_for_error, wire_code_for_slug};
 mod global;
 mod history;
 mod http;

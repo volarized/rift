@@ -466,7 +466,7 @@ impl CompositionBuilder {
     /// duplicate stage path, foreign flow handle, or missing output selection.
     pub fn build(self) -> Result<ProviderComposition, RiftError> {
         if let Some(error) = self.errors.into_iter().next() {
-            return Err(error);
+            return error.fail();
         }
         let output = self
             .output
@@ -706,7 +706,7 @@ impl CompositionEditor {
     /// duplicate name, incompatible types, or removal of a referenced stage.
     pub fn build(self) -> Result<ProviderComposition, RiftError> {
         if let Some(error) = self.errors.into_iter().next() {
-            return Err(error);
+            return error.fail();
         }
         Ok(ProviderComposition::from_nodes(
             self.id,

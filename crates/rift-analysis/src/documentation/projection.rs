@@ -16,9 +16,8 @@ use rift_protocol::documentation::{
 use rift_protocol::read::TextRange;
 use rift_ranking::{DocumentIdentity, RankedIdentity, RankingInput};
 
-use super::failure::{DocumentationViolation, refused};
 use super::publication::DocumentationCollection;
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 /// Blocks one layer holds across its collections.
 ///
@@ -156,10 +155,9 @@ impl<'collection> DocumentationLayer<'collection> {
         bounds: LayerBounds,
     ) -> Result<Self, RiftError> {
         if u32::try_from(collections.len()).is_err() {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "projection.collections",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("projection.collections")
+                .fail();
         }
         let sources = layer_sources(&collections, bounds.sources)?;
         let blocks = layer_blocks(&collections, bounds.blocks)?;
@@ -184,11 +182,15 @@ impl<'collection> DocumentationLayer<'collection> {
         identity: DocumentIdentity,
         block_identity: &DocumentationDigest,
     ) -> Result<(), RiftError> {
-        let address = self
-            .block_address(block_identity)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.identity"))?;
+        let address = self.block_address(block_identity).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("block.identity")
+                .error()
+        })?;
         if self.block_at(address).symbol.is_none() {
-            return Err(refused(DocumentationViolation::Format, "block.symbol"));
+            return errors::analysis::documentation_format_invalid()
+                .field("block.symbol")
+                .fail();
         }
         let start = self
             .mappings
@@ -203,10 +205,9 @@ impl<'collection> DocumentationLayer<'collection> {
             return Ok(());
         }
         if self.mappings.len() >= self.mapping_bound {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "projection.mappings",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("projection.mappings")
+                .fail();
         }
         self.mappings.insert(
             end,
@@ -496,11 +497,10 @@ impl Projected {
         DocumentIdentity::for_documentation_block(&mapping.block.identity.0)
             .map(Self::Block)
             .map_err(|error| {
-                caused_by(
-                    DocumentationViolation::LimitExceeded,
-                    "projection.identity",
-                    error,
-                )
+                errors::analysis::documentation_limit_exceeded()
+                    .field("projection.identity")
+                    .source(error)
+                    .error()
             })
     }
 }
@@ -533,10 +533,9 @@ fn layer_sources(
         count.checked_add(held.collection().index().sources.len())
     });
     if count.is_none_or(|count| count > bound) {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "projection.sources",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("projection.sources")
+            .fail();
     }
     let mut sources = Vec::with_capacity(count.unwrap_or_default());
     for (position, held) in (0_u32..).zip(collections) {
@@ -550,10 +549,9 @@ fn layer_sources(
     }
     sort_by_key(&mut sources);
     if sources.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(refused(
-            DocumentationViolation::DuplicateSource,
-            "projection.source",
-        ));
+        return errors::analysis::documentation_duplicate_source()
+            .field("projection.source")
+            .fail();
     }
     Ok(sources)
 }
@@ -567,10 +565,9 @@ fn layer_blocks(
         count.checked_add(held.collection().index().blocks.len())
     });
     if count.is_none_or(|count| count > bound) {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "projection.blocks",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("projection.blocks")
+            .fail();
     }
     let mut blocks = Vec::with_capacity(count.unwrap_or_default());
     for (collection, held) in (0_u32..).zip(collections) {
@@ -582,10 +579,9 @@ fn layer_blocks(
     }
     sort_by_key(&mut blocks);
     if blocks.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(refused(
-            DocumentationViolation::Identity,
-            "projection.block",
-        ));
+        return errors::analysis::documentation_identity_invalid()
+            .field("projection.block")
+            .fail();
     }
     Ok(blocks)
 }
@@ -605,10 +601,9 @@ fn layer_mappings(
         count.checked_add(additions.len())
     });
     if count.is_none_or(|count| count > bound) {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "projection.mappings",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("projection.mappings")
+            .fail();
     }
     let mut mappings = derived.into_iter().flatten().collect::<Vec<_>>();
     sort_by_key(&mut mappings);
@@ -696,7 +691,10 @@ fn collection_mappings(
         };
         for chunk in &block.chunks {
             let identity = DocumentIdentity::new(chunk.identity.as_str()).map_err(|error| {
-                caused_by(DocumentationViolation::Identity, "chunk.identity", error)
+                errors::analysis::documentation_identity_invalid()
+                    .field("chunk.identity")
+                    .source(error)
+                    .error()
             })?;
             additions.push((
                 identity,
@@ -758,18 +756,31 @@ fn owner_identities(block: &DocumentationBlock) -> Result<Vec<DocumentIdentity>,
     let Some(symbol) = &block.symbol else {
         return Ok(Vec::new());
     };
-    let mut identities = vec![
-        DocumentIdentity::new(symbol.0.clone())
-            .map_err(|error| caused_by(DocumentationViolation::Identity, "block.symbol", error))?,
-    ];
+    let mut identities = vec![DocumentIdentity::new(symbol.0.clone()).map_err(|error| {
+        errors::analysis::documentation_identity_invalid()
+            .field("block.symbol")
+            .source(error)
+            .error()
+    })?];
     if let DocumentationSourceIdentity::Package { unit } = &block.source.source {
-        let unit = rift_core::SourceUnitId::parse(&unit.0)
-            .map_err(|error| caused_by(DocumentationViolation::Identity, "block.source", error))?;
-        let symbol = rift_core::parse_symbol_identity(&symbol.0)
-            .map_err(|error| caused_by(DocumentationViolation::Identity, "block.symbol", error))?;
+        let unit = rift_core::SourceUnitId::parse(&unit.0).map_err(|error| {
+            errors::analysis::documentation_identity_invalid()
+                .field("block.source")
+                .source(error)
+                .error()
+        })?;
+        let symbol = rift_core::parse_symbol_identity(&symbol.0).map_err(|error| {
+            errors::analysis::documentation_identity_invalid()
+                .field("block.symbol")
+                .source(error)
+                .error()
+        })?;
         identities.push(
             DocumentIdentity::for_unit(&unit, symbol.qualified_name()).map_err(|error| {
-                caused_by(DocumentationViolation::Identity, "block.symbol", error)
+                errors::analysis::documentation_identity_invalid()
+                    .field("block.symbol")
+                    .source(error)
+                    .error()
             })?,
         );
     }
@@ -784,24 +795,27 @@ fn heading_identity(
         DocumentationSourceIdentity::Project { path } => DocumentIdentity::new(
             rift_core::symbol_identity("markdown", &path.0, name),
         )
-        .map_err(|error| caused_by(DocumentationViolation::Identity, "heading.identity", error)),
+        .map_err(|error| {
+            errors::analysis::documentation_identity_invalid()
+                .field("heading.identity")
+                .source(error)
+                .error()
+        }),
         DocumentationSourceIdentity::Package { unit } => {
             let unit = rift_core::SourceUnitId::parse(&unit.0).map_err(|error| {
-                caused_by(DocumentationViolation::Identity, "heading.identity", error)
+                errors::analysis::documentation_identity_invalid()
+                    .field("heading.identity")
+                    .source(error)
+                    .error()
             })?;
             DocumentIdentity::for_unit(&unit, name).map_err(|error| {
-                caused_by(DocumentationViolation::Identity, "heading.identity", error)
+                errors::analysis::documentation_identity_invalid()
+                    .field("heading.identity")
+                    .source(error)
+                    .error()
             })
         }
     }
-}
-
-fn caused_by(
-    violation: DocumentationViolation,
-    field: &'static str,
-    source: impl std::error::Error + Send + Sync + 'static,
-) -> RiftError {
-    super::failure::refused_by(violation, field, source)
 }
 
 /// Picks the narrowest block containing the located match, ties broken by source, start,

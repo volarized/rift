@@ -45,8 +45,6 @@ pub enum PathViolation {
     RiftState,
 }
 
-/// Invalid project or source path.
-
 /// Validated path below a workspace root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectPath(Arc<str>);
@@ -63,16 +61,17 @@ impl ProjectPath {
         let value = value.into();
         validate_common(&value, PathKind::Project, PROJECT_PATH_BYTES_MAX)?;
         if value.chars().nfc().ne(value.chars()) {
-            return Err(path_error(
-                PathKind::Project,
-                PathViolation::NonCanonicalUnicode,
-            ));
+            return errors::core::path_non_canonical_unicode()
+                .path_kind("project")
+                .fail();
         }
         if value == RIFT_STATE_DIRECTORY || value.starts_with(RIFT_STATE_DIRECTORY_PREFIX) {
-            return Err(path_error(PathKind::Project, PathViolation::RiftState));
+            return errors::core::path_rift_state().path_kind("project").fail();
         }
         if value.split('/').any(str::is_empty) && !value.is_empty() {
-            return Err(path_error(PathKind::Project, PathViolation::EmptySegment));
+            return errors::core::path_empty_segment()
+                .path_kind("project")
+                .fail();
         }
         Ok(Self(Arc::from(value)))
     }
@@ -119,7 +118,7 @@ impl SourcePath {
         let value = value.into();
         validate_common(&value, PathKind::Source, SOURCE_PATH_BYTES_MAX)?;
         if value.is_empty() {
-            return Err(path_error(PathKind::Source, PathViolation::Empty));
+            return errors::core::path_empty().path_kind("source").fail();
         }
         Ok(Self(Arc::from(value)))
     }
@@ -139,7 +138,37 @@ impl fmt::Display for SourcePath {
 
 fn validate_common(value: &str, kind: PathKind, bytes_max: usize) -> Result<(), RiftError> {
     match path_violation(value, bytes_max) {
-        Some(violation) => Err(path_error(kind, violation)),
+        Some(violation) => {
+            let path_kind = match kind {
+                PathKind::Project => "project",
+                PathKind::Source => "source",
+            };
+            match violation {
+                PathViolation::Empty => errors::core::path_empty().path_kind(path_kind).fail(),
+                PathViolation::TooLong => errors::core::path_too_long().path_kind(path_kind).fail(),
+                PathViolation::Absolute => {
+                    errors::core::path_absolute().path_kind(path_kind).fail()
+                }
+                PathViolation::DotSegment => {
+                    errors::core::path_dot_segment().path_kind(path_kind).fail()
+                }
+                PathViolation::EmptySegment => errors::core::path_empty_segment()
+                    .path_kind(path_kind)
+                    .fail(),
+                PathViolation::Backslash => {
+                    errors::core::path_backslash().path_kind(path_kind).fail()
+                }
+                PathViolation::ControlCharacter => errors::core::path_control_character()
+                    .path_kind(path_kind)
+                    .fail(),
+                PathViolation::NonCanonicalUnicode => errors::core::path_non_canonical_unicode()
+                    .path_kind(path_kind)
+                    .fail(),
+                PathViolation::RiftState => {
+                    errors::core::path_rift_state().path_kind(path_kind).fail()
+                }
+            }
+        }
         None => Ok(()),
     }
 }
@@ -164,31 +193,6 @@ fn is_dot_segment(segment: &str) -> bool {
     match segment {
         "." | ".." => true,
         _ => false,
-    }
-}
-
-fn path_error(kind: PathKind, violation: PathViolation) -> RiftError {
-    let path_kind = match kind {
-        PathKind::Project => "project",
-        PathKind::Source => "source",
-    };
-    macro_rules! build {
-        ($builder:expr) => {
-            $builder.path_kind(path_kind).error()
-        };
-    }
-    match violation {
-        PathViolation::Empty => build!(errors::core::path_empty()),
-        PathViolation::TooLong => build!(errors::core::path_too_long()),
-        PathViolation::Absolute => build!(errors::core::path_absolute()),
-        PathViolation::DotSegment => build!(errors::core::path_dot_segment()),
-        PathViolation::EmptySegment => build!(errors::core::path_empty_segment()),
-        PathViolation::Backslash => build!(errors::core::path_backslash()),
-        PathViolation::ControlCharacter => build!(errors::core::path_control_character()),
-        PathViolation::NonCanonicalUnicode => {
-            build!(errors::core::path_non_canonical_unicode())
-        }
-        PathViolation::RiftState => build!(errors::core::path_rift_state()),
     }
 }
 
@@ -236,7 +240,10 @@ mod tests {
         assert_eq!(project, project_clone);
         assert!(project < ProjectPath::new("src/main.rs").expect("valid project path"));
         assert_eq!(project.to_string(), "src/lib.rs");
-        assert_eq!(AsRef::<std::path::Path>::as_ref(&project), std::path::Path::new("src/lib.rs"));
+        assert_eq!(
+            AsRef::<std::path::Path>::as_ref(&project),
+            std::path::Path::new("src/lib.rs")
+        );
         assert!(ProjectPath::new("src/../lib.rs").is_err());
 
         let mut project_hash = std::collections::hash_map::DefaultHasher::new();

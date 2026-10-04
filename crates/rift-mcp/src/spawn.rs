@@ -18,7 +18,7 @@ mod process;
 use process::{Child, Command, Stdio, detached_command_for, spawn_detached};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
-use rift_core::{CapturedStream, CliCode, ErrorName, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Bytes of a detached server's startup stderr kept verbatim; the rest is
@@ -367,14 +367,10 @@ impl<Failure> StartExit<Failure> {
 /// met a lock on the election file - a concurrent starter's, or a probe's the
 /// operating system has not released yet - and it exited on its own, printing
 /// the same `server_already_serving` refusal an operator sees from `rift
-/// server start --foreground`. The marker is built from the CLI registry so
-/// the match cannot drift from the code the binary actually prints.
+/// server start --foreground`. The marker matches `server_already_serving`,
+/// the CLI code for `rift.cli.server_already_serving`.
 fn lost_start_election(stderr: &str) -> bool {
-    let marker = format!(
-        "error[{code}]",
-        code = ErrorName::Cli(CliCode::ServerAlreadyServing).code()
-    );
-    stderr.contains(&marker)
+    stderr.contains("error[server_already_serving]")
 }
 
 /// A server one start spawned, watched until it exits.

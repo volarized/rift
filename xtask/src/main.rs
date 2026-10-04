@@ -76,8 +76,11 @@ fields = { field = { type = "string" } }
         let directory = tempfile::tempdir().expect("create temporary workspace");
         std::fs::create_dir_all(directory.path().join("crates/rift-error/src"))
             .expect("create generated source directory");
-        std::fs::write(directory.path().join("crates/rift-error/errors.toml"), REGISTRY)
-            .expect("write test registry");
+        std::fs::write(
+            directory.path().join("crates/rift-error/errors.toml"),
+            REGISTRY,
+        )
+        .expect("write test registry");
         directory
     }
 

@@ -7,8 +7,7 @@ use rift_core::{ProjectPath, line::line_of, line::line_starts};
 use rift_protocol::read::TextRange;
 use tree_sitter::{Language, Node, ParseOptions, ParseState, Parser, Point, Tree};
 
-use super::failure::{DocumentationViolation, refused};
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 const SOURCE_BYTES_MAX: usize = 4 * 1_024 * 1_024;
 const SYNTAX_NODES_MAX: usize = 250_000;
@@ -130,10 +129,9 @@ fn extract_rst_facts_with_bounds(
     bounds: RstParseBounds,
 ) -> Result<RstFacts, RiftError> {
     if text.len() > bounds.source_bytes {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "source_bytes",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("source_bytes")
+            .fail();
     }
     let tree = parse(text, bounds)?;
     let language: Language = tree_sitter_rst::LANGUAGE.into();
@@ -145,9 +143,11 @@ fn extract_rst_facts_with_bounds(
 fn parse(text: &str, bounds: RstParseBounds) -> Result<Tree, RiftError> {
     let language: Language = tree_sitter_rst::LANGUAGE.into();
     let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .map_err(|_| refused(DocumentationViolation::Format, "rst_grammar"))?;
+    parser.set_language(&language).map_err(|_| {
+        errors::analysis::documentation_format_invalid()
+            .field("rst_grammar")
+            .error()
+    })?;
     let (tree, exhausted) = {
         let mut calls = 0_usize;
         let mut exhausted = false;
@@ -170,17 +170,15 @@ fn parse(text: &str, bounds: RstParseBounds) -> Result<Tree, RiftError> {
         (tree, exhausted)
     };
     tree.ok_or_else(|| {
-        let field = if exhausted {
-            "rst_progress"
+        if exhausted {
+            errors::analysis::documentation_limit_exceeded()
+                .field("rst_progress")
+                .error()
         } else {
-            "rst_parse"
-        };
-        let violation = if exhausted {
-            DocumentationViolation::LimitExceeded
-        } else {
-            DocumentationViolation::Format
-        };
-        refused(violation, field)
+            errors::analysis::documentation_format_invalid()
+                .field("rst_parse")
+                .error()
+        }
     })
 }
 
@@ -196,15 +194,21 @@ fn bounded_nodes(root: Node<'_>, bounds: RstParseBounds) -> Result<Vec<RstNode<'
     let mut cursor = root.walk();
     while let Some((node, depth, parent)) = pending.pop() {
         if depth > bounds.depth {
-            return Err(refused(DocumentationViolation::LimitExceeded, "rst_depth"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("rst_depth")
+                .fail();
         }
         if nodes.len() >= bounds.node_count {
-            return Err(refused(DocumentationViolation::LimitExceeded, "rst_nodes"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("rst_nodes")
+                .fail();
         }
         let node_id = node.id();
         nodes.push(RstNode { node, parent });
         if nodes.len() + pending.len() + node.named_child_count() > bounds.node_count {
-            return Err(refused(DocumentationViolation::LimitExceeded, "rst_nodes"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("rst_nodes")
+                .fail();
         }
         // The cursor steps sibling to sibling; `Node::child` restarts from the
         // first child on every call, which makes a wide node quadratic. The
@@ -671,13 +675,21 @@ fn collect_target(
     if node.kind_id() == kinds.target {
         if let Some(name) = node.child_by_field_id(kinds.name_field) {
             let raw_range = byte_range(name)?;
-            let mut start = usize::try_from(raw_range.start)
-                .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?;
-            let mut end = usize::try_from(raw_range.end)
-                .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?;
-            let raw = text
-                .get(start..end)
-                .ok_or_else(|| refused(DocumentationViolation::Range, "rst_range"))?;
+            let mut start = usize::try_from(raw_range.start).map_err(|_| {
+                errors::analysis::documentation_range_invalid()
+                    .field("rst_range")
+                    .error()
+            })?;
+            let mut end = usize::try_from(raw_range.end).map_err(|_| {
+                errors::analysis::documentation_range_invalid()
+                    .field("rst_range")
+                    .error()
+            })?;
+            let raw = text.get(start..end).ok_or_else(|| {
+                errors::analysis::documentation_range_invalid()
+                    .field("rst_range")
+                    .error()
+            })?;
             if raw.starts_with('_') {
                 start += 1;
             }
@@ -686,7 +698,11 @@ fn collect_target(
             }
             let authored = text
                 .get(start..end)
-                .ok_or_else(|| refused(DocumentationViolation::Range, "rst_range"))?
+                .ok_or_else(|| {
+                    errors::analysis::documentation_range_invalid()
+                        .field("rst_range")
+                        .error()
+                })?
                 .trim()
                 .to_owned();
             let range = text_range(start, end)?;
@@ -758,12 +774,20 @@ fn collect_link(
 
 fn reference_name_range(node: Node<'_>, text: &str) -> Result<Option<TextRange>, RiftError> {
     let mut range = byte_range(node)?;
-    let mut start = usize::try_from(range.start)
-        .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?;
-    let mut end = usize::try_from(range.end)
-        .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?;
+    let mut start = usize::try_from(range.start).map_err(|_| {
+        errors::analysis::documentation_range_invalid()
+            .field("rst_range")
+            .error()
+    })?;
+    let mut end = usize::try_from(range.end).map_err(|_| {
+        errors::analysis::documentation_range_invalid()
+            .field("rst_range")
+            .error()
+    })?;
     let Some(raw) = text.get(start..end) else {
-        return Err(refused(DocumentationViolation::Range, "rst_range"));
+        return errors::analysis::documentation_range_invalid()
+            .field("rst_range")
+            .fail();
     };
     if raw.starts_with('`') {
         start += 1;
@@ -796,18 +820,31 @@ fn collect_errors(node: Node<'_>, output: &mut Vec<TextRange>) -> Result<(), Rif
 
 fn byte_range(node: Node<'_>) -> Result<TextRange, RiftError> {
     Ok(TextRange {
-        start: u64::try_from(node.start_byte())
-            .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?,
-        end: u64::try_from(node.end_byte())
-            .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?,
+        start: u64::try_from(node.start_byte()).map_err(|_| {
+            errors::analysis::documentation_range_invalid()
+                .field("rst_range")
+                .error()
+        })?,
+        end: u64::try_from(node.end_byte()).map_err(|_| {
+            errors::analysis::documentation_range_invalid()
+                .field("rst_range")
+                .error()
+        })?,
     })
 }
 
 fn text_range(start: usize, end: usize) -> Result<TextRange, RiftError> {
     Ok(TextRange {
-        start: u64::try_from(start)
-            .map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?,
-        end: u64::try_from(end).map_err(|_| refused(DocumentationViolation::Range, "rst_range"))?,
+        start: u64::try_from(start).map_err(|_| {
+            errors::analysis::documentation_range_invalid()
+                .field("rst_range")
+                .error()
+        })?,
+        end: u64::try_from(end).map_err(|_| {
+            errors::analysis::documentation_range_invalid()
+                .field("rst_range")
+                .error()
+        })?,
     })
 }
 
@@ -826,6 +863,7 @@ fn overlaps_any(range: &TextRange, errors: &[TextRange]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::documentation::DocumentationViolation;
 
     fn path() -> ProjectPath {
         ProjectPath::new("docs/guide.rst").expect("valid source path")

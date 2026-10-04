@@ -16,6 +16,7 @@ TEST_ATTRIBUTE = re.compile(r"#\[(?:tokio::)?test\b")
 
 EXPECTED_EDGES = {
     "rift -> rift-core",
+    "rift -> rift-error",
     "rift -> rift-index",
     "rift -> rift-mcp",
     "rift -> rift-protocol",
@@ -28,10 +29,13 @@ EXPECTED_EDGES = {
     "rift-cloud-client -> rift-ranking",
     "rift-core -> rift-protocol",
     "rift-core -> rift-error",
+    "rift-error-codegen -> rift-error",
     "rift-dependency -> rift-core",
     "rift-dependency -> rift-protocol",
     "rift-history -> rift-core",
+    "rift-history -> rift-error",
     "rift-history-store -> rift-core",
+    "rift-history-store -> rift-error",
     "rift-history-store -> rift-protocol",
     "rift-history-store -> rift-ranking",
     "rift-analysis -> rift-core",

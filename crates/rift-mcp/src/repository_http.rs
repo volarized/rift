@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{any, post};
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::ServerConfiguration;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -26,8 +26,7 @@ use crate::RiftMcp;
 use crate::election::{ElectionGuard, claim};
 use crate::http::{
     HttpServer, IdleTracker, MCP_PATH, RequestGate, STOP_PATH, TokenCheck, WORKSPACE_ROOT_HEADER,
-    authorize_request, bind_loopback_listener, guard_loopback_boundary, http_serve_failed,
-    mint_token, watch_idle,
+    authorize_request, bind_loopback_listener, guard_loopback_boundary, mint_token, watch_idle,
 };
 use crate::identity::BuildCheckout;
 use crate::repository::{ServerConfigurationSelection, select_server_configuration};
@@ -52,14 +51,29 @@ pub(crate) async fn serve_repository_http(
 ) -> Result<HttpServer, RiftError> {
     let authority_root = tokio::fs::canonicalize(authority_root)
         .await
-        .map_err(|error| http_serve_failed("repository authority root", error))?;
+        .map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("repository authority root")
+                .source(error)
+                .error()
+        })?;
     let common_directory = tokio::fs::canonicalize(common_directory)
         .await
-        .map_err(|error| http_serve_failed("repository common directory", error))?;
+        .map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("repository common directory")
+                .source(error)
+                .error()
+        })?;
     let blocking = BlockingExecutor::for_configuration(&server_configuration)?;
     let identity = crate::identity::product_identity(checkout)
         .await
-        .map_err(|error| http_serve_failed("product identity", error))?;
+        .map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("product identity")
+                .source(error)
+                .error()
+        })?;
     let token = mint_token()?;
     let (port, listener) = bind_loopback_listener(server_configuration.serving_ports())?;
     let stop = shutdown.child_token();
@@ -551,13 +565,20 @@ async fn stop_repository_workspace(
     workspace.stop.cancel();
     let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
         .await
-        .map_err(|error| http_serve_failed("workspace engines shutdown", error));
+        .map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("workspace engines shutdown")
+                .source(error)
+                .error()
+        });
     let supervisor = workspace.supervisor.shutdown(deadline).await;
     let database = if let Some(database) = workspace.database.as_ref() {
-        database
-            .shutdown(deadline)
-            .await
-            .map_err(|error| http_serve_failed("SQLite worker shutdown", error))
+        database.shutdown(deadline).await.map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("SQLite worker shutdown")
+                .cause(error)
+                .error()
+        })
     } else {
         Ok(())
     };

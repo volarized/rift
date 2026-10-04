@@ -274,7 +274,7 @@ pub(crate) fn encode_within(
             );
             Ok(None)
         }
-        Err(error) => Err(error),
+        Err(error) => error.fail(),
     }
 }
 

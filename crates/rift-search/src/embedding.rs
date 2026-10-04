@@ -927,6 +927,7 @@ mod tests {
         LOCAL_INPUTS_MAX, QueryTransformation, RemoteEmbeddingSettings, RiftOpenAiEmbeddingModel,
         embed_all, narrowed, outcome_of, outcome_of_status, placed_by_index, stored_coordinate,
     };
+    use rift_error::errors;
     use rig_core::embeddings::{Embedding, EmbeddingModel};
     use std::time::Duration;
 

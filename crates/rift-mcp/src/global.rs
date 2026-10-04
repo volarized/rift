@@ -31,10 +31,7 @@ use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
 };
-use rift_server::{
-    CalleeDeclaration, CalleePackage, PackageCallee, PositionEncoding, ReadService, RiftError,
-};
-use serde::Serialize;
+use rift_server::{CalleeDeclaration, CalleePackage, PackageCallee, PositionEncoding, ReadService};
 use tokio::sync::Mutex;
 
 /// One client shared by reads under the same accepted configuration and credential value.
@@ -886,7 +883,7 @@ pub(crate) fn merge_search(
     let mut payloads = std::collections::BTreeMap::new();
     let mut local_order = Vec::new();
     for hit in local.results.drain(..) {
-        let identity = search_identity(&hit)?;
+        let identity = ranking_identity(&hit)?;
         local_order.push(identity.clone());
         payloads.insert(identity, hit);
     }
@@ -1025,19 +1022,6 @@ fn candidate_fields(hit: &SearchHit) -> FieldSet {
     }
 }
 
-/// The ranking identity one project search hit is fused under, or the refusal naming the
-/// hit by its wire identity, or by its kind when it carries none.
-fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
-    ranking_identity(hit).map_err(|error| {
-        let key = search_hit_key(hit);
-        let key = if key.is_empty() { "file" } else { key };
-        errors::mcp::project_hit_identity_refused()
-            .hit(key)
-            .cause(error)
-            .error()
-    })
-}
-
 /// The identity a project search hit ranks under: its symbol address, or the source unit
 /// and qualified name for a hit that names a unit, its path for a file, its address for a
 /// node, its block for documentation, and its revision for a commit.
@@ -1045,9 +1029,9 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
     let identity = match (&hit.hit, hit.unit.as_ref(), hit.path.as_ref()) {
         (SearchHitTarget::Symbol { symbol }, unit, _) => {
             let symbol_id = symbol.id.as_ref().ok_or_else(|| {
-                errors::mcp::project_hit_identity_missing()
-                    .hit(search_hit_key(hit).if_empty("symbol"))
-                    .error()
+                let hit = search_hit_key(hit);
+                let hit = if hit.is_empty() { "symbol" } else { hit };
+                errors::mcp::project_hit_identity_missing().hit(hit).error()
             })?;
             match unit {
                 Some(unit) => unit_identity(unit, symbol_id)?,
@@ -1108,10 +1092,18 @@ fn unit_identity(
     unit: &rift_protocol::read::SourceUnitId,
     symbol_id: &SymbolId,
 ) -> Result<DocumentIdentity, RiftError> {
-    let unit = rift_core::SourceUnitId::parse(&unit.0)
-        .map_err(|_| errors::mcp::project_hit_unit_invalid().hit(&unit.0).error())?;
+    let unit = rift_core::SourceUnitId::parse(&unit.0).map_err(|_| {
+        errors::mcp::project_hit_unit_invalid()
+            .hit(&symbol_id.0)
+            .error()
+    })?;
     let qualified_name = encoded_qualified_name(symbol_id)?;
-    Ok(DocumentIdentity::for_unit(&unit, &qualified_name)?)
+    DocumentIdentity::for_unit(&unit, &qualified_name).map_err(|error| {
+        errors::mcp::project_hit_identity_refused()
+            .hit(&symbol_id.0)
+            .cause(error)
+            .error()
+    })
 }
 
 fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
@@ -1523,6 +1515,7 @@ fn failure_state(error: &ClientError) -> RouteState {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::sync::{Arc, Mutex};
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -1533,6 +1526,7 @@ mod tests {
     };
     use rift_cloud_client::{ClientError, ResponseMeta};
     use rift_dependency::DependencyContext;
+    use rift_error::errors;
     use rift_protocol::read::GlobalFailureClass;
     use rift_ranking::{ParsedQuery, QueryPhase};
 
@@ -1863,7 +1857,7 @@ mod tests {
         ];
 
         for (hit, expected) in hits.iter().zip(expected) {
-            let identity = super::search_identity(hit).expect("a project hit ranks");
+            let identity = super::ranking_identity(hit).expect("a project hit ranks");
             assert_eq!(identity.as_str(), expected);
         }
         let mut ordered = hits.to_vec();
@@ -1988,6 +1982,12 @@ mod tests {
                     .context()
                     .any(|(key, value)| key == "hit" && value == label)
             );
+            if slug == errors::mcp::project_hit_identity_refused::SLUG {
+                assert!(
+                    error.source().is_some(),
+                    "refused project identity retains its source error"
+                );
+            }
         }
     }
 

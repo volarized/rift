@@ -619,7 +619,9 @@ pub async fn serve_repository_elected(
     );
     match guard.publish(&document) {
         Ok(()) => Ok(ElectedServer { server, guard }),
-        Err(error) => Err(shut_down_unpublished(server, &serving_stop, error).await),
+        Err(error) => shut_down_unpublished(server, &serving_stop, error)
+            .await
+            .fail(),
     }
 }
 
@@ -697,7 +699,6 @@ async fn elect_and_serve(
     let serving_stop = shutdown.child_token();
     let server =
         serve_http_with_storage(root, serving_stop.clone(), storage, limits, check, checkout)
-            .await
             .await?;
     let document = served_document(
         server.port(),
@@ -707,7 +708,9 @@ async fn elect_and_serve(
     );
     match guard.publish(&document) {
         Ok(()) => Ok(ElectedServer { server, guard }),
-        Err(error) => Err(shut_down_unpublished(server, &serving_stop, error).await),
+        Err(error) => shut_down_unpublished(server, &serving_stop, error)
+            .await
+            .fail(),
     }
 }
 

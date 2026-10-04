@@ -8,12 +8,10 @@
 
 use std::path::Path;
 
-use rift_core::Error;
-pub use rift_core::acceptance::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault,
-};
+pub use rift_core::acceptance::CONFIGURATION_FILE_BYTES_MAX;
 use rift_core::acceptance::{ConfigurationEnvironment, NamedMembers, accept_configuration_naming};
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
+use rift_error::{ErrorContext, RiftError, errors};
 use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
 
 use crate::history_fill::release_matcher;
@@ -24,11 +22,11 @@ use crate::history_fill::release_matcher;
 ///
 /// # Errors
 ///
-/// Returns [`ConfigurationError`] when the file cannot be read, is larger
+/// Returns [`RiftError`] when the file cannot be read, is larger
 /// than configuration can be, or is not the documented shape; when a
 /// variable naming a key is malformed or names no key; or when a value breaks
 /// a documented bound.
-pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, ConfigurationError> {
+pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, RiftError> {
     let document = read_document(root)?;
     accept_workspace(
         document.as_deref(),
@@ -37,18 +35,22 @@ pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, Configu
 }
 
 /// The file's text, or `None` when the workspace has no `rift.toml`.
-fn read_document(root: &Path) -> Result<Option<String>, ConfigurationError> {
+fn read_document(root: &Path) -> Result<Option<String>, RiftError> {
     let path = root.join(WORKSPACE_CONFIGURATION_FILE);
     match std::fs::read_to_string(&path) {
         Ok(raw) => Ok(Some(raw)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) if path.is_dir() => Err(Error::new(ConfigurationFault::IsDirectory {
-            path: path.display().to_string(),
-        })),
-        Err(error) => Err(Error::new(ConfigurationFault::Unreadable {
-            path: path.display().to_string(),
-            io: error.to_string(),
-        })),
+        Err(_) if path.is_dir() => errors::core::configuration_is_directory()
+            .file(WORKSPACE_CONFIGURATION_FILE)
+            .path(path.display().to_string())
+            .detail("directory")
+            .fail(),
+        Err(error) => errors::core::configuration_unreadable()
+            .file(WORKSPACE_CONFIGURATION_FILE)
+            .path(path.display().to_string())
+            .io(&error)
+            .source(error)
+            .fail(),
     }
 }
 
@@ -64,7 +66,7 @@ fn read_document(root: &Path) -> Result<Option<String>, ConfigurationError> {
 fn accept_workspace(
     document: Option<&str>,
     environment: &ConfigurationEnvironment,
-) -> Result<WorkspaceConfiguration, ConfigurationError> {
+) -> Result<WorkspaceConfiguration, RiftError> {
     let shipped: Vec<String> = rift_syntax::definitions()
         .iter()
         .map(|definition| definition.shipped().language().identity_segment())
@@ -77,38 +79,49 @@ fn accept_workspace(
     let (configuration, variables) =
         accept_configuration_naming::<WorkspaceConfiguration>(document, environment, &members)?
             .into_parts();
-    let invalid = |violation| {
-        Error::new(ConfigurationFault::Invalid {
-            violation,
-            variables: variables.clone(),
-        })
-    };
-    configuration.validate().map_err(invalid)?;
+    if let Err(violation) = configuration.validate() {
+        let mut error = rift_core::configuration_violation_error(&violation)
+            .with(ErrorContext::new("file", WORKSPACE_CONFIGURATION_FILE));
+        if !variables.is_empty() {
+            error = error.with(ErrorContext::new("variables", variables.join(", ")));
+        }
+        return error.fail();
+    }
     let releases = &configuration.providers.history.releases;
     if let Some((pattern, error)) = releases
         .iter()
         .find_map(|pattern| release_matcher(pattern).err().map(|error| (pattern, error)))
     {
-        return Err(invalid(
-            ConfigurationViolation::HistoryReleasePatternInvalid {
-                pattern: pattern.clone(),
-                detail: error.to_string(),
-            },
-        ));
+        let violation = ConfigurationViolation::HistoryReleasePatternInvalid {
+            pattern: pattern.clone(),
+            detail: error.to_string(),
+        };
+        let mut error = rift_core::configuration_violation_error(&violation)
+            .with(ErrorContext::new("file", WORKSPACE_CONFIGURATION_FILE));
+        if !variables.is_empty() {
+            error = error.with(ErrorContext::new("variables", variables.join(", ")));
+        }
+        return error.fail();
     }
-    tracing_subscriber::EnvFilter::try_new(&configuration.logs.capture).map_err(|error| {
-        invalid(ConfigurationViolation::LogCaptureInvalid {
+    if let Err(error) = tracing_subscriber::EnvFilter::try_new(&configuration.logs.capture) {
+        let violation = ConfigurationViolation::LogCaptureInvalid {
             capture: configuration.logs.capture.clone(),
             detail: error.to_string(),
-        })
-    })?;
+        };
+        let mut error = rift_core::configuration_violation_error(&violation)
+            .with(ErrorContext::new("file", WORKSPACE_CONFIGURATION_FILE));
+        if !variables.is_empty() {
+            error = error.with(ErrorContext::new("variables", variables.join(", ")));
+        }
+        return error.fail();
+    }
     Ok(configuration)
 }
 
 #[cfg(test)]
 mod tests {
     /// Accepts one document with no variable overriding it.
-    fn accept(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
+    fn accept(raw: &str) -> Result<WorkspaceConfiguration, RiftError> {
         accept_workspace(Some(raw), &ConfigurationEnvironment::default())
     }
 
@@ -242,7 +255,6 @@ download_timeout = "5m"
     }
 
     use super::*;
-    use rift_core::{ErrorCode, ErrorName};
     use rift_protocol::configuration::{
         ByteSize, Duration, EmbeddingConfiguration, WorkspaceConfiguration,
     };
@@ -267,14 +279,7 @@ download_timeout = "5m"
     fn test_unknown_key_is_refused_as_malformed() {
         let error = accept("[execution]\nmax_codes = \"16kb\"\n")
             .expect_err("an unknown key must refuse the file");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::Malformed { .. }
-        ));
-        assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-        );
+        assert_eq!(error.slug(), errors::core::configuration_malformed::SLUG);
         let message = error.to_string();
         assert!(
             message.contains("key execution") && message.contains("location line 2 column 1"),
@@ -297,10 +302,7 @@ download_timeout = "5m"
     #[test]
     fn test_toml_syntax_error_is_refused_as_malformed() {
         let error = accept("[execution\n").expect_err("a syntax error must refuse the file");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::Malformed { .. }
-        ));
+        assert_eq!(error.slug(), errors::core::configuration_malformed::SLUG);
         let message = error.to_string();
         assert!(
             message.contains("location line 1 column "),
@@ -339,10 +341,7 @@ download_timeout = "5m"
         let oversized = "# padding\n".repeat(1 << 15);
         assert!(oversized.len() as u64 > CONFIGURATION_FILE_BYTES_MAX);
         let error = accept(&oversized).expect_err("an oversized file must be refused");
-        assert!(matches!(
-            error.fault(),
-            ConfigurationFault::Oversized { .. }
-        ));
+        assert_eq!(error.slug(), errors::core::configuration_oversized::SLUG);
         let message = error.to_string();
         assert!(
             message.contains("bytes") && message.contains("bytes_max 262144"),
@@ -364,7 +363,8 @@ download_timeout = "5m"
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
             .expect("fixture permissions restore");
         let error = error.expect_err("a file this process cannot read must fail to read");
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+        assert_eq!(error.slug(), errors::core::configuration_unreadable::SLUG);
+        assert!(std::error::Error::source(&error).is_some());
         let message = error.to_string();
         assert!(
             message.contains("path ") && message.contains("io "),
@@ -379,11 +379,7 @@ download_timeout = "5m"
             .expect("a directory can shadow the configuration file");
         let error = load_configuration(directory.path())
             .expect_err("a directory in the file's place must be refused, not retried");
-        assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-            "a directory can never become readable by retrying"
-        );
+        assert_eq!(error.slug(), errors::core::configuration_is_directory::SLUG);
         let message = error.to_string();
         let expected_path = directory
             .path()
@@ -404,15 +400,16 @@ download_timeout = "5m"
     fn test_invalid_log_capture_filter_is_refused() {
         let error = accept("[logs]\ncapture = \"[\"\n")
             .expect_err("an invalid tracing filter must refuse the file");
+        assert_eq!(
+            error.slug(),
+            errors::core::configuration_log_capture_invalid::SLUG
+        );
+        let context: Vec<_> = error.context().collect();
+        assert!(context.contains(&("capture", "[".to_owned())));
         assert!(
-            matches!(
-                error.fault(),
-                ConfigurationFault::Invalid {
-                    violation: ConfigurationViolation::LogCaptureInvalid { capture, detail },
-                    ..
-                } if capture == "[" && !detail.is_empty()
-            ),
-            "unexpected configuration failure: {error:?}"
+            context
+                .iter()
+                .any(|(key, value)| *key == "detail" && !value.is_empty())
         );
     }
 
@@ -424,19 +421,15 @@ download_timeout = "5m"
             "releases = [\"v*\", \"v[1\"]\n",
         );
         let error = accept(document).expect_err("an unclosed class compiles into no matcher");
-        assert!(
-            matches!(
-                error.fault(),
-                ConfigurationFault::Invalid {
-                    violation: ConfigurationViolation::HistoryReleasePatternInvalid {
-                        pattern,
-                        detail,
-                    },
-                    ..
-                } if pattern == "v[1" && detail.contains("unclosed character class")
-            ),
-            "unexpected configuration failure: {error:?}"
+        assert_eq!(
+            error.slug(),
+            errors::core::configuration_history_release_pattern_invalid::SLUG
         );
+        let context: Vec<_> = error.context().collect();
+        assert!(context.contains(&("pattern", "v[1".to_owned())));
+        assert!(context.iter().any(|(key, value)| {
+            *key == "detail" && value.contains("unclosed character class")
+        }));
         let rendered = error.to_string();
         assert!(
             rendered.contains("providers.history.releases"),
@@ -460,14 +453,13 @@ download_timeout = "5m"
             ConfigurationEnvironment::from_variables([("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "0")]);
         let error = accept_workspace(Some("[providers.history]\nenabled = true\n"), &environment)
             .expect_err("zero nodes breaks the documented bound");
-        assert!(
-            matches!(
-                error.fault(),
-                ConfigurationFault::Invalid { variables, .. }
-                    if variables == &["RIFT_PROVIDERS_SYNTAX_MAX_NODES"]
-            ),
-            "unexpected configuration failure: {error:?}"
+        assert_eq!(
+            error.slug(),
+            errors::core::configuration_limit_out_of_range::SLUG
         );
+        assert!(error.context().any(|(key, value)| {
+            key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
+        }));
     }
 
     #[test]

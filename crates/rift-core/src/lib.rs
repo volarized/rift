@@ -24,15 +24,14 @@ pub use tracing;
 pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{
     LanguageFileSelection, LanguageFileSelections, SourceVisibility, TextFileInclusion,
-    is_absolute_program,
+    configuration_violation_error, is_absolute_program,
 };
 pub use digest::FileDigest;
 pub use identity::{
     CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision,
-    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId,
-    SourceResolverId, SourceRevision, SourceUnitId,
-    SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId, encode_path, parse_symbol_identity,
-    symbol_identity,
+    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId, SourceResolverId,
+    SourceRevision, SourceUnitId, SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId,
+    encode_path, parse_symbol_identity, symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{
@@ -42,14 +41,13 @@ pub use name::is_canonical_ascii_name;
 pub use path::{PathKind, PathViolation, ProjectPath, SourcePath};
 pub use semantic::{
     CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
-    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder,
-    ContributionKey, ContributionOrigin, ContributionReference,
-    ContributionRelationship, ContributionViolation, DeclarationBinding, Documentation,
-    DocumentationFormat, EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions,
-    Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PackageIdentity, PortableSymbolFacts,
-    ReferenceRole, RelationshipKind, SemanticReference, Signature, SourceApplicability, SourceKind,
-    SourceLocation, SourceRange, SymbolFacet, SymbolRecord, SymbolResolution, TypeBinding,
-    is_portable_name,
+    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionKey,
+    ContributionOrigin, ContributionReference, ContributionRelationship, ContributionViolation,
+    DeclarationBinding, Documentation, DocumentationFormat, EquivalenceEvidence, ExactKind,
+    ExtensionKey, ExtensionValue, Extensions, Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX,
+    PackageIdentity, PortableSymbolFacts, ReferenceRole, RelationshipKind, SemanticReference,
+    Signature, SourceApplicability, SourceKind, SourceLocation, SourceRange, SymbolFacet,
+    SymbolRecord, SymbolResolution, TypeBinding, is_portable_name,
 };
 
 /// Iterates while charging one unit to a loop budget before each body execution.

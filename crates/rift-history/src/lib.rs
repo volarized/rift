@@ -15,11 +15,9 @@ mod repository;
 mod working;
 
 pub use commits::{ChangedBlob, ChangedBlobs, CommitFacts, TaggedCommit, WindowCommit};
-pub use contribution::{
-    HistoryContributionAdapter,
-};
+pub use contribution::HistoryContributionAdapter;
 pub use repository::{
-    ChangedFiles, PathHistory, PathRevision, REVISION_TREE_ENTRIES_MAX,
-    Repository, ResolvedRevision, TreeFile,
+    ChangedFiles, PathHistory, PathRevision, REVISION_TREE_ENTRIES_MAX, Repository,
+    ResolvedRevision, TreeFile,
 };
 pub use working::{WorkingForm, WorkingForms};

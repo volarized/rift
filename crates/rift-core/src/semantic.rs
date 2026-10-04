@@ -137,10 +137,9 @@ impl SourceRange {
     /// Returns [`RiftError`] when end does not follow start.
     pub fn new(start: u64, end: u64) -> Result<Self, RiftError> {
         if start >= end {
-            return Err(contribution_error(
-                ContributionViolation::InvalidSourceRange,
-                "source.range",
-            ));
+            return errors::core::contribution_invalid_source_range()
+                .field("source.range")
+                .fail();
         }
         Ok(Self { start, end })
     }
@@ -211,10 +210,9 @@ impl ContributionOrigin {
     ) -> Result<Self, RiftError> {
         let synthetic = source_kind == SourceKind::Synthetic;
         if synthetic == location.is_some() {
-            return Err(contribution_error(
-                ContributionViolation::InvalidOrigin,
-                "origin",
-            ));
+            return errors::core::contribution_invalid_origin()
+                .field("origin")
+                .fail();
         }
         Ok(Self {
             location,
@@ -474,10 +472,9 @@ impl SemanticReference {
             || targets.len() > CONTRIBUTION_FACTS_MAX
             || unique.len() != targets.len()
         {
-            return Err(contribution_error(
-                ContributionViolation::InvalidReference,
-                "references.targets",
-            ));
+            return errors::core::contribution_invalid_reference()
+                .field("references.targets")
+                .fail();
         }
         Ok(Self {
             source,
@@ -770,10 +767,9 @@ impl SymbolRecord {
                 )
         );
         if !identity_matches || contributions.is_empty() {
-            return Err(contribution_error(
-                ContributionViolation::InvalidRecord,
-                "symbol_record",
-            ));
+            return errors::core::contribution_invalid_record()
+                .field("symbol_record")
+                .fail();
         }
         Ok(Self {
             index_revision,
@@ -841,56 +837,6 @@ pub enum ContributionViolation {
     InvalidRecord,
 }
 
-/// Invalid Contribution or normalized record.
-
-fn contribution_error(violation: ContributionViolation, field: &'static str) -> RiftError {
-    macro_rules! build {
-        ($builder:expr) => {
-            $builder.field(field).error()
-        };
-    }
-    match violation {
-        ContributionViolation::InvalidName => build!(errors::core::contribution_invalid_name()),
-        ContributionViolation::InvalidLanguage => {
-            build!(errors::core::contribution_invalid_language())
-        }
-        ContributionViolation::InvalidKind => build!(errors::core::contribution_invalid_kind()),
-        ContributionViolation::InvalidSourceRange => {
-            build!(errors::core::contribution_invalid_source_range())
-        }
-        ContributionViolation::InvalidOrigin => {
-            build!(errors::core::contribution_invalid_origin())
-        }
-        ContributionViolation::UnboundIdentity => {
-            build!(errors::core::contribution_unbound_identity())
-        }
-        ContributionViolation::TooManyFacts => {
-            build!(errors::core::contribution_too_many_facts())
-        }
-        ContributionViolation::TooMuchEvidence => {
-            build!(errors::core::contribution_too_much_evidence())
-        }
-        ContributionViolation::TooManyNamespacedFacts => {
-            build!(errors::core::contribution_too_many_namespaced_facts())
-        }
-        ContributionViolation::InvalidNamespace => {
-            build!(errors::core::contribution_invalid_namespace())
-        }
-        ContributionViolation::InvalidNamespaceVersion => {
-            build!(errors::core::contribution_invalid_namespace_version())
-        }
-        ContributionViolation::InvalidReference => {
-            build!(errors::core::contribution_invalid_reference())
-        }
-        ContributionViolation::DuplicateFact => {
-            build!(errors::core::contribution_duplicate_fact())
-        }
-        ContributionViolation::InvalidRecord => {
-            build!(errors::core::contribution_invalid_record())
-        }
-    }
-}
-
 fn validate_contribution(contribution: &Contribution) -> Result<(), RiftError> {
     validate_provider_symbol(contribution)?;
     if let Some(facts) = &contribution.facts {
@@ -901,10 +847,9 @@ fn validate_contribution(contribution: &Contribution) -> Result<(), RiftError> {
     if contribution.references.len() > CONTRIBUTION_FACTS_MAX
         || contribution.relationships.len() > CONTRIBUTION_FACTS_MAX
     {
-        return Err(contribution_error(
-            ContributionViolation::TooManyFacts,
-            "references",
-        ));
+        return errors::core::contribution_too_many_facts()
+            .field("references")
+            .fail();
     }
     validate_namespaced(&contribution.namespaced)
 }
@@ -912,32 +857,28 @@ fn validate_contribution(contribution: &Contribution) -> Result<(), RiftError> {
 fn validate_provider_symbol(contribution: &Contribution) -> Result<(), RiftError> {
     let value = contribution.key.reference.symbol.as_str();
     if value.len() > PROVIDER_SYMBOL_ID_BYTES_MAX {
-        return Err(contribution_error(
-            ContributionViolation::InvalidName,
-            "provider_symbol",
-        ));
+        return errors::core::contribution_invalid_name()
+            .field("provider_symbol")
+            .fail();
     }
     Ok(())
 }
 
 fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError> {
     if !is_portable_name(&facts.name) || !is_portable_name(&facts.qualified_name) {
-        return Err(contribution_error(
-            ContributionViolation::InvalidName,
-            "facts.name",
-        ));
+        return errors::core::contribution_invalid_name()
+            .field("facts.name")
+            .fail();
     }
     if !valid_language(&facts.language) {
-        return Err(contribution_error(
-            ContributionViolation::InvalidLanguage,
-            "facts.language",
-        ));
+        return errors::core::contribution_invalid_language()
+            .field("facts.language")
+            .fail();
     }
     if !facts.kind.is_valid() {
-        return Err(contribution_error(
-            ContributionViolation::InvalidKind,
-            "facts.kind",
-        ));
+        return errors::core::contribution_invalid_kind()
+            .field("facts.kind")
+            .fail();
     }
     let counts = [
         facts.facets.len(),
@@ -950,74 +891,65 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
         .into_iter()
         .any(|count| count > CONTRIBUTION_FACTS_MAX)
     {
-        return Err(contribution_error(
-            ContributionViolation::TooManyFacts,
-            "facts",
-        ));
+        return errors::core::contribution_too_many_facts()
+            .field("facts")
+            .fail();
     }
     let unique: BTreeSet<_> = facts.facets.iter().copied().collect();
     if unique.len() != facts.facets.len() {
-        return Err(contribution_error(
-            ContributionViolation::DuplicateFact,
-            "facts.facets",
-        ));
+        return errors::core::contribution_duplicate_fact()
+            .field("facts.facets")
+            .fail();
     }
     Ok(())
 }
 
 fn validate_source_and_origin(contribution: &Contribution) -> Result<(), RiftError> {
     if contribution.identity_anchor.is_some() && contribution.source.is_none() {
-        return Err(contribution_error(
-            ContributionViolation::UnboundIdentity,
-            "identity_anchor",
-        ));
+        return errors::core::contribution_unbound_identity()
+            .field("identity_anchor")
+            .fail();
     }
     let synthetic = contribution.origin.source_kind == SourceKind::Synthetic;
     if contribution.source.is_some() && synthetic {
-        return Err(contribution_error(
-            ContributionViolation::InvalidOrigin,
-            "source",
-        ));
+        return errors::core::contribution_invalid_origin()
+            .field("source")
+            .fail();
     }
     Ok(())
 }
 
 fn validate_evidence(contribution: &Contribution) -> Result<(), RiftError> {
     if contribution.equivalence.len() > CONTRIBUTION_EVIDENCE_MAX {
-        return Err(contribution_error(
-            ContributionViolation::TooMuchEvidence,
-            "equivalence",
-        ));
+        return errors::core::contribution_too_much_evidence()
+            .field("equivalence")
+            .fail();
     }
     Ok(())
 }
 
 fn validate_namespaced(namespaced: &Extensions) -> Result<(), RiftError> {
     if namespaced.0.len() > CONTRIBUTION_NAMESPACES_MAX {
-        return Err(contribution_error(
-            ContributionViolation::TooManyNamespacedFacts,
-            "namespaced",
-        ));
+        return errors::core::contribution_too_many_namespaced_facts()
+            .field("namespaced")
+            .fail();
     }
     for (key, value) in &namespaced.0 {
         validate_namespace(key)?;
         if value.version == 0 {
-            return Err(contribution_error(
-                ContributionViolation::InvalidNamespaceVersion,
-                "namespaced.version",
-            ));
+            return errors::core::contribution_invalid_namespace_version()
+                .field("namespaced.version")
+                .fail();
         }
         let bytes = serde_json::to_vec(value).map_err(|_| {
-            contribution_error(
-                ContributionViolation::TooManyNamespacedFacts,
-                "namespaced.data",
-            )
+            errors::core::contribution_too_many_namespaced_facts()
+                .field("namespaced.data")
+                .error()
         })?;
         if bytes.len() > CONTRIBUTION_NAMESPACE_BYTES_MAX {
-            return Err(contribution_error(
-                ContributionViolation::TooManyNamespacedFacts,
-                "namespaced.data",
-            ));
+            return errors::core::contribution_too_many_namespaced_facts()
+                .field("namespaced.data")
+                .fail();
         }
     }
     Ok(())
@@ -1027,10 +959,9 @@ fn validate_namespace(key: &ExtensionKey) -> Result<(), RiftError> {
     if valid_namespace(&key.0) {
         return Ok(());
     }
-    Err(contribution_error(
-        ContributionViolation::InvalidNamespace,
-        "namespaced.key",
-    ))
+    errors::core::contribution_invalid_namespace()
+        .field("namespaced.key")
+        .fail()
 }
 
 /// Whether the Contribution contract accepts `value` as a portable name: nonempty, at

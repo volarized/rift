@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use rift_dependency::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages};
-use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncoding};
+use rift_error::RiftError;
+use rift_lsp::{EngineLaunch, EngineSession, Framing, PositionEncoding};
 use ruff_db::Db as _;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
@@ -81,7 +82,7 @@ const CONTENT_MODIFIED: i64 = -32801;
 ///
 /// # Errors
 ///
-/// Returns [`EngineError`] when the handshake refuses, exactly as a
+/// Returns [`RiftError`] when the handshake refuses, exactly as a
 /// spawned engine's start does.
 ///
 /// # Cancel safety
@@ -91,7 +92,7 @@ const CONTENT_MODIFIED: i64 = -32801;
 pub(crate) async fn started_session(
     launch: EngineLaunch,
     workspace_root: &Path,
-) -> Result<EngineSession, EngineError> {
+) -> Result<EngineSession, RiftError> {
     let (client, server) = tokio::io::duplex(DUPLEX_BYTES);
     let root = workspace_root.to_path_buf();
     tokio::spawn(serve(server, root));

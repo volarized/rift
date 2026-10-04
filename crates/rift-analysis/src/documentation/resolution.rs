@@ -10,12 +10,11 @@ use rift_protocol::documentation::{
 };
 use rift_protocol::read::{Digest, Language, SymbolId};
 
-use super::failure::{DocumentationViolation, refused};
 use super::identity::canonical_digest;
 use super::links::DocumentationFragment;
 use super::links::{DeclarationLinkMatch, DeclarationLinkNames, Destination, local_destination};
 use super::references::{DeclarationNames, DocumentationDeclaration};
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 const RESOLUTION_DEPENDENCIES_MAX: usize = DOCUMENTATION_REFERENCES_MAX as usize * 5;
 
@@ -534,10 +533,9 @@ fn initialize_affected(
     for block_id in affected {
         if facts.contains_key(block_id) {
             let input = fingerprints.get(block_id).ok_or_else(|| {
-                refused(
-                    DocumentationViolation::MissingTarget,
-                    "resolution.fingerprint",
-                )
+                errors::analysis::documentation_target_missing()
+                    .field("resolution.fingerprint")
+                    .error()
             })?;
             results.insert(block_id.clone(), empty_cached(input.clone()));
         }
@@ -587,9 +585,11 @@ fn cached_block_mut<'a>(
     block: &DocumentationDigest,
     field: &'static str,
 ) -> Result<&'a mut CachedBlock, RiftError> {
-    results
-        .get_mut(block)
-        .ok_or_else(|| refused(DocumentationViolation::MissingTarget, field))
+    results.get_mut(block).ok_or_else(|| {
+        errors::analysis::documentation_target_missing()
+            .field(field)
+            .error()
+    })
 }
 
 fn assemble_output(
@@ -628,7 +628,9 @@ fn validate_input(input: &ResolutionInput<'_>) -> Result<(), RiftError> {
         || input.fragments.len() > DOCUMENTATION_REFERENCES_MAX as usize
         || input.declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_MAX as usize
     {
-        return Err(refused(DocumentationViolation::LimitExceeded, "resolution"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("resolution")
+            .fail();
     }
     Ok(())
 }
@@ -698,8 +700,11 @@ fn add_link_dependencies(
     if declarations.direct(&link.authored).is_some() {
         return Ok(());
     }
-    let source =
-        source.ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.source"))?;
+    let source = source.ok_or_else(|| {
+        errors::analysis::documentation_target_missing()
+            .field("block.source")
+            .error()
+    })?;
     let Destination::Local { identity, fragment } = local_destination(source, &link.authored)?
     else {
         return Ok(());
@@ -829,18 +834,21 @@ fn assemble_links(
     raw.iter()
         .map(|link| {
             let offset = offsets.entry(link.block.clone()).or_default();
-            let cached = blocks
-                .get(&link.block)
-                .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.block"))?;
+            let cached = blocks.get(&link.block).ok_or_else(|| {
+                errors::analysis::documentation_target_missing()
+                    .field("link.block")
+                    .error()
+            })?;
             let resolved = if resolvable {
                 &cached.resolvable_links
             } else {
                 &cached.fixed_unresolved_links
             };
-            let result = resolved
-                .get(*offset)
-                .cloned()
-                .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.cache"))?;
+            let result = resolved.get(*offset).cloned().ok_or_else(|| {
+                errors::analysis::documentation_target_missing()
+                    .field("link.cache")
+                    .error()
+            })?;
             *offset += 1;
             Ok(result)
         })
@@ -854,14 +862,17 @@ fn assemble_candidates(
     let mut offsets = BTreeMap::<DocumentationDigest, usize>::new();
     let mut unresolved = Vec::new();
     for candidate in candidates {
-        let block = blocks
-            .get(&candidate.block)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "candidate.block"))?;
+        let block = blocks.get(&candidate.block).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("candidate.block")
+                .error()
+        })?;
         let offset = offsets.entry(candidate.block.clone()).or_default();
-        let result = block
-            .candidate_results
-            .get(*offset)
-            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "candidate.cache"))?;
+        let result = block.candidate_results.get(*offset).ok_or_else(|| {
+            errors::analysis::documentation_target_missing()
+                .field("candidate.cache")
+                .error()
+        })?;
         *offset += 1;
         if let Some(candidate) = result {
             unresolved.push(candidate.clone());

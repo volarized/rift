@@ -12,8 +12,7 @@ use rift_protocol::documentation::{
 use rift_protocol::read::{Language, TextRange};
 use tree_sitter::{Language as Grammar, Node, Parser, Tree};
 
-use super::failure::{DocumentationViolation, refused};
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 const DOCUMENT_KIND: &str = "document";
 const OBJECT_KIND: &str = "object";
@@ -167,16 +166,14 @@ fn validate_input(
     notebook_identity: &DocumentationContentIdentity,
 ) -> Result<(), RiftError> {
     if source.len() > DOCUMENTATION_SOURCE_BYTES_MAX as usize {
-        return Err(refused(
-            DocumentationViolation::LimitExceeded,
-            "notebook.source_bytes",
-        ));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("notebook.source_bytes")
+            .fail();
     }
     if notebook_identity.cell.is_some() {
-        return Err(refused(
-            DocumentationViolation::Notebook,
-            "notebook.identity",
-        ));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("notebook.identity")
+            .fail();
     }
     Ok(())
 }
@@ -185,16 +182,22 @@ fn parse_tree(source: &str) -> Result<Tree, RiftError> {
     let kinds = json_kinds();
     let mut parser = Parser::new();
     let grammar: Grammar = tree_sitter_json::LANGUAGE.into();
-    parser
-        .set_language(&grammar)
-        .map_err(|_| refused(DocumentationViolation::Notebook, "notebook.grammar"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.parse"))?;
+    parser.set_language(&grammar).map_err(|_| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.grammar")
+            .error()
+    })?;
+    let tree = parser.parse(source, None).ok_or_else(|| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.parse")
+            .error()
+    })?;
     let root = tree.root_node();
     validate_tree(root)?;
     if root.has_error() || root.kind_id() != kinds.document {
-        return Err(refused(DocumentationViolation::Notebook, "notebook.json"));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("notebook.json")
+            .fail();
     }
     Ok(tree)
 }
@@ -204,14 +207,25 @@ fn decode_tree(root: Node<'_>, source: &str) -> Result<NotebookContent, RiftErro
     let document = root
         .named_child(0)
         .filter(|node| node.kind_id() == kinds.object)
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.object"))?;
+        .ok_or_else(|| {
+            errors::analysis::documentation_notebook_invalid()
+                .field("notebook.object")
+                .error()
+        })?;
     let cells_node = object_value(document, "cells", source, kinds)?
         .filter(|node| node.kind_id() == kinds.array)
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.cells"))?;
+        .ok_or_else(|| {
+            errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cells")
+                .error()
+        })?;
     let language = notebook_language(document, source, kinds)?;
     let cells = decode_cells(cells_node, language.as_ref(), source, kinds)?;
-    let selected_count = u32::try_from(cells.len())
-        .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.cells"))?;
+    let selected_count = u32::try_from(cells.len()).map_err(|_| {
+        errors::analysis::documentation_limit_exceeded()
+            .field("notebook.cells")
+            .error()
+    })?;
     Ok(NotebookContent {
         cells,
         coverage: DocumentationCoverage {
@@ -275,20 +289,20 @@ fn validate_tree(root: Node<'_>) -> Result<(), RiftError> {
     let mut nodes_seen = 0_usize;
     let mut cursor = root.walk();
     while let Some((node, depth)) = pending.pop() {
-        nodes_seen = nodes_seen
-            .checked_add(1)
-            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "notebook.nodes"))?;
+        nodes_seen = nodes_seen.checked_add(1).ok_or_else(|| {
+            errors::analysis::documentation_limit_exceeded()
+                .field("notebook.nodes")
+                .error()
+        })?;
         if nodes_seen > SOURCE_NODES_MAX {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "notebook.nodes",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("notebook.nodes")
+                .fail();
         }
         if depth > SOURCE_DEPTH_MAX {
-            return Err(refused(
-                DocumentationViolation::LimitExceeded,
-                "notebook.depth",
-            ));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("notebook.depth")
+                .fail();
         }
         pending.extend(node.children(&mut cursor).map(|child| (child, depth + 1)));
     }
@@ -303,10 +317,15 @@ fn selected_cells<'tree>(
     let mut selected = Vec::new();
     let mut cursor = cells.walk();
     for (index, cell) in cells.named_children(&mut cursor).enumerate() {
-        let cell_index = u32::try_from(index)
-            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.cells"))?;
+        let cell_index = u32::try_from(index).map_err(|_| {
+            errors::analysis::documentation_limit_exceeded()
+                .field("notebook.cells")
+                .error()
+        })?;
         if cell.kind_id() != kinds.object {
-            return Err(refused(DocumentationViolation::Notebook, "notebook.cell"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cell")
+                .fail();
         }
         let cell_type = object_value(cell, "cell_type", source, kinds)?;
         let kind = match cell_type {
@@ -319,13 +338,15 @@ fn selected_cells<'tree>(
             }
             _ => continue,
         };
-        let source_node = object_value(cell, "source", source, kinds)?
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.cell.source"))?;
+        let source_node = object_value(cell, "source", source, kinds)?.ok_or_else(|| {
+            errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cell.source")
+                .error()
+        })?;
         if source_node.kind_id() != kinds.string && source_node.kind_id() != kinds.array {
-            return Err(refused(
-                DocumentationViolation::Notebook,
-                "notebook.cell.source",
-            ));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.cell.source")
+                .fail();
         }
         selected.push(SelectedCell {
             source: source_node,
@@ -352,7 +373,9 @@ fn authored_id_counts(
         if valid_authored_id(&id) {
             let count = counts.entry(id).or_insert(0_u32);
             *count = count.checked_add(1).ok_or_else(|| {
-                refused(DocumentationViolation::LimitExceeded, "notebook.cell.id")
+                errors::analysis::documentation_limit_exceeded()
+                    .field("notebook.cell.id")
+                    .error()
             })?;
         }
     }
@@ -400,7 +423,9 @@ fn decode_source(
     let mut cursor = source_node.walk();
     for child in source_node.named_children(&mut cursor) {
         if child.kind_id() != kinds.string {
-            return Err(refused(DocumentationViolation::Notebook, "notebook.source"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.source")
+                .fail();
         }
         append_string(child, source, kinds, &mut decoded, &mut physical_ranges)?;
     }
@@ -416,16 +441,14 @@ fn append_string(
 ) -> Result<(), RiftError> {
     decoded.push_str(&decode_string(source, node, kinds)?);
     let start = u64::try_from(node.start_byte()).map_err(|_| {
-        refused(
-            DocumentationViolation::LimitExceeded,
-            "notebook.source_range",
-        )
+        errors::analysis::documentation_limit_exceeded()
+            .field("notebook.source_range")
+            .error()
     })?;
     let end = u64::try_from(node.end_byte()).map_err(|_| {
-        refused(
-            DocumentationViolation::LimitExceeded,
-            "notebook.source_range",
-        )
+        errors::analysis::documentation_limit_exceeded()
+            .field("notebook.source_range")
+            .error()
     })?;
     physical_ranges.push(TextRange { start, end });
     Ok(())
@@ -472,18 +495,23 @@ fn object_value<'tree>(
     let mut cursor = object.walk();
     for pair in object.named_children(&mut cursor) {
         if pair.kind_id() != kinds.pair {
-            return Err(refused(DocumentationViolation::Notebook, "notebook.object"));
+            return errors::analysis::documentation_notebook_invalid()
+                .field("notebook.object")
+                .fail();
         }
         let key = pair
             .child_by_field_id(kinds.key.get())
             .filter(|node| node.kind_id() == kinds.string)
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.object.key"))?;
+            .ok_or_else(|| {
+                errors::analysis::documentation_notebook_invalid()
+                    .field("notebook.object.key")
+                    .error()
+            })?;
         if decode_string(source, key, kinds)? == name {
             if value.is_some() {
-                return Err(refused(
-                    DocumentationViolation::Notebook,
-                    "notebook.duplicate_field",
-                ));
+                return errors::analysis::documentation_notebook_invalid()
+                    .field("notebook.duplicate_field")
+                    .fail();
             }
             value = pair.child_by_field_id(kinds.value.get());
         }
@@ -493,13 +521,20 @@ fn object_value<'tree>(
 
 fn decode_string(source: &str, node: Node<'_>, kinds: &JsonKinds) -> Result<String, RiftError> {
     if node.kind_id() != kinds.string {
-        return Err(refused(DocumentationViolation::Notebook, "notebook.string"));
+        return errors::analysis::documentation_notebook_invalid()
+            .field("notebook.string")
+            .fail();
     }
-    let token = source
-        .get(node.byte_range())
-        .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.string.range"))?;
-    serde_json::from_str(token)
-        .map_err(|_| refused(DocumentationViolation::Notebook, "notebook.string"))
+    let token = source.get(node.byte_range()).ok_or_else(|| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.string.range")
+            .error()
+    })?;
+    serde_json::from_str(token).map_err(|_| {
+        errors::analysis::documentation_notebook_invalid()
+            .field("notebook.string")
+            .error()
+    })
 }
 
 #[cfg(test)]

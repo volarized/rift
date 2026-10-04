@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use syn::File;
+use syn::{File, ItemUse};
 
 use crate::{ir, schema, validate::CodegenError};
 
@@ -62,32 +62,56 @@ pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> 
         .iter()
         .any(|field| field.field_type == schema::FieldType::Duration);
     let has_borrow = has_bool || has_duration || has_pid || has_port;
+    let has_error = fields
+        .iter()
+        .any(|field| field.field_type == schema::FieldType::Error);
     let has_source = fields
         .iter()
         .any(|field| matches!(field.role, Some(schema::FieldRole::Source)));
-    let imports = quote! {
-        use rift_error::{BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
-            RiftError};
-    };
-    let extra_imports = [
-        has_fields.then(|| quote! { use rift_error::ErrorValue; }),
-        has_required.then(|| quote! { use rift_error::{Set as SetState, Unset}; }),
-        has_display.then(|| quote! { use std::fmt::Display; }),
-        has_unsigned.then(|| quote! { use rift_error::IntoUnsigned; }),
-        has_integer.then(|| quote! { use rift_error::IntoInteger; }),
-        has_path.then(|| quote! { use std::path::Path; }),
-        (has_borrow && has_duration).then(|| quote! { use std::{borrow::Borrow, time::Duration}; }),
-        (has_bool && !has_duration).then(|| quote! { use std::borrow::Borrow; }),
-        has_source.then(|| quote! { use std::{boxed::Box, error::Error}; }),
-        Some(quote! { use std::marker::PhantomData; }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let mut import_paths = vec![
+        ("rift_error", "BuilderCore", None),
+        ("rift_error", "ErrorContext", None),
+        ("rift_error", "ErrorSlug", None),
+        ("rift_error", "EvidenceFor", None),
+        ("rift_error", "IntoRiftError", None),
+        ("rift_error", "RiftError", None),
+        ("std", "marker::PhantomData", None),
+    ];
+    if has_fields {
+        import_paths.push(("rift_error", "ErrorValue", None));
+    }
+    if has_required {
+        import_paths.push(("rift_error", "Set", Some("SetState")));
+        import_paths.push(("rift_error", "Unset", None));
+    }
+    if has_display {
+        import_paths.push(("std", "fmt::Display", None));
+    }
+    if has_unsigned {
+        import_paths.push(("rift_error", "IntoUnsigned", None));
+    }
+    if has_integer {
+        import_paths.push(("rift_error", "IntoInteger", None));
+    }
+    if has_path {
+        import_paths.push(("std", "path::Path", None));
+    }
+    if has_borrow {
+        import_paths.push(("std", "borrow::Borrow", None));
+    }
+    if has_duration {
+        import_paths.push(("std", "time::Duration", None));
+    }
+    if has_error {
+        import_paths.push(("std", "error::Error", None));
+    }
+    if has_source {
+        import_paths.push(("std", "boxed::Box", None));
+    }
+    let imports = imports(&import_paths)?;
     let tokens = quote! {
         pub use rift_error::{FieldSet, OptionalFieldSet};
-        #imports
-        #(#extra_imports)*
+        #(#imports)*
         #[doc(hidden)]
         pub const REGISTRY_NAMESPACE: &str = #namespace;
         #[doc(hidden)]
@@ -96,6 +120,54 @@ pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> 
     };
     let file: File = syn::parse2(tokens).map_err(|error| CodegenError::Rust(error.to_string()))?;
     Ok(prettyplease::unparse(&file))
+}
+
+#[derive(Default)]
+struct ImportNode {
+    alias: Option<Ident>,
+    children: BTreeMap<String, ImportNode>,
+}
+
+fn imports(paths: &[(&str, &str, Option<&str>)]) -> Result<Vec<ItemUse>, CodegenError> {
+    let mut roots = BTreeMap::<String, ImportNode>::new();
+    for (namespace, path, alias) in paths {
+        let mut node = roots.entry((*namespace).to_owned()).or_default();
+        let parts = path.split("::").collect::<Vec<_>>();
+        for part in &parts {
+            node = node.children.entry((*part).to_owned()).or_default();
+        }
+        node.alias = alias.map(|alias| format_ident!("{alias}"));
+    }
+    roots
+        .into_iter()
+        .map(|(namespace, node)| {
+            let namespace = ident(&namespace);
+            let tree = import_tree(&node);
+            syn::parse2(quote! { use #namespace::#tree; })
+                .map_err(|error| CodegenError::Rust(error.to_string()))
+        })
+        .collect()
+}
+
+fn import_tree(node: &ImportNode) -> TokenStream {
+    let children = node.children.iter().map(|(name, child)| {
+        let name = ident(name);
+        let tree = if child.children.is_empty() {
+            if let Some(alias) = &child.alias {
+                quote! { #name as #alias }
+            } else {
+                quote! { #name }
+            }
+        } else {
+            import_tree(child)
+        };
+        if child.children.is_empty() {
+            tree
+        } else {
+            quote! { #name::#tree }
+        }
+    });
+    quote! { { #(#children),* } }
 }
 
 fn render_children(node: &Node<'_>) -> TokenStream {

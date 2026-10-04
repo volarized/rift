@@ -540,7 +540,7 @@ fn parse_release_tag(tag: &str) -> Result<Version, RiftError> {
     let version = Version::parse(value).map_err(|source| {
         errors::cli::update_release_tag_invalid()
             .tag(tag)
-            .maybe_source(Some(source))
+            .source(source)
             .error()
     })?;
     if !version.pre.is_empty() || !version.build.is_empty() {
@@ -1055,6 +1055,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
+    use rift_error::errors;
     use semver::Version;
     #[cfg(windows)]
     use waitpid_any::WaitHandle;
@@ -1378,7 +1379,7 @@ mod tests {
         }
         for error in [
             errors::cli::update_download_too_large()
-                .bytes_max(1)
+                .bytes_max(1_u64)
                 .error(),
             errors::cli::update_archive_contents_invalid().error(),
         ] {

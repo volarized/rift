@@ -513,7 +513,9 @@ impl EngineSession {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(engine_launch_failed)?;
+        let mut child = command
+            .spawn()
+            .map_err(|source| errors::lsp::engine_launch_failed().source(source).error())?;
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -613,7 +615,7 @@ impl EngineSession {
             .await
         {
             session.end().await;
-            return Err(error);
+            return error.fail();
         }
         Ok(session)
     }
@@ -1006,7 +1008,7 @@ impl EngineSession {
                     if ends_session(&error) {
                         self.end().await;
                     }
-                    return Err(error);
+                    return error.fail();
                 }
             }
         }
@@ -1282,7 +1284,7 @@ impl EngineSession {
                 if ends_session(&error) {
                     self.end().await;
                 }
-                Err(error)
+                error.fail()
             }
             Err(_elapsed) => {
                 self.end().await;

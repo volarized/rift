@@ -278,10 +278,10 @@ mod tests {
                 .any(|(key, value)| key == "value" && value == "many")
         );
         let announced = errors::lsp::framing_message_too_long()
-            .announced_bytes(7)
+            .announced_bytes(7_u64)
             .field("framing.message_bytes_max")
             .limit(MESSAGE_BYTES_MAX)
-            .required(7)
+            .required(7_u64)
             .error();
         assert!(announced.to_string().contains("body of 7 bytes"));
         let overlong = errors::lsp::framing_header_too_long().error();

@@ -291,8 +291,9 @@ impl RequestedPackage {
 }
 
 /// Rule one requested package breaks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, strum::AsRefStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum RequestedPackageViolation {
     /// `manager` is empty, or longer than [`PACKAGE_MANAGER_CHARS_MAX`] characters.
     ManagerLength,
@@ -919,14 +920,15 @@ mod tests {
         assert_eq!(schema["required"], json!(["manager", "name"]));
     }
 
-    /// The serde spelling of each violation is the label a refusal names.
+    /// The enum label agrees with the spelling serde emits.
     #[test]
-    fn test_requested_package_violations_spell_their_field() {
+    fn test_requested_package_violation_labels_match_serde() {
         for (violation, spelling) in [
             (RequestedPackageViolation::ManagerLength, "manager_length"),
             (RequestedPackageViolation::NameLength, "name_length"),
             (RequestedPackageViolation::VersionLength, "version_length"),
         ] {
+            assert_eq!(violation.as_ref(), spelling);
             assert_eq!(
                 serde_json::to_value(violation).expect("serializes"),
                 json!(spelling)

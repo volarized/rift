@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rift_error::RiftError;
 use rift_error::errors;
 use rift_search::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 
@@ -52,7 +53,7 @@ fn resolved_directory(
 }
 
 /// The refusal one identifier earned, with its rendered message.
-fn refused(source: Result<ModelSource, rift_search::RiftError>, model: &str) -> String {
+fn refused(source: Result<ModelSource, RiftError>, model: &str) -> String {
     let error = source.expect_err(&format!("`{model}` must be refused"));
     assert_eq!(
         error.slug(),
@@ -297,7 +298,7 @@ fn every_acquisition_violation_renders_its_own_message() {
             .error(),
         errors::search::model_download_too_large()
             .url("https://example.test/model")
-            .bytes_max(64)
+            .bytes_max(64_u64)
             .error(),
     ];
     for error in cases {

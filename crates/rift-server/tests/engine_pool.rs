@@ -25,7 +25,8 @@ use process_lifecycle::{
     ok_response, refused_response, retrying,
 };
 use rift_core::ProjectPath;
-use rift_lsp::session::{EngineFault, EngineSession};
+use rift_error::{RiftError, errors};
+use rift_lsp::session::EngineSession;
 use rift_protocol::configuration::{Duration, LspConfiguration};
 use rift_protocol::read::Language;
 use rift_protocol::retry::RestartPolicy;
@@ -81,10 +82,7 @@ fn start_position() -> Position {
 
 /// One reference request through the pool for `name`. Opening the document
 /// first gives a restarted engine the source the request addresses.
-async fn references_through(
-    pool: &EnginePool,
-    name: &str,
-) -> Result<(), rift_lsp::session::EngineError> {
+async fn references_through(pool: &EnginePool, name: &str) -> Result<(), RiftError> {
     let slot = pool
         .engine_for(&language(name))
         .expect("the language is served");
@@ -133,10 +131,12 @@ async fn dead_engine_is_restarted_within_the_budget_and_a_death_past_it_surfaces
     let error = references_through(&pool, "rust")
         .await
         .expect_err("the engine dies on both attempts");
-    assert!(matches!(
-        error.fault(),
-        EngineFault::ConnectionClosed { .. }
-    ));
+    assert_eq!(error.slug(), errors::lsp::engine_connection_closed::SLUG);
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| { key == "method" && value == "textDocument/references" })
+    );
     pool.shutdown().await;
 }
 
@@ -156,11 +156,7 @@ async fn restart_budget_spent_inside_the_window_refuses_the_next_start() {
     let refused = references_through(&pool, "rust")
         .await
         .expect_err("the spent budget refuses another start");
-    assert!(
-        matches!(refused.fault(), EngineFault::Ended),
-        "unexpected fault {:?}",
-        refused.fault()
-    );
+    assert_eq!(refused.slug(), errors::lsp::engine_ended::SLUG);
     pool.shutdown().await;
 }
 
@@ -178,10 +174,16 @@ async fn engine_that_stopped_answering_is_restarted_within_the_budget() {
     let error = references_through(&pool, "rust")
         .await
         .expect_err("neither engine answers");
+    assert_eq!(error.slug(), errors::lsp::engine_timed_out::SLUG);
     assert!(
-        matches!(error.fault(), EngineFault::TimedOut { .. }),
-        "unexpected fault {:?}",
-        error.fault()
+        error
+            .context()
+            .any(|(key, value)| { key == "method" && value == "textDocument/references" })
+    );
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| { key == "timeout_ms" && value == "1000" })
     );
     pool.shutdown().await;
 }
@@ -199,19 +201,12 @@ async fn failed_starts_spend_the_restart_budget() {
     let error = references_through(&pool, "rust")
         .await
         .expect_err("the program cannot be started");
-    assert!(
-        matches!(error.fault(), EngineFault::LaunchFailed { .. }),
-        "unexpected fault {:?}",
-        error.fault()
-    );
+    assert_eq!(error.slug(), errors::lsp::engine_launch_failed::SLUG);
+    assert!(std::error::Error::source(&error).is_some());
     let refused = references_through(&pool, "rust")
         .await
         .expect_err("the spent budget refuses another start");
-    assert!(
-        matches!(refused.fault(), EngineFault::Ended),
-        "unexpected fault {:?}",
-        refused.fault()
-    );
+    assert_eq!(refused.slug(), errors::lsp::engine_ended::SLUG);
 }
 
 /// A restart that left the window stops counting against the budget.
@@ -227,24 +222,18 @@ async fn restart_budget_frees_once_its_window_passes() {
     let failed = references_through(&pool, "rust")
         .await
         .expect_err("the program cannot be started");
-    assert!(matches!(failed.fault(), EngineFault::LaunchFailed { .. }));
+    assert_eq!(failed.slug(), errors::lsp::engine_launch_failed::SLUG);
+    assert!(std::error::Error::source(&failed).is_some());
     let refused = references_through(&pool, "rust")
         .await
         .expect_err("the spent budget refuses another start");
-    assert!(
-        matches!(refused.fault(), EngineFault::Ended),
-        "unexpected fault {:?}",
-        refused.fault()
-    );
+    assert_eq!(refused.slug(), errors::lsp::engine_ended::SLUG);
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let freed = references_through(&pool, "rust")
         .await
         .expect_err("the program still cannot be started");
-    assert!(
-        matches!(freed.fault(), EngineFault::LaunchFailed { .. }),
-        "the freed budget must reach the start again, not refuse: {:?}",
-        freed.fault()
-    );
+    assert_eq!(freed.slug(), errors::lsp::engine_launch_failed::SLUG);
+    assert!(std::error::Error::source(&freed).is_some());
 }
 
 /// A configuration fault surfaces at once instead of restarting.
@@ -261,10 +250,11 @@ async fn a_configuration_fault_surfaces_without_restarting() {
         let error = references_through(&pool, "rust")
             .await
             .expect_err("the program is refused");
+        assert_eq!(error.slug(), errors::lsp::engine_program_absolute::SLUG);
         assert!(
-            matches!(error.fault(), EngineFault::ProgramAbsolute { .. }),
-            "unexpected fault {:?}",
-            error.fault()
+            error
+                .context()
+                .any(|(key, value)| { key == "program" && value == "/usr/bin/rift_absent_engine" })
         );
     }
 }
@@ -327,7 +317,22 @@ async fn refusal_leaves_the_engine_serving_without_a_restart() {
     let refusal = references_through(&pool, "rust")
         .await
         .expect_err("the engine refuses the position");
-    assert!(matches!(refusal.fault(), EngineFault::Refused { .. }));
+    assert_eq!(refusal.slug(), errors::lsp::engine_refused_terminal::SLUG);
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| { key == "method" && value == "textDocument/references" })
+    );
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| { key == "code" && value == "-32602" })
+    );
+    assert!(
+        refusal.context().any(|(key, value)| {
+            key == "message" && value == "position is outside the document"
+        })
+    );
     let slot = pool
         .engine_for(&language("rust"))
         .expect("the language is served");
@@ -460,17 +465,21 @@ async fn a_verdict_refusal_retries_and_returns_the_latest_engine_words() {
     let error = references_through(&pool, "rust")
         .await
         .expect_err("the engine refuses the position");
+    assert_eq!(error.slug(), errors::lsp::engine_refused_terminal::SLUG);
     assert!(
-        matches!(
-            error.fault(),
-            EngineFault::Refused {
-                code: -32602,
-                message,
-                ..
-            } if message == "position is outside the document"
-        ),
-        "unexpected fault {:?}",
-        error.fault()
+        error
+            .context()
+            .any(|(key, value)| { key == "method" && value == "textDocument/references" })
+    );
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "code" && value == "-32602")
+    );
+    assert!(
+        error.context().any(|(key, value)| {
+            key == "message" && value == "position is outside the document"
+        })
     );
     pool.shutdown().await;
 }

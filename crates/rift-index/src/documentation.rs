@@ -398,7 +398,7 @@ fn check_regular_source_count(
         count = count.saturating_add(1);
         check_documentation_source_count(count).map_err(|_| {
             errors::index::workspace_documentation_limit()
-                .maybe_path(Some(path))
+                .path(path)
                 .field("sources")
                 .observed(count)
                 .maximum(DOCUMENTATION_SOURCES_MAX as usize)
@@ -416,7 +416,7 @@ fn check_next_source_count(
     let count = inputs.saturating_add(omissions).saturating_add(1);
     check_documentation_source_count(count).map_err(|_| {
         errors::index::workspace_documentation_limit()
-            .maybe_path(Some(path))
+            .path(path)
             .field("sources")
             .observed(count)
             .maximum(DOCUMENTATION_SOURCES_MAX as usize)

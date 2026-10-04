@@ -55,16 +55,6 @@ const BEARER_SCHEME: &str = "Bearer";
 /// The `Host` spellings that name the loopback the server binds.
 const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
 
-pub(crate) fn http_serve_failed(
-    operation: &'static str,
-    source: impl std::error::Error + Send + Sync + 'static,
-) -> RiftError {
-    errors::mcp::http_serve_failed()
-        .operation(operation)
-        .source(source)
-        .error()
-}
-
 /// Whether the served routes check the minted bearer token.
 ///
 /// The token separates OS users sharing the machine, and the loopback bind
@@ -228,10 +218,12 @@ impl DeferredDatabaseShutdown {
     /// Returns [`RiftError`] if the SQLite worker fails or cannot stop before the deadline.
     pub async fn shutdown(self, deadline: Instant) -> Result<(), RiftError> {
         match self.0 {
-            Some(search_index) => search_index
-                .shutdown(deadline)
-                .await
-                .map_err(|error| http_serve_failed("SQLite worker shutdown", error)),
+            Some(search_index) => search_index.shutdown(deadline).await.map_err(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("SQLite worker shutdown")
+                    .cause(error)
+                    .error()
+            }),
             None => Ok(()),
         }
     }
@@ -325,13 +317,19 @@ impl HttpServer {
         let idle_outcome = self.idle_watch.await;
         let repository_idle_outcome = match self.repository_idle_watch {
             Some(mut watch) => match tokio::time::timeout_at(deadline, &mut watch).await {
-                Ok(outcome) => {
-                    outcome.map_err(|error| http_serve_failed("workspace idle watch task", error))
-                }
+                Ok(outcome) => outcome.map_err(|error| {
+                    errors::mcp::http_serve_failed()
+                        .operation("workspace idle watch task")
+                        .source(error)
+                        .error()
+                }),
                 Err(error) => {
                     watch.abort();
                     let _ = watch.await;
-                    Err(http_serve_failed("workspace idle watch task", error))
+                    errors::mcp::http_serve_failed()
+                        .operation("workspace idle watch task")
+                        .source(error)
+                        .fail()
                 }
             },
             None => Ok(()),
@@ -375,7 +373,12 @@ impl HttpServer {
             .and(repository_idle_outcome)
             .and(serve_result)
             .and_then(|()| {
-                idle_outcome.map_err(|error| http_serve_failed("idle watch task", error))
+                idle_outcome.map_err(|error| {
+                    errors::mcp::http_serve_failed()
+                        .operation("idle watch task")
+                        .source(error)
+                        .error()
+                })
             });
         (
             deadline,
@@ -393,8 +396,14 @@ fn classify_serve_outcome(
 ) -> Result<(), RiftError> {
     match outcome {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(http_serve_failed("http serve loop", error)),
-        Err(error) => Err(http_serve_failed("http serve task", error)),
+        Ok(Err(error)) => errors::mcp::http_serve_failed()
+            .operation("http serve loop")
+            .source(error)
+            .fail(),
+        Err(error) => errors::mcp::http_serve_failed()
+            .operation("http serve task")
+            .source(error)
+            .fail(),
     }
 }
 
@@ -412,7 +421,10 @@ async fn drained_serve_outcome(
 ) -> Result<(), RiftError> {
     match tokio::time::timeout_at(deadline, serving).await {
         Ok(joined) => classify_serve_outcome(joined),
-        Err(elapsed) => Err(http_serve_failed("http serve drain", elapsed)),
+        Err(elapsed) => errors::mcp::http_serve_failed()
+            .operation("http serve drain")
+            .source(elapsed)
+            .fail(),
     }
 }
 
@@ -428,7 +440,12 @@ fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
 /// characters.
 pub(crate) fn mint_token() -> Result<String, RiftError> {
     let mut entropy = [0_u8; TOKEN_ENTROPY_BYTES];
-    getrandom::fill(&mut entropy).map_err(|error| http_serve_failed("token mint", error))?;
+    getrandom::fill(&mut entropy).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("token mint")
+            .source(error)
+            .error()
+    })?;
     Ok(BASE64URL_NOPAD.encode(&entropy))
 }
 
@@ -461,11 +478,18 @@ pub(crate) fn bind_loopback_listener(
     let (port, listener) = bind_first_free(ports, |port| {
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
     })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| http_serve_failed("listener nonblocking mode", error))?;
-    let listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|error| http_serve_failed("listener runtime registration", error))?;
+    listener.set_nonblocking(true).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("listener nonblocking mode")
+            .source(error)
+            .error()
+    })?;
+    let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("listener runtime registration")
+            .source(error)
+            .error()
+    })?;
     Ok((port, listener))
 }
 
@@ -849,6 +873,7 @@ mod tests {
 
     use tokio::time::Instant;
 
+    use crate::failure::{McpErrorExt as _, WireFailure as _};
     use crate::server::EngineHold;
     use crate::validation::{IndexSupervisor, IndexValidation};
 
@@ -931,14 +956,25 @@ mod tests {
                 .context()
                 .any(|(key, value)| key == "port_max" && value == "6")
         );
-        let rendered = error.to_string();
-        assert!(rendered.contains("4..=6"), "{rendered}");
+        let wire = error
+            .mcp()
+            .wire_error(rift_protocol::error::ErrorPhase::Read);
+        assert_eq!(
+            wire.code,
+            rift_protocol::error::ErrorCode::TemporarilyUnavailable
+        );
+        assert_eq!(
+            wire.retry,
+            rift_protocol::error::RetryDirective::SameRequest
+        );
     }
 
     #[test]
-    #[test]
     fn serve_error_names_its_operation_and_exposes_the_source() {
-        let error = http_serve_failed("http serve loop", std::io::Error::other("socket gone"));
+        let error = errors::mcp::http_serve_failed()
+            .operation("http serve loop")
+            .source(std::io::Error::other("socket gone"))
+            .error();
         assert_eq!(error.slug(), errors::mcp::http_serve_failed::SLUG);
         let rendered = error.to_string();
         assert!(rendered.contains("http serve loop"), "{rendered}");
@@ -946,7 +982,6 @@ mod tests {
         assert_eq!(source.to_string(), "socket gone");
     }
 
-    #[test]
     #[test]
     fn ports_exhausted_carries_no_source() {
         let error = bind_first_free(4..=6, |_| {
@@ -1111,7 +1146,14 @@ mod tests {
             "the later stages must be given the whole budget"
         );
         let error = stopped.expect_err("a supervisor that never joins must miss the deadline");
-        assert_eq!(error.slug(), errors::mcp::http_serve_failed::SLUG);
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert_eq!(
+            error
+                .mcp()
+                .wire_error(rift_protocol::error::ErrorPhase::Read)
+                .code,
+            rift_protocol::error::ErrorCode::TemporarilyUnavailable
+        );
     }
 
     #[tokio::test(start_paused = true)]

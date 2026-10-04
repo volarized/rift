@@ -70,9 +70,8 @@ const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some
 fn stop_timeout(process: ProcessExit, holder: &ServerLock) -> Result<(), RiftError> {
     let mut builder = errors::cli::server_stop_timed_out()
         .waited(STOP_WAIT_MAX)
-        .maybe_listening(Some(format!("127.0.0.1:{}", holder.port)))
-        .maybe_pid(Some(holder.pid))
-        .maybe_detail(None::<String>);
+        .listening(format!("127.0.0.1:{}", holder.port))
+        .pid(holder.pid);
     if let Some(detail) = process.refusal_detail() {
         builder = builder.with(ErrorContext::new("detail", detail));
     }
@@ -925,7 +924,7 @@ async fn serve_foreground(
                 tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
             )
             .await;
-            return Err(foreground_refused(root, error));
+            return foreground_refused(root, error).fail();
         }
     };
     let stop_signals = cancel_on_stop_signal(shutdown.clone());
@@ -1256,9 +1255,7 @@ async fn print_logs(
     }
     let Some(store) = WorkspaceStorage::open(root).await.logs() else {
         return errors::cli::server_logs_unavailable()
-            .maybe_operation(None::<String>)
-            .maybe_detail(Some("the workspace database at `.rift/db` did not open"))
-            .maybe_source(None::<RiftError>)
+            .detail("the workspace database at `.rift/db` did not open")
             .fail();
     };
     let printed = match tail {
@@ -2393,18 +2390,13 @@ mod tests {
             if poll_again {
                 assert!(!process.exited(), "the current process must remain alive");
             }
-            let current = holder();
-            let error = process.refused(
-                errors::cli::server_stop_timed_out()
-                    .waited(STOP_WAIT_MAX)
-                    .listening(format!("127.0.0.1:{}", current.port))
-                    .pid(current.pid)
-                    .error(),
-            );
+            let detail = process.refusal_detail();
             assert_eq!(
-                error.to_string().contains("process wait interrupted"),
+                detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("process wait interrupted")),
                 !poll_again,
-                "a successful poll must clear the prior wait failure: {error}"
+                "a successful poll must clear the prior wait failure: {detail:?}"
             );
         }
         Ok(())

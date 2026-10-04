@@ -1,8 +1,7 @@
 //! Documentation projection over the request's captured project sources.
 
-use rift_index::{
-    DocumentationError, DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
-};
+use rift_error::RiftError;
+use rift_index::{DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget};
 use rift_protocol::documentation::{
     DocumentationContentIdentity, DocumentationSourceIdentity, DocumentationStage,
     DocumentationWarning, DocumentationWarningKind,
@@ -11,9 +10,9 @@ use rift_protocol::read::TextRange;
 
 use super::{
     DocumentIdentity, FusedCandidate, ParsedQuery, Path, PathMatcher, ProjectPath, RankingInput,
-    ReadWarning, Resolution, ResolvedCandidate, RiftError, SearchHit, SearchHitTarget,
-    SearchParamsTarget, SearchScope, WorkspaceIndex, includes, matched_fields, query_line,
-    resolve_candidate, text_range,
+    ReadWarning, Resolution, ResolvedCandidate, SearchHit, SearchHitTarget, SearchParamsTarget,
+    SearchScope, WorkspaceIndex, includes, matched_fields, query_line, resolve_candidate,
+    text_range,
 };
 
 /// Metadata held for one search, without another copy of source content.
@@ -148,7 +147,7 @@ impl<'a> JoinedLayers<'a> {
     fn join(
         &mut self,
         documentation: &str,
-        layer: Result<&'a DocumentationLayer<'static>, &DocumentationError>,
+        layer: Result<&'a DocumentationLayer<'static>, &RiftError>,
     ) {
         match layer {
             Ok(layer) => {

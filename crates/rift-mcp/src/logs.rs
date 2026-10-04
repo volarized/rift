@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rift_index::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use rift_error::causes;
+use rift_index::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use rift_protocol::configuration::LogsConfiguration;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio::sync::{Notify, watch};

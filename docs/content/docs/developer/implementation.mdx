@@ -522,14 +522,21 @@ store that published it, and deciding which identities win does not.
 
 `crates/rift-error/errors.toml` defines concrete Rift failures and evidence fields. `rift-error-codegen` validates
 those definitions and emits typed builders in `crates/rift-error/src/generated.rs`. The runtime
-stores each failure's slug, rendered message, action, context, and optional source. Domain code
-selects generated errors and supplies evidence with typed builder methods; `.error()` constructs a
-`RiftError`, and `.fail()` returns it immediately.
+stores each failure's slug, rendered message, action, and evidence. Generated setters accept the
+Rust type declared for each field. Required fields must be set before `.error()` constructs a
+`RiftError` or `.fail()` returns one; optional fields accept `Option<T>` through `.maybe_<field>()`.
 
-The `rift-error` crate owns evidence extraction and representation extensions. The MCP crate
-registers `.mcp()` conversion to `McpFailure`, while the registry remains independent of MCP
-types. `cargo xtask errors generate` updates generated Rust. `cargo xtask errors check` compares
-generated output without writing it; CI runs that check through `just generate-check`.
+A `source` field retains an underlying Rust error and exposes it through `std::error::Error::source`.
+A `cause` field retains another `RiftError` in that chain. The runtime also converts owned and
+borrowed `RiftError` values, including shared `Arc` values, without dropping their source chains.
+Sensitive evidence is redacted in rendered output.
+
+The registry does not contain transport codes. The MCP adapter maps each slug to its wire code and
+retry directive, then supplies the request phase with `.tool_error(phase)`. Calling `.fail()` on
+that representation returns its JSON-RPC error. `cargo xtask errors generate` updates generated
+Rust. The generator builds a syntax tree, sorts and groups imports at the file top, and formats it
+with `prettyplease`. `cargo xtask errors check` compares generated output without writing it; CI
+runs that check through `just generate-check`.
 
 ## Vector search
 

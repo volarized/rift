@@ -1,9 +1,10 @@
 //! Wire projection of operating failures served on tool results.
 
-use rift_error::{IntoRiftError, RiftError};
+use rift_error::{RiftError, errors};
 use rift_protocol::error as wire;
 use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
+use std::fmt;
 
 /// JSON-RPC error code every Rift operating failure travels under: the
 /// first code of the server-defined range (-32000 to -32099), which rmcp
@@ -34,8 +35,21 @@ pub(crate) trait WireFailure {
 }
 
 /// Rift error prepared for the MCP wire boundary.
+#[derive(Debug)]
 pub struct McpFailure {
     error: RiftError,
+}
+
+impl fmt::Display for McpFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for McpFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.error)
+    }
 }
 
 impl McpFailure {
@@ -50,11 +64,19 @@ impl McpFailure {
     pub fn slug(&self) -> rift_error::ErrorSlug {
         self.error.slug()
     }
+
+    /// Returns wire code for this failure.
+    #[must_use]
+    pub fn wire_code(&self) -> String {
+        wire_code_for_error(&self.error).unwrap_or_else(|| self.error.slug().as_str().to_owned())
+    }
 }
 
 rift_error::format! {
     mcp -> McpFailure as McpErrorExt, McpErrorFailExt using McpFailure::new
 }
+
+impl McpErrorFailExt for ErrorData {}
 
 impl WireFailure for McpFailure {
     fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
@@ -63,7 +85,7 @@ impl WireFailure for McpFailure {
     }
 
     fn wire_error(&self, phase: wire::ErrorPhase) -> wire::ErrorData {
-        let (code, retry) = wire_guidance(self.error.slug().as_str()).unwrap_or((
+        let (code, retry) = wire_guidance_for_error(&self.error).unwrap_or((
             wire::ErrorCode::InternalError,
             wire::RetryDirective::SameRequest,
         ));
@@ -79,7 +101,7 @@ impl WireFailure for McpFailure {
     }
 
     fn wire_causes(&self) -> Vec<wire::ErrorCause> {
-        let (code, retry) = wire_guidance(self.error.slug().as_str()).unwrap_or((
+        let (code, retry) = wire_guidance_for_error(&self.error).unwrap_or((
             wire::ErrorCode::InternalError,
             wire::RetryDirective::SameRequest,
         ));
@@ -116,6 +138,35 @@ pub(crate) fn bounded_causes(
 pub fn wire_code_for_slug(slug: &str) -> Option<String> {
     let (code, _) = wire_guidance(slug)?;
     serde_json::to_value(code).ok()?.as_str().map(str::to_owned)
+}
+
+/// Returns wire code for a registered error, including delegated workspace identity.
+#[must_use]
+pub fn wire_code_for_error(error: &RiftError) -> Option<String> {
+    let (code, _) = wire_guidance_for_error(error)?;
+    serde_json::to_value(code).ok()?.as_str().map(str::to_owned)
+}
+
+fn wire_guidance_for_error(error: &RiftError) -> Option<(wire::ErrorCode, wire::RetryDirective)> {
+    let slug = error.slug();
+    if slug == errors::index::workspace_syntax::SLUG
+        || slug == errors::index::workspace_history::SLUG
+    {
+        let mut source = std::error::Error::source(error);
+        for _ in 0..rift_error::CAUSE_DEPTH_MAX {
+            let Some(current) = source else {
+                break;
+            };
+            if let Some(child) = current.downcast_ref::<RiftError>() {
+                if let Some(guidance) = wire_guidance(child.slug().as_str()) {
+                    return Some(guidance);
+                }
+                break;
+            }
+            source = std::error::Error::source(current);
+        }
+    }
+    wire_guidance(slug.as_str())
 }
 
 fn wire_guidance(slug: &str) -> Option<(wire::ErrorCode, wire::RetryDirective)> {
@@ -359,6 +410,35 @@ fn wire_guidance(slug: &str) -> Option<(wire::ErrorCode, wire::RetryDirective)> 
         | "rift.cli.server_stop_refused"
         | "rift.cli.server_stop_timed_out"
         | "rift.cli.server_logs_unavailable" => (Code::InternalError, Retry::SameRequest),
+        "rift.cli.update_version_invalid"
+        | "rift.cli.update_release_tag_invalid"
+        | "rift.cli.update_prerelease_unsupported"
+        | "rift.cli.update_release_file_inspection_failed"
+        | "rift.cli.update_release_file_not_regular"
+        | "rift.cli.update_release_file_size_invalid"
+        | "rift.cli.update_release_metadata_invalid"
+        | "rift.cli.update_checksum_mismatch"
+        | "rift.cli.update_checksum_manifest_invalid"
+        | "rift.cli.update_checksum_read_failed"
+        | "rift.cli.update_download_failed"
+        | "rift.cli.update_download_too_large"
+        | "rift.cli.update_archive_file_inspection_failed"
+        | "rift.cli.update_archive_file_not_regular"
+        | "rift.cli.update_archive_file_size_invalid"
+        | "rift.cli.update_archive_member_too_large"
+        | "rift.cli.update_archive_contents_invalid"
+        | "rift.cli.update_archive_extraction_failed" => (Code::InternalError, Retry::SameRequest),
+        "rift.cli.update_binary_invalid"
+        | "rift.cli.update_staging_failed"
+        | "rift.cli.update_publish_copy_failed"
+        | "rift.cli.update_publish_pending_cleanup"
+        | "rift.cli.update_publish_parent_missing"
+        | "rift.cli.update_publish_failed"
+        | "rift.cli.update_rollback_failed"
+        | "rift.cli.update_rollback_cleanup_failed" => (Code::InternalError, Retry::OperatorAction),
+        "rift.history.contribution_invalid" | "rift.lsp.position_offset_out_of_range" => {
+            (Code::InternalError, Retry::SameRequest)
+        }
         slug if slug.starts_with("rift.core.path_") => (Code::UnsupportedPath, Retry::Never),
         slug if slug.starts_with("rift.core.configuration_") => {
             (Code::ConfigurationInvalid, Retry::OperatorAction)
@@ -409,10 +489,11 @@ mod tests {
     use std::error::Error;
 
     use rift_core::SourceVisibility;
-    use rift_error::errors;
+    use rift_error::{ErrorContext, ErrorSlug, ErrorValue, RiftError, errors};
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::error as wire;
     use rift_server::ReadService;
+    use rmcp::ErrorData;
 
     use super::{McpErrorExt as _, WireFailure};
 
@@ -439,6 +520,22 @@ mod tests {
     }
 
     #[test]
+    fn immediate_mcp_failure_uses_phase_and_wire_classification() {
+        use super::McpErrorFailExt as _;
+
+        let result: Result<(), ErrorData> = errors::ranking::query_empty()
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read)
+            .fail();
+        let error = result.expect_err("registered failure must terminate the tool call");
+        let data: wire::ErrorData =
+            serde_json::from_value(error.data.expect("MCP response retains typed wire data"))
+                .expect("MCP response carries wire error data");
+        assert_eq!(data.code, wire::ErrorCode::InvalidRequest);
+        assert_eq!(data.phase, wire::ErrorPhase::Read);
+    }
+
+    #[test]
     fn index_bound_projects_generated_evidence_to_wire_limit() {
         let error = errors::index::lexical_unit_limit()
             .field("units_max")
@@ -461,6 +558,55 @@ mod tests {
             super::wire_code_for_slug("rift.ranking.query_empty").as_deref(),
             Some("invalid_request")
         );
+    }
+
+    #[test]
+    fn workspace_syntax_and_history_preserve_child_wire_guidance() {
+        let syntax_limit = errors::index::workspace_syntax()
+            .cause(
+                errors::syntax::source_too_large()
+                    .source_bytes(2_u64)
+                    .source_bytes_max(1_u64)
+                    .error(),
+            )
+            .error();
+        let failure = super::McpFailure::new(syntax_limit);
+        let wire = failure.wire_error(wire::ErrorPhase::Read);
+        assert_eq!(wire.code, wire::ErrorCode::LimitExceeded);
+        assert_eq!(wire.retry, wire::RetryDirective::Never);
+        assert_eq!(failure.wire_code(), "limit_exceeded");
+        assert_eq!(wire.causes[0].code, wire::ErrorCode::LimitExceeded);
+
+        let syntax_zero = errors::index::workspace_syntax()
+            .cause(errors::syntax::zero_limit().bound("source_bytes").error())
+            .error();
+        let wire = super::McpFailure::new(syntax_zero).wire_error(wire::ErrorPhase::Read);
+        assert_eq!(wire.code, wire::ErrorCode::ConfigurationInvalid);
+        assert_eq!(wire.retry, wire::RetryDirective::OperatorAction);
+
+        let history = errors::index::workspace_history()
+            .cause(
+                errors::history::revision_unknown()
+                    .rev("missing")
+                    .requires("commit")
+                    .error(),
+            )
+            .error();
+        let wire = super::McpFailure::new(history).wire_error(wire::ErrorPhase::Read);
+        assert_eq!(wire.code, wire::ErrorCode::ResourceNotFound);
+        assert_eq!(wire.retry, wire::RetryDirective::OperatorAction);
+
+        let provider = errors::index::workspace_provider()
+            .cause(
+                errors::syntax::source_too_large()
+                    .source_bytes(2_u64)
+                    .source_bytes_max(1_u64)
+                    .error(),
+            )
+            .error();
+        let wire = super::McpFailure::new(provider).wire_error(wire::ErrorPhase::Read);
+        assert_eq!(wire.code, wire::ErrorCode::InternalError);
+        assert_eq!(wire.retry, wire::RetryDirective::SameRequest);
     }
 
     #[derive(Debug)]
@@ -517,7 +663,7 @@ mod tests {
             rift_protocol::configuration::HistoryConfiguration::default(),
         )
         .expect_err("missing root must fail");
-        let causes = error.wire_causes();
+        let causes = (&error).mcp().wire_error(wire::ErrorPhase::Read).causes;
         assert!(!causes.is_empty(), "sourced failure must yield causes");
         assert!(causes.len() <= super::ERROR_CAUSES_MAX);
         let code = super::wire_guidance(error.slug().as_str())
@@ -527,5 +673,52 @@ mod tests {
             assert!(!cause.message.is_empty(), "cause message must be rendered");
             assert_eq!(cause.code, code);
         }
+    }
+
+    #[test]
+    fn mcp_failure_forwards_display_and_source_without_added_cause_level() {
+        let error = RiftError::new(
+            ErrorSlug::new("rift.test.mcp_source"),
+            "registered failure",
+            "retry the operation",
+            vec![ErrorContext::new(
+                "source",
+                ErrorValue::source(std::io::Error::other("socket gone")),
+            )],
+        );
+        let failure = super::McpFailure::new(error);
+
+        assert_eq!(
+            failure.to_string(),
+            "registered failure: source socket gone; retry the operation"
+        );
+        let source = Error::source(&failure).expect("MCP failure forwards registered source");
+        assert_eq!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .expect("forwarding keeps concrete source type")
+                .to_string(),
+            "socket gone"
+        );
+        assert_eq!(rift_error::causes(&failure), ["socket gone"]);
+    }
+
+    #[test]
+    fn mcp_failure_debug_keeps_sensitive_evidence_redacted() {
+        let error = RiftError::new(
+            ErrorSlug::new("rift.test.mcp_sensitive"),
+            "registered failure {token}",
+            "rotate {token}",
+            vec![ErrorContext::with_flags(
+                "token",
+                "private-token",
+                true,
+                true,
+            )],
+        );
+        let failure = super::McpFailure::new(error);
+
+        assert!(!format!("{failure:?}").contains("private-token"));
+        assert!(!failure.to_string().contains("private-token"));
     }
 }

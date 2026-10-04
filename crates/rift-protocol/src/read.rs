@@ -1569,9 +1569,11 @@ pub enum RelationshipDerivation {
     PartialEq,
     PartialOrd,
     Serialize,
+    strum::AsRefStr,
     strum::VariantArray,
 )]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum RelationshipFacet {
     /// The source contains the target within its scope.
     Contains,
@@ -2292,6 +2294,18 @@ mod tests {
     };
     use schemars::schema_for;
     use serde_json::json;
+    use strum::VariantArray;
+
+    /// Each relationship facet label matches the spelling serde emits.
+    #[test]
+    fn relationship_facet_labels_match_serde() {
+        for facet in RelationshipFacet::VARIANTS {
+            assert_eq!(
+                serde_json::to_value(facet).expect("serializes"),
+                json!(facet.as_ref())
+            );
+        }
+    }
 
     /// The kinds the advertised schema pattern accepts are the kinds `ExactKind` accepts,
     /// over both sides of every rule the pattern states.

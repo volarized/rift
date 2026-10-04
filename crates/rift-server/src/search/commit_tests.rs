@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
+use rift_error::errors;
 use rift_history::fixture::{commit_all, commit_all_at, git, init};
 use rift_history_store::{HistoryStore, StoreLocation};
 use rift_index::WorkspaceIndexLimits;
@@ -304,8 +305,6 @@ fn a_commit_trimmed_between_the_match_and_the_read_answers_no_hit() -> TestResul
 
 #[test]
 fn a_commit_search_over_a_store_whose_message_index_is_gone_refuses() -> TestResult {
-    use rift_core::{ErrorCode, ErrorName, Fault as _};
-
     let directory = three_commits()?;
     let folder = tempfile::tempdir()?;
     let service = searchable(directory.path(), folder.path())?;
@@ -316,13 +315,15 @@ fn a_commit_search_over_a_store_whose_message_index_is_gone_refuses() -> TestRes
     let refused = service.search_commits(&commit_search("beacon")?);
 
     let error = refused.expect_err("no message index answers the match");
-    assert_eq!(
-        error.fault().name(),
-        ErrorName::Wire(ErrorCode::StorageFailure)
+    assert_eq!(error.slug(), errors::history_store::database::SLUG);
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| { key == "operation" && value == "search commit messages" })
     );
     assert!(
-        error.to_string().contains("search commit messages"),
-        "{error}"
+        error.source().is_some(),
+        "SQLite failure source is retained"
     );
     Ok(())
 }
@@ -477,12 +478,12 @@ fn a_commit_search_without_a_store_is_unsupported() -> TestResult {
         let Err(refusal) = service.search_commits(&commit_search("beacon")?) else {
             return Err("a commit search needs the history store".into());
         };
-        assert_eq!(
-            refusal.name(),
-            rift_core::ErrorName::Wire(rift_core::ErrorCode::CapabilityUnavailable),
-            "{refusal}"
+        assert_eq!(refusal.slug(), errors::server::read_unsupported::SLUG);
+        assert!(
+            refusal
+                .context()
+                .any(|(key, value)| { key == "capability" && value == detail })
         );
-        assert!(refusal.to_string().contains(detail), "{refusal}");
     }
     Ok(())
 }

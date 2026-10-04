@@ -535,7 +535,7 @@ impl HistoryAnalysis {
             Err(error) if error.slug() == errors::history::blob_too_large::SLUG => {
                 return Ok(ParsedSide::unknown(0));
             }
-            Err(error) => return Err(error),
+            Err(error) => return error.fail(),
         };
         let parsed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let Ok(text) = String::from_utf8(bytes) else {

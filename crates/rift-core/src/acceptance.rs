@@ -9,16 +9,16 @@
 //! checks its bounds.
 
 use rift_protocol::schema::{
-    DeclaredKey, DocumentStep, declared_keys, declared_named_keys, declared_tables,
-    document_steps, expected_shape, named_member,
+    DeclaredKey, DocumentStep, declared_keys, declared_named_keys, declared_tables, document_steps,
+    expected_shape, named_member,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::constants::WORKSPACE_CONFIGURATION_FILE;
-use rift_error::{RiftError, errors};
 use crate::line::lines_inclusive;
+use rift_error::{RiftError, errors};
 
 /// Bytes a configuration document may hold, at most. The document states
 /// bounded tables and entries; one this large is not configuration.
@@ -29,8 +29,6 @@ pub const ENVIRONMENT_PREFIX: &str = "RIFT";
 
 /// Bytes one variable naming a configuration key may hold, at most.
 const VARIABLE_VALUE_BYTES_MAX: usize = 64 << 10;
-
-/// Invalid configuration input.
 
 /// The variables a configuration may be overridden from: every variable whose
 /// name starts with `RIFT_`.
@@ -282,7 +280,7 @@ fn variable_value(
     schema: &Value,
 ) -> Result<toml::Value, RiftError> {
     if text.len() > VARIABLE_VALUE_BYTES_MAX {
-        return Err(variable_malformed(variable, key, schema));
+        return variable_malformed(variable, key, schema).fail();
     }
     if key.is_textual() {
         return Ok(toml::Value::String(text.to_owned()));
@@ -327,10 +325,7 @@ fn insert_value(table: &mut toml::Table, path: &[String], value: toml::Value) {
 /// it stopped, what the documented shape accepts there, and a value it takes.
 /// The parser's own account is not carried: it speaks of Rust types and serde
 /// grammar, which name nothing the operator can write.
-fn accept_document<Model: DeserializeOwned>(
-    raw: &str,
-    schema: &Value,
-) -> Result<Model, RiftError> {
+fn accept_document<Model: DeserializeOwned>(raw: &str, schema: &Value) -> Result<Model, RiftError> {
     let bytes = raw.len() as u64;
     if bytes > CONFIGURATION_FILE_BYTES_MAX {
         return errors::core::configuration_oversized()
@@ -341,7 +336,7 @@ fn accept_document<Model: DeserializeOwned>(
     }
     let deserializer = match toml::Deserializer::parse(raw) {
         Ok(deserializer) => deserializer,
-        Err(error) => return Err(malformed_document(raw, error.span(), &[], schema)),
+        Err(error) => return malformed_document(raw, error.span(), &[], schema).fail(),
     };
     serde_path_to_error::deserialize(deserializer).map_err(|refused| {
         let steps = document_steps(refused.path());
@@ -438,7 +433,7 @@ mod tests {
     use rift_protocol::schema::{configuration_schema, declared_keys};
 
     use super::{
-        ConfigurationEnvironment, RiftError, NamedMembers, accept_configuration,
+        ConfigurationEnvironment, NamedMembers, RiftError, accept_configuration,
         accept_configuration_naming, variable_name,
     };
     use rift_error::ErrorContext;
@@ -688,15 +683,17 @@ mod tests {
             min: 1,
             max: 100_000_000,
         };
-        let overridden = crate::configuration::configuration_violation_error(&violation)
-            .with(ErrorContext::new("variables", "RIFT_PROVIDERS_SYNTAX_MAX_NODES"));
+        let overridden = crate::configuration::configuration_violation_error(&violation).with(
+            ErrorContext::new("variables", "RIFT_PROVIDERS_SYNTAX_MAX_NODES"),
+        );
         assert!(overridden.context().any(|(key, value)| {
             key == "variables" && value == "RIFT_PROVIDERS_SYNTAX_MAX_NODES"
         }));
         assert!(!overridden.context().any(|(key, _)| key == "file"));
 
-        let file_error = crate::configuration::configuration_violation_error(&violation)
-            .with(ErrorContext::new("file", crate::constants::WORKSPACE_CONFIGURATION_FILE));
+        let file_error = crate::configuration::configuration_violation_error(&violation).with(
+            ErrorContext::new("file", crate::constants::WORKSPACE_CONFIGURATION_FILE),
+        );
         assert!(file_error.context().any(|(key, value)| {
             key == "file" && value == crate::constants::WORKSPACE_CONFIGURATION_FILE
         }));

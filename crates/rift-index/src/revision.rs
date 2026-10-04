@@ -170,7 +170,7 @@ impl WorkspaceIndex {
                 Err(error) if error.slug() == rift_error::errors::history::blob_too_large::SLUG => {
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return error.fail(),
             };
             if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
                 continue;
@@ -192,7 +192,7 @@ impl WorkspaceIndex {
             let project_path = ProjectPath::new(tree_file.path().to_owned()).map_err(|error| {
                 errors::index::workspace_invalid_path()
                     .path(&context_path)
-                    .source(error)
+                    .cause(error)
                     .error()
             })?;
             let text_file = super::workspace::included_text_file(
@@ -280,20 +280,17 @@ fn revision_composition() -> Result<ProviderComposition, RiftError> {
     let source = component::<(), RevisionFiles>("git-history-source")?;
     let syntax = component::<RevisionFiles, RustFacts>("rust-tree-sitter")?;
     let index = component::<RustFacts, ReadIndex>("memory-index")?;
-    let mut builder =
-        CompositionBuilder::new(CompositionId::new("rust-revision-read").map_err(|source| {
-            errors::index::workspace_composition()
-                .source(source)
-                .error()
-        })?);
+    let mut builder = CompositionBuilder::new(
+        CompositionId::new("rust-revision-read")
+            .map_err(|source| errors::index::workspace_composition().cause(source).error())?,
+    );
     let files = builder.source("history", &source);
     let facts = builder.then(files, "syntax", &syntax);
     let reads = builder.then(facts, "index", &index);
-    builder.output(reads).build().map_err(|source| {
-        errors::index::workspace_composition()
-            .source(source)
-            .error()
-    })
+    builder
+        .output(reads)
+        .build()
+        .map_err(|source| errors::index::workspace_composition().cause(source).error())
 }
 
 #[cfg(test)]

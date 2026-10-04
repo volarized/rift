@@ -133,13 +133,13 @@ impl<'input> ExactPackageInput<'input> {
         for file in files {
             if !paths.insert(file.path) {
                 return errors::analysis::package_input_duplicate_path()
-                    .maybe_path(Some(file.path.as_str()))
+                    .path(file.path.as_str())
                     .fail();
             }
             SourceUnitId::for_package(package, file.path).map_err(|error| {
                 errors::analysis::package_input_identity_invalid()
-                    .maybe_path(Some(file.path.as_str()))
-                    .maybe_source(Some(error))
+                    .path(file.path.as_str())
+                    .cause(error)
                     .error()
             })?;
             let file_bytes = u64::try_from(file.text.len()).unwrap_or(u64::MAX);
@@ -205,7 +205,7 @@ fn validate_package_identity(package: &PackageIdentity) -> Result<(), RiftError>
         .map(|_| ())
         .map_err(|source| {
             errors::analysis::package_input_identity_invalid()
-                .source(source)
+                .cause(source)
                 .error()
         })
 }

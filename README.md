@@ -119,7 +119,15 @@ Run the developer package directly with:
 uv run --locked --project dev rift-dev --help
 ```
 
-Install the pre-commit hook with `uvx pre-commit install`. It runs `just rust-gate`.
+Install the repository hook after syncing the development environment:
+
+```sh
+uv sync --locked --project dev --group dev
+git config --local core.hooksPath .githooks
+```
+
+The hook runs `just quick-gate`; see [Testing](docs/content/docs/developer/testing.mdx) for its
+checks and the full `just rust-gate`.
 
 ## Rift releases
 

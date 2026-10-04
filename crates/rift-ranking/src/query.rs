@@ -118,8 +118,14 @@ impl ParsedQuery {
                 .fail();
         }
         let scanned = deduplicate(scan(query)?);
-        if let Some(refusal) = phrase_limit(&scanned) {
-            return Err(refusal);
+        let phrases = scanned.iter().filter(|member| member.is_phrase()).count();
+        if phrases > PARSED_QUERY_MEMBERS_MAX {
+            return errors::ranking::query_phrase_limit()
+                .subject("query")
+                .field("query.phrases")
+                .limit(PARSED_QUERY_MEMBERS_MAX)
+                .required(phrases)
+                .fail();
         }
         let members = narrow(scanned);
         Ok(Self {
@@ -381,23 +387,6 @@ fn narrow(members: Vec<QueryMember>) -> Narrowed {
         members: kept,
         narrowed: true,
     }
-}
-
-/// Refuses a query carrying more quoted phrases than one phase accepts.
-///
-/// Unquoted terms narrow, so a long question is answered rather than refused.
-/// A phrase cannot narrow the same way: dropping one changes what the caller
-/// asked for, and keeping a partial set would answer a question nobody asked.
-fn phrase_limit(members: &[QueryMember]) -> Option<RiftError> {
-    let phrases = members.iter().filter(|member| member.is_phrase()).count();
-    (phrases > PARSED_QUERY_MEMBERS_MAX).then(|| {
-        errors::ranking::query_phrase_limit()
-            .subject("query")
-            .field("query.phrases")
-            .limit(PARSED_QUERY_MEMBERS_MAX)
-            .required(phrases)
-            .error()
-    })
 }
 
 #[cfg(test)]

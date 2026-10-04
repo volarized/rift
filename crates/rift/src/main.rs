@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 #[cfg(test)]
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
+use rift_mcp::McpErrorExt as _;
 use tracing::subscriber::Interest;
 use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
@@ -278,8 +279,7 @@ impl CliError {
     /// Returns stable command code for operator output.
     fn code(&self) -> String {
         match self {
-            Self::Mcp(error) => rift_mcp::wire_code_for_slug(error.slug().as_str())
-                .unwrap_or_else(|| error.slug().as_str().to_owned()),
+            Self::Mcp(error) => error.wire_code(),
             Self::Update(error) => cli_code(error),
             Self::Server(error) | Self::Install(error) => cli_code(error),
         }
@@ -346,7 +346,7 @@ fn cli_code(error: &rift_error::RiftError) -> String {
             "update_rollback_failed"
         }
         _ => {
-            return rift_mcp::wire_code_for_slug(error.slug().as_str())
+            return rift_mcp::wire_code_for_error(error)
                 .unwrap_or_else(|| error.slug().as_str().to_owned());
         }
     }
@@ -405,7 +405,7 @@ async fn run(
         Some(CliCommand::Mcp) => {
             rift_mcp::serve_proxy(Path::new("."), BUILD_CHECKOUT)
                 .await
-                .map_err(CliError::Mcp)?;
+                .map_err(|error| CliError::Mcp(error.mcp()))?;
             Ok(None)
         }
         Some(CliCommand::Server { command }) => server::run(command, drain, retention_records)
@@ -440,7 +440,7 @@ mod tests {
     use std::error::Error as _;
     use std::sync::{Arc, Mutex};
 
-    use super::{Cli, CliCommand, CliError, cli_command};
+    use super::{Cli, CliCommand, CliError, cli_code, cli_command};
     use clap::Parser;
     use tracing::span::{Attributes, Id};
     use tracing_subscriber::layer::{Context, SubscriberExt as _};
@@ -512,7 +512,7 @@ mod tests {
 
         let mcp =
             rift_mcp::McpFailure::new(rift_error::errors::mcp::proxy_unexpected_quit().error());
-        let mcp_code = rift_mcp::wire_code_for_slug(mcp.slug().as_str()).unwrap();
+        let mcp_code = mcp.wire_code();
         assert!(!mcp_code.is_empty());
         assert_eq!(CliError::Mcp(mcp).code(), mcp_code);
     }
@@ -808,7 +808,11 @@ mod tests {
 
     #[test]
     fn a_rendered_error_without_causes_is_one_line() {
-        let error = CliError::Server(super::server::error_for_test());
+        let error = CliError::Server(
+            rift_error::errors::cli::server_stop_timed_out()
+                .waited(std::time::Duration::ZERO)
+                .error(),
+        );
         let rendered = error.rendered();
         assert_eq!(rendered.lines().count(), 1, "{rendered}");
         assert!(rendered.ends_with('\n'));

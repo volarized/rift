@@ -124,7 +124,7 @@ async fn open_workspace_database(
     match WorkspaceDatabase::open_with_owner(&database_path, configured_pool(root), owner).await {
         Ok(database) => Some(database),
         Err(error) => {
-            let causes = rift_core::causes(&error).join(": ");
+            let causes = causes(&error).join(": ");
             tracing::warn!(
                 component = "storage",
                 operation = "database.open",

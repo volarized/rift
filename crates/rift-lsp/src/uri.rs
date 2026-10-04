@@ -317,7 +317,7 @@ impl EngineRoots {
         let tree = match self.tree.project_path(uri) {
             Ok(path) => Some(path),
             Err(error) if is_outside_root(&error) => None,
-            Err(error) => return Err(error),
+            Err(error) => return error.fail(),
         };
         let deeper = self.claimed_package(uri).filter(|(package, _)| {
             tree.is_none() || package.root.slash_form.len() > self.tree.slash_form.len()
@@ -333,7 +333,7 @@ impl EngineRoots {
                 }))
             }
             (None, Some(path)) => Ok(EngineAddress::Project(path)),
-            (None, None) => Err(uri_outside_root()),
+            (None, None) => errors::lsp::uri_outside_root().fail(),
         }
     }
 

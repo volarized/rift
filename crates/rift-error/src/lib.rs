@@ -18,7 +18,7 @@ pub use evidence::EvidenceFor;
 pub use representation::IntoRiftError;
 pub use runtime::{
     BuilderCore, CAUSE_DEPTH_MAX, ErrorContext, ErrorSlug, ErrorValue, FieldSet, IntoInteger,
-    IntoUnsigned, OptionalFieldSet, RiftError, Set, Unset, causes,
+    IntoUnsigned, OptionalFieldSet, RiftError, Set, SourceView, Unset, causes,
 };
 
 #[doc(hidden)]
@@ -104,7 +104,9 @@ macro_rules! evidence {
 #[macro_export]
 macro_rules! format {
     ($method:ident -> $representation:ident using $convert:path) => {
+        /// Converts complete registered errors to configured representations.
         pub trait RiftErrorFormatExt {
+            /// Converts this complete error to the configured representation.
             fn $method(self) -> $representation;
         }
 
@@ -117,19 +119,21 @@ macro_rules! format {
             }
         }
 
-        pub trait RiftErrorFailExt {
-            fn fail<T>(self) -> Result<T, $representation>;
-        }
-
-        impl RiftErrorFailExt for $representation {
-            fn fail<T>(self) -> Result<T, $representation> {
+        /// Returns configured representations through function result types.
+        pub trait RiftErrorFailExt: Sized {
+            /// Returns this representation through a function result type.
+            fn fail<T>(self) -> Result<T, Self> {
                 Err(self)
             }
         }
+
+        impl RiftErrorFailExt for $representation {}
     };
     ($method:ident -> $representation:ident as $extension:ident,
         $failure_extension:ident using $convert:path) => {
+        /// Converts complete registered errors to configured representations.
         pub trait $extension {
+            /// Converts this complete error to the configured representation.
             fn $method(self) -> $representation;
         }
 
@@ -142,15 +146,15 @@ macro_rules! format {
             }
         }
 
-        pub trait $failure_extension {
-            fn fail<T>(self) -> Result<T, $representation>;
-        }
-
-        impl $failure_extension for $representation {
-            fn fail<T>(self) -> Result<T, $representation> {
+        /// Returns configured representations through function result types.
+        pub trait $failure_extension: Sized {
+            /// Returns this representation through a function result type.
+            fn fail<T>(self) -> Result<T, Self> {
                 Err(self)
             }
         }
+
+        impl $failure_extension for $representation {}
     };
 }
 

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rift_index::{
 use rift_error::errors;
+use rift_index::{
     LastCapture, PathChange, PathChanges, capture_visible_digests_with_languages_cancellable,
 };
 use rift_protocol::configuration::ServerConfiguration;
@@ -242,7 +242,10 @@ impl VersionControlHold {
                 move |_| match std::fs::symlink_metadata(&path) {
                     Ok(_) => Ok(true),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(error) => errors::server::read_unavailable().operation("Git index lock validation").detail(error.to_string()).fail(),
+                    Err(error) => errors::server::read_unavailable()
+                        .operation("Git index lock validation")
+                        .detail(error.to_string())
+                        .fail(),
                 },
             );
             let present = tokio::select! {
@@ -538,7 +541,10 @@ mod tests {
             |_root: &std::path::Path,
              _limits: rift_index::WorkspaceIndexLimits,
              _request: &super::super::RebuildRequest| {
-                errors::server::read_unavailable().operation("workspace capture").detail("forced capture failure").fail()
+                errors::server::read_unavailable()
+                    .operation("workspace capture")
+                    .detail("forced capture failure")
+                    .fail()
             },
         )
         .await

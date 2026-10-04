@@ -33,6 +33,7 @@ dev = [
     "ruff==0.16.8",
     "ty==0.0.82",
     "types-pywin32==312.0.0.20260827",
+    "pre-commit==4.6.2",
 ]
 
 [tool.pytest.ini_options]

@@ -21,6 +21,7 @@ mod resolution;
 #[cfg(feature = "collector")]
 mod rst;
 
+#[cfg(test)]
 pub use failure::DocumentationViolation;
 pub use input::{DocumentationInput, DocumentationSourceSet, check_documentation_source_count};
 pub use links::{DocumentationFragment, linked_blocks, resolve_links};

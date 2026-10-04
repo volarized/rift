@@ -220,7 +220,6 @@ fn compiled_override(root: &Path, patterns: &[String]) -> Result<Option<Override
     }
     builder.build().map(Some).map_err(|source| {
         errors::analysis::source_pattern_invalid()
-            .maybe_pattern(None::<&str>)
             .source(source)
             .error()
     })

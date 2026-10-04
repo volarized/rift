@@ -5,9 +5,9 @@ use std::sync::{Arc, OnceLock};
 
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
-use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion, fault_label, line};
+use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion, line};
 use rift_dependency::{DependencyContext, StandardLibrary};
-pub use rift_error::RiftError;
+pub(crate) use rift_error::RiftError;
 use rift_error::errors;
 use rift_history::Repository;
 use rift_index::{
@@ -1261,7 +1261,7 @@ fn requested_packages_violation(
         _ => packages.iter().enumerate().find_map(|(index, package)| {
             package
                 .violation()
-                .map(|violation| format!("entry {index} breaks {}", fault_label(&violation)))
+                .map(|violation| format!("entry {index} breaks {}", violation.as_ref()))
         }),
     }
 }
@@ -1824,22 +1824,44 @@ impl SymbolAddress {
 /// decoded parts. The language segment is taken as spelled; resolution
 /// verifies it against the addressed file's document.
 pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, RiftError> {
-    let malformed = || {
+    let remainder = address
+        .strip_prefix(rift_core::constants::SYMBOL_URI_PREFIX)
+        .ok_or_else(|| {
+            errors::server::read_invalid()
+                .field("symbol")
+                .violation("not a rift symbol address")
+                .error()
+        })?;
+    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(|| {
         errors::server::read_invalid()
             .field("symbol")
             .violation("not a rift symbol address")
             .error()
-    };
-    let remainder = address
-        .strip_prefix(rift_core::constants::SYMBOL_URI_PREFIX)
-        .ok_or_else(malformed)?;
-    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(malformed)?;
+    })?;
     if language_segment.is_empty() {
-        return Err(malformed());
+        return errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .fail();
     }
-    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(malformed)?;
-    let path = decoded(encoded_path).ok_or_else(malformed)?;
-    let qualified_name = decoded(encoded_name).ok_or_else(malformed)?;
+    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
+    let path = decoded(encoded_path).ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
+    let qualified_name = decoded(encoded_name).ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation("not a rift symbol address")
+            .error()
+    })?;
     let path = CoreProjectPath::new(path)?;
     Ok(SymbolAddress {
         language_segment: language_segment.to_owned(),
@@ -1881,8 +1903,8 @@ pub(crate) mod tests {
     use super::{
         Arc, DependenciesConfiguration, DependencyResolution, HistoryConfiguration,
         REQUESTED_PACKAGES_MAX, ReadService, RequestedPackage, RiftError, WorkspaceIndex,
-        WorkspaceIndexLimits, accepted_limit, excerpt, file_id, validate_requested_packages,
-        wire_node,
+        WorkspaceIndexLimits, accepted_limit, errors, excerpt, file_id,
+        validate_requested_packages, wire_node,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -3381,10 +3403,10 @@ pub fn compute() -> i32 {
             invalid.slug() == rift_error::errors::server::read_source_unavailable::SLUG,
             "an invalid-UTF-8 path answers content_unavailable, not not_found: {invalid}"
         );
-        assert_eq!(
-            invalid.descriptor().code(),
-            "content_unavailable",
-            "the wire code names the omitted content, not a missing path"
+        assert!(
+            invalid
+                .context()
+                .any(|(key, value)| { key == "path" && value == "src/invalid.rs" })
         );
 
         let absent = nodes_at_root(&service, "src/missing.rs")
@@ -3393,10 +3415,10 @@ pub fn compute() -> i32 {
             absent.slug() == rift_error::errors::server::read_not_found::SLUG,
             "an absent sibling path is unaffected: {absent}"
         );
-        assert_eq!(
-            absent.descriptor().code(),
-            "resource_not_found",
-            "a genuinely absent path keeps its own wire code"
+        assert!(
+            absent
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/missing.rs")
         );
 
         let kept = nodes_at_root(&service, "src/lib.rs")?;
@@ -3694,7 +3716,7 @@ pub fn compute() -> i32 {
                 .expect_err("a revision read names no package");
             assert_eq!(
                 packages_violation(&error),
-                Some("package facts are served for the current tree alone"),
+                Some("package facts are served for the current tree alone".to_owned()),
                 "scope {scope}: {error}"
             );
         }
@@ -3719,7 +3741,7 @@ pub fn compute() -> i32 {
             .expect_err("one entry past the bound refuses");
         assert_eq!(
             packages_violation(&error),
-            Some("65 entries exceed the maximum 64")
+            Some("65 entries exceed the maximum 64".to_owned())
         );
 
         let error = validate_requested_packages(
@@ -3730,7 +3752,7 @@ pub fn compute() -> i32 {
         .expect_err("an empty name refuses");
         assert_eq!(
             packages_violation(&error),
-            Some("entry 1 breaks name_length")
+            Some("entry 1 breaks name_length".to_owned())
         );
     }
 
@@ -4550,7 +4572,7 @@ pub fn compute() -> i32 {
                 .context()
                 .find(|(key, _)| *key == "extension")
                 .map(|(_, value)| value),
-            Some("lock files"),
+            Some("lock files".to_owned()),
             "a revision snapshot carries no filesystem policy, so the extension alone \
              decides: nodes can never serve an unclaimed one, whatever tree it reads"
         );

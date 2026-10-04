@@ -141,6 +141,49 @@ action = "provide a token"
     }
 
     #[test]
+    fn generated_imports_are_grouped_unique_and_ordered() {
+        use quote::ToTokens as _;
+        use syn::Item;
+
+        let source = r#"
+[registry]
+namespace = "rift.cloud"
+schema = 1
+
+[error.auth.token_expired]
+message = "token expired for {subject}"
+action = "renew token for {subject}"
+fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true }, pid = { type = "pid" }, port = { type = "port" } }
+"#;
+        let generated = generate_source(source).expect("generate source");
+        let file = syn::parse_file(&generated).expect("generated Rust parses");
+        let imports = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Use(item) if matches!(item.vis, syn::Visibility::Inherited) => {
+                    Some(item.to_token_stream().to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            imports.len(),
+            2,
+            "one grouped import per namespace: {imports:?}"
+        );
+        assert!(imports[0].starts_with("use rift_error"), "{imports:?}");
+        assert!(imports[1].starts_with("use std"), "{imports:?}");
+        let mut sorted = imports.clone();
+        sorted.sort();
+        assert_eq!(imports, sorted, "imports sort by namespace: {imports:?}");
+        let mut unique = imports.clone();
+        unique.dedup();
+        assert_eq!(imports, unique, "imports have no duplicates: {imports:?}");
+        assert!(imports[1].contains("borrow :: Borrow"), "{imports:?}");
+    }
+
+    #[test]
     fn generated_cloud_namespace_compiles_against_runtime() {
         use std::fs;
         use std::process::Command;
@@ -291,6 +334,22 @@ fields = { name = { type = "string" } }
             "required-only generated registry did not compile under deny(warnings):\n{}",
             String::from_utf8_lossy(&required_valid.stderr)
         );
+        for (name, field, value) in [
+            ("cloud-pid-only", "pid", "41_u32"),
+            ("cloud-port-only", "port", "8080_u16"),
+        ] {
+            let registry = format!(
+                "[registry]\nnamespace = \"rift.cloud\"\nschema = 1\n\n[error.simple.scalar]\nmessage = \"scalar rejected\"\naction = \"supply valid scalar\"\nfields = {{ {field} = {{ type = \"{field}\" }} }}\n"
+            );
+            let generated = generate_source(&registry).expect("generate scalar-only registry");
+            let expression = format!("cloud::simple::scalar().{field}({value}).error()");
+            let scalar = compile(name, &generated, &expression);
+            assert!(
+                scalar.status.success(),
+                "{name} generated registry did not compile under deny(warnings):\n{}",
+                String::from_utf8_lossy(&scalar.stderr)
+            );
+        }
         let _ = fs::remove_dir_all(&directory);
     }
 }

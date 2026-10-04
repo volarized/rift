@@ -642,7 +642,7 @@ mod tests {
     use rift_error::errors;
 
     use super::*;
-    use crate::failure::{parse_cancelled, position_overflow};
+    use crate::failure::position_overflow;
 
     fn text_at(text: &str, range: ByteRange) -> &str {
         let start = usize::try_from(range.start).expect("range starts within source");

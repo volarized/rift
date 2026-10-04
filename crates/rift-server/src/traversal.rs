@@ -244,7 +244,10 @@ pub(crate) fn relationship_coverage_warning(facets: Vec<RelationshipFacet>) -> O
 
 /// The detail clause for a facet gap, naming each facet in its wire spelling.
 fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
-    let named: Vec<String> = facets.iter().map(rift_core::fault_label).collect();
+    let named: Vec<String> = facets
+        .iter()
+        .map(|facet| facet.as_ref().to_owned())
+        .collect();
     let (subject, reference) = match named.len() {
         0 => return None,
         1 => ("facet", "it"),
@@ -260,16 +263,15 @@ fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
 /// neither as a relationship-store node nor as a lexical declaration.
 fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSymbolId, RiftError> {
-    let not_found = || {
+    let identity = CoreSymbolId::new(seed.0.clone()).map_err(|_error| {
         errors::server::read_not_found()
             .path(seed.0.clone())
             .error()
-    };
-    let identity = CoreSymbolId::new(seed.0.clone()).map_err(|_error| not_found())?;
+    })?;
     if walkable(reads, &identity) {
         Ok(identity)
     } else {
-        Err(not_found())
+        errors::server::read_not_found().path(seed.0.clone()).fail()
     }
 }
 
@@ -486,7 +488,7 @@ fn graph_hop(edge: &RelationshipEdge, direction: HopDirection) -> GraphHop {
     GraphHop {
         relationship: Relationship {
             from: wire_symbol_id(edge.from()),
-            kind: ExactKind(rift_core::fault_label(&edge.facet())),
+            kind: ExactKind(edge.facet().as_ref().to_owned()),
             facets: vec![edge.facet()],
             to: wire_symbol_id(edge.to()),
             evidence: edge.occurrence().node().cloned().into_iter().collect(),
@@ -1091,7 +1093,7 @@ pub(crate) mod tests {
         GraphHop {
             relationship: Relationship {
                 from: rift_protocol::read::SymbolId(from.to_owned()),
-                kind: ExactKind(rift_core::fault_label(&RelationshipFacet::References)),
+                kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
                 facets: vec![RelationshipFacet::References],
                 to: rift_protocol::read::SymbolId(to.to_owned()),
                 evidence: Vec::new(),

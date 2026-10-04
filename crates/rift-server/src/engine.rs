@@ -746,17 +746,6 @@ fn restart_may_help(error: &RiftError) -> bool {
         && error.slug() != errors::lsp::engine_program_absolute::SLUG
 }
 
-fn analyzing_attempts(error: &RiftError) -> Option<u64> {
-    (error.slug() == errors::lsp::engine_analyzing::SLUG)
-        .then(|| {
-            error
-                .context()
-                .find(|(key, _)| *key == "attempts")
-                .and_then(|(_, value)| value.parse().ok())
-        })
-        .flatten()
-}
-
 impl EngineSlot {
     /// Records `changes` for the live session's next exchange.
     fn owe(&self, changes: &PathChanges) {
@@ -1100,7 +1089,7 @@ impl EngineSlot {
                     .unwrap_or_default();
                 Ok(OutgoingAnswer::Unsettled { attempts })
             }
-            Err(error) => Err(error),
+            Err(error) => error.fail(),
         }
     }
 
@@ -1176,7 +1165,7 @@ impl EngineSlot {
                         reported = Some(error);
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return error.fail(),
                 }
             }
             self.report_readiness(session.readiness());
@@ -1216,7 +1205,7 @@ impl EngineSlot {
                 AttemptEnd::Completed(Err(error)) => {
                     finish(session).await;
                     guarded.finished = true;
-                    return Err(error);
+                    return error.fail();
                 }
             };
             // One clock read decides the wait and schedules its end, so the end
@@ -1345,7 +1334,7 @@ impl EngineSlot {
                     "language engine restart budget is spent for this window"
                 );
                 if let Some(reported) = reported {
-                    return Err(reported);
+                    return reported.fail();
                 }
                 return errors::lsp::engine_ended().fail();
             }
@@ -3211,7 +3200,9 @@ done
         let times = times.lock().expect("attempt times").clone();
         let made = attempts.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            analyzing_attempts(&spent).is_some_and(|attempts| attempts == made && made >= 2),
+            spent.context().any(|(key, value)| {
+                key == "attempts" && value == made.to_string() && made >= 2
+            }),
             "{made} attempts: {:?}",
             spent
         );
@@ -3271,7 +3262,11 @@ done
         };
         let (spent, ()) = tokio::join!(request, owe);
         let spent = spent.expect_err("a partial report never settles");
-        assert!(analyzing_attempts(&spent).is_some(), "{:?}", spent);
+        assert!(
+            spent.context().any(|(key, _)| key == "attempts"),
+            "{:?}",
+            spent
+        );
         assert!(
             !directory.path().join("notified.log").exists(),
             "past the bound the live session is told nothing"

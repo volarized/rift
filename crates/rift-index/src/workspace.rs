@@ -198,11 +198,8 @@ impl WorkspaceIndexLimits {
         self,
         configuration: &SyntaxConfiguration,
     ) -> Result<Self, RiftError> {
-        let syntax = SyntaxLimits::from_configuration(configuration).map_err(|error| {
-            errors::index::workspace_zero_limit()
-                .maybe_source(Some(error))
-                .error()
-        })?;
+        let syntax = SyntaxLimits::from_configuration(configuration)
+            .map_err(|error| errors::index::workspace_zero_limit().cause(error).error())?;
         Ok(self.with_syntax(syntax))
     }
 
@@ -639,7 +636,7 @@ impl WorkspaceSourcePolicy {
             }
             let relative = entry.path().strip_prefix(&self.root).map_err(|error| {
                 errors::index::workspace_invalid_path()
-                    .maybe_path(Some(entry.path()))
+                    .path(entry.path())
                     .source(error)
                     .error()
             })?;
@@ -663,7 +660,7 @@ impl WorkspaceSourcePolicy {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return errors::index::workspace_filesystem()
-                    .maybe_path(Some(path))
+                    .path(path)
                     .source(error)
                     .fail();
             }
@@ -677,7 +674,7 @@ impl WorkspaceSourcePolicy {
             .read_to_end(&mut bytes)
             .map_err(|error| {
                 errors::index::workspace_filesystem()
-                    .maybe_path(Some(path))
+                    .path(path)
                     .source(error)
                     .error()
             })?;
@@ -709,7 +706,7 @@ impl WorkspaceSourcePolicy {
                 Err(error) => match left_out_file(error, path.clone()) {
                     Ok(Some(_)) => {}
                     Ok(None) => unreachable!("recognized file refusal always names a warning"),
-                    Err(error) => return Err(error),
+                    Err(error) => return error.fail(),
                 },
             }
         }
@@ -955,13 +952,13 @@ fn left_out_file(
                     error: Arc::new(error),
                 }))
             } else {
-                Err(error)
+                error.fail()
             }
         }
         errors::index::workspace_provider::SLUG => {
             let source = source_rift_error(&error);
             let Some(source) = source else {
-                return Err(error);
+                return error.fail();
             };
             if source.context().any(|(key, _)| key == "field") {
                 Ok(Some(WorkspaceIndexWarning::Contribution {
@@ -969,10 +966,10 @@ fn left_out_file(
                     error: Arc::new(error),
                 }))
             } else {
-                Err(error)
+                error.fail()
             }
         }
-        _ => Err(error),
+        _ => error.fail(),
     }
 }
 
@@ -1351,7 +1348,7 @@ impl WorkspaceIndexPreparation {
         let project_path = |path: &PathBuf| {
             let relative = path.strip_prefix(&self.root).map_err(|error| {
                 errors::index::workspace_invalid_path()
-                    .maybe_path(Some(path))
+                    .path(path)
                     .source(error)
                     .error()
             })?;
@@ -1383,7 +1380,7 @@ impl WorkspaceIndexPreparation {
         let project_path = |path: &Path| {
             let relative = path.strip_prefix(&self.root).map_err(|error| {
                 errors::index::workspace_invalid_path()
-                    .maybe_path(Some(path))
+                    .path(path)
                     .source(error)
                     .error()
             })?;
@@ -1420,7 +1417,7 @@ impl WorkspaceIndexPreparation {
             .map(|path| {
                 let relative = path.strip_prefix(&self.root).map_err(|error| {
                     errors::index::workspace_invalid_path()
-                        .maybe_path(Some(path))
+                        .path(path)
                         .source(error)
                         .error()
                 })?;
@@ -3052,7 +3049,7 @@ impl WorkspaceIndex {
                 }
                 Ok(Some(warning)) => return Ok(Some(IndexRead::left_out(warning))),
                 Ok(None) => unreachable!("recognized file refusal always names a warning"),
-                Err(error) => return Err(error),
+                Err(error) => return error.fail(),
             },
         };
         let nodes = syntax.nodes_at(position).into_iter().cloned().collect();
@@ -3226,7 +3223,7 @@ impl WorkspaceIndex {
             };
             let relative = path.strip_prefix(&self.root).map_err(|error| {
                 errors::index::workspace_invalid_path()
-                    .maybe_path(Some(path))
+                    .path(path)
                     .source(error)
                     .error()
             })?;
@@ -3462,7 +3459,7 @@ fn positive_bound(bound: usize) -> Result<(), RiftError> {
 fn canonical_root(root: &Path) -> Result<PathBuf, RiftError> {
     let canonical = fs::canonicalize(root).map_err(|error| {
         errors::index::workspace_invalid_root()
-            .maybe_path(Some(root))
+            .path(root)
             .source(error)
             .error()
     })?;
@@ -3478,29 +3475,24 @@ fn composition() -> Result<ProviderComposition, RiftError> {
     let source = component::<(), WorkspaceFiles>("workspace-source")?;
     let syntax = component::<WorkspaceFiles, RustFacts>("rust-tree-sitter")?;
     let index = component::<RustFacts, ReadIndex>("memory-index")?;
-    let mut builder =
-        CompositionBuilder::new(CompositionId::new("rust-read").map_err(|source| {
-            errors::index::workspace_composition()
-                .source(source)
-                .error()
-        })?);
+    let mut builder = CompositionBuilder::new(
+        CompositionId::new("rust-read")
+            .map_err(|source| errors::index::workspace_composition().cause(source).error())?,
+    );
     let files = builder.source("project", &source);
     let facts = builder.then(files, "syntax", &syntax);
     let reads = builder.then(facts, "index", &index);
-    builder.output(reads).build().map_err(|source| {
-        errors::index::workspace_composition()
-            .source(source)
-            .error()
-    })
+    builder
+        .output(reads)
+        .build()
+        .map_err(|source| errors::index::workspace_composition().cause(source).error())
 }
 
 pub(crate) fn component<Input: 'static, Output: 'static>(
     id: &str,
 ) -> Result<Component<Input, Output>, RiftError> {
     Ok(Component::new(ProviderId::new(id).map_err(|source| {
-        errors::index::workspace_composition()
-            .source(source)
-            .error()
+        errors::index::workspace_composition().cause(source).error()
     })?))
 }
 
@@ -3586,9 +3578,10 @@ fn built_contents(
                 });
             }
             Err(error) => {
-                return Err(error
+                return error
                     .with(ctx::operation("index.build"))
-                    .with(ctx::workspace(root)));
+                    .with(ctx::workspace(root))
+                    .fail();
             }
         }
     }
@@ -3914,13 +3907,13 @@ fn compiled_gitignore(path: &Path) -> Result<Gitignore, RiftError> {
     let mut builder = GitignoreBuilder::new(directory);
     if let Some(error) = builder.add(path) {
         return errors::index::workspace_filesystem()
-            .maybe_path(Some(path))
+            .path(path)
             .source(error)
             .fail();
     }
     builder.build().map_err(|error| {
         errors::index::workspace_filesystem()
-            .maybe_path(Some(path))
+            .path(path)
             .source(error)
             .error()
     })
@@ -4570,7 +4563,7 @@ fn walk_source_path(error: &ignore::Error) -> Option<PathBuf> {
 fn walk_error(root: &Path, error: ignore::Error) -> RiftError {
     let path = walk_source_path(&error).unwrap_or_else(|| root.to_path_buf());
     errors::index::workspace_filesystem()
-        .maybe_path(Some(&path))
+        .path(&path)
         .source(error)
         .error()
 }
@@ -4584,13 +4577,13 @@ fn read_file(
 ) -> Result<IndexedFile, RiftError> {
     let handle = fs::File::open(path).map_err(|error| {
         errors::index::workspace_filesystem()
-            .maybe_path(Some(path))
+            .path(path)
             .source(error)
             .error()
     })?;
     let metadata = handle.metadata().map_err(|error| {
         errors::index::workspace_filesystem()
-            .maybe_path(Some(path))
+            .path(path)
             .source(error)
             .error()
     })?;
@@ -4616,7 +4609,7 @@ fn syntax_read(
             Ok(Some(warning)) if warning.holds_text() => Ok(IndexRead::held_unparsed(warning)),
             Ok(Some(warning)) => Ok(IndexRead::left_out(warning)),
             Ok(None) => unreachable!("recognized file refusal always names a warning"),
-            Err(error) => Err(error),
+            Err(error) => error.fail(),
         },
     }
 }
@@ -4648,8 +4641,8 @@ fn analyze_source(
         .analyze(SyntaxSource { path, text: source }, limits)
         .map_err(|error| {
             errors::index::workspace_syntax()
-                .maybe_path(Some(context_path))
-                .source(error)
+                .path(context_path)
+                .cause(error)
                 .error()
         })
 }
@@ -4698,8 +4691,8 @@ pub(crate) fn included_file(
         )
         .map_err(|error| {
             errors::index::workspace_syntax()
-                .maybe_path(Some(context_path))
-                .source(error)
+                .path(context_path)
+                .cause(error)
                 .error()
         })?;
     let digest = FileDigest::of(source.as_bytes());
@@ -4721,13 +4714,13 @@ fn read_text_file(
 ) -> Result<TextSourceFile, RiftError> {
     let bytes = fs::read(path).map_err(|error| {
         errors::index::workspace_filesystem()
-            .maybe_path(Some(path))
+            .path(path)
             .source(error)
             .error()
     })?;
     let metadata = fs::metadata(path).map_err(|error| {
         errors::index::workspace_filesystem()
-            .maybe_path(Some(path))
+            .path(path)
             .source(error)
             .error()
     })?;
@@ -4993,7 +4986,7 @@ pub(crate) fn read_file_bytes(
         .read_to_end(&mut bytes)
         .map_err(|error| {
             errors::index::workspace_filesystem()
-                .maybe_path(Some(path))
+                .path(path)
                 .source(error)
                 .error()
         })?;
@@ -5021,7 +5014,7 @@ pub(crate) fn included_text_file(
 fn source_utf8(bytes: Vec<u8>, context_path: &Path) -> Result<String, RiftError> {
     String::from_utf8(bytes).map_err(|error| {
         errors::index::workspace_invalid_source()
-            .maybe_path(Some(context_path))
+            .path(context_path)
             .source(error)
             .error()
     })
@@ -5034,7 +5027,7 @@ fn source_utf8(bytes: Vec<u8>, context_path: &Path) -> Result<String, RiftError>
 fn project_path_below(root: &Path, absolute: &Path) -> Result<ProjectPath, RiftError> {
     let relative = absolute.strip_prefix(root).map_err(|error| {
         errors::index::workspace_invalid_path()
-            .maybe_path(Some(absolute))
+            .path(absolute)
             .source(error)
             .error()
     })?;
@@ -5057,8 +5050,8 @@ pub fn relative_path(path: &Path) -> Result<ProjectPath, RiftError> {
         .join("/");
     ProjectPath::new(value).map_err(|error| {
         errors::index::workspace_invalid_path()
-            .maybe_path(Some(path))
-            .source(error)
+            .path(path)
+            .cause(error)
             .error()
     })
 }
@@ -9137,7 +9130,7 @@ mod tests {
         let path = ProjectPath::new("src/wide.rs").expect("path");
         let error = errors::index::workspace_provider()
             .path(Path::new("/workspace/src/wide.rs"))
-            .source(rift_core::SourceRange::new(1, 0).expect_err("a reversed range is refused"))
+            .cause(rift_core::SourceRange::new(1, 0).expect_err("a reversed range is refused"))
             .error();
         assert_eq!(
             error_path(&error),
@@ -9220,13 +9213,29 @@ mod tests {
             .maximum(32_usize)
             .error();
         assert!(left_out_file(other, path.clone()).is_err());
-        let syntax = errors::index::workspace_syntax()
+        let source = errors::index::workspace_syntax()
             .path(context)
             .source(std::io::Error::other("provider refused"))
             .error();
         assert!(
-            left_out_file(syntax, path.clone()).is_err(),
-            "syntax error without child bound stays failure"
+            left_out_file(source, path.clone()).is_err(),
+            "a standard source without a syntax bound stays failure"
+        );
+        let syntax = errors::index::workspace_syntax()
+            .path(context)
+            .cause(
+                errors::syntax::source_too_large()
+                    .source_bytes(2_u64)
+                    .source_bytes_max(1_u64)
+                    .error(),
+            )
+            .error();
+        assert!(
+            matches!(
+                left_out_file(syntax, path.clone()),
+                Ok(Some(WorkspaceIndexWarning::SyntaxTooLarge { .. }))
+            ),
+            "syntax bound cause becomes a warning"
         );
 
         let strict = SyntaxLimits::new(1, 1, 1).expect("positive bounds");

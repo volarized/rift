@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use rift_error::RiftError;
 use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, ContributionReference, ExactKind,
     PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision, ProviderSymbolId,
     SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
     SymbolId, TreeRevision, encode_path, symbol_identity,
 };
+use rift_error::RiftError;
 use rift_provider::{ProviderPublication, PublicationLimits};
 
 use crate::{SyntaxDocument, SyntaxFacts};
@@ -143,10 +143,7 @@ impl SyntaxPublicationBuilder {
     ///
     /// Returns [`RiftError`] when source identity or one
     /// Contribution is invalid.
-    pub fn add_document(
-        &mut self,
-        document: &SyntaxDocument,
-    ) -> Result<(), RiftError> {
+    pub fn add_document(&mut self, document: &SyntaxDocument) -> Result<(), RiftError> {
         let placement = DocumentPlacement::project(document)?;
         self.add_document_placed(document, &placement)
     }

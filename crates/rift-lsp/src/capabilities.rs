@@ -23,8 +23,6 @@ pub enum PositionEncoding {
     Utf16,
 }
 
-/// An engine answer the capability record refuses.
-
 /// What one engine advertised at initialize.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {

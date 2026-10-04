@@ -595,7 +595,7 @@ impl SearchIndex {
             Ok(model) => self.hold(model).await,
             Err(error) => {
                 self.set_readiness(VectorReadiness::Unavailable);
-                Err(error)
+                error.fail()
             }
         }
     }

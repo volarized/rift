@@ -11,10 +11,9 @@ use rift_protocol::documentation::{
 use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
 use rift_protocol::read::{Language, SymbolId, TextRange};
 
-use super::failure::{DocumentationViolation, refused};
 use super::identity::canonical_digest;
 use super::input::{source_path, validate_identity};
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 /// A borrowed declaration's identity and name-resolution facts.
 #[derive(Clone, Debug)]
@@ -48,21 +47,21 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
                 && !text.chars().any(char::is_control)
         };
         if !accepted_name(name) || !accepted_name(qualified_name) {
-            return Err(refused(
-                DocumentationViolation::Identity,
-                "declaration.name",
-            ));
+            return errors::analysis::documentation_identity_invalid()
+                .field("declaration.name")
+                .fail();
         }
         let path = declaration_path(source)?;
         let expected = symbol_identity(&language.identity_segment(), &path, qualified_name);
         if symbol.0 != expected {
-            return Err(refused(
-                DocumentationViolation::Identity,
-                "declaration.symbol",
-            ));
+            return errors::analysis::documentation_identity_invalid()
+                .field("declaration.symbol")
+                .fail();
         }
         if range.end < range.start {
-            return Err(refused(DocumentationViolation::Range, "declaration.range"));
+            return errors::analysis::documentation_range_invalid()
+                .field("declaration.range")
+                .fail();
         }
         Ok(Self {
             symbol,
@@ -103,8 +102,11 @@ pub(super) fn declaration_path(source: &DocumentationContentIdentity) -> Result<
     match &source.source {
         DocumentationSourceIdentity::Project { .. } => Ok(path),
         DocumentationSourceIdentity::Package { unit } => {
-            let parsed = rift_core::SourceUnitId::parse(&unit.0)
-                .map_err(|_| refused(DocumentationViolation::Identity, "source.unit"))?;
+            let parsed = rift_core::SourceUnitId::parse(&unit.0).map_err(|_| {
+                errors::analysis::documentation_identity_invalid()
+                    .field("source.unit")
+                    .error()
+            })?;
             Ok(format!("{}/{path}", parsed.resolver()))
         }
     }
@@ -158,7 +160,9 @@ pub fn resolve_references(
     if declarations.len() > PACKAGE_SYMBOLS_MAX as usize
         || candidates.len() > DOCUMENTATION_REFERENCES_MAX as usize
     {
-        return Err(refused(DocumentationViolation::LimitExceeded, "references"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("references")
+            .fail();
     }
     let index = DeclarationNames::new(declarations);
     let mut references = Vec::new();
@@ -215,7 +219,9 @@ pub(super) fn validate_candidate(
         && candidate.authored.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize;
     let range_accepted = candidate.range.end > candidate.range.start;
     if !spelling_accepted || !range_accepted || !super::identity::is_digest(&candidate.block) {
-        return Err(refused(DocumentationViolation::Identity, "reference"));
+        return errors::analysis::documentation_identity_invalid()
+            .field("reference")
+            .fail();
     }
     Ok(())
 }

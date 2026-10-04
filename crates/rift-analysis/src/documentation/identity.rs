@@ -9,9 +9,8 @@ use rift_protocol::documentation::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use super::failure::{DocumentationViolation, refused_by};
 use super::input::validate_identity;
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 /// Returns one baseline document identity for a validated content owner.
 ///
@@ -33,16 +32,19 @@ pub fn content_owner_identity(
             DocumentationSourceIdentity::Package { unit } => unit.0.clone(),
         });
     };
-    let serialized = canonical_json(identity)
-        .map_err(|error| refused_by(DocumentationViolation::Encoding, "owner_identity", error))?;
+    let serialized = canonical_json(identity).map_err(|error| {
+        errors::analysis::documentation_encoding_failed()
+            .field("owner_identity")
+            .source(error)
+            .error()
+    })?;
     let encoded = utf8_percent_encode(&serialized, NON_ALPHANUMERIC);
     let owner = format!("\u{1f}documentation-cell/{encoded}");
     rift_ranking::DocumentIdentity::new(owner.clone()).map_err(|error| {
-        refused_by(
-            DocumentationViolation::LimitExceeded,
-            "owner_identity",
-            error,
-        )
+        errors::analysis::documentation_limit_exceeded()
+            .field("owner_identity")
+            .source(error)
+            .error()
     })?;
     Ok(owner)
 }
@@ -63,11 +65,10 @@ pub fn content_chunk_identity(
     let owner = content_owner_identity(identity)?;
     let chunk = format!("{owner}#chunk/{ordinal}");
     rift_ranking::DocumentIdentity::new(chunk.clone()).map_err(|error| {
-        refused_by(
-            DocumentationViolation::LimitExceeded,
-            "chunk_identity",
-            error,
-        )
+        errors::analysis::documentation_limit_exceeded()
+            .field("chunk_identity")
+            .source(error)
+            .error()
     })?;
     Ok(chunk)
 }
@@ -80,8 +81,12 @@ pub fn content_digest(bytes: &[u8]) -> DocumentationDigest {
 }
 
 pub(super) fn canonical_digest(value: &impl Serialize) -> Result<DocumentationDigest, RiftError> {
-    let encoded = canonical_json(value)
-        .map_err(|error| refused_by(DocumentationViolation::Encoding, "documentation", error))?;
+    let encoded = canonical_json(value).map_err(|error| {
+        errors::analysis::documentation_encoding_failed()
+            .field("documentation")
+            .source(error)
+            .error()
+    })?;
     Ok(content_digest(encoded.as_bytes()))
 }
 

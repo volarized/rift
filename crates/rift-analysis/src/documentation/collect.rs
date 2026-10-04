@@ -19,13 +19,12 @@ use rift_syntax::{
     SyntaxProvider, SyntaxSource,
 };
 
-use super::failure::{DocumentationViolation, refused};
 use super::identity::{canonical_digest, content_digest};
 use super::input::{slice, source_file_path};
 use super::{
     DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
 };
-use rift_error::RiftError;
+use rift_error::{RiftError, errors};
 
 /// Collects metadata without acquiring bytes or retaining another text copy.
 ///
@@ -57,7 +56,9 @@ pub fn collect_documentation_incremental(
     declarations: &[DocumentationDeclaration<'_>],
 ) -> Result<DocumentationCollection, RiftError> {
     if declarations.len() > PACKAGE_SYMBOLS_MAX as usize {
-        return Err(refused(DocumentationViolation::LimitExceeded, "references"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("references")
+            .fail();
     }
     let attached = attached_declaration_facts(declarations);
     let (mut output, cache) = collect_source_facts(previous, sources, &attached)?;
@@ -189,8 +190,11 @@ fn build_collection(
     cache: ExtractionCache,
     resolution_cache: Option<super::resolution::ResolutionCache>,
 ) -> Result<DocumentationCollection, RiftError> {
-    let selected = u32::try_from(sources.sources().len())
-        .map_err(|_| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+    let selected = u32::try_from(sources.sources().len()).map_err(|_| {
+        errors::analysis::documentation_limit_exceeded()
+            .field("sources")
+            .error()
+    })?;
     let records = sources
         .sources()
         .iter()
@@ -378,7 +382,7 @@ fn extract_source_facts(
     let mut facts = Collected::default();
     if let Err(error) = extract_source(input, symbols, &mut facts) {
         let Some(kind) = recoverable_source_error(input, &error) else {
-            return Err(error);
+            return error.fail();
         };
         facts = Collected::default();
         facts.omitted = 1;
@@ -586,7 +590,9 @@ fn append_rst_targets_and_links(
             .or_insert(value);
         if target.destination.is_none() {
             if output.fragments.len() >= DOCUMENTATION_REFERENCES_MAX as usize {
-                return Err(refused(DocumentationViolation::LimitExceeded, "fragments"));
+                return errors::analysis::documentation_limit_exceeded()
+                    .field("fragments")
+                    .fail();
             }
             output.fragments.push(super::DocumentationFragment {
                 source: input.source().identity.clone(),
@@ -602,7 +608,9 @@ fn append_rst_targets_and_links(
         if output.links.len() + output.unresolved_links.len()
             >= DOCUMENTATION_REFERENCES_MAX as usize
         {
-            return Err(refused(DocumentationViolation::LimitExceeded, "links"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("links")
+                .fail();
         }
         let (authored, resolution) = match link.kind {
             super::rst::RstLinkKind::Destination => (link.authored, None),
@@ -682,14 +690,18 @@ fn extract_cell(input: &DocumentationInput<'_>, output: &mut Collected) -> Resul
             };
             append_block(input, output, draft, &mut BTreeMap::new()).map(|_| ())
         }
-        None => Err(refused(DocumentationViolation::Notebook, "cell")),
+        None => errors::analysis::documentation_notebook_invalid()
+            .field("cell")
+            .fail(),
     }
 }
 
 fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, RiftError> {
     if let Some(syntax) = input.shared_syntax() {
         if syntax.markdown_facts().is_none() {
-            return Err(refused(DocumentationViolation::Format, "syntax"));
+            return errors::analysis::documentation_format_invalid()
+                .field("syntax")
+                .fail();
         }
         return Ok(Arc::clone(syntax));
     }
@@ -703,7 +715,10 @@ fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, Ri
             SyntaxLimits::default(),
         )
         .map_err(|error| {
-            super::failure::refused_by(DocumentationViolation::Format, "markdown", error)
+            errors::analysis::documentation_format_invalid()
+                .field("markdown")
+                .source(error)
+                .error()
         })?;
     Ok(document.into_facts())
 }
@@ -713,9 +728,11 @@ fn extract_markdown(
     output: &mut Collected,
 ) -> Result<(), RiftError> {
     let syntax = markdown_facts(input)?;
-    let facts = syntax
-        .markdown_facts()
-        .ok_or_else(|| refused(DocumentationViolation::Format, "syntax"))?;
+    let facts = syntax.markdown_facts().ok_or_else(|| {
+        errors::analysis::documentation_format_invalid()
+            .field("syntax")
+            .error()
+    })?;
     let filtered;
     let facts = if input.source().format == DocumentationSourceFormat::Mdx {
         filtered = facts.for_mdx(input.text());
@@ -737,7 +754,11 @@ fn extract_markdown(
                         level: u32::from(heading.level),
                         name: symbol.qualified_name.clone(),
                     })
-                    .ok_or_else(|| refused(DocumentationViolation::Range, "heading"))
+                    .ok_or_else(|| {
+                        errors::analysis::documentation_range_invalid()
+                            .field("heading")
+                            .error()
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let kind = match fact.kind {
@@ -797,7 +818,9 @@ fn append_markdown_references(
             continue;
         };
         if output.candidates.len() >= DOCUMENTATION_REFERENCES_MAX as usize {
-            return Err(refused(DocumentationViolation::LimitExceeded, "references"));
+            return errors::analysis::documentation_limit_exceeded()
+                .field("references")
+                .fail();
         }
         output.candidates.push(DocumentationReferenceCandidate {
             block: block.clone(),
@@ -829,7 +852,9 @@ fn append_markdown_link(
         return Ok(());
     };
     if output.links.len() + output.unresolved_links.len() >= DOCUMENTATION_REFERENCES_MAX as usize {
-        return Err(refused(DocumentationViolation::LimitExceeded, "links"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("links")
+            .fail();
     }
     let links = if resolvable {
         &mut output.links
@@ -916,7 +941,9 @@ fn append_block(
 ) -> Result<DocumentationDigest, RiftError> {
     let exact = slice(input.text(), &draft.range)?;
     if output.blocks.len() >= DOCUMENTATION_BLOCKS_MAX as usize {
-        return Err(refused(DocumentationViolation::LimitExceeded, "blocks"));
+        return errors::analysis::documentation_limit_exceeded()
+            .field("blocks")
+            .fail();
     }
     let key = canonical_digest(&(&draft.headings, draft.structure, draft.kind))?.0;
     let ordinal = ordinals.entry(key).or_default();

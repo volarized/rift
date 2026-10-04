@@ -121,7 +121,7 @@ pub fn accepted_pattern(
         return Ok(None);
     };
     if let Some(conflict) = pattern_conflict(params) {
-        return Err(conflict);
+        return conflict.fail();
     }
     if params.target == SearchParamsTarget::Documentation {
         return errors::server::read_unsupported()

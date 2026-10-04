@@ -28,7 +28,7 @@ pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
-    LexicalStamp, PublishedIndex, RevisionScoped,
+    LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
 };
 pub use log::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,

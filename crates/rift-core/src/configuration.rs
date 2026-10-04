@@ -15,10 +15,10 @@ use rift_protocol::configuration::{
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
 
-#[cfg(test)]
 use rift_error::{ErrorContext, RiftError, errors};
+use rift_protocol::configuration::ConfigurationViolation;
 #[cfg(test)]
-use rift_protocol::configuration::{ConfigurationViolation, UnitParseError};
+use rift_protocol::configuration::UnitParseError;
 
 /// Which files below a workspace root the index may see: the resolved
 /// `[source]` policy, independent of the wire model it was read from.
@@ -300,8 +300,9 @@ pub(crate) fn unit_parse_error(error: &UnitParseError) -> RiftError {
         .error()
 }
 
-#[cfg(test)]
-pub(crate) fn configuration_violation_error(violation: &ConfigurationViolation) -> RiftError {
+/// Converts one accepted configuration violation to its registered error.
+#[must_use]
+pub fn configuration_violation_error(violation: &ConfigurationViolation) -> RiftError {
     macro_rules! build {
         ($builder:expr) => {{
             let mut builder = $builder;

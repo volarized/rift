@@ -22,7 +22,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::failure::{McpErrorExt as _, WireFailure};
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
 
 /// The arguments one tool call carries, deserialized into its parameter model.
 pub(crate) struct Parameters<P>(pub P);
@@ -60,6 +60,6 @@ where
             .maybe_accepted((!shape.accepted().is_empty()).then(|| shape.accepted().join(", ")))
             .maybe_example(shape.example().map(ToString::to_string))
             .mcp();
-        Err(refused.tool_error(wire::ErrorPhase::Read))
+        refused.tool_error(wire::ErrorPhase::Read).fail()
     }
 }

@@ -134,7 +134,7 @@ impl CalleeRoots {
             match roots.address(uri) {
                 Ok(address) => return Ok(Some(address)),
                 Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => {}
-                Err(error) => return Err(error),
+                Err(error) => return error.fail(),
             }
         }
         Ok(None)

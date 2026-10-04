@@ -573,7 +573,7 @@ fn call_hop(from: &SymbolId, to: SymbolId) -> GraphHop {
         relationship: Relationship {
             from: from.clone(),
             to,
-            kind: ExactKind(rift_core::fault_label(&RelationshipFacet::Calls)),
+            kind: ExactKind(RelationshipFacet::Calls.as_ref().to_owned()),
             facets: vec![RelationshipFacet::Calls],
             evidence: Vec::new(),
             derivation: RelationshipDerivation::Resolution,
@@ -730,7 +730,7 @@ async fn resolve_symbol_callees(
         Err(error) if error.slug() == errors::lsp::engine_capability_absent::SLUG => {
             return Ok(SymbolCallees::NotServed);
         }
-        Err(error) => return Err(error),
+        Err(error) => return error.fail(),
     };
     let trees = [slot.workspace_root(), reads.index().root()];
     match map_callees(reads, report, identity, (walk.roots, &trees)) {
@@ -751,7 +751,7 @@ async fn resolve_symbol_callees(
                 detail: error.detail(),
             })
         }
-        Err(error) => Err(error),
+        Err(error) => error.fail(),
     }
 }
 
@@ -893,11 +893,11 @@ async fn resolve_symbol_references(
             let attempts = error
                 .context()
                 .find(|(key, _)| *key == "attempts")
-                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .and_then(|(_, value)| value.parse::<u64>().ok())
                 .unwrap_or(0);
             return Ok(SymbolReferences::Unsettled { language, attempts });
         }
-        Err(error) => return Err(error),
+        Err(error) => return error.fail(),
     };
     symbol_references(
         map_references(reads, identity, report, slot.workspace_root()),
@@ -930,7 +930,7 @@ fn symbol_references(
                 detail: error.detail(),
             })
         }
-        Err(error) => Err(error),
+        Err(error) => error.fail(),
     }
 }
 
@@ -1144,7 +1144,7 @@ fn map_references(
             relationship: Relationship {
                 from: caller,
                 to: SymbolId(target.as_str().to_owned()),
-                kind: ExactKind(rift_core::fault_label(&RelationshipFacet::References)),
+                kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
                 facets: vec![RelationshipFacet::References],
                 evidence: Vec::new(),
                 derivation: RelationshipDerivation::Resolution,
@@ -1176,13 +1176,13 @@ fn reference_caller(
         if error.slug() == errors::lsp::uri_outside_root::SLUG {
             TreeRoot::new(reads.index().root())?.project_path(at.uri)
         } else {
-            Err(error)
+            error.fail()
         }
     });
     let path = match relative {
         Ok(path) => path,
         Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return error.fail(),
     };
     project_declaration(reads, &path, (at.range, at.encoding), "engine references")
 }
@@ -1238,7 +1238,7 @@ fn declaration_name_offset(file: &IndexedFile, symbol: &SyntaxSymbol) -> Result<
     let start = usize::try_from(range.start).map_err(|_| invalid())?;
     let end = usize::try_from(range.end).map_err(|_| invalid())?;
     if file.source().get(start..end).is_none() {
-        return Err(invalid());
+        return invalid().fail();
     }
     Ok(start)
 }
@@ -1255,6 +1255,7 @@ mod tests {
 
     use lsp_types::{Location, Position, Range};
     use rift_core::{ProjectPath, SourceVisibility, TextFileInclusion};
+    use rift_error::errors;
     use rift_index::WorkspaceIndexLimits;
     use rift_lsp::capabilities::PositionEncoding;
     use rift_lsp::uri::TreeRoot;
@@ -1605,13 +1606,25 @@ mod tests {
     #[test]
     fn an_outgoing_walk_keeps_the_incoming_walk_refusals() {
         let seed = "rift://symbol/rust/lib.rs/beacon";
-        for (extra, code) in [
-            (json!({"rev": "main"}), "capability_unavailable"),
+        for (extra, slug, context_key, context_value) in [
+            (
+                json!({"rev": "main"}),
+                errors::server::read_unsupported::SLUG,
+                "capability",
+                "traversal at a revision",
+            ),
             (
                 json!({"change": {"base": "baseline"}}),
-                "capability_unavailable",
+                errors::server::read_unsupported::SLUG,
+                "capability",
+                crate::search::CHANGE_TRAVERSAL_CAPABILITY,
             ),
-            (json!({"scope": "global"}), "invalid_request"),
+            (
+                json!({"scope": "global"}),
+                errors::server::read_invalid::SLUG,
+                "violation",
+                "the relationship graph serves the project alone",
+            ),
         ] {
             for direction in ["incoming", "outgoing"] {
                 let mut request = json!({"traversal": {"seed": seed, "direction": direction}});
@@ -1622,7 +1635,13 @@ mod tests {
                     serde_json::from_value(request.clone()).expect("search request");
                 let refused =
                     crate::search::validate_search(&params).expect_err("the walk refuses");
-                assert_eq!(refused.descriptor().code(), code, "{request}: {refused}");
+                assert_eq!(refused.slug(), slug, "{request}: {refused}");
+                assert!(
+                    refused
+                        .context()
+                        .any(|(key, value)| key == context_key && value == context_value),
+                    "{request}: {refused}"
+                );
             }
         }
     }
@@ -2041,15 +2060,22 @@ mod tests {
             revision: Some("other".to_owned()),
             ..EngineReferences::default()
         };
+        let refused = reads
+            .search_with_references(
+                &request(&symbol(&reads, "beacon")),
+                &StoreAnswer::identifier_only(),
+                &references,
+            )
+            .expect_err("references from another publication are refused");
+        assert_eq!(refused.slug(), errors::server::read_unavailable::SLUG);
         assert!(
-            reads
-                .search_with_references(
-                    &request(&symbol(&reads, "beacon")),
-                    &StoreAnswer::identifier_only(),
-                    &references
-                )
-                .is_err()
+            refused
+                .context()
+                .any(|(key, value)| { key == "operation" && value == "engine references" })
         );
+        assert!(refused.context().any(|(key, value)| {
+            key == "detail" && value == "source revision changed before search"
+        }));
         Ok(())
     }
 
@@ -2070,7 +2096,10 @@ mod tests {
         let refused = reads
             .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("no engine answered, so the walk has no edge source");
-        assert_eq!(refused.descriptor().code(), "capability_unavailable");
+        assert_eq!(refused.slug(), errors::server::read_unsupported::SLUG);
+        assert!(refused.context().any(|(key, value)| {
+            key == "capability" && value == crate::traversal::TRAVERSAL_CAPABILITY
+        }));
         Ok(())
     }
 
@@ -2164,7 +2193,10 @@ mod tests {
         let refused = reads
             .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("an engine without the references capability answers no edge");
-        assert_eq!(refused.descriptor().code(), "capability_unavailable");
+        assert_eq!(refused.slug(), errors::server::read_unsupported::SLUG);
+        assert!(refused.context().any(|(key, value)| {
+            key == "capability" && value == crate::traversal::TRAVERSAL_CAPABILITY
+        }));
         Ok(())
     }
 
@@ -2221,7 +2253,11 @@ mod tests {
             let error = Box::pin(resolve_engine_references(&reads, &engines, &params, walk()))
                 .await
                 .expect_err("invalid search before engine");
-            assert_eq!(error.descriptor().code(), expected.descriptor().code());
+            assert_eq!(error.slug(), expected.slug());
+            assert_eq!(
+                error.context().collect::<Vec<_>>(),
+                expected.context().collect::<Vec<_>>()
+            );
             assert_eq!(error.detail(), expected.detail());
         }
         engines.shutdown().await;

@@ -693,7 +693,7 @@ impl RepositoryCache {
             .and_then(|fetched| accepted_blob(&fetched, origin.revision(), &url, &blobs));
         let accepted = match accepted {
             Ok(accepted) => accepted,
-            Err(failure) => return Err(discard(&staged, failure).await),
+            Err(failure) => return discard(&staged, failure).await.fail(),
         };
         place_blob(&staged, &accepted.blob).await?;
         Ok(accepted)
@@ -777,7 +777,7 @@ async fn fetch_with_retry<T: FileTransport>(
                 attempts,
                 "model download failed on every attempt"
             );
-            return Err(failure);
+            return failure.fail();
         };
         tokio::time::sleep(delay).await;
         attempt += 1;
@@ -982,8 +982,7 @@ mod tests {
         HUB_ENDPOINT, HUB_HOME_VARIABLE, HubEnvironment, HubTransport, MODEL_FILES, ModelSource,
         REFS_DIRECTORY, RepositoryCache, RepositoryOrigin, USER_HOME_VARIABLE,
         USER_PROFILE_VARIABLE, acquire_from, acquire_repository, bare_etag, copy_atomically,
-        download_failure, download_refused, place_blob, place_in_snapshot, repository_directory,
-        write_atomically,
+        place_blob, place_in_snapshot, repository_directory, write_atomically,
     };
     use crate::encoder::ModelFiles;
     use rift_error::{RiftError, errors};

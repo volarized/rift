@@ -60,7 +60,6 @@ impl Context7 {
         if bytes.len() > CONTEXT7_BYTES_MAX {
             return errors::analysis::context7_oversized()
                 .file(CONTEXT7_FILE)
-                .maybe_source(None::<serde_json::Error>)
                 .fail();
         }
         let document = document(bytes)?;
@@ -121,16 +120,16 @@ fn document(bytes: &[u8]) -> Result<Context7Document, RiftError> {
     let malformed = |source| {
         errors::analysis::context7_malformed()
             .file(CONTEXT7_FILE)
-            .maybe_key(None::<&str>)
-            .maybe_source(source)
+            .source(source)
             .error()
     };
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|source| malformed(Some(source)))?;
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(malformed)?;
     if !value.is_object() {
-        return Err(malformed(None));
+        return errors::analysis::context7_malformed()
+            .file(CONTEXT7_FILE)
+            .fail();
     }
-    serde_json::from_value(value).map_err(|source| malformed(Some(source)))
+    serde_json::from_value(value).map_err(malformed)
 }
 
 /// Refuses a list past `entries_max`, then its first entry `accepted` refuses.
@@ -144,7 +143,6 @@ fn checked_entries(
         return errors::analysis::context7_too_many_entries()
             .file(CONTEXT7_FILE)
             .key(key)
-            .maybe_source(None::<serde_json::Error>)
             .fail();
     }
     match entries
@@ -155,7 +153,6 @@ fn checked_entries(
             .file(CONTEXT7_FILE)
             .key(key)
             .entry(entry.clone())
-            .maybe_source(None::<serde_json::Error>)
             .fail(),
         None => Ok(()),
     }

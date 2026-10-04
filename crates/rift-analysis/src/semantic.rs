@@ -211,10 +211,12 @@ impl WorkspaceSemantics {
                     refused_contributions.push((placed.path.clone(), error));
                 }
                 Err(error) => {
-                    return Err(error.with(ErrorContext::new(
-                        "path",
-                        ErrorValue::path(placed.path.as_str()),
-                    )));
+                    return error
+                        .with(ErrorContext::new(
+                            "path",
+                            ErrorValue::path(placed.path.as_str()),
+                        ))
+                        .fail();
                 }
             }
         }

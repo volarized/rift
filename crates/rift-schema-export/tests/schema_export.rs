@@ -6,6 +6,7 @@ use std::fs;
 use std::process::Command;
 
 use rift_mcp::skill::{self, SkillForm};
+use rift_protocol::error::ErrorCode;
 use rift_schema_export::{self as export, ExportError};
 use serde_json::Value;
 
@@ -174,7 +175,7 @@ fn global_contract_target_reports_contract_drift() -> TestResult {
 
     let error = export::run(&request).expect_err("an invalid contract must fail");
     assert!(matches!(error, ExportError::GlobalContract { .. }));
-    assert_eq!(error.descriptor().code(), "artifact_stale");
+    assert_eq!(error.code(), ErrorCode::ConfigurationInvalid);
     assert!(error.source().is_some());
     assert!(error.to_string().contains("fails contract validation"));
     Ok(())
@@ -413,7 +414,7 @@ fn parse_arguments_rejects_unknown_flag() {
     let error =
         export::parse_arguments(["--bogus".to_owned()]).expect_err("unknown flag must fail");
     let message = error.to_string();
-    assert_eq!(error.descriptor().code(), "invalid_request");
+    assert_eq!(error.code(), ErrorCode::InvalidRequest);
     let ExportError::UnknownFlag { argument } = error else {
         panic!("expected UnknownFlag, got {error:?}");
     };
@@ -423,28 +424,35 @@ fn parse_arguments_rejects_unknown_flag() {
 }
 
 #[test]
-fn descriptor_codes_match_registry_per_variant() {
+fn export_errors_keep_their_command_code_mapping() {
     let extra =
         export::parse_arguments(["first".to_owned(), "second".to_owned(), "third".to_owned()])
             .expect_err("a third positional argument must fail");
-    assert_eq!(extra.descriptor().code(), "invalid_request");
+    assert_eq!(extra.code(), ErrorCode::InvalidRequest);
+    assert!(matches!(extra, ExportError::ExtraArgument { argument } if argument == "third"));
     let missing = ExportError::TemplateToolMissing { name: "search" };
-    assert_eq!(missing.descriptor().code(), "install_template_missing_tool");
+    assert_eq!(missing.code(), ErrorCode::CapabilityUnavailable);
     assert!(missing.to_string().contains("`search`"));
     assert!(std::error::Error::source(&missing).is_none());
 }
 
 #[test]
-fn check_unreadable_descriptor_is_storage_failure() -> TestResult {
+fn check_unreadable_keeps_path_source_and_storage_code() -> TestResult {
     let directory = tempfile::tempdir()?;
     let error =
         export::run(&check_request(&directory)?).expect_err("missing document must fail check");
-    assert_eq!(error.descriptor().code(), "storage_failure");
+    assert_eq!(error.code(), ErrorCode::StorageFailure);
+    let ExportError::CheckUnreadable { path, source } = &error else {
+        panic!("expected CheckUnreadable, got {error:?}");
+    };
+    assert!(path.ends_with("mcp.json"), "{path:?}");
+    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    assert!(std::error::Error::source(&error).is_some());
     Ok(())
 }
 
 #[test]
-fn write_failed_descriptor_is_storage_failure() -> TestResult {
+fn write_failed_keeps_path_source_and_storage_code() -> TestResult {
     let directory = tempfile::tempdir()?;
     let blocked = directory.path().join("blocked");
     fs::write(&blocked, "not a directory")?;
@@ -453,19 +461,28 @@ fn write_failed_descriptor_is_storage_failure() -> TestResult {
         directory.path().join("plugin").display().to_string(),
     ])?;
     let error = export::run(&request).expect_err("writing under a file must fail");
-    assert_eq!(error.descriptor().code(), "storage_failure");
+    assert_eq!(error.code(), ErrorCode::StorageFailure);
+    let ExportError::WriteFailed { path, .. } = &error else {
+        panic!("expected WriteFailed, got {error:?}");
+    };
+    assert!(path.ends_with("nested"), "{path:?}");
+    assert!(std::error::Error::source(&error).is_some());
     Ok(())
 }
 
 #[test]
-fn check_mismatch_descriptor_is_artifact_stale() -> TestResult {
+fn check_mismatch_keeps_path_and_configuration_code() -> TestResult {
     let directory = tempfile::tempdir()?;
     export::run(&write_request(&directory)?)?;
     fs::write(directory.path().join("public/mcp.json"), "{}")?;
 
     let error =
         export::run(&check_request(&directory)?).expect_err("stale document must fail check");
-    assert_eq!(error.descriptor().code(), "artifact_stale");
+    assert_eq!(error.code(), ErrorCode::ConfigurationInvalid);
+    let ExportError::CheckMismatch { path } = error else {
+        panic!("expected CheckMismatch, got {error:?}");
+    };
+    assert!(path.ends_with("mcp.json"), "{path:?}");
     Ok(())
 }
 
