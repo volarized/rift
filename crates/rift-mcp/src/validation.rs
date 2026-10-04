@@ -43,6 +43,7 @@ use rift_server::{
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
+#[cfg(test)]
 use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -2509,6 +2510,7 @@ impl LexicalLane {
     /// that read and its await: tokio's `Notified` "is guaranteed to receive wakeups
     /// from `notify_waiters()` as soon as it has been created, even if it has not yet
     /// been polled".
+    #[cfg(test)]
     pub(crate) fn landed(&self) -> Notified<'_> {
         self.queue.landed.notified()
     }
