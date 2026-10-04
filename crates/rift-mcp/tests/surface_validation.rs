@@ -957,6 +957,8 @@ async fn call_tool_retrying_acceptance(
 #[tokio::test]
 async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
     let (_fixture, client, server_task) = served_fixture().await?;
+    // Map readiness covers local file preparation; wait for lexical population before the corpus.
+    workspace_client::search_after_population(&client, &json!({ "query": "beacon" })).await?;
     let tools = client.list_all_tools().await?;
 
     let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
