@@ -112,6 +112,139 @@ fn commit_facts_carry_author_time_and_the_full_message() {
     );
 }
 
+fn assert_storage_refusal(error: &rift_error::RiftError, operation: &str, detail: &str) {
+    assert_eq!(error.slug().as_str(), "rift.history.storage");
+    assert_eq!(
+        error
+            .context()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        std::collections::BTreeMap::from([
+            ("operation", operation.to_owned()),
+            ("detail", detail.to_owned()),
+        ])
+    );
+    assert_eq!(error.context().count(), 2);
+    assert_eq!(
+        error.message(),
+        format!("repository storage failed during {operation}: {detail}")
+    );
+    assert_eq!(error.action(), "check repository storage and retry");
+    assert!(std::error::Error::source(error).is_none());
+}
+
+#[test]
+fn a_missing_commit_refuses_the_window_and_facts_until_the_object_is_restored() {
+    // Issue #535: an absent parent refuses the whole window, including a readable head.
+    let directory = three_commits();
+    let root = directory.path();
+    let repository = Repository::open(root).expect("repository");
+    let head = head_of(&repository);
+    let middle = repository.resolve("HEAD~1").expect("middle");
+    let expected_window = repository.first_parent_window(&head, 10).expect("window");
+    let expected_facts = repository.commit_facts(&middle).expect("facts");
+    assert_eq!(expected_window.len(), 3);
+    assert_eq!(expected_window[0].parent(), Some(&middle));
+    let object_id = middle.commit_id();
+    drop(repository);
+    let path = root
+        .join(".git/objects")
+        .join(&object_id[..2])
+        .join(&object_id[2..]);
+    let bytes = fs::read(&path).expect("loose commit");
+    fs::remove_file(&path).expect("remove middle commit");
+    let repository = Repository::open(root).expect("repository");
+    let detail = format!("An object with id {object_id} could not be found");
+
+    let error = repository
+        .first_parent_window(&head, 10)
+        .expect_err("missing parent");
+    assert_storage_refusal(&error, "read commit", &detail);
+    let error = repository
+        .commit_facts(&middle)
+        .expect_err("missing commit");
+    assert_storage_refusal(&error, "read commit", &detail);
+    drop(repository);
+
+    fs::write(&path, bytes).expect("restore commit");
+    let restored = Repository::open(root).expect("repository");
+    assert_eq!(
+        restored.first_parent_window(&head, 10).expect("window"),
+        expected_window
+    );
+    assert_eq!(
+        restored.commit_facts(&middle).expect("facts"),
+        expected_facts
+    );
+}
+
+#[test]
+fn a_worktrees_file_refuses_live_heads_until_the_folder_can_be_listed() {
+    // Issue #535: unreadable worktree metadata must not return only the main head.
+    let directory = three_commits();
+    let root = directory.path();
+    let repository = Repository::open(root).expect("repository");
+    let head = head_of(&repository);
+    let path = root.join(".git/worktrees");
+    fs::write(&path, b"not a directory").expect("worktrees file");
+    let expected = fs::read_dir(&path).expect_err("a regular file cannot be listed");
+
+    let error = repository
+        .live_heads()
+        .expect_err("worktree metadata is not a folder");
+    assert_storage_refusal(&error, "list worktrees", &expected.to_string());
+    assert_eq!(
+        fs::read(&path).expect("retained metadata"),
+        b"not a directory"
+    );
+    fs::remove_file(&path).expect("remove invalid worktree metadata");
+    fs::create_dir(&path).expect("worktrees folder");
+    assert_eq!(repository.live_heads().expect("live heads"), [head]);
+}
+
+#[test]
+fn malformed_shallow_metadata_refuses_both_history_walks_until_removed() {
+    // Issue #535: malformed boundary metadata must not become a complete history answer.
+    let directory = three_commits();
+    let root = directory.path();
+    let repository = Repository::open(root).expect("repository");
+    let head = head_of(&repository);
+    let expected_window = repository.first_parent_window(&head, 10).expect("window");
+    let expected_history = repository
+        .path_revisions(&head, "lib.rs", 10)
+        .expect("history");
+    assert_eq!(expected_window.len(), 3);
+    assert_eq!(expected_history.revisions().len(), 2);
+    assert!(expected_history.is_complete());
+    drop(repository);
+    let path = root.join(".git/shallow");
+    fs::write(&path, b"not-an-object-id\n").expect("malformed shallow metadata");
+    let repository = Repository::open(root).expect("repository");
+    let detail = "Could not decode a line in shallow file as hex-encoded object hash";
+
+    let error = repository
+        .first_parent_window(&head, 10)
+        .expect_err("invalid shallow boundary");
+    assert_storage_refusal(&error, "read shallow file", detail);
+    let error = repository
+        .path_revisions(&head, "lib.rs", 10)
+        .expect_err("invalid shallow boundary");
+    assert_storage_refusal(&error, "read shallow file", detail);
+    drop(repository);
+
+    fs::remove_file(&path).expect("remove malformed shallow metadata");
+    let restored = Repository::open(root).expect("repository");
+    assert_eq!(
+        restored.first_parent_window(&head, 10).expect("window"),
+        expected_window
+    );
+    assert_eq!(
+        restored
+            .path_revisions(&head, "lib.rs", 10)
+            .expect("history"),
+        expected_history
+    );
+}
+
 #[test]
 fn changed_blobs_name_each_side_of_every_changed_path() {
     let directory = three_commits();
