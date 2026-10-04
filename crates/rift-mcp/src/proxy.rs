@@ -34,6 +34,7 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
+use tracing::Instrument as _;
 
 use crate::election::{ServerPresence, StaleReason, probe, probe_state_directory};
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
@@ -389,7 +390,16 @@ impl RiftProxy {
             .send_cancellable_request(request, PeerRequestOptions::with_timeout(budget))
             .await
         {
-            Ok(handle) => handle.await_response().await,
+            Ok(handle) => {
+                tracing::debug!(component = "mcp", upstream_request_id = %handle.id, "forwarded request awaiting response");
+                let result = handle.await_response().await;
+                tracing::debug!(
+                    component = "mcp",
+                    is_error = result.is_err(),
+                    "forwarded request completed"
+                );
+                result
+            }
             Err(error) => Err(error),
         };
         match answer {
@@ -1099,17 +1109,34 @@ impl ServerHandler for RiftProxy {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-        self.forward(request, |result| match result {
-            ServerResult::CallToolResult(result) => Some(CallToolResponse::Complete(result)),
-            ServerResult::InputRequiredResult(result) => {
-                Some(CallToolResponse::InputRequired(result))
-            }
-            ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
-            _ => None,
-        })
+        let span = tracing::info_span!(
+            "mcp.forward",
+            component = "mcp",
+            operation = "tools/call",
+            request_id = %context.id,
+            tool = %request.name
+        );
+        async {
+            tracing::debug!("tool forward started");
+            let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+            let result = self
+                .forward(request, |result| match result {
+                    ServerResult::CallToolResult(result) => {
+                        Some(CallToolResponse::Complete(result))
+                    }
+                    ServerResult::InputRequiredResult(result) => {
+                        Some(CallToolResponse::InputRequired(result))
+                    }
+                    ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
+                    _ => None,
+                })
+                .await;
+            tracing::debug!(is_error = result.is_err(), "tool forward completed");
+            result
+        }
+        .instrument(span)
         .await
     }
 
@@ -2191,6 +2218,131 @@ mod tests {
         .await
         .expect_err("a closed transport must fail initialization");
         assert_eq!(error.slug(), errors::mcp::proxy_initialization_failed::SLUG);
+    }
+
+    #[tokio::test]
+    async fn tool_diagnostics_correlate_proxy_and_server_requests() -> TestResult {
+        use rmcp::ServiceExt as _;
+
+        // Issue #483 needs the request still awaiting an answer to retain its IDs.
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("rift=info,rift_mcp=debug,rift_server=debug,rift_index=info")
+            .with_ansi(false)
+            .with_writer(log.reopen()?)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        let server = crate::server::RiftMcp::build_settled(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+        )
+        .await?;
+        let (server_transport, upstream_transport) = tokio::io::duplex(64 * 1024);
+        let (serving, upstream) =
+            tokio::join!(server.serve(server_transport), ().serve(upstream_transport));
+        let serving = serving?;
+        let upstream = upstream?;
+        // Advance the upstream's IDs so matching the downstream ID cannot pass by chance.
+        upstream.list_tools(None).await?;
+        let proxy = RiftProxy::new(directory.path(), test_identity());
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running: upstream,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let (proxy_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let (forwarding, client) =
+            tokio::join!(proxy.serve(proxy_transport), ().serve(client_transport));
+        let forwarding = forwarding?;
+        let client = client?;
+        let params = super::CallToolRequestParams::new("search").with_arguments(
+            serde_json::from_value(json!({"query": "zzdiagnosticsecret", "scope": "local"}))?,
+        );
+        let request = super::ClientRequest::CallToolRequest(super::CallToolRequest::new(params));
+        let handle = client
+            .send_cancellable_request(request, super::PeerRequestOptions::default())
+            .await?;
+        let request_id = handle.id.to_string();
+        let result = handle.await_response().await?;
+        let ServerResult::CallToolResult(result) = result else {
+            return Err("search must return a tool result".into());
+        };
+        assert_ne!(result.is_error, Some(true));
+        let invalid = client
+            .call_tool(super::CallToolRequestParams::new("nodes").with_arguments(
+                serde_json::from_value(json!({"path": "../outside.rs", "position": 0}))?,
+            ))
+            .await
+            .expect_err("invalid paths retain the wire refusal");
+        let ServiceError::McpError(invalid) = invalid else {
+            return Err("invalid paths must return an MCP error".into());
+        };
+        assert_eq!(
+            invalid.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!("invalid_request"))
+        );
+        let records = std::fs::read_to_string(log.path())?;
+        assert_tool_diagnostics(&records, &request_id)?;
+        client.cancel().await?;
+        forwarding.cancel().await?;
+        serving.cancel().await?;
+        Ok(())
+    }
+
+    fn assert_tool_diagnostics(records: &str, request_id: &str) -> TestResult {
+        let forwarded = records
+            .lines()
+            .find(|line| {
+                line.contains("forwarded request awaiting response")
+                    && line.contains(&format!("request_id={request_id}"))
+                    && line.contains("tool=search")
+            })
+            .ok_or("the proxy records the active forward and downstream request ID")?;
+        let upstream_id = forwarded
+            .split("upstream_request_id=")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or("the forward records its upstream request ID")?;
+        assert_ne!(upstream_id, request_id);
+        for event in [
+            "tool request started",
+            "worker admission started",
+            "worker admitted",
+            "request capture compared with publication",
+            "tool request completed",
+        ] {
+            assert!(
+                records.lines().any(|line| {
+                    line.contains("mcp.request{")
+                        && line.contains(&format!("request_id={upstream_id}"))
+                        && line.contains(event)
+                }),
+                "the server event retains the upstream request ID: {event}\n{records}"
+            );
+        }
+        assert!(
+            records
+                .lines()
+                .any(|line| line.contains("tool request completed")
+                    && line.contains("is_error=false"))
+        );
+        assert!(
+            records
+                .lines()
+                .any(|line| line.contains("tool request completed")
+                    && line.contains("is_error=true"))
+        );
+        assert!(
+            !records.contains("zzdiagnosticsecret"),
+            "request arguments stay out of diagnostics: {records}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

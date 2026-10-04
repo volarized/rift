@@ -42,10 +42,11 @@ use rift_server::{
     StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
-    ServerConfig,
+    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
@@ -197,6 +198,7 @@ impl BlockingExecutor {
         let acquire = Arc::clone(&self.operations).acquire_owned();
         let queue_timeout_ms = self.queue_timeout_ms;
         let permit_result = async {
+            tracing::debug!(work = operation, queue_timeout_ms, "worker admission started");
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => errors::server::read_cancelled().fail(),
@@ -210,10 +212,17 @@ impl BlockingExecutor {
         .instrument(tracing::debug_span!(
             "worker.queue",
             component = "worker",
-            operation = "worker.queue"
+            operation = "worker.queue",
+            work = operation
         ))
         .await;
         let permit = permit_result?;
+        tracing::debug!(
+            component = "worker",
+            operation = "worker.queue",
+            work = operation,
+            "worker admitted"
+        );
         if cancellation.is_cancelled() {
             drop(permit);
             return errors::server::read_cancelled().fail();
@@ -226,6 +235,7 @@ impl BlockingExecutor {
             tokio::task::spawn_blocking(move || {
                 let result = rayon_pool.install(move || {
                     let _entered = parent.enter();
+                    tracing::debug!(work = operation, "worker execution started");
                     work(&cancellation)
                 });
                 // Explicit success-path release; unwinding also drops the owned permit.
@@ -237,7 +247,8 @@ impl BlockingExecutor {
         .instrument(tracing::debug_span!(
             "worker.run",
             component = "worker",
-            operation = "worker.run"
+            operation = "worker.run",
+            work = operation
         ))
         .await
         .map_err(|error| {
@@ -824,7 +835,7 @@ const WARNING_DETAIL_BYTES_MAX: usize = 4096;
 const STALE_INDEX_PATHS_MAX: usize = 5;
 
 /// What a read must resolve before its next request-time capture.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ReadWait {
     /// The first capture checks content even when observations are ahead.
     Capture,
@@ -2390,6 +2401,7 @@ impl RiftMcp {
                 component = "search",
                 operation = "search.references",
                 {
+                    tracing::debug!("search references started");
                     self.current_tree_references(resolved, ranking, requested, deadline)
                         .await
                 }
@@ -2602,6 +2614,7 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ErrorData> {
         let include_local_preparation = params.scope != SearchScope::Global;
         rift_core::traced_async!(component = "search", operation = "search.read", {
+            tracing::debug!("search read started");
             self.current_tree_read(resolved, include_local_preparation, move |reads| {
                 reads.search_with_references(&params, &answer, &references)
             })
@@ -2829,6 +2842,7 @@ impl RiftMcp {
         };
         let tree_revision = published.reads.tree_revision();
         let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
+            tracing::debug!("search store read started");
             self.store_answer(index, tree_revision, &parsed).await
         })
         .await;
@@ -3334,8 +3348,23 @@ impl RiftMcp {
     /// not, since a deadline this call needs before validation can even
     /// begin cannot itself wait on that validation.
     async fn readiness_timeout(&self) -> Duration {
+        tracing::debug!(
+            component = "index",
+            operation = "index.readiness",
+            "reading request readiness budget"
+        );
         let state = self.published.read().await;
         let (current, _failure) = state.snapshot();
+        tracing::debug!(
+            component = "index",
+            operation = "index.readiness",
+            timeout_ms = current
+                .configuration
+                .server_configuration()
+                .readiness_timeout
+                .milliseconds(),
+            "request readiness budget resolved"
+        );
         Duration::from_millis(
             current
                 .configuration
@@ -3400,7 +3429,9 @@ impl RiftMcp {
                 return (&failure.error).mcp().tool_error(phase).fail();
             }
             let superseded_seen = self.validation.superseded_epoch();
-            let capture = self.reconciliation_capture(&current, phase).await?;
+            let capture = self
+                .reconciliation_capture(&current, phase, attempts, superseded_seen)
+                .await?;
             let configuration_matches = current.configuration.fingerprint == capture.configuration;
             if capture.tree == current.fingerprint
                 && configuration_matches
@@ -3427,6 +3458,12 @@ impl RiftMcp {
                 previous.awaits_publication(&current, &capture.tree, capture.configuration)
             });
             if configuration_matches && owed_publication {
+                tracing::debug!(
+                    component = "index",
+                    operation = "index.reconcile",
+                    attempts,
+                    "request capture still awaits publication"
+                );
                 wait = ReadWait::Rebuild { superseded_seen };
                 continue;
             }
@@ -3435,7 +3472,7 @@ impl RiftMcp {
                 .filter(|previous| !previous.matches(&capture.tree, capture.configuration));
             attempts += 1;
             let requested_epoch = self
-                .request_rebuild(&current, &changes, configuration_matches, phase)
+                .request_rebuild(&current, &changes, configuration_matches, phase, attempts)
                 .await?;
             if configuration_matches
                 && let Some(previous) = moved_since_previous
@@ -3530,6 +3567,8 @@ impl RiftMcp {
         &self,
         current: &Arc<PublishedWorkspace>,
         phase: wire::ErrorPhase,
+        attempts: usize,
+        superseded_seen: u64,
     ) -> Result<ReconciliationCapture, ErrorData> {
         let capture_started = tokio::time::Instant::now();
         let (digests, configuration) = self.capture_read(current, phase).await?;
@@ -3537,6 +3576,17 @@ impl RiftMcp {
         let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
             digests.fingerprint()
         });
+        tracing::debug!(
+            component = "index",
+            operation = "index.reconcile",
+            attempts,
+            published_epoch = current.epoch,
+            observed_epoch = self.validation.observed_epoch(),
+            superseded_epoch = superseded_seen,
+            tree_matches = tree == current.fingerprint,
+            configuration_matches = current.configuration.fingerprint == configuration,
+            "request capture compared with publication"
+        );
         Ok(ReconciliationCapture {
             digests,
             configuration,
@@ -3556,6 +3606,7 @@ impl RiftMcp {
         changes: &PathChanges,
         configuration_matches: bool,
         phase: wire::ErrorPhase,
+        attempts: usize,
     ) -> Result<u64, ErrorData> {
         let observed = if configuration_matches
             && self
@@ -3567,7 +3618,15 @@ impl RiftMcp {
         } else {
             self.validation.observe_whole_workspace()
         };
-        observed.map_err(|error| error.mcp().tool_error(phase))
+        let requested_epoch = observed.map_err(|error| error.mcp().tool_error(phase))?;
+        tracing::debug!(
+            component = "index",
+            operation = "index.reconcile",
+            attempts,
+            requested_epoch,
+            "request capture requested a rebuild"
+        );
+        Ok(requested_epoch)
     }
 
     /// Whether a rebuild naming the paths in `changes` reaches what the capture that found
@@ -3728,6 +3787,13 @@ impl RiftMcp {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let observed_epoch = self.validation.observed_epoch();
+            tracing::debug!(
+                component = "index",
+                operation = "index.readiness",
+                ?wait,
+                observed_epoch,
+                "request reading publication"
+            );
             let state = self.published.read().await;
             let (current, failure) = state.snapshot();
             drop(state);
@@ -3781,7 +3847,21 @@ impl RiftMcp {
             if capture {
                 return Ok((current, None));
             }
+            tracing::debug!(
+                component = "index",
+                operation = "index.readiness",
+                ?wait,
+                published_epoch = current.epoch,
+                observed_epoch,
+                superseded_epoch = self.validation.superseded_epoch(),
+                "request waiting for publication"
+            );
             changed.as_mut().await;
+            tracing::debug!(
+                component = "index",
+                operation = "index.readiness",
+                "publication wait notified"
+            );
         }
     }
 }
@@ -3929,6 +4009,29 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let span = tracing::info_span!(
+            "mcp.request",
+            component = "mcp",
+            operation = "tools/call",
+            request_id = %context.id,
+            tool = %request.name
+        );
+        async {
+            tracing::debug!("tool request started");
+            let tcc = ToolCallContext::new(self, request, context);
+            let result = self.tool_router.call(tcc).await;
+            tracing::debug!(is_error = result.is_err(), "tool request completed");
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -8745,6 +8848,13 @@ done
     /// whole budget the request was given.
     #[tokio::test]
     async fn a_publication_wait_ends_at_the_deadline_the_request_carries() -> TestResult {
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(log.reopen()?)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         // The tree moves past the publication, so the read waits for a rebuild that the
@@ -8776,6 +8886,27 @@ done
                 .message
                 .contains(&format!("{}ms", STALLED_PUBLICATION_BUDGET.as_millis())),
             "the refusal names the whole budget the request was given: {error:?}"
+        );
+        let records = fs::read_to_string(log.path())?;
+        for event in [
+            "request capture compared with publication",
+            "request capture requested a rebuild",
+            "request waiting for publication",
+            "a request spent its whole readiness budget",
+        ] {
+            assert!(
+                records.contains(event),
+                "the wait records its active stage: {event}\n{records}"
+            );
+        }
+        let waiting = records
+            .lines()
+            .find(|line| line.contains("request waiting for publication"))
+            .ok_or("the request records its publication wait before the deadline")?;
+        assert!(waiting.contains("published_epoch=0"), "{waiting}");
+        assert!(
+            waiting.contains("observed_epoch=") && waiting.contains("superseded_epoch="),
+            "{waiting}"
         );
         Ok(())
     }
