@@ -59,10 +59,19 @@ fn a_corpus_row_of_another_width_is_refused_and_the_message_names_both() {
     rows.push(StoredVector::new("narrow".to_owned(), vec![1.0, 0.0]));
     let error = nearest(&QUERY, &rows, 4).expect_err("a row of another width is not an answer");
     assert_eq!(error.slug(), errors::search::vector_width_mismatch::SLUG);
-    let rendered = error.to_string();
+    assert_eq!(
+        error.message(),
+        "query vector width 3 does not match stored vector width 2"
+    );
+    assert_eq!(
+        error.action(),
+        "use vectors with the stored width and retry"
+    );
+    let evidence = error.context().collect::<Vec<_>>();
     assert!(
-        rendered.contains("query width 3 does not match stored vector width 2"),
-        "{rendered}"
+        evidence.contains(&("query_width", "3".to_owned()))
+            && evidence.contains(&("stored_width", "2".to_owned())),
+        "{evidence:?}"
     );
 }
 

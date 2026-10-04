@@ -315,13 +315,13 @@ impl WorkingForms<'_> {
             .map_err(|error| {
                 errors::history::storage()
                     .operation("convert to working form")
-                    .detail(&error)
+                    .detail(error)
                     .error()
             })?;
         let converted = converted.as_bytes().ok_or_else(|| {
             errors::history::storage()
                 .operation("convert to working form")
-                .detail(&"a driver answered")
+                .detail("a driver answered")
                 .error()
         })?;
         Ok(WorkingForm::Converted(converted.to_vec()))
@@ -370,7 +370,7 @@ impl<'repo> BaseChecks<'repo> {
             .ok_or_else(|| {
                 errors::history::storage()
                     .operation("read working tree")
-                    .detail(&"the repository is bare")
+                    .detail("the repository is bare")
                     .error()
             })?
             .to_owned();

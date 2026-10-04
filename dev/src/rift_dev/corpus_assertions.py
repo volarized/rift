@@ -319,7 +319,10 @@ def lexical_breach(answer: JsonObject, maximum: int) -> int:
     )
     detail = string_value(found[0].get("detail"), "lexical warning detail")
     matched = re.search(
-        rf"\bfield units_max, observed ([0-9]+), maximum {maximum}(?:;|$)", detail
+        rf"lexical index received more units than its accepted limit of {maximum}: "
+        r"field units_max, observed ([0-9]+); "
+        r"resend the same request after a short delay$",
+        detail,
     )
     if matched is None:
         raise AssertionError(f"lexical warning lost its exact bound: {detail}")

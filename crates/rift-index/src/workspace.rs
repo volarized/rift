@@ -1989,7 +1989,7 @@ impl WorkspaceIndexWarning {
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
-            Self::InvalidUtf8Source { error, .. } => error.detail(),
+            Self::InvalidUtf8Source { .. } => "holds bytes that are not valid UTF-8".to_owned(),
             Self::BinarySource(_) => "contains a NUL byte".to_owned(),
             Self::FileTooLarge { error, .. }
             | Self::SyntaxTooLarge { error, .. }
@@ -4129,7 +4129,9 @@ pub fn capture_digests_with_languages_cancellable(
             result => return result,
         }
     }
-    Err(changed.expect("three changed captures leave one change error"))
+    changed
+        .expect("three changed captures leave one change error")
+        .fail()
 }
 
 /// Captures indexed file states and all visible content with the same stat record.
@@ -4215,7 +4217,9 @@ pub fn capture_visible_digests_with_languages_cancellable(
             result => return result,
         }
     }
-    Err(changed.expect("three changed captures leave one change error"))
+    changed
+        .expect("three changed captures leave one change error")
+        .fail()
 }
 
 /// Captures one publication's selected source and other paths without walking the workspace.
@@ -7951,7 +7955,7 @@ mod tests {
             missing_error.slug(),
             errors::index::workspace_invalid_root::SLUG
         );
-        assert_eq!(error_path(&missing_error), Some(missing.to_path_buf()));
+        assert_eq!(error_path(&missing_error), Some(missing.clone()));
         assert!(std::error::Error::source(&missing_error).is_some());
 
         let directory = fixture();
@@ -8151,7 +8155,7 @@ mod tests {
         )
         .expect_err("syntax byte bound");
         assert_eq!(syntax_error.slug(), errors::index::workspace_syntax::SLUG);
-        assert_eq!(error_path(&syntax_error), Some(source_path.to_path_buf()));
+        assert_eq!(error_path(&syntax_error), Some(source_path.clone()));
         assert!(std::error::Error::source(&syntax_error).is_some());
         assert_eq!(
             source_rift_error(&syntax_error).map(RiftError::slug),
@@ -8190,7 +8194,7 @@ mod tests {
         .expect_err("unreadable directory");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
         assert_eq!(unreadable.slug(), errors::index::workspace_filesystem::SLUG);
-        assert_eq!(error_path(&unreadable), Some(locked.to_path_buf()));
+        assert_eq!(error_path(&unreadable), Some(locked.clone()));
 
         let unsearchable = root.join("unsearchable");
         fs::create_dir(&unsearchable).expect("unsearchable directory");
@@ -9203,10 +9207,14 @@ mod tests {
             .path(context)
             .source(invalid_source)
             .error();
+        let warning = left_out_file(invalid, path.clone())
+            .expect("invalid UTF-8 is a file omission")
+            .expect("invalid UTF-8 names a warning");
         assert!(matches!(
-            left_out_file(invalid, path.clone()),
-            Ok(Some(WorkspaceIndexWarning::InvalidUtf8Source { .. }))
+            &warning,
+            WorkspaceIndexWarning::InvalidUtf8Source { .. }
         ));
+        assert_eq!(warning.reason(), "holds bytes that are not valid UTF-8");
         let other = errors::index::workspace_workspace_too_large()
             .field("source.workspace_bytes")
             .observed(64_usize)
@@ -10789,7 +10797,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
         let error = outcome.expect_err("an unreadable directory fails the walk");
         assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
-        assert_eq!(error_path(&error), Some(locked.to_path_buf()));
+        assert_eq!(error_path(&error), Some(locked.clone()));
     }
 
     /// A request-time capture refuses a file the process cannot read, naming it, as the
@@ -10815,7 +10823,7 @@ mod tests {
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore read");
         let error = outcome.expect_err("a read this process cannot make fails the capture");
         assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
-        assert_eq!(error_path(&error), Some(sealed.to_path_buf()));
+        assert_eq!(error_path(&error), Some(sealed.clone()));
     }
 
     #[test]
@@ -11217,7 +11225,7 @@ mod tests {
                 error.slug(),
                 errors::index::workspace_workspace_too_large::SLUG
             );
-            assert_eq!(error_path(&error), Some(lockfile.to_path_buf()));
+            assert_eq!(error_path(&error), Some(lockfile.clone()));
         }
     }
 

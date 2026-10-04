@@ -72,8 +72,8 @@ just rust-gate
 ```
 
 The repository's Git hook runs the quick gate before each commit. The gate checks formatting,
-dashes, generated files, locked workspace metadata, all-target and all-feature compilation, and
-crate boundaries. Install the hook after syncing the development environment:
+dashes, generated files, locked workspace metadata, all-target and all-feature compilation, crate
+boundaries, and strict Clippy. Install the hook after syncing the development environment:
 
 ```sh
 uv sync --locked --project dev --group dev
@@ -82,10 +82,9 @@ git config --local core.hooksPath .githooks
 
 The local Git setting keeps this hook inside the repository. The hook runs `pre-commit`, which
 applies `just quick-gate` from `.pre-commit-config.yaml`. CI runs the same hook over all files with
-`uv run --locked --project dev pre-commit run --all-files`. `just rust-gate` adds Clippy, Rust
-documentation, doctests, dependency audit, unit tests, release tests, installer tests, and developer
-tooling checks. CI keeps native, live, corpus, artifact, agent, and cold-start suites in their own
-jobs.
+`uv run --locked --project dev pre-commit run --all-files`. `just rust-gate` adds Rust documentation,
+doctests, dependency audit, unit tests, release tests, installer tests, and developer tooling checks.
+CI keeps native, live, corpus, artifact, agent, and cold-start suites in their own jobs.
 
 The hook sets `CARGO_PROFILE_DEV_DEBUG=0` when that variable is unset and keeps any value already
 supplied.

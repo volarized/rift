@@ -123,12 +123,12 @@ fn insert_method(
     field: &str,
     slug: &str,
 ) -> Result<(), CodegenError> {
-    if let Some(previous) = methods.insert(method.to_owned(), field.to_owned()) {
-        if previous != field {
-            return Err(invalid(format!(
-                "error {slug} fields {previous} and {field} generate duplicate method {method}"
-            )));
-        }
+    if let Some(previous) = methods.insert(method.to_owned(), field.to_owned())
+        && previous != field
+    {
+        return Err(invalid(format!(
+            "error {slug} fields {previous} and {field} generate duplicate method {method}"
+        )));
     }
     Ok(())
 }

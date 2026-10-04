@@ -2965,8 +2965,7 @@ done
             .expect_err("the incoming walk reports the spent wait");
         assert!(
             incoming.slug() == errors::lsp::engine_analyzing::SLUG,
-            "{:?}",
-            incoming
+            "{incoming:?}"
         );
         assert!(slot.state.lock().await.session.is_some());
         pool.shutdown().await;
@@ -3000,8 +2999,7 @@ done
                 && refused
                     .context()
                     .any(|(key, value)| key == "code" && value == INVALID_REQUEST.to_string()),
-            "{:?}",
-            refused
+            "{refused:?}"
         );
         pool.shutdown().await;
     }
@@ -3203,8 +3201,7 @@ done
             spent.context().any(|(key, value)| {
                 key == "attempts" && value == made.to_string() && made >= 2
             }),
-            "{made} attempts: {:?}",
-            spent
+            "{made} attempts: {spent:?}"
         );
         assert_waits_under_the_deadline(&table("sh").retry, deadline, &times, returned);
         assert!(
@@ -3264,8 +3261,7 @@ done
         let spent = spent.expect_err("a partial report never settles");
         assert!(
             spent.context().any(|(key, _)| key == "attempts"),
-            "{:?}",
-            spent
+            "{spent:?}"
         );
         assert!(
             !directory.path().join("notified.log").exists(),

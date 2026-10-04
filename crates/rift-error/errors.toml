@@ -732,9 +732,9 @@ message = "model source {model} has invalid form; expected {expected}"
 action = "use a model source in the expected form and retry"
 fields = { model = { type = "string" }, expected = { type = "string" }, source = { type = "error", role = "source", optional = true } }
 [error.search.model_cache_unavailable]
-message = "model cache directory could not be resolved"
+message = "model cache directory could not be resolved from environment variables {variables}"
 action = "set a model cache directory and retry"
-fields = { }
+fields = { variables = { type = "string" } }
 [error.search.model_download_failed]
 message = "model file download failed: {subject}"
 action = "check network access and retry"
@@ -1090,7 +1090,7 @@ action = "report this internal failure with its full context"
 fields = { source = { type = "error", role = "source" } }
 
 [error.mcp.proxy_unexpected_quit]
-message = "MCP proxy service ended unexpectedly"
+message = "MCP service ended unexpectedly"
 action = "report this internal failure with its full context"
 
 [error.mcp.forward_unanswered]
@@ -1213,7 +1213,7 @@ action = "address a path a shipped provider parses"
 fields = { extension = { type = "string" } }
 
 [error.server.read_invalid]
-message = "request field {field} is invalid: {violation}"
+message = "the request does not match the documented form: field {field}, violation {violation}"
 action = "correct the reported field and resend the request"
 fields = { field = { type = "string" }, violation = { type = "string" }, cause = { type = "rift_error", role = "cause", optional = true } }
 
@@ -1243,7 +1243,7 @@ action = "resend the same request after a short delay"
 fields = { operation = { type = "string" }, detail = { type = "string" } }
 
 [error.server.read_engine_answer]
-message = "language engine answer does not match served revision during {operation}"
+message = "the addressed content exists but its bytes cannot be served: operation {operation}, detail {detail}"
 action = "read the request again once the engine has read the served revision"
 fields = { operation = { type = "string" }, detail = { type = "string" } }
 

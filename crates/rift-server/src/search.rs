@@ -2836,21 +2836,21 @@ impl Tower {
     fn search_requires_query_rejects_empty_query_and_zero_limit() -> TestResult {
         let (_directory, service) = fixture()?;
         let missing_query: SearchParams = serde_json::from_value(json!({}))?;
-        assert!(
-            (service
+        assert_eq!(
+            service
                 .search(&missing_query, &StoreAnswer::identifier_only())
                 .expect_err("missing query must fail")
-                .slug()
-                == rift_error::errors::server::read_invalid::SLUG)
+                .slug(),
+            rift_error::errors::server::read_invalid::SLUG
         );
 
         let empty_query: SearchParams = serde_json::from_value(json!({"query": ""}))?;
-        assert!(
-            (service
+        assert_eq!(
+            service
                 .search(&empty_query, &StoreAnswer::identifier_only())
                 .expect_err("empty query must fail")
-                .slug()
-                == rift_error::errors::server::read_invalid::SLUG)
+                .slug(),
+            rift_error::errors::server::read_invalid::SLUG
         );
 
         let zero_limit: SearchParams =
@@ -2858,7 +2858,7 @@ impl Tower {
         let error = service
             .search(&zero_limit, &StoreAnswer::identifier_only())
             .expect_err("zero limit must fail");
-        assert!((error.slug() == rift_error::errors::server::read_invalid::SLUG));
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
             "the request does not match the documented form: field limit, \
@@ -2879,7 +2879,10 @@ impl Tower {
             .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a comparison on one snapshot must refuse");
 
-        assert!((error.slug() == rift_error::errors::server::read_unsupported::SLUG));
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unsupported::SLUG
+        );
         assert!(
             error
                 .to_string()
@@ -3319,12 +3322,12 @@ impl Tower {
             "query": "Beacon",
             "paths": {"include": ["src\\lib.rs"]}
         }))?;
-        assert!(
-            (service
+        assert_eq!(
+            service
                 .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("a backslash pattern must be refused")
-                .slug()
-                == rift_error::errors::server::read_invalid::SLUG)
+                .slug(),
+            rift_error::errors::server::read_invalid::SLUG
         );
         Ok(())
     }

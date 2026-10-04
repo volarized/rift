@@ -1300,10 +1300,6 @@ fn digest_of<T: Serialize>(record: &T, package: &PackageIdentity) -> Result<Dige
     Ok(text_digest(&rendered))
 }
 
-/// The refusal a record that cannot be rendered canonically draws. Every record this
-/// analyzer builds is a plain struct of strings, integers and booleans, so no value it
-/// hands the renderer can fail; the arm exists because the renderer's contract admits it.
-
 /// One publication bound as the in-memory count a collection compares against.
 ///
 /// Every bound this module reads is a `u32` the protocol states, and `u32` always fits

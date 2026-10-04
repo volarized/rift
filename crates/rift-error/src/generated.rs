@@ -315,11 +315,18 @@ pub const REGISTERED_SLUGS: &[&str] = &[
 ];
 #[allow(missing_docs)]
 pub mod analysis {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState,
+        Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod context7_entry_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -333,7 +340,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod entry {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -371,9 +378,8 @@ pub mod analysis {
             }
         }
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -399,7 +405,7 @@ pub mod analysis {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -437,7 +443,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -537,6 +543,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -549,9 +556,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -565,6 +578,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn context7_entry_invalid() -> context7_entry_invalid::Builder<Unset> {
         context7_entry_invalid::Builder {
             core: BuilderCore::new(
@@ -578,7 +592,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod context7_malformed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.analysis.context7_malformed");
@@ -590,9 +607,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -618,7 +634,7 @@ pub mod analysis {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -656,7 +672,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -739,6 +755,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -751,9 +768,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -767,6 +790,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn context7_malformed() -> context7_malformed::Builder<Unset> {
         context7_malformed::Builder {
             core: BuilderCore::new(
@@ -780,7 +804,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod context7_oversized {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.analysis.context7_oversized");
@@ -792,9 +819,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -820,7 +846,7 @@ pub mod analysis {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -858,7 +884,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -941,6 +967,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -953,9 +980,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -969,6 +1002,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn context7_oversized() -> context7_oversized::Builder<Unset> {
         context7_oversized::Builder {
             core: BuilderCore::new(
@@ -982,7 +1016,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod context7_too_many_entries {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -996,9 +1033,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1024,7 +1060,7 @@ pub mod analysis {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1062,7 +1098,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1145,6 +1181,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -1157,9 +1194,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -1173,6 +1216,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn context7_too_many_entries() -> context7_too_many_entries::Builder<Unset> {
         context7_too_many_entries::Builder {
             core: BuilderCore::new(
@@ -1186,7 +1230,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_digest_mismatch {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -1200,9 +1247,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1228,7 +1274,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1294,6 +1340,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -1306,9 +1353,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -1322,6 +1375,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_digest_mismatch() -> documentation_digest_mismatch::Builder<
         Unset,
     > {
@@ -1337,7 +1391,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_duplicate_source {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -1351,9 +1408,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1379,7 +1435,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1445,6 +1501,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -1457,9 +1514,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -1473,6 +1536,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_duplicate_source() -> documentation_duplicate_source::Builder<
         Unset,
     > {
@@ -1488,7 +1552,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_encoding_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -1502,9 +1569,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1530,7 +1596,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1596,6 +1662,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -1608,9 +1675,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -1624,6 +1697,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_encoding_failed() -> documentation_encoding_failed::Builder<
         Unset,
     > {
@@ -1639,7 +1713,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_format_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -1653,9 +1730,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1681,7 +1757,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1747,6 +1823,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -1759,9 +1836,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -1775,6 +1858,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_format_invalid() -> documentation_format_invalid::Builder<
         Unset,
     > {
@@ -1790,7 +1874,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_identity_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -1804,9 +1891,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1832,7 +1918,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -1898,6 +1984,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -1910,9 +1997,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -1926,6 +2019,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_identity_invalid() -> documentation_identity_invalid::Builder<
         Unset,
     > {
@@ -1941,7 +2035,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_limit_exceeded {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -1955,9 +2052,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -1983,7 +2079,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2049,6 +2145,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2061,9 +2158,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2077,6 +2180,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_limit_exceeded() -> documentation_limit_exceeded::Builder<
         Unset,
     > {
@@ -2092,7 +2196,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_notebook_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -2106,9 +2213,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -2134,7 +2240,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2200,6 +2306,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2212,9 +2319,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2228,6 +2341,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_notebook_invalid() -> documentation_notebook_invalid::Builder<
         Unset,
     > {
@@ -2243,7 +2357,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_order_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -2257,9 +2374,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -2285,7 +2401,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2351,6 +2467,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2363,9 +2480,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2379,6 +2502,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_order_invalid() -> documentation_order_invalid::Builder<Unset> {
         documentation_order_invalid::Builder {
             core: BuilderCore::new(
@@ -2392,7 +2516,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_origin_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -2406,9 +2533,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -2434,7 +2560,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2500,6 +2626,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2512,9 +2639,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2528,6 +2661,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_origin_invalid() -> documentation_origin_invalid::Builder<
         Unset,
     > {
@@ -2543,7 +2677,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_range_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -2557,9 +2694,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -2585,7 +2721,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2651,6 +2787,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2663,9 +2800,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2679,6 +2822,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_range_invalid() -> documentation_range_invalid::Builder<Unset> {
         documentation_range_invalid::Builder {
             core: BuilderCore::new(
@@ -2692,7 +2836,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_revision_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -2706,9 +2853,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -2734,7 +2880,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2800,6 +2946,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2812,9 +2959,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2828,6 +2981,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_revision_invalid() -> documentation_revision_invalid::Builder<
         Unset,
     > {
@@ -2843,7 +2997,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod documentation_target_missing {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -2857,9 +3014,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -2885,7 +3041,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -2951,6 +3107,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -2963,9 +3120,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -2979,6 +3142,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn documentation_target_missing() -> documentation_target_missing::Builder<
         Unset,
     > {
@@ -2994,7 +3158,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_declarations_exceeded {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3008,9 +3175,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod package {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -3036,7 +3202,7 @@ pub mod analysis {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3100,6 +3266,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -3112,9 +3279,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -3128,6 +3301,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_declarations_exceeded() -> package_declarations_exceeded::Builder<
         Unset,
     > {
@@ -3143,7 +3317,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_identity_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3157,7 +3334,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3195,9 +3372,8 @@ pub mod analysis {
             }
         }
         pub mod package {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -3223,7 +3399,7 @@ pub mod analysis {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3304,6 +3480,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -3316,9 +3493,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -3332,6 +3515,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_identity_invalid() -> package_identity_invalid::Builder<Unset> {
         package_identity_invalid::Builder {
             core: BuilderCore::new(
@@ -3345,7 +3529,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_input_duplicate_path {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3359,7 +3546,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3411,6 +3598,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -3423,9 +3611,15 @@ pub mod analysis {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -3439,6 +3633,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_input_duplicate_path() -> package_input_duplicate_path::Builder {
         package_input_duplicate_path::Builder {
             core: BuilderCore::new(
@@ -3452,7 +3647,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_input_identity_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3466,7 +3664,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3501,7 +3699,7 @@ pub mod analysis {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3570,6 +3768,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -3582,9 +3781,15 @@ pub mod analysis {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -3598,6 +3803,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_input_identity_invalid() -> package_input_identity_invalid::Builder {
         package_input_identity_invalid::Builder {
             core: BuilderCore::new(
@@ -3611,7 +3817,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_input_origin_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3625,7 +3834,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -3677,6 +3886,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -3689,9 +3899,15 @@ pub mod analysis {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -3705,6 +3921,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_input_origin_invalid() -> package_input_origin_invalid::Builder {
         package_input_origin_invalid::Builder {
             core: BuilderCore::new(
@@ -3718,7 +3935,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_input_too_many_bytes {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3732,9 +3952,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod bound {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -3763,9 +3982,8 @@ pub mod analysis {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -3794,9 +4012,8 @@ pub mod analysis {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -3848,6 +4065,7 @@ pub mod analysis {
                     Self,
                 >>::set(self, observed::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -3860,9 +4078,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -3876,6 +4100,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_input_too_many_bytes() -> package_input_too_many_bytes::Builder<
         Unset,
         Unset,
@@ -3893,7 +4118,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_input_too_many_files {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -3907,9 +4135,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod bound {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -3938,9 +4165,8 @@ pub mod analysis {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -3969,9 +4195,8 @@ pub mod analysis {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -4023,6 +4248,7 @@ pub mod analysis {
                     Self,
                 >>::set(self, observed::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4035,9 +4261,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4051,6 +4283,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_input_too_many_files() -> package_input_too_many_files::Builder<
         Unset,
         Unset,
@@ -4068,7 +4301,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_provider_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -4082,7 +4318,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -4120,9 +4356,8 @@ pub mod analysis {
             }
         }
         pub mod package {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -4148,7 +4383,7 @@ pub mod analysis {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -4186,7 +4421,7 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -4289,6 +4524,7 @@ pub mod analysis {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4301,9 +4537,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4317,6 +4559,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_provider_failed() -> package_provider_failed::Builder<Unset> {
         package_provider_failed::Builder {
             core: BuilderCore::new(
@@ -4330,7 +4573,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod package_syntax_unavailable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -4344,9 +4590,8 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod package {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -4375,9 +4620,8 @@ pub mod analysis {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -4421,6 +4665,7 @@ pub mod analysis {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4433,9 +4678,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4449,6 +4700,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn package_syntax_unavailable() -> package_syntax_unavailable::Builder<
         Unset,
         Unset,
@@ -4465,7 +4717,10 @@ pub mod analysis {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_pattern_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -4479,7 +4734,7 @@ pub mod analysis {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod pattern {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -4519,9 +4774,8 @@ pub mod analysis {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -4576,6 +4830,7 @@ pub mod analysis {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4588,9 +4843,15 @@ pub mod analysis {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4604,6 +4865,7 @@ pub mod analysis {
             }
         }
     }
+    #[must_use]
     pub fn source_pattern_invalid() -> source_pattern_invalid::Builder<Unset> {
         source_pattern_invalid::Builder {
             core: BuilderCore::new(
@@ -4618,11 +4880,18 @@ pub mod analysis {
 }
 #[allow(missing_docs)]
 pub mod cli {
-    use super::*;
+    use super::{
+        Borrow, Box, BuilderCore, Display, Duration, Error, ErrorContext, ErrorSlug,
+        ErrorValue, EvidenceFor, IntoRiftError, IntoUnsigned, Path, PhantomData,
+        RiftError, SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod install_home_unresolved {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.install_home_unresolved");
@@ -4634,9 +4903,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod checked {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -4671,6 +4939,7 @@ pub mod cli {
             {
                 <checked::Field as checked::Set<Self>>::set(self, checked::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4683,9 +4952,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4699,6 +4974,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn install_home_unresolved() -> install_home_unresolved::Builder<Unset> {
         install_home_unresolved::Builder {
             core: BuilderCore::new(
@@ -4712,7 +4988,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod install_remove_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.install_remove_failed");
@@ -4724,9 +5003,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -4755,9 +5033,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -4801,6 +5078,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4813,9 +5091,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4829,6 +5113,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn install_remove_failed() -> install_remove_failed::Builder<Unset, Unset> {
         install_remove_failed::Builder {
             core: BuilderCore::new(
@@ -4842,7 +5127,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod install_settings_unparsable {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -4856,9 +5144,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -4887,9 +5174,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -4933,6 +5219,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -4945,9 +5232,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -4961,6 +5254,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn install_settings_unparsable() -> install_settings_unparsable::Builder<
         Unset,
         Unset,
@@ -4977,7 +5271,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod install_template_missing_tool {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -4991,9 +5288,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod tool {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -5025,6 +5321,7 @@ pub mod cli {
             {
                 <tool::Field as tool::Set<Self>>::set(self, tool::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5037,9 +5334,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5053,6 +5356,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn install_template_missing_tool() -> install_template_missing_tool::Builder<
         Unset,
     > {
@@ -5068,7 +5372,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod install_write_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.install_write_failed");
@@ -5080,9 +5387,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -5111,9 +5417,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -5157,6 +5462,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5169,9 +5475,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5185,6 +5497,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn install_write_failed() -> install_write_failed::Builder<Unset, Unset> {
         install_write_failed::Builder {
             core: BuilderCore::new(
@@ -5198,7 +5511,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_already_serving {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_already_serving");
@@ -5210,7 +5526,7 @@ pub mod cli {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -5247,7 +5563,7 @@ pub mod cli {
             }
         }
         pub mod listening {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -5284,7 +5600,7 @@ pub mod cli {
             }
         }
         pub mod pid {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -5378,6 +5694,7 @@ pub mod cli {
                     Self,
                 >>::set_optional(self, pid::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5390,9 +5707,15 @@ pub mod cli {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5406,6 +5729,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_already_serving() -> server_already_serving::Builder {
         server_already_serving::Builder {
             core: BuilderCore::new(
@@ -5419,7 +5743,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_election_unreleased {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Duration, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -5433,9 +5760,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod pid {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -5464,9 +5790,8 @@ pub mod cli {
             }
         }
         pub mod waited {
-            use super::*;
+            use super::{Borrow, Builder, Duration, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -5510,6 +5835,7 @@ pub mod cli {
             {
                 <waited::Field as waited::Set<Self>>::set(self, waited::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5522,9 +5848,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5538,6 +5870,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_election_unreleased() -> server_election_unreleased::Builder<
         Unset,
         Unset,
@@ -5554,7 +5887,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_logs_unavailable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_logs_unavailable");
@@ -5566,7 +5902,7 @@ pub mod cli {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -5603,7 +5939,7 @@ pub mod cli {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -5640,7 +5976,7 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -5739,6 +6075,7 @@ pub mod cli {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5751,9 +6088,15 @@ pub mod cli {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5767,6 +6110,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_logs_unavailable() -> server_logs_unavailable::Builder {
         server_logs_unavailable::Builder {
             core: BuilderCore::new(
@@ -5780,7 +6124,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_spawn_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_spawn_failed");
@@ -5792,9 +6139,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -5823,9 +6169,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -5874,6 +6219,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5886,9 +6232,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5902,6 +6254,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_spawn_failed() -> server_spawn_failed::Builder<Unset, Unset> {
         server_spawn_failed::Builder {
             core: BuilderCore::new(
@@ -5915,7 +6268,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_start_exited {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_start_exited");
@@ -5927,9 +6283,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod pid {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -5961,6 +6316,7 @@ pub mod cli {
             {
                 <pid::Field as pid::Set<Self>>::set(self, pid::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -5973,9 +6329,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -5989,6 +6351,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_start_exited() -> server_start_exited::Builder<Unset> {
         server_start_exited::Builder {
             core: BuilderCore::new(
@@ -6002,7 +6365,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_start_timed_out {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Duration, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_start_timed_out");
@@ -6014,9 +6380,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod waited {
-            use super::*;
+            use super::{Borrow, Builder, Duration, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -6051,6 +6416,7 @@ pub mod cli {
             {
                 <waited::Field as waited::Set<Self>>::set(self, waited::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6063,9 +6429,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6079,6 +6451,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_start_timed_out() -> server_start_timed_out::Builder<Unset> {
         server_start_timed_out::Builder {
             core: BuilderCore::new(
@@ -6092,7 +6465,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_stop_refused {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_stop_refused");
@@ -6104,7 +6480,7 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -6144,9 +6520,8 @@ pub mod cli {
             }
         }
         pub mod status {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -6201,6 +6576,7 @@ pub mod cli {
             {
                 <status::Field as status::Set<Self>>::set(self, status::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6213,9 +6589,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6229,6 +6611,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_stop_refused() -> server_stop_refused::Builder<Unset> {
         server_stop_refused::Builder {
             core: BuilderCore::new(
@@ -6242,7 +6625,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_stop_request_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -6256,9 +6642,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -6287,9 +6672,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -6338,6 +6722,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6350,9 +6735,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6366,6 +6757,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_stop_request_failed() -> server_stop_request_failed::Builder<
         Unset,
         Unset,
@@ -6382,7 +6774,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod server_stop_timed_out {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Display, Duration, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.server_stop_timed_out");
@@ -6394,7 +6789,7 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -6434,7 +6829,7 @@ pub mod cli {
             }
         }
         pub mod listening {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -6474,7 +6869,7 @@ pub mod cli {
             }
         }
         pub mod pid {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -6512,9 +6907,8 @@ pub mod cli {
             }
         }
         pub mod waited {
-            use super::*;
+            use super::{Borrow, Builder, Duration, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -6608,6 +7002,7 @@ pub mod cli {
             {
                 <waited::Field as waited::Set<Self>>::set(self, waited::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6620,9 +7015,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6636,6 +7037,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn server_stop_timed_out() -> server_stop_timed_out::Builder<Unset> {
         server_stop_timed_out::Builder {
             core: BuilderCore::new(
@@ -6649,7 +7051,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_archive_contents_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -6663,6 +7068,7 @@ pub mod cli {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6675,9 +7081,15 @@ pub mod cli {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6691,6 +7103,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_archive_contents_invalid() -> update_archive_contents_invalid::Builder {
         update_archive_contents_invalid::Builder {
             core: BuilderCore::new(
@@ -6704,7 +7117,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_archive_extraction_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -6718,9 +7134,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -6755,6 +7170,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6767,9 +7183,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6783,6 +7205,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_archive_extraction_failed() -> update_archive_extraction_failed::Builder<
         Unset,
     > {
@@ -6798,7 +7221,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_archive_file_inspection_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -6812,9 +7238,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -6843,9 +7268,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -6889,6 +7313,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6901,9 +7326,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -6917,6 +7348,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_archive_file_inspection_failed() -> update_archive_file_inspection_failed::Builder<
         Unset,
         Unset,
@@ -6933,7 +7365,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_archive_file_not_regular {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -6947,9 +7382,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -6981,6 +7415,7 @@ pub mod cli {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -6993,9 +7428,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7009,6 +7450,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_archive_file_not_regular() -> update_archive_file_not_regular::Builder<
         Unset,
     > {
@@ -7024,7 +7466,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_archive_file_size_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -7038,9 +7483,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -7069,9 +7513,8 @@ pub mod cli {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -7100,9 +7543,8 @@ pub mod cli {
             }
         }
         pub mod size {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -7154,6 +7596,7 @@ pub mod cli {
             {
                 <size::Field as size::Set<Self>>::set(self, size::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7166,9 +7609,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7182,6 +7631,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_archive_file_size_invalid() -> update_archive_file_size_invalid::Builder<
         Unset,
         Unset,
@@ -7199,7 +7649,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_archive_member_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -7213,9 +7666,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -7252,6 +7704,7 @@ pub mod cli {
                     Self,
                 >>::set(self, bytes_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7264,9 +7717,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7280,6 +7739,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_archive_member_too_large() -> update_archive_member_too_large::Builder<
         Unset,
     > {
@@ -7295,7 +7755,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_binary_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_binary_invalid");
@@ -7307,9 +7770,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod invoked_as {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -7338,9 +7800,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -7389,6 +7850,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7401,9 +7863,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7417,6 +7885,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_binary_invalid() -> update_binary_invalid::Builder<Unset, Unset> {
         update_binary_invalid::Builder {
             core: BuilderCore::new(
@@ -7430,7 +7899,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_checksum_manifest_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -7444,6 +7916,7 @@ pub mod cli {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7456,9 +7929,15 @@ pub mod cli {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7472,6 +7951,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_checksum_manifest_invalid() -> update_checksum_manifest_invalid::Builder {
         update_checksum_manifest_invalid::Builder {
             core: BuilderCore::new(
@@ -7485,7 +7965,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_checksum_mismatch {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_checksum_mismatch");
@@ -7497,9 +7980,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod actual {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -7528,9 +8010,8 @@ pub mod cli {
             }
         }
         pub mod expected {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -7579,6 +8060,7 @@ pub mod cli {
                     Self,
                 >>::set(self, expected::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7591,9 +8073,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7607,6 +8095,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_checksum_mismatch() -> update_checksum_mismatch::Builder<
         Unset,
         Unset,
@@ -7623,7 +8112,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_checksum_read_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -7637,9 +8129,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -7674,6 +8165,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7686,9 +8178,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7702,6 +8200,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_checksum_read_failed() -> update_checksum_read_failed::Builder<Unset> {
         update_checksum_read_failed::Builder {
             core: BuilderCore::new(
@@ -7715,7 +8214,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_download_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_download_failed");
@@ -7727,9 +8229,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -7764,6 +8265,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7776,9 +8278,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7792,6 +8300,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_download_failed() -> update_download_failed::Builder<Unset> {
         update_download_failed::Builder {
             core: BuilderCore::new(
@@ -7805,7 +8314,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_download_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_download_too_large");
@@ -7817,9 +8329,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -7856,6 +8367,7 @@ pub mod cli {
                     Self,
                 >>::set(self, bytes_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7868,9 +8380,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7884,6 +8402,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_download_too_large() -> update_download_too_large::Builder<Unset> {
         update_download_too_large::Builder {
             core: BuilderCore::new(
@@ -7897,7 +8416,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_prerelease_unsupported {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -7911,9 +8433,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod tag {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -7945,6 +8466,7 @@ pub mod cli {
             {
                 <tag::Field as tag::Set<Self>>::set(self, tag::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -7957,9 +8479,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -7973,6 +8501,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_prerelease_unsupported() -> update_prerelease_unsupported::Builder<
         Unset,
     > {
@@ -7988,7 +8517,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_publish_copy_failed {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8002,9 +8534,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -8033,9 +8564,8 @@ pub mod cli {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -8076,6 +8606,7 @@ pub mod cli {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8088,9 +8619,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8104,6 +8641,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_publish_copy_failed() -> update_publish_copy_failed::Builder<
         Unset,
         Unset,
@@ -8120,7 +8658,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_publish_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_publish_failed");
@@ -8132,9 +8673,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -8163,9 +8703,8 @@ pub mod cli {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -8194,9 +8733,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -8251,6 +8789,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8263,9 +8802,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8279,6 +8824,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_publish_failed() -> update_publish_failed::Builder<
         Unset,
         Unset,
@@ -8296,7 +8842,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_publish_parent_missing {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8310,9 +8859,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -8344,6 +8892,7 @@ pub mod cli {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8356,9 +8905,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8372,6 +8927,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_publish_parent_missing() -> update_publish_parent_missing::Builder<
         Unset,
     > {
@@ -8387,7 +8943,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_publish_pending_cleanup {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8401,9 +8960,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -8435,6 +8993,7 @@ pub mod cli {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8447,9 +9006,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8463,6 +9028,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_publish_pending_cleanup() -> update_publish_pending_cleanup::Builder<
         Unset,
     > {
@@ -8478,7 +9044,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_release_file_inspection_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8492,9 +9061,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -8523,9 +9091,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -8569,6 +9136,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8581,9 +9149,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8597,6 +9171,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_release_file_inspection_failed() -> update_release_file_inspection_failed::Builder<
         Unset,
         Unset,
@@ -8613,7 +9188,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_release_file_not_regular {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8627,9 +9205,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -8661,6 +9238,7 @@ pub mod cli {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8673,9 +9251,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8689,6 +9273,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_release_file_not_regular() -> update_release_file_not_regular::Builder<
         Unset,
     > {
@@ -8704,7 +9289,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_release_file_size_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8718,9 +9306,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -8749,9 +9336,8 @@ pub mod cli {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -8780,9 +9366,8 @@ pub mod cli {
             }
         }
         pub mod size {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -8834,6 +9419,7 @@ pub mod cli {
             {
                 <size::Field as size::Set<Self>>::set(self, size::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8846,9 +9432,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8862,6 +9454,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_release_file_size_invalid() -> update_release_file_size_invalid::Builder<
         Unset,
         Unset,
@@ -8879,7 +9472,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_release_metadata_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8893,9 +9489,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -8930,6 +9525,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -8942,9 +9538,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -8958,6 +9560,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_release_metadata_invalid() -> update_release_metadata_invalid::Builder<
         Unset,
     > {
@@ -8973,7 +9576,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_release_tag_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -8987,7 +9593,7 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -9027,9 +9633,8 @@ pub mod cli {
             }
         }
         pub mod tag {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -9081,6 +9686,7 @@ pub mod cli {
             {
                 <tag::Field as tag::Set<Self>>::set(self, tag::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -9093,9 +9699,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -9109,6 +9721,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_release_tag_invalid() -> update_release_tag_invalid::Builder<Unset> {
         update_release_tag_invalid::Builder {
             core: BuilderCore::new(
@@ -9122,7 +9735,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_rollback_cleanup_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -9136,9 +9752,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -9167,9 +9782,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -9213,6 +9827,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -9225,9 +9840,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -9241,6 +9862,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_rollback_cleanup_failed() -> update_rollback_cleanup_failed::Builder<
         Unset,
         Unset,
@@ -9257,7 +9879,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_rollback_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_rollback_failed");
@@ -9269,9 +9894,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -9300,9 +9924,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -9346,6 +9969,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -9358,9 +9982,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -9374,6 +10004,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_rollback_failed() -> update_rollback_failed::Builder<Unset, Unset> {
         update_rollback_failed::Builder {
             core: BuilderCore::new(
@@ -9387,7 +10018,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_staging_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_staging_failed");
@@ -9399,9 +10033,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -9430,9 +10063,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -9461,9 +10093,8 @@ pub mod cli {
             }
         }
         pub mod space {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -9513,6 +10144,7 @@ pub mod cli {
             {
                 <space::Field as space::Set<Self>>::set(self, space::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -9525,9 +10157,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -9541,6 +10179,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_staging_failed() -> update_staging_failed::Builder<
         Unset,
         Unset,
@@ -9558,7 +10197,10 @@ pub mod cli {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod update_version_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.cli.update_version_invalid");
@@ -9570,9 +10212,8 @@ pub mod cli {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -9601,9 +10242,8 @@ pub mod cli {
             }
         }
         pub mod raw {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -9632,9 +10272,8 @@ pub mod cli {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -9684,6 +10323,7 @@ pub mod cli {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -9696,9 +10336,15 @@ pub mod cli {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -9712,6 +10358,7 @@ pub mod cli {
             }
         }
     }
+    #[must_use]
     pub fn update_version_invalid() -> update_version_invalid::Builder<
         Unset,
         Unset,
@@ -9730,11 +10377,17 @@ pub mod cli {
 }
 #[allow(missing_docs)]
 pub mod core {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_command_argument_oversized {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -9748,7 +10401,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod bytes {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -9783,7 +10436,7 @@ pub mod core {
             }
         }
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -9820,7 +10473,7 @@ pub mod core {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -9911,6 +10564,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, field::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -9923,9 +10577,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -9939,6 +10599,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_command_argument_oversized() -> configuration_command_argument_oversized::Builder {
         configuration_command_argument_oversized::Builder {
             core: BuilderCore::new(
@@ -9952,7 +10613,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_command_program_absolute {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -9966,7 +10630,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10001,7 +10665,7 @@ pub mod core {
             }
         }
         pub mod program {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10075,6 +10739,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, program::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -10087,9 +10752,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -10103,6 +10774,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_command_program_absolute() -> configuration_command_program_absolute::Builder {
         configuration_command_program_absolute::Builder {
             core: BuilderCore::new(
@@ -10116,7 +10788,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_command_program_dot_segment {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -10130,7 +10805,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10165,7 +10840,7 @@ pub mod core {
             }
         }
         pub mod program {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10239,6 +10914,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, program::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -10251,9 +10927,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -10267,6 +10949,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_command_program_dot_segment() -> configuration_command_program_dot_segment::Builder {
         configuration_command_program_dot_segment::Builder {
             core: BuilderCore::new(
@@ -10280,7 +10963,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_command_program_empty {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -10294,7 +10980,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10346,6 +11032,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, field::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -10358,9 +11045,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -10374,6 +11067,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_command_program_empty() -> configuration_command_program_empty::Builder {
         configuration_command_program_empty::Builder {
             core: BuilderCore::new(
@@ -10387,7 +11081,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_command_program_oversized {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -10401,7 +11098,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod bytes {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10436,7 +11133,7 @@ pub mod core {
             }
         }
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10473,7 +11170,7 @@ pub mod core {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10564,6 +11261,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, field::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -10576,9 +11274,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -10592,6 +11296,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_command_program_oversized() -> configuration_command_program_oversized::Builder {
         configuration_command_program_oversized::Builder {
             core: BuilderCore::new(
@@ -10605,7 +11310,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_command_program_whitespace {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -10619,7 +11327,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10654,7 +11362,7 @@ pub mod core {
             }
         }
         pub mod program {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10728,6 +11436,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, program::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -10740,9 +11449,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -10756,6 +11471,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_command_program_whitespace() -> configuration_command_program_whitespace::Builder {
         configuration_command_program_whitespace::Builder {
             core: BuilderCore::new(
@@ -10769,7 +11485,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_embedding_endpoint_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -10783,7 +11502,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10818,7 +11537,7 @@ pub mod core {
             }
         }
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10887,6 +11606,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, value::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -10899,9 +11619,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -10915,6 +11641,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_embedding_endpoint_invalid() -> configuration_embedding_endpoint_invalid::Builder {
         configuration_embedding_endpoint_invalid::Builder {
             core: BuilderCore::new(
@@ -10928,7 +11655,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_embedding_identifier_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -10942,7 +11672,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -10977,7 +11707,7 @@ pub mod core {
             }
         }
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11046,6 +11776,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, value::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11058,9 +11789,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11074,6 +11811,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_embedding_identifier_invalid() -> configuration_embedding_identifier_invalid::Builder {
         configuration_embedding_identifier_invalid::Builder {
             core: BuilderCore::new(
@@ -11087,7 +11825,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_embedding_model_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -11101,7 +11842,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11136,7 +11877,7 @@ pub mod core {
             }
         }
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11205,6 +11946,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, value::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11217,9 +11959,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11233,6 +11981,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_embedding_model_invalid() -> configuration_embedding_model_invalid::Builder {
         configuration_embedding_model_invalid::Builder {
             core: BuilderCore::new(
@@ -11246,7 +11995,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_file_name_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -11260,7 +12012,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11295,7 +12047,7 @@ pub mod core {
             }
         }
         pub mod name {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11364,6 +12116,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, name::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11376,9 +12129,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11392,6 +12151,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_file_name_invalid() -> configuration_file_name_invalid::Builder {
         configuration_file_name_invalid::Builder {
             core: BuilderCore::new(
@@ -11405,7 +12165,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_history_cpu_share_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -11419,7 +12182,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11454,7 +12217,7 @@ pub mod core {
             }
         }
         pub mod share {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11523,6 +12286,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, share::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11535,9 +12299,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11551,6 +12321,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_history_cpu_share_invalid() -> configuration_history_cpu_share_invalid::Builder {
         configuration_history_cpu_share_invalid::Builder {
             core: BuilderCore::new(
@@ -11564,7 +12335,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_history_release_pattern_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -11578,7 +12352,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11615,7 +12389,7 @@ pub mod core {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11650,7 +12424,7 @@ pub mod core {
             }
         }
         pub mod pattern {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11744,6 +12518,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, pattern::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11756,9 +12531,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11772,6 +12553,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_history_release_pattern_invalid() -> configuration_history_release_pattern_invalid::Builder {
         configuration_history_release_pattern_invalid::Builder {
             core: BuilderCore::new(
@@ -11787,7 +12569,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_history_releases_missing {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -11801,7 +12586,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod fields {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11858,6 +12643,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, fields::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11870,9 +12656,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11886,6 +12678,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_history_releases_missing() -> configuration_history_releases_missing::Builder {
         configuration_history_releases_missing::Builder {
             core: BuilderCore::new(
@@ -11899,7 +12692,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_history_releases_outside_selective {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -11913,7 +12709,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod fields {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -11970,6 +12766,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, fields::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -11982,9 +12779,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -11998,6 +12801,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_history_releases_outside_selective() -> configuration_history_releases_outside_selective::Builder {
         configuration_history_releases_outside_selective::Builder {
             core: BuilderCore::new(
@@ -12013,7 +12817,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.configuration_invalid");
@@ -12025,7 +12832,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12062,7 +12869,7 @@ pub mod core {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12097,7 +12904,7 @@ pub mod core {
             }
         }
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12132,7 +12939,7 @@ pub mod core {
             }
         }
         pub mod first {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12167,7 +12974,7 @@ pub mod core {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12202,7 +13009,7 @@ pub mod core {
             }
         }
         pub mod language {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12239,7 +13046,7 @@ pub mod core {
             }
         }
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12274,7 +13081,7 @@ pub mod core {
             }
         }
         pub mod name {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12309,7 +13116,7 @@ pub mod core {
             }
         }
         pub mod pattern {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12346,7 +13153,7 @@ pub mod core {
             }
         }
         pub mod range {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12381,7 +13188,7 @@ pub mod core {
             }
         }
         pub mod second {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12418,7 +13225,7 @@ pub mod core {
             }
         }
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12455,7 +13262,7 @@ pub mod core {
             }
         }
         pub mod variables {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -12732,6 +13539,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, variables::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -12744,9 +13552,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -12760,6 +13574,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_invalid() -> configuration_invalid::Builder {
         configuration_invalid::Builder {
             core: BuilderCore::new(
@@ -12773,7 +13588,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_is_directory {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -12787,9 +13605,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -12818,9 +13635,8 @@ pub mod core {
             }
         }
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -12849,9 +13665,8 @@ pub mod core {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -12901,6 +13716,7 @@ pub mod core {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -12913,9 +13729,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -12929,6 +13751,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_is_directory() -> configuration_is_directory::Builder<
         Unset,
         Unset,
@@ -12946,7 +13769,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_language_identity_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -12960,7 +13786,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod language {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13019,6 +13845,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, language::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -13031,9 +13858,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -13047,6 +13880,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_language_identity_invalid() -> configuration_language_identity_invalid::Builder {
         configuration_language_identity_invalid::Builder {
             core: BuilderCore::new(
@@ -13060,7 +13894,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_language_include_duplicate {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -13074,7 +13911,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod first {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13109,7 +13946,7 @@ pub mod core {
             }
         }
         pub mod pattern {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13146,7 +13983,7 @@ pub mod core {
             }
         }
         pub mod second {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13240,6 +14077,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, second::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -13252,9 +14090,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -13268,6 +14112,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_language_include_duplicate() -> configuration_language_include_duplicate::Builder {
         configuration_language_include_duplicate::Builder {
             core: BuilderCore::new(
@@ -13281,7 +14126,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_language_lsp_unknown {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -13295,7 +14143,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod language {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13332,7 +14180,7 @@ pub mod core {
             }
         }
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13406,6 +14254,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, lsp::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -13418,9 +14267,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -13434,6 +14289,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_language_lsp_unknown() -> configuration_language_lsp_unknown::Builder {
         configuration_language_lsp_unknown::Builder {
             core: BuilderCore::new(
@@ -13447,7 +14303,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_limit_out_of_range {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -13461,7 +14320,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13496,7 +14355,7 @@ pub mod core {
             }
         }
         pub mod range {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13531,7 +14390,7 @@ pub mod core {
             }
         }
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13617,6 +14476,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, value::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -13629,9 +14489,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -13645,6 +14511,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_limit_out_of_range() -> configuration_limit_out_of_range::Builder {
         configuration_limit_out_of_range::Builder {
             core: BuilderCore::new(
@@ -13658,7 +14525,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_log_capture_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -13672,7 +14542,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod capture {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13709,7 +14579,7 @@ pub mod core {
             }
         }
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13746,7 +14616,7 @@ pub mod core {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13838,6 +14708,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, field::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -13850,9 +14721,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -13866,6 +14743,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_log_capture_invalid() -> configuration_log_capture_invalid::Builder {
         configuration_log_capture_invalid::Builder {
             core: BuilderCore::new(
@@ -13879,7 +14757,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_lsp_embedded_extras {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -13893,7 +14774,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13928,7 +14809,7 @@ pub mod core {
             }
         }
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -13997,6 +14878,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, lsp::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -14009,9 +14891,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -14025,6 +14913,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_lsp_embedded_extras() -> configuration_lsp_embedded_extras::Builder {
         configuration_lsp_embedded_extras::Builder {
             core: BuilderCore::new(
@@ -14038,7 +14927,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_lsp_engine_missing {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -14052,7 +14944,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod fields {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14089,7 +14981,7 @@ pub mod core {
             }
         }
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14161,6 +15053,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, lsp::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -14173,9 +15066,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -14189,6 +15088,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_lsp_engine_missing() -> configuration_lsp_engine_missing::Builder {
         configuration_lsp_engine_missing::Builder {
             core: BuilderCore::new(
@@ -14202,7 +15102,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_lsp_engine_selection_conflict {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -14216,7 +15119,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod fields {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14253,7 +15156,7 @@ pub mod core {
             }
         }
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14325,6 +15228,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, lsp::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -14337,9 +15241,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -14353,6 +15263,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_lsp_engine_selection_conflict() -> configuration_lsp_engine_selection_conflict::Builder {
         configuration_lsp_engine_selection_conflict::Builder {
             core: BuilderCore::new(
@@ -14366,7 +15277,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_lsp_environment_key_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -14380,7 +15294,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14415,7 +15329,7 @@ pub mod core {
             }
         }
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14484,6 +15398,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, lsp::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -14496,9 +15411,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -14512,6 +15433,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_lsp_environment_key_invalid() -> configuration_lsp_environment_key_invalid::Builder {
         configuration_lsp_environment_key_invalid::Builder {
             core: BuilderCore::new(
@@ -14525,7 +15447,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_lsp_initialization_options_not_object {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -14539,7 +15464,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod lsp {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14591,6 +15516,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, lsp::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -14603,9 +15529,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -14619,6 +15551,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_lsp_initialization_options_not_object() -> configuration_lsp_initialization_options_not_object::Builder {
         configuration_lsp_initialization_options_not_object::Builder {
             core: BuilderCore::new(
@@ -14634,7 +15567,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_lsp_name_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -14648,7 +15584,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod name {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14700,6 +15636,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, name::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -14712,9 +15649,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -14728,6 +15671,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_lsp_name_invalid() -> configuration_lsp_name_invalid::Builder {
         configuration_lsp_name_invalid::Builder {
             core: BuilderCore::new(
@@ -14741,7 +15685,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_malformed {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.configuration_malformed");
@@ -14753,7 +15700,7 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod accepted {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14793,7 +15740,7 @@ pub mod core {
             }
         }
         pub mod example {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14833,9 +15780,8 @@ pub mod core {
             }
         }
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -14861,7 +15807,7 @@ pub mod core {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -14899,7 +15845,7 @@ pub mod core {
             }
         }
         pub mod location {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15026,6 +15972,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, location::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -15038,9 +15985,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -15054,6 +16007,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_malformed() -> configuration_malformed::Builder<Unset> {
         configuration_malformed::Builder {
             core: BuilderCore::new(
@@ -15067,7 +16021,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_oversized {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.configuration_oversized");
@@ -15079,9 +16036,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod bytes {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -15110,9 +16066,8 @@ pub mod core {
             }
         }
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -15141,9 +16096,8 @@ pub mod core {
             }
         }
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -15195,6 +16149,7 @@ pub mod core {
             {
                 <file::Field as file::Set<Self>>::set(self, file::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -15207,9 +16162,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -15223,6 +16184,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_oversized() -> configuration_oversized::Builder<
         Unset,
         Unset,
@@ -15240,7 +16202,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_package_selector_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -15254,7 +16219,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15289,7 +16254,7 @@ pub mod core {
             }
         }
         pub mod package {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15363,6 +16328,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, package::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -15375,9 +16341,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -15391,6 +16363,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_package_selector_invalid() -> configuration_package_selector_invalid::Builder {
         configuration_package_selector_invalid::Builder {
             core: BuilderCore::new(
@@ -15404,7 +16377,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_path_pattern_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -15418,7 +16394,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15453,7 +16429,7 @@ pub mod core {
             }
         }
         pub mod pattern {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15527,6 +16503,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, pattern::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -15539,9 +16516,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -15555,6 +16538,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_path_pattern_invalid() -> configuration_path_pattern_invalid::Builder {
         configuration_path_pattern_invalid::Builder {
             core: BuilderCore::new(
@@ -15568,7 +16552,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_port_range_inverted {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -15582,7 +16569,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod max {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15617,7 +16604,7 @@ pub mod core {
             }
         }
         pub mod min {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15686,6 +16673,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, min::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -15698,9 +16686,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -15714,6 +16708,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_port_range_inverted() -> configuration_port_range_inverted::Builder {
         configuration_port_range_inverted::Builder {
             core: BuilderCore::new(
@@ -15727,7 +16722,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_port_selection_conflict {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -15741,7 +16739,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod fields {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15798,6 +16796,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, fields::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -15810,9 +16809,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -15826,6 +16831,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_port_selection_conflict() -> configuration_port_selection_conflict::Builder {
         configuration_port_selection_conflict::Builder {
             core: BuilderCore::new(
@@ -15839,7 +16845,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_search_weights_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -15853,7 +16862,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod identifier_weight {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15898,7 +16907,7 @@ pub mod core {
             }
         }
         pub mod lexical_weight {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -15941,7 +16950,7 @@ pub mod core {
             }
         }
         pub mod vector_weight {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -16052,6 +17061,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, vector_weight::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -16064,9 +17074,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -16080,6 +17096,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_search_weights_invalid() -> configuration_search_weights_invalid::Builder {
         configuration_search_weights_invalid::Builder {
             core: BuilderCore::new(
@@ -16093,7 +17110,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_unit_parse {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.configuration_unit_parse");
@@ -16105,9 +17125,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod expected {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -16136,9 +17155,8 @@ pub mod core {
             }
         }
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -16184,6 +17202,7 @@ pub mod core {
             {
                 <value::Field as value::Set<Self>>::set(self, value::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -16196,9 +17215,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -16212,6 +17237,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_unit_parse() -> configuration_unit_parse::Builder<
         Unset,
         Unset,
@@ -16228,7 +17254,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_unreadable {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.configuration_unreadable");
@@ -16240,9 +17269,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod file {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -16271,9 +17299,8 @@ pub mod core {
             }
         }
         pub mod io {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -16302,9 +17329,8 @@ pub mod core {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -16333,7 +17359,7 @@ pub mod core {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -16415,6 +17441,7 @@ pub mod core {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -16427,9 +17454,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -16443,6 +17476,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_unreadable() -> configuration_unreadable::Builder<
         Unset,
         Unset,
@@ -16460,7 +17494,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_variable_malformed {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -16474,7 +17511,7 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod accepted {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -16517,7 +17554,7 @@ pub mod core {
             }
         }
         pub mod example {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -16560,9 +17597,8 @@ pub mod core {
             }
         }
         pub mod key {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -16591,9 +17627,8 @@ pub mod core {
             }
         }
         pub mod variable {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -16681,6 +17716,7 @@ pub mod core {
                     Self,
                 >>::set(self, variable::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -16693,9 +17729,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -16709,6 +17751,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_variable_malformed() -> configuration_variable_malformed::Builder<
         Unset,
         Unset,
@@ -16725,7 +17768,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_variable_not_unicode {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -16739,9 +17785,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -16770,9 +17815,8 @@ pub mod core {
             }
         }
         pub mod variable {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -16821,6 +17865,7 @@ pub mod core {
                     Self,
                 >>::set(self, variable::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -16833,9 +17878,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -16849,6 +17900,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_variable_not_unicode() -> configuration_variable_not_unicode::Builder<
         Unset,
         Unset,
@@ -16865,7 +17917,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod configuration_variable_unknown {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -16879,9 +17934,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod accepted {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -16910,9 +17964,8 @@ pub mod core {
             }
         }
         pub mod variable {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -16963,6 +18016,7 @@ pub mod core {
                     Self,
                 >>::set(self, variable::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -16975,9 +18029,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -16991,6 +18051,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn configuration_variable_unknown() -> configuration_variable_unknown::Builder<
         Unset,
         Unset,
@@ -17007,7 +18068,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_duplicate_fact {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17021,9 +18085,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17055,6 +18118,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17067,9 +18131,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17083,6 +18153,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_duplicate_fact() -> contribution_duplicate_fact::Builder<Unset> {
         contribution_duplicate_fact::Builder {
             core: BuilderCore::new(
@@ -17096,7 +18167,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_kind {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17110,9 +18184,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17144,6 +18217,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17156,9 +18230,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17172,6 +18252,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_kind() -> contribution_invalid_kind::Builder<Unset> {
         contribution_invalid_kind::Builder {
             core: BuilderCore::new(
@@ -17185,7 +18266,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_language {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17199,9 +18283,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17233,6 +18316,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17245,9 +18329,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17261,6 +18351,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_language() -> contribution_invalid_language::Builder<
         Unset,
     > {
@@ -17276,7 +18367,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_name {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17290,9 +18384,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17324,6 +18417,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17336,9 +18430,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17352,6 +18452,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_name() -> contribution_invalid_name::Builder<Unset> {
         contribution_invalid_name::Builder {
             core: BuilderCore::new(
@@ -17365,7 +18466,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_namespace {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17379,9 +18483,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17413,6 +18516,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17425,9 +18529,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17441,6 +18551,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_namespace() -> contribution_invalid_namespace::Builder<
         Unset,
     > {
@@ -17456,7 +18567,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_namespace_version {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17470,9 +18584,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17504,6 +18617,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17516,9 +18630,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17532,6 +18652,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_namespace_version() -> contribution_invalid_namespace_version::Builder<
         Unset,
     > {
@@ -17547,7 +18668,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_origin {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17561,9 +18685,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17595,6 +18718,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17607,9 +18731,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17623,6 +18753,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_origin() -> contribution_invalid_origin::Builder<Unset> {
         contribution_invalid_origin::Builder {
             core: BuilderCore::new(
@@ -17636,7 +18767,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_record {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17650,9 +18784,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17684,6 +18817,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17696,9 +18830,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17712,6 +18852,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_record() -> contribution_invalid_record::Builder<Unset> {
         contribution_invalid_record::Builder {
             core: BuilderCore::new(
@@ -17725,7 +18866,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_reference {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17739,9 +18883,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17773,6 +18916,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17785,9 +18929,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17801,6 +18951,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_reference() -> contribution_invalid_reference::Builder<
         Unset,
     > {
@@ -17816,7 +18967,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid_source_range {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17830,9 +18984,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17864,6 +19017,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17876,9 +19030,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17892,6 +19052,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid_source_range() -> contribution_invalid_source_range::Builder<
         Unset,
     > {
@@ -17907,7 +19068,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_too_many_facts {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -17921,9 +19085,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -17955,6 +19118,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -17967,9 +19131,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -17983,6 +19153,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_too_many_facts() -> contribution_too_many_facts::Builder<Unset> {
         contribution_too_many_facts::Builder {
             core: BuilderCore::new(
@@ -17996,7 +19167,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_too_many_namespaced_facts {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -18010,9 +19184,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18044,6 +19217,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18056,9 +19230,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18072,6 +19252,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_too_many_namespaced_facts() -> contribution_too_many_namespaced_facts::Builder<
         Unset,
     > {
@@ -18087,7 +19268,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_too_much_evidence {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -18101,9 +19285,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18135,6 +19318,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18147,9 +19331,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18163,6 +19353,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_too_much_evidence() -> contribution_too_much_evidence::Builder<
         Unset,
     > {
@@ -18178,7 +19369,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_unbound_identity {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -18192,9 +19386,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18226,6 +19419,7 @@ pub mod core {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18238,9 +19432,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18254,6 +19454,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn contribution_unbound_identity() -> contribution_unbound_identity::Builder<
         Unset,
     > {
@@ -18269,7 +19470,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod identity_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.identity_invalid");
@@ -18281,6 +19485,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18293,9 +19498,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18309,6 +19520,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn identity_invalid() -> identity_invalid::Builder {
         identity_invalid::Builder {
             core: BuilderCore::new(
@@ -18322,7 +19534,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_absolute {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_absolute");
@@ -18334,9 +19549,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18373,6 +19587,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18385,9 +19600,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18401,6 +19622,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_absolute() -> path_absolute::Builder<Unset> {
         path_absolute::Builder {
             core: BuilderCore::new(
@@ -18414,7 +19636,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_backslash {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_backslash");
@@ -18426,9 +19651,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18465,6 +19689,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18477,9 +19702,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18493,6 +19724,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_backslash() -> path_backslash::Builder<Unset> {
         path_backslash::Builder {
             core: BuilderCore::new(
@@ -18506,7 +19738,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_control_character {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_control_character");
@@ -18518,9 +19753,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18557,6 +19791,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18569,9 +19804,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18585,6 +19826,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_control_character() -> path_control_character::Builder<Unset> {
         path_control_character::Builder {
             core: BuilderCore::new(
@@ -18598,7 +19840,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_dot_segment {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_dot_segment");
@@ -18610,9 +19855,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18649,6 +19893,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18661,9 +19906,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18677,6 +19928,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_dot_segment() -> path_dot_segment::Builder<Unset> {
         path_dot_segment::Builder {
             core: BuilderCore::new(
@@ -18690,7 +19942,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_empty {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_empty");
@@ -18702,9 +19957,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18741,6 +19995,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18753,9 +20008,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18769,6 +20030,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_empty() -> path_empty::Builder<Unset> {
         path_empty::Builder {
             core: BuilderCore::new(
@@ -18782,7 +20044,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_empty_segment {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_empty_segment");
@@ -18794,9 +20059,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18833,6 +20097,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18845,9 +20110,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18861,6 +20132,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_empty_segment() -> path_empty_segment::Builder<Unset> {
         path_empty_segment::Builder {
             core: BuilderCore::new(
@@ -18874,7 +20146,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_non_canonical_unicode {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -18888,9 +20163,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -18927,6 +20201,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -18939,9 +20214,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -18955,6 +20236,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_non_canonical_unicode() -> path_non_canonical_unicode::Builder<Unset> {
         path_non_canonical_unicode::Builder {
             core: BuilderCore::new(
@@ -18968,7 +20250,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_rift_state {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_rift_state");
@@ -18980,9 +20265,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19019,6 +20303,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19031,9 +20316,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19047,6 +20338,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_rift_state() -> path_rift_state::Builder<Unset> {
         path_rift_state::Builder {
             core: BuilderCore::new(
@@ -19060,7 +20352,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_too_long {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.path_too_long");
@@ -19072,9 +20367,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19111,6 +20405,7 @@ pub mod core {
                     Self,
                 >>::set(self, path_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19123,9 +20418,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19139,6 +20440,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn path_too_long() -> path_too_long::Builder<Unset> {
         path_too_long::Builder {
             core: BuilderCore::new(
@@ -19152,7 +20454,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod resolver_id_empty {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.resolver_id_empty");
@@ -19164,9 +20469,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19203,6 +20507,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19215,9 +20520,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19231,6 +20542,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn resolver_id_empty() -> resolver_id_empty::Builder<Unset> {
         resolver_id_empty::Builder {
             core: BuilderCore::new(
@@ -19244,7 +20556,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod resolver_id_invalid_character {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -19258,9 +20573,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19297,6 +20611,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19309,9 +20624,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19325,6 +20646,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn resolver_id_invalid_character() -> resolver_id_invalid_character::Builder<
         Unset,
     > {
@@ -19340,7 +20662,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod resolver_id_too_long {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.resolver_id_too_long");
@@ -19352,9 +20677,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19391,6 +20715,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19403,9 +20728,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19419,6 +20750,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn resolver_id_too_long() -> resolver_id_too_long::Builder<Unset> {
         resolver_id_too_long::Builder {
             core: BuilderCore::new(
@@ -19432,7 +20764,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod revision_zero {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.revision_zero");
@@ -19444,6 +20779,7 @@ pub mod core {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19456,9 +20792,15 @@ pub mod core {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19472,6 +20814,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn revision_zero() -> revision_zero::Builder {
         revision_zero::Builder {
             core: BuilderCore::new(
@@ -19485,7 +20828,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_unit_id_invalid_address {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -19499,9 +20845,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19538,6 +20883,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19550,9 +20896,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19566,6 +20918,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn source_unit_id_invalid_address() -> source_unit_id_invalid_address::Builder<
         Unset,
     > {
@@ -19581,7 +20934,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_unit_id_invalid_encoding {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -19595,9 +20951,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -19634,6 +20989,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19646,9 +21002,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19662,6 +21024,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn source_unit_id_invalid_encoding() -> source_unit_id_invalid_encoding::Builder<
         Unset,
     > {
@@ -19677,7 +21040,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_unit_id_invalid_key {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -19691,9 +21057,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -19722,9 +21087,8 @@ pub mod core {
             }
         }
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -19770,6 +21134,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19782,9 +21147,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19798,6 +21169,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn source_unit_id_invalid_key() -> source_unit_id_invalid_key::Builder<
         Unset,
         Unset,
@@ -19814,7 +21186,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_unit_id_invalid_resolver {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -19828,9 +21203,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -19859,9 +21233,8 @@ pub mod core {
             }
         }
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -19907,6 +21280,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -19919,9 +21293,15 @@ pub mod core {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -19935,6 +21315,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn source_unit_id_invalid_resolver() -> source_unit_id_invalid_resolver::Builder<
         Unset,
         Unset,
@@ -19951,7 +21332,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_unit_id_non_canonical {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -19965,9 +21349,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -20004,6 +21387,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20016,9 +21400,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20032,6 +21422,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn source_unit_id_non_canonical() -> source_unit_id_non_canonical::Builder<
         Unset,
     > {
@@ -20047,7 +21438,10 @@ pub mod core {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_unit_id_too_long {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.core.source_unit_id_too_long");
@@ -20059,9 +21453,8 @@ pub mod core {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod identity {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -20098,6 +21491,7 @@ pub mod core {
                     Self,
                 >>::set(self, identity::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20110,9 +21504,15 @@ pub mod core {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20126,6 +21526,7 @@ pub mod core {
             }
         }
     }
+    #[must_use]
     pub fn source_unit_id_too_long() -> source_unit_id_too_long::Builder<Unset> {
         source_unit_id_too_long::Builder {
             core: BuilderCore::new(
@@ -20140,11 +21541,17 @@ pub mod core {
 }
 #[allow(missing_docs)]
 pub mod history {
-    use super::*;
+    use super::{
+        BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+        IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod blob_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.blob_too_large");
@@ -20156,9 +21563,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -20187,9 +21593,8 @@ pub mod history {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -20218,9 +21623,8 @@ pub mod history {
             }
         }
         pub mod size {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -20272,6 +21676,7 @@ pub mod history {
             {
                 <size::Field as size::Set<Self>>::set(self, size::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20284,9 +21689,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20300,6 +21711,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn blob_too_large() -> blob_too_large::Builder<Unset, Unset, Unset> {
         blob_too_large::Builder {
             core: BuilderCore::new(
@@ -20313,7 +21725,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod contribution_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.contribution_invalid");
@@ -20325,9 +21740,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -20362,6 +21776,7 @@ pub mod history {
             {
                 <detail::Field as detail::Set<Self>>::set(self, detail::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20374,9 +21789,15 @@ pub mod history {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20390,6 +21811,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn contribution_invalid() -> contribution_invalid::Builder<Unset> {
         contribution_invalid::Builder {
             core: BuilderCore::new(
@@ -20403,7 +21825,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod path_unrepresentable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.path_unrepresentable");
@@ -20415,9 +21840,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -20449,6 +21873,7 @@ pub mod history {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20461,9 +21886,15 @@ pub mod history {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20477,6 +21908,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn path_unrepresentable() -> path_unrepresentable::Builder<Unset> {
         path_unrepresentable::Builder {
             core: BuilderCore::new(
@@ -20490,7 +21922,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod revision_not_commit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.revision_not_commit");
@@ -20502,9 +21937,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod requires {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -20533,9 +21967,8 @@ pub mod history {
             }
         }
         pub mod resolved_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -20564,9 +21997,8 @@ pub mod history {
             }
         }
         pub mod rev {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -20623,6 +22055,7 @@ pub mod history {
             {
                 <rev::Field as rev::Set<Self>>::set(self, rev::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20635,9 +22068,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20651,6 +22090,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn revision_not_commit() -> revision_not_commit::Builder<Unset, Unset, Unset> {
         revision_not_commit::Builder {
             core: BuilderCore::new(
@@ -20664,7 +22104,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod revision_unknown {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.revision_unknown");
@@ -20676,9 +22119,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod requires {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -20707,9 +22149,8 @@ pub mod history {
             }
         }
         pub mod rev {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -20755,6 +22196,7 @@ pub mod history {
             {
                 <rev::Field as rev::Set<Self>>::set(self, rev::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20767,9 +22209,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20783,6 +22231,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn revision_unknown() -> revision_unknown::Builder<Unset, Unset> {
         revision_unknown::Builder {
             core: BuilderCore::new(
@@ -20796,7 +22245,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod storage {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.storage");
@@ -20808,9 +22260,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -20839,9 +22290,8 @@ pub mod history {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -20890,6 +22340,7 @@ pub mod history {
                     Self,
                 >>::set(self, operation::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -20902,9 +22353,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -20918,6 +22375,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn storage() -> storage::Builder<Unset, Unset> {
         storage::Builder {
             core: BuilderCore::new(
@@ -20931,7 +22389,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod too_many_tags {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.too_many_tags");
@@ -20943,9 +22404,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod limit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -20974,9 +22434,8 @@ pub mod history {
             }
         }
         pub mod tags_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -21022,6 +22481,7 @@ pub mod history {
                     Self,
                 >>::set(self, tags_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21034,9 +22494,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21050,6 +22516,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn too_many_tags() -> too_many_tags::Builder<Unset, Unset> {
         too_many_tags::Builder {
             core: BuilderCore::new(
@@ -21063,7 +22530,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod tree_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.tree_too_large");
@@ -21075,9 +22545,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod entries_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -21106,9 +22575,8 @@ pub mod history {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -21154,6 +22622,7 @@ pub mod history {
             {
                 <limit::Field as limit::Set<Self>>::set(self, limit::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21166,9 +22635,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21182,6 +22657,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn tree_too_large() -> tree_too_large::Builder<Unset, Unset> {
         tree_too_large::Builder {
             core: BuilderCore::new(
@@ -21195,7 +22671,10 @@ pub mod history {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod unversioned {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history.unversioned");
@@ -21207,9 +22686,8 @@ pub mod history {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod requires {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -21238,9 +22716,8 @@ pub mod history {
             }
         }
         pub mod workspace {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -21291,6 +22768,7 @@ pub mod history {
                     Self,
                 >>::set(self, workspace::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21303,9 +22781,15 @@ pub mod history {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21319,6 +22803,7 @@ pub mod history {
             }
         }
     }
+    #[must_use]
     pub fn unversioned() -> unversioned::Builder<Unset, Unset> {
         unversioned::Builder {
             core: BuilderCore::new(
@@ -21333,11 +22818,18 @@ pub mod history {
 }
 #[allow(missing_docs)]
 pub mod history_store {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState,
+        Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod database {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history_store.database");
@@ -21349,9 +22841,8 @@ pub mod history_store {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -21380,9 +22871,8 @@ pub mod history_store {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -21431,6 +22921,7 @@ pub mod history_store {
                     Self,
                 >>::set(self, operation::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21443,9 +22934,15 @@ pub mod history_store {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21459,6 +22956,7 @@ pub mod history_store {
             }
         }
     }
+    #[must_use]
     pub fn database() -> database::Builder<Unset, Unset> {
         database::Builder {
             core: BuilderCore::new(
@@ -21472,7 +22970,10 @@ pub mod history_store {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod folder {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history_store.folder");
@@ -21484,9 +22985,8 @@ pub mod history_store {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -21515,9 +23015,8 @@ pub mod history_store {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -21546,9 +23045,8 @@ pub mod history_store {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -21603,6 +23101,7 @@ pub mod history_store {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21615,9 +23114,15 @@ pub mod history_store {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21631,6 +23136,7 @@ pub mod history_store {
             }
         }
     }
+    #[must_use]
     pub fn folder() -> folder::Builder<Unset, Unset, Unset> {
         folder::Builder {
             core: BuilderCore::new(
@@ -21644,7 +23150,10 @@ pub mod history_store {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lock_unstable {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.history_store.lock_unstable");
@@ -21656,9 +23165,8 @@ pub mod history_store {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod attempts {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -21687,9 +23195,8 @@ pub mod history_store {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -21735,6 +23242,7 @@ pub mod history_store {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21747,9 +23255,15 @@ pub mod history_store {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21763,6 +23277,7 @@ pub mod history_store {
             }
         }
     }
+    #[must_use]
     pub fn lock_unstable() -> lock_unstable::Builder<Unset, Unset> {
         lock_unstable::Builder {
             core: BuilderCore::new(
@@ -21777,11 +23292,18 @@ pub mod history_store {
 }
 #[allow(missing_docs)]
 pub mod index {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState,
+        Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_document_location_unsupported {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -21795,7 +23317,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -21847,6 +23369,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21859,9 +23382,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21875,6 +23404,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_document_location_unsupported() -> lexical_document_location_unsupported::Builder {
         lexical_document_location_unsupported::Builder {
             core: BuilderCore::new(
@@ -21888,7 +23418,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_duplicate_identity {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -21902,7 +23435,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -21954,6 +23487,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -21966,9 +23500,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -21982,6 +23522,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_duplicate_identity() -> lexical_duplicate_identity::Builder {
         lexical_duplicate_identity::Builder {
             core: BuilderCore::new(
@@ -21995,7 +23536,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_record_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.lexical_record_limit");
@@ -22007,9 +23551,8 @@ pub mod index {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -22038,9 +23581,8 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -22069,9 +23611,8 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -22126,6 +23667,7 @@ pub mod index {
                     Self,
                 >>::set(self, observed::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -22138,9 +23680,15 @@ pub mod index {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -22154,6 +23702,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_record_limit() -> lexical_record_limit::Builder<Unset, Unset, Unset> {
         lexical_record_limit::Builder {
             core: BuilderCore::new(
@@ -22167,7 +23716,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_storage {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.lexical_storage");
@@ -22179,7 +23731,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -22214,7 +23766,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -22288,6 +23840,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -22300,9 +23853,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -22316,6 +23875,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_storage() -> lexical_storage::Builder {
         lexical_storage::Builder {
             core: BuilderCore::new(
@@ -22329,7 +23889,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_stored_kind_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -22343,7 +23906,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -22378,7 +23941,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -22452,6 +24015,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -22464,9 +24028,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -22480,6 +24050,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_stored_kind_invalid() -> lexical_stored_kind_invalid::Builder {
         lexical_stored_kind_invalid::Builder {
             core: BuilderCore::new(
@@ -22493,7 +24064,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_stored_path_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -22507,7 +24081,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -22542,7 +24116,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -22616,6 +24190,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -22628,9 +24203,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -22644,6 +24225,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_stored_path_invalid() -> lexical_stored_path_invalid::Builder {
         lexical_stored_path_invalid::Builder {
             core: BuilderCore::new(
@@ -22657,7 +24239,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_unit_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.lexical_unit_limit");
@@ -22669,9 +24254,8 @@ pub mod index {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -22700,9 +24284,8 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -22731,9 +24314,8 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -22788,6 +24370,7 @@ pub mod index {
                     Self,
                 >>::set(self, observed::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -22800,9 +24383,15 @@ pub mod index {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -22816,6 +24405,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_unit_limit() -> lexical_unit_limit::Builder<Unset, Unset, Unset> {
         lexical_unit_limit::Builder {
             core: BuilderCore::new(
@@ -22829,7 +24419,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod lexical_unit_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.lexical_unit_too_large");
@@ -22841,9 +24434,8 @@ pub mod index {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -22872,9 +24464,8 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -22903,9 +24494,8 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -22934,7 +24524,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23019,6 +24609,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -23031,9 +24622,15 @@ pub mod index {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -23047,6 +24644,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn lexical_unit_too_large() -> lexical_unit_too_large::Builder<
         Unset,
         Unset,
@@ -23064,7 +24662,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_cancelled {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_cancelled");
@@ -23076,7 +24677,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23128,6 +24729,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -23140,9 +24742,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -23156,6 +24764,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_cancelled() -> workspace_cancelled::Builder {
         workspace_cancelled::Builder {
             core: BuilderCore::new(
@@ -23169,7 +24778,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_changed_during_capture {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -23183,7 +24795,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23218,7 +24830,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23292,6 +24904,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -23304,9 +24917,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -23320,6 +24939,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_changed_during_capture() -> workspace_changed_during_capture::Builder {
         workspace_changed_during_capture::Builder {
             core: BuilderCore::new(
@@ -23333,7 +24953,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_composition {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_composition");
@@ -23345,7 +24968,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23397,6 +25020,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, cause::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -23409,9 +25033,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -23425,6 +25055,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_composition() -> workspace_composition::Builder {
         workspace_composition::Builder {
             core: BuilderCore::new(
@@ -23438,7 +25069,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_documentation_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -23452,9 +25086,8 @@ pub mod index {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -23483,9 +25116,8 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -23514,9 +25146,8 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -23545,7 +25176,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23630,6 +25261,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -23642,9 +25274,15 @@ pub mod index {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -23658,6 +25296,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_documentation_limit() -> workspace_documentation_limit::Builder<
         Unset,
         Unset,
@@ -23675,7 +25314,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_file_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -23689,7 +25331,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23724,7 +25366,7 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23761,7 +25403,7 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23798,7 +25440,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23909,6 +25551,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -23921,9 +25564,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -23937,6 +25586,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_file_too_large() -> workspace_file_too_large::Builder {
         workspace_file_too_large::Builder {
             core: BuilderCore::new(
@@ -23950,7 +25600,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_filesystem {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_filesystem");
@@ -23962,7 +25615,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -23997,7 +25650,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24071,6 +25724,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -24083,9 +25737,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -24099,6 +25759,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_filesystem() -> workspace_filesystem::Builder {
         workspace_filesystem::Builder {
             core: BuilderCore::new(
@@ -24112,7 +25773,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_history {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_history");
@@ -24124,7 +25788,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24159,7 +25823,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24228,6 +25892,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -24240,9 +25905,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -24256,6 +25927,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_history() -> workspace_history::Builder {
         workspace_history::Builder {
             core: BuilderCore::new(
@@ -24269,7 +25941,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_invalid_path {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_invalid_path");
@@ -24281,7 +25956,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24316,7 +25991,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24351,7 +26026,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24442,6 +26117,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -24454,9 +26130,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -24470,6 +26152,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_invalid_path() -> workspace_invalid_path::Builder {
         workspace_invalid_path::Builder {
             core: BuilderCore::new(
@@ -24483,7 +26166,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_invalid_root {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_invalid_root");
@@ -24495,7 +26181,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24530,7 +26216,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24604,6 +26290,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -24616,9 +26303,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -24632,6 +26325,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_invalid_root() -> workspace_invalid_root::Builder {
         workspace_invalid_root::Builder {
             core: BuilderCore::new(
@@ -24645,7 +26339,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_invalid_source {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -24659,7 +26356,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24694,7 +26391,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24768,6 +26465,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -24780,9 +26478,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -24796,6 +26500,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_invalid_source() -> workspace_invalid_source::Builder {
         workspace_invalid_source::Builder {
             core: BuilderCore::new(
@@ -24809,7 +26514,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_language_include_required {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -24823,7 +26531,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod language {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24882,6 +26590,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, language::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -24894,9 +26603,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -24910,6 +26625,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_language_include_required() -> workspace_language_include_required::Builder {
         workspace_language_include_required::Builder {
             core: BuilderCore::new(
@@ -24923,7 +26639,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_language_match_conflict {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -24937,7 +26656,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod language {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -24974,7 +26693,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25048,6 +26767,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -25060,9 +26780,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -25076,6 +26802,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_language_match_conflict() -> workspace_language_match_conflict::Builder {
         workspace_language_match_conflict::Builder {
             core: BuilderCore::new(
@@ -25089,7 +26816,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_provider {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_provider");
@@ -25101,7 +26831,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25136,7 +26866,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25171,7 +26901,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25262,6 +26992,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -25274,9 +27005,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -25290,6 +27027,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_provider() -> workspace_provider::Builder {
         workspace_provider::Builder {
             core: BuilderCore::new(
@@ -25303,7 +27041,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_result_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_result_limit");
@@ -25315,7 +27056,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25350,7 +27091,7 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25387,7 +27128,7 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25483,6 +27224,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, observed::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -25495,9 +27237,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -25511,6 +27259,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_result_limit() -> workspace_result_limit::Builder {
         workspace_result_limit::Builder {
             core: BuilderCore::new(
@@ -25524,7 +27273,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_syntax {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_syntax");
@@ -25536,7 +27288,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25571,7 +27323,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25606,7 +27358,7 @@ pub mod index {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25697,6 +27449,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -25709,9 +27462,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -25725,6 +27484,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_syntax() -> workspace_syntax::Builder {
         workspace_syntax::Builder {
             core: BuilderCore::new(
@@ -25738,7 +27498,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_too_deep {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_too_deep");
@@ -25750,7 +27513,7 @@ pub mod index {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25788,9 +27551,8 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -25816,7 +27578,7 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25856,7 +27618,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -25959,6 +27721,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -25971,9 +27734,15 @@ pub mod index {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -25987,6 +27756,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_too_deep() -> workspace_too_deep::Builder<Unset> {
         workspace_too_deep::Builder {
             core: BuilderCore::new(
@@ -26000,7 +27770,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_too_many_files {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -26014,7 +27787,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26049,7 +27822,7 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26086,7 +27859,7 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26123,7 +27896,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26234,6 +28007,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -26246,9 +28020,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -26262,6 +28042,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_too_many_files() -> workspace_too_many_files::Builder {
         workspace_too_many_files::Builder {
             core: BuilderCore::new(
@@ -26275,7 +28056,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_workspace_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -26289,7 +28073,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26324,7 +28108,7 @@ pub mod index {
             }
         }
         pub mod maximum {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26361,7 +28145,7 @@ pub mod index {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26398,7 +28182,7 @@ pub mod index {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26509,6 +28293,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -26521,9 +28306,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -26537,6 +28328,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_workspace_too_large() -> workspace_workspace_too_large::Builder {
         workspace_workspace_too_large::Builder {
             core: BuilderCore::new(
@@ -26550,7 +28342,10 @@ pub mod index {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod workspace_zero_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.index.workspace_zero_limit");
@@ -26562,7 +28357,7 @@ pub mod index {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26597,7 +28392,7 @@ pub mod index {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -26666,6 +28461,7 @@ pub mod index {
                     Self,
                 >>::set_optional(self, field::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -26678,9 +28474,15 @@ pub mod index {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -26694,6 +28496,7 @@ pub mod index {
             }
         }
     }
+    #[must_use]
     pub fn workspace_zero_limit() -> workspace_zero_limit::Builder {
         workspace_zero_limit::Builder {
             core: BuilderCore::new(
@@ -26708,11 +28511,18 @@ pub mod index {
 }
 #[allow(missing_docs)]
 pub mod lsp {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoInteger, IntoRiftError, IntoUnsigned, PhantomData, RiftError,
+        SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod capabilities_position_encoding_unsupported {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -26726,9 +28536,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod encoding {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -26765,6 +28574,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, encoding::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -26777,9 +28587,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -26793,6 +28609,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn capabilities_position_encoding_unsupported() -> capabilities_position_encoding_unsupported::Builder<
         Unset,
     > {
@@ -26808,7 +28625,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod correlation_pending_requests_exceeded {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -26822,9 +28642,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -26853,9 +28672,8 @@ pub mod lsp {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -26884,9 +28702,8 @@ pub mod lsp {
             }
         }
         pub mod required {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -26938,6 +28755,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, required::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -26950,9 +28768,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -26966,6 +28790,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn correlation_pending_requests_exceeded() -> correlation_pending_requests_exceeded::Builder<
         Unset,
         Unset,
@@ -26983,7 +28808,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod correlation_response_unknown {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -26997,9 +28825,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod id {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -27031,6 +28858,7 @@ pub mod lsp {
             {
                 <id::Field as id::Set<Self>>::set(self, id::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27043,9 +28871,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27059,6 +28893,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn correlation_response_unknown() -> correlation_response_unknown::Builder<
         Unset,
     > {
@@ -27074,7 +28909,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_analyzing {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_analyzing");
@@ -27086,9 +28924,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod attempts {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -27125,6 +28962,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, attempts::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27137,9 +28975,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27153,6 +28997,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_analyzing() -> engine_analyzing::Builder<Unset> {
         engine_analyzing::Builder {
             core: BuilderCore::new(
@@ -27166,7 +29011,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_capability_absent {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_capability_absent");
@@ -27178,9 +29026,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod capability {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -27217,6 +29064,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, capability::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27229,9 +29077,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27245,6 +29099,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_capability_absent() -> engine_capability_absent::Builder<Unset> {
         engine_capability_absent::Builder {
             core: BuilderCore::new(
@@ -27258,7 +29113,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_connection_closed {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_connection_closed");
@@ -27270,9 +29128,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod method {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -27307,6 +29164,7 @@ pub mod lsp {
             {
                 <method::Field as method::Set<Self>>::set(self, method::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27319,9 +29177,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27335,6 +29199,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_connection_closed() -> engine_connection_closed::Builder<Unset> {
         engine_connection_closed::Builder {
             core: BuilderCore::new(
@@ -27348,7 +29213,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_ended {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_ended");
@@ -27360,6 +29228,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27372,9 +29241,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27388,6 +29263,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_ended() -> engine_ended::Builder {
         engine_ended::Builder {
             core: BuilderCore::new(
@@ -27401,7 +29277,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_launch_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_launch_failed");
@@ -27413,9 +29292,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -27450,6 +29328,7 @@ pub mod lsp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27462,9 +29341,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27478,6 +29363,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_launch_failed() -> engine_launch_failed::Builder<Unset> {
         engine_launch_failed::Builder {
             core: BuilderCore::new(
@@ -27491,7 +29377,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_message_unreadable {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_message_unreadable");
@@ -27503,6 +29392,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27515,9 +29405,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27531,6 +29427,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_message_unreadable() -> engine_message_unreadable::Builder {
         engine_message_unreadable::Builder {
             core: BuilderCore::new(
@@ -27544,7 +29441,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_program_absolute {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_program_absolute");
@@ -27556,9 +29456,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod program {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -27593,6 +29492,7 @@ pub mod lsp {
             {
                 <program::Field as program::Set<Self>>::set(self, program::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27605,9 +29505,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27621,6 +29527,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_program_absolute() -> engine_program_absolute::Builder<Unset> {
         engine_program_absolute::Builder {
             core: BuilderCore::new(
@@ -27634,7 +29541,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_program_empty {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_program_empty");
@@ -27646,6 +29556,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27658,9 +29569,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27674,6 +29591,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_program_empty() -> engine_program_empty::Builder {
         engine_program_empty::Builder {
             core: BuilderCore::new(
@@ -27687,7 +29605,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_refused_retryable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoInteger, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_refused_retryable");
@@ -27699,9 +29620,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod code {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoInteger, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -27730,9 +29650,8 @@ pub mod lsp {
             }
         }
         pub mod message {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -27761,9 +29680,8 @@ pub mod lsp {
             }
         }
         pub mod method {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -27816,6 +29734,7 @@ pub mod lsp {
             {
                 <method::Field as method::Set<Self>>::set(self, method::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -27828,9 +29747,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -27844,6 +29769,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_refused_retryable() -> engine_refused_retryable::Builder<
         Unset,
         Unset,
@@ -27861,7 +29787,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_refused_terminal {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoInteger, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_refused_terminal");
@@ -27873,9 +29802,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod code {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoInteger, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -27904,9 +29832,8 @@ pub mod lsp {
             }
         }
         pub mod message {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -27935,9 +29862,8 @@ pub mod lsp {
             }
         }
         pub mod method {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -27990,6 +29916,7 @@ pub mod lsp {
             {
                 <method::Field as method::Set<Self>>::set(self, method::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28002,9 +29929,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28018,6 +29951,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_refused_terminal() -> engine_refused_terminal::Builder<
         Unset,
         Unset,
@@ -28035,7 +29969,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_result_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_result_invalid");
@@ -28047,9 +29984,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod method {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -28078,9 +30014,8 @@ pub mod lsp {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -28127,6 +30062,7 @@ pub mod lsp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28139,9 +30075,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28155,6 +30097,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_result_invalid() -> engine_result_invalid::Builder<Unset, Unset> {
         engine_result_invalid::Builder {
             core: BuilderCore::new(
@@ -28168,7 +30111,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod engine_timed_out {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.engine_timed_out");
@@ -28180,9 +30126,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod method {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -28211,9 +30156,8 @@ pub mod lsp {
             }
         }
         pub mod timeout_ms {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -28262,6 +30206,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, timeout_ms::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28274,9 +30219,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28290,6 +30241,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn engine_timed_out() -> engine_timed_out::Builder<Unset, Unset> {
         engine_timed_out::Builder {
             core: BuilderCore::new(
@@ -28303,7 +30255,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod framing_content_length_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -28317,9 +30272,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod value {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -28351,6 +30305,7 @@ pub mod lsp {
             {
                 <value::Field as value::Set<Self>>::set(self, value::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28363,9 +30318,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28379,6 +30340,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn framing_content_length_invalid() -> framing_content_length_invalid::Builder<
         Unset,
     > {
@@ -28394,7 +30356,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod framing_content_length_missing {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -28408,6 +30373,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28420,9 +30386,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28436,6 +30408,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn framing_content_length_missing() -> framing_content_length_missing::Builder {
         framing_content_length_missing::Builder {
             core: BuilderCore::new(
@@ -28449,7 +30422,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod framing_header_malformed {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.framing_header_malformed");
@@ -28461,6 +30437,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28473,9 +30450,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28489,6 +30472,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn framing_header_malformed() -> framing_header_malformed::Builder {
         framing_header_malformed::Builder {
             core: BuilderCore::new(
@@ -28502,7 +30486,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod framing_header_too_long {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.framing_header_too_long");
@@ -28514,6 +30501,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28526,9 +30514,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28542,6 +30536,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn framing_header_too_long() -> framing_header_too_long::Builder {
         framing_header_too_long::Builder {
             core: BuilderCore::new(
@@ -28555,7 +30550,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod framing_message_too_long {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.framing_message_too_long");
@@ -28572,9 +30570,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState, SetState>;
         pub mod announced_bytes {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -28610,9 +30607,8 @@ pub mod lsp {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -28646,9 +30642,8 @@ pub mod lsp {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -28682,9 +30677,8 @@ pub mod lsp {
             }
         }
         pub mod required {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -28752,6 +30746,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, required::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28764,9 +30759,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28780,6 +30781,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn framing_message_too_long() -> framing_message_too_long::Builder<
         Unset,
         Unset,
@@ -28798,7 +30800,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_character_misaligned {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -28812,9 +30817,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod character {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -28843,9 +30847,8 @@ pub mod lsp {
             }
         }
         pub mod line {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -28891,6 +30894,7 @@ pub mod lsp {
             {
                 <line::Field as line::Set<Self>>::set(self, line::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -28903,9 +30907,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -28919,6 +30929,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn position_character_misaligned() -> position_character_misaligned::Builder<
         Unset,
         Unset,
@@ -28935,7 +30946,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_character_out_of_range {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -28949,9 +30963,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod character {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -28980,9 +30993,8 @@ pub mod lsp {
             }
         }
         pub mod line {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -29011,9 +31023,8 @@ pub mod lsp {
             }
         }
         pub mod line_units {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -29070,6 +31081,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, line_units::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29082,9 +31094,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29098,6 +31116,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn position_character_out_of_range() -> position_character_out_of_range::Builder<
         Unset,
         Unset,
@@ -29115,7 +31134,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_line_out_of_range {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -29129,9 +31151,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod line {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -29160,9 +31181,8 @@ pub mod lsp {
             }
         }
         pub mod line_count {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -29208,6 +31228,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, line_count::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29220,9 +31241,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29236,6 +31263,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn position_line_out_of_range() -> position_line_out_of_range::Builder<
         Unset,
         Unset,
@@ -29252,7 +31280,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_offset_inside_line_ending {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -29266,9 +31297,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod byte_offset {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -29305,6 +31335,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, byte_offset::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29317,9 +31348,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29333,6 +31370,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn position_offset_inside_line_ending() -> position_offset_inside_line_ending::Builder<
         Unset,
     > {
@@ -29348,7 +31386,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_offset_misaligned {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -29362,9 +31403,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod byte_offset {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -29401,6 +31441,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, byte_offset::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29413,9 +31454,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29429,6 +31476,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn position_offset_misaligned() -> position_offset_misaligned::Builder<Unset> {
         position_offset_misaligned::Builder {
             core: BuilderCore::new(
@@ -29442,7 +31490,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_offset_out_of_range {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -29456,9 +31507,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod byte_offset {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -29487,9 +31537,8 @@ pub mod lsp {
             }
         }
         pub mod document_bytes {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -29540,6 +31589,7 @@ pub mod lsp {
                     Self,
                 >>::set(self, document_bytes::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29552,9 +31602,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29568,6 +31624,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn position_offset_out_of_range() -> position_offset_out_of_range::Builder<
         Unset,
         Unset,
@@ -29584,7 +31641,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_host_refused {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_host_refused");
@@ -29596,9 +31656,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod host {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -29630,6 +31689,7 @@ pub mod lsp {
             {
                 <host::Field as host::Set<Self>>::set(self, host::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29642,9 +31702,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29658,6 +31724,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_host_refused() -> uri_host_refused::Builder<Unset> {
         uri_host_refused::Builder {
             core: BuilderCore::new(
@@ -29671,7 +31738,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_outside_root {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_outside_root");
@@ -29683,6 +31753,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29695,9 +31766,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29711,6 +31788,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_outside_root() -> uri_outside_root::Builder {
         uri_outside_root::Builder {
             core: BuilderCore::new(
@@ -29724,7 +31802,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_path_not_decodable {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_path_not_decodable");
@@ -29736,6 +31817,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29748,9 +31830,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29764,6 +31852,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_path_not_decodable() -> uri_path_not_decodable::Builder {
         uri_path_not_decodable::Builder {
             core: BuilderCore::new(
@@ -29777,7 +31866,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_root_not_absolute {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_root_not_absolute");
@@ -29789,9 +31881,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod root {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -29823,6 +31914,7 @@ pub mod lsp {
             {
                 <root::Field as root::Set<Self>>::set(self, root::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29835,9 +31927,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29851,6 +31949,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_root_not_absolute() -> uri_root_not_absolute::Builder<Unset> {
         uri_root_not_absolute::Builder {
             core: BuilderCore::new(
@@ -29864,7 +31963,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_root_not_unicode {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_root_not_unicode");
@@ -29876,6 +31978,7 @@ pub mod lsp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29888,9 +31991,15 @@ pub mod lsp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29904,6 +32013,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_root_not_unicode() -> uri_root_not_unicode::Builder {
         uri_root_not_unicode::Builder {
             core: BuilderCore::new(
@@ -29917,7 +32027,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_scheme_refused {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_scheme_refused");
@@ -29929,9 +32042,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod scheme {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -29966,6 +32078,7 @@ pub mod lsp {
             {
                 <scheme::Field as scheme::Set<Self>>::set(self, scheme::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -29978,9 +32091,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -29994,6 +32113,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_scheme_refused() -> uri_scheme_refused::Builder<Unset> {
         uri_scheme_refused::Builder {
             core: BuilderCore::new(
@@ -30007,7 +32127,10 @@ pub mod lsp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod uri_uri_malformed {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.lsp.uri_uri_malformed");
@@ -30019,9 +32142,8 @@ pub mod lsp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod uri {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -30053,6 +32175,7 @@ pub mod lsp {
             {
                 <uri::Field as uri::Set<Self>>::set(self, uri::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30065,9 +32188,15 @@ pub mod lsp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30081,6 +32210,7 @@ pub mod lsp {
             }
         }
     }
+    #[must_use]
     pub fn uri_uri_malformed() -> uri_uri_malformed::Builder<Unset> {
         uri_uri_malformed::Builder {
             core: BuilderCore::new(
@@ -30095,11 +32225,18 @@ pub mod lsp {
 }
 #[allow(missing_docs)]
 pub mod mcp {
-    use super::*;
+    use super::{
+        Borrow, Box, BuilderCore, Display, Duration, Error, ErrorContext, ErrorSlug,
+        ErrorValue, EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState,
+        Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod arguments_not_object {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.arguments_not_object");
@@ -30111,9 +32248,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -30145,6 +32281,7 @@ pub mod mcp {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30157,9 +32294,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30173,6 +32316,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn arguments_not_object() -> arguments_not_object::Builder<Unset> {
         arguments_not_object::Builder {
             core: BuilderCore::new(
@@ -30186,7 +32330,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod election_already_serving {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.election_already_serving");
@@ -30198,6 +32345,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30210,9 +32358,15 @@ pub mod mcp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30226,6 +32380,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn election_already_serving() -> election_already_serving::Builder {
         election_already_serving::Builder {
             core: BuilderCore::new(
@@ -30239,7 +32394,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod election_document_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.election_document_invalid");
@@ -30251,6 +32409,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30263,9 +32422,15 @@ pub mod mcp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30279,6 +32444,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn election_document_invalid() -> election_document_invalid::Builder {
         election_document_invalid::Builder {
             core: BuilderCore::new(
@@ -30292,7 +32458,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod election_storage_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.election_storage_failed");
@@ -30304,9 +32473,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -30335,9 +32503,8 @@ pub mod mcp {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -30366,9 +32533,8 @@ pub mod mcp {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -30423,6 +32589,7 @@ pub mod mcp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30435,9 +32602,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30451,6 +32624,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn election_storage_failed() -> election_storage_failed::Builder<
         Unset,
         Unset,
@@ -30468,7 +32642,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod forward_unanswered {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Duration, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.forward_unanswered");
@@ -30480,9 +32657,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod waited {
-            use super::*;
+            use super::{Borrow, Builder, Duration, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -30517,6 +32693,7 @@ pub mod mcp {
             {
                 <waited::Field as waited::Set<Self>>::set(self, waited::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30529,9 +32706,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30545,6 +32728,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn forward_unanswered() -> forward_unanswered::Builder<Unset> {
         forward_unanswered::Builder {
             core: BuilderCore::new(
@@ -30558,7 +32742,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod http_ports_exhausted {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.http_ports_exhausted");
@@ -30570,9 +32757,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod port_max {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -30601,9 +32787,8 @@ pub mod mcp {
             }
         }
         pub mod port_min {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -30654,6 +32839,7 @@ pub mod mcp {
                     Self,
                 >>::set(self, port_min::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30666,9 +32852,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30682,6 +32874,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn http_ports_exhausted() -> http_ports_exhausted::Builder<Unset, Unset> {
         http_ports_exhausted::Builder {
             core: BuilderCore::new(
@@ -30695,7 +32888,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod http_serve_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.http_serve_failed");
@@ -30707,7 +32903,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -30745,9 +32941,8 @@ pub mod mcp {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -30773,7 +32968,7 @@ pub mod mcp {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -30861,6 +33056,7 @@ pub mod mcp {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -30873,9 +33069,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -30889,6 +33091,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn http_serve_failed() -> http_serve_failed::Builder<Unset> {
         http_serve_failed::Builder {
             core: BuilderCore::new(
@@ -30902,7 +33105,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod parameter_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.parameter_invalid");
@@ -30914,7 +33120,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod accepted {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -30954,7 +33160,7 @@ pub mod mcp {
             }
         }
         pub mod example {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -30994,7 +33200,7 @@ pub mod mcp {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -31032,9 +33238,8 @@ pub mod mcp {
             }
         }
         pub mod tool {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31125,6 +33330,7 @@ pub mod mcp {
             {
                 <tool::Field as tool::Set<Self>>::set(self, tool::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31137,9 +33343,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31153,6 +33365,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn parameter_invalid() -> parameter_invalid::Builder<Unset> {
         parameter_invalid::Builder {
             core: BuilderCore::new(
@@ -31166,7 +33379,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod project_hit_identity_missing {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -31180,9 +33396,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod hit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31214,6 +33429,7 @@ pub mod mcp {
             {
                 <hit::Field as hit::Set<Self>>::set(self, hit::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31226,9 +33442,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31242,6 +33464,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn project_hit_identity_missing() -> project_hit_identity_missing::Builder<
         Unset,
     > {
@@ -31257,7 +33480,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod project_hit_identity_refused {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -31271,7 +33497,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -31309,9 +33535,8 @@ pub mod mcp {
             }
         }
         pub mod hit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31360,6 +33585,7 @@ pub mod mcp {
             {
                 <hit::Field as hit::Set<Self>>::set(self, hit::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31372,9 +33598,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31388,6 +33620,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn project_hit_identity_refused() -> project_hit_identity_refused::Builder<
         Unset,
     > {
@@ -31403,7 +33636,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod project_hit_identity_undecodable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -31417,9 +33653,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod hit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31451,6 +33686,7 @@ pub mod mcp {
             {
                 <hit::Field as hit::Set<Self>>::set(self, hit::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31463,9 +33699,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31479,6 +33721,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn project_hit_identity_undecodable() -> project_hit_identity_undecodable::Builder<
         Unset,
     > {
@@ -31494,7 +33737,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod project_hit_name_unmatched {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -31508,9 +33754,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod hit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31542,6 +33787,7 @@ pub mod mcp {
             {
                 <hit::Field as hit::Set<Self>>::set(self, hit::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31554,9 +33800,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31570,6 +33822,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn project_hit_name_unmatched() -> project_hit_name_unmatched::Builder<Unset> {
         project_hit_name_unmatched::Builder {
             core: BuilderCore::new(
@@ -31583,7 +33836,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod project_hit_unit_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.project_hit_unit_invalid");
@@ -31595,9 +33851,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod hit {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31629,6 +33884,7 @@ pub mod mcp {
             {
                 <hit::Field as hit::Set<Self>>::set(self, hit::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31641,9 +33897,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31657,6 +33919,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn project_hit_unit_invalid() -> project_hit_unit_invalid::Builder<Unset> {
         project_hit_unit_invalid::Builder {
             core: BuilderCore::new(
@@ -31670,7 +33933,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod proxy_identity_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.proxy_identity_failed");
@@ -31682,9 +33948,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31719,6 +33984,7 @@ pub mod mcp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31731,9 +33997,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31747,6 +34019,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn proxy_identity_failed() -> proxy_identity_failed::Builder<Unset> {
         proxy_identity_failed::Builder {
             core: BuilderCore::new(
@@ -31760,7 +34033,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod proxy_initialization_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -31774,9 +34050,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31811,6 +34086,7 @@ pub mod mcp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31823,9 +34099,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31839,6 +34121,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn proxy_initialization_failed() -> proxy_initialization_failed::Builder<Unset> {
         proxy_initialization_failed::Builder {
             core: BuilderCore::new(
@@ -31852,7 +34135,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod proxy_task_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.proxy_task_failed");
@@ -31864,9 +34150,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -31901,6 +34186,7 @@ pub mod mcp {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31913,9 +34199,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31929,6 +34221,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn proxy_task_failed() -> proxy_task_failed::Builder<Unset> {
         proxy_task_failed::Builder {
             core: BuilderCore::new(
@@ -31942,7 +34235,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod proxy_unexpected_quit {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.proxy_unexpected_quit");
@@ -31954,6 +34250,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -31966,9 +34263,15 @@ pub mod mcp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -31982,11 +34285,12 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn proxy_unexpected_quit() -> proxy_unexpected_quit::Builder {
         proxy_unexpected_quit::Builder {
             core: BuilderCore::new(
                 ErrorSlug::new("rift.mcp.proxy_unexpected_quit"),
-                "MCP proxy service ended unexpectedly",
+                "MCP service ended unexpectedly",
                 "report this internal failure with its full context",
                 0usize,
             ),
@@ -31995,7 +34299,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod spawn_failed {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.spawn_failed");
@@ -32007,9 +34314,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod stderr {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32035,7 +34341,7 @@ pub mod mcp {
             }
         }
         pub mod stderr_truncated {
-            use super::*;
+            use super::{Borrow, Builder, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -32114,6 +34420,7 @@ pub mod mcp {
                     Self,
                 >>::set_optional(self, stderr_truncated::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32126,9 +34433,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32142,6 +34455,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn spawn_failed() -> spawn_failed::Builder<Unset> {
         spawn_failed::Builder {
             core: BuilderCore::new(
@@ -32155,7 +34469,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod spawn_no_output {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.spawn_no_output");
@@ -32167,6 +34484,7 @@ pub mod mcp {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32179,9 +34497,15 @@ pub mod mcp {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32195,6 +34519,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn spawn_no_output() -> spawn_no_output::Builder {
         spawn_no_output::Builder {
             core: BuilderCore::new(
@@ -32208,7 +34533,10 @@ pub mod mcp {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod start_building {
-        use super::*;
+        use super::{
+            Borrow, BuilderCore, Duration, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.mcp.start_building");
@@ -32220,9 +34548,8 @@ pub mod mcp {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod waited {
-            use super::*;
+            use super::{Borrow, Builder, Duration, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32257,6 +34584,7 @@ pub mod mcp {
             {
                 <waited::Field as waited::Set<Self>>::set(self, waited::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32269,9 +34597,15 @@ pub mod mcp {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32285,6 +34619,7 @@ pub mod mcp {
             }
         }
     }
+    #[must_use]
     pub fn start_building() -> start_building::Builder<Unset> {
         start_building::Builder {
             core: BuilderCore::new(
@@ -32299,11 +34634,17 @@ pub mod mcp {
 }
 #[allow(missing_docs)]
 pub mod provider {
-    use super::*;
+    use super::{
+        BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+        IntoRiftError, PhantomData, RiftError, SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod cache_too_many_keys {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.provider.cache_too_many_keys");
@@ -32315,6 +34656,7 @@ pub mod provider {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32327,9 +34669,15 @@ pub mod provider {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32343,6 +34691,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn cache_too_many_keys() -> cache_too_many_keys::Builder {
         cache_too_many_keys::Builder {
             core: BuilderCore::new(
@@ -32356,7 +34705,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_dangling_input {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32370,9 +34722,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod stage {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32404,6 +34755,7 @@ pub mod provider {
             {
                 <stage::Field as stage::Set<Self>>::set(self, stage::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32416,9 +34768,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32432,6 +34790,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_dangling_input() -> composition_dangling_input::Builder<Unset> {
         composition_dangling_input::Builder {
             core: BuilderCore::new(
@@ -32445,7 +34804,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_duplicate_stage {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32459,9 +34821,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod stage {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32493,6 +34854,7 @@ pub mod provider {
             {
                 <stage::Field as stage::Set<Self>>::set(self, stage::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32505,9 +34867,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32521,6 +34889,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_duplicate_stage() -> composition_duplicate_stage::Builder<Unset> {
         composition_duplicate_stage::Builder {
             core: BuilderCore::new(
@@ -32534,7 +34903,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_foreign_flow {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32548,6 +34920,7 @@ pub mod provider {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32560,9 +34933,15 @@ pub mod provider {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32576,6 +34955,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_foreign_flow() -> composition_foreign_flow::Builder {
         composition_foreign_flow::Builder {
             core: BuilderCore::new(
@@ -32589,7 +34969,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_invalid_name {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32603,6 +34986,7 @@ pub mod provider {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32615,9 +34999,15 @@ pub mod provider {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32631,6 +35021,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_invalid_name() -> composition_invalid_name::Builder {
         composition_invalid_name::Builder {
             core: BuilderCore::new(
@@ -32644,7 +35035,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_missing_output {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32658,6 +35052,7 @@ pub mod provider {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32670,9 +35065,15 @@ pub mod provider {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32686,6 +35087,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_missing_output() -> composition_missing_output::Builder {
         composition_missing_output::Builder {
             core: BuilderCore::new(
@@ -32699,7 +35101,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_stage_not_found {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32713,9 +35118,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod stage {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32747,6 +35151,7 @@ pub mod provider {
             {
                 <stage::Field as stage::Set<Self>>::set(self, stage::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32759,9 +35164,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32775,6 +35186,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_stage_not_found() -> composition_stage_not_found::Builder<Unset> {
         composition_stage_not_found::Builder {
             core: BuilderCore::new(
@@ -32788,7 +35200,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod composition_type_mismatch {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32802,9 +35217,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod stage {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32836,6 +35250,7 @@ pub mod provider {
             {
                 <stage::Field as stage::Set<Self>>::set(self, stage::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32848,9 +35263,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32864,6 +35285,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn composition_type_mismatch() -> composition_type_mismatch::Builder<Unset> {
         composition_type_mismatch::Builder {
             core: BuilderCore::new(
@@ -32877,7 +35299,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_contribution_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32891,9 +35316,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -32925,6 +35349,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -32937,9 +35362,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -32953,6 +35384,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_contribution_limit() -> publication_contribution_limit::Builder<
         Unset,
     > {
@@ -32968,7 +35400,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_duplicate_symbol {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -32982,9 +35417,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33016,6 +35450,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33028,9 +35463,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33044,6 +35485,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_duplicate_symbol() -> publication_duplicate_symbol::Builder<
         Unset,
     > {
@@ -33059,7 +35501,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_provider_contribution_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33073,9 +35518,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33107,6 +35551,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33119,9 +35564,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33135,6 +35586,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_provider_contribution_limit() -> publication_provider_contribution_limit::Builder<
         Unset,
     > {
@@ -33150,7 +35602,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_provider_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33164,9 +35619,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33198,6 +35652,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33210,9 +35665,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33226,6 +35687,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_provider_limit() -> publication_provider_limit::Builder<Unset> {
         publication_provider_limit::Builder {
             core: BuilderCore::new(
@@ -33239,7 +35701,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_provider_mismatch {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33253,9 +35718,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33287,6 +35751,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33299,9 +35764,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33315,6 +35786,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_provider_mismatch() -> publication_provider_mismatch::Builder<
         Unset,
     > {
@@ -33330,7 +35802,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_revision_mismatch {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33344,9 +35819,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33378,6 +35852,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33390,9 +35865,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33406,6 +35887,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_revision_mismatch() -> publication_revision_mismatch::Builder<
         Unset,
     > {
@@ -33421,7 +35903,10 @@ pub mod provider {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod publication_zero_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33435,9 +35920,8 @@ pub mod provider {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33469,6 +35953,7 @@ pub mod provider {
             {
                 <field::Field as field::Set<Self>>::set(self, field::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33481,9 +35966,15 @@ pub mod provider {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33497,6 +35988,7 @@ pub mod provider {
             }
         }
     }
+    #[must_use]
     pub fn publication_zero_limit() -> publication_zero_limit::Builder<Unset> {
         publication_zero_limit::Builder {
             core: BuilderCore::new(
@@ -33511,11 +36003,17 @@ pub mod provider {
 }
 #[allow(missing_docs)]
 pub mod ranking {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod capabilities_incompatible {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33529,6 +36027,7 @@ pub mod ranking {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33541,9 +36040,15 @@ pub mod ranking {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33557,6 +36062,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn capabilities_incompatible() -> capabilities_incompatible::Builder {
         capabilities_incompatible::Builder {
             core: BuilderCore::new(
@@ -33570,7 +36076,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod document_field_length {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.document_field_length");
@@ -33587,9 +36096,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset, Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -33623,9 +36131,8 @@ pub mod ranking {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -33659,9 +36166,8 @@ pub mod ranking {
             }
         }
         pub mod required {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -33695,9 +36201,8 @@ pub mod ranking {
             }
         }
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -33763,6 +36268,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33775,9 +36281,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState, SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33791,6 +36303,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn document_field_length() -> document_field_length::Builder<
         Unset,
         Unset,
@@ -33809,7 +36322,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod document_identity_empty {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33823,7 +36339,7 @@ pub mod ranking {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -33880,6 +36396,7 @@ pub mod ranking {
                     Self,
                 >>::set_optional(self, subject::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33892,9 +36409,15 @@ pub mod ranking {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -33908,6 +36431,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn document_identity_empty() -> document_identity_empty::Builder {
         document_identity_empty::Builder {
             core: BuilderCore::new(
@@ -33921,7 +36445,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod fusion_constant_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -33935,9 +36462,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -33972,6 +36498,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -33984,9 +36511,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34000,6 +36533,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn fusion_constant_invalid() -> fusion_constant_invalid::Builder<Unset> {
         fusion_constant_invalid::Builder {
             core: BuilderCore::new(
@@ -34013,7 +36547,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod pattern_size {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.pattern_size");
@@ -34025,9 +36562,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -34062,6 +36598,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -34074,9 +36611,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34090,6 +36633,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn pattern_size() -> pattern_size::Builder<Unset> {
         pattern_size::Builder {
             core: BuilderCore::new(
@@ -34103,7 +36647,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod pattern_syntax {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.pattern_syntax");
@@ -34115,9 +36662,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -34152,6 +36698,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -34164,9 +36711,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34180,6 +36733,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn pattern_syntax() -> pattern_syntax::Builder<Unset> {
         pattern_syntax::Builder {
             core: BuilderCore::new(
@@ -34193,7 +36747,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod query_empty {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.query_empty");
@@ -34205,7 +36762,7 @@ pub mod ranking {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -34262,6 +36819,7 @@ pub mod ranking {
                     Self,
                 >>::set_optional(self, subject::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -34274,9 +36832,15 @@ pub mod ranking {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34290,6 +36854,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn query_empty() -> query_empty::Builder {
         query_empty::Builder {
             core: BuilderCore::new(
@@ -34303,7 +36868,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod query_length {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.query_length");
@@ -34320,9 +36888,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset, Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34356,9 +36923,8 @@ pub mod ranking {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34392,9 +36958,8 @@ pub mod ranking {
             }
         }
         pub mod required {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34428,9 +36993,8 @@ pub mod ranking {
             }
         }
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34496,6 +37060,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -34508,9 +37073,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState, SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34524,6 +37095,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn query_length() -> query_length::Builder<Unset, Unset, Unset, Unset> {
         query_length::Builder {
             core: BuilderCore::new(
@@ -34537,7 +37109,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod query_phrase_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.query_phrase_limit");
@@ -34554,9 +37129,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset, Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34590,9 +37164,8 @@ pub mod ranking {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34626,9 +37199,8 @@ pub mod ranking {
             }
         }
         pub mod required {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34662,9 +37234,8 @@ pub mod ranking {
             }
         }
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34730,6 +37301,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -34742,9 +37314,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState, SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34758,6 +37336,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn query_phrase_limit() -> query_phrase_limit::Builder<
         Unset,
         Unset,
@@ -34776,7 +37355,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod query_quote_unterminated {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -34790,7 +37372,7 @@ pub mod ranking {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -34847,6 +37429,7 @@ pub mod ranking {
                     Self,
                 >>::set_optional(self, subject::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -34859,9 +37442,15 @@ pub mod ranking {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -34875,6 +37464,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn query_quote_unterminated() -> query_quote_unterminated::Builder {
         query_quote_unterminated::Builder {
             core: BuilderCore::new(
@@ -34888,7 +37478,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod query_term_length {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.query_term_length");
@@ -34905,9 +37498,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset, Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState, SetState>;
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34941,9 +37533,8 @@ pub mod ranking {
             }
         }
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -34977,9 +37568,8 @@ pub mod ranking {
             }
         }
         pub mod required {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -35013,9 +37603,8 @@ pub mod ranking {
             }
         }
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -35081,6 +37670,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35093,9 +37683,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState, SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35109,6 +37705,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn query_term_length() -> query_term_length::Builder<
         Unset,
         Unset,
@@ -35127,7 +37724,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod ranking_weights_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -35141,9 +37741,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -35178,6 +37777,7 @@ pub mod ranking {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35190,9 +37790,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35206,6 +37812,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn ranking_weights_invalid() -> ranking_weights_invalid::Builder<Unset> {
         ranking_weights_invalid::Builder {
             core: BuilderCore::new(
@@ -35219,7 +37826,10 @@ pub mod ranking {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod reader_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.ranking.reader_failed");
@@ -35231,9 +37841,8 @@ pub mod ranking {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -35259,7 +37868,7 @@ pub mod ranking {
             }
         }
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -35328,6 +37937,7 @@ pub mod ranking {
                     Self,
                 >>::set_optional(self, subject::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35340,9 +37950,15 @@ pub mod ranking {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35356,6 +37972,7 @@ pub mod ranking {
             }
         }
     }
+    #[must_use]
     pub fn reader_failed() -> reader_failed::Builder<Unset> {
         reader_failed::Builder {
             core: BuilderCore::new(
@@ -35370,11 +37987,18 @@ pub mod ranking {
 }
 #[allow(missing_docs)]
 pub mod search {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState,
+        Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod encode_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.encode_failed");
@@ -35386,7 +38010,7 @@ pub mod search {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -35423,7 +38047,7 @@ pub mod search {
             }
         }
         pub mod stage {
-            use super::*;
+            use super::{Builder, Display, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -35495,6 +38119,7 @@ pub mod search {
                     Self,
                 >>::set_optional(self, stage::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35507,9 +38132,15 @@ pub mod search {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35523,6 +38154,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn encode_failed() -> encode_failed::Builder {
         encode_failed::Builder {
             core: BuilderCore::new(
@@ -35536,20 +38168,62 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod model_cache_unavailable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
             "rift.search.model_cache_unavailable",
         );
         pub struct EvidenceTag;
-        pub struct Builder {
+        pub struct Builder<State0 = Unset> {
             pub(super) core: BuilderCore,
-            pub(super) marker: PhantomData<()>,
+            pub(super) marker: PhantomData<State0>,
         }
-        pub type EvidenceInput = Builder;
-        pub type EvidenceOutput = Builder;
-        impl Builder {
+        pub type EvidenceInput = Builder<Unset>;
+        pub type EvidenceOutput = Builder<SetState>;
+        pub mod variables {
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
+            pub use super::FieldSet as Set;
+            pub struct Field;
+            impl<State0> Set<Builder<State0>> for Field {
+                type Output = Builder<SetState>;
+                fn set(mut target: Builder<State0>, value: ErrorValue) -> Self::Output {
+                    target.core.set(0u32 as usize, "variables", value, true, false);
+                    Builder::<SetState> {
+                        core: target.core,
+                        marker: PhantomData,
+                    }
+                }
+            }
+            pub fn value<T>(value: T) -> ErrorValue
+            where
+                T: Display,
+            {
+                ErrorValue::display(value)
+            }
+            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue>
+            where
+                T: Display,
+            {
+                value.map(self::value)
+            }
+        }
+        impl<State0> Builder<State0> {
+            pub fn variables<T>(
+                self,
+                value: T,
+            ) -> <variables::Field as variables::Set<Self>>::Output
+            where
+                T: Display,
+            {
+                <variables::Field as variables::Set<
+                    Self,
+                >>::set(self, variables::value(value))
+            }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35561,10 +38235,16 @@ pub mod search {
                 evidence.apply_evidence(self)
             }
         }
-        impl Builder {
+        impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35572,26 +38252,30 @@ pub mod search {
                 self.core.finish()
             }
         }
-        impl IntoRiftError for Builder {
+        impl IntoRiftError for Builder<SetState> {
             fn into_rift_error(self) -> RiftError {
                 self.finish()
             }
         }
     }
-    pub fn model_cache_unavailable() -> model_cache_unavailable::Builder {
+    #[must_use]
+    pub fn model_cache_unavailable() -> model_cache_unavailable::Builder<Unset> {
         model_cache_unavailable::Builder {
             core: BuilderCore::new(
                 ErrorSlug::new("rift.search.model_cache_unavailable"),
-                "model cache directory could not be resolved",
+                "model cache directory could not be resolved from environment variables {variables}",
                 "set a model cache directory and retry",
-                0usize,
+                1usize,
             ),
             marker: PhantomData,
         }
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod model_configuration_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -35605,7 +38289,7 @@ pub mod search {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -35640,7 +38324,7 @@ pub mod search {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -35714,6 +38398,7 @@ pub mod search {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35726,9 +38411,15 @@ pub mod search {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35742,6 +38433,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn model_configuration_invalid() -> model_configuration_invalid::Builder {
         model_configuration_invalid::Builder {
             core: BuilderCore::new(
@@ -35755,7 +38447,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod model_download_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.model_download_failed");
@@ -35767,7 +38462,7 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -35807,9 +38502,8 @@ pub mod search {
             }
         }
         pub mod subject {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -35864,6 +38558,7 @@ pub mod search {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -35876,9 +38571,15 @@ pub mod search {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -35892,6 +38593,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn model_download_failed() -> model_download_failed::Builder<Unset> {
         model_download_failed::Builder {
             core: BuilderCore::new(
@@ -35905,7 +38607,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod model_download_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -35919,9 +38624,8 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -35950,9 +38654,8 @@ pub mod search {
             }
         }
         pub mod url {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -35998,6 +38701,7 @@ pub mod search {
             {
                 <url::Field as url::Set<Self>>::set(self, url::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36010,9 +38714,15 @@ pub mod search {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36026,6 +38736,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn model_download_too_large() -> model_download_too_large::Builder<
         Unset,
         Unset,
@@ -36042,7 +38753,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod model_file_missing {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.model_file_missing");
@@ -36054,9 +38768,8 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod subject {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -36091,6 +38804,7 @@ pub mod search {
             {
                 <subject::Field as subject::Set<Self>>::set(self, subject::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36103,9 +38817,15 @@ pub mod search {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36119,6 +38839,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn model_file_missing() -> model_file_missing::Builder<Unset> {
         model_file_missing::Builder {
             core: BuilderCore::new(
@@ -36132,7 +38853,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod model_source_invalid {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.model_source_invalid");
@@ -36144,9 +38868,8 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod expected {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -36175,9 +38898,8 @@ pub mod search {
             }
         }
         pub mod model {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -36206,7 +38928,7 @@ pub mod search {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -36286,6 +39008,7 @@ pub mod search {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36298,9 +39021,15 @@ pub mod search {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36314,6 +39043,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn model_source_invalid() -> model_source_invalid::Builder<Unset, Unset> {
         model_source_invalid::Builder {
             core: BuilderCore::new(
@@ -36327,7 +39057,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod task_failed {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.task_failed");
@@ -36339,7 +39072,7 @@ pub mod search {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -36396,6 +39129,7 @@ pub mod search {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36408,9 +39142,15 @@ pub mod search {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36424,6 +39164,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn task_failed() -> task_failed::Builder {
         task_failed::Builder {
             core: BuilderCore::new(
@@ -36437,7 +39178,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod text_limit {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.text_limit");
@@ -36449,9 +39193,8 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod limit {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -36480,9 +39223,8 @@ pub mod search {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -36528,6 +39270,7 @@ pub mod search {
                     Self,
                 >>::set(self, observed::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36540,9 +39283,15 @@ pub mod search {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36556,6 +39305,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn text_limit() -> text_limit::Builder<Unset, Unset> {
         text_limit::Builder {
             core: BuilderCore::new(
@@ -36569,7 +39319,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod tokenizer_unreadable {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.tokenizer_unreadable");
@@ -36581,7 +39334,7 @@ pub mod search {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -36616,7 +39369,7 @@ pub mod search {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -36690,6 +39443,7 @@ pub mod search {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36702,9 +39456,15 @@ pub mod search {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36718,6 +39478,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn tokenizer_unreadable() -> tokenizer_unreadable::Builder {
         tokenizer_unreadable::Builder {
             core: BuilderCore::new(
@@ -36731,7 +39492,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod vector_coordinate_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -36745,9 +39509,8 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod coordinate {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -36784,6 +39547,7 @@ pub mod search {
                     Self,
                 >>::set(self, coordinate::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36796,9 +39560,15 @@ pub mod search {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36812,6 +39582,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn vector_coordinate_invalid() -> vector_coordinate_invalid::Builder<Unset> {
         vector_coordinate_invalid::Builder {
             core: BuilderCore::new(
@@ -36825,7 +39596,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod vector_width_mismatch {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.vector_width_mismatch");
@@ -36837,9 +39611,8 @@ pub mod search {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod query_width {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -36868,9 +39641,8 @@ pub mod search {
             }
         }
         pub mod stored_width {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -36921,6 +39693,7 @@ pub mod search {
                     Self,
                 >>::set(self, stored_width::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -36933,9 +39706,15 @@ pub mod search {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -36949,6 +39728,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn vector_width_mismatch() -> vector_width_mismatch::Builder<Unset, Unset> {
         vector_width_mismatch::Builder {
             core: BuilderCore::new(
@@ -36962,7 +39742,10 @@ pub mod search {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod weights_unreadable {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Error, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.search.weights_unreadable");
@@ -36974,7 +39757,7 @@ pub mod search {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -37009,7 +39792,7 @@ pub mod search {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -37083,6 +39866,7 @@ pub mod search {
                     Self,
                 >>::set_optional(self, source::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37095,9 +39879,15 @@ pub mod search {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37111,6 +39901,7 @@ pub mod search {
             }
         }
     }
+    #[must_use]
     pub fn weights_unreadable() -> weights_unreadable::Builder {
         weights_unreadable::Builder {
             core: BuilderCore::new(
@@ -37125,11 +39916,17 @@ pub mod search {
 }
 #[allow(missing_docs)]
 pub mod server {
-    use super::*;
+    use super::{
+        BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+        IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_cancelled {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, EvidenceFor, IntoRiftError,
+            PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_cancelled");
@@ -37141,6 +39938,7 @@ pub mod server {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         impl Builder {
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37153,9 +39951,15 @@ pub mod server {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37169,6 +39973,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_cancelled() -> read_cancelled::Builder {
         read_cancelled::Builder {
             core: BuilderCore::new(
@@ -37182,7 +39987,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_capacity_timeout {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_capacity_timeout");
@@ -37194,9 +40002,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -37225,9 +40032,8 @@ pub mod server {
             }
         }
         pub mod timeout_ms {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -37278,6 +40084,7 @@ pub mod server {
                     Self,
                 >>::set(self, timeout_ms::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37290,9 +40097,15 @@ pub mod server {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37306,6 +40119,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_capacity_timeout() -> read_capacity_timeout::Builder<Unset, Unset> {
         read_capacity_timeout::Builder {
             core: BuilderCore::new(
@@ -37319,7 +40133,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_engine_answer {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_engine_answer");
@@ -37331,9 +40148,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -37362,9 +40178,8 @@ pub mod server {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -37413,6 +40228,7 @@ pub mod server {
                     Self,
                 >>::set(self, operation::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37425,9 +40241,15 @@ pub mod server {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37441,11 +40263,12 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_engine_answer() -> read_engine_answer::Builder<Unset, Unset> {
         read_engine_answer::Builder {
             core: BuilderCore::new(
                 ErrorSlug::new("rift.server.read_engine_answer"),
-                "language engine answer does not match served revision during {operation}",
+                "the addressed content exists but its bytes cannot be served: operation {operation}, detail {detail}",
                 "read the request again once the engine has read the served revision",
                 2usize,
             ),
@@ -37454,7 +40277,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_invalid {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_invalid");
@@ -37466,7 +40292,7 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod cause {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoRiftError, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -37507,9 +40333,8 @@ pub mod server {
             }
         }
         pub mod field {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -37538,9 +40363,8 @@ pub mod server {
             }
         }
         pub mod violation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -37603,6 +40427,7 @@ pub mod server {
                     Self,
                 >>::set(self, violation::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37615,9 +40440,15 @@ pub mod server {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37631,11 +40462,12 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_invalid() -> read_invalid::Builder<Unset, Unset> {
         read_invalid::Builder {
             core: BuilderCore::new(
                 ErrorSlug::new("rift.server.read_invalid"),
-                "request field {field} is invalid: {violation}",
+                "the request does not match the documented form: field {field}, violation {violation}",
                 "correct the reported field and resend the request",
                 3usize,
             ),
@@ -37644,7 +40476,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_not_found {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_not_found");
@@ -37656,9 +40491,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -37690,6 +40524,7 @@ pub mod server {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37702,9 +40537,15 @@ pub mod server {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37718,6 +40559,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_not_found() -> read_not_found::Builder<Unset> {
         read_not_found::Builder {
             core: BuilderCore::new(
@@ -37731,7 +40573,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_source_unavailable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -37745,9 +40590,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -37779,6 +40623,7 @@ pub mod server {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37791,9 +40636,15 @@ pub mod server {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37807,6 +40658,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_source_unavailable() -> read_source_unavailable::Builder<Unset> {
         read_source_unavailable::Builder {
             core: BuilderCore::new(
@@ -37820,7 +40672,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_storage {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_storage");
@@ -37832,9 +40687,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod io {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -37863,9 +40717,8 @@ pub mod server {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -37894,9 +40747,8 @@ pub mod server {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -37948,6 +40800,7 @@ pub mod server {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -37960,9 +40813,15 @@ pub mod server {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -37976,6 +40835,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_storage() -> read_storage::Builder<Unset, Unset, Unset> {
         read_storage::Builder {
             core: BuilderCore::new(
@@ -37989,7 +40849,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_task {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_task");
@@ -38001,9 +40864,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -38032,9 +40894,8 @@ pub mod server {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -38083,6 +40944,7 @@ pub mod server {
                     Self,
                 >>::set(self, operation::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38095,9 +40957,15 @@ pub mod server {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38111,6 +40979,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_task() -> read_task::Builder<Unset, Unset> {
         read_task::Builder {
             core: BuilderCore::new(
@@ -38124,7 +40993,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_unavailable {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_unavailable");
@@ -38136,9 +41008,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod detail {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -38167,9 +41038,8 @@ pub mod server {
             }
         }
         pub mod operation {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -38218,6 +41088,7 @@ pub mod server {
                     Self,
                 >>::set(self, operation::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38230,9 +41101,15 @@ pub mod server {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38246,6 +41123,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_unavailable() -> read_unavailable::Builder<Unset, Unset> {
         read_unavailable::Builder {
             core: BuilderCore::new(
@@ -38259,7 +41137,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_unclaimed_extension {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -38273,9 +41154,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod extension {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -38312,6 +41192,7 @@ pub mod server {
                     Self,
                 >>::set(self, extension::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38324,9 +41205,15 @@ pub mod server {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38340,6 +41227,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_unclaimed_extension() -> read_unclaimed_extension::Builder<Unset> {
         read_unclaimed_extension::Builder {
             core: BuilderCore::new(
@@ -38353,7 +41241,10 @@ pub mod server {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod read_unsupported {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.server.read_unsupported");
@@ -38365,9 +41256,8 @@ pub mod server {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod capability {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -38404,6 +41294,7 @@ pub mod server {
                     Self,
                 >>::set(self, capability::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38416,9 +41307,15 @@ pub mod server {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38432,6 +41329,7 @@ pub mod server {
             }
         }
     }
+    #[must_use]
     pub fn read_unsupported() -> read_unsupported::Builder<Unset> {
         read_unsupported::Builder {
             core: BuilderCore::new(
@@ -38446,11 +41344,18 @@ pub mod server {
 }
 #[allow(missing_docs)]
 pub mod syntax {
-    use super::*;
+    use super::{
+        Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+        EvidenceFor, IntoRiftError, IntoUnsigned, Path, PhantomData, RiftError, SetState,
+        Unset,
+    };
     pub use super::{FieldSet, OptionalFieldSet};
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod incompatible_grammar {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.incompatible_grammar");
@@ -38462,9 +41367,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod grammar_abi_version {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -38495,9 +41399,8 @@ pub mod syntax {
             }
         }
         pub mod runtime_abi_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -38528,9 +41431,8 @@ pub mod syntax {
             }
         }
         pub mod runtime_abi_min {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -38594,6 +41496,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, runtime_abi_min::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38606,9 +41509,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38622,6 +41531,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn incompatible_grammar() -> incompatible_grammar::Builder<Unset, Unset, Unset> {
         incompatible_grammar::Builder {
             core: BuilderCore::new(
@@ -38635,7 +41545,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod invalid_markdown_ranges {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -38649,9 +41562,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -38683,6 +41595,7 @@ pub mod syntax {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38695,9 +41608,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38711,6 +41630,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn invalid_markdown_ranges() -> invalid_markdown_ranges::Builder<Unset> {
         invalid_markdown_ranges::Builder {
             core: BuilderCore::new(
@@ -38724,7 +41644,11 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod invalid_query {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState,
+            Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.invalid_query");
@@ -38736,9 +41660,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod line_number {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -38767,9 +41690,8 @@ pub mod syntax {
             }
         }
         pub mod line_text {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -38798,9 +41720,8 @@ pub mod syntax {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -38860,6 +41781,7 @@ pub mod syntax {
             {
                 <source::Field as source::Set<Self>>::set(self, source::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -38872,9 +41794,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -38888,6 +41816,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn invalid_query() -> invalid_query::Builder<Unset, Unset, Unset> {
         invalid_query::Builder {
             core: BuilderCore::new(
@@ -38901,7 +41830,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod markdown_progress_exceeded {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -38915,9 +41847,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -38946,9 +41877,8 @@ pub mod syntax {
             }
         }
         pub mod progress_callbacks_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -39004,6 +41934,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, progress_callbacks_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39016,9 +41947,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39032,6 +41969,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn markdown_progress_exceeded() -> markdown_progress_exceeded::Builder<
         Unset,
         Unset,
@@ -39048,7 +41986,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod parse_cancelled {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            Path, PhantomData, RiftError,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.parse_cancelled");
@@ -39060,7 +42001,7 @@ pub mod syntax {
         pub type EvidenceInput = Builder;
         pub type EvidenceOutput = Builder;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -39112,6 +42053,7 @@ pub mod syntax {
                     Self,
                 >>::set_optional(self, path::optional_value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39124,9 +42066,15 @@ pub mod syntax {
             }
         }
         impl Builder {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39140,6 +42088,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn parse_cancelled() -> parse_cancelled::Builder {
         parse_cancelled::Builder {
             core: BuilderCore::new(
@@ -39153,7 +42102,11 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod position_overflow {
-        use super::*;
+        use super::{
+            Box, BuilderCore, Display, Error, ErrorContext, ErrorSlug, ErrorValue,
+            EvidenceFor, IntoRiftError, IntoUnsigned, PhantomData, RiftError, SetState,
+            Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.position_overflow");
@@ -39170,9 +42123,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState, SetState>;
         pub mod end_byte {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -39206,9 +42158,8 @@ pub mod syntax {
             }
         }
         pub mod node_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -39242,9 +42193,8 @@ pub mod syntax {
             }
         }
         pub mod source {
-            use super::*;
+            use super::{Box, Builder, Error, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -39278,9 +42228,8 @@ pub mod syntax {
             }
         }
         pub mod start_byte {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<
                 State0,
@@ -39356,6 +42305,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, start_byte::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39368,9 +42318,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39384,6 +42340,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn position_overflow() -> position_overflow::Builder<
         Unset,
         Unset,
@@ -39402,7 +42359,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod source_too_large {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.source_too_large");
@@ -39414,7 +42374,7 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData};
             pub use super::FieldSet as Set;
             pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
@@ -39455,9 +42415,8 @@ pub mod syntax {
             }
         }
         pub mod source_bytes {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -39486,9 +42445,8 @@ pub mod syntax {
             }
         }
         pub mod source_bytes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -39558,6 +42516,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, source_bytes_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39570,9 +42529,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39586,6 +42551,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn source_too_large() -> source_too_large::Builder<Unset, Unset> {
         source_too_large::Builder {
             core: BuilderCore::new(
@@ -39599,7 +42565,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod too_deep {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.too_deep");
@@ -39611,9 +42580,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -39642,9 +42610,8 @@ pub mod syntax {
             }
         }
         pub mod syntax_depth_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -39692,6 +42659,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, syntax_depth_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39704,9 +42672,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39720,6 +42694,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn too_deep() -> too_deep::Builder<Unset, Unset> {
         too_deep::Builder {
             core: BuilderCore::new(
@@ -39733,7 +42708,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod too_many_captures {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.too_many_captures");
@@ -39745,9 +42723,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod captures_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -39784,6 +42761,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, captures_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39796,9 +42774,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39812,6 +42796,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn too_many_captures() -> too_many_captures::Builder<Unset> {
         too_many_captures::Builder {
             core: BuilderCore::new(
@@ -39825,7 +42810,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod too_many_markdown_inline_ranges {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new(
@@ -39839,9 +42827,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState, SetState>;
         pub mod inline_ranges_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<SetState, State1, State2>;
@@ -39872,9 +42859,8 @@ pub mod syntax {
             }
         }
         pub mod observed {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, SetState, State2>;
@@ -39903,9 +42889,8 @@ pub mod syntax {
             }
         }
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1, State2> Set<Builder<State0, State1, State2>> for Field {
                 type Output = Builder<State0, State1, SetState>;
@@ -39962,6 +42947,7 @@ pub mod syntax {
             {
                 <path::Field as path::Set<Self>>::set(self, path::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -39974,9 +42960,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -39990,6 +42982,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn too_many_markdown_inline_ranges() -> too_many_markdown_inline_ranges::Builder<
         Unset,
         Unset,
@@ -40007,7 +43000,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod too_many_nodes {
-        use super::*;
+        use super::{
+            BuilderCore, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor, IntoRiftError,
+            IntoUnsigned, Path, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.too_many_nodes");
@@ -40019,9 +43015,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset, Unset>;
         pub type EvidenceOutput = Builder<SetState, SetState>;
         pub mod path {
-            use super::*;
+            use super::{Builder, ErrorValue, Path, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<SetState, State1>;
@@ -40050,9 +43045,8 @@ pub mod syntax {
             }
         }
         pub mod syntax_nodes_max {
-            use super::*;
+            use super::{Builder, ErrorValue, IntoUnsigned, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0, State1> Set<Builder<State0, State1>> for Field {
                 type Output = Builder<State0, SetState>;
@@ -40100,6 +43094,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, syntax_nodes_max::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -40112,9 +43107,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState, SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -40128,6 +43129,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn too_many_nodes() -> too_many_nodes::Builder<Unset, Unset> {
         too_many_nodes::Builder {
             core: BuilderCore::new(
@@ -40141,7 +43143,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod unknown_node_kind {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.unknown_node_kind");
@@ -40153,9 +43158,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod node_kind {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -40192,6 +43196,7 @@ pub mod syntax {
                     Self,
                 >>::set(self, node_kind::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -40204,9 +43209,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -40220,6 +43231,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn unknown_node_kind() -> unknown_node_kind::Builder<Unset> {
         unknown_node_kind::Builder {
             core: BuilderCore::new(
@@ -40233,7 +43245,10 @@ pub mod syntax {
     }
     #[allow(non_camel_case_types, missing_docs, unused_parens)]
     pub mod zero_limit {
-        use super::*;
+        use super::{
+            BuilderCore, Display, ErrorContext, ErrorSlug, ErrorValue, EvidenceFor,
+            IntoRiftError, PhantomData, RiftError, SetState, Unset,
+        };
         pub use super::{FieldSet, OptionalFieldSet};
         /// Stable registry identity for this error.
         pub const SLUG: ErrorSlug = ErrorSlug::new("rift.syntax.zero_limit");
@@ -40245,9 +43260,8 @@ pub mod syntax {
         pub type EvidenceInput = Builder<Unset>;
         pub type EvidenceOutput = Builder<SetState>;
         pub mod bound {
-            use super::*;
+            use super::{Builder, Display, ErrorValue, PhantomData, SetState};
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
             pub struct Field;
             impl<State0> Set<Builder<State0>> for Field {
                 type Output = Builder<SetState>;
@@ -40279,6 +43293,7 @@ pub mod syntax {
             {
                 <bound::Field as bound::Set<Self>>::set(self, bound::value(value))
             }
+            #[must_use]
             pub fn with(mut self, context: ErrorContext) -> Self {
                 self.core.with(context);
                 self
@@ -40291,9 +43306,15 @@ pub mod syntax {
             }
         }
         impl Builder<SetState> {
+            #[must_use]
             pub fn error(self) -> RiftError {
                 self.finish()
             }
+            /// Return this registered error as a failed result.
+            ///
+            /// # Errors
+            ///
+            /// Always returns this registered error.
             pub fn fail<T>(self) -> Result<T, RiftError> {
                 Err(self.finish())
             }
@@ -40307,6 +43328,7 @@ pub mod syntax {
             }
         }
     }
+    #[must_use]
     pub fn zero_limit() -> zero_limit::Builder<Unset> {
         zero_limit::Builder {
             core: BuilderCore::new(

@@ -1993,8 +1993,21 @@ mod tests {
 
         let missing = directory.path().join("missing");
         let error = super::archive_sha256(&missing).expect_err("missing must fail");
+        assert_eq!(
+            error.slug(),
+            errors::cli::update_archive_file_inspection_failed::SLUG
+        );
         assert!(error.to_string().contains("could not be inspected"));
         assert!(error.to_string().contains("missing"));
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == missing.display().to_string() })
+        );
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("inspection failure retains filesystem source");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
 
         let error = super::archive_sha256(directory.path()).expect_err("directory must fail");
         assert!(error.to_string().contains("is not a regular file"));
@@ -2004,16 +2017,58 @@ mod tests {
                 .contains("https://github.com/volarized/rift/issues")
         );
 
+        let empty = directory.path().join("empty");
+        fs::write(&empty, b"")?;
+        let error = super::archive_sha256(&empty).expect_err("empty archive must fail");
+        assert_eq!(
+            error.slug(),
+            errors::cli::update_archive_file_size_invalid::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "size" && value == "0")
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == empty.display().to_string() })
+        );
+        assert!(error.context().any(|(key, value)| {
+            key == "bytes_max" && value == super::RELEASE_ARCHIVE_BYTES_MAX.to_string()
+        }));
+        assert!(std::error::Error::source(&error).is_none());
+
         let oversized = directory.path().join("oversized");
-        fs::write(&oversized, b"12345")?;
+        fs::File::create(&oversized)?.set_len(super::RELEASE_ARCHIVE_BYTES_MAX + 1)?;
         let error = super::archive_sha256(&oversized).expect_err("oversize must fail");
-        assert!(error.to_string().contains("incorrect size of 5 bytes"));
-        assert!(error.to_string().contains("between 1 and bytes"));
+        assert!(error.context().any(|(key, value)| {
+            key == "size" && value == (super::RELEASE_ARCHIVE_BYTES_MAX + 1).to_string()
+        }));
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "path" && value == oversized.display().to_string() })
+        );
+        assert!(error.context().any(|(key, value)| {
+            key == "bytes_max" && value == super::RELEASE_ARCHIVE_BYTES_MAX.to_string()
+        }));
+        assert!(error.to_string().contains(&format!(
+            "incorrect size of {} bytes",
+            super::RELEASE_ARCHIVE_BYTES_MAX + 1
+        )));
+
+        let valid = directory.path().join("valid");
+        fs::write(&valid, b"12345")?;
+        assert_eq!(
+            super::archive_sha256(&valid)?,
+            "5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5"
+        );
         Ok(())
     }
 
     #[test]
-    fn update_errors_carry_registry_codes() -> TestResult {
+    fn update_errors_carry_registry_codes() {
         let release_tag = parse_release_tag("vinvalid").expect_err("tag must be invalid");
         assert_eq!(
             release_tag.slug(),
@@ -2023,7 +2078,6 @@ mod tests {
             .source(std::io::Error::other("fixture"))
             .error();
         assert_eq!(download.slug(), errors::cli::update_download_failed::SLUG);
-        Ok(())
     }
 
     #[test]

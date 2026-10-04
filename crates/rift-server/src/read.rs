@@ -184,9 +184,8 @@ impl ReadService {
             &cache,
             cancelled,
         )
-        .map_err(|source| {
+        .inspect_err(|_| {
             span.record("outcome", "error");
-            source
         })?;
         let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
             root,
@@ -196,9 +195,8 @@ impl ReadService {
             languages,
             cancelled,
         )
-        .map_err(|source| {
+        .inspect_err(|_| {
             span.record("outcome", "error");
-            source
         })?;
         let revisions = captured_revisions(&index);
         let context = Arc::new(resolved_context(root, &source_policy, &dependencies)?);
@@ -436,9 +434,8 @@ impl ReadService {
                 )?;
                 Ok((index, source_policy))
             });
-        let (index, source_policy) = built.map_err(|source| {
+        let (index, source_policy) = built.inspect_err(|_| {
             span.record("outcome", "error");
-            source
         })?;
         let revisions = captured_revisions(&index);
         let context = Arc::new(resolved_context(
@@ -501,9 +498,8 @@ impl ReadService {
         let index = self
             .index
             .rebuilt_cancellable(changes, cancelled)
-            .map_err(|source| {
+            .inspect_err(|_| {
                 span.record("outcome", "error");
-                source
             })?;
         let revisions = captured_revisions(&index);
         let context = self.context_after(source_policy, changes, &index)?;
@@ -855,7 +851,13 @@ impl ReadService {
     /// file's byte length.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, RiftError> {
         validate_common(params.rev.is_some())?;
-        let path = CoreProjectPath::new(params.path.0)?;
+        let path = CoreProjectPath::new(params.path.0).map_err(|error| {
+            errors::server::read_invalid()
+                .field("path")
+                .violation(error.detail())
+                .cause(error)
+                .error()
+        })?;
         let file = self
             .index
             .file(&path)
@@ -878,7 +880,13 @@ impl ReadService {
     /// set, a parse refusal, or a source that changed during the read.
     pub fn nodes_for_preparation(&self, params: NodesParams) -> Result<NodesResult, RiftError> {
         validate_common(params.rev.is_some())?;
-        let path = CoreProjectPath::new(params.path.0.clone())?;
+        let path = CoreProjectPath::new(params.path.0.clone()).map_err(|error| {
+            errors::server::read_invalid()
+                .field("path")
+                .violation(error.detail())
+                .cause(error)
+                .error()
+        })?;
         if self.file_record(&path).is_some() {
             return self.nodes(params);
         }
@@ -890,7 +898,9 @@ impl ReadService {
         };
         let absolute = self.index.root().join(path.as_str());
         let before = policy.visible_digest(&absolute).map_err(|error| {
-            if self.index_names_omission(&path) {
+            if error.slug() == errors::index::workspace_file_too_large::SLUG
+                || self.index_names_omission(&path)
+            {
                 errors::server::read_source_unavailable()
                     .path(path.as_str())
                     .error()
@@ -916,7 +926,9 @@ impl ReadService {
             }
         };
         let after = policy.visible_digest(&absolute).map_err(|error| {
-            if self.index_names_omission(&path) {
+            if error.slug() == errors::index::workspace_file_too_large::SLUG
+                || self.index_names_omission(&path)
+            {
                 errors::server::read_unavailable()
                     .operation("nodes")
                     .detail("source changed during the targeted read")
@@ -1862,7 +1874,13 @@ pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, RiftE
             .violation("not a rift symbol address")
             .error()
     })?;
-    let path = CoreProjectPath::new(path)?;
+    let path = CoreProjectPath::new(path).map_err(|error| {
+        errors::server::read_invalid()
+            .field("symbol")
+            .violation(error.detail())
+            .cause(error)
+            .error()
+    })?;
     Ok(SymbolAddress {
         language_segment: language_segment.to_owned(),
         path,
@@ -1911,10 +1929,22 @@ pub(crate) mod tests {
 
     #[test]
     fn symbol_address_refuses_empty_language_and_decoded_invalid_paths() {
-        for (address, expected) in [
-            ("rift://symbol//lib.rs/beacon", "not a rift symbol address"),
-            ("rift://symbol/rust/%2Flib.rs/beacon", "absolute"),
-            ("rift://symbol/rust/src%2F..%2Flib.rs/beacon", "dot_segment"),
+        for (address, expected_violation, expected_cause) in [
+            (
+                "rift://symbol//lib.rs/beacon",
+                Some("not a rift symbol address"),
+                None,
+            ),
+            (
+                "rift://symbol/rust/%2Flib.rs/beacon",
+                None,
+                Some(rift_error::errors::core::path_absolute::SLUG),
+            ),
+            (
+                "rift://symbol/rust/src%2F..%2Flib.rs/beacon",
+                None,
+                Some(rift_error::errors::core::path_dot_segment::SLUG),
+            ),
         ] {
             let error = super::parse_symbol_address(address)
                 .map(|_| ())
@@ -1925,11 +1955,19 @@ pub(crate) mod tests {
                     .context()
                     .any(|(key, value)| key == "field" && value == "symbol")
             );
-            assert!(
-                error
-                    .context()
-                    .any(|(key, value)| key == "violation" && value == expected)
-            );
+            if let Some(expected) = expected_violation {
+                assert!(
+                    error
+                        .context()
+                        .any(|(key, value)| key == "violation" && value == expected)
+                );
+            }
+            if let Some(expected) = expected_cause {
+                let cause = std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<RiftError>())
+                    .expect("invalid path error remains its cause");
+                assert_eq!(cause.slug(), expected);
+            }
         }
     }
 
@@ -2613,12 +2651,6 @@ pub fn compute() -> i32 {
             let settled_error = settled
                 .nodes(params)
                 .expect_err("settled index omits the same source");
-            assert!(
-                (partial_error.slug() == rift_error::errors::server::read_source_unavailable::SLUG)
-            );
-            assert!(
-                (settled_error.slug() == rift_error::errors::server::read_source_unavailable::SLUG)
-            );
             assert_eq!(
                 partial_error.slug(),
                 errors::server::read_source_unavailable::SLUG
@@ -2661,6 +2693,23 @@ pub fn compute() -> i32 {
             settled_error.slug(),
             errors::server::read_source_unavailable::SLUG
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nodes_preparation_preserves_unrelated_source_read_errors() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let partial = partial_nodes_service(directory.path(), WorkspaceIndexLimits::default())?;
+        fs::create_dir(directory.path().join("blocked.rs"))?;
+        let error = partial
+            .nodes_for_preparation(NodesParams {
+                path: ProjectPath("blocked.rs".to_owned()),
+                position: 0,
+                rev: None,
+            })
+            .expect_err("reading a directory as source fails");
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
         Ok(())
     }
 
@@ -3288,9 +3337,9 @@ pub fn compute() -> i32 {
             position: 0,
             rev: None,
         });
-        assert!(
-            (missing.expect_err("missing source must fail").slug()
-                == rift_error::errors::server::read_not_found::SLUG)
+        assert_eq!(
+            missing.expect_err("missing source must fail").slug(),
+            rift_error::errors::server::read_not_found::SLUG
         );
         Ok(())
     }
@@ -3530,14 +3579,20 @@ pub fn compute() -> i32 {
     #[test]
     fn nodes_rejects_path_outside_project_root() -> TestResult {
         let (_directory, service) = fixture()?;
-        let result = service.nodes(NodesParams {
-            path: ProjectPath("/etc/passwd".to_owned()),
-            position: 0,
-            rev: None,
-        });
-        assert!(
-            (result.expect_err("absolute path must fail").slug()
-                == rift_error::errors::server::read_invalid::SLUG)
+        let error = service
+            .nodes(NodesParams {
+                path: ProjectPath("/etc/passwd".to_owned()),
+                position: 0,
+                rev: None,
+            })
+            .expect_err("absolute path must fail");
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<RiftError>())
+                .expect("path validation error remains its cause")
+                .slug(),
+            rift_error::errors::core::path_absolute::SLUG
         );
         Ok(())
     }
@@ -3785,29 +3840,25 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn a_documentation_fault_keeps_its_identity_evidence_and_source() -> TestResult {
+    fn documentation_error_keeps_its_identity_and_evidence() {
         let failure = rift_index::DocumentationCollection::from_candidate_blocks(
             rift_protocol::read::Digest("00000000".to_owned()),
             Vec::new(),
             Vec::new(),
         )
         .expect_err("incompatible documentation revision");
-        let expected_context = failure.context().collect::<Vec<_>>();
-        let expected_text = failure.to_string();
-        let expected_evidence = failure.context().collect::<Vec<_>>();
-
         let error = failure;
 
         assert_eq!(
             error.slug(),
             rift_error::errors::analysis::documentation_revision_invalid::SLUG
         );
-        assert_eq!(error.context().collect::<Vec<_>>(), expected_context);
-        assert_eq!(error.context().collect::<Vec<_>>(), expected_evidence);
-        let source =
-            std::error::Error::source(&error).ok_or("a documentation fault carries a source")?;
-        assert_eq!(source.to_string(), expected_text);
-        Ok(())
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "field" && value == "documentation_revision" })
+        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -3858,10 +3909,9 @@ pub fn compute() -> i32 {
             .error();
         assert_eq!(error.slug(), errors::server::read_storage::SLUG);
         let context = error.context().collect::<Vec<_>>();
-        let keys: Vec<&str> = context.iter().map(|(key, _)| *key).collect();
-        assert_eq!(keys, ["path", "operation", "io"]);
-        assert_eq!(context[0].1, "src/lib.rs");
-        assert_eq!(context[2].1, "sealed");
+        assert!(context.contains(&("path", "src/lib.rs".to_owned())));
+        assert!(context.contains(&("operation", "stage".to_owned())));
+        assert!(context.contains(&("io", "sealed".to_owned())));
     }
 
     #[test]
@@ -3872,8 +3922,8 @@ pub fn compute() -> i32 {
             .error();
         assert_eq!(error.slug(), errors::server::read_task::SLUG);
         let context = error.context().collect::<Vec<_>>();
-        assert_eq!(context[0], ("operation", "initial index build".to_owned()));
-        assert_eq!(context[1], ("detail", "worker panicked".to_owned()));
+        assert!(context.contains(&("operation", "initial index build".to_owned())));
+        assert!(context.contains(&("detail", "worker panicked".to_owned())));
     }
 
     /// Every internal `SourceLocation` variant maps to its wire `SourceLocationKind`.
@@ -4551,7 +4601,14 @@ pub fn compute() -> i32 {
 
         let context = error.context().collect::<Vec<_>>();
         assert_eq!(error.slug(), errors::server::read_task::SLUG);
-        assert_eq!(context[0], ("operation", "incremental rebuild".to_owned()));
+        assert!(
+            context
+                .iter()
+                .any(|(key, value)| { *key == "operation" && value == "incremental rebuild" })
+        );
+        assert!(context.iter().any(|(key, value)| {
+            *key == "detail" && value == "a revision snapshot has no filesystem tree"
+        }));
         Ok(())
     }
 
@@ -4711,15 +4768,21 @@ pub fn compute() -> i32 {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let error = revision_service(directory.path(), "main")
             .expect_err("a workspace without a repository must refuse");
-        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
+        assert_eq!(error.slug(), errors::history::unversioned::SLUG);
+        let context = error.context().collect::<Vec<_>>();
         let canonical = fs::canonicalize(directory.path())?;
+        assert!(context.contains(&("workspace", canonical.display().to_string())));
+        assert!(
+            context
+                .iter()
+                .any(|(key, value)| { *key == "requires" && value.contains("run `git init`") })
+        );
         assert_eq!(
             error.to_string(),
             format!(
-                "no configured provider serves this request: workspace {}, \
+                "workspace has no git repository: {}: \
                  requires a git repository - run `git init`, or omit `rev` to \
-                 read the current tree; adjust the request to a served \
-                 capability, or configure a provider that serves it",
+                 read the current tree; run `git init`, or omit `rev` to read current tree",
                 canonical.display()
             )
         );
@@ -4737,11 +4800,6 @@ pub fn compute() -> i32 {
             .error();
         assert_eq!(error.slug(), errors::server::read_engine_answer::SLUG);
         assert_eq!(
-            error.slug(),
-            errors::server::read_engine_answer::SLUG,
-            "no resend reaches bytes the engine has not read yet"
-        );
-        assert_eq!(
             error.to_string(),
             "the addressed content exists but its bytes cannot be served: \
              operation engine references, detail character out of range; read \
@@ -4758,7 +4816,12 @@ pub fn compute() -> i32 {
         let directory = committed_fixture()?;
         let error = revision_service(directory.path(), "feature/absent")
             .expect_err("an unknown revision must refuse");
-        assert_eq!(error.slug(), errors::server::read_not_found::SLUG);
+        assert_eq!(error.slug(), errors::history::revision_unknown::SLUG);
+        let context = error.context().collect::<Vec<_>>();
+        assert!(context.contains(&("rev", "feature/absent".to_owned())));
+        assert!(context.iter().any(|(key, value)| {
+            *key == "requires" && value.contains("branch, tag, or commit id")
+        }));
         Ok(())
     }
 
@@ -4872,7 +4935,7 @@ pub fn compute() -> i32 {
         );
         let error =
             accepted_limit(PAGE_LIMIT_MAX + 1).expect_err("one over the maximum must refuse");
-        assert!((error.slug() == rift_error::errors::server::read_invalid::SLUG));
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
         assert_eq!(
             error.to_string(),
             "the request does not match the documented form: field limit, violation 10001 \

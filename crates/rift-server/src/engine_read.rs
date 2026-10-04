@@ -1803,7 +1803,12 @@ mod tests {
         };
         let error =
             map_references(&reads, &target, report, directory.path()).expect_err("scheme refused");
-        assert!(error.detail().contains("scheme_refused"), "{error}");
+        assert_eq!(error.slug(), errors::lsp::uri_scheme_refused::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "scheme" && value == "https" })
+        );
         Ok(())
     }
 
@@ -2121,8 +2126,12 @@ mod tests {
         .await;
         engines.shutdown().await;
         let error = result.expect_err("absolute program is refused");
-        assert!(error.slug() == errors::lsp::engine_launch_failed::SLUG);
-        assert!(error.detail().contains("absolute"), "{}", error.detail());
+        assert_eq!(error.slug(), errors::lsp::engine_program_absolute::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "program" && value == "/refused-engine" })
+        );
         Ok(())
     }
 
@@ -2219,11 +2228,21 @@ mod tests {
         .await;
         engines.shutdown().await;
         let error = result.expect_err("engine refused references");
-        assert!(error.slug() == errors::lsp::engine_launch_failed::SLUG);
+        assert_eq!(error.slug(), errors::lsp::engine_refused_terminal::SLUG);
         assert!(
-            error.detail().contains("references refused"),
-            "{}",
-            error.detail()
+            error
+                .context()
+                .any(|(key, value)| { key == "method" && value == "textDocument/references" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "code" && value == "-32602" })
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "message" && value == "references refused" })
         );
         Ok(())
     }
@@ -2547,14 +2566,16 @@ done
         let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
         engines.shutdown().await;
         let error = result.expect_err("an answer outside the shape refuses the walk");
+        assert_eq!(error.slug(), errors::lsp::engine_result_invalid::SLUG);
         assert!(
-            error.slug() == errors::lsp::engine_launch_failed::SLUG,
-            "{error}"
+            error
+                .context()
+                .any(|(key, value)| { key == "method" && value == "callHierarchy/outgoingCalls" })
         );
-        let rendered = error.to_string();
         assert!(
-            rendered.contains("callHierarchy/outgoingCalls"),
-            "{rendered}"
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<serde_json::Error>())
+                .is_some()
         );
         Ok(())
     }

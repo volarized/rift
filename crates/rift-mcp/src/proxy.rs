@@ -400,11 +400,11 @@ impl RiftProxy {
                     "the workspace server did not answer a forwarded request within its budget; \
                      the request is cancelled"
                 );
-                return errors::mcp::forward_unanswered()
+                errors::mcp::forward_unanswered()
                     .waited(budget)
                     .mcp()
                     .tool_error(wire::ErrorPhase::Read)
-                    .fail();
+                    .fail()
             }
             answered => Ok(answered),
         }
@@ -1807,9 +1807,9 @@ mod tests {
         let quit = errors::mcp::proxy_unexpected_quit().error();
         assert_eq!(quit.slug(), errors::mcp::proxy_unexpected_quit::SLUG);
         let rendered = quit.to_string();
-        assert!(
-            rendered.contains("MCP proxy service ended unexpectedly"),
-            "{rendered}"
+        assert_eq!(
+            rendered,
+            "MCP service ended unexpectedly; report this internal failure with its full context"
         );
         assert!(std::error::Error::source(&quit).is_none());
 

@@ -236,12 +236,12 @@ impl SyntaxPublicationBuilder {
     /// Returns [`RiftError`] when publication bounds or keys are
     /// invalid.
     pub fn build(self) -> Result<ProviderPublication, RiftError> {
-        Ok(ProviderPublication::new(
+        ProviderPublication::new(
             self.provider,
             self.publication,
             self.contributions,
             self.limits,
-        )?)
+        )
     }
 }
 
@@ -253,7 +253,7 @@ impl SyntaxPublicationBuilder {
 ///
 /// # Errors
 ///
-/// Returns [`SourceUnitIdError`] when the document's path breaks source-unit rules.
+/// Returns [`RiftError`] when the document's path breaks source-unit rules.
 pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, RiftError> {
     source_unit_for_path(document.path())
 }
@@ -262,7 +262,7 @@ pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, RiftError>
 ///
 /// # Errors
 ///
-/// Returns [`SourceUnitIdError`] when the path breaks source-unit rules.
+/// Returns [`RiftError`] when the path breaks source-unit rules.
 pub fn source_unit_for_path(path: &ProjectPath) -> Result<SourceUnitId, RiftError> {
     SourceUnitId::parse(&format!(
         "rift://source/project/{}",

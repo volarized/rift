@@ -894,14 +894,14 @@ async fn serve_foreground(
         let storage = storage.ok_or_else(|| {
             errors::mcp::election_storage_failed()
                 .operation("select repository server")
-                .path(root.to_path_buf())
+                .path(root)
                 .source(io::Error::other("workspace storage is unavailable"))
                 .error()
         })?;
         let guard = guard.ok_or_else(|| {
             errors::mcp::election_storage_failed()
                 .operation("select repository server")
-                .path(root.to_path_buf())
+                .path(root)
                 .source(io::Error::other("workspace election is unavailable"))
                 .error()
         })?;
@@ -960,7 +960,7 @@ fn foreground_selection(
         rift_mcp::repository::select_server_configuration(root, None).map_err(|source| {
             errors::mcp::election_storage_failed()
                 .operation("select repository server")
-                .path(root.to_path_buf())
+                .path(root)
                 .source(source)
                 .error()
         })?;
@@ -970,7 +970,7 @@ fn foreground_selection(
     ) {
         return errors::mcp::election_storage_failed()
             .operation("select repository server")
-            .path(root.to_path_buf())
+            .path(root)
             .source(io::Error::other("repository settings are unavailable"))
             .fail();
     }
@@ -1941,11 +1941,16 @@ mod tests {
         );
         assert!(timed_out.contains("--foreground"), "{timed_out}");
 
-        let exited = errors::cli::server_start_exited()
-            .pid(7)
-            .error()
-            .to_string();
-        assert!(exited.contains("pid 7"), "{exited}");
+        let exited_error = errors::cli::server_start_exited().pid(7).error();
+        assert_eq!(exited_error.slug(), errors::cli::server_start_exited::SLUG);
+        assert!(
+            exited_error
+                .context()
+                .any(|(key, value)| key == "pid" && value == "7"),
+            "typed process identifier must remain present: {exited_error:?}"
+        );
+        let exited = exited_error.to_string();
+        assert!(exited.contains("process 7"), "{exited}");
         assert!(exited.contains("exited before publishing"), "{exited}");
         assert!(
             exited.contains(&format!(".rift/{}", rift_mcp::SERVER_STDERR_FILE_NAME)),
@@ -1965,7 +1970,7 @@ mod tests {
             .waited(STOP_WAIT_MAX)
             .error()
             .to_string();
-        assert!(unreleased.contains("pid 7"), "{unreleased}");
+        assert!(unreleased.contains("process 7"), "{unreleased}");
         assert!(
             unreleased.contains("still holds the election"),
             "{unreleased}"

@@ -52,6 +52,7 @@ use rift_mcp::{
     probe,
 };
 use rift_protocol::configuration::WorkspaceConfiguration;
+use rift_protocol::error as wire;
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
@@ -1051,15 +1052,14 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
 /// The refusal an agent sees when the workspace's own spawned server
 /// exists but cannot bind its configured port: the detached spawn
 /// succeeds, the child prints its own startup failure to stderr and exits
-/// before publishing a lock document, and the proxy answers with that
-/// captured stderr instead of waiting out the poll's own window.
+/// before publishing a lock document, and the proxy reports a redacted summary
+/// of captured stderr instead of waiting out the poll's own window.
 ///
-/// The pinned port stays held for the whole test. Captured stderr and the
-/// absence of the poll-exhaustion refusal prove the spawned process exit
+/// The pinned port stays held for the whole test. The redacted stderr summary
+/// and absence of the poll-exhaustion refusal prove the spawned process exit
 /// supplied the result.
 #[tokio::test]
-async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_stderr() -> TestResult
-{
+async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr() -> TestResult {
     let held = held_port_in_range()?;
     let port = held.local_addr()?.port();
     let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], &format!("port = {port}\n"))?;
@@ -1079,12 +1079,16 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_st
     let rmcp::ServiceError::McpError(data) = refusal else {
         panic!("expected a protocol-level refusal, got {refusal:?}");
     };
-    assert!(
-        data.message
-            .contains("every loopback port in the serving range is bound"),
-        "the refusal must carry the spawned server's own captured stderr: {}",
-        data.message
+    assert_eq!(
+        data.message,
+        "spawned server exited before serving: stderr [redacted], stderr_truncated false; report this internal failure with its full context"
     );
+    let wire_error: wire::ErrorData = serde_json::from_value(
+        data.data
+            .expect("spawn refusal retains typed wire classification"),
+    )?;
+    assert_eq!(wire_error.code, wire::ErrorCode::TemporarilyUnavailable);
+    assert_eq!(wire_error.retry, wire::RetryDirective::SameRequest);
     assert!(
         !data.message.contains('\u{1b}'),
         "a server whose stderr is a pipe writes no terminal escape codes into it: {}",

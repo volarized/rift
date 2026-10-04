@@ -181,11 +181,38 @@ fields = { subject = { type = "string" }, token = { type = "bool", optional = tr
         unique.dedup();
         assert_eq!(imports, unique, "imports have no duplicates: {imports:?}");
         assert!(imports[1].contains("borrow :: Borrow"), "{imports:?}");
+        fn contains_glob(tree: &syn::UseTree) -> bool {
+            match tree {
+                syn::UseTree::Glob(_) => true,
+                syn::UseTree::Group(group) => group.items.iter().any(contains_glob),
+                syn::UseTree::Path(path) => contains_glob(&path.tree),
+                syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
+            }
+        }
+        fn assert_no_wildcard_imports(items: &[Item]) {
+            for item in items {
+                match item {
+                    Item::Use(item) => assert!(
+                        !contains_glob(&item.tree),
+                        "wildcard import: {}",
+                        item.to_token_stream()
+                    ),
+                    Item::Mod(item) => {
+                        if let Some((_, items)) = &item.content {
+                            assert_no_wildcard_imports(items);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_no_wildcard_imports(&file.items);
     }
 
     #[test]
     fn generated_cloud_namespace_compiles_against_runtime() {
         use std::fs;
+        use std::path::PathBuf;
         use std::process::Command;
 
         let registry = r#"
@@ -210,49 +237,39 @@ action = "renew token for {subject}"
         }
 "#;
         let generated = generate_source(registry).expect("generate cloud registry");
-        let directory =
-            std::env::temp_dir().join(format!("rift-error-codegen-cloud-{}", std::process::id()));
-        fs::create_dir_all(&directory).expect("create temporary directory");
-        let dependencies = std::env::current_exe()
-            .expect("current test executable")
+        let manifest_dir =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("runtime CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
             .parent()
-            .expect("test executable directory")
-            .to_path_buf();
-        let runtime = fs::read_dir(&dependencies)
-            .expect("read test dependency directory")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("librift_error-") && name.ends_with(".rlib")
-                    })
-            })
-            .expect("compiled rift-error library");
+            .and_then(std::path::Path::parent)
+            .expect("workspace root");
+        let directory = workspace_root
+            .join("target")
+            .join(format!("rift-error-codegen-cloud-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create temporary directory");
+        let manifest = "[workspace]\n\n[package]\nname = \"generated-cloud-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nrift-error = { path = \"../../../crates/rift-error\" }\n".to_owned();
         let compile = |name: &str, generated: &str, expression: &str| {
-            let source = directory.join(format!("{name}.rs"));
-            let output = directory.join(format!("{name}.rlib"));
+            let package = directory.join(name);
+            let source = package.join("src");
+            fs::create_dir_all(&source).expect("create generated fixture source directory");
+            fs::write(package.join("Cargo.toml"), &manifest)
+                .expect("write generated fixture manifest");
             fs::write(
-                &source,
+                source.join("lib.rs"),
                 format!(
                     "#![deny(warnings)]\npub mod cloud {{\n{generated}\n}}\npub fn downstream() -> rift_error::RiftError {{ {expression} }}\n"
                 ),
             )
             .expect("write generated fixture");
-            Command::new("rustc")
-                .arg("--edition=2024")
-                .arg("--crate-type=lib")
-                .arg("-Dwarnings")
-                .arg("--extern")
-                .arg(format!("rift_error={}", runtime.display()))
-                .arg("-L")
-                .arg(format!("dependency={}", dependencies.display()))
-                .arg(&source)
-                .arg("-o")
-                .arg(&output)
+            Command::new("cargo")
+                .arg("check")
+                .arg("--offline")
+                .arg("--manifest-path")
+                .arg(package.join("Cargo.toml"))
+                .arg("--target-dir")
+                .arg(directory.join("target"))
                 .output()
-                .expect("run rustc for generated cloud registry")
+                .expect("run cargo check for generated cloud registry")
         };
         let valid = compile(
             "cloud-valid",
@@ -264,30 +281,41 @@ action = "renew token for {subject}"
             "valid generated evidence did not compile:\n{}",
             String::from_utf8_lossy(&valid.stderr)
         );
-        for (name, expression) in [
+        for (name, expression, trait_bound) in [
             (
                 "cloud-bad-bool",
                 "cloud::auth::token_expired().subject(\"token\").count(2_usize).code(-5_i32).pid(41_u32).port(8080_u16).path(std::path::Path::new(\"src/lib.rs\")).waited(std::time::Duration::from_secs(1)).source(std::io::Error::other(\"source\")).maybe_token(Some(\"true\")).error()",
+                "Borrow<bool>",
             ),
             (
                 "cloud-bad-unsigned",
                 "cloud::auth::token_expired().subject(\"token\").count(\"2\").code(-5_i32).pid(41_u32).port(8080_u16).path(std::path::Path::new(\"src/lib.rs\")).waited(std::time::Duration::from_secs(1)).source(std::io::Error::other(\"source\")).error()",
+                "IntoUnsigned",
             ),
             (
                 "cloud-bad-integer",
                 "cloud::auth::token_expired().subject(\"token\").count(2_usize).code(5_u32).pid(41_u32).port(8080_u16).path(std::path::Path::new(\"src/lib.rs\")).waited(std::time::Duration::from_secs(1)).source(std::io::Error::other(\"source\")).error()",
+                "IntoInteger",
             ),
             (
                 "cloud-bad-pid",
                 "cloud::auth::token_expired().subject(\"token\").count(2_usize).code(-5_i32).pid(\"41\").port(8080_u16).path(std::path::Path::new(\"src/lib.rs\")).waited(std::time::Duration::from_secs(1)).source(std::io::Error::other(\"source\")).error()",
+                "Borrow<u32>",
             ),
             (
                 "cloud-bad-port",
                 "cloud::auth::token_expired().subject(\"token\").count(2_usize).code(-5_i32).pid(41_u32).port(\"8080\").path(std::path::Path::new(\"src/lib.rs\")).waited(std::time::Duration::from_secs(1)).source(std::io::Error::other(\"source\")).error()",
+                "Borrow<u16>",
             ),
         ] {
             let invalid = compile(name, &generated, expression);
-            assert!(!invalid.status.success(), "invalid {name} compiled");
+            let stderr = String::from_utf8_lossy(&invalid.stderr);
+            assert!(
+                !invalid.status.success()
+                    && stderr.contains("error[E0277]")
+                    && stderr.contains(trait_bound),
+                "invalid {name} must fail on its evidence type, got:\n{stderr}"
+            );
         }
         let fieldless = generate_source(
             r#"

@@ -2457,8 +2457,8 @@ mod tests {
         let field = error.context().find(|(key, _)| *key == "field");
         assert_eq!(field, Some(("field", "file_content".to_owned())));
         assert_eq!(
-            error.context().find(|(key, _)| *key == "path").unwrap().1,
-            "src/a.rs"
+            error.context().find(|(key, _)| *key == "path"),
+            Some(("path", "src/a.rs".to_owned()))
         );
     }
 
@@ -2498,7 +2498,7 @@ mod tests {
 
     #[test]
     fn test_unit_limit_exposes_typed_limit_evidence() {
-        let documents = vec![file_document("a", "body"), file_document("b", "body")];
+        let documents = [file_document("a", "body"), file_document("b", "body")];
         let limits = LexicalIndexLimits::new(1, 1_048_576, 1_000, 4, 1_000);
         let error = validate_indexed_count(documents.len(), limits)
             .expect_err("a batch over units_max must refuse");
@@ -2970,8 +2970,7 @@ mod tests {
             .expect("the refusal names the query it ran");
         assert!(
             probe.starts_with("unexpected probe rows"),
-            "the refusal carries the rows it read: {}",
-            probe
+            "the refusal carries the rows it read: {probe}"
         );
         Ok(())
     }

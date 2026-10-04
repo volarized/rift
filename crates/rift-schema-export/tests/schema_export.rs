@@ -465,8 +465,12 @@ fn write_failed_keeps_path_source_and_storage_code() -> TestResult {
     let ExportError::WriteFailed { path, .. } = &error else {
         panic!("expected WriteFailed, got {error:?}");
     };
-    assert!(path.ends_with("nested"), "{path:?}");
-    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(path, &blocked.join("nested").join("public"));
+    let source = std::error::Error::source(&error).expect("filesystem write source");
+    assert!(
+        source.downcast_ref::<std::io::Error>().is_some(),
+        "filesystem write source is an I/O error: {source}"
+    );
     Ok(())
 }
 

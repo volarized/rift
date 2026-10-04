@@ -166,7 +166,6 @@ pub fn parse_symbol_identity(value: &str) -> Result<ParsedSymbolIdentity, Symbol
 }
 
 /// Invalid stable identity.
-
 macro_rules! define_id {
     ($name:ident, $docs:literal) => {
         #[doc = $docs]
@@ -474,7 +473,6 @@ fn is_unit_key_safe(byte: u8) -> bool {
 }
 
 /// Invalid zero revision.
-
 macro_rules! define_revision {
     ($name:ident, $docs:literal) => {
         #[doc = $docs]
@@ -896,7 +894,7 @@ mod tests {
     }
 
     fn context_pairs(error: &RiftError) -> Vec<(&'static str, String)> {
-        error.context().into_iter().collect()
+        error.context().collect()
     }
 
     #[test]

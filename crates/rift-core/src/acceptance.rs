@@ -383,7 +383,7 @@ fn malformed_document(
 ) -> RiftError {
     let shape = expected_shape(schema, steps);
     let accepted = (!shape.accepted().is_empty()).then(|| shape.accepted().join(", "));
-    let example = shape.example().map(|example| example.to_string());
+    let example = shape.example().map(std::string::ToString::to_string);
     errors::core::configuration_malformed()
         .file(WORKSPACE_CONFIGURATION_FILE)
         .maybe_location(span.map(|span| position_of(raw, span.start)))
@@ -402,7 +402,7 @@ fn variable_malformed(variable: &str, key: &DeclaredKey, schema: &Value) -> Rift
         .collect();
     let shape = expected_shape(schema, &steps);
     let accepted = (!shape.accepted().is_empty()).then(|| shape.accepted().join(", "));
-    let example = shape.example().map(|example| example.to_string());
+    let example = shape.example().map(std::string::ToString::to_string);
     errors::core::configuration_variable_malformed()
         .variable(variable)
         .key(key.path().join("."))
@@ -635,7 +635,10 @@ mod tests {
         };
         let error = accept_configuration::<WorkspaceConfiguration>(None, &environment)
             .expect_err("a key's variable must be UTF-8");
-        assert!(error.slug().as_str() == "rift.core.configuration_variable_not_unicode");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.configuration_variable_not_unicode"
+        );
     }
 
     #[test]
@@ -645,7 +648,7 @@ mod tests {
             &[("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "5000000")],
         )
         .expect_err("the document names an unknown key");
-        assert!(error.slug().as_str() == "rift.core.configuration_malformed");
+        assert_eq!(error.slug().as_str(), "rift.core.configuration_malformed");
         assert_eq!(
             context_value(&error, "location").as_deref(),
             Some("line 2 column 1")
@@ -657,7 +660,7 @@ mod tests {
         let oversized =
             "#".repeat(usize::try_from(super::CONFIGURATION_FILE_BYTES_MAX + 1).expect("fits"));
         let error = accept(Some(&oversized), &[]).expect_err("oversized");
-        assert!(error.slug().as_str() == "rift.core.configuration_oversized");
+        assert_eq!(error.slug().as_str(), "rift.core.configuration_oversized");
     }
 
     #[test]
@@ -772,6 +775,9 @@ mod tests {
         }
         let error = accept_naming(&[("RIFT_LANGUAGES_RUST_ENABLED", "maybe")])
             .expect_err("a bool key refuses text");
-        assert!(error.slug().as_str() == "rift.core.configuration_variable_malformed");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.configuration_variable_malformed"
+        );
     }
 }

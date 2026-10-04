@@ -25,11 +25,7 @@ use crate::relationship::RelationshipStore;
 ///
 /// Returns [`RiftError`] when `declarations_max` is zero.
 fn publication_limits(declarations_max: usize) -> Result<PublicationLimits, RiftError> {
-    Ok(PublicationLimits::new(
-        PROVIDERS_MAX_DEFAULT,
-        declarations_max,
-        declarations_max,
-    )?)
+    PublicationLimits::new(PROVIDERS_MAX_DEFAULT, declarations_max, declarations_max)
 }
 
 /// One syntax document and the placement its declarations are filed under.

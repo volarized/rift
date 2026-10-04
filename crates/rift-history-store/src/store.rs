@@ -167,7 +167,7 @@ impl HistoryStore {
         match Self::open_in(location) {
             Err(refused) => {
                 let Some(fallback) = location.in_worktree(&refused) else {
-                    return Err(refused);
+                    return refused.fail();
                 };
                 let mut store = Self::open_in(&fallback)?;
                 store.fallback = Some(WorktreeFallback {

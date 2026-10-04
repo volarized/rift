@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use rift_core::ProjectPath;
 use rift_core::line::{line_of, line_starts, without_ending};
-use rift_error::errors;
+use rift_error::{ErrorContext, ErrorValue, errors};
 use rift_index::{
     PatternCandidate, PatternCandidates, SymbolMatch, TextSourceFile, UnindexedRows, WorkspaceIndex,
 };
@@ -145,7 +145,9 @@ pub fn accepted_pattern(
         }
         _ => {}
     }
-    Pattern::parse(pattern, bounds.compiled_bytes_max).map(Some)
+    Pattern::parse(pattern, bounds.compiled_bytes_max)
+        .map(Some)
+        .map_err(|error| error.with(ErrorContext::new("field", ErrorValue::display("pattern"))))
 }
 
 /// One file to verify: the index holding it, and the spans of it the trigram index

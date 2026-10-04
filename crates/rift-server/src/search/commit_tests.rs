@@ -473,7 +473,7 @@ fn a_commit_search_without_a_store_is_unsupported() -> TestResult {
 
     for (service, detail) in [
         (unattached, "commit search"),
-        (disabled, "providers.history disabled"),
+        (disabled, "commit search (providers.history disabled)"),
     ] {
         let Err(refusal) = service.search_commits(&commit_search("beacon")?) else {
             return Err("a commit search needs the history store".into());

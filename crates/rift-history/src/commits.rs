@@ -332,13 +332,13 @@ impl Repository {
             .map_err(|error| {
                 errors::history::storage()
                     .operation("render commit time")
-                    .detail(&error)
+                    .detail(error)
                     .error()
             })?;
         let message = commit.message_raw().map_err(|error| {
             errors::history::storage()
                 .operation("read commit message")
-                .detail(&error)
+                .detail(error)
                 .error()
         })?;
         Ok(CommitFacts {

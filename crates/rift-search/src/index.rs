@@ -1672,7 +1672,8 @@ mod store_error_tests {
         assert_eq!(error.slug(), errors::index::lexical_unit_limit::SLUG);
         let message = error.to_string();
 
-        let action = "resize the request below the named limit";
+        let action = "reduce indexed units below 1 and retry";
+        assert_eq!(error.action(), action);
         assert_eq!(
             message.matches(action).count(),
             1,

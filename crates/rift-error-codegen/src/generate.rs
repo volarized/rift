@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
@@ -177,10 +177,11 @@ fn render_children(node: &Node<'_>) -> TokenStream {
             render_error(error)
         } else {
             let contents = render_children(child);
+            let imports = super_imports(&scope_import_names(child));
             quote! {
                 #[allow(missing_docs)]
                 pub mod #name {
-                    use super::*;
+                    #imports
                     pub use super::{FieldSet, OptionalFieldSet};
                     #contents
                 }
@@ -188,6 +189,73 @@ fn render_children(node: &Node<'_>) -> TokenStream {
         }
     });
     quote! { #(#modules)* }
+}
+
+fn scope_import_names(node: &Node<'_>) -> BTreeSet<&'static str> {
+    let mut names = node.error.map(error_import_names).unwrap_or_default();
+    for child in node.children.values() {
+        names.extend(scope_import_names(child));
+    }
+    names
+}
+
+fn error_import_names(error: &ir::Error) -> BTreeSet<&'static str> {
+    let mut names = BTreeSet::from([
+        "BuilderCore",
+        "ErrorContext",
+        "ErrorSlug",
+        "EvidenceFor",
+        "IntoRiftError",
+        "PhantomData",
+        "RiftError",
+    ]);
+    if !error.fields.is_empty() {
+        names.insert("ErrorValue");
+    }
+    if error.fields.iter().any(|field| !field.optional) {
+        names.extend(["SetState", "Unset"]);
+    }
+    for field in &error.fields {
+        add_bound_imports(&mut names, field);
+    }
+    names
+}
+
+fn add_bound_imports(names: &mut BTreeSet<&'static str>, field: &ir::Field) {
+    match field.field_type {
+        schema::FieldType::String => {
+            names.insert("Display");
+        }
+        schema::FieldType::Bool | schema::FieldType::Pid | schema::FieldType::Port => {
+            names.insert("Borrow");
+        }
+        schema::FieldType::Integer => {
+            names.insert("IntoInteger");
+        }
+        schema::FieldType::Unsigned => {
+            names.insert("IntoUnsigned");
+        }
+        schema::FieldType::Path => {
+            names.insert("Path");
+        }
+        schema::FieldType::Duration => {
+            names.extend(["Borrow", "Duration"]);
+        }
+        schema::FieldType::Error => {
+            names.insert("Error");
+            if matches!(field.role, Some(schema::FieldRole::Source)) {
+                names.insert("Box");
+            }
+        }
+        schema::FieldType::RiftError => {
+            names.insert("IntoRiftError");
+        }
+    }
+}
+
+fn super_imports(names: &BTreeSet<&'static str>) -> TokenStream {
+    let names = names.iter().map(|name| ident(name));
+    quote! { use super::{#(#names),*}; }
 }
 
 fn render_error(error: &ir::Error) -> TokenStream {
@@ -213,7 +281,9 @@ fn render_error(error: &ir::Error) -> TokenStream {
     let complete_builder = builder_type(&complete_states);
 
     let field_count = fields.len();
+    let error_imports = super_imports(&error_import_names(error));
     let ambient_methods = quote! {
+        #[must_use]
         pub fn with(mut self, context: ErrorContext) -> Self {
             self.core.with(context);
             self
@@ -307,7 +377,13 @@ fn render_error(error: &ir::Error) -> TokenStream {
     let terminal = if state_names.is_empty() {
         quote! {
             impl Builder {
+                #[must_use]
                 pub fn error(self) -> RiftError { self.finish() }
+                /// Return this registered error as a failed result.
+                ///
+                /// # Errors
+                ///
+                /// Always returns this registered error.
                 pub fn fail<T>(self) -> Result<T, RiftError> { Err(self.finish()) }
                 #finish
             }
@@ -318,7 +394,13 @@ fn render_error(error: &ir::Error) -> TokenStream {
     } else {
         quote! {
             impl Builder<#(#complete_states),*> {
+                #[must_use]
                 pub fn error(self) -> RiftError { self.finish() }
+                /// Return this registered error as a failed result.
+                ///
+                /// # Errors
+                ///
+                /// Always returns this registered error.
                 pub fn fail<T>(self) -> Result<T, RiftError> { Err(self.finish()) }
                 #finish
             }
@@ -328,6 +410,7 @@ fn render_error(error: &ir::Error) -> TokenStream {
         }
     };
     let function_body = quote! {
+        #[must_use]
         pub fn #function() -> #function_builder {
             #function::Builder {
                 core: BuilderCore::new(ErrorSlug::new(#slug), #message, #action, #field_count),
@@ -339,7 +422,7 @@ fn render_error(error: &ir::Error) -> TokenStream {
     quote! {
         #[allow(non_camel_case_types, missing_docs, unused_parens)]
         pub mod #function {
-            use super::*;
+            #error_imports
             pub use super::{FieldSet, OptionalFieldSet};
             /// Stable registry identity for this error.
             pub const SLUG: ErrorSlug = ErrorSlug::new(#slug);
@@ -426,11 +509,25 @@ fn render_field(
         quote! {}
     };
     let _ = error;
+    let mut imports = BTreeSet::from(["Builder", "ErrorValue"]);
+    if !required.is_empty() {
+        imports.insert("PhantomData");
+    }
+    if !field.optional {
+        imports.insert("SetState");
+    }
+    add_bound_imports(&mut imports, field);
+    let imports = super_imports(&imports);
+    let optional_set_reexport = if field.optional {
+        quote! { pub use super::OptionalFieldSet as SetOptional; }
+    } else {
+        quote! {}
+    };
     quote! {
         pub mod #name {
-            use super::*;
+            #imports
             pub use super::FieldSet as Set;
-            pub use super::OptionalFieldSet as SetOptional;
+            #optional_set_reexport
             pub struct Field;
             #implementation
             #optional_impl

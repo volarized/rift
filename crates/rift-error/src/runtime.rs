@@ -440,7 +440,7 @@ impl BuilderCore {
 }
 
 impl RiftError {
-    /// Creates a registered error from rendered message and action templates.
+    /// Creates a registered error from message and action templates.
     #[must_use]
     pub fn new(
         slug: ErrorSlug,
@@ -469,7 +469,10 @@ impl RiftError {
     }
 
     /// Returns this error through a function's result type.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns this error.
     pub fn fail<T>(self) -> Result<T, Self> {
         Err(self)
     }
@@ -507,7 +510,6 @@ impl RiftError {
     }
 
     /// Returns visible evidence as context strings.
-    #[must_use]
     pub fn context(&self) -> impl Iterator<Item = (&'static str, String)> + '_ {
         self.fields
             .iter()
@@ -572,6 +574,7 @@ impl fmt::Debug for RiftError {
             .field("message", &self.detail())
             .field("action", &render_visible(&self.action, &self.fields))
             .field("fields", &self.fields)
+            .field("templated_fields", &self.templated_fields)
             .finish()
     }
 }
@@ -789,7 +792,12 @@ mod tests {
             "retry",
             vec![ErrorContext::new("source", ErrorValue::source(source))],
         );
-        assert_eq!(Error::source(&error).unwrap().to_string(), "disk failed");
+        assert_eq!(
+            Error::source(&error)
+                .expect("stored error source remains available")
+                .to_string(),
+            "disk failed"
+        );
 
         let cause = RiftError::new(ErrorSlug::new("rift.test.cause"), "inner", "retry", vec![]);
         let error = RiftError::new(
@@ -798,7 +806,12 @@ mod tests {
             "retry",
             vec![ErrorContext::new("cause", ErrorValue::cause(cause))],
         );
-        assert_eq!(Error::source(&error).unwrap().to_string(), "inner; retry");
+        assert_eq!(
+            Error::source(&error)
+                .expect("registered cause remains available")
+                .to_string(),
+            "inner; retry"
+        );
     }
 
     #[test]
@@ -985,11 +998,16 @@ mod tests {
         let port = 8080_u16;
 
         assert_eq!(ErrorValue::unsigned(count).rendered(), "7");
-        assert_eq!(ErrorValue::unsigned(&count).rendered(), "7");
+        let count_ref = &count;
+        assert_eq!(ErrorValue::unsigned(count_ref).rendered(), "7");
         assert_eq!(ErrorValue::integer(code).rendered(), "-3");
-        assert_eq!(ErrorValue::integer(&code).rendered(), "-3");
-        assert_eq!(ErrorValue::bool_value(&enabled).rendered(), "true");
-        assert_eq!(ErrorValue::pid(&pid).rendered(), "42");
-        assert_eq!(ErrorValue::port(&port).rendered(), "8080");
+        let code_ref = &code;
+        assert_eq!(ErrorValue::integer(code_ref).rendered(), "-3");
+        let enabled_ref = &enabled;
+        assert_eq!(ErrorValue::bool_value(enabled_ref).rendered(), "true");
+        let pid_ref = &pid;
+        assert_eq!(ErrorValue::pid(pid_ref).rendered(), "42");
+        let port_ref = &port;
+        assert_eq!(ErrorValue::port(port_ref).rendered(), "8080");
     }
 }

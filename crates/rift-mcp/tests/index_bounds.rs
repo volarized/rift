@@ -139,7 +139,9 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
         "the refused commit never reached search",
         |answer| {
             warning_detail(answer, "lexical_ranking_unavailable").is_some_and(|detail| {
-                detail.contains("units_max") && detail.contains("maximum 1000")
+                detail.ends_with(
+                    "lexical index received more units than its accepted limit of 1000: field units_max, observed 1109; resend the same request after a short delay",
+                )
             })
         },
     )
@@ -338,14 +340,28 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
         }
         tokio::time::sleep(ANSWER_POLL).await;
     };
-    let refusal_text = format!(
-        "{} {}",
-        refusal.message,
-        refusal.data.unwrap_or(Value::Null)
-    );
+    let refused_path = directory.path().canonicalize()?.join("bulk-15.txt");
     assert!(
-        refusal_text.contains("source.workspace_size") && refusal_text.contains("maximum 16777216"),
-        "the read refusal must name the key and its maximum: {refusal_text}"
+        refusal.message
+            == format!(
+                "workspace source bytes exceed their accepted limit of 16777216: field source.workspace_size, observed 16777322, path {}; reduce workspace source bytes below 16777216 and retry",
+                refused_path.display()
+            ),
+        "the read refusal must retain its exact bound and path: {}",
+        refusal.message
+    );
+    let data = refusal.data.expect("the refusal carries wire data");
+    assert_eq!(data["code"], json!("limit_exceeded"), "{data:#}");
+    assert_eq!(data["retry"], json!("never"), "{data:#}");
+    assert_eq!(data["phase"], json!("read"), "{data:#}");
+    assert_eq!(
+        data["limit"],
+        json!({
+            "field": "source.workspace_size",
+            "limit": 16_777_216_u64,
+            "required": 16_777_322_u64,
+        }),
+        "the refusal must carry exact typed bound evidence: {data:#}"
     );
     client.cancel().await?;
     server_task.await?;
@@ -370,9 +386,13 @@ async fn the_same_workspace_serves_under_the_default_workspace_size_and_a_change
     assert!(hit_paths(&stale).contains(&"lib.rs"), "{stale:#}");
     let detail = warning_detail(&stale, "stale_index")
         .ok_or_else(|| format!("the answer carries stale_index: {stale:#}"))?;
+    let failed_path = directory.path().canonicalize()?.join("bulk-15.txt");
     assert!(
-        detail.contains("source.workspace_size") && detail.contains("maximum 16777216"),
-        "the warning must name the key and its maximum: {detail}"
+        detail.ends_with(&format!(
+            "workspace source bytes exceed their accepted limit of 16777216: field source.workspace_size, observed 16777322, path {}; reduce workspace source bytes below 16777216 and retry; the next filesystem event retries the rebuild",
+            failed_path.display()
+        )),
+        "the warning must retain the exact bound, path, and recovery: {detail}"
     );
 
     // The restored file reaches the server through the filesystem watcher, so the

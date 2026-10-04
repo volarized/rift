@@ -351,6 +351,16 @@ fn write_commit(
                 .detail(source)
                 .error()
         })?;
+    write_commit_paths_and_declarations(transaction, row, commit)?;
+    Ok(())
+}
+
+/// Writes path and declaration rows that belong to one commit row.
+fn write_commit_paths_and_declarations(
+    transaction: &rusqlite::Transaction<'_>,
+    row: i64,
+    commit: &CommitRecord,
+) -> Result<(), RiftError> {
     for changed in &commit.paths {
         transaction
             .prepare_cached("INSERT INTO changed_paths VALUES (?1, ?2, ?3, ?4)")

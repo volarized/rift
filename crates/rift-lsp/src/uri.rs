@@ -534,7 +534,7 @@ mod tests {
                 .context()
                 .any(|(key, value)| key == "path_kind" && value == "project")
         );
-        assert!(error.to_string().contains("violation dot_segment"));
+        assert_eq!(error.message(), "project path contains a dot segment");
     }
 
     #[test]
@@ -836,12 +836,13 @@ mod tests {
         let cause = source
             .downcast_ref::<RiftError>()
             .expect("registered path error");
+        assert_eq!(cause.slug(), errors::core::path_backslash::SLUG);
+        assert_eq!(cause.message(), "source path contains a backslash");
         assert!(
             cause
                 .context()
-                .any(|(key, value)| key == "violation" && value == "backslash")
+                .any(|(key, value)| key == "path_kind" && value == "source")
         );
         assert!(error.to_string().contains("identity source_unit"));
-        assert!(error.to_string().contains("violation backslash"));
     }
 }

@@ -210,7 +210,18 @@ fn a_model_directory_missing_a_file_names_the_file() -> TestResult {
 fn an_empty_directory_is_refused_as_a_missing_model_file() -> TestResult {
     let directory = tempfile::tempdir()?;
     let error = ModelFiles::in_directory(directory.path()).expect_err("nothing is there");
-    assert!(error.to_string().contains("model_file_missing"), "{error}");
+    let subject = directory.path().join("config.json").display().to_string();
+    assert_eq!(error.slug(), errors::search::model_file_missing::SLUG);
+    assert_eq!(
+        error.message(),
+        format!("model directory is missing file {subject}")
+    );
+    assert_eq!(error.action(), "supply the missing model file and retry");
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "subject" && value == subject)
+    );
     Ok(())
 }
 
@@ -224,7 +235,23 @@ fn unreadable_weights_are_refused_without_a_panic() -> TestResult {
     )?;
     let files = ModelFiles::in_directory(directory.path())?;
     let error = Encoder::load(&files, limits()).expect_err("the weights are not weights");
-    assert!(error.to_string().contains("weights_unreadable"), "{error}");
+    let path = directory
+        .path()
+        .join("model.safetensors")
+        .display()
+        .to_string();
+    assert_eq!(error.slug(), errors::search::weights_unreadable::SLUG);
+    assert_eq!(error.message(), "model weights are unreadable");
+    assert_eq!(error.action(), "repair the model weights file and retry");
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == path)
+    );
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string().contains("header too large"))
+    );
     Ok(())
 }
 
@@ -235,9 +262,24 @@ fn an_invalid_configuration_is_refused_without_a_panic() -> TestResult {
     std::fs::write(directory.path().join("config.json"), b"{")?;
     let files = ModelFiles::in_directory(directory.path())?;
     let error = Encoder::load(&files, limits()).expect_err("the configuration is truncated");
+    let path = directory.path().join("config.json").display().to_string();
+    assert_eq!(
+        error.slug(),
+        errors::search::model_configuration_invalid::SLUG
+    );
+    assert_eq!(error.message(), "model configuration is invalid");
+    assert_eq!(
+        error.action(),
+        "provide a model configuration this encoder serves and retry"
+    );
     assert!(
-        error.to_string().contains("model_configuration_invalid"),
-        "{error}"
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == path)
+    );
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string().contains("EOF while parsing"))
     );
     Ok(())
 }
@@ -249,9 +291,22 @@ fn an_unreadable_tokenizer_is_refused_without_a_panic() -> TestResult {
     std::fs::write(directory.path().join("tokenizer.json"), b"{")?;
     let files = ModelFiles::in_directory(directory.path())?;
     let error = Encoder::load(&files, limits()).expect_err("the tokenizer is truncated");
+    let path = directory
+        .path()
+        .join("tokenizer.json")
+        .display()
+        .to_string();
+    assert_eq!(error.slug(), errors::search::tokenizer_unreadable::SLUG);
+    assert_eq!(error.message(), "model tokenizer is unreadable");
+    assert_eq!(error.action(), "repair the model tokenizer file and retry");
     assert!(
-        error.to_string().contains("tokenizer_unreadable"),
-        "{error}"
+        error
+            .context()
+            .any(|(key, value)| key == "path" && value == path)
+    );
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string().contains("EOF while parsing"))
     );
     Ok(())
 }
@@ -314,7 +369,14 @@ fn more_texts_than_the_bound_are_refused_before_any_pass_runs() -> TestResult {
         .embed_documents(&texts)
         .expect_err("the bound must refuse the call");
     assert_eq!(error.slug(), errors::search::text_limit::SLUG);
-    assert!(error.to_string().contains("9 texts, 8 allowed"), "{error}");
+    assert_eq!(
+        error.message(),
+        "encoder received 9 texts, exceeding accepted limit 8"
+    );
+    assert_eq!(error.action(), "reduce input texts below 8 and retry");
+    let evidence = error.context().collect::<Vec<_>>();
+    assert!(evidence.contains(&("observed", "9".to_owned())));
+    assert!(evidence.contains(&("limit", "8".to_owned())));
     Ok(())
 }
 

@@ -15,8 +15,9 @@ use rift_protocol::configuration::{
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
 
+use rift_error::errors::core::configuration_port_selection_conflict;
 use rift_error::{ErrorContext, RiftError, errors};
-use rift_protocol::configuration::ConfigurationViolation;
+use rift_protocol::configuration::ConfigurationViolation::{self, PortSelectionConflict};
 #[cfg(test)]
 use rift_protocol::configuration::UnitParseError;
 
@@ -385,9 +386,7 @@ pub fn configuration_violation_error(violation: &ConfigurationViolation) -> Rift
         ConfigurationViolation::LogCaptureInvalid { .. } => {
             build!(errors::core::configuration_log_capture_invalid())
         }
-        ConfigurationViolation::PortSelectionConflict => {
-            build!(errors::core::configuration_port_selection_conflict())
-        }
+        PortSelectionConflict => build!(configuration_port_selection_conflict()),
         ConfigurationViolation::PortRangeInverted { .. } => {
             build!(errors::core::configuration_port_range_inverted())
         }

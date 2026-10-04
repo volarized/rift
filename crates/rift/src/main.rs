@@ -280,8 +280,7 @@ impl CliError {
     fn code(&self) -> String {
         match self {
             Self::Mcp(error) => error.wire_code(),
-            Self::Update(error) => cli_code(error),
-            Self::Server(error) | Self::Install(error) => cli_code(error),
+            Self::Update(error) | Self::Server(error) | Self::Install(error) => cli_code(error),
         }
     }
 
@@ -318,9 +317,9 @@ fn cli_code(error: &rift_error::RiftError) -> String {
         "rift.cli.install_remove_failed" => "install_remove_failed",
         "rift.cli.install_settings_unparsable" => "install_settings_unparsable",
         "rift.cli.update_binary_invalid" => "update_binary_invalid",
-        "rift.cli.update_version_invalid" => "update_release_invalid",
         "rift.cli.update_staging_failed" => "update_staging_failed",
-        "rift.cli.update_release_tag_invalid"
+        "rift.cli.update_version_invalid"
+        | "rift.cli.update_release_tag_invalid"
         | "rift.cli.update_prerelease_unsupported"
         | "rift.cli.update_release_file_inspection_failed"
         | "rift.cli.update_release_file_not_regular"
@@ -357,9 +356,9 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mcp(error) => error.fmt(formatter),
-            Self::Server(error) => error.fmt(formatter),
-            Self::Update(error) => error.fmt(formatter),
-            Self::Install(error) => error.fmt(formatter),
+            Self::Server(error) | Self::Update(error) | Self::Install(error) => {
+                error.fmt(formatter)
+            }
         }
     }
 }
@@ -368,9 +367,7 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Mcp(error) => Some(error),
-            Self::Server(error) => Some(error),
-            Self::Update(error) => Some(error),
-            Self::Install(error) => Some(error),
+            Self::Server(error) | Self::Update(error) | Self::Install(error) => Some(error),
         }
     }
 }
@@ -482,10 +479,24 @@ mod tests {
 
     #[test]
     fn update_cli_error_preserves_message_and_source() {
-        let error = CliError::Update(super::update::error_for_test());
+        let failure = super::update::error_for_test();
+        assert_eq!(
+            failure.slug(),
+            rift_error::errors::cli::update_release_tag_invalid::SLUG
+        );
+        let error = CliError::Update(failure);
+        assert_eq!(error.code(), "update_release_invalid");
         assert_eq!(
             error.to_string(),
-            "release tag `vinvalid` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`"
+            "release tag `vinvalid` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`: source unexpected character 'i' while parsing major version number; use a stable release tag of the form `vMAJOR.MINOR.PATCH`"
+        );
+        assert!(rift_error::causes(&error).iter().any(|cause| {
+            cause == "unexpected character 'i' while parsing major version number"
+        }));
+        assert!(
+            error
+                .rendered()
+                .starts_with("rift: error[update_release_invalid]: ")
         );
         assert!(error.source().is_some());
     }

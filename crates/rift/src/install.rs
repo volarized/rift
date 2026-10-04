@@ -246,25 +246,25 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), RiftError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|source| {
         errors::cli::install_write_failed()
-            .path(path.to_owned())
+            .path(path)
             .source(source)
             .error()
     })?;
     staged.write_all(content.as_bytes()).map_err(|source| {
         errors::cli::install_write_failed()
-            .path(path.to_owned())
+            .path(path)
             .source(source)
             .error()
     })?;
     staged.as_file().sync_all().map_err(|source| {
         errors::cli::install_write_failed()
-            .path(path.to_owned())
+            .path(path)
             .source(source)
             .error()
     })?;
     staged.persist(path).map_err(|error| {
         errors::cli::install_write_failed()
-            .path(path.to_owned())
+            .path(path)
             .source(error.error)
             .error()
     })?;
@@ -466,13 +466,13 @@ fn read_settings(path: &Path) -> Result<Value, RiftError> {
     match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str::<Value>(&text).map_err(|source| {
             errors::cli::install_settings_unparsable()
-                .path(path.to_owned())
+                .path(path)
                 .source(source)
                 .error()
         }),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(json!({})),
         Err(source) => errors::cli::install_settings_unparsable()
-            .path(path.to_owned())
+            .path(path)
             .source(source)
             .fail(),
     }
@@ -494,7 +494,7 @@ fn write_hook(settings_path: PathBuf, remove: bool) -> Result<HookOutcome, RiftE
         let parent = settings_path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent).map_err(|source| {
             errors::cli::install_write_failed()
-                .path(parent.to_owned())
+                .path(parent)
                 .source(source)
                 .error()
         })?;
@@ -639,7 +639,7 @@ mod tests {
 
         let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         let write = errors::cli::install_write_failed()
-            .path(Path::new("skill/SKILL.md").to_owned())
+            .path(Path::new("skill/SKILL.md"))
             .source(denied())
             .error();
         assert_eq!(write.slug(), errors::cli::install_write_failed::SLUG);
@@ -647,7 +647,7 @@ mod tests {
         assert!(write.source().is_some(), "{write}");
 
         let remove = errors::cli::install_remove_failed()
-            .path(Path::new("skill").to_owned())
+            .path(Path::new("skill"))
             .source(denied())
             .error();
         assert_eq!(remove.slug(), errors::cli::install_remove_failed::SLUG);
@@ -672,7 +672,7 @@ mod tests {
         assert!(std::error::Error::source(&template).is_none(), "{template}");
 
         let settings = errors::cli::install_settings_unparsable()
-            .path(Path::new("x/.claude/settings.json").to_owned())
+            .path(Path::new("x/.claude/settings.json"))
             .source(io::Error::new(io::ErrorKind::InvalidData, "bad json"))
             .error();
         assert_eq!(

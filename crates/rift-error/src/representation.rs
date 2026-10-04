@@ -7,6 +7,10 @@ pub trait IntoRiftError: Sized {
     fn into_rift_error(self) -> RiftError;
 
     /// Returns this error through a function's result type.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RiftError`] produced by [`Self::into_rift_error`].
     fn fail<T>(self) -> Result<T, RiftError> {
         self.into_rift_error().fail()
     }

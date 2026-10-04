@@ -562,7 +562,13 @@ impl HubEnvironment {
                         .join(HUB_DIRECTORY)
                 })
             })
-            .ok_or_else(|| errors::search::model_cache_unavailable().error())
+            .ok_or_else(|| {
+                errors::search::model_cache_unavailable()
+                    .variables(format!(
+                        "{HUB_CACHE_VARIABLE}, {HUB_HOME_VARIABLE}, {CACHE_HOME_VARIABLE}, {USER_HOME_VARIABLE}, {USER_PROFILE_VARIABLE}"
+                    ))
+                    .error()
+            })
     }
 
     /// The origin one file is read from.
@@ -1244,10 +1250,22 @@ mod tests {
             .cache_root()
             .expect_err("no variable names a root");
         assert_eq!(error.slug(), errors::search::model_cache_unavailable::SLUG);
+        let variables = format!(
+            "{HUB_CACHE_VARIABLE}, {HUB_HOME_VARIABLE}, {CACHE_HOME_VARIABLE}, {USER_HOME_VARIABLE}, {USER_PROFILE_VARIABLE}"
+        );
+        let expected_message = format!(
+            "model cache directory could not be resolved from environment variables {variables}"
+        );
+        assert_eq!(error.message(), expected_message);
         let rendered = error.to_string();
-        assert!(rendered.contains("model_cache_unavailable"), "{rendered}");
-        assert!(rendered.contains(HUB_CACHE_VARIABLE), "{rendered}");
-        assert!(rendered.contains(USER_HOME_VARIABLE), "{rendered}");
+        assert_eq!(
+            rendered,
+            format!("{expected_message}; set a model cache directory and retry")
+        );
+        assert_eq!(
+            error.context().collect::<Vec<_>>(),
+            vec![("variables", variables)]
+        );
     }
 
     #[test]

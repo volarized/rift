@@ -610,7 +610,7 @@ fn path_revision(
         .map_err(|error| {
             errors::history::storage()
                 .operation("render commit time")
-                .detail(&error)
+                .detail(error)
                 .error()
         })?;
     let summary = commit
@@ -618,7 +618,7 @@ fn path_revision(
         .map_err(|error| {
             errors::history::storage()
                 .operation("read commit message")
-                .detail(&error)
+                .detail(error)
                 .error()
         })?
         .summary()
@@ -643,7 +643,7 @@ pub(crate) fn commit_author(commit: &gix::Commit<'_>) -> Result<(String, String)
     let author = commit.author().map_err(|error| {
         errors::history::storage()
             .operation("read commit author")
-            .detail(&error)
+            .detail(error)
             .error()
     })?;
     Ok((

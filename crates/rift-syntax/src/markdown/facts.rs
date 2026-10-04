@@ -1567,7 +1567,7 @@ mod tests {
         assert!(context.contains(&("path", "docs/facts.md".to_owned())));
         assert!(context.contains(&("inline_ranges_max", "0".to_owned())));
         assert!(context.contains(&("observed", "1".to_owned())));
-        assert!(error.to_string().contains("1"));
+        assert!(error.to_string().contains('1'));
     }
 
     #[test]

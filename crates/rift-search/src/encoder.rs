@@ -1122,12 +1122,16 @@ mod tests {
             .source(cause)
             .error();
         assert_eq!(error.slug(), errors::search::encode_failed::SLUG);
-        let rendered = error.to_string();
-        assert!(rendered.contains("encode_failed"), "{rendered}");
-        assert!(rendered.contains("the forward pass"), "{rendered}");
+        assert_eq!(error.message(), "text encoding failed");
         assert!(
-            std::error::Error::source(&error).is_some(),
-            "the candle failure rides as the source"
+            error
+                .context()
+                .any(|(key, value)| key == "stage" && value == "the forward pass")
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.to_string().contains("shape mismatch")),
+            "the Candle source keeps its shape mismatch"
         );
     }
 
@@ -1234,9 +1238,12 @@ mod tests {
             .embed_documents(&["beta".to_owned()])
             .expect_err("the beta row is not in the table");
         assert_eq!(error.slug(), errors::search::encode_failed::SLUG);
-        let rendered = error.to_string();
-        assert!(rendered.contains("token 4"), "{rendered}");
-        assert!(rendered.contains("4 rows"), "{rendered}");
+        assert_eq!(error.message(), "text encoding failed");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| { key == "stage" && value == "token 4 is past 4 weight rows" })
+        );
         Ok(())
     }
 

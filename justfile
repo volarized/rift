@@ -108,9 +108,9 @@ coldstart-test *args:
 integration-test:
     {{ rift_dev }} integration-test
 
-quick-gate: format dashes generate-check check
+quick-gate: format dashes generate-check check clippy
 
-rust-gate: quick-gate clippy docs doctest audit test release-test installer-test testing-check
+rust-gate: quick-gate docs doctest audit test release-test installer-test testing-check
 
 # One signed tag on the commit `origin/main` names right now; pushing it starts
 # `rift-release`.

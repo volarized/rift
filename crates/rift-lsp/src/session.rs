@@ -995,7 +995,7 @@ impl EngineSession {
                     Ok(None)
                 }
                 Ok(Ok(payload)) => self.route_waited(payload).await,
-                Ok(Err(error)) => Err(error),
+                Ok(Err(error)) => error.fail(),
             };
             match unread {
                 Ok(None) => {}
@@ -1335,13 +1335,12 @@ impl EngineSession {
                         .code(code)
                         .message(message)
                         .fail();
-                } else {
-                    return errors::lsp::engine_refused_terminal()
-                        .method(method)
-                        .code(code)
-                        .message(message)
-                        .fail();
                 }
+                return errors::lsp::engine_refused_terminal()
+                    .method(method)
+                    .code(code)
+                    .message(message)
+                    .fail();
             }
             let result = incoming.result.unwrap_or(Value::Null);
             return serde_json::from_value(result).map_err(|source| {

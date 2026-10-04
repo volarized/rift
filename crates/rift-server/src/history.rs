@@ -1015,11 +1015,14 @@ mod tests {
             None,
         )
         .expect_err("a disabled provider must refuse before any repository access");
-        assert!((error.slug() == rift_error::errors::server::read_unsupported::SLUG));
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unsupported::SLUG
+        );
     }
 
     #[test]
-    fn open_refuses_an_unborn_head() {
+    fn open_classifies_an_unborn_head_as_an_unknown_revision() {
         let directory = tempfile::tempdir().expect("temp dir");
         rift_history::fixture::init(directory.path());
         let error = SymbolTimelines::open(
@@ -1030,7 +1033,15 @@ mod tests {
             None,
         )
         .expect_err("a repository without commits resolves no HEAD");
-        assert_eq!(error.slug(), rift_error::errors::history::unversioned::SLUG);
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::history::revision_unknown::SLUG
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "rev" && value == "HEAD")
+        );
     }
 
     /// One `beacon_one` timeline over the shared-path fixture, composed

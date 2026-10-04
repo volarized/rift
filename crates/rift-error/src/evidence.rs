@@ -58,6 +58,7 @@ mod tests {
 
         let target = Builder(Vec::new());
         let value = Some(Evidence("borrowed"));
-        assert_eq!((&value).apply_evidence(target), Builder(vec!["borrowed"]));
+        let value_ref = &value;
+        assert_eq!(value_ref.apply_evidence(target), Builder(vec!["borrowed"]));
     }
 }

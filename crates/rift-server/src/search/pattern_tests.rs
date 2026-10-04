@@ -372,11 +372,15 @@ async fn orders_other_than_relevance_sort_the_hits() -> TestResult {
 }
 
 /// The refusal `request` meets, as its field and message.
-fn refusal(service: &ReadService, request: Value) -> TestResult<String> {
+fn refusal(
+    service: &ReadService,
+    request: Value,
+    expected_slug: rift_error::ErrorSlug,
+) -> TestResult<String> {
     let error = service
         .search(&params(request)?, &StoreAnswer::identifier_only())
         .expect_err("the request is refused");
-    assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+    assert_eq!(error.slug(), expected_slug);
     assert!(
         error
             .context()
@@ -391,29 +395,49 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
     let (_directory, service) = fixture()?;
     let too_long = "a".repeat(SEARCH_PATTERN_CHARS_MAX + 1);
     let cases = [
-        (json!({"pattern": "useState("}), "unclosed group"),
-        (json!({"pattern": too_long}), "exceeds the maximum 1024"),
-        (json!({"pattern": ""}), "empty"),
+        (
+            json!({"pattern": "useState("}),
+            "unclosed group",
+            rift_error::errors::ranking::pattern_syntax::SLUG,
+        ),
+        (
+            json!({"pattern": too_long}),
+            "exceeds the maximum 1024",
+            rift_error::errors::server::read_invalid::SLUG,
+        ),
+        (
+            json!({"pattern": ""}),
+            "empty",
+            rift_error::errors::server::read_invalid::SLUG,
+        ),
         (
             json!({"pattern": "\\w{500}"}),
-            "exceeds 1048576 bytes, the [search] pattern_compiled_size bound",
+            "the compiled pattern exceeds 1048576 bytes",
+            rift_error::errors::ranking::pattern_size::SLUG,
         ),
-        (json!({"pattern": "TODO", "query": "todo"}), "`query`"),
+        (
+            json!({"pattern": "TODO", "query": "todo"}),
+            "`query`",
+            rift_error::errors::server::read_invalid::SLUG,
+        ),
         (
             json!({"pattern": "TODO", "traversal": {"seed": "rift://symbol/rust/src/lib.rs/alpha"}}),
             "a walk answers relationships",
+            rift_error::errors::server::read_invalid::SLUG,
         ),
         (
             json!({"pattern": "TODO", "change": {"base": "main"}}),
             "committed revisions",
+            rift_error::errors::server::read_invalid::SLUG,
         ),
         (
             json!({"pattern": "TODO", "rev": "main"}),
             "current tree alone",
+            rift_error::errors::server::read_invalid::SLUG,
         ),
     ];
-    for (request, expected) in cases {
-        let message = refusal(&service, request.clone())?;
+    for (request, expected, expected_slug) in cases {
+        let message = refusal(&service, request.clone(), expected_slug)?;
         assert!(message.contains(expected), "{request}: {message}");
     }
     let documentation = service
@@ -422,7 +446,10 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
             &StoreAnswer::identifier_only(),
         )
         .expect_err("documentation blocks answer no pattern");
-    assert!((documentation.slug() == rift_error::errors::server::read_unsupported::SLUG));
+    assert_eq!(
+        documentation.slug(),
+        rift_error::errors::server::read_unsupported::SLUG
+    );
     Ok(())
 }
 

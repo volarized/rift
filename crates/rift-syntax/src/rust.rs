@@ -1281,9 +1281,9 @@ mod tests {
             assert_eq!(error.slug(), errors::syntax::invalid_query::SLUG);
             assert_eq!(
                 std::error::Error::source(&error)
-                    .unwrap()
+                    .expect("invalid query carries tree-sitter source")
                     .downcast_ref::<tree_sitter::QueryError>()
-                    .unwrap()
+                    .expect("query source is tree-sitter QueryError")
                     .kind,
                 kind,
                 "classifies {query}"
@@ -1305,7 +1305,7 @@ mod tests {
                 .context()
                 .any(|(key, _)| key == "grammar_abi_version")
         );
-        let cancelled = errors::syntax::parse_cancelled().path(&path()).error();
+        let cancelled = errors::syntax::parse_cancelled().path(path()).error();
         assert_eq!(cancelled.slug(), errors::syntax::parse_cancelled::SLUG);
         assert_eq!(
             cancelled.context().collect::<Vec<_>>(),

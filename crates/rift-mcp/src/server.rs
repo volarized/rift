@@ -4715,10 +4715,17 @@ done
             return Err("invalid path must return an MCP error".into());
         };
         assert_eq!(data.code, ErrorCode(-32000));
-        assert!(data.message.contains("request field path is invalid"));
+        assert_eq!(
+            data.message,
+            "the request does not match the documented form: field path, \
+             violation project path contains a dot segment: cause project path contains a dot segment; \
+             use a workspace-relative path with `/` separators and no `.` or `..` components; \
+             correct the reported field and resend the request"
+        );
         let wire = data.data.ok_or("invalid path carries wire error data")?;
         assert_eq!(wire["code"], "invalid_request");
         assert_eq!(wire["retry"], "never");
+        assert_eq!(wire["phase"], "read");
         assert!(wire["causes"].as_array().is_some_and(|causes| {
             causes.iter().any(|cause| {
                 cause["message"]
@@ -6581,7 +6588,8 @@ done
         assert_eq!(data.code, ErrorCode(-32000));
         assert_eq!(
             data.message.as_ref(),
-            "request field query is invalid: empty; correct the reported field and resend the request"
+            "the request does not match the documented form: field query, \
+             violation empty; correct the reported field and resend the request"
         );
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
@@ -6600,10 +6608,17 @@ done
         assert_eq!(data.code, ErrorCode(-32000));
         assert_eq!(
             data.message.as_ref(),
-            "request field limit is invalid: zero; correct the reported field and resend the request"
+            "the request does not match the documented form: field limit, \
+             violation zero; correct the reported field and resend the request"
         );
         let wire = data.data.ok_or("wire error data must be present")?;
         assert_eq!(wire["code"], json!("invalid_request"));
+        assert_eq!(wire["retry"], json!("never"));
+        assert_eq!(wire["phase"], json!("read"));
+        assert!(
+            wire.get("causes").is_none(),
+            "a failure with no causal chain must omit causes"
+        );
         Ok(())
     }
 

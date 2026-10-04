@@ -1827,8 +1827,9 @@ mod tests {
             .expect_err("a workspace with no repository must refuse");
 
         assert_eq!(error.slug(), errors::history::unversioned::SLUG);
+        let canonical = fs::canonicalize(fixture.directory.path())?;
         assert!(error.context().any(|(key, value)| {
-            key == "workspace" && value == fixture.directory.path().display().to_string()
+            key == "workspace" && value == canonical.display().to_string()
         }));
         Ok(())
     }

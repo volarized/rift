@@ -285,7 +285,7 @@ mod tests {
             error
                 .context()
                 .find(|(key, _)| *key == "encoding")
-                .unwrap()
+                .expect("unsupported encoding evidence is present")
                 .1,
             "utf-32"
         );

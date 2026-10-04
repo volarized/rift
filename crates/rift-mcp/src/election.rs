@@ -48,7 +48,7 @@ const UNPUBLISHED_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 /// once; the bound only keeps a probe from hanging on a filtered socket.
 const PRESENCE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
-fn election_document_invalid(violation: ServerLockViolation) -> RiftError {
+fn election_document_invalid(violation: &ServerLockViolation) -> RiftError {
     let mut builder = errors::mcp::election_document_invalid();
     for (key, value) in violation.evidence() {
         builder = builder.with(ErrorContext::new(key, value));
@@ -175,7 +175,8 @@ impl ElectionGuard {
     /// Returns a registered error when the document breaks the [`ServerLock`]
     /// contract or staging or renaming fails.
     pub fn publish(&self, lock: &ServerLock) -> Result<(), RiftError> {
-        lock.validate().map_err(election_document_invalid)?;
+        lock.validate()
+            .map_err(|violation| election_document_invalid(&violation))?;
         let bytes = serde_json::to_vec(lock).map_err(|error| {
             errors::mcp::election_storage_failed()
                 .operation("serialize lock document")
@@ -1269,7 +1270,7 @@ mod tests {
         let violation = document
             .validate()
             .expect_err("a zero pid must break the contract");
-        let error = super::election_document_invalid(violation);
+        let error = super::election_document_invalid(&violation);
         let context = error.context().collect::<Vec<_>>();
         assert!(
             context.iter().any(|(key, _)| *key == "pid"),

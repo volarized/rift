@@ -151,9 +151,18 @@ def test_stop_rejects_status_after_original_deadline(
         check_coldstart.stop_container("fixture", 7)
 
 
-@pytest.mark.parametrize("failed_launch", [True, False])
+@pytest.mark.parametrize(
+    ("failed_launch", "cause_message"),
+    [
+        (True, "No such file or directory (os error 2)"),
+        (True, None),
+        (False, None),
+    ],
+)
 def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
-    monkeypatch: pytest.MonkeyPatch, failed_launch: bool
+    monkeypatch: pytest.MonkeyPatch,
+    failed_launch: bool,
+    cause_message: str | None,
 ) -> None:
     from contextlib import nullcontext
     from typing import cast
@@ -170,8 +179,25 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
             if failed_launch:
                 raise MCPError(
                     code=-32000,
-                    message="launch_failed",
-                    data={"code": "capability_unavailable"},
+                    message="language engine could not start",
+                    data={
+                        "code": "capability_unavailable",
+                        "retry": "operator_action",
+                        "phase": "read",
+                        **(
+                            {
+                                "causes": [
+                                    {
+                                        "code": "capability_unavailable",
+                                        "message": cause_message,
+                                        "retry": "operator_action",
+                                    }
+                                ]
+                            }
+                            if cause_message is not None
+                            else {}
+                        ),
+                    },
                 )
             return {"results": []}
         assert name == "get_symbol"
@@ -196,13 +222,15 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
         "container_command",
         lambda name, arguments: commands.append((name, arguments)),
     )
-    with (
-        nullcontext()
-        if failed_launch
-        else pytest.raises(AssertionError, match="answered references")
-    ):
+    if cause_message is not None:
+        expected = nullcontext()
+    elif failed_launch:
+        expected = pytest.raises(AssertionError, match="lost launch cause")
+    else:
+        expected = pytest.raises(AssertionError, match="answered references")
+    with expected:
         asyncio.run(
             check_coldstart.check_missing_executable(cast(Client, client), "fixture")
         )
-    assert len(reads) == (2 if failed_launch else 1)
+    assert len(reads) == (2 if cause_message is not None else 1)
     assert commands[0][1][-1] == '[languages.rust.lsp]\ncommand = ["rust-analyzer"]\n'
