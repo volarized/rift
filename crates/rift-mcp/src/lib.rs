@@ -34,7 +34,7 @@ pub use http::{
 };
 pub use identity::{BuildCheckout, product_identity_of};
 pub use logs::{
-    LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogSettlement, LogSink,
+    LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogLane, LogSettlement, LogSink,
     PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture, logs_configuration,
 };
 pub use output::OutputPolicy;

@@ -201,6 +201,33 @@ impl LogSink {
     }
 }
 
+/// What a stop asks of the log lane once its drain is joined or aborted: how many records
+/// it took and never wrote.
+///
+/// A clone taken before the drain runs keeps answering after the drain task is aborted.
+#[derive(Clone, Debug)]
+pub struct LogLane {
+    dropped: Arc<AtomicU64>,
+    settlement: Arc<LogSettlement>,
+}
+
+impl LogLane {
+    /// Records the lane accepted and has not finished with, plus dropped records whose
+    /// count no batch has carried yet.
+    ///
+    /// After the drain is aborted, this is what the stop lost: the queued records, the
+    /// batch the drain held, and the drops its next batch would have reported. Drops a
+    /// held batch already carried in its notice are not counted again.
+    #[must_use]
+    pub fn unwritten(&self) -> u64 {
+        let accepted = self.settlement.accepted.load(Ordering::SeqCst);
+        let finished = self.settlement.progress.borrow().finished;
+        accepted
+            .saturating_sub(finished)
+            .saturating_add(self.dropped.load(Ordering::Relaxed))
+    }
+}
+
 /// The queue's reading end, and the task that writes it into the store.
 #[derive(Debug)]
 pub struct LogDrain {
@@ -210,6 +237,15 @@ pub struct LogDrain {
 }
 
 impl LogDrain {
+    /// A handle on this drain's lane that outlives the drain task.
+    #[must_use]
+    pub fn lane(&self) -> LogLane {
+        LogLane {
+            dropped: Arc::clone(&self.dropped),
+            settlement: Arc::clone(&self.settlement),
+        }
+    }
+
     /// One queued record, without waiting; for a test that reads the queue without a store.
     #[cfg(test)]
     pub(crate) fn try_recv_record(&mut self) -> Result<LogRecord, mpsc::error::TryRecvError> {
@@ -984,6 +1020,77 @@ mod tests {
             .connect()
             .and_then(|reads| reads.count())
             .expect("the count reads")
+    }
+
+    /// The lane counts what it accepted and never finished, and drops no batch carried yet.
+    #[tokio::test]
+    async fn a_lane_counts_its_unwritten_records() {
+        let (sink, drain) = log_capture();
+        let lane = drain.lane();
+        assert_eq!(
+            lane.unwritten(),
+            0,
+            "an empty lane leaves nothing unwritten"
+        );
+        let subscriber = tracing_subscriber::registry().with(sink.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(component = "logs", "first");
+            tracing::info!(component = "logs", "second");
+        });
+        assert_eq!(lane.unwritten(), 2, "queued records are unwritten");
+        drain.dropped.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(lane.unwritten(), 5, "drops no batch carried count too");
+
+        let (_directory, store) = store().await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        drain.run(Arc::clone(&store), 100, cancellation).await;
+
+        assert_eq!(
+            lane.unwritten(),
+            0,
+            "a flushed lane leaves nothing unwritten"
+        );
+        assert_eq!(
+            count(&store),
+            3,
+            "the two records and the drop notice landed"
+        );
+    }
+
+    /// A drain whose flush meets another connection's write lock on the metrics database
+    /// outlasts its bound; once aborted, its lane reports every record it accepted.
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_drain_behind_a_held_metrics_lock_leaves_its_records_unwritten() {
+        const ACCEPTED: u64 = 4;
+        let (directory, store) = store().await;
+        let holder = rusqlite::Connection::open(directory.path().join("metrics"))
+            .expect("the holding connection opens");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the holding connection takes the write lock");
+        let (sink, drain) = log_capture();
+        let lane = drain.lane();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
+            for record in 0..ACCEPTED {
+                tracing::info!(component = "logs", record, "behind the held lock");
+            }
+        });
+        let cancellation = CancellationToken::new();
+        let mut task = tokio::spawn(drain.run(Arc::clone(&store), 100, cancellation.clone()));
+        cancellation.cancel();
+
+        let bound = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let joined = tokio::time::timeout_at(bound, &mut task).await;
+        assert!(
+            joined.is_err(),
+            "the flush waits on the held lock past its bound"
+        );
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(lane.unwritten(), ACCEPTED);
+        drop(holder);
     }
 
     #[test]

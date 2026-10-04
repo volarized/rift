@@ -53,8 +53,19 @@ const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// flush runs, each taking only what the stage before it left of that
 /// deadline.
 const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(4);
-/// Shutdown time reserved for the shared SQLite worker after final log writes.
+/// Time the stop keeps for the metrics database's close, its last stage: the log drain's
+/// final flush ends this long before the stop's deadline.
 const SERVER_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
+/// Time the stop keeps for the log drain's final flush: the index and vectors databases
+/// close by this long before the flush's own bound, so the flush can write what their
+/// close recorded.
+const SERVER_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
+// The two reserves leave the serving stages and the index and vectors close a share of
+// the stop's deadline.
+const _: () = assert!(
+    SERVER_DATABASE_STOP_RESERVE.as_millis() + SERVER_LOG_FLUSH_RESERVE.as_millis()
+        < SERVER_STOP_DEADLINE.as_millis()
+);
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The form `--tail` accepts, named in every refusal.
@@ -889,11 +900,17 @@ fn process_absent(error: &io::Error) -> bool {
 /// same token stops it.
 ///
 /// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
-/// task drains, the engines and index supervisor shut down, the log drain's
-/// final flush runs, and only then is the election released, by dropping the
-/// guard right before the process exits - so a stop the CLI reports as
-/// success means the process is leaving. The deadline starts where the stop
-/// begins, and each stage takes only what the one before it left of it.
+/// task drains and the engines and index supervisor shut down; the index and
+/// vectors databases close, by [`SERVER_LOG_FLUSH_RESERVE`] and
+/// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline; the log drain's final
+/// flush runs, writing what the stages before it recorded, by
+/// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline; the metrics database
+/// closes by the deadline; and only then is the election released, by
+/// dropping the guard right before the process exits - so a stop the CLI
+/// reports as success means the process is leaving. The deadline starts where
+/// the stop begins, and each stage takes only what the one before it left of
+/// it. Each stage records its name, what it left of the deadline, and its
+/// error, and a failed stop leaves with the rendered error on stderr.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
@@ -916,11 +933,9 @@ async fn serve_foreground(
             .await
             .map_err(|error| foreground_refused(root, error))?;
         let log_drain = match (drain, storage.logs()) {
-            (Some(drain), Some(store)) => Some(tokio::spawn(drain.run(
-                store,
-                retention_records,
-                shutdown.clone(),
-            ))),
+            (Some(drain), Some(store)) => {
+                Some(RunningLogDrain::spawn(drain, store, retention_records))
+            }
             _ => None,
         };
         (Some(storage), Some(guard), log_drain)
@@ -987,18 +1002,21 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    let (guard, deadline, stopped, database) =
+    let (guard, deadline, stopped, mut database) =
         server.stopped_before_database(SERVER_STOP_DEADLINE).await;
-    let stopped = stopped;
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;
-    stop_log_drain(log_drain, deadline - SERVER_DATABASE_STOP_RESERVE).await;
-    let database = database.shutdown(deadline).await;
+    let flush_deadline = deadline - SERVER_DATABASE_STOP_RESERVE;
+    let search = database
+        .close_search(flush_deadline - SERVER_LOG_FLUSH_RESERVE)
+        .await;
+    stop_log_drain(log_drain, flush_deadline).await;
+    let logs = database.close_logs(deadline).await;
     // The election releases last: dropping the guard retires the document and
     // unlocks, immediately before the process exits.
     drop(guard);
-    stopped.and(database)
+    stopped.and(search).and(logs)
 }
 
 fn foreground_selection(
@@ -1029,40 +1047,71 @@ fn foreground_selection(
     Ok(Some(selected))
 }
 
-/// Joins the diagnostics drain by `deadline`, the stop's shared deadline.
+/// A log drain task the stop joins, with its own stop token and its lane.
 ///
-/// The drain runs last, so its final flush takes only what the engines and the
-/// index supervisor left of `deadline`. When the write turn a rebuild holds
-/// does not free in time, the drain drops its last batch with its own
-/// "refused a batch" stderr line, and this abort stops it waiting further.
-/// The join runs inside a `server.stop` span, so its close carries the stage's
-/// elapsed time beside the stages the transport records.
+/// The drain stops on its own token rather than the serving one, so records the stop
+/// stages emit after serving ended still reach the queue it drains.
+#[derive(Debug)]
+struct RunningLogDrain {
+    task: tokio::task::JoinHandle<()>,
+    lane: rift_mcp::LogLane,
+    stop: CancellationToken,
+}
+
+impl RunningLogDrain {
+    /// Starts `drain` writing into `store`.
+    fn spawn(
+        drain: LogDrain,
+        store: std::sync::Arc<rift_tracing::LogStore>,
+        retention_records: u64,
+    ) -> Self {
+        let lane = drain.lane();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(drain.run(store, retention_records, stop.clone()));
+        Self { task, lane, stop }
+    }
+}
+
+/// Stops the diagnostics drain and joins it by `deadline`; answers the records left
+/// unwritten when the drain had to be aborted.
+///
+/// The drain closes its queue, then flushes what it holds within what the stages before
+/// it left of `deadline`. When the metrics database refuses the flush past that, the
+/// drain is aborted, and the "log drain outlasted the stop deadline" warning carries
+/// `unwritten`: the records the lane accepted and never wrote. The join runs as the
+/// `log drain` stop stage, so it records its elapsed time beside the other stages.
 async fn stop_log_drain(
-    drain: Option<tokio::task::JoinHandle<()>>,
+    drain: Option<RunningLogDrain>,
     deadline: tokio::time::Instant,
-) {
-    let Some(mut drain) = drain else {
-        return;
-    };
-    rift_core::traced_async!(
-        component = "logs",
-        operation = "server.stop",
-        stage = "log drain",
-        {
-            match tokio::time::timeout_at(deadline, &mut drain).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(component = "logs", %error, "log drain task failed");
-                }
-                Err(_) => {
-                    drain.abort();
-                    let _ = drain.await;
-                    tracing::warn!(component = "logs", "log drain outlasted the stop deadline");
-                }
+) -> Option<u64> {
+    let RunningLogDrain {
+        mut task,
+        lane,
+        stop,
+    } = drain?;
+    stop.cancel();
+    let joined = rift_mcp::stop_stage("log drain", deadline, async {
+        Ok(match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => {
+                tracing::warn!(component = "logs", %error, "log drain task failed");
+                None
             }
-        }
-    )
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                let unwritten = lane.unwritten();
+                tracing::warn!(
+                    component = "logs",
+                    unwritten,
+                    "log drain outlasted the stop deadline"
+                );
+                Some(unwritten)
+            }
+        })
+    })
     .await;
+    joined.ok().flatten()
 }
 
 /// Cancels `shutdown` when the process receives an interrupt.
@@ -1548,13 +1597,14 @@ mod tests {
 
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
-        SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns, StartedServer,
-        TailCount, TokenCheck, await_election_released, await_election_released_with_probe,
-        await_serving, await_serving_with_probe, await_stopped, await_stopped_with_probe,
-        discard_stale_document, foreground_refused, label, level_glyph, logs_mode, logs_query,
-        now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp, request_stop,
-        stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain, token_check,
+        RunningLogDrain, SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
+        STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns,
+        StartedServer, TailCount, TokenCheck, await_election_released,
+        await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
+        await_stopped_with_probe, discard_stale_document, foreground_refused, label, level_glyph,
+        logs_mode, logs_query, now_ms, print_logs, rendered_fields, rendered_line,
+        rendered_timestamp, request_stop, stale_reason_phrase, start_detached, start_mode, status,
+        stop, stop_log_drain, token_check,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_error::errors;
@@ -1752,15 +1802,58 @@ mod tests {
         assert_eq!(AuthMode::default(), AuthMode::Token);
     }
 
+    /// A running drain over `task`, on a lane of its own.
+    fn running_drain(task: tokio::task::JoinHandle<()>) -> RunningLogDrain {
+        RunningLogDrain {
+            task,
+            lane: rift_mcp::log_capture().1.lane(),
+            stop: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_log_drain_is_joined() {
         let drain = tokio::spawn(async { panic!("injected log drain failure") });
 
-        stop_log_drain(
-            Some(drain),
+        let unwritten = stop_log_drain(
+            Some(running_drain(drain)),
             tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
         )
         .await;
+
+        assert_eq!(unwritten, None, "a joined drain leaves nothing to count");
+    }
+
+    /// A drain aborted at its bound reports every record the lane accepted and never
+    /// wrote.
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_log_drain_counts_the_records_it_never_wrote() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const ACCEPTED: u64 = 3;
+        let (sink, drain) = rift_mcp::log_capture();
+        let lane = drain.lane();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
+            for record in 0..ACCEPTED {
+                tracing::info!(component = "test", record, "accepted and never written");
+            }
+        });
+        // The task holds the drain's queue open and never writes it, as a drain does whose
+        // store refuses every batch.
+        let task = tokio::spawn(async move {
+            let _held = drain;
+            std::future::pending::<()>().await;
+        });
+        let running = RunningLogDrain {
+            task,
+            lane,
+            stop: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let started = tokio::time::Instant::now();
+        let unwritten = stop_log_drain(Some(running), started + SERVER_STOP_DEADLINE).await;
+
+        assert_eq!(unwritten, Some(ACCEPTED));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1781,8 +1874,10 @@ mod tests {
         tokio::task::yield_now().await;
 
         let started = tokio::time::Instant::now();
-        stop_log_drain(Some(drain), started + SERVER_STOP_DEADLINE).await;
+        let unwritten =
+            stop_log_drain(Some(running_drain(drain)), started + SERVER_STOP_DEADLINE).await;
 
+        assert_eq!(unwritten, Some(0), "an empty lane leaves nothing unwritten");
         assert!(stopped.load(Ordering::Acquire));
         assert!(
             started.elapsed() < rift_mcp::STOP_REQUEST_TIMEOUT,

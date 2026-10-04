@@ -209,7 +209,12 @@ pub struct HttpServer {
     pub(crate) repository_workspaces: Option<Arc<RepositoryWorkspaceRegistry>>,
 }
 
-/// SQLite close held until process log writes finish.
+/// The index and vectors databases and the metrics database of a stopped server, closed
+/// after its serving stopped.
+///
+/// A caller with a log drain closes them in two steps around the drain's final flush:
+/// [`Self::close_search`] first, so a close failure is recorded and the flush writes it,
+/// then [`Self::close_logs`] last, so the metrics database outlives every record.
 #[doc(hidden)]
 pub struct DeferredDatabaseShutdown(
     Option<Arc<SearchIndex>>,
@@ -217,30 +222,65 @@ pub struct DeferredDatabaseShutdown(
 );
 
 impl DeferredDatabaseShutdown {
-    /// Closes the process-owned workspace database, then the metrics database, by the
-    /// shared stop deadline.
+    /// Closes the index database, and the vectors database when it opened, then the
+    /// metrics database, all by the shared stop deadline.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] if the SQLite worker or the metrics writer thread fails or
+    /// Returns [`RiftError`] if a SQLite worker or the metrics writer thread fails or
     /// cannot stop before the deadline.
-    pub async fn shutdown(self, deadline: Instant) -> Result<(), RiftError> {
-        let database = match self.0 {
-            Some(search_index) => {
-                stop_stage("SQLite worker shutdown", deadline, async {
-                    search_index.shutdown(deadline).await.map_err(|error| {
-                        errors::mcp::http_serve_failed()
-                            .operation("SQLite worker shutdown")
-                            .cause(error)
-                            .error()
-                    })
-                })
-                .await
-            }
-            None => Ok(()),
+    pub async fn shutdown(mut self, deadline: Instant) -> Result<(), RiftError> {
+        let search = self.close_search(deadline).await;
+        let logs = self.close_logs(deadline).await;
+        search.and(logs)
+    }
+
+    /// Closes the index database, and the vectors database when it opened, by `deadline`.
+    ///
+    /// A failure is recorded as a `warn` record of the `storage` component, operation
+    /// `database.close`, so a log drain still running writes it to the metrics database.
+    /// A second call closes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] if a SQLite worker fails or cannot stop before `deadline`.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future leaves the workers to stop on their own; the databases are not
+    /// closed again.
+    pub async fn close_search(&mut self, deadline: Instant) -> Result<(), RiftError> {
+        let Some(search_index) = self.0.take() else {
+            return Ok(());
         };
-        let logs = close_logs(self.1.as_deref(), deadline).await;
-        database.and(logs)
+        stop_stage("SQLite worker shutdown", deadline, async {
+            search_index.shutdown(deadline).await.map_err(|error| {
+                tracing::warn!(
+                    component = "storage",
+                    operation = "database.close",
+                    %error,
+                    "the index or vectors database did not close"
+                );
+                errors::mcp::http_serve_failed()
+                    .operation("SQLite worker shutdown")
+                    .cause(error)
+                    .error()
+            })
+        })
+        .await
+    }
+
+    /// Closes the metrics database by `deadline`, when it opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] if the metrics writer thread fails or outlasts `deadline`.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future after the close is queued leaves the writer thread to close.
+    pub async fn close_logs(self, deadline: Instant) -> Result<(), RiftError> {
+        close_logs(self.1.as_deref(), deadline).await
     }
 }
 
