@@ -62,6 +62,15 @@ the workspace accepts, plus an allowance for the answer. When the budget ends, t
 the request, which closes its Streamable HTTP response stream, and the caller gets a
 `temporarily_unavailable` refusal naming the budget.
 
+`rift mcp` takes one `--output` choice: `all`, the default, or `text`. The proxy keeps the choice
+for its lifetime, across upstream reconnects, so the tool listing it advertises stays stable. With
+`text`, the proxy removes `structuredContent` from each completed tool result, `outputSchema`
+from every tool on every `tools/list` page, and the `application/json` contents of a completed
+resource read that holds another content, all after the upstream answer arrives; `all` forwards
+everything unchanged.
+
+Each `rift mcp` process owns its choice, so two proxies on one workspace can differ.
+
 Before it adopts a live server, the proxy compares the product identity from the lock with its
 own: the version and the canonical MCP schema SHA-256. The version is the package version with the
 git commit the binary was built from as semantic-versioning build metadata, the version
@@ -97,6 +106,23 @@ The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https:/
 runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; `/api/stop` serves
 `rift server stop`.
+
+When the server builds a tool result, it renders compact text from the typed answer into
+`content` and serializes the same answer into `structuredContent`. Typed layout code renders every
+tool answer, every failure, and every resource as sections: a title at column 0 that counts its
+entries, such as `2 results`, `1 warning`, or `2 errors`, with the entries indented under it. The
+text writer enforces a byte limit on each text and refuses one that crosses it.
+
+A resource read carries two contents for the requested URI: the compact text as `text/plain`, then
+the JSON body as `application/json`.
+
+Only `rift mcp` applies the output choice, so direct HTTP access to the server returns both
+representations.
+
+Where the server converts a tool method's result, it classifies a Rift operating failure on the
+tool path as a completed tool result with `isError` set and the failure's compact text in
+`content`: one `N errors` section whose entries are the failure, then its causes. Protocol
+failures stay JSON-RPC errors.
 
 Startup runs one cycle:
 

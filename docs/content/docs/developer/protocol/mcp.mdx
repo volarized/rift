@@ -8,10 +8,10 @@ limits, and failures. For an introduction through an agent's workflow, see the
 [MCP guide](/docs/mcp).
 
 The expandable tool examples come from the served [JSON schema](https://volar.sh/rift/mcp.json).
+A result example on this page shows one answer in two tabs: its compact text and its JSON.
+[Result content](#result-content) defines the compact text.
 
 ## Map [#resource-map]
-
-<VersionBadge version="v0.0.29" />
 
 `rift://map` reads a workspace orientation snapshot: a starting picture for a caller new to the
 codebase. The answer carries:
@@ -31,14 +31,10 @@ codebase. The answer carries:
 - `pagination` - always page zero of one, the whole map on one page
 - `warnings` - conditions that qualify the answer, omitted when empty
 
-<VersionBadge version="v0.0.47" />
-
 During local preparation, the map carries [`local_index_preparing`](#reads). File counts and
 documentation paths can describe discovered files before their declarations are prepared;
 symbol counts describe prepared declarations. The server **MUST** return the map's revision,
 counts, and warnings from the same publication.
-
-<VersionBadge version="v0.0.29" languages={["Rust"]} />
 
 `entry_points` lists symbols carrying the `entrypoint`
 [`SymbolFacet`](/docs/developer/protocol/reference) - a file-scope `fn main`, not one
@@ -54,8 +50,6 @@ strongest pairs and two reads of one tree agree. Both read the index alone: the 
 engine resolves a reference for one read and publishes none, so both lists stay empty until a
 provider publishes resolved references into the index.
 
-<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
-
 `packages` lists the [dependency context](/docs/developer/architecture#dependency-context): what the
 Cargo, uv, npm, and Bun resolvers read from `Cargo.toml` and `Cargo.lock`, `pyproject.toml` and
 `uv.lock`, `package.json` and `package-lock.json`, and `package.json` and `bun.lock`. The
@@ -68,17 +62,57 @@ rewritten while the server runs is read again on the next publication.
 A resolver reads at most 256 manifests per workspace, taken in path order, so `packages` over a
 workspace holding more lists what the manifests it read declare.
 
-<VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
-
 `packages` also lists one entry for each standard library a language the workspace uses relies
 on, under the manager `stdlib`: `stdlib/rust`, `stdlib/node` beside the npm `typescript` package,
 or `stdlib/python`. Its version comes from the workspace's pins, or from a version probe under
 [`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"`, and the
 [dependency context](/docs/developer/architecture#standard-libraries) lists where each one is read.
 
+A read of `rift://map` answers the [two contents](#resource-contents) of a resource. The compact text has these parts:
+
+- the header `map <revision>`
+- directly below the header, the sections `languages`, `modules`, `hubs`, `entry points`, `docs`, `module relationships`, and `packages`, in that order, each a title such as `languages:` with its entries indented by one level; the server **MUST** omit a section that has no entry
+- a language entry as `language · N files · M symbols`, and a module entry as `path · N files · M symbols`
+- a child module one level deeper than its parent, written by its path relative to the parent when the parent's path is a prefix of it, and by its full path otherwise
+- a hub entry as `symbol · kind · N references`, and a module relationship as `from → to · N references`
+- a package entry as `name@version` or `name requirement`, followed by `(manager)`, with the availability added after the manager unless it is `canonical`
+- after the last section, when the map carries warnings, the section `N warnings`, or `1 warning`, with one line per warning as in a [tool result](#result-content)
+
+A count of 1 takes the singular, as in `1 file`. The map is always one page, so the text writes no `pagination`.
+
+The tabs below show the same map as compact text and as JSON:
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
 **Request:** `rift://map`
 
-**Response:**
+**Response, compact text:**
+
+```text
+map 3f9a1c2e
+languages:
+	rust · 191 files · 3204 symbols
+modules:
+	crates · 191 files · 3204 symbols
+		rift-server · 16 files · 418 symbols
+entry points:
+	rift://symbol/rust/crates/rift/src/main.rs/main
+docs:
+	README.md
+packages:
+	tokio@1.53.1 (cargo)
+	rust@1.98.1 (stdlib)
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Request:** `rift://map`
+
+**Response, JSON:**
 
 ```json
 {
@@ -120,6 +154,10 @@ or `stdlib/python`. Its version comes from the workspace's pins, or from a versi
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 ## Search
 
 <McpTool name="search" />
@@ -155,11 +193,6 @@ This request narrows the search to the tests tree, then reaches one file the wor
 
 ### Full-text search [#search-fulltext]
 
-<VersionBadge
-  version="v0.0.9"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
 `query` matches declaration names, qualified names, signatures, and attached documentation,
 and the contents of every indexed file, through a full-text index, and the identifiers it
 carries against the indexed names. A multi-word query is answered first by the documents
@@ -188,6 +221,24 @@ indexed field carries the query's literal bytes at all.
 ```json
 { "query": "loads workspace configuration", "target": "symbol" }
 ```
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`search` result holding this hit, compact text:**
+
+```text
+1 result
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+	src/config.rs:10 · documentation
+	rift://symbol/rust/src/config.rs/load_config
+	Loads the workspace configuration from `rift.toml`.
+```
+
+</Tab>
+
+<Tab value="json">
 
 **Search hit:**
 
@@ -223,7 +274,9 @@ indexed field carries the query's literal bytes at all.
 }
 ```
 
-<VersionBadge version="v0.0.46" />
+</Tab>
+
+</ExampleTabs>
 
 The index holds a file's text once, in the file's own rows, and a declaration's row carries its
 names, signature, and documentation alone. A term only a declaration's body holds therefore
@@ -234,8 +287,6 @@ query's terms in them, and answers those declarations in place of the first of t
 first. Each is tagged `matched_by: ["content"]`, and a declaration its own row placed ahead of
 that file row keeps its place and its tags.
 
-<VersionBadge version="v0.0.25" />
-
 Every visible bounded UTF-8 file without a NUL byte joins the same index when its effective
 language entry or [`[search.text].include`](/docs/developer/configuration#search) selects it. A hit on one
 of those files returns as a `file` hit, tagged `matched_by: ["content"]` the same way:
@@ -245,6 +296,21 @@ of those files returns as a `file` hit, tagged `matched_by: ["content"]` the sam
 ```json
 { "query": "install checksum", "target": "file" }
 ```
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`search` result holding this hit, compact text:**
+
+```text
+1 result
+	README.md:35 · content
+```
+
+</Tab>
+
+<Tab value="json">
 
 **Search hit:**
 
@@ -261,6 +327,10 @@ of those files returns as a `file` hit, tagged `matched_by: ["content"]` the sam
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 A path carrying no extension - `justfile`, `Dockerfile` - is selected by the same patterns and
 returns the same way, because the selection reads the whole project-relative path. A file hit
 carries `languages` only where a syntax provider claims the path; the full-text index also
@@ -275,11 +345,6 @@ attaches the fused ranking value that ordered the page, comparable only within t
 answer.
 
 ### Pattern [#search-pattern]
-
-<VersionBadge
-  version="v0.0.46"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
 
 `pattern` answers every match of a regular expression in the text of the indexed files, in place
 of `query`. The syntax is the Rust [`regex`](https://docs.rs/regex) crate's, the dialect ripgrep
@@ -320,7 +385,25 @@ every other search answer.
 }
 ```
 
-**Response:**
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Response, compact text:**
+
+```text
+2 results
+	[1] src/main.rs:9 · content
+		#[tokio::main]
+	[2] src/main.rs:11 · content
+		    let config = tokio::task::spawn_blocking(|| {
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Response, JSON:**
 
 ```json
 {
@@ -345,6 +428,10 @@ every other search answer.
   "pagination": { "page_index": 0, "total_pages": 1 }
 }
 ```
+
+</Tab>
+
+</ExampleTabs>
 
 A `pattern` search is bounded at every step it takes. The pattern holds at most 1,024
 characters, the schema's `maxLength`, and the
@@ -371,8 +458,6 @@ index, as [package scope](#search-scope) describes. `target: "documentation"` re
 
 ### Traversal [#search-traversal]
 
-<VersionBadge version="v0.0.29" languages={["Rust"]} />
-
 `traversal` walks the references or calls a configured
 [language engine](/docs/developer/configuration#languages-and-lsp) resolves: a bounded search
 from one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and
@@ -387,7 +472,7 @@ carries both entries.
 
 - `incoming`, the default - the engine answers which declarations reference the symbol, and each
   hop carries the `references` facet.
-- `outgoing` <VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> -
+- `outgoing` -
   the engine's call hierarchy answers which declarations the symbol calls, and each hop carries the
   `calls` facet.
 
@@ -444,7 +529,32 @@ declarations `serve` calls:
 }
 ```
 
-**Response:**
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Response, compact text:**
+
+```text
+2 results
+	at rift://symbol/python/service.py/serve
+
+		↳ calls
+			def handle(port: int) -> int:
+			in handlers.py:1
+			at rift://symbol/python/handlers.py/handle
+
+		↳ calls
+			function len
+			in rift://source/stdlib/python@3.12.9/builtins.pyi · stdlib
+			at rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Response, JSON:**
 
 ```json
 {
@@ -536,6 +646,10 @@ declarations `serve` calls:
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 `handle`'s `traversal_path` carries a relationship from `serve` to `handle`, with
 `facets: ["calls"]` and `derivation: "resolution"`, followed in the `outgoing` direction. The local
 index holds no declaration of `len`, so its hit carries the identity and the `kind` the global
@@ -585,8 +699,6 @@ carries no edge to a dropped callee; `callees` counts the edges it dropped over 
 
 ### Language-engine references [#search-engine-references]
 
-<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
-
 A current-tree symbol traversal consults the configured
 [language engine](/docs/developer/configuration#languages-and-lsp) when `facets` is empty or
 names the engine facet of its `direction`: `references` for `incoming`, `calls` for `outgoing`.
@@ -597,8 +709,6 @@ smallest indexed declaration containing it. Locations outside the workspace or w
 indexed declaration contribute no hit. When no engine is configured, or the engine lacks
 reference support, the walk refuses `capability_unavailable`. A configured engine that fails to
 start returns its failure through [`ErrorData`](/docs/developer/protocol/reference).
-
-<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} />
 
 A callee outside the project maps to the package whose files hold it, at an exact version:
 
@@ -627,8 +737,6 @@ once where the request enters. Exhausted attempts or an expired deadline return
 A stale publication uses indexed relationships and carries `stale_index`. Each engine request
 also uses the configured engine retry and restart bounds.
 
-<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} />
-
 A walk takes an engine's answer once the engine reads ready: the work it announced has ended and
 stayed quiet for its `settle_delay`. The walk waits for that until a tenth of the
 `[server] readiness_timeout` budget before the request's deadline, so the answer and its warning
@@ -646,11 +754,6 @@ for its `settle_delay`, and attaches an `engine_readiness_unconfirmed` entry nam
 process key in `processes`.
 
 ### Change [#search-change]
-
-<VersionBadge
-  version="v0.0.36"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
 
 `change` answers the declarations two sides hold differently. `base` names the committed revision
 compared from, spelled the way a [revision read](#revision-reads) spells `rev`, such as `main` or
@@ -680,6 +783,30 @@ above and the `base_path` and `head_path` the declaration lives at on each side.
 { "change": { "base": "main", "head": "HEAD" }, "include": ["source"] }
 ```
 
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`search` result holding this hit, compact text:**
+
+```text
+1 result
+	pub function load_config
+	src/config.rs:1 · change
+	rift://symbol/rust/src/config.rs/load_config
+	signature changed
+
+	/// Loads the workspace configuration from `rift.toml`.
+	pub fn load_config(path: &Path, strict: bool) -> Result<Config, ConfigError> {
+	    let text = std::fs::read_to_string(path)?;
+	    parse_config(&text)
+	}
+```
+
+</Tab>
+
+<Tab value="json">
+
 **Search hit:**
 
 ```json
@@ -708,8 +835,32 @@ above and the `base_path` and `head_path` the declaration lives at on each side.
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 A removed declaration is the exception: the head revision no longer holds it, so its hit keeps
 its base-side identity, path, range, and source, and its `change` carries `base_path` alone:
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`search` result holding this hit, compact text:**
+
+```text
+1 result
+	pub function load_legacy_config
+	src/legacy.rs:1 · change
+	rift://symbol/rust/src/legacy.rs/load_legacy_config
+	removed
+
+	pub fn load_legacy_config() {}
+```
+
+</Tab>
+
+<Tab value="json">
 
 **Search hit:**
 
@@ -735,7 +886,9 @@ its base-side identity, path, range, and source, and its `change` carries `base_
 }
 ```
 
-<VersionBadge version="v0.0.46" />
+</Tab>
+
+</ExampleTabs>
 
 Against the working tree, the head side is the current publication, so staged and unstaged edits,
 files git does not track, and deleted files all take part, and the answer carries `stale_index`
@@ -778,8 +931,6 @@ refuses `resource_not_found`.
 
 ### Commit search [#search-commits]
 
-<VersionBadge version="v0.0.46" />
-
 `target: "commit"` matches `query` against the messages of the commits the
 [history store](/docs/developer/architecture#history) holds. The server parses the query the way a
 [full-text search](#search-fulltext) does, then answers the commits whose message carries every
@@ -794,6 +945,22 @@ While the store fills, a commit it has not analyzed yet answers nothing, and the
 `total` its latest fill selects. The same warning appears when the store has not yet analyzed the
 commit `HEAD` names, such as right after a new commit, and the read asks the fill to catch up:
 
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`search` result carrying only this warning, compact text:**
+
+```text
+0 results
+1 warning
+	history_store_filling · analyzed 40 · total 100: the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest
+```
+
+</Tab>
+
+<Tab value="json">
+
 **Warning:**
 
 ```json
@@ -804,6 +971,10 @@ commit `HEAD` names, such as right after a new commit, and the read asks the fil
   "detail": "the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest"
 }
 ```
+
+</Tab>
+
+</ExampleTabs>
 
 Each hit carries a [`CommitHit`](/docs/developer/protocol/reference) as `commit`: the commit's
 `revision`, its `message`, its `author`, the committer `timestamp`, and the `paths` it changed
@@ -817,6 +988,28 @@ and `message_truncated` says so; `paths` lists at most 32 paths in path order, a
 ```json
 { "target": "commit", "query": "change path bound", "limit": 10 }
 ```
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`search` result holding this hit, compact text:**
+
+```text
+1 result
+	9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
+	Bound comparisons at 512 changed paths
+
+	A comparison that reaches the bound answers from the paths that fit and warns change_truncated.
+
+	2 paths:
+		crates/rift-protocol/src/search.rs
+		crates/rift-server/src/change.rs
+```
+
+</Tab>
+
+<Tab value="json">
 
 **Search hit:**
 
@@ -837,6 +1030,10 @@ and `message_truncated` says so; `paths` lists at most 32 paths in path order, a
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 The server refuses `target: "commit"` beside `pattern`, `traversal`, `change`, `rev`, `packages`,
 and `paths`, and with a `scope` past `local`, each with `invalid_request` naming the field: each of
 them selects declarations, file text, or another tree, and the global index holds no project
@@ -846,8 +1043,6 @@ history. A missing or empty `query` refuses `invalid_request` naming `query`.
 one with no git repository.
 
 ### Package scope [#search-scope]
-
-<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
 `scope` selects what `query` and `pattern` run over, with the three values
 [`get_symbol`](#get_symbol-scope) takes. `local`, the default, runs the lanes above: the
@@ -867,8 +1062,6 @@ A `pattern` reaches the package files too. The global index answers each match a
 addressed by `unit`, with the file's `size`, and each declaration holding a match as a `symbol`
 hit at its first match, both tagged `matched_by: ["content"]`. `global` answers the package
 matches alone; `all` answers them after the project's, in package, path, and offset order.
-
-<VersionBadge version="v0.0.43" />
 
 The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
 package facts are served for the current tree alone, and refuses `traversal` together with
@@ -897,7 +1090,28 @@ global index holds no release of, so the nearest collected release, 1.0.0, answe
 { "query": "helper_beacon", "scope": "global" }
 ```
 
-**Response:**
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Response, compact text:**
+
+```text
+1 result
+	pub fn helper_beacon()
+	rift://source/cargo/demo@1.0.0/src/lib.rs:1 · name · dependency demo@1.0.0
+	rift://symbol/rust/src/lib.rs/helper_beacon
+3 warnings
+	package_unavailable · entry helper@0.1.0 (cargo, path) · reason Currently rift doesn't support indexing dependencies by path. If you're interested in this capability, please upvote it at https://github.com/volarized/rift/issues/392.
+	package_absent · package rust@1.98.1 (stdlib)
+	package_substituted · entry demo@1.0.1 (cargo) · package demo@1.0.0 (cargo)
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Response, JSON:**
 
 ```json
 {
@@ -956,14 +1170,16 @@ global index holds no release of, so the nearest collected release, 1.0.0, answe
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 `packages` names package versions this search reaches beside the workspace's own; see
 [requested packages](#requested-packages).
 
 ## Symbol retrieval
 
 <McpTool name="get_symbol" />
-
-<VersionBadge version="v0.0.13" />
 
 `include` selects the optional fields a hit carries:
 
@@ -980,8 +1196,6 @@ served revision, and classifies what each revision did: `introduced`, `body_chan
 `signature_changed`, `moved`, `removed`, or `decorators_changed`. A revision whose source cannot be
 parsed, or where the symbol is absent, contributes no version.
 
-<VersionBadge version="v0.0.46" />
-
 Each [`SymbolVersion`](/docs/developer/protocol/reference) names the commit's `author`, name and
 email, as the commit records them; `timestamp` stays the committer time. A file renamed without a
 changed byte, or a declaration moved unchanged into another file, answers a `moved` version, and
@@ -993,9 +1207,171 @@ clone's boundary, or the oldest selected release ended it first, or that the sto
 analyzed the served revision, so revisions older than the listed ones may have touched the symbol.
 A server whose store did not open walks git per request instead.
 
-### Package scope [#get_symbol-scope]
+This lookup requests the source and the history of `load_config`:
 
-<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
+**Request:**
+
+```json
+{ "name": "load_config", "include": ["source", "history"] }
+```
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Response, compact text:**
+
+```text
+1 result
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+	src/config.rs:10
+	rift://symbol/rust/src/config.rs/load_config
+
+	Loads the workspace configuration from `rift.toml`.
+
+	history:
+		2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>
+			Return ConfigError from load_config
+		2026-08-17 · 82590265 · introduced · Alice <alice@example.com>
+			Add workspace configuration loading
+
+	/// Loads the workspace configuration from `rift.toml`.
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+	    let text = std::fs::read_to_string(path)?;
+	    parse_config(&text)
+	}
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Response, JSON:**
+
+```json
+{
+  "hits": [
+    {
+      "history": {
+        "complete": true,
+        "symbol": "rift://symbol/rust/src/config.rs/load_config",
+        "versions": [
+          {
+            "author": {
+              "email": "alice@example.com",
+              "name": "Alice"
+            },
+            "kind": "signature_changed",
+            "path": "src/config.rs",
+            "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
+            "summary": "Return ConfigError from load_config",
+            "timestamp": "2026-08-21T14:03:22+00:00"
+          },
+          {
+            "author": {
+              "email": "alice@example.com",
+              "name": "Alice"
+            },
+            "kind": "introduced",
+            "path": "src/config.rs",
+            "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
+            "summary": "Add workspace configuration loading",
+            "timestamp": "2026-08-17T09:41:05+00:00"
+          }
+        ]
+      },
+      "line": 10,
+      "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+      "path": "src/config.rs",
+      "range": {
+        "end": 355,
+        "start": 162
+      },
+      "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+      "symbol": {
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Loads the workspace configuration from `rift.toml`."
+          }
+        ],
+        "facets": [
+          "value",
+          "callable",
+          "public"
+        ],
+        "id": "rift://symbol/rust/src/config.rs/load_config",
+        "kind": "function",
+        "language": "rust",
+        "name": "load_config",
+        "signatures": [
+          {
+            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+            "language": "rust",
+            "links": [
+              {
+                "range": {
+                  "end": 48,
+                  "start": 42
+                },
+                "symbol": "rift://symbol/rust/src/config.rs/Config"
+              }
+            ],
+            "parameters": [
+              {
+                "name": "path",
+                "optional": false,
+                "types": [
+                  {
+                    "origin": "declared",
+                    "role": "parameter",
+                    "type": {
+                      "language": "rust",
+                      "source": "&Path"
+                    }
+                  }
+                ],
+                "variadic": false
+              }
+            ],
+            "returns": [
+              {
+                "origin": "declared",
+                "role": "return",
+                "type": {
+                  "language": "rust",
+                  "source": "Result<Config, ConfigError>"
+                }
+              }
+            ]
+          }
+        ],
+        "types": [
+          {
+            "origin": "declared",
+            "role": "return",
+            "type": {
+              "language": "rust",
+              "source": "Result<Config, ConfigError>"
+            }
+          }
+        ],
+        "visibility": "pub"
+      }
+    }
+  ],
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  }
+}
+```
+
+</Tab>
+
+</ExampleTabs>
+
+### Package scope [#get_symbol-scope]
 
 `scope` selects which corpus the lookup searches, by what the corpus holds rather than by
 where it is stored. `local`, the default, searches the workspace tree. `global` searches the
@@ -1006,8 +1382,6 @@ A package hit carries `unit` in place of `path`: the
 [`SourceUnitId`](/docs/developer/protocol/reference) of the package file, spelled
 `rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
 package. The hit carries neither `node` nor `history`.
-
-<VersionBadge version="v0.0.43" />
 
 A `local` read reaches no package declaration and resolves no package. A `global` or `all` read
 sends the dependency context's `canonical` entries to the configured global REST API, which
@@ -1038,7 +1412,31 @@ pins:
 { "name": "helper_beacon", "scope": "global" }
 ```
 
-**Response:**
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Response, compact text:**
+
+```text
+1 result
+	pub fn helper_beacon()
+	rift://source/cargo/demo@1.0.0/src/lib.rs:1
+	rift://symbol/rust/src/lib.rs/helper_beacon
+	dependency demo@1.0.0
+
+	pub fn helper_beacon() {}
+3 warnings
+	package_unavailable · entry helper@0.1.0 (cargo, path) · reason Currently rift doesn't support indexing dependencies by path. If you're interested in this capability, please upvote it at https://github.com/volarized/rift/issues/392.
+	package_absent · package rust@1.98.1 (stdlib)
+	package_substituted · entry demo@1.0.1 (cargo) · package demo@1.0.0 (cargo)
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Response, JSON:**
 
 ```json
 {
@@ -1094,6 +1492,10 @@ pins:
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 `packages` names package versions this lookup reads beside the workspace's own; see
 [requested packages](#requested-packages).
 
@@ -1104,13 +1506,145 @@ pins:
 A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
 `capability_unavailable`, naming the extension, or stating that the path carries none.
 
-<VersionBadge version="v0.0.47" />
-
 During local preparation, the server **MAY** prepare the requested path within the remaining
 [`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
 the published prepared files carries [`local_index_preparing`](#reads), including when syntax
 is returned; this read does not advance published progress. Exhausted preparation returns empty
 nodes with that warning.
+
+This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
+
+**Request:**
+
+```json
+{ "path": "src/config.rs", "position": 338 }
+```
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Response, compact text:**
+
+```text
+5 nodes
+	[1] source_file · 14 lines
+		rift://node/rust/src/config.rs@0-356#dcbef6dd
+	[2] function_item · 4 lines
+		rift://node/rust/src/config.rs@218-355#67ecfb36
+		rift://symbol/rust/src/config.rs/load_config
+		name 225..236 · body 281..355
+	[3] block · 4 lines
+		rift://node/rust/src/config.rs@281-355#4e554fa8
+	[4] call_expression
+		rift://node/rust/src/config.rs@334-353#4df4426e
+	[5] identifier
+		rift://node/rust/src/config.rs@334-346#03f22dac
+
+		parse_config
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Response, JSON:**
+
+```json
+{
+  "nodes": [
+    {
+      "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+      "kind": "source_file",
+      "language": "rust",
+      "range": {
+        "end": 356,
+        "start": 0
+      },
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "facets": [
+        "declaration",
+        "definition"
+      ],
+      "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+      "kind": "function_item",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+      "range": {
+        "end": 355,
+        "start": 218
+      },
+      "regions": [
+        {
+          "range": {
+            "end": 236,
+            "start": 225
+          },
+          "role": "name"
+        },
+        {
+          "range": {
+            "end": 355,
+            "start": 281
+          },
+          "role": "body"
+        }
+      ],
+      "symbol": "rift://symbol/rust/src/config.rs/load_config",
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+      "kind": "block",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+      "range": {
+        "end": 355,
+        "start": 281
+      },
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "facets": [
+        "expression"
+      ],
+      "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+      "kind": "call_expression",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+      "range": {
+        "end": 353,
+        "start": 334
+      },
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+      "kind": "identifier",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
+      "range": {
+        "end": 346,
+        "start": 334
+      },
+      "unit": "rift://file/src/config.rs"
+    }
+  ],
+  "source": [
+    "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
+    "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+    "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+    "parse_config(&text)",
+    "parse_config"
+  ]
+}
+```
+
+</Tab>
+
+</ExampleTabs>
 
 ## Reads
 
@@ -1121,6 +1655,8 @@ Callers read code through these tools:
 | [`get_symbol`](#tool-get_symbol) | declarations and their source by known name |
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
+
+[Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
 The index never follows or indexes a symlink, so no read returns one; the file a link points
 at answers under its own path.
@@ -1134,8 +1670,6 @@ the last page returns an empty page whose `pagination` still carries the true `t
 Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
 from an index that lags the tree the read captured, and names the two tree revision digests that
 disagree.
-
-<VersionBadge version="v0.0.47" />
 
 The server **MUST** carry `local_index_preparing` once while the requested local scope remains
 incomplete. `prepared` counts visible files whose capture and analysis finished, including files
@@ -1153,6 +1687,22 @@ selection changes.
 { "name": "ReadService" }
 ```
 
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**`get_symbol` result carrying only this warning, compact text:**
+
+```text
+0 results
+1 warning
+	local_index_preparing · prepared 0: selected local files are still being prepared
+```
+
+</Tab>
+
+<Tab value="json">
+
 **Warning before discovery completes:**
 
 ```json
@@ -1162,6 +1712,10 @@ selection changes.
   "detail": "selected local files are still being prepared"
 }
 ```
+
+</Tab>
+
+</ExampleTabs>
 
 A read served while the last rebuild's failure stands carries `stale_index` too, with a `detail`
 naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
@@ -1213,8 +1767,6 @@ a file past its per-file bound, or a syntax tree the provider refused - so it an
 lookup while every other file stays available. An answer carries at most eight of them, in
 project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
 and counts the rest, and `rift://logs` names each.
-
-<VersionBadge version="v0.0.46" />
 
 Text search answers can carry these warnings:
 
@@ -1274,8 +1826,6 @@ Package-scope answers can also carry these package warnings:
   manager, such as `pypi`. The request's `packages` leave only after every other entry has, the
   ones sorted last first, and `reason` then counts the requested packages not reported.
 
-<VersionBadge version="v0.0.46" />
-
 Each `availability` a `package_unavailable` warning names carries its own `reason`:
 
 | `availability` | Source | `reason` |
@@ -1298,12 +1848,392 @@ eight of each.
 
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 
-### Revision-addressed reads [#revision-reads]
+### Result content [#result-content]
 
-<VersionBadge
-  version="v0.0.7"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
+A completed tool result carries `content` with one text block of compact text. When the proxy selection is `all`, the result also carries `structuredContent` with the canonical result, and the tool listing carries `outputSchema`. The text block and `structuredContent` are rendered from the same answer.
+
+A caller selects the representations when it starts the proxy with `rift mcp --output`:
+
+- `all` - the default. The proxy forwards `content` and `structuredContent`, lists `outputSchema`, and forwards every content of a resource read.
+- `text` - the proxy **MUST** omit `structuredContent` from each completed tool result and `outputSchema` from every tool on every `tools/list` page. The proxy **MUST** also omit the `application/json` contents of a completed resource read that holds another content, so the compact text of the [resource](#resource-contents) remains.
+
+The proxy **MUST** keep its selection for its lifetime. A tool list that changes between pages or
+requests would break the caller's cache of the advertised tools.
+
+Direct HTTP access to `rift server` returns both representations, because only the proxy applies
+the selection. A resource read over direct HTTP therefore carries both contents.
+
+The compact text of `search`, `get_symbol`, and `nodes` results follows one layout. The text lists what an agent reads to choose its next call and leaves the normal state of each field out, and the facts of one line are separated by ` · `. Under the `all` selection, `structuredContent` carries every field of the result, including each field the layout leaves implicit.
+
+The text is a sequence of sections. A section is a title line at column 0, then its entries, each indented by at least one level. A title is `N` and a noun, with the noun in the singular when N is 1, so a line at column 0 is always a title.
+
+The server **MUST** indent with tabs, one tab per level, and **MUST NOT** indent with spaces. A caller then counts the levels of a line by its leading tabs, and the whitespace of copied text never reads as an indent. Copied text keeps its own whitespace after the indent.
+
+The server **MUST NOT** write a blank line between a title and its first entry, between two items, or between two sections. A blank line inside an item stays, and the server writes it empty. The tree of a relationship walk, described below, is the one exception: a blank line separates its parts.
+
+The server **MUST** write the items section first: `N results`, or `1 result`, for `search` and `get_symbol`, and `N nodes`, or `1 node`, for `nodes`. The title is written also when the result holds no item.
+
+For `search` and `get_symbol`, the server **MUST** append ` · page P/T` to the title of the items section when `total_pages` is greater than 1 or the requested `page_index` lies past the last page, where P is `page_index` plus 1 and T is `total_pages`. The title is the only place the text carries pagination, so a caller requests the next page with a `page_index` equal to P.
+
+When the result carries warnings, the server **MUST** write the warnings section after the items section: the title `N warnings`, or `1 warning`, then one line per warning. A result without warnings has no warnings section. The line of a warning has these parts:
+
+- the `code` of the warning
+- each payload field except `detail`, as ` · name value`, in the order the warning declares them; a list joins its items with `, `, a package identity is `name@version (manager)`, and a package context entry is `name@version` or `name requirement` followed by `(manager)`, with the availability added after the manager unless it is `canonical`
+- `: ` and the `detail`, when the warning carries one
+
+When the result holds more than one item, the server **MUST** start each item with `[n] ` at one level, counting from 1 in result order, and write every further line of the item at two levels. A result with one item carries no marker and writes every line at one level.
+
+A `nodes` result numbers its nodes the same way.
+
+The server writes the lines of a hit in the order below and omits a line whose fact is absent. A location is `path:line`, or `unit:line` for a hit in a package source unit.
+
+A symbol hit of `search` has these lines:
+
+- the declaration: the display of the first signature, behind its visibility when the display does not start with it
+- the location and the `matched_by` field names joined by `, `, followed by the exceptional facts below, all separated by ` · `
+- the symbol identity, or the byte range as `START..END` when the symbol has no identity
+- the first non-empty line of the first documentation text
+- the change line, when the hit comes from a comparison
+- a blank line, then the source
+
+The change line is the `kind` alone, with its underscores written as spaces. When the change has a `base_path` and a `head_path` that differ, the line adds ` · ` and the two paths joined by ` → `. When it has only one of them and that path differs from the location, the line adds that path.
+
+A symbol hit of `search` whose `traversal_path` holds at least one hop is a **walk hit**. The server **MUST NOT** write walk hits as items. It writes them as a tree: the **root** is the symbol the walk starts from, and each hop of a `traversal_path` is one **branch** under the symbol the hop starts from.
+
+The server **MUST** write the hits outside the walk first, as items, and the marker rule counts only those hits. The server **MUST** then write one tree per root, in the order the first walk hit of each tree has in the result.
+
+The server builds a tree from the `traversal_path` of each walk hit:
+
+- the root is the symbol the first hop starts from: the `from` of its relationship when the `direction` of the hop is `outgoing`, the `to` when it is `incoming`
+- each hop adds one level, and its branch is the symbol the hop reaches: the `to` of an `outgoing` hop, the `from` of an `incoming` hop
+- paths that share their first hops share those branches, and the branches under one symbol keep the order their hits have in the result
+- the hit sits on the branch of its last hop
+
+The root writes every line at one level. A branch `d` levels under the root writes its head line at level `1 + d` and every further line at level `2 + d`.
+
+The server **MUST** write a blank line before the root and before every branch, except before a root that is the first entry of the section. The further lines of a branch and the head line of a branch under it share a level, so the blank line marks where one ends.
+
+The head line of a branch is `↳ ` and the relationship of its hop. The relationship is the `facets` of the hop's relationship, joined by `, `:
+
+- an `outgoing` hop writes each facet as its wire name with underscores as spaces, such as `calls` or `depends on`
+- an `incoming` hop writes each facet read from the other end, as in the table below
+- a relationship whose `derivation` is `heuristic` writes `probably ` before its first facet
+
+| Facet | `incoming` hop | Facet | `incoming` hop |
+| --- | --- | --- | --- |
+| `contains` | `contained by` | `aliases` | `aliased by` |
+| `declares` | `declared by` | `generates` | `generated by` |
+| `augments` | `augmented by` | `depends_on` | `dependency of` |
+| `references` | `referenced by` | `annotated_by` | `annotates` |
+| `calls` | `called by` | `throws` | `thrown by` |
+| `constructs` | `constructed by` | `catches` | `caught by` |
+| `reads` | `read by` | `bounded_by` | `bounds` |
+| `writes` | `written by` | `instantiates` | `instantiated by` |
+| `imports` | `imported by` | `specializes` | `specialized by` |
+| `exports` | `exported by` | `overloads` | `overloaded by` |
+| `extends` | `extended by` | `mixes_in` | `mixed in by` |
+| `implements` | `implemented by` | `embeds` | `embedded by` |
+| `has_type` | `type of` | `tests` | `tested by` |
+| `overrides` | `overridden by` | `configures` | `configured by` |
+| | | `binds` | `bound by` |
+
+A root whose symbol is a hit of the result writes the lines of that symbol hit at level 1, with the declaration as its first line and no word before it. Its location line starts with `in `, unless the hit has no location, and its symbol identity line starts with `at `. The further lines follow unchanged. Its location line leaves `relationship` out of the `matched_by` names, because the tree states it.
+
+A branch whose symbol is a hit of the result writes its head line, then the lines of that symbol hit, all at level `2 + d`, with these words before some of them:
+
+- `by ` before the declaration, when every facet phrase of the hop ends in ` by`, such as `referenced by` or `called by`. The head line then leaves ` by` out of each phrase, as in `↳ referenced, called`, so that `by` heads the declaration line. When a phrase does not end in ` by`, such as `type of`, the head line keeps the whole phrases and the declaration line has no word before it.
+- `in ` before the location line, which starts with the location. A hit without a location writes that line without `in `.
+- `at ` before the symbol identity line. A symbol with no identity writes its byte range without `at `.
+
+The further lines of the symbol hit follow unchanged: the first documentation line, the change line, a blank line, and the source. The branch writes the location line without `relationship` in the `matched_by` names, as the root does.
+
+A root whose symbol is no hit of the result writes one line: `at ` and the symbol identity. A branch whose symbol is no hit writes its head line and the `at` line, and no other line. A branch is no hit when its own hit lies on another page. The root is no hit because a walk does not return the symbol it starts from. When a hit outside the walk is the root symbol, as a `query` beside the `traversal` can return it, the server **MUST** write that hit as the root and not as an item.
+
+A file hit has the location and the `matched_by` field names on its first line, then the source directly below. A node hit adds the node identity between those two lines. A documentation hit starts with the heading path joined by ` > `, or `documentation` without headings, then the location of the block and the `matched_by` field names, the identity of the symbol the block documents, and the source.
+
+A commit hit has these lines:
+
+- the revision, the author as `name <email>`, and the date, hour, minute, and offset of the timestamp as `2026-09-22 14:03 +02:00`, separated by ` · `; a requested `score` ends the line
+- the first line of the message
+- a blank line, then the rest of the message
+- `message truncated`, when `message_truncated` is `true`
+- a blank line, then `N paths:` and one changed path per line, one level below `N paths:`; when `paths_truncated` is `true`, the label is `N+ paths · truncated` and a last line of `...` follows
+
+A `get_symbol` hit has these lines:
+
+- the declaration, as for a symbol hit of `search`
+- the location, then the symbol identity or the byte range, then one line of the exceptional facts below
+- each documentation text, after a blank line, with its lines unchanged
+- `documentation:` or `documentation (truncated):` when the call requested documentation, then each referenced block as its location and heading path, with its excerpt indented below
+- `history:` or `history (incomplete):` when the call requested history, then one entry per version as the date, the revision, the kind, and the author, with the path added when it differs from the hit's path, and the summary indented below
+- a blank line, then the source, last
+
+A `nodes` result lists the nodes from the outermost to the innermost. Each node has these lines:
+
+- the `kind`, then ` · N lines` when its excerpt holds more than one line, then `generated` and `test` when the node has those facets
+- the node identity
+- the symbol identity, when the node has one
+- the regions as `role START..END`, joined by ` · `, when the node has regions
+
+After the last node, the server writes a blank line and the excerpt of the innermost node, indented like the further lines of an item, last in the items section. Each outer excerpt contains the inner ones, so `structuredContent` carries the excerpt of every node in `source`.
+
+The server **MUST NOT** write a fact in its normal state. The absence of a fact therefore states the normal state, such as a project declaration that is authored, current, not deprecated, and not a test. The exceptional facts are:
+
+- `score` and its value, when the request asked for `score`
+- the origin as its location and `name@version`, when the declaration is not a project declaration without a package; the location is `dependency`, `stdlib`, or `external`
+- `generated` or `synthetic`, when `source_kind` is not `authored`
+- `deprecated` and `test`, when the symbol has those facets
+- `document local`, when `document_local` is `true`
+- a truncation or an incomplete history, in the lines above
+
+The layout leaves these fields to `structuredContent`:
+
+- the language, container, modifiers, types, and extensions of a symbol, every signature beyond the first, and every documentation line beyond the first of a `search` hit
+- the byte range of a symbol that has an identity
+- the `distance` of a walk hit, which the level of its branch shows, and the `relationship` entry of its `matched_by`, which the tree shows
+- the size and languages of a file hit
+- the unit, language, other facets, parent, and byte range of a node
+
+The server **MUST** write a value that is lowercase hex of at least 8 characters as its first 8 characters: the revision of a commit hit or a history entry, and each digest in a warning line or a resource text. The server resolves a request revision with git revision parsing, which accepts a commit id prefix, so a caller **MAY** send the cut value wherever a request takes a revision. `structuredContent` carries the full revision.
+
+The server **MUST** write source, documentation text, a commit message, and excerpts line by line,
+with their bytes unchanged apart from the indent. A caller then recovers the text by
+removing the leading tabs of the indent, with no unescaping. The server writes every other fact on one line, with
+`\n`, `\r`, `\t`, and `\u{HEX}` for the control characters it holds.
+
+The server writes every requested fact, so a caller that requests `score`, `source`,
+`documentation`, or `history` finds it in the compact text. The server enforces a byte limit on one
+answer's text and refuses an answer that crosses it.
+
+The tabs below show the compact text of `search`, `get_symbol`, and `nodes` results, and of the warnings of an answer:
+
+<Tabs items={["search", "search (commit)", "search (traversal)", "search (change)", "get_symbol", "nodes", "warnings", "items and warnings"]}>
+
+<Tab value="search">
+
+**`search` result, compact text** of the first `search` example, a symbol hit and a file hit:
+
+```text
+2 results · page 1/3
+	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+		src/config.rs:10 · name
+		rift://symbol/rust/src/config.rs/load_config
+		Loads the workspace configuration from `rift.toml`.
+
+		/// Loads the workspace configuration from `rift.toml`.
+		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+		    let text = std::fs::read_to_string(path)?;
+		    parse_config(&text)
+		}
+	[2] src/lib.rs:7 · content
+		    let config = load_config(&arguments.path)?;
+```
+
+</Tab>
+
+<Tab value="search (commit)">
+
+**`search` result, compact text** of the second `search` example, a commit hit:
+
+```text
+1 result
+	9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
+	Bound comparisons at 512 changed paths
+
+	A comparison that reaches the bound answers from the paths that fit and warns change_truncated.
+
+	2 paths:
+		crates/rift-protocol/src/search.rs
+		crates/rift-server/src/change.rs
+```
+
+</Tab>
+
+<Tab value="search (traversal)">
+
+**`search` result, compact text** of an `incoming` walk of two hops from `load_config`. `run` and `reload_config` reference `load_config`, and `main` references `run`:
+
+```text
+3 results
+	at rift://symbol/rust/src/config.rs/load_config
+
+		↳ referenced
+			by fn run(args: &Arguments) -> Result<(), ConfigError>
+			in src/app.rs:20
+			at rift://symbol/rust/src/app.rs/run
+
+			↳ referenced
+				by async fn main() -> Result<(), ConfigError>
+				in src/main.rs:9
+				at rift://symbol/rust/src/main.rs/main
+
+		↳ referenced
+			by fn reload_config() -> Result<(), ConfigError>
+			in src/watch.rs:41
+			at rift://symbol/rust/src/watch.rs/reload_config
+```
+
+**`search` result, compact text** of the second page of a walk. The hit of `run` lies on the first page, so its branch writes only its head line and the `at` line. The second branch comes from an `outgoing` hop with a `heuristic` relationship:
+
+```text
+2 results · page 2/2
+	at rift://symbol/rust/src/config.rs/load_config
+
+		↳ referenced
+			at rift://symbol/rust/src/app.rs/run
+
+			↳ referenced
+				by async fn main() -> Result<(), ConfigError>
+				in src/main.rs:9
+				at rift://symbol/rust/src/main.rs/main
+
+		↳ probably implements
+			impl ConfigLoader for WorkspaceLoader
+			in src/workspace.rs:84
+			at rift://symbol/rust/src/workspace.rs/WorkspaceLoader
+1 warning
+	traversal_truncated · visited 1000: the walk stopped at its node bound
+```
+
+**`search` result, compact text** of a `traversal` beside a `query`. The file hit is outside the walk, and the lexical hit of `load_config` is the root:
+
+```text
+5 results
+	README.md:3 · content
+	A Rust project that reads workspace configuration
+
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+	in src/config.rs:10 · name
+	at rift://symbol/rust/src/config.rs/load_config
+
+		↳ referenced
+			by fn run(args: &Arguments) -> Result<(), ConfigError>
+			in src/app.rs:20
+			at rift://symbol/rust/src/app.rs/run
+
+			↳ referenced
+				by async fn main() -> Result<(), ConfigError>
+				in src/main.rs:9
+				at rift://symbol/rust/src/main.rs/main
+
+		↳ referenced
+			by fn reload_config() -> Result<(), ConfigError>
+			in src/watch.rs:41
+			at rift://symbol/rust/src/watch.rs/reload_config
+```
+
+</Tab>
+
+<Tab value="search (change)">
+
+**`search` result, compact text** of a symbol hit that a comparison found moved:
+
+```text
+1 result
+	struct A
+	a.rs:1 · name
+	rift://symbol/rust/a.rs/A
+	moved · old/a.rs → new/a.rs
+```
+
+</Tab>
+
+<Tab value="get_symbol">
+
+**`get_symbol` result, compact text** of the `get_symbol` example, with source, documentation text, and
+history:
+
+```text
+1 result
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+	src/config.rs:10
+	rift://symbol/rust/src/config.rs/load_config
+
+	Loads the workspace configuration from `rift.toml`.
+
+	history:
+		2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>
+			Return ConfigError from load_config
+		2026-08-17 · 82590265 · introduced · Alice <alice@example.com>
+			Add workspace configuration loading
+
+	/// Loads the workspace configuration from `rift.toml`.
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+	    let text = std::fs::read_to_string(path)?;
+	    parse_config(&text)
+	}
+```
+
+</Tab>
+
+<Tab value="nodes">
+
+**`nodes` result, compact text** of the authored example, five nodes and the excerpt of the innermost:
+
+```text
+5 nodes
+	[1] source_file · 14 lines
+		rift://node/rust/src/config.rs@0-356#dcbef6dd
+	[2] function_item · 4 lines
+		rift://node/rust/src/config.rs@218-355#67ecfb36
+		rift://symbol/rust/src/config.rs/load_config
+		name 225..236 · body 281..355
+	[3] block · 4 lines
+		rift://node/rust/src/config.rs@281-355#4e554fa8
+	[4] call_expression
+		rift://node/rust/src/config.rs@334-353#4df4426e
+	[5] identifier
+		rift://node/rust/src/config.rs@334-346#03f22dac
+
+		parse_config
+```
+
+</Tab>
+
+<Tab value="warnings">
+
+**`search` result, compact text** of an answer without a hit, whose items section is followed by its warnings section:
+
+```text
+0 results
+5 warnings
+	global_access_disabled
+	results_truncated · results_max 100
+	package_substituted · entry serde@1.0.0 (cargo) · package serde@1.0.1 (cargo)
+	pattern_matches_truncated · matches_per_file 5 · files rift://file/a.rs, rift://file/b.rs
+	stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree
+```
+
+</Tab>
+
+<Tab value="items and warnings">
+
+**`search` result, compact text** of the first `search` example carrying two warnings, whose section follows the items:
+
+```text
+2 results · page 1/3
+	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+		src/config.rs:10 · name
+		rift://symbol/rust/src/config.rs/load_config
+		Loads the workspace configuration from `rift.toml`.
+
+		/// Loads the workspace configuration from `rift.toml`.
+		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+		    let text = std::fs::read_to_string(path)?;
+		    parse_config(&text)
+		}
+	[2] src/lib.rs:7 · content
+		    let config = load_config(&arguments.path)?;
+2 warnings
+	results_truncated · results_max 100
+	stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree
+```
+
+</Tab>
+
+</Tabs>
+
+### Revision-addressed reads [#revision-reads]
 
 Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
 `main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
@@ -1317,8 +2247,6 @@ currently holds:
 ```json
 { "name": "ReadService", "rev": "main" }
 ```
-
-<VersionBadge version="v0.0.46" />
 
 A name may carry git's ancestry suffixes: `~N` walks `N` first parents and `^N` picks the `N`th
 parent, each count defaulting to 1, so `HEAD~1` and `HEAD^` name the commit below `HEAD`. The server
@@ -1337,7 +2265,23 @@ working tree, which a revision does not have.
 
 A workspace with no git repository refuses a revision read and names the remedy:
 
-**Error:**
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Execution failure, compact text:**
+
+```text
+1 error
+	capability_unavailable · retry operator_action
+		no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Execution failure, `ErrorData`:**
 
 ```json
 {
@@ -1348,13 +2292,15 @@ A workspace with no git repository refuses a revision read and names the remedy:
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 An unknown revision refuses with `resource_not_found`, and
 [`[providers.history]`](/docs/developer/configuration#providers) owns the capability: `enabled = false`
 refuses every revision read.
 
 ### Requested packages [#requested-packages]
-
-<VersionBadge version="v0.0.46" />
 
 `packages` names package versions a `get_symbol` or `search` read reaches beside the ones the
 workspace's manifests and lockfiles name, at most 64 entries. Each entry is a
@@ -1395,9 +2341,15 @@ reaches the global API.
 
 ## Resources
 
-### Server logs [#resource-logs]
+### Resource contents [#resource-contents]
 
-<VersionBadge version="v0.0.22" />
+A read of a resource answers `contents` with two entries, both naming the requested `uri`. The first is compact text with `mimeType` `text/plain`, and the second is the JSON body with `mimeType` `application/json`. The server makes both from the same data.
+
+The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves the compact text as the only content of a read.
+
+The compact text of a resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
+
+### Server logs [#resource-logs]
 
 `rift://logs` reads the server's own diagnostics back, newest first. Events admitted by the
 `[logs] capture` filter enter a bounded queue and one task writes them to the workspace database,
@@ -1410,23 +2362,127 @@ terminal. When the queue fills, the task drops later events and records the drop
 | `rift://logs/level/{level}` | one severity: `trace`, `debug`, `info`, `warn`, or `error` |
 | `rift://logs/component/{component}` | one component's records, as its spans label them |
 
-The answer is a JSON object carrying `records` and `record_count`. Each record names its
-`identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`,
-`component`, `operation`, `message`, and the remaining `fields` as an object. A span that
-closed carries the fields it recorded beside `elapsed_ms`, which is how long the work it
-wrapped took.
+A read answers the [two contents](#resource-contents) of a resource. The JSON content is an object carrying `uri`, `records`, and `record_count`, and an `unavailable` reason when the store could not be opened.
+
+Each record names its `identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`, `component`, `operation`, `message`, and the remaining `fields`. The `fields` are an object, or the stored text as a string when it is not a JSON object. A span that closed carries the fields it recorded beside `elapsed_ms`, which is how long the work it wrapped took.
+
+The compact text has these parts:
+
+- the title `N records`, or `1 record`
+- directly below the title, one line for each record, indented by one level, in the order of the JSON `records`
+- on each line, the time as `YYYY-MM-DD HH:MM:SS.mmm` in UTC from `recorded_at_ms`, then the `level`, the `component`, and the `operation`, with `-` for a `component` or `operation` that is empty
+- `: ` and the `message`, when it is not empty
+- each entry of `fields` as ` · key value`; a `fields` value that is not an object is written as ` · ` and its text
+- when the store could not be opened, the section `1 warning` after `0 records`, with the line `unavailable: <reason>` indented by one level
+
+The text does not write `identity` or `target`. A `recorded_at_ms` before the epoch or after the year 9999 is written as its count. A read of a level or component template names the requested `uri` in both contents.
+
+The tabs below show a read of `rift://logs` that answers two records, the newer one with an `operation` and the older one without:
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Request:** `rift://logs`
+
+**Response, compact text:**
+
+```text
+2 records
+	2026-10-04 10:42:07.120 warn index index.build: file left out of the index · path src/deep.rs · reason syntax tree depth exceeds accepted limit 512
+	2026-10-04 10:41:58.317 info mcp -: MCP server starting · transport http
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Request:** `rift://logs`
+
+**Response, JSON:**
+
+```json
+{
+  "record_count": 2,
+  "records": [
+    {
+      "component": "index",
+      "fields": {
+        "path": "src/deep.rs",
+        "reason": "syntax tree depth exceeds accepted limit 512"
+      },
+      "identity": 2,
+      "level": "warn",
+      "message": "file left out of the index",
+      "operation": "index.build",
+      "recorded_at_ms": 1791110527120,
+      "target": "rift_mcp::server"
+    },
+    {
+      "component": "mcp",
+      "fields": {
+        "transport": "http"
+      },
+      "identity": 1,
+      "level": "info",
+      "message": "MCP server starting",
+      "operation": "",
+      "recorded_at_ms": 1791110518317,
+      "target": "rift_mcp::http"
+    }
+  ],
+  "uri": "rift://logs"
+}
+```
+
+</Tab>
+
+</ExampleTabs>
 
 The read never waits on workspace readiness. A request that refuses because the index will not
 settle is exactly the request whose reason these records hold, so the log read answers while
 every workspace read is still refusing. A store that could not be opened answers with an empty
-set and an `unavailable` reason rather than a refusal.
+set and an `unavailable` reason rather than a refusal:
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Request:** `rift://logs`
+
+**Response, compact text:**
+
+```text
+0 records
+1 warning
+	unavailable: the workspace log store could not be opened, so this run recorded nothing
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Request:** `rift://logs`
+
+**Response, JSON:**
+
+```json
+{
+  "record_count": 0,
+  "records": [],
+  "unavailable": "the workspace log store could not be opened, so this run recorded nothing",
+  "uri": "rift://logs"
+}
+```
+
+</Tab>
+
+</ExampleTabs>
 
 `[logs] page_records` bounds one read; `retention_records` bounds the store. Both are
 [workspace configuration](/docs/developer/configuration#logs).
 
 ### Workspace [#resource-workspace]
-
-<VersionBadge version="v0.0.25" />
 
 `rift://workspace` reads accepted configuration together with one captured source catalog page.
 The answer carries:
@@ -1442,7 +2498,81 @@ The bare URI selects page zero. `rift://workspace?page_index=1` selects another 
 holds at most 1000 source units; language summaries repeat so every page can be read
 alone. A page past the end returns an empty `source` list with the true page count.
 
-<VersionBadge version="v0.0.47" />
+A read answers the [two contents](#resource-contents) of a resource. The compact text has these parts:
+
+- the header `workspace <configuration_revision>`, with ` · page P/T` added under the rule of the [tool results](#result-content)
+- directly below the header, the sections `languages` and `source`, in that order, each a title such as `languages:` with its entries indented by one level; the server **MUST** omit a section that has no entry
+- a language entry: the language identity, `disabled` when `enabled` is `false`, `syntax` and `execution` when they hold, and `lsp <process> <state>` when the language has a selected LSP process
+- under a language entry, `include` and `exclude` lines with their patterns joined by `, `, each only when the list is not empty
+- a source entry as `path · language · digest`, without the language when none matched
+- after the last section, when the page carries warnings, the section `N warnings`, or `1 warning`, with one line per warning as in a [tool result](#result-content)
+
+The tabs below show the page of a workspace with one TypeScript language and one source unit:
+
+<ExampleTabs items={["text", "json"]}>
+
+<Tab value="text">
+
+**Request:** `rift://workspace`
+
+**Response, compact text:**
+
+```text
+workspace 3f9a1c2e
+languages:
+	typescript:tsx · syntax · lsp typescript:tsx ready
+		include src/**/*.tsx
+		exclude src/generated/**
+source:
+	src/view.tsx · typescript:tsx · 8a4d20bc
+```
+
+</Tab>
+
+<Tab value="json">
+
+**Request:** `rift://workspace`
+
+**Response, JSON:**
+
+```json
+{
+  "configuration_revision": "3f9a1c2e",
+  "languages": [
+    {
+      "enabled": true,
+      "exclude": [
+        "src/generated/**"
+      ],
+      "execution": false,
+      "include": [
+        "src/**/*.tsx"
+      ],
+      "language": "typescript:tsx",
+      "lsp": {
+        "process": "typescript:tsx",
+        "state": "ready"
+      },
+      "syntax": true
+    }
+  ],
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  },
+  "source": [
+    {
+      "digest": "8a4d20bc",
+      "language": "typescript:tsx",
+      "path": "src/view.tsx"
+    }
+  ]
+}
+```
+
+</Tab>
+
+</ExampleTabs>
 
 The source page describes one published catalog. The server **MUST** return its configuration
 revision, source digests, pagination, and preparation warning from that publication. During
@@ -1451,10 +2581,117 @@ after preparation, the catalog also includes visible files without enabled synta
 
 ## Errors
 
-[`ErrorData`](/docs/developer/protocol/reference) reports request and infrastructure failures
-such as invalid input, a crossed limit, or a storage failure.
+A failure travels by its class. A **tool execution failure** is a Rift operating failure on a
+`get_symbol`, `search`, or `nodes` call, such as invalid input, a crossed limit, or a storage
+failure. A **protocol failure** is any other failure: an unknown method or tool, a malformed
+request envelope, a transport failure, a resource read failure, or an MCP error forwarded from
+upstream.
 
-Every one carries a `retry` directive, which is the field to branch on - it rides each error
+### Tool execution failures [#tool-execution-failures]
+
+The server **MUST** answer a tool execution failure with a completed tool result that has
+`isError` set to `true` and one `content` text block of compact text. The result **MUST NOT**
+carry `structuredContent` under either output selection. The MCP specification
+[reports tool execution errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
+in the result, where the model can read the failure and adjust its request.
+
+The advertised `outputSchema` of each tool describes the success result only. A proxy started
+with `--output text` forwards the failure unchanged: it keeps `isError` and `content`, and the
+result had no `structuredContent` to remove.
+
+The text of a failure is one section. Its title is `N errors`, or `1 error`, where N is 1 plus the number of entries of `causes`. Its entries are the failure, then each entry of `causes`, outermost first, as one list. Each line is written on one line, with control characters as escapes:
+
+- the head of an entry, at one level: `<code> · retry <directive>`, the `code` and `retry` of [`ErrorData`](/docs/developer/protocol/reference) or of the cause
+- below the head, at two levels, the `message` of the entry; an empty message writes no line
+- below the failure's message, `limit <field>: <required> over <limit>`, when the failure carries `limit`
+- then one line for each entry of `diagnostics`, as the `severity`, the code in brackets, the file of the span followed by `:line:column`, and `: <message>`, each part only when the diagnostic carries it
+
+Every entry writes its `code` and `retry`, also a cause whose `code` or `retry` equals the failure's.
+
+The text omits `phase`. The typed `ErrorData` model carries it, and a protocol failure carries it in the JSON-RPC `data` as described under [protocol failures](#protocol-failures).
+
+The tabs below show execution failures as compact text, and the completed tool result of the first:
+
+<Tabs items={["invalid_request", "completed result", "limit_exceeded", "causes", "diagnostics"]}>
+
+<Tab value="invalid_request">
+
+**Execution failure, compact text** of a request whose `limit` is below 1:
+
+```text
+1 error
+	invalid_request · retry never
+		the request does not match the documented form: field limit, violation zero; correct the reported field and resend the request
+```
+
+</Tab>
+
+<Tab value="completed result">
+
+**Execution failure, completed tool result** of the same request:
+
+```json
+{
+  "content": [
+    {
+      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field limit, violation zero; correct the reported field and resend the request\n",
+      "type": "text"
+    }
+  ],
+  "isError": true,
+  "resultType": "complete"
+}
+```
+
+</Tab>
+
+<Tab value="limit_exceeded">
+
+**Execution failure, compact text** of a `limit_exceeded` failure on `source.files` that names a cause:
+
+```text
+2 errors
+	limit_exceeded · retry never
+		the request crosses a limit
+		limit source.files: 11 over 10
+	storage_failure · retry same_request
+		the store refused
+```
+
+</Tab>
+
+<Tab value="causes">
+
+**Execution failure, compact text** of a `storage_failure` whose two causes share its `code` and `retry`:
+
+```text
+3 errors
+	storage_failure · retry same_request
+		history store database operation failed: open: unable to open database file; check the history store database and retry
+	storage_failure · retry same_request
+		unable to open database file
+	storage_failure · retry same_request
+		Permission denied (os error 13)
+```
+
+</Tab>
+
+<Tab value="diagnostics">
+
+**Execution failure, compact text** of a failure that carries one provider diagnostic:
+
+```text
+1 error
+	capability_unavailable · retry operator_action
+		the provider reported findings
+		error[E0308] src/lib.rs:3:9: mismatched types
+```
+
+</Tab>
+
+</Tabs>
+
+Every failure carries a `retry` directive, which is the field to branch on - it rides each error
 instance rather than the code, because the same `storage_failure` can be transient once and
 permanent the next time:
 
@@ -1463,5 +2700,23 @@ permanent the next time:
   write in flight
 - `operator_action` - the workspace requires a local state or configuration change before retry
 
-A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
-parsing the message meant for a human.
+The `phase` field of `ErrorData` names the operation that failed while serving the request; its only value, `read`, covers reading
+workspace or provider data. A `limit_exceeded` also carries which limit and by how much, so a
+request can be resized without parsing the message meant for a human. Any other code omits
+`limit`.
+
+Each entry of `causes` holds a `code`, a `message`, and a `retry` for one link of the failure
+chain, outermost first. The `retry` of the failure governs the call; a cause's own `retry`
+says what could be done about that cause. The text writes the `code` and the `retry` of every cause.
+
+### Protocol failures [#protocol-failures]
+
+A protocol failure stays a JSON-RPC error. An MCP error forwarded from upstream keeps its received
+code, message, and data, so the proxy adds nothing to a refusal the server classified.
+
+A failure the proxy raises itself carries the same typed `ErrorData` as the JSON-RPC `data`
+under code `-32000`: a `tools/call` whose `arguments` is not an object, a forwarded request that
+the server did not answer within the proxy's budget, and a server that is still building or
+failed to start. The caller **SHOULD** read `retry` from that `data` as it reads it from the
+first entry of an execution failure. A resource read refusal, such as an unknown `rift://logs`
+level, carries a code and a message and no `data`. A read whose compact text crosses the byte limit carries the typed `ErrorData` as `data`.

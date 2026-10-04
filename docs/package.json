@@ -6,7 +6,7 @@
     "build": "next build",
     "pack": "node scripts/pack.mjs",
     "deploy": "bun run build && bun run pack && wrangler deploy",
-    "dev": "next dev --turbo",
+    "dev": "next dev --turbo --disable-source-maps",
     "start": "next start",
     "logo": "node scripts/logo.mjs",
     "og": "node scripts/og.mjs",

@@ -4,11 +4,11 @@ description: From repository discovery to precise edit targets.
 ---
 
 import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
-import { Card, Cards } from "fumadocs-ui/components/card";
+import { Cards } from "fumadocs-ui/components/card";
 import { Callout } from "fumadocs-ui/components/callout";
 import { AgentWorkflow } from "@/components/agent-workflow";
 import { ExampleProject } from "@/components/example-project";
-import { SymbolExample } from "@/components/symbol-example";
+import { IconCard } from "@/components/icon-card";
 import { WorkspaceMapExample } from "@/components/workspace-map-example";
 import { BookOpenIcon, FileTextIcon, GearIcon } from "@phosphor-icons/react/ssr";
 
@@ -29,8 +29,8 @@ controls.
 </Accordion>
 </Accordions>
 
-Rift follows the MCP specifications, and all inputs and outputs have a strictly defined JSON
-schema, available [here](https://volar.sh/rift/mcp.json).
+Rift follows the MCP specifications, and all inputs and structured outputs have a strictly defined
+JSON schema, available [here](https://volar.sh/rift/mcp.json).
 
 An agent working on an unfamiliar project first needs to understand its structure, then find
 and read the code relevant to its task. Rift provides context before an edit and updates its
@@ -58,17 +58,19 @@ For the example project, a map can look like this:
 
 <WorkspaceMapExample />
 
+In the text, the first line names the map's revision. Each section, such as `languages:` or `packages:`, lists
+its entries indented under it, and a package shows the version the project locks or, as for
+`tokio` here, the requirement its manifest declares.
+
 <Callout type="info">
 
 Rift updates the map when it publishes a new index, so later reads follow changes to the project.
-
-<VersionBadge version="v0.0.47" />
 
 While Rift prepares the local index, the map can show discovered files before their symbols
 are available. A `local_index_preparing` warning reports that incomplete preparation.
 
 The [map reference](/docs/developer/protocol/mcp#resource-map) describes additional facts, such as
-entry points and relationships, and when they are available.
+entry points and relationships, and when they are available. It also shows a map as compact text.
 
 </Callout>
 
@@ -77,13 +79,160 @@ entry points and relationships, and when they are available.
 Once the agent knows where to look, `search` finds code by a name, a phrase, or a description
 of its behavior. A search for configuration loading can start with:
 
+<ExampleTabs items={["call", "text", "json"]}>
+
+<Tab value="call">
+
 ```json
 { "query": "load configuration", "include": ["source"], "limit": 5 }
 ```
 
+</Tab>
+
+<Tab value="text">
+
+```text
+2 results
+	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+		src/config.rs:10 · name
+		rift://symbol/rust/src/config.rs/load_config
+		Loads the workspace configuration from `rift.toml`.
+
+		/// Loads the workspace configuration from `rift.toml`.
+		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+		    let text = std::fs::read_to_string(path)?;
+		    parse_config(&text)
+		}
+	[2] src/main.rs:12 · content
+		        load_config(Path::new("rift.toml"))
+```
+
+</Tab>
+
+<Tab value="json">
+
+```json
+{
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  },
+  "results": [
+    {
+      "hit": {
+        "symbol": {
+          "documentation": [
+            {
+              "format": "markdown",
+              "text": "Loads the workspace configuration from `rift.toml`."
+            }
+          ],
+          "facets": [
+            "value",
+            "callable",
+            "public"
+          ],
+          "id": "rift://symbol/rust/src/config.rs/load_config",
+          "kind": "function",
+          "language": "rust",
+          "name": "load_config",
+          "signatures": [
+            {
+              "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+              "language": "rust",
+              "links": [
+                {
+                  "range": {
+                    "end": 48,
+                    "start": 42
+                  },
+                  "symbol": "rift://symbol/rust/src/config.rs/Config"
+                }
+              ],
+              "parameters": [
+                {
+                  "name": "path",
+                  "optional": false,
+                  "types": [
+                    {
+                      "origin": "declared",
+                      "role": "parameter",
+                      "type": {
+                        "language": "rust",
+                        "source": "&Path"
+                      }
+                    }
+                  ],
+                  "variadic": false
+                }
+              ],
+              "returns": [
+                {
+                  "origin": "declared",
+                  "role": "return",
+                  "type": {
+                    "language": "rust",
+                    "source": "Result<Config, ConfigError>"
+                  }
+                }
+              ]
+            }
+          ],
+          "types": [
+            {
+              "origin": "declared",
+              "role": "return",
+              "type": {
+                "language": "rust",
+                "source": "Result<Config, ConfigError>"
+              }
+            }
+          ],
+          "visibility": "pub"
+        },
+        "target": "symbol"
+      },
+      "line": 10,
+      "matched_by": [
+        "name"
+      ],
+      "path": "src/config.rs",
+      "range": {
+        "end": 355,
+        "start": 162
+      },
+      "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+    },
+    {
+      "hit": {
+        "languages": [
+          "rust"
+        ],
+        "size": 344,
+        "target": "file"
+      },
+      "line": 12,
+      "matched_by": [
+        "content"
+      ],
+      "path": "src/main.rs",
+      "range": {
+        "end": 249,
+        "start": 214
+      },
+      "source": "        load_config(Path::new(\"rift.toml\"))"
+    }
+  ]
+}
+```
+
+</Tab>
+
+</ExampleTabs>
+
 Each result identifies what matched and where it was found. A declaration result includes its
 symbol name and identity, so the agent can use that name with [get_symbol](#tool-get_symbol)
-to read it in more detail.
+to read it in more detail. [Reading results](#reads) explains the text response.
 
 ### Full-text search (FTS) [#search-fulltext]
 
@@ -139,11 +288,86 @@ every `TODO`, every call written as `spawn_blocking(`, every path into a crate. 
 regular expression as `pattern` instead of `query`. The syntax is the one ripgrep reads, so a pattern the
 agent would write for `Grep` or `rg` works unchanged:
 
+<ExampleTabs items={["call", "text", "json"]}>
+
+<Tab value="call">
+
 ```json
 { "pattern": "tokio::\\w+", "paths": { "include": ["src/**"] }, "target": "file" }
 ```
 
-Every match comes back as a file hit with its byte range and line; `target: "symbol"` answers
+</Tab>
+
+<Tab value="text">
+
+```text
+2 results
+	[1] src/main.rs:9 · content
+		#[tokio::main]
+	[2] src/main.rs:11 · content
+		    let config = tokio::task::spawn_blocking(|| {
+```
+
+</Tab>
+
+<Tab value="json">
+
+```json
+{
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  },
+  "results": [
+    {
+      "hit": {
+        "languages": [
+          "rust"
+        ],
+        "size": 344,
+        "target": "file"
+      },
+      "line": 9,
+      "matched_by": [
+        "content"
+      ],
+      "path": "src/main.rs",
+      "range": {
+        "end": 109,
+        "start": 98
+      },
+      "source": "#[tokio::main]"
+    },
+    {
+      "hit": {
+        "languages": [
+          "rust"
+        ],
+        "size": 344,
+        "target": "file"
+      },
+      "line": 11,
+      "matched_by": [
+        "content"
+      ],
+      "path": "src/main.rs",
+      "range": {
+        "end": 184,
+        "start": 173
+      },
+      "source": "    let config = tokio::task::spawn_blocking(|| {"
+    }
+  ]
+}
+```
+
+</Tab>
+
+</ExampleTabs>
+
+In the example project, the pattern matches two lines of `src/main.rs`. Every match comes back as a file hit with its byte range and line; the text shows its path and
+line, with the source line below it. A match shows its own line only, so a statement that
+continues on later lines looks cut; `nodes` or `get_symbol` reads the rest. `target: "symbol"` answers
 each declaration holding a match instead. Matching runs line by line, and a `(?i)` prefix makes it
 case-insensitive. Rift reads only the files a trigram index says can match, then checks them
 with the pattern, so the answer holds every match the files carry.
@@ -238,6 +462,10 @@ Before changing a declaration, the agent can ask which other declarations refere
 `traversal` starts from a symbol identity returned by `search` or `get_symbol` and follows
 incoming references:
 
+<ExampleTabs items={["call", "text", "json"]}>
+
+<Tab value="call">
+
 ```json
 {
   "traversal": {
@@ -250,9 +478,115 @@ incoming references:
 }
 ```
 
+</Tab>
+
+<Tab value="text">
+
+```text
+1 result
+	at rift://symbol/rust/src/config.rs/load_config
+
+		↳ referenced
+			by async fn main() -> Result<(), ConfigError>
+			in src/main.rs:9
+			at rift://symbol/rust/src/main.rs/main
+```
+
+</Tab>
+
+<Tab value="json">
+
+```json
+{
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  },
+  "results": [
+    {
+      "distance": 1,
+      "hit": {
+        "symbol": {
+          "facets": [
+            "value",
+            "callable"
+          ],
+          "id": "rift://symbol/rust/src/main.rs/main",
+          "kind": "function",
+          "language": "rust",
+          "name": "main",
+          "signatures": [
+            {
+              "display": "async fn main() -> Result<(), ConfigError>",
+              "language": "rust"
+            }
+          ]
+        },
+        "target": "symbol"
+      },
+      "line": 9,
+      "matched_by": [
+        "relationship"
+      ],
+      "path": "src/main.rs",
+      "range": {
+        "end": 343,
+        "start": 96
+      },
+      "traversal_path": [
+        {
+          "direction": "incoming",
+          "relationship": {
+            "derivation": "resolution",
+            "facets": [
+              "references"
+            ],
+            "from": "rift://symbol/rust/src/main.rs/main",
+            "kind": "references",
+            "to": "rift://symbol/rust/src/config.rs/load_config"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+</Tab>
+
+</ExampleTabs>
+
+For the example project, the result is `main`. The text shows the walk as a tree: the first line
+starts with `at` and the symbol identity the walk starts from, and each `↳` line starts a declaration that references the
+one above it. Below that line, `by` gives the declaration, `in` its location, and `at` its symbol
+identity. A deeper reference sits one tab further in.
+
 At `depth: 1`, the result contains declarations that reference `load_config`. At `depth: 2`,
 Rift also follows references to those declarations, helping the agent inspect the effect of a change.
 Use the returned symbol identity for `seed`, since names alone do not identify a declaration.
+
+In a larger project, a walk at `depth: 2` returns a deeper tree. Here `run` and
+`reload_config` reference `load_config`, and `main` references `run`:
+
+```text
+3 results
+	at rift://symbol/rust/src/config.rs/load_config
+
+		↳ referenced
+			by fn run(args: &Arguments) -> Result<(), ConfigError>
+			in src/app.rs:20
+			at rift://symbol/rust/src/app.rs/run
+
+			↳ referenced
+				by async fn main() -> Result<(), ConfigError>
+				in src/main.rs:9
+				at rift://symbol/rust/src/main.rs/main
+
+		↳ referenced
+			by fn reload_config() -> Result<(), ConfigError>
+			in src/watch.rs:41
+			at rift://symbol/rust/src/watch.rs/reload_config
+```
 
 Reading a declaration raises the opposite question: what does it rely on? `direction: "outgoing"`
 follows the calls the declaration makes, and each hop carries the `calls` facet:
@@ -320,11 +654,35 @@ constraints.
 When the agent needs the commit that introduced a change, it can search commit messages.
 `target: "commit"` matches `query` against the messages of the commits the history store holds:
 
-**Request:**
+<ExampleTabs items={["call", "text", "json"]}>
+
+<Tab value="call">
 
 ```json
 { "target": "commit", "query": "change path bound", "limit": 10 }
 ```
+
+</Tab>
+
+<Tab value="text">
+
+**`search` result holding this hit, compact text:**
+
+```text
+1 result
+	9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
+	Bound comparisons at 512 changed paths
+
+	A comparison that reaches the bound answers from the paths that fit and warns change_truncated.
+
+	2 paths:
+		crates/rift-protocol/src/search.rs
+		crates/rift-server/src/change.rs
+```
+
+</Tab>
+
+<Tab value="json">
 
 **Search hit:**
 
@@ -345,9 +703,23 @@ When the agent needs the commit that introduced a change, it can search commit m
 }
 ```
 
-Each hit carries the commit's message, author, time, and the paths it changed. While the local
-server is still filling its history store, the answer carries a `history_store_filling` warning
-naming how many of the selected commits the store holds, and a later search answers the rest.
+</Tab>
+
+</ExampleTabs>
+
+Each hit carries the commit's message, author, time, and the paths it changed. The text cuts the
+revision to its first 8 characters, which Rift accepts wherever a request takes a revision.
+
+While the local server is still filling its history store, the answer carries a
+`history_store_filling` warning naming how many of the selected commits the store holds, and a
+later search answers the rest. A search that finds no commit yet reads:
+
+```text
+0 results
+1 warning
+	history_store_filling · analyzed 40 · total 100: the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest
+```
+
 A commit search takes `query` alone; see the [commit search reference](/docs/developer/protocol/mcp#search-commits)
 for ordering, bounds, and refusals.
 
@@ -361,11 +733,135 @@ and its source.
 
 To read `load_config` from the example project, the agent calls `get_symbol`:
 
-<SymbolExample />
+<ExampleTabs items={["call", "text", "json"]}>
 
-The result gives the agent the function's definition, location, and symbol identity.
-If several declarations match, the agent can inspect their paths and qualified names
-and select the one relevant to its task.
+<Tab value="call">
+
+```json
+{ "name": "load_config" }
+```
+
+</Tab>
+
+<Tab value="text">
+
+```text
+1 result
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+	src/config.rs:10
+	rift://symbol/rust/src/config.rs/load_config
+
+	Loads the workspace configuration from `rift.toml`.
+
+	/// Loads the workspace configuration from `rift.toml`.
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+	    let text = std::fs::read_to_string(path)?;
+	    parse_config(&text)
+	}
+```
+
+</Tab>
+
+<Tab value="json">
+
+```json
+{
+  "hits": [
+    {
+      "line": 10,
+      "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+      "path": "src/config.rs",
+      "range": {
+        "end": 355,
+        "start": 162
+      },
+      "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+      "symbol": {
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Loads the workspace configuration from `rift.toml`."
+          }
+        ],
+        "facets": [
+          "value",
+          "callable",
+          "public"
+        ],
+        "id": "rift://symbol/rust/src/config.rs/load_config",
+        "kind": "function",
+        "language": "rust",
+        "name": "load_config",
+        "signatures": [
+          {
+            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+            "language": "rust",
+            "links": [
+              {
+                "range": {
+                  "end": 48,
+                  "start": 42
+                },
+                "symbol": "rift://symbol/rust/src/config.rs/Config"
+              }
+            ],
+            "parameters": [
+              {
+                "name": "path",
+                "optional": false,
+                "types": [
+                  {
+                    "origin": "declared",
+                    "role": "parameter",
+                    "type": {
+                      "language": "rust",
+                      "source": "&Path"
+                    }
+                  }
+                ],
+                "variadic": false
+              }
+            ],
+            "returns": [
+              {
+                "origin": "declared",
+                "role": "return",
+                "type": {
+                  "language": "rust",
+                  "source": "Result<Config, ConfigError>"
+                }
+              }
+            ]
+          }
+        ],
+        "types": [
+          {
+            "origin": "declared",
+            "role": "return",
+            "type": {
+              "language": "rust",
+              "source": "Result<Config, ConfigError>"
+            }
+          }
+        ],
+        "visibility": "pub"
+      }
+    }
+  ],
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  }
+}
+```
+
+</Tab>
+
+</ExampleTabs>
+
+The result gives the agent the function's definition, location, and symbol identity, then its
+documentation and source. If several declarations match, each gets a `[n]` marker, and the agent
+can inspect their paths and qualified names and select the one relevant to its task.
 
 Use `include` to choose which additional information comes with each symbol. Options can be combined:
 
@@ -381,11 +877,38 @@ If omitted, `include` defaults to `["source"]`. An explicit list replaces that d
 With `history`, each hit lists the revisions that changed the declaration, newest first, each
 with its author:
 
-**Request:**
+<ExampleTabs items={["call", "text", "json"]}>
+
+<Tab value="call">
 
 ```json
 { "name": "load_config", "include": ["history"] }
 ```
+
+</Tab>
+
+<Tab value="text">
+
+**`get_symbol` result, compact text:**
+
+```text
+1 result
+	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+	src/config.rs:10
+	rift://symbol/rust/src/config.rs/load_config
+
+	Loads the workspace configuration from `rift.toml`.
+
+	history:
+		2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>
+			Return ConfigError from load_config
+		2026-08-17 · 82590265 · introduced · Alice <alice@example.com>
+			Add workspace configuration loading
+```
+
+</Tab>
+
+<Tab value="json">
 
 **Hit history:**
 
@@ -414,9 +937,13 @@ with its author:
 }
 ```
 
+</Tab>
+
+</ExampleTabs>
+
 The local server fills its history store in the background after it starts. Until the store
-holds the revision a read is served from, the timeline answers `complete: false`, and a later
-read answers the rest.
+holds the revision a read is served from, the timeline answers `complete: false`, the text labels
+it `history (incomplete):`, and a later read answers the rest.
 
 <span id="get_symbol-scope" />
 
@@ -439,9 +966,135 @@ The position is a UTF-8 byte offset, rather than a line or character number.
 
 In the sample `src/config.rs`, byte `338` lies inside the `parse_config(&text)` call:
 
+<ExampleTabs items={["call", "text", "json"]}>
+
+<Tab value="call">
+
 ```json
 { "path": "src/config.rs", "position": 338 }
 ```
+
+</Tab>
+
+<Tab value="text">
+
+```text
+5 nodes
+	[1] source_file · 14 lines
+		rift://node/rust/src/config.rs@0-356#dcbef6dd
+	[2] function_item · 4 lines
+		rift://node/rust/src/config.rs@218-355#67ecfb36
+		rift://symbol/rust/src/config.rs/load_config
+		name 225..236 · body 281..355
+	[3] block · 4 lines
+		rift://node/rust/src/config.rs@281-355#4e554fa8
+	[4] call_expression
+		rift://node/rust/src/config.rs@334-353#4df4426e
+	[5] identifier
+		rift://node/rust/src/config.rs@334-346#03f22dac
+
+		parse_config
+```
+
+</Tab>
+
+<Tab value="json">
+
+```json
+{
+  "nodes": [
+    {
+      "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+      "kind": "source_file",
+      "language": "rust",
+      "range": {
+        "end": 356,
+        "start": 0
+      },
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "facets": [
+        "declaration",
+        "definition"
+      ],
+      "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+      "kind": "function_item",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+      "range": {
+        "end": 355,
+        "start": 218
+      },
+      "regions": [
+        {
+          "range": {
+            "end": 236,
+            "start": 225
+          },
+          "role": "name"
+        },
+        {
+          "range": {
+            "end": 355,
+            "start": 281
+          },
+          "role": "body"
+        }
+      ],
+      "symbol": "rift://symbol/rust/src/config.rs/load_config",
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+      "kind": "block",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+      "range": {
+        "end": 355,
+        "start": 281
+      },
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "facets": [
+        "expression"
+      ],
+      "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+      "kind": "call_expression",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+      "range": {
+        "end": 353,
+        "start": 334
+      },
+      "unit": "rift://file/src/config.rs"
+    },
+    {
+      "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+      "kind": "identifier",
+      "language": "rust",
+      "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
+      "range": {
+        "end": 346,
+        "start": 334
+      },
+      "unit": "rift://file/src/config.rs"
+    }
+  ],
+  "source": [
+    "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
+    "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+    "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+    "parse_config(&text)",
+    "parse_config"
+  ]
+}
+```
+
+</Tab>
+
+</ExampleTabs>
 
 The response lists enclosing nodes from outermost to innermost, with source excerpts and byte ranges:
 
@@ -452,6 +1105,14 @@ The response lists enclosing nodes from outermost to innermost, with source exce
 | Function body | The implementation inside the braces |
 | `parse_config(&text)` call | The expression to change |
 | `parse_config` identifier | The name within that expression |
+
+In the text response:
+
+- Each node shows its syntax kind and line count, then its node identity, which carries the
+  byte range: `@334-353` is the `parse_config(&text)` call.
+- The function also shows its symbol identity and the ranges of its name and body.
+- The excerpt of the innermost node closes the answer; the structured output carries the excerpt
+  of every node.
 
 The agent chooses the range it needs and applies the change with its own editing tools.
 After the file changes, it should read again before using its ranges for another edit.
@@ -481,6 +1142,91 @@ whose text still answers, `large_file_skipped` counts files left out of text sea
 `lockfile_excluded` names a lockfile the path selection reached but search leaves out.
 The [read reference](/docs/developer/protocol/mcp#reads) describes each warning.
 
+The agent reads each answer as compact text. The text is a list of sections, and each section
+starts with a title that counts its entries, such as `2 results` or `1 warning`, with the entries
+indented under it. Warnings form their own section after the items:
+
+<Tabs items={["results", "results and warnings", "warnings only"]}>
+
+<Tab value="results">
+
+**`search` result, compact text** of a symbol hit and a file hit:
+
+```text
+2 results · page 1/3
+	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+		src/config.rs:10 · name
+		rift://symbol/rust/src/config.rs/load_config
+		Loads the workspace configuration from `rift.toml`.
+
+		/// Loads the workspace configuration from `rift.toml`.
+		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+		    let text = std::fs::read_to_string(path)?;
+		    parse_config(&text)
+		}
+	[2] src/lib.rs:7 · content
+		    let config = load_config(&arguments.path)?;
+```
+
+</Tab>
+
+<Tab value="results and warnings">
+
+**`search` result, compact text** of the same hits with two warnings:
+
+```text
+2 results · page 1/3
+	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
+		src/config.rs:10 · name
+		rift://symbol/rust/src/config.rs/load_config
+		Loads the workspace configuration from `rift.toml`.
+
+		/// Loads the workspace configuration from `rift.toml`.
+		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+		    let text = std::fs::read_to_string(path)?;
+		    parse_config(&text)
+		}
+	[2] src/lib.rs:7 · content
+		    let config = load_config(&arguments.path)?;
+2 warnings
+	results_truncated · results_max 100
+	stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree
+```
+
+</Tab>
+
+<Tab value="warnings only">
+
+**`get_symbol` result, compact text** of a read while Rift prepares the local index:
+
+```text
+0 results
+1 warning
+	local_index_preparing · prepared 0: selected local files are still being prepared
+```
+
+</Tab>
+
+</Tabs>
+
+- `2 results · page 1/3` counts the items on the served page and names that page; `page_index: 1`
+  asks for the next one.
+- Each item starts with `[n]` when there are several. A symbol hit shows its declaration, where it
+  is and which field matched, its symbol identity for the next call, and the source.
+- A warning line names its `code`, then its facts, and after `: ` the detail.
+- The title is written even when nothing matched, so `0 results` with a warning tells the agent
+  why the answer is empty.
+
+Compact text prints only what stands out, such as a requested `score`, a dependency origin, or a
+truncated history. Everything else is in the structured output, which by default `rift mcp` sends
+beside the text, so a program calling the tools can read every field as JSON.
+
+When the agent only needs the text, start `rift mcp --output=text`. It leaves out the structured
+output and the output schemas in the tool listing, which makes each response smaller. A resource read
+then returns its compact text without the JSON body.
+
+The [result content reference](/docs/developer/protocol/mcp#result-content) defines the form.
+
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
@@ -499,9 +1245,67 @@ and argument constraints.
 </Accordion>
 <Accordion title="Errors" id="errors">
 
-A failed request carries a `retry` directive that distinguishes retrying the same request from
-changing its arguments or fixing local configuration. See the
-[error reference](/docs/developer/protocol/mcp#errors) for those directives and limit details.
+When a call fails, the agent gets a result marked as an error instead of an answer. Its text is one
+section, titled with the count of errors, that lists the failure first and then its causes,
+outermost first. Each entry names its `code` and a `retry` directive, which says whether sending
+the same request again can help, and the line below states what failed:
+
+<Tabs items={["invalid_request", "limit_exceeded", "causes"]}>
+
+<Tab value="invalid_request">
+
+**Tool execution failure, compact text** of a request whose `limit` is below 1:
+
+```text
+1 error
+	invalid_request · retry never
+		the request does not match the documented form: field limit, violation zero; correct the reported field and resend the request
+```
+
+</Tab>
+
+<Tab value="limit_exceeded">
+
+**Tool execution failure, compact text** of a request that crosses a limit on `source.files`, with one cause:
+
+```text
+2 errors
+	limit_exceeded · retry never
+		the request crosses a limit
+		limit source.files: 11 over 10
+	storage_failure · retry same_request
+		the store refused
+```
+
+</Tab>
+
+<Tab value="causes">
+
+**Tool execution failure, compact text** of a history store that could not be opened, with two causes:
+
+```text
+3 errors
+	storage_failure · retry same_request
+		history store database operation failed: open: unable to open database file; check the history store database and retry
+	storage_failure · retry same_request
+		unable to open database file
+	storage_failure · retry same_request
+		Permission denied (os error 13)
+```
+
+</Tab>
+
+</Tabs>
+
+- `retry never` tells the agent to change its arguments first; `retry same_request` says the same
+  request can succeed later.
+- A `limit_exceeded` failure adds the limit it crossed, `limit source.files: 11 over 10`, so the
+  agent can resize the request.
+- The `retry` of the first entry governs the call; a cause's `retry` says what could be done
+  about that cause.
+
+See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for the other
+directives and the complete form.
 
 </Accordion>
 </Accordions>
@@ -512,20 +1316,63 @@ When a result needs more context, the agent can read the local configuration or 
 through MCP resources:
 
 <Cards>
-<Card id="resource-workspace" title="Workspace" href="/docs/developer/protocol/mcp#resource-workspace" icon={<GearIcon />}>
+<IconCard id="resource-workspace" title="Workspace" href="/docs/developer/protocol/mcp#resource-workspace" icon={GearIcon}>
 
 `rift://workspace` shows accepted configuration and the source catalog, including which files
 and languages Rift serves.
 
-</Card>
-<Card id="resource-logs" title="Server logs" href="/docs/developer/protocol/mcp#resource-logs" icon={<FileTextIcon />}>
+</IconCard>
+<IconCard id="resource-logs" title="Server logs" href="/docs/developer/protocol/mcp#resource-logs" icon={FileTextIcon}>
 
 `rift://logs` returns recorded diagnostics, newest first, including when the index is not ready.
 
-</Card>
-<Card title="MCP reference" href="/docs/developer/protocol/mcp" icon={<BookOpenIcon />}>
+</IconCard>
+<IconCard title="MCP reference" href="/docs/developer/protocol/mcp" icon={BookOpenIcon}>
 
 Complete tool examples, resource fields, limits, warnings, and failure behavior.
 
-</Card>
+</IconCard>
 </Cards>
+
+A resource read also comes as compact text, in the same form as a tool result:
+
+<Tabs items={["rift://workspace", "rift://logs"]}>
+
+<Tab value="rift://workspace">
+
+**`rift://workspace`, compact text** of a workspace with one TypeScript language and one source file:
+
+```text
+workspace 3f9a1c2e
+languages:
+	typescript:tsx · syntax · lsp typescript:tsx ready
+		include src/**/*.tsx
+		exclude src/generated/**
+source:
+	src/view.tsx · typescript:tsx · 8a4d20bc
+```
+
+</Tab>
+
+<Tab value="rift://logs">
+
+**`rift://logs`, compact text** of two records, newest first:
+
+```text
+2 records
+	2026-10-04 10:42:07.120 warn index index.build: file left out of the index · path src/deep.rs · reason syntax tree depth exceeds accepted limit 512
+	2026-10-04 10:41:58.317 info mcp -: MCP server starting · transport http
+```
+
+</Tab>
+
+</Tabs>
+
+- The workspace text starts with the digest of the accepted `rift.toml`, then lists each language
+  with its include and exclude patterns, and each source file with its language and content
+  digest.
+- Each log record shows its time in UTC, level, component, and operation, then its message and
+  fields; `-` stands for an empty component or operation.
+
+See [resource contents](/docs/developer/protocol/mcp#resource-contents) for the compact text and
+the JSON body a read carries.
