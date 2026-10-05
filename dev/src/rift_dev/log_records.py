@@ -11,12 +11,11 @@ The context holds the root span's `key=value` fields, or, for a record outside e
 span, the record's own `component`, `operation`, and fields. The nested operation is `↳`,
 the nearest span's name, and its fields. The message is `close`, a mark, and `busy` and
 `idle` for a span close; a mark (`→`, `✓`, `✗`) and the message for a lifecycle record;
-the message and the record's own fields otherwise. A metric snapshot record prints its
-instrument group as the function and its values as the message. A stored page pads each
-column to the widest value of its group and puts a blank line between groups; a live
-stream pads to fixed widths. The runners parse two kinds of record from a stopped
-server's output, `database.close` and `stop stage ended`, and pick the newest
-`operations in flight` and metric snapshot records for a failure window.
+the message and the record's own fields otherwise. A stored page pads each column to the
+widest value of its group and puts a blank line between groups; a live stream pads to
+fixed widths. The runners parse two kinds of record from a stopped server's output,
+`database.close` and `stop stage ended`, and pick the newest `operations in flight`
+record for a failure window.
 """
 
 from __future__ import annotations
@@ -31,10 +30,6 @@ STAGE_ENDED = "stop stage ended"
 IN_FLIGHT = "operations in flight"
 STALL_REPORT = "operations in flight past the stall delay"
 DATABASE_CLOSE = "database.close"
-# The instrument groups a metric snapshot record prints in the function column.
-SNAPSHOT_GROUPS = frozenset(
-    ["operations", "locks", "database", "runtime", "process", "lifecycle"]
-)
 # Entries one report keeps per record kind. A stop writes a handful; the newest win.
 ENTRIES_MAX = 64
 # Characters of a free-text value the report keeps.
@@ -88,12 +83,7 @@ class Line(NamedTuple):
 
     @property
     def operation(self) -> str:
-        """The record's `operation`: its own, else the nearest span's, else the root's.
-
-        A metric snapshot record names its instrument group here.
-        """
-        if self.is_snapshot():
-            return self.function
+        """The record's `operation`: its own, else the nearest span's, else the root's."""
         return self.label("operation")
 
     def label(self, key: str) -> str:
@@ -103,11 +93,6 @@ class Line(NamedTuple):
             if value is not None:
                 return value
         return ""
-
-    def is_snapshot(self) -> bool:
-        """Whether the line is a metric snapshot record: an instrument group, not a
-        function, in the function column."""
-        return self.function in SNAPSHOT_GROUPS and not self.context
 
     def message_end(self, message: str) -> int | None:
         """Where `message` ends in `rest`, after an optional mark; None when absent.
@@ -330,16 +315,3 @@ def newest_in_flight(records: Iterable[Line]) -> Line | None:
         if record.is_message(IN_FLIGHT) and not record.is_message(STALL_REPORT):
             newest = record
     return newest
-
-
-def newest_snapshots(records: Iterable[Line]) -> list[Line]:
-    """The newest metric snapshot record of each group, oldest first.
-
-    A snapshot record names its group, one of operations, locks, database, runtime,
-    process, or lifecycle, in the function column.
-    """
-    newest: dict[str, Line] = {}
-    for record in records:
-        if record.is_snapshot():
-            newest[record.function] = record
-    return sorted(newest.values(), key=lambda record: record.time)

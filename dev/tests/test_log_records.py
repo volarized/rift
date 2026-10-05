@@ -10,7 +10,6 @@ from rift_dev.log_records import (
     instant,
     lines,
     newest_in_flight,
-    newest_snapshots,
     parse_line,
     stop_measurements,
 )
@@ -224,18 +223,3 @@ def test_the_newest_operations_in_flight_is_not_a_stall_report() -> None:
     assert found is not None
     assert found.text == IN_FLIGHT
     assert newest_in_flight(lines(STALL)) is None
-
-
-def test_the_newest_snapshot_of_each_group_is_kept() -> None:
-    def snapshot(second: int, group: str) -> str:
-        return f"2026-10-05 09:00:0{second}.000Z INFO  {group}   a=1"
-
-    kept = newest_snapshots(
-        lines(
-            "\n".join(
-                [snapshot(1, "locks"), snapshot(2, "database"), snapshot(3, "locks")]
-            )
-        )
-    )
-    assert [record.operation for record in kept] == ["database", "locks"]
-    assert kept[1].time.second == 3
