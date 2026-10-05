@@ -227,9 +227,10 @@ available. CI runs this check with its compiled Linux artifact; a local macOS ru
 ## Local traces
 
 Rift times cold-start work through `tracing` spans, opened by the `traced!`/`traced_async!`
-macros in `rift-core`. Building with `--features otlp` adds an OTLP/HTTP export layer that sends
-those spans to a local collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one - the feature is
-off by default, so a plain build carries no OpenTelemetry stack.
+macros in `rift-core`. Building `rift` with `--features otlp` turns on the same feature of
+`rift-tracing`, which adds an OTLP/HTTP export layer that sends those spans to a local collector
+once `OTEL_EXPORTER_OTLP_ENDPOINT` names one - the feature is off by default, so a plain build
+carries no OpenTelemetry stack.
 
 Start the collector, build with the feature, and point a run at it from a second terminal:
 

@@ -616,6 +616,18 @@ count; meanwhile the queue fills and then drops, and the next batch written carr
 `the log queue was full and dropped records` record with the `dropped` count. The stop's
 deadline bounds the retry: a drain aborted there reports what it held as `unwritten`.
 
+The CLI starts tracing through `TracingRuntime::builder` in `rift-tracing`, which installs one
+subscriber with a filter per layer:
+
+- stderr under `RUST_LOG`, or `rift=info,rift_mcp=info,rift_server=info,rift_index=warn` when
+  that variable is unset or does not parse
+- the `LogSink` under `[logs]` `capture`, installed for a foreground server alone
+- with the `otlp` feature, the OTLP export under `RIFT_OTLP_FILTER`
+
+A foreground server whose stderr is not a terminal writes at most 1 MiB there. The write that
+crosses the bound is followed by one notice, `standard error reached its byte bound`, and every
+later write is discarded; the records the `LogSink` captured are unaffected.
+
 ## Shared ranking
 
 `rift-ranking` states the retrieval decisions every index makes: the document shape and its
