@@ -65,6 +65,8 @@ the workspace accepts, plus an allowance for the answer. When the budget ends, t
 the request, which closes its Streamable HTTP response stream, and the caller gets a
 `temporarily_unavailable` refusal naming the budget.
 
+<VersionBadge version="v0.0.62" />
+
 `rift mcp` takes one `--output` choice: `all`, the default, or `text`. The proxy keeps the choice
 for its lifetime, across upstream reconnects, so the tool listing it advertises stays stable. With
 `text`, the proxy removes `structuredContent` from each completed tool result, `outputSchema`
@@ -109,6 +111,8 @@ The server is an [Axum](https://docs.rs/axum) application on the [Tokio](https:/
 runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP through
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; `/api/stop` serves
 `rift server stop`.
+
+<VersionBadge version="v0.0.62" />
 
 When the server builds a tool result, it renders compact text from the typed answer into
 `content` and serializes the same answer into `structuredContent`. Typed layout code renders every
@@ -178,6 +182,8 @@ Freeing a large index can take longer than closing the listener. After the index
 stops, the blocking pool releases its retained index while the foreground process finishes
 the log drain and releases the election.
 
+<VersionBadge version="v0.0.62" />
+
 A foreground stop runs its stages under one deadline, `SERVER_STOP_DEADLINE` (4 s) from where the
 stop begins, and each stage takes only what the one before it left:
 
@@ -193,6 +199,8 @@ stop begins, and each stage takes only what the one before it left:
 
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
 `stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure.
+
+<VersionBadge version="v0.0.62" />
 
 A server records each step of its life at `INFO`, so the store keeps them under the default
 `[logs]` `capture`. A record that opens a step carries `phase = "start"`, and one that ends it
@@ -403,6 +411,8 @@ through [rusqlite](https://github.com/rusqlite/rusqlite) directly, as the histor
 The server never reads, migrates, or removes a `.rift/db` file left in the state directory;
 delete it and its `-wal`, `-shm`, and `.lock` files by hand.
 
+<VersionBadge version="v0.0.62" />
+
 An elected server opens the metrics database first, then the index database, so the index
 database's open lands as a record. The vectors database opens through `LazyDatabase`, a handle
 that opens the file at the first vector operation, at most once, under the same election owner;
@@ -425,6 +435,8 @@ database's migration set. SQLite refuses a second process's WAL switch at once, 
 for the first, and Toasty applies every migration it read as missing, so two processes preparing
 one new file side by side leave one of them without the database. A process that meets the lock
 waits for it up to [`[search]`](/docs/developer/configuration#search) `busy_timeout`.
+
+<VersionBadge version="v0.0.62" />
 
 `LogStore::open` in `rift-tracing` spawns `rift-db-metrics`, which opens the one write connection
 to `.rift/metrics` and keeps it for its life. One thread owns the only write connection, so
@@ -628,9 +640,9 @@ The flags narrow what prints:
 - `-n`, `--tail` prints only the newest records
 - `--since` prints records recorded at or after an age such as `10m`, or an RFC 3339 timestamp
   such as `2026-10-04T20:42:58Z`
-- `--until` prints records recorded before a bound, in the same two forms; with `--since` it
+- `--until` <VersionBadge version="v0.0.62" inline /> prints records recorded before a bound, in the same two forms; with `--since` it
   selects one window
-- `--kind` prints `log` records, the default, `metric` snapshot records, or `all` of them
+- `--kind` <VersionBadge version="v0.0.62" inline /> prints `log` records, the default, `metric` snapshot records, or `all` of them
 - `--level` selects one severity
 - `--component` selects records from one component
 
@@ -644,6 +656,8 @@ metrics database refuses stays with the drain, which retries it every 500 ms wit
 count; meanwhile the queue fills and then drops, and the next batch written carries a
 `the log queue was full and dropped records` record with the `dropped` count. The stop's
 deadline bounds the retry: a drain aborted there reports what it held as `unwritten`.
+
+<VersionBadge version="v0.0.62" />
 
 An event record names the spans it was emitted in, so the records of one request group by its
 `request_id` even while a background task logs between them. When a span opens, the `LogSink`
@@ -731,6 +745,8 @@ overflow series. Every `traced!` operation records `traces.span.metrics.calls` a
 the operation, not its span: a span clone held elsewhere does not lengthen the duration, and the
 span's filters do not select it.
 
+<VersionBadge version="v0.0.62" />
+
 Every request `rift server` answers records `mcp.server.operation.duration`, and every request
 `rift mcp` forwards to it records `mcp.client.operation.duration`, in seconds, bucketed at the
 boundaries the MCP semantic conventions advise, from 10 ms to 300 s. A series names
@@ -739,6 +755,8 @@ boundaries the MCP semantic conventions advise, from 10 ms to 300 s. A series na
 `nodes`, or `search`. A tool answered with `isError` records `error.type` `tool_error`; a
 JSON-RPC error records its code as both `error.type` and `rpc.response.status_code`, such as
 `-32602`, or `error.type` `_OTHER` for a code outside the JSON-RPC, MCP, and Rift codes.
+
+<VersionBadge version="v0.0.62" />
 
 A foreground server samples its own process every [`[logs]`](/docs/developer/configuration#logs)
 `sample_interval`. A sample reads the process once through `sysinfo`, on the blocking pool, and
@@ -752,6 +770,8 @@ database registers one that records `sqlite.file.size` for the database file and
 log, so the sizes move on each tick between open and close. With the `otlp` feature and
 `OTEL_EXPORTER_OTLP_ENDPOINT` set, every recorded value is also forwarded to an OpenTelemetry
 meter whose reader exports at `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default.
+
+<VersionBadge version="v0.0.62" />
 
 Work that has not finished is evidence too. The runtime keeps a table of operations in flight:
 every span carrying an `operation` field, every lock wait, and every held lock, from its opening
@@ -780,6 +800,8 @@ within 4 KiB, and count what did not fit in `left_out`:
 `operation opened` event inside the operation's span, so the store holds the operation while it
 runs and a killed server leaves it behind. `lexical.commit` opens this way.
 
+<VersionBadge version="v0.0.62" />
+
 `rift_tracing::lock(name).acquire(future)` wraps the caller's own acquisition future, such as
 `mutex.lock()`, and polls it as the caller would, so the lock's queue order and cancellation
 stay its own. A wait that does not acquire at its first poll opens a `lock.wait` span naming
@@ -793,6 +815,8 @@ and `lock.held.duration`. The write turn of `.rift/index` and `.rift/vectors` is
 `index.write` and `vectors.write`, so a lexical commit that waits for a documentation write shows
 as a `lock.wait` entry under `lexical.commit` while the holder's `lock.held` entry names the
 operation running its statements.
+
+<VersionBadge version="v0.0.62" />
 
 The sample tick also writes metric snapshot records, kind `metric`, one per instrument group:
 `operations`, `locks`, `database`, `runtime`, `process`, and `lifecycle`. A gauge prints its

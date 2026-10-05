@@ -141,6 +141,8 @@ The server stops itself once no request remains active and the
 `rift server stop` ends it sooner. The server removes its lock file on the way out, and the next
 `rift mcp` starts a fresh one. The databases under `.rift` survive the exit.
 
+<VersionBadge version="v0.0.62" />
+
 A served workspace keeps three databases under `.rift`:
 
 - the index database, `.rift/index`, holds the lexical index `search` ranks from
