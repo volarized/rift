@@ -1093,10 +1093,29 @@ async fn serve_foreground(
     stop_export(&export, export_deadline).await;
     stop_log_drain(log_drain, flush_deadline).await;
     let logs = database.close_logs(deadline).await;
-    // The election releases last: dropping the guard retires the document and
-    // unlocks, immediately before the process exits.
-    drop(guard);
+    retire_before_exit(guard);
     stopped.and(search).and(logs)
+}
+
+/// Retires `server.json` and drops this stop's election guard, immediately before the
+/// process exits.
+///
+/// Each database thread holds a clone of the guard until it exits, so a close that
+/// ended `timeout` leaves a thread still holding it: the election stays held until the
+/// process exits, and the operating system releases the lock then. The document is
+/// retired here either way, because the process no longer serves; dropping the last
+/// clone retires it again, which finds it gone.
+fn retire_before_exit(guard: std::sync::Arc<rift_mcp::ElectionGuard>) {
+    guard.retire();
+    if std::sync::Arc::strong_count(&guard) > 1 {
+        rift_tracing::warn!(
+            component = "mcp",
+            operation = "server.stop",
+            "a database thread still holds the workspace election; it is released when the \
+             process exits"
+        );
+    }
+    drop(guard);
 }
 
 fn foreground_selection(

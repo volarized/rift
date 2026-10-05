@@ -277,7 +277,10 @@ start nor its end. A vector population that fails ends with its warning, carryin
 
 A wait for the Git `index.lock` records `Git index lock wait ended` only when it found the lock
 present, with the `outcome` `ok`, `timeout`, or `cancelled`. The election guard drops after the
-metrics database closes, so `workspace election released` reaches stderr and not the store.
+metrics database closes, so `workspace election released` reaches stderr and not the store. A
+database thread whose close ended `timeout` still holds a clone of the election guard, so the
+stop retires `server.json` itself before the process exits, records `a database thread still
+holds the workspace election` at `warn`, and the election is released by the process exit.
 
 `rift mcp` and `rift server start` record their side of a start on their own stderr. Each
 detached server they spawn records `detached server spawned` with its `pid` and where `stdin`,

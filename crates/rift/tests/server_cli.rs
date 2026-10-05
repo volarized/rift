@@ -1573,6 +1573,101 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
     Ok(())
 }
 
+/// How long the server's index writes wait for another process's lock in the forced
+/// close below: `[search] busy_timeout` at its upper bound, longer than the whole stop.
+const HELD_INDEX_BUSY_TIMEOUT: &str = "30s";
+
+/// A server whose index write waits on a lock another process holds is stopped: the
+/// write keeps the database's write turn and its SQLite worker, so the index close's
+/// checkpoint and the worker's stop both outlast their bound. The stop still exits 0,
+/// ends the `SQLite worker shutdown` stage `timeout` with the checkpoint named, and
+/// retires `server.json` before the process leaves, while the held worker keeps the
+/// election until the process exits.
+#[test]
+fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_document() -> TestResult
+{
+    let directory = workspace()?;
+    let root = directory.path();
+    let configuration = fs::read_to_string(root.join("rift.toml"))?;
+    fs::write(
+        root.join("rift.toml"),
+        format!("{configuration}[search]\nbusy_timeout = \"{HELD_INDEX_BUSY_TIMEOUT}\"\n"),
+    )?;
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = harness::FailureWindow::begin(root);
+
+    let mut child = rift_command()?
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .envs(SERVER_LOG_VARIABLES)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
+    wait_for_foreground_server(root, &mut child, &stderr)?;
+    wait_for(START_POLL_ATTEMPT_COUNT, "the first lexical commit", || {
+        stderr
+            .snapshot()
+            .contains("lexical commit settled")
+            .then_some(())
+    })?;
+
+    // Another process takes the index database's write lock, then a source change makes
+    // the server write: its `BEGIN IMMEDIATE` waits inside SQLite's busy handler.
+    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
+    holder.execute_batch("BEGIN IMMEDIATE")?;
+    fs::write(
+        root.join("lib.rs"),
+        "pub fn beacon() {}\npub fn held() {}\n",
+    )?;
+    wait_for(START_POLL_ATTEMPT_COUNT, "the held lexical commit", || {
+        (stderr
+            .snapshot()
+            .matches("lexical commit committing")
+            .count()
+            >= 2)
+            .then_some(())
+    })?;
+
+    stop_foreground_server(root, &mut child, &stderr)?;
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server to exit",
+        || exited(&mut child),
+    )?;
+    holder.execute_batch("ROLLBACK")?;
+    let stderr = stderr.finished()?;
+    assert!(
+        status.success(),
+        "the stop exits cleanly: {status:?}; {stderr}"
+    );
+    let worker_stage = stderr
+        .lines()
+        .find(|line| {
+            line.contains("stage=SQLite worker shutdown") && line.contains("stop stage ended")
+        })
+        .ok_or_else(|| format!("the SQLite worker stage ended with a record: {stderr}"))?;
+    assert!(worker_stage.contains("outcome=timeout"), "{worker_stage}");
+    assert!(
+        stderr.contains("database checkpoint outlasted the shutdown deadline"),
+        "the outlasted checkpoint is named: {stderr}"
+    );
+    // The held worker keeps its clone of the election guard, so the election is
+    // released by the process exit, not by the stop.
+    assert!(
+        stderr.contains("a database thread still holds the workspace election"),
+        "the stop names the held election: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a stop that ends timeout retires server.json; server.json: {:?}; stderr: {stderr}",
+        fs::read_to_string(document_path(root))
+    );
+    failure_window.passed();
+    Ok(())
+}
+
 // Native startup regression: https://github.com/volarized/rift/issues/447
 #[test]
 fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
