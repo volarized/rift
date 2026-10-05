@@ -289,7 +289,9 @@ impl DeferredDatabaseShutdown {
 /// The span's close carries the stage's elapsed time. The `stop stage ended` record
 /// carries the stage's name, what it left of the stop's shared `deadline`, its outcome,
 /// and, for a failure, the error and its causes, so a stop that leaves with a failure
-/// names the stage that returned it.
+/// names the stage that returned it. The span records its opening too, so a stage the
+/// process never finishes still names itself, and the stage the deadline expired in
+/// publishes the table of operations in flight with the reason `stop deadline`.
 ///
 /// # Errors
 ///
@@ -307,10 +309,18 @@ pub async fn stop_stage<Value>(
     rift_tracing::traced!(
         component = "mcp",
         operation = "server.stop",
+        open = true,
         stage = stage,
         async move {
+            let deadline_ahead = Instant::now() < deadline;
             let outcome = work.await;
             let remaining = deadline.saturating_duration_since(Instant::now());
+            // The stage the shared deadline expired in publishes the operations still open:
+            // what it, and every stage after it, met unfinished. A stage that starts past
+            // the deadline publishes nothing, so one stop publishes once.
+            if deadline_ahead && remaining.is_zero() {
+                rift_tracing::publish_in_flight("stop deadline");
+            }
             match &outcome {
                 Ok(_) => rift_tracing::info!(
                     component = "mcp",
@@ -438,6 +448,9 @@ impl HttpServer {
     }
 
     /// Stops serving and index lanes, leaving SQLite open for final log writes.
+    ///
+    /// As the stop begins it publishes the table of operations in flight with the reason
+    /// `stop`, so the store holds what was still running when the stop arrived.
     #[doc(hidden)]
     pub async fn stopped_before_database(
         self,
@@ -457,6 +470,7 @@ impl HttpServer {
             ?budget,
             "MCP server stopping"
         );
+        rift_tracing::publish_in_flight("stop");
         // The serve loop can end on its own I/O error, where nothing has
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
@@ -1264,6 +1278,55 @@ mod tests {
             ended[1].fields().contains("injected stage failure"),
             "{ended:?}"
         );
+    }
+
+    /// Every stop stage records its opening, and the stage the stop deadline expires in
+    /// publishes the operations still open, once: a stage that starts past the deadline
+    /// publishes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_stage_the_stop_deadline_expires_in_publishes_the_operations_in_flight()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BUDGET: Duration = Duration::from_millis(10);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let deadline = Instant::now() + BUDGET;
+        let stages = [
+            ("engines shutdown", Duration::ZERO),
+            ("index supervisor shutdown", BUDGET * 2),
+            ("SQLite worker shutdown", Duration::ZERO),
+        ];
+        for (stage, spent) in stages {
+            super::stop_stage(stage, deadline, async move {
+                tokio::time::advance(spent).await;
+                Ok::<_, rift_error::RiftError>(())
+            })
+            .await?;
+        }
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let opened = records
+            .iter()
+            .filter(|record| record.message() == "operation opened")
+            .count();
+        assert_eq!(opened, stages.len(), "one opening per stage: {records:?}");
+        let tables = records
+            .iter()
+            .filter(|record| record.message() == "operations in flight")
+            .collect::<Vec<_>>();
+        assert_eq!(tables.len(), 1, "one publication per stop: {tables:?}");
+        let table: serde_json::Value = serde_json::from_str(tables[0].fields())?;
+        assert_eq!(table["reason"], "stop deadline", "{table}");
+        assert_eq!(
+            table["root_span"]["fields"]["stage"], "index supervisor shutdown",
+            "{table}"
+        );
+        assert!(
+            table["operations"]
+                .as_str()
+                .is_some_and(|listed| listed.contains("\"operation\":\"server.stop\"")),
+            "{table}"
+        );
+        Ok(())
     }
 
     #[test]
