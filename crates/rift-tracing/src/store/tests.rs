@@ -712,9 +712,12 @@ async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestRes
 
     let missed = missed.expect_err("the close misses its deadline");
     let rendered = format!("{missed}: {}", rift_error::causes(&missed).join(": "));
+    // The queue holds the append until the writer thread receives it, which races the
+    // close request, so the depth the failure names is 0 or 1.
     assert!(
         rendered.contains("stage queued running for")
-            && rendered.contains("the queue held 1 of 1 commands at the close request"),
+            && (rendered.contains("the queue held 0 of 1 commands at the close request")
+                || rendered.contains("the queue held 1 of 1 commands at the close request")),
         "the missed close names the stage it waited in and the queue it waited behind: {rendered}"
     );
     assert!(
