@@ -193,4 +193,6 @@ def test_a_failed_run_keeps_the_servers_evidence_as_notes(
     entry = getattr(module, f"check_{runner}")
     with pytest.raises(RuntimeError, match="connect failed") as raised:
         asyncio.run(entry(tmp_path / "rift", "0.0.0"))
-    assert raised.value.__notes__ == ["server stderr:\nboom\n", "records:\nERROR\n"]
+    *evidence, entry_line = raised.value.__notes__
+    assert evidence == ["server stderr:\nboom\n", "records:\nERROR\n"]
+    assert entry_line.startswith("collector: ")

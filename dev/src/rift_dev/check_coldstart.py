@@ -3,6 +3,8 @@
 Only the supplied Linux binary is mounted. The validating MCP SDK runs on the
 host and drives `docker exec -i ... rift mcp`, so no Python environment or cache
 enters the container. Docker bounds the server log outside the served workspace.
+It runs without the OTLP collector: the container runs with `--network none`, so no
+host endpoint is reachable.
 """
 
 from __future__ import annotations

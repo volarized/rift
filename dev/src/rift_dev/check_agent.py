@@ -18,12 +18,14 @@ from rift_dev.rift_test_client import (
     Client,
     Server,
     array_value,
+    collector_line,
     gate_deadline,
     object_value,
     require,
     string_value,
     verify_version,
 )
+from rift_dev.trace import collector
 
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
@@ -145,7 +147,12 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
             (root / "service.py").write_text(
                 PYTHON_SOURCE, encoding="utf-8", newline=""
             )
-            with Server(binary, root, base / "server.log") as server:
+            with (
+                collector() as telemetry,
+                Server(
+                    binary, root, base / "server.log", collector=telemetry
+                ) as server,
+            ):
                 try:
                     async with server.connect() as client:
                         await check_resources(client)
@@ -158,4 +165,6 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                 except BaseException as error:
                     for note in server.evidence():
                         error.add_note(note)
+                    error.add_note(collector_line(telemetry))
                     raise
+                print(collector_line(telemetry), flush=True)

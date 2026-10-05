@@ -405,6 +405,22 @@ def telemetry_notes(
     return notes
 
 
+def collector_counts(collector: Collector | None) -> JsonObject | None:
+    """What `collector` received and dropped; None when none started."""
+    if collector is None:
+        return None
+    return {
+        "points": collector.metrics.received,
+        "spans": collector.spans.received,
+        "dropped": dict(collector.dropped().counts()),
+    }
+
+
+def collector_line(collector: Collector | None) -> str:
+    """The `collector` entry of a runner's report as one line."""
+    return "collector: " + json.dumps(collector_counts(collector), sort_keys=True)
+
+
 def failure_window(
     read: LogsReader,
     *,

@@ -12,12 +12,14 @@ from rift_dev.rift_test_client import (
     JsonObject,
     Server,
     array_value,
+    collector_line,
     gate_deadline,
     object_value,
     require,
     string_value,
     verify_version,
 )
+from rift_dev.trace import collector
 
 ARTIFACT_SECONDS = 240.0
 CONFIGURATION = "[search.vector]\ndisabled = true\n"
@@ -113,7 +115,12 @@ async def check_artifact(binary: Path, version: str) -> None:
             root = base / "workspace"
             root.mkdir()
             lay_out_workspace(root)
-            with Server(binary, root, base / "server.log") as server:
+            with (
+                collector() as telemetry,
+                Server(
+                    binary, root, base / "server.log", collector=telemetry
+                ) as server,
+            ):
                 try:
                     async with server.connect() as client:
                         await check_reads(client)
@@ -122,4 +129,6 @@ async def check_artifact(binary: Path, version: str) -> None:
                 except BaseException as error:
                     for note in server.evidence():
                         error.add_note(note)
+                    error.add_note(collector_line(telemetry))
                     raise
+                print(collector_line(telemetry), flush=True)

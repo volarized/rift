@@ -62,6 +62,7 @@ from rift_dev.rift_test_client import (
     Server,
     ToolFailure,
     array_value,
+    collector_counts,
     gate_deadline,
     object_value,
     require,
@@ -277,13 +278,7 @@ class Corpus:
 
     def collector_counts(self) -> JsonObject | None:
         """What the case's collector received and dropped; None before it started."""
-        if self.telemetry is None:
-            return None
-        return {
-            "points": self.telemetry.metrics.received,
-            "spans": self.telemetry.spans.received,
-            "dropped": dict(self.telemetry.dropped().counts()),
-        }
+        return collector_counts(self.telemetry)
 
     async def tree(self, directory: Path) -> None:
         """Run the case; on failure keep each server's evidence before the tree goes."""
