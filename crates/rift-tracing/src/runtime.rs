@@ -176,7 +176,9 @@ impl TracingRuntimeBuilder {
     }
 
     /// Samples the current process every `interval`: its resident and virtual memory, CPU
-    /// time and usage, open files, and disk bytes. An interval below
+    /// time and usage, open files, and disk bytes, and the Tokio runtime that installs the
+    /// subscriber: its workers, live tasks, global queue depth, worker busy time, and worker
+    /// parks. An interval below
     /// [`PROCESS_SAMPLE_INTERVAL_MIN`](crate::PROCESS_SAMPLE_INTERVAL_MIN) samples at that
     /// minimum.
     ///
@@ -239,15 +241,16 @@ impl TracingRuntimeBuilder {
         let values = Arc::new(MetricValues::default());
         let flights = Arc::new(FlightTable::default());
         let sampler = self.sample_interval.and_then(|interval| {
-            if tokio::runtime::Handle::try_current().is_err() {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 eprintln!("rift: warning: no Tokio runtime runs the process sampler");
                 return None;
-            }
+            };
             Some(ProcessSampler::spawn(
                 SystemProcessReader::current(),
                 interval,
                 Arc::clone(&values),
                 TickEvidence {
+                    runtime: Some(handle.metrics()),
                     flights: Some(Arc::clone(&flights)),
                     stall_delay: self.stall_delay,
                 },
