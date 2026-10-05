@@ -1,13 +1,8 @@
 //! Proves `rift update` fails typed on an unreachable network, never
 //! panicking on the async runtime and never drawing progress off a terminal.
 
-// The shared end-to-end harness names the test each spawned `rift` serves.
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod engine_fixture;
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod harness;
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod rust_engine;
+// Names the test each spawned `rift` serves.
+mod test_case;
 
 use std::process::Command;
 
@@ -23,7 +18,7 @@ fn update_reports_a_typed_failure_off_the_runtime() {
         std::env::var_os("CARGO_BIN_EXE_rift")
             .expect("test runner must provide CARGO_BIN_EXE_rift"),
     );
-    let output = harness::with_test_case_name(&mut command)
+    let output = test_case::with_test_case_name(&mut command)
         .arg("update")
         .env("HTTP_PROXY", DEAD_PROXY)
         .env("HTTPS_PROXY", DEAD_PROXY)

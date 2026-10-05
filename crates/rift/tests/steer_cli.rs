@@ -4,13 +4,8 @@
 //! `crates/rift/src/steer.rs`; this proves the process-level wiring: reading
 //! stdin, probing the real filesystem, and writing the marker.
 
-// The shared end-to-end harness names the test each spawned `rift` serves.
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod engine_fixture;
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod harness;
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod rust_engine;
+// Names the test each spawned `rift` serves.
+mod test_case;
 
 use std::error::Error;
 use std::fs;
@@ -29,7 +24,7 @@ fn run_steer(root: &Path, stdin: &str, env: &[(&str, &str)]) -> TestResult<Outpu
         std::env::var_os("CARGO_BIN_EXE_rift")
             .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
     );
-    harness::with_test_case_name(&mut command)
+    test_case::with_test_case_name(&mut command)
         .arg("steer")
         .current_dir(root)
         .stdin(Stdio::piped())

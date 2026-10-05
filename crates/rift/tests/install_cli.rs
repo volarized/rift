@@ -3,13 +3,8 @@
 //! `--user` scope writes under an overridden `HOME` and never touches the
 //! workspace directory the command runs in.
 
-// The shared end-to-end harness names the test each spawned `rift` serves.
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod engine_fixture;
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod harness;
-#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
-mod rust_engine;
+// Names the test each spawned `rift` serves.
+mod test_case;
 
 use std::error::Error;
 use std::fs;
@@ -19,13 +14,13 @@ use std::process::{Command, Output};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// A command running the compiled `rift` that carries the test's
-/// [`harness::TEST_CASE_NAME_ATTRIBUTE`].
+/// [`test_case::TEST_CASE_NAME_ATTRIBUTE`].
 fn rift_command() -> TestResult<Command> {
     let mut command = Command::new(
         std::env::var_os("CARGO_BIN_EXE_rift")
             .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
     );
-    harness::with_test_case_name(&mut command);
+    test_case::with_test_case_name(&mut command);
     Ok(command)
 }
 

@@ -32,6 +32,7 @@ mod engine_fixture;
 mod harness;
 mod live_engine_gate;
 mod rust_engine;
+mod test_case;
 
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};

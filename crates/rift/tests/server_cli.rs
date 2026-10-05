@@ -15,6 +15,11 @@ mod engine_fixture;
 mod harness;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod rust_engine;
+#[allow(
+    dead_code,
+    reason = "shared test identity helper, used by sibling suites"
+)]
+mod test_case;
 
 use std::error::Error;
 use std::fs;
@@ -41,10 +46,10 @@ fn rift_binary() -> TestResult<PathBuf> {
 }
 
 /// A command running [`rift_binary`] that carries the test's
-/// [`harness::TEST_CASE_NAME_ATTRIBUTE`].
+/// [`test_case::TEST_CASE_NAME_ATTRIBUTE`].
 fn rift_command() -> TestResult<Command> {
     let mut command = Command::new(rift_binary()?);
-    harness::with_test_case_name(&mut command);
+    test_case::with_test_case_name(&mut command);
     Ok(command)
 }
 
@@ -2040,15 +2045,15 @@ fn a_start_file_reads_back_every_key() -> TestResult {
 #[test]
 fn the_test_case_name_attribute_encodes_what_the_sdk_parse_splits_at() {
     assert_eq!(
-        harness::resource_attributes(None, FIXTURE_ATTEMPT),
+        test_case::resource_attributes(None, FIXTURE_ATTEMPT),
         format!("test.case.name={FIXTURE_ATTEMPT}")
     );
     assert_eq!(
-        harness::resource_attributes(Some("service.namespace=ci"), "a, b%c\n"),
+        test_case::resource_attributes(Some("service.namespace=ci"), "a, b%c\n"),
         "service.namespace=ci,test.case.name=a%2C%20b%25c%0A"
     );
     assert_eq!(
-        harness::resource_attributes(Some(" "), "a"),
+        test_case::resource_attributes(Some(" "), "a"),
         "test.case.name=a"
     );
 }

@@ -13,6 +13,11 @@ mod engine_fixture;
 mod harness;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod rust_engine;
+#[allow(
+    dead_code,
+    reason = "shared test identity helper, used by sibling suites"
+)]
+mod test_case;
 
 use harness::{
     FailureWindow, StopOnDrop, TestResult, assigned_port_key, await_workspace_ready,
