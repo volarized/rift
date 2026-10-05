@@ -287,15 +287,33 @@ impl RepositoryWorkspaceRegistry {
         if self.stop.is_cancelled() {
             return Err(Self::stopping());
         }
+        let started = Instant::now();
         let _admission = self.admit().await?;
         self.validate_workspace_settings(root.clone()).await?;
         let cell = self.workspace_cell(&root).await?;
         let workspace = cell
             .get_or_try_init(|| self.build_workspace(root.clone()))
             .await;
+        let elapsed_ms = started.elapsed().as_millis();
         match workspace {
-            Ok(_) => self.active_service(&root, &cell).await,
+            Ok(_) => {
+                tracing::info!(
+                    component = "mcp",
+                    root = %root.display(),
+                    elapsed_ms,
+                    "repository workspace ready for its first request"
+                );
+                self.active_service(&root, &cell).await
+            }
             Err(error) => {
+                tracing::warn!(
+                    component = "mcp",
+                    root = %root.display(),
+                    elapsed_ms,
+                    status = %error.0,
+                    refusal = error.1,
+                    "repository workspace build refused"
+                );
                 self.remove_failed_cell(&root, &cell).await;
                 Err(error)
             }
