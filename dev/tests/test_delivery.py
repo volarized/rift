@@ -178,7 +178,9 @@ def functions_calling(binary: str, call: str) -> set[str]:
     functions = list(TEST_FUNCTION.finditer(source))
     calling: set[str] = set()
     for index, function in enumerate(functions):
-        end = functions[index + 1].start() if index + 1 < len(functions) else len(source)
+        end = (
+            functions[index + 1].start() if index + 1 < len(functions) else len(source)
+        )
         if f"{call}(" in source[function.end() : end]:
             calling.add(function.group(1))
     return calling
@@ -287,8 +289,10 @@ def leg_profile(leg: dict[str, Any]) -> str:
 def leg_report(leg: dict[str, Any]) -> str:
     """The path one native leg uploads its test report from."""
     upload = native_step(
-        lambda step: step.get("uses", "").startswith(UPLOAD_ACTION)
-        and "native-tests" in (step.get("with") or {}).get("name", "")
+        lambda step: (
+            step.get("uses", "").startswith(UPLOAD_ACTION)
+            and "native-tests" in (step.get("with") or {}).get("name", "")
+        )
     )
     return for_leg(upload["with"]["path"], leg)
 
@@ -969,7 +973,9 @@ class ProxiedCallsFailInsideTheDeadline(unittest.TestCase):
     is a timeout carrying nothing about the call that hung.
     """
 
-    def test_the_proxied_call_bound_ends_inside_every_harness_suite_deadline(self) -> None:
+    def test_the_proxied_call_bound_ends_inside_every_harness_suite_deadline(
+        self,
+    ) -> None:
         bound = harness_bound(PROXIED_CALL_BOUND)
         including = suites_including(HARNESS_HELPER)
         self.assertTrue(including, f"no suite includes {HARNESS}")
