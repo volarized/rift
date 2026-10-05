@@ -672,7 +672,7 @@ where
         }
         let observed = tokio::time::Instant::now();
         let deadline_reached = observed >= deadline;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "cli",
             operation = "server.start",
             probe_count,
@@ -698,7 +698,7 @@ where
     }
     // A holder that has not published is starting, whether the document is
     // absent or still the pre-spawn leftover it has yet to scrub.
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "cli",
         operation = "server.start",
         probe_count = probe_count + 1,
@@ -776,7 +776,7 @@ where
         }
         let observed = tokio::time::Instant::now();
         let deadline_reached = observed >= deadline;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "cli",
             operation = "server.election",
             probe_count = probe_index + 1,
@@ -1071,7 +1071,7 @@ async fn stop_log_drain(
 async fn cancel_on_interrupt(shutdown: CancellationToken) {
     match tokio::signal::ctrl_c().await {
         Ok(()) => shutdown.cancel(),
-        Err(error) => tracing::warn!(component = "cli", %error, "interrupt listener failed"),
+        Err(error) => rift_tracing::warn!(component = "cli", %error, "interrupt listener failed"),
     }
 }
 
@@ -1098,7 +1098,7 @@ fn cancel_on_stop_signal(shutdown: CancellationToken) -> tokio::task::JoinHandle
         let (mut interrupt, mut terminate) = match installed {
             Ok(signals) => signals,
             Err(error) => {
-                tracing::warn!(component = "cli", %error, "interrupt listener failed");
+                rift_tracing::warn!(component = "cli", %error, "interrupt listener failed");
                 return;
             }
         };
@@ -1241,7 +1241,7 @@ where
         }
         let observed = tokio::time::Instant::now();
         let deadline_reached = observed >= deadline;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "cli",
             operation = "server.stop",
             probe_count = probe_index + 1,
@@ -1272,7 +1272,7 @@ fn discard_stale_document(root: &Path) {
     match std::fs::remove_file(&document_path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!(
+        Err(error) => rift_tracing::warn!(
             component = "cli",
             path = %document_path.display(),
             %error,
@@ -1673,18 +1673,17 @@ mod tests {
     /// and leaves nothing unwritten when it joins by its deadline.
     #[tokio::test]
     async fn a_joined_log_drain_leaves_its_records_written() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir().expect("a temporary directory");
         let store = Arc::new(
             rift_tracing::LogStore::open(&directory.path().join("metrics"), None)
                 .await
                 .expect("the metrics database opens"),
         );
-        let (sink, drain) = rift_tracing::log_capture();
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
-            tracing::info!(component = "test", "written by the final flush");
-        });
+        let (recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        rift_tracing::info!(component = "test", "written by the final flush");
+        drop(recorder);
         let running = RunningLogDrain::spawn(drain, Arc::clone(&store), 100);
 
         let unwritten = stop_log_drain(
@@ -2428,13 +2427,9 @@ mod tests {
     /// A stop wait with slow probes ends inside its polling window.
     #[tokio::test(start_paused = true)]
     async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let process = ProcessExit::open(pid);
@@ -2471,13 +2466,9 @@ mod tests {
     /// The wait for a holder to release its election ends at its window under slow probes.
     #[tokio::test(start_paused = true)]
     async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let probe_times = std::cell::RefCell::new(Vec::new());
@@ -2513,13 +2504,9 @@ mod tests {
     /// one probe it adds past the window.
     #[tokio::test(start_paused = true)]
     async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let mut spawns = StartSpawns::<FakeChild>::default();
         let probe_times = std::cell::RefCell::new(Vec::new());
@@ -2557,13 +2544,9 @@ mod tests {
     /// Records actual blocking probe costs alongside the start wait's deadline decisions.
     #[tokio::test]
     async fn a_start_wait_records_synchronous_probe_costs() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let mut spawns = StartSpawns::<FakeChild>::default();
         let mut observations = Vec::new();

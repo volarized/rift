@@ -4517,7 +4517,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "unicode-width",
  "waitpid-any",
  "windows-sys 0.59.0",
