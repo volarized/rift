@@ -75,17 +75,19 @@ where
                 open,
             } = stage.as_mut().project_replace(Stage::Spent)
         {
+            let work = work.instrument(open());
             let completion = future_completion(operation);
-            stage.set(Stage::Running {
-                work: work.instrument(open()),
-                completion,
-            });
+            stage.set(Stage::Running { work, completion });
         }
-        let StageProjection::Running { work, completion } = stage.as_mut().project() else {
+        let StageProjection::Running {
+            mut work,
+            completion,
+        } = stage.as_mut().project()
+        else {
             panic!("a traced future was polled after it completed or its span constructor panicked")
         };
-        let output = std::task::ready!(work.poll(context));
-        completion.finished();
+        let output = std::task::ready!(work.as_mut().poll(context));
+        completion.finished(work.span());
         stage.set(Stage::Spent);
         Poll::Ready(output)
     }
@@ -235,9 +237,13 @@ pub fn parent_span(parent: &Span) -> Span {
 /// `traces.span.metrics.duration`, in seconds, labeled with the operation literal as
 /// `span.name` and its outcome as `status.code`: `Ok` when the work finished, by any path
 /// out of a block or by returning from a future, and `Error` with `error.type` `panic` or
-/// `cancelled` when it panicked or an awaited future was dropped before it returned. The
-/// span's close record states the same outcome as `status.code` and `error.type`, and
-/// the span records `code.function.name`, the function the macro expands in. The metric
+/// `cancelled` when it panicked or an awaited future was dropped before it returned. Work
+/// that records `error.type`, or an `outcome` other than `ok` or `acquired`, on the
+/// operation's span ends with `Error` too: `error.type` holds the recorded value when it is
+/// `panic`, `cancelled`, `timeout`, or `refused`, and `_OTHER` otherwise. The macro never
+/// reads the work's value. The span's close record states the same outcome as
+/// `status.code` and `error.type`, and the span records `code.function.name`, the
+/// function the macro expands in. The metric
 /// recording follows the operation, not its span: a clone of the span held elsewhere
 /// does not lengthen the duration, and the span's filters do not select it. A thread
 /// whose dispatcher holds no metric values records nothing and reads no clock for it.
@@ -355,7 +361,6 @@ macro_rules! __rift_traced_block {
         [$($parent:expr)?] [$($component:expr)?] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
-        let __rift_completion = $crate::__private::completion($operation);
         let __rift_entered = $crate::__private::tracing::span!(
             $(parent: $parent,)?
             $crate::__private::tracing::Level::INFO,
@@ -367,6 +372,10 @@ macro_rules! __rift_traced_block {
             error.type = $crate::__private::tracing::field::Empty
         )
         .entered();
+        // Declared after the entered span, the completion drops first, while the span is
+        // still open and holds what it recorded.
+        let __rift_completion =
+            $crate::__private::completion($operation).of_span(__rift_entered.id());
         $($crate::__rift_traced_opened!($open);)?
         $work
     }};

@@ -363,7 +363,11 @@ def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
 
 
 def active_stdout(output: str, operation: str, epoch: str | None) -> str:
-    """Require synchronous start without a later matching completion record."""
+    """Require synchronous start without a later matching close record.
+
+    A close under `✗` ends the operation as a close under `✓` does: a build that failed
+    before the stop is not in flight at the stop.
+    """
     require(
         output.endswith("\n"), f"{operation}: stderr ends with an incomplete record"
     )

@@ -426,7 +426,15 @@ class Decisions(unittest.TestCase):
             start.strip(),
         )
         matching_close = wrong_close.replace("epoch=6", "epoch=7")
-        for output, epoch in ((start, "8"), (start + matching_close, "7"), ("", "7")):
+        failed_close = matching_close.replace(
+            "outcome=ok close ✓", "outcome=error close ✗"
+        )
+        for output, epoch in (
+            (start, "8"),
+            (start + matching_close, "7"),
+            (start + failed_close, "7"),
+            ("", "7"),
+        ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", epoch)
         for output in (

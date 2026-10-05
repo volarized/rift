@@ -106,6 +106,25 @@ def test_a_span_close_names_the_span_after_the_mark_or_by_its_operation() -> Non
     assert not closes_span(started, "index.build")
 
 
+def test_a_failed_close_is_a_close_of_its_span() -> None:
+    for message in (
+        "close ✗ busy=7.95ms idle=19.3µs",
+        "close ✗ error.type=timeout busy=7.95ms idle=19.3µs",
+        "close ✗ panicked busy=7.95ms idle=19.3µs",
+        "close ✗ cancelled busy=7.95ms idle=19.3µs",
+    ):
+        failed = parse_line(
+            CLOSE.replace(
+                "outcome=ok close ✓ busy=7.95ms idle=19.3µs", f"outcome=error {message}"
+            )
+        )
+        assert failed is not None
+        assert failed.label("outcome") == "error"
+        assert failed.closes(), message
+        assert closes_span(failed, "index.build"), message
+        assert failed.nested_name == "index.build"
+
+
 def test_a_trait_method_function_keeps_its_spaces() -> None:
     record = parse_line(TRAIT_METHOD)
     assert record is not None

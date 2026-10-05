@@ -190,7 +190,7 @@ def split_columns(text: str) -> tuple[str, str, str, str]:
 
 
 def closes_span(record: Line, name: str) -> bool:
-    """Whether `record` is the close record of the span `name`.
+    """Whether `record` is the close record of the span `name`, under `✓` or `✗`.
 
     A nested close names its span after `↳`. A root span prints no name, so its close is
     the close of the span whose `operation` is `name`, as `traced!` names a span after its

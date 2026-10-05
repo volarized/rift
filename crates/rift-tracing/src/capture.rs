@@ -58,6 +58,19 @@ const STATUS_CODE_MEMBER: &str = "status.code";
 /// The member naming why an operation did not complete: `panic`, `cancelled`, or the
 /// registered error identity. The spelling of the operation metrics' label.
 const ERROR_TYPE_MEMBER: &str = "error.type";
+/// The field a span or a lifecycle record states how it ended in.
+pub(crate) const OUTCOME_FIELD: &str = "outcome";
+/// The `outcome` values that state an operation or a phase completed: `ok`, and
+/// `acquired` for a lock wait. Every other value, such as `error`, `timeout`, `refused`, or
+/// `cancelled`, states it did not.
+const COMPLETED_OUTCOMES: [&str; 2] = ["ok", "acquired"];
+/// The `error.type` values the operation metrics keep as their own label: a panic, a
+/// cancellation, and the lock wait endings. Every other failure records `_OTHER`, the
+/// value OpenTelemetry's `error.type` names for a failure no listed value fits; a recorded
+/// value can be any string, and a metric label is a declared value.
+const ERROR_TYPE_LABELS: [&str; 4] = ["panic", "cancelled", "timeout", "refused"];
+/// The `error.type` label of a failure [`ERROR_TYPE_LABELS`] does not list.
+const OTHER_ERROR_TYPE: &str = "_OTHER";
 /// Field names the layer writes itself. A span or event field under one of them is not
 /// recorded, so a member the layer writes never meets a field of the same name.
 const RESERVED_FIELD_NAMES: [&str; 6] = [
@@ -444,14 +457,40 @@ impl SpanNode {
     }
 }
 
+/// Whether the `outcome` value `value` states its operation or phase completed.
+pub(crate) fn completed_outcome(value: &str) -> bool {
+    COMPLETED_OUTCOMES.contains(&value)
+}
+
+/// The operation metrics' `error.type` label of the failure value `value`.
+fn error_type_label(value: &str) -> &'static str {
+    ERROR_TYPE_LABELS
+        .into_iter()
+        .find(|label| *label == value)
+        .unwrap_or(OTHER_ERROR_TYPE)
+}
+
+/// The operation metrics' `error.type` label of the failure the open span `id` recorded,
+/// as its close record will state it: see [`SpanLabels::failure`]. `None` when the span
+/// recorded none, is closed, or the thread's dispatcher keeps no [`SpanContextLayer`]
+/// entry for it.
+pub(crate) fn span_failure(id: &tracing::span::Id) -> Option<&'static str> {
+    tracing::dispatcher::get_default(|dispatch| {
+        let span = dispatch.downcast_ref::<Registry>()?.span(id)?;
+        let extensions = span.extensions();
+        extensions.get::<SpanEntry>()?.node.labels().failure()
+    })
+}
+
 /// The record of the span `id` closing: its name as the message, its own fields, then
 /// `span`, `elapsed_ms`, `busy_ns`, `idle_ns`, `status.code`, `error.type` when it did not
 /// complete, and, when it closes inside another span, `root_span` for the outermost span
 /// around it. `None` when the span carries no [`SpanContextLayer`] entry.
 ///
 /// The span completed (`status.code` `Ok`) unless it recorded an `error.type` itself, as
-/// `traced!` does for an awaited operation dropped before it returned (`cancelled`), or it
-/// closes while its thread unwinds a panic (`panic`).
+/// `traced!` does for an awaited operation dropped before it returned (`cancelled`), it
+/// closes while its thread unwinds a panic (`panic`), or it recorded an `outcome` that is
+/// not a completion (see [`completed_outcome`]), as `index.build` records `error`.
 pub(crate) fn closed_record<S>(
     id: &tracing::span::Id,
     context: &Context<'_, S>,
@@ -476,13 +515,15 @@ where
         "\"span\":\"closed\",\"elapsed_ms\":\"{elapsed_ms}\",\"{BUSY_MEMBER}\":\"{busy_ns}\",\
          \"{IDLE_MEMBER}\":\"{idle_ns}\","
     );
-    if labels.error_type {
+    if labels.error_type.is_some() {
         let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Error\"");
     } else if std::thread::panicking() {
         let _ = write!(
             fields,
             "\"{STATUS_CODE_MEMBER}\":\"Error\",\"{ERROR_TYPE_MEMBER}\":\"panic\""
         );
+    } else if labels.failed_outcome.is_some() {
+        let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Error\"");
     } else {
         let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Ok\"");
     }
@@ -569,8 +610,9 @@ fn push_span_member(members: &mut String, member: &str, span: Option<&SpanNode>)
 /// object an event record carries for the span, `{"name":…,"fields":{…}}`, its `fields`
 /// holding `component`, `operation`, and the span's other fields. Both member sets keep
 /// [`SPAN_FIELDS_BYTES_MAX`]. `context` is written when the span opens and again when it
-/// records a field, never per event. `error_type` is whether the span recorded an
-/// `error.type`, so its close states it did not complete.
+/// records a field, never per event. `error_type` holds the operation metrics' label of
+/// the `error.type` the span recorded, and `failed_outcome` that of an `outcome` it
+/// recorded that is not a completion, so its close states it did not complete.
 #[derive(Debug)]
 struct SpanLabels {
     component: String,
@@ -579,7 +621,8 @@ struct SpanLabels {
     context_fields: SpanFields,
     quoted_name: String,
     context: String,
-    error_type: bool,
+    error_type: Option<&'static str>,
+    failed_outcome: Option<&'static str>,
 }
 
 impl SpanLabels {
@@ -601,7 +644,8 @@ impl SpanLabels {
             context_fields,
             quoted_name: quoted(&bounded(name, LOG_LABEL_BYTES_MAX)),
             context: String::new(),
-            error_type: false,
+            error_type: None,
+            failed_outcome: None,
         };
         labels.extend(&fields.rest);
         labels
@@ -613,7 +657,11 @@ impl SpanLabels {
             return;
         }
         for (name, value) in rest {
-            self.error_type |= name == ERROR_TYPE_MEMBER;
+            if name == ERROR_TYPE_MEMBER {
+                self.error_type = Some(error_type_label(value));
+            } else if name == OUTCOME_FIELD {
+                self.failed_outcome = (!completed_outcome(value)).then(|| error_type_label(value));
+            }
             self.fields.push(name, value);
             self.context_fields.push(name, value);
         }
@@ -625,6 +673,18 @@ impl SpanLabels {
         );
         self.context_fields.write_into(&mut self.context);
         self.context.push_str("}}");
+    }
+}
+
+impl SpanLabels {
+    /// The operation metrics' `error.type` label of the span's failure: its recorded
+    /// `error.type`, else an `outcome` that is not a completion. `None` while neither was
+    /// recorded.
+    const fn failure(&self) -> Option<&'static str> {
+        match self.error_type {
+            Some(label) => Some(label),
+            None => self.failed_outcome,
+        }
     }
 }
 
