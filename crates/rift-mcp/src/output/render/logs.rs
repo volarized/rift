@@ -5,7 +5,7 @@
 
 use serde_json::{Map, Value};
 
-use super::facts::FACT_SEPARATOR;
+use super::facts::{DETAIL_SEPARATOR, FACT_SEPARATOR, quoted_value};
 use super::{layout, warning};
 use crate::output::text::{TextError, TextWriter};
 
@@ -84,12 +84,15 @@ pub(super) fn answer(out: &mut TextWriter, page: &LogsPage<'_>) -> Result<(), Te
     }
     let reasons: Vec<String> = unavailable
         .iter()
-        .map(|reason| format!("unavailable: {reason}"))
+        .map(|reason| format!("unavailable{DETAIL_SEPARATOR}{}", quoted_value(reason)))
         .collect();
     warning::lines_section(out, &reasons)
 }
 
 /// `time level component operation[: message][ · key value]...`.
+///
+/// A message or a field value that holds ` · ` or `: ` is quoted, with `"` and `\` escaped
+/// inside the quotes.
 fn line(record: &LogLine<'_>) -> String {
     let LogLine {
         identity: _,
@@ -108,8 +111,8 @@ fn line(record: &LogLine<'_>) -> String {
         label(operation)
     );
     if !message.is_empty() {
-        text.push_str(": ");
-        text.push_str(message);
+        text.push_str(DETAIL_SEPARATOR);
+        text.push_str(&quoted_value(message));
     }
     push_fields(&mut text, fields);
     text
@@ -128,12 +131,12 @@ fn push_fields(text: &mut String, fields: &LogFields<'_>) {
                 text.push_str(FACT_SEPARATOR);
                 text.push_str(key);
                 text.push(' ');
-                text.push_str(&value_text(value));
+                text.push_str(&quoted_value(&value_text(value)));
             }
         }
         LogFields::Text(rest) if !rest.is_empty() => {
             text.push_str(FACT_SEPARATOR);
-            text.push_str(rest);
+            text.push_str(&quoted_value(rest));
         }
         LogFields::Text(_) => {}
     }

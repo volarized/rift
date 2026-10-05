@@ -8,11 +8,13 @@
 //!
 //! A warning line is `<code>[ · <evidence>]...[: <detail>]`. The evidence is every payload field
 //! except `detail`, as `<wire name> <value>`, in declaration order. A hex value of 8 or more
-//! characters is cut to 8. Control characters are made visible so one warning stays on one line.
+//! characters is cut to 8. An evidence value or a detail that holds ` · ` or `: ` is quoted, with
+//! `"` and `\` escaped inside the quotes. Control characters are made visible so one warning
+//! stays on one line.
 
 use rift_protocol::read::ReadWarning;
 
-use super::facts::{FACT_SEPARATOR, cut_hash};
+use super::facts::{DETAIL_SEPARATOR, FACT_SEPARATOR, cut_hash, quoted_value};
 use super::inline::fields_of;
 use super::layout;
 use crate::output::text::{TextError, TextWriter, visible};
@@ -40,13 +42,13 @@ pub(super) fn line(warning: &ReadWarning) -> Result<String, TextError> {
                 text.push_str(FACT_SEPARATOR);
                 text.push_str(key);
                 text.push(' ');
-                text.push_str(cut_hash(&value));
+                text.push_str(&quoted_value(cut_hash(&value)));
             }
         }
     }
     if !detail.trim().is_empty() {
-        text.push_str(": ");
-        text.push_str(&detail);
+        text.push_str(DETAIL_SEPARATOR);
+        text.push_str(&quoted_value(&detail));
     }
     Ok(visible(text.trim_end()).into_owned())
 }

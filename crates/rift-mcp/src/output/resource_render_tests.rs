@@ -520,6 +520,39 @@ fn logs_mark_a_missing_component_and_operation_and_hide_control_characters() {
 }
 
 #[test]
+fn logs_quote_a_message_or_value_that_holds_a_delimiter() {
+    let logs = page(vec![
+        line(
+            0,
+            ("warn", "mcp", "mcp.read"),
+            "read failed: a \"b\" · c\\d",
+            object(r#"{"note":"k: v","path":"a · b","plain":"a:b"}"#),
+        ),
+        line(0, ("warn", "mcp", "mcp.read"), "plain", object("x · y")),
+    ]);
+    golden(
+        &logs,
+        &[
+            "2 records",
+            "\t1970-01-01 00:00:00.000 warn mcp mcp.read: \"read failed: a \\\"b\\\" · c\\\\d\" · note \"k: v\" · path \"a · b\" · plain a:b",
+            "\t1970-01-01 00:00:00.000 warn mcp mcp.read: plain · \"x · y\"",
+        ],
+    );
+    let unavailable = LogsPage {
+        records: Vec::new(),
+        unavailable: Some("open failed: denied"),
+    };
+    golden(
+        &unavailable,
+        &[
+            "0 records",
+            "1 warning",
+            "\tunavailable: \"open failed: denied\"",
+        ],
+    );
+}
+
+#[test]
 fn an_unavailable_store_is_zero_records_and_one_warning_with_its_reason() {
     let logs = LogsPage {
         records: Vec::new(),

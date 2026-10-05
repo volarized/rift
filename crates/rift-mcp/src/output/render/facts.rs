@@ -3,6 +3,8 @@
 //! Each function turns typed values into the short forms the text layouts share. Facts that hold
 //! the normal state are not written: the structured content carries them.
 
+use std::borrow::Cow;
+
 use rift_protocol::documentation::{
     DocumentationBlock, DocumentationContentIdentity, DocumentationHeading,
     DocumentationSourceIdentity,
@@ -13,10 +15,14 @@ use rift_protocol::read::{
 };
 use serde::Serialize;
 
-use crate::output::text::TextError;
+use crate::output::text::{TextError, quoted};
 
 /// Separates the facts of one line.
 pub(super) const FACT_SEPARATOR: &str = " · ";
+/// Separates the facts of a line from the prose after them.
+pub(super) const DETAIL_SEPARATOR: &str = ": ";
+/// Text a value holding it is quoted for, so the value stays one value of its line.
+const LINE_DELIMITERS: [&str; 2] = [FACT_SEPARATOR, DETAIL_SEPARATOR];
 /// Characters of a hash that stay when it is cut.
 const HASH_CUT: usize = 8;
 /// Characters of `YYYY-MM-DDTHH:MM:SS`.
@@ -44,6 +50,12 @@ impl Facts {
         self.text.push_str(fact);
     }
 
+    /// Appends `value` as one fact, quoted by [`quoted_value`] when it holds a line delimiter.
+    /// Empty text appends nothing.
+    pub(super) fn push_value(&mut self, value: &str) {
+        self.push(&quoted_value(value));
+    }
+
     /// Appends every fact of `other`.
     pub(super) fn extend(&mut self, other: &Self) {
         self.push(&other.text);
@@ -53,6 +65,12 @@ impl Facts {
     pub(super) fn as_str(&self) -> &str {
         &self.text
     }
+}
+
+/// `text` as one value of a line: between quotes when it holds the fact separator or the
+/// detail separator, else unchanged.
+pub(super) fn quoted_value(text: &str) -> Cow<'_, str> {
+    quoted(text, &LINE_DELIMITERS)
 }
 
 /// The wire spelling of a unit enum variant.

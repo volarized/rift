@@ -182,10 +182,35 @@ impl TextWriter {
     }
 }
 
+/// Opens and closes a quoted value.
+const QUOTE: char = '"';
+/// Starts an escape inside a quoted value.
+const BACKSLASH: char = '\\';
+
+/// `text` between quotes when it holds one of `delimiters`, else `text` unchanged.
+///
+/// Inside the quotes each `"` and `\` is written after a `\`, so the closing quote is the first
+/// unescaped `"`. A value without a delimiter stays bare, backslash and quote included.
+pub(crate) fn quoted<'a>(text: &'a str, delimiters: &[&str]) -> Cow<'a, str> {
+    if !delimiters.iter().any(|delimiter| text.contains(delimiter)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len().saturating_add(2));
+    out.push(QUOTE);
+    for character in text.chars() {
+        if matches!(character, QUOTE | BACKSLASH) {
+            out.push(BACKSLASH);
+        }
+        out.push(character);
+    }
+    out.push(QUOTE);
+    Cow::Owned(out)
+}
+
 /// `text` with each control character written as an escape, so one fact stays on one line.
 ///
 /// The escapes are `\n`, `\r`, `\t`, and `\u{HEX}`. Other characters, backslash and quote
-/// included, stay as they are.
+/// included, stay as they are; [`quoted`] escapes those inside a quoted value.
 pub(crate) fn visible(text: &str) -> Cow<'_, str> {
     if !text.chars().any(char::is_control) {
         return Cow::Borrowed(text);

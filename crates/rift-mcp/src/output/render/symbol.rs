@@ -112,8 +112,8 @@ fn reference_entry(
     } = documentation;
     let block = block_of(block);
     let mut facts = Facts::default();
-    facts.push(&block.place);
-    facts.push(&block.headings);
+    facts.push_value(&block.place);
+    facts.push_value(&block.headings);
     lines.line(ENTRY_INDENT, facts.as_str())?;
     match excerpt.as_deref() {
         Some(excerpt) if !excerpt.is_empty() => lines.verbatim(DETAIL_INDENT, excerpt),
@@ -162,12 +162,12 @@ fn version_entry(
         author,
     } = version;
     let mut facts = Facts::default();
-    facts.push(date_of(timestamp));
-    facts.push(cut_hash(&revision.0));
+    facts.push_value(date_of(timestamp));
+    facts.push_value(cut_hash(&revision.0));
     facts.push(&spaced_name(kind)?);
-    facts.push(&author_of(author));
+    facts.push_value(&author_of(author));
     if Some(path) != own_path {
-        facts.push(&path.0);
+        facts.push_value(&path.0);
     }
     lines.line(ENTRY_INDENT, facts.as_str())?;
     lines.line(DETAIL_INDENT, summary.as_deref().unwrap_or_default())

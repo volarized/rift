@@ -1,6 +1,8 @@
 use serde::ser::Error as _;
 
-use super::{INDENT_UNIT, OUTPUT_TEXT_BYTES_MAX, OutputOverflow, TextError, TextWriter, visible};
+use super::{
+    INDENT_UNIT, OUTPUT_TEXT_BYTES_MAX, OutputOverflow, TextError, TextWriter, quoted, visible,
+};
 
 /// A limit far above every fixture in these tests.
 const LIMIT: usize = 1 << 20;
@@ -155,4 +157,76 @@ fn visible_escapes_control_characters_and_keeps_everything_else() {
     );
     assert!(matches!(visible("x"), std::borrow::Cow::Borrowed(_)));
     assert_eq!(visible(""), "");
+}
+
+/// The delimiters of a fact line: the fact separator and the detail separator.
+const DELIMITERS: [&str; 2] = [" · ", ": "];
+
+#[test]
+fn quoted_keeps_a_value_without_a_delimiter_bare() {
+    for bare in [
+        "plain",
+        "",
+        "a·b",
+        "a:b",
+        "path:12",
+        "back \\ slash \" quote",
+        "a ·b",
+        "a :b",
+    ] {
+        assert!(
+            matches!(quoted(bare, &DELIMITERS), std::borrow::Cow::Borrowed(text) if text == bare),
+            "{bare:?}"
+        );
+    }
+}
+
+#[test]
+fn quoted_wraps_a_value_holding_a_delimiter_and_escapes_quote_and_backslash() {
+    assert_eq!(quoted("a · b", &DELIMITERS), "\"a · b\"");
+    assert_eq!(quoted("key: value", &DELIMITERS), "\"key: value\"");
+    assert_eq!(quoted(" · ", &DELIMITERS), "\" · \"");
+    assert_eq!(quoted(": ", &DELIMITERS), "\": \"");
+    assert_eq!(
+        quoted("say \"hi\": C:\\dir", &DELIMITERS),
+        "\"say \\\"hi\\\": C:\\\\dir\""
+    );
+    assert_eq!(quoted("日本 · 語", &DELIMITERS), "\"日本 · 語\"");
+}
+
+#[test]
+fn a_quoted_value_unescapes_to_the_original_text() {
+    let unquote = |text: &str| -> String {
+        let inner = text
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("quoted");
+        let mut out = String::new();
+        let mut escaped = false;
+        for character in inner.chars() {
+            if escaped || character != '\\' {
+                out.push(character);
+                escaped = false;
+            } else {
+                escaped = true;
+            }
+        }
+        assert!(!escaped, "a lone backslash ends {text:?}");
+        out
+    };
+    for original in ["a · b", "a: b", "\\ · \"", "x\\: \"\"", "\" · \\"] {
+        let text = quoted(original, &DELIMITERS);
+        assert_eq!(unquote(&text), original, "{text}");
+    }
+}
+
+#[test]
+fn quoted_with_no_delimiters_keeps_every_value_bare() {
+    assert_eq!(quoted("a · b: c", &[]), "a · b: c");
+}
+
+#[test]
+fn a_quoted_value_with_a_control_character_stays_on_one_line_after_visible() {
+    let text = quoted("a · b\nc", &DELIMITERS);
+    assert_eq!(visible(&text), "\"a · b\\nc\"");
 }

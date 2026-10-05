@@ -916,6 +916,29 @@ fn every_warning_variant_renders_as_one_line() {
 }
 
 #[test]
+fn a_warning_value_or_detail_holding_a_delimiter_is_quoted_and_others_stay_bare() {
+    assert_eq!(
+        warning_line(
+            &json!({"code": "package_context_degraded", "resolver": "cargo",
+            "reason": "metadata: read \"failed\" · C:\\x"})
+        ),
+        r#"package_context_degraded · resolver cargo · reason "metadata: read \"failed\" · C:\\x""#
+    );
+    assert_eq!(
+        warning_line(&json!({"code": "documentation_unavailable",
+            "detail": "bound crossed: 2 files · 9 bytes"})),
+        r#"documentation_unavailable: "bound crossed: 2 files · 9 bytes""#
+    );
+    assert_eq!(
+        warning_line(
+            &json!({"code": "package_context_degraded", "resolver": "cargo",
+            "reason": "C:\\dir \"x\" a:b a·b"})
+        ),
+        r#"package_context_degraded · resolver cargo · reason C:\dir "x" a:b a·b"#
+    );
+}
+
+#[test]
 fn a_warning_line_shows_one_line_per_payload_shape() {
     let lines = [
         warning_line(&json!({"code": "global_access_disabled"})),
@@ -3216,6 +3239,37 @@ fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warnin
             "",
             "\tdocumentation (truncated):",
             "\t\tdocumentation · warning (source docs/a.md, stage source, kind source_unavailable, count 2)",
+        ],
+    );
+}
+
+#[test]
+fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
+    let guide = documentation_hit_at("docs/guide.md", 2, &["Step 1: Install", "a · b"], None);
+    let mut hit = symbol_hit_with_source(None);
+    hit.documentation = Some(context(&json!([reference(&guide, None)]), false));
+    let mut moved = version("aaaaaaaa11", "src/a · b.rs", SymbolVersionKind::Moved, None);
+    moved.author = CommitAuthor {
+        name: "Ops: \"bot\" \\ team".to_owned(),
+        email: "ops@example.com".to_owned(),
+    };
+    let mut odd_time = version("bbbbbbbb22", "a.rs", SymbolVersionKind::Introduced, None);
+    odd_time.timestamp = "day 1: noon".to_owned();
+    hit.history = Some(history(vec![moved, odd_time], true));
+    golden(
+        &symbol_result(vec![hit], pagination(0, 1)),
+        &[
+            "1 result",
+            "\tstruct A",
+            "\ta.rs:1",
+            "\trift://symbol/rust/a.rs/A",
+            "",
+            "\tdocumentation:",
+            "\t\tdocs/guide.md:2 · \"Step 1: Install > a · b\"",
+            "",
+            "\thistory:",
+            "\t\t2026-08-21 · aaaaaaaa · moved · \"Ops: \\\"bot\\\" \\\\ team <ops@example.com>\" · \"src/a · b.rs\"",
+            "\t\t\"day 1: noon\" · bbbbbbbb · introduced · Alice <alice@example.com>",
         ],
     );
 }
