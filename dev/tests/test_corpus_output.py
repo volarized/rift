@@ -358,3 +358,69 @@ def test_actions_carry_utc_start_and_end(
     assert first["started_at"] <= first["ended_at"]
     corpus.record("second")
     assert corpus.actions[1]["started_at"] == first["ended_at"]  # type: ignore[index]
+
+
+def stopped_corpus(tmp_path: Path) -> tuple[Corpus, Mock, Path]:
+    """A corpus over a fake server whose stop leaves only `index` and `index-wal`."""
+    corpus = Corpus(pins()["fastapi"], tmp_path / "rift", tmp_path / "out" / "r.json")
+    root = tmp_path / "workspace"
+    (root / ".rift").mkdir(parents=True)
+    (root / ".rift" / "index").write_bytes(b"i" * 7)
+    (root / ".rift" / "index-wal").write_bytes(b"")
+    (root / ".rift" / "metrics").write_bytes(b"m" * 3)
+    server = Mock(spec=Server)
+    server.root = root
+    server.log_path = tmp_path / "out" / "r.server-1.log"
+    server.records_path = tmp_path / "out" / "r.server-1.records.log"
+    return corpus, server, root
+
+
+def test_a_stop_keeps_records_and_sizes_with_an_absent_vectors_file(
+    tmp_path: Path,
+) -> None:
+    corpus, server, _ = stopped_corpus(tmp_path)
+    corpus.stop(server)
+    server.stop.assert_called_once_with()
+    server.read_records.assert_called_once_with()
+    assert corpus.stops == [
+        {
+            "stderr": str(server.log_path),
+            "sizes": {
+                "index": 7,
+                "index-wal": 0,
+                "metrics": 3,
+                "metrics-wal": "absent",
+                "vectors": "absent",
+                "vectors-wal": "absent",
+            },
+            "records": str(server.records_path),
+        }
+    ]
+
+
+def test_a_failing_records_read_is_noted_and_the_case_continues(
+    tmp_path: Path,
+) -> None:
+    corpus, server, _ = stopped_corpus(tmp_path)
+    server.read_records.side_effect = RuntimeError("rift exited 3")
+    corpus.stop(server)
+    assert corpus.stops[0]["records"] is None
+    assert corpus.stops[0]["records_error"] == "rift exited 3"
+
+
+def test_a_failing_stop_keeps_no_stop_entry(tmp_path: Path) -> None:
+    corpus, server, _ = stopped_corpus(tmp_path)
+    server.stop.side_effect = AssertionError("server stop exceeded its deadline")
+    with pytest.raises(AssertionError, match="exceeded its deadline"):
+        corpus.stop(server)
+    server.read_records.assert_not_called()
+    assert corpus.stops == []
+
+
+def test_the_report_carries_the_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus, report, _ = corpus_with_server(tmp_path, monkeypatch, fails=False)
+    corpus.stops.append({"stderr": "x", "sizes": {"vectors": "absent"}})
+    asyncio.run(corpus.run())
+    assert json.loads(report.read_text())["stops"] == corpus.stops

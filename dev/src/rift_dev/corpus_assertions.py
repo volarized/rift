@@ -480,6 +480,25 @@ def database_bytes(root: Path) -> JsonObject:
     }
 
 
+STOP_SIZE_FILES = tuple(
+    f"{database}{suffix}"
+    for database in ("index", "metrics", "vectors")
+    for suffix in ("", "-wal")
+)
+"""The files whose size a stop records; `vectors` exists after the first vector operation."""
+
+ABSENT = "absent"
+
+
+def stop_sizes(root: Path) -> JsonObject:
+    """Size each `STOP_SIZE_FILES` entry below `.rift`; a missing file reads `"absent"`."""
+    return {
+        name: path.stat().st_size if path.is_file() else ABSENT
+        for name in STOP_SIZE_FILES
+        for path in (root / ".rift" / name,)
+    }
+
+
 def probe_units(root: Path) -> int:
     """Count only the probe's persisted units after the lexical lane commits."""
     database = root / ".rift" / "index"

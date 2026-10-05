@@ -31,6 +31,8 @@ def test_shallow_history_preserves_declaration_and_history_checks_after_preparat
     client.call.side_effect = [preparing, settled]
     client.resource.return_value = {"records": []}
     server = MagicMock(spec=Server)
+    server.root = Path("workspace")
+    server.log_path = Path("server.log")
     server.__enter__.return_value = server
     server.connect.return_value.__aenter__.return_value = client
     corpus = Corpus(pins()["fastapi"], tmp_path / "rift", tmp_path / "fastapi.json")
