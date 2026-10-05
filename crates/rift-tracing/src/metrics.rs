@@ -19,6 +19,7 @@ use std::time::Duration;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 
+use crate::capture::span_failure;
 use crate::measurement::monotonic_now;
 use crate::sampler::ProcessSample;
 
@@ -594,7 +595,7 @@ const OPERATION_SERIES_MAX: usize = 1_024;
 
 /// The `status.code` of an operation that finished.
 const STATUS_OK: &str = "Ok";
-/// The `status.code` of an operation that panicked or was cancelled.
+/// The `status.code` of an operation that failed, panicked, or was cancelled.
 const STATUS_ERROR: &str = "Error";
 /// The `error.type` of an operation that panicked.
 const ERROR_PANIC: &str = "panic";
@@ -608,6 +609,9 @@ enum Ending {
     Finished,
     /// The awaited work was dropped before it returned.
     Cancelled,
+    /// The awaited work returned after its span recorded the failure with this
+    /// `error.type` label.
+    Failed(&'static str),
 }
 
 /// The completion of one `traced!` operation: its duration and its outcome, recorded once
@@ -624,12 +628,26 @@ pub struct Completion {
     operation: &'static str,
     started: Option<Duration>,
     ending: Ending,
+    span: Option<tracing::span::Id>,
 }
 
 impl Completion {
-    /// Marks an awaited operation's work as returned.
-    pub(crate) fn finished(&mut self) {
-        self.ending = Ending::Finished;
+    /// The guard of an operation whose open span `span` the guard reads, as it drops, for
+    /// a failure the span recorded: an `error.type`, or an `outcome` that is not a
+    /// completion. The guard drops before the span closes.
+    #[doc(hidden)]
+    pub fn of_span(mut self, span: Option<tracing::span::Id>) -> Self {
+        self.span = span;
+        self
+    }
+
+    /// Marks an awaited operation's work as returned, under `span`, still open: failed
+    /// when the span recorded a failure, finished otherwise.
+    pub(crate) fn finished(&mut self, span: &tracing::Span) {
+        self.ending = match self.started.and(span.id()).as_ref().and_then(span_failure) {
+            Some(label) => Ending::Failed(label),
+            None => Ending::Finished,
+        };
     }
 
     /// Whether the guard reads the clock and records when it drops.
@@ -648,10 +666,15 @@ impl Drop for Completion {
         let elapsed = monotonic_now().checked_sub(started);
         let (status, error) = if std::thread::panicking() {
             (STATUS_ERROR, ERROR_PANIC)
-        } else if self.ending == Ending::Cancelled {
-            (STATUS_ERROR, ERROR_CANCELLED)
         } else {
-            (STATUS_OK, "")
+            match self.ending {
+                Ending::Cancelled => (STATUS_ERROR, ERROR_CANCELLED),
+                Ending::Failed(label) => (STATUS_ERROR, label),
+                Ending::Finished => match self.span.as_ref().and_then(span_failure) {
+                    Some(label) => (STATUS_ERROR, label),
+                    None => (STATUS_OK, ""),
+                },
+            }
         };
         let labels = [self.operation, status, error];
         OPERATION_CALLS.labeled(labels).add(1);
@@ -679,6 +702,7 @@ fn started(operation: &'static str, ending: Ending) -> Completion {
         operation,
         started: installed().then(monotonic_now),
         ending,
+        span: None,
     }
 }
 

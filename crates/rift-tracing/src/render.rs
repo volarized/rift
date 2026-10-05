@@ -31,6 +31,7 @@ use std::fmt::Write as _;
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
+use crate::capture::{OUTCOME_FIELD, completed_outcome};
 use crate::record::{LogRecord, RecordKind};
 
 /// The time a line prints: UTC with milliseconds, `2026-10-04 20:42:58.787Z`.
@@ -525,30 +526,36 @@ fn own_pairs(fields: &Map<String, Value>) -> String {
 /// The message of a span close: `close`, the mark, the reason the operation did not
 /// complete, then `busy` and `idle`.
 ///
+/// The close is `✗` when its `status.code` is `Error`, it carries an `error.type`, or the
+/// span's `outcome` is not a completion, so a record stored before its `status.code`
+/// stated a recorded failure prints `✗` too. The reason is `panicked`, `cancelled`, or
+/// `error.type=…`; a failure stated by `outcome` alone prints no reason, because the
+/// span's fields before the message already print the `outcome`.
+///
 /// A close record written without `busy_ns` and `idle_ns` prints its `elapsed_ms`, and
-/// one without `status.code` prints no mark.
+/// one without `status.code`, `error.type`, or `outcome` prints no mark.
 fn close_message(own: &Map<String, Value>) -> String {
     let text = |key: &str| own.get(key).map(plain_value);
+    let error_type = text("error.type");
+    let failed = text("status.code").as_deref() == Some("Error")
+        || error_type.is_some()
+        || text(OUTCOME_FIELD).is_some_and(|outcome| !completed_outcome(&outcome));
     let mut message = String::from("close");
-    match text("status.code").as_deref() {
-        Some("Ok") => {
-            message.push(' ');
-            message.push_str(COMPLETED_MARK);
-        }
-        Some(_) => {
-            message.push(' ');
-            message.push_str(FAILED_MARK);
-            match text("error.type").as_deref() {
-                Some("panic") => message.push_str(" panicked"),
-                Some("cancelled") => message.push_str(" cancelled"),
-                Some(other) => {
-                    message.push(' ');
-                    message.push_str(&pair("error.type", &Value::from(other)));
-                }
-                None => {}
+    if failed {
+        message.push(' ');
+        message.push_str(FAILED_MARK);
+        match error_type.as_deref() {
+            Some("panic") => message.push_str(" panicked"),
+            Some("cancelled") => message.push_str(" cancelled"),
+            Some(other) => {
+                message.push(' ');
+                message.push_str(&pair("error.type", &Value::from(other)));
             }
+            None => {}
         }
-        None => {}
+    } else if text("status.code").is_some() || own.contains_key(OUTCOME_FIELD) {
+        message.push(' ');
+        message.push_str(COMPLETED_MARK);
     }
     let nanoseconds = |key: &str| text(key).and_then(|value| value.parse::<u64>().ok());
     match (nanoseconds("busy_ns"), nanoseconds("idle_ns")) {
@@ -571,14 +578,15 @@ fn close_message(own: &Map<String, Value>) -> String {
 }
 
 /// The mark of a lifecycle record, from the fields that state its transition:
-/// `phase = "start"` starts a phase, `outcome = "ok"` completes it, and
-/// `outcome = "error"` fails it. `None` for any other record.
+/// `phase = "start"` starts a phase, an `outcome` that is a completion (`ok`) completes
+/// it, and any other `outcome`, such as `error` or `timeout`, fails it. `None` for any
+/// other record.
 fn lifecycle_mark(own: &Map<String, Value>) -> Option<&'static str> {
     let text = |key: &str| own.get(key).and_then(Value::as_str);
-    match (text("phase"), text("outcome")) {
+    match (text("phase"), text(OUTCOME_FIELD)) {
         (Some("start"), _) => Some(STARTED_MARK),
-        (_, Some("ok")) => Some(COMPLETED_MARK),
-        (_, Some("error")) => Some(FAILED_MARK),
+        (_, Some(outcome)) if completed_outcome(outcome) => Some(COMPLETED_MARK),
+        (_, Some(_)) => Some(FAILED_MARK),
         _ => None,
     }
 }

@@ -831,6 +831,144 @@ fn a_close_record_states_a_panic_and_a_cancellation() {
     }
 }
 
+/// Runs one operation per way of ending, each recording how it ended on its own span.
+fn record_failures_on_spans() {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let outcome = |name: &'static str, value: &'static str| {
+        let span = crate::Span::current();
+        span.record("outcome", value);
+        name
+    };
+    crate::traced!(
+        component = "test",
+        operation = "test.outcome_error",
+        outcome = crate::empty!(),
+        { outcome("test.outcome_error", "error") }
+    );
+    crate::traced!(
+        component = "test",
+        operation = "test.outcome_timeout",
+        outcome = crate::empty!(),
+        { outcome("test.outcome_timeout", "timeout") }
+    );
+    crate::traced!(
+        component = "test",
+        operation = "test.error_type",
+        outcome = crate::empty!(),
+        {
+            outcome("test.error_type", "timeout");
+            crate::Span::current().record("error.type", "index.lexical_storage");
+        }
+    );
+    crate::traced!(
+        component = "test",
+        operation = "test.outcome_ok",
+        outcome = crate::empty!(),
+        { outcome("test.outcome_ok", "ok") }
+    );
+    let mut awaited = pin!(crate::traced!(
+        component = "test",
+        operation = "test.awaited_error",
+        outcome = crate::empty!(),
+        async { outcome("test.awaited_error", "error") }
+    ));
+    assert_eq!(
+        awaited
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready("test.awaited_error")
+    );
+    let build = tracing::info_span!(
+        "index.build",
+        component = "index",
+        outcome = tracing::field::Empty
+    );
+    build.in_scope(|| build.record("outcome", "error"));
+    drop(build);
+    let wait = tracing::info_span!(
+        "lock.wait",
+        component = "lock",
+        outcome = tracing::field::Empty
+    );
+    wait.record("outcome", "acquired");
+    drop(wait);
+}
+
+/// A span that records a failure itself ends failed in its close record, its printed
+/// close, and the operation metrics alike: `outcome` other than `ok` or `acquired`, or
+/// any `error.type`. The record keeps the recorded `error.type`; the metric label is that
+/// value when the metrics list it, `_OTHER` otherwise.
+#[test]
+fn a_failure_the_span_records_ends_the_record_the_line_and_the_metric_failed() {
+    let (recorder, mut drain) = crate::ScopedRecorder::builder()
+        .capture("trace")
+        .install()
+        .expect("the capture filter parses");
+    record_failures_on_spans();
+
+    let records = queued(&mut drain);
+    let snapshot = recorder.metrics();
+    for (message, status, error_type, label, close) in [
+        (
+            "test.outcome_error",
+            "Error",
+            None,
+            Some("_OTHER"),
+            "close ✗ busy=",
+        ),
+        (
+            "test.outcome_timeout",
+            "Error",
+            None,
+            Some("timeout"),
+            "close ✗ busy=",
+        ),
+        (
+            "test.error_type",
+            "Error",
+            Some("index.lexical_storage"),
+            Some("_OTHER"),
+            "close ✗ error.type=index.lexical_storage busy=",
+        ),
+        ("test.outcome_ok", "Ok", None, None, "close ✓ busy="),
+        (
+            "test.awaited_error",
+            "Error",
+            None,
+            Some("_OTHER"),
+            "close ✗ busy=",
+        ),
+        ("index.build", "Error", None, None, "close ✗ busy="),
+        ("lock.wait", "Ok", None, None, "close ✓ busy="),
+    ] {
+        let fields = fields_of(&records, message);
+        assert_eq!(fields["status.code"], status, "{message}: {fields}");
+        assert_eq!(
+            fields.get("error.type").and_then(serde_json::Value::as_str),
+            error_type,
+            "{message}: {fields}"
+        );
+        let line = records
+            .iter()
+            .find(|record| record.message() == message)
+            .map(LogRecord::rendered)
+            .unwrap_or_default();
+        assert!(line.contains(close), "{message}: {line}");
+        if message.starts_with("test.") {
+            let mut labels = vec![("span.name", message), ("status.code", status)];
+            labels.extend(label.map(|label| ("error.type", label)));
+            assert!(
+                snapshot
+                    .find("traces.span.metrics.calls", &labels)
+                    .is_some(),
+                "{message} counts under {labels:?}: {snapshot:?}"
+            );
+        }
+    }
+}
+
 /// A span the capture filter leaves out still names the records inside it: the event
 /// carries it as its root or nearest span, as the stderr line prints it.
 #[test]

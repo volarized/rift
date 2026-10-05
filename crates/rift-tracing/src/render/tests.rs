@@ -187,6 +187,33 @@ fn a_close_that_did_not_complete_prints_its_reason() {
         "close busy=6.55ms idle=290µs\n",
         "a close record without `status.code` states no outcome"
     );
+    assert_eq!(
+        line(json!({"status.code": "Error", "outcome": "error"})),
+        "close ✗ busy=6.55ms idle=290µs\n",
+        "a failure stated by `outcome` alone prints no reason"
+    );
+    assert_eq!(
+        line(json!({"status.code": "Ok", "outcome": "error"})),
+        "close ✗ busy=6.55ms idle=290µs\n",
+        "a record stored before its `status.code` stated the `outcome` still prints `✗`"
+    );
+    assert_eq!(
+        line(json!({"outcome": "timeout"})),
+        "close ✗ busy=6.55ms idle=290µs\n"
+    );
+    assert_eq!(
+        line(json!({"status.code": "Ok", "error.type": "timeout"})),
+        "close ✗ error.type=timeout busy=6.55ms idle=290µs\n"
+    );
+    assert_eq!(
+        line(json!({"status.code": "Ok", "outcome": "ok"})),
+        "close ✓ busy=6.55ms idle=290µs\n"
+    );
+    assert_eq!(
+        line(json!({"outcome": "acquired"})),
+        "close ✓ busy=6.55ms idle=290µs\n",
+        "a lock wait that acquired its lock completed"
+    );
 }
 
 /// A lifecycle record prints the mark its `phase` or `outcome` states before its message,
@@ -224,6 +251,15 @@ fn a_lifecycle_record_prints_its_mark() {
         )]),
         "2026-10-04 20:42:58.787Z INFO  rift_mcp::validation::prepare   component=index \
          operation=index.build error=refused outcome=error  ✗ the commit failed\n"
+    );
+    assert_eq!(
+        page(&[lifecycle(
+            json!({"outcome": "timeout", "stage": "log drain"}),
+            "stop stage ended"
+        )]),
+        "2026-10-04 20:42:58.787Z INFO  rift_mcp::validation::prepare   component=index \
+         operation=index.build outcome=timeout stage=log drain  ✗ stop stage ended\n",
+        "a phase that ran out its deadline did not complete"
     );
 }
 
