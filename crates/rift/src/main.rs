@@ -12,7 +12,7 @@ mod server;
 mod steer;
 mod update;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -104,6 +104,39 @@ impl Cli {
             })
         )
     }
+
+    /// Whether this command serves repository workspaces through one process.
+    const fn serves_repository(&self) -> bool {
+        matches!(
+            &self.command,
+            Some(CliCommand::Server {
+                command: server::ServerCommand::Start {
+                    foreground: true,
+                    repository: true,
+                    ..
+                }
+            })
+        )
+    }
+}
+
+/// The folder whose `[logs]` table sets this process's capture, sampling, and retention.
+///
+/// Under repository serving one process holds one runtime, so its process-wide `[logs]`
+/// values come from the main worktree that `select_server_configuration` takes `[server]`
+/// from. Every other command, and a repository start whose selection fails (which the
+/// start then refuses), reads `start`.
+fn logs_root(cli: &Cli, start: &Path) -> PathBuf {
+    if !cli.serves_repository() {
+        return start.to_path_buf();
+    }
+    match rift_mcp::repository::select_server_configuration(start, None) {
+        Ok(rift_mcp::repository::ServerConfigurationSelection::Repository {
+            authority_root,
+            ..
+        }) => authority_root,
+        _ => start.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -120,7 +153,7 @@ const FAILED_EXIT_STATUS: i32 = 1;
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let serves = cli.records_logs();
-    let logs = serves.then(|| rift_mcp::logs_configuration(Path::new(".")));
+    let logs = serves.then(|| rift_mcp::logs_configuration(&logs_root(&cli, Path::new("."))));
     let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
     if let Some(logs) = &logs {
         let sample_interval = Duration::from_millis(logs.sample_interval.milliseconds());
@@ -343,6 +376,74 @@ mod tests {
             .expect_err("--version prints and exits")
             .to_string();
         assert_eq!(printed.trim(), format!("rift {}", super::product_version()));
+    }
+
+    /// One git command in `root` with a fixed identity and signing off.
+    fn git(root: &std::path::Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Rift Fixture",
+                "-c",
+                "user.email=fixture@rift.invalid",
+            ])
+            .args(arguments)
+            .status()
+            .expect("git must run");
+        assert!(status.success(), "git {arguments:?} must succeed");
+    }
+
+    /// A linked worktree whose `[logs]` differs from the main worktree's: repository
+    /// serving reads the main worktree's table, and a workspace start reads its own.
+    #[test]
+    fn repository_serving_reads_logs_from_the_main_worktree() {
+        let main = tempfile::tempdir().expect("main worktree");
+        git(main.path(), &["init", "-q"]);
+        std::fs::write(main.path().join("lib.rs"), "pub fn beacon() {}\n").expect("source");
+        git(main.path(), &["add", "lib.rs"]);
+        git(main.path(), &["commit", "-qm", "add source"]);
+        let linked_parent = tempfile::tempdir().expect("linked parent");
+        let linked = linked_parent.path().join("linked");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().expect("temporary path is UTF-8"),
+                "HEAD",
+            ],
+        );
+        std::fs::write(
+            main.path().join("rift.toml"),
+            "[logs]\nretention_records = 200\n",
+        )
+        .expect("main configuration");
+        std::fs::write(
+            linked.join("rift.toml"),
+            "[logs]\nretention_records = 300\n",
+        )
+        .expect("linked configuration");
+
+        let repository =
+            Cli::try_parse_from(["rift", "server", "start", "--foreground", "--repository"])
+                .expect("repository start parses");
+        let root = super::logs_root(&repository, &linked);
+        assert_eq!(
+            root,
+            std::fs::canonicalize(main.path()).expect("canonical main root")
+        );
+        assert_eq!(rift_mcp::logs_configuration(&root).retention_records, 200);
+
+        let workspace = Cli::try_parse_from(["rift", "server", "start", "--foreground"])
+            .expect("workspace start parses");
+        let root = super::logs_root(&workspace, &linked);
+        assert_eq!(root, linked);
+        assert_eq!(rift_mcp::logs_configuration(&root).retention_records, 300);
     }
 
     #[test]
