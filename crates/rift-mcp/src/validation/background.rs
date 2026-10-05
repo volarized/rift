@@ -267,6 +267,10 @@ impl VersionControlHold {
 
     /// Metadata probes run on the bounded worker pool. Cancellation ends the wait;
     /// a retained lock is passed once its original timeout expires.
+    ///
+    /// A wait that found the lock present records how it ended, once: `ok` when the lock
+    /// went away, `timeout` when its timeout expired, and `cancelled` when cancellation
+    /// ended it. A wait that never found the lock records nothing.
     pub(super) async fn wait(
         &mut self,
         context: &IndexSupervisorContext,
@@ -274,6 +278,8 @@ impl VersionControlHold {
         let Some(lock) = self.lock.clone() else {
             return Ok(true);
         };
+        // A deadline left by an earlier wait is that lock's sighting, still unresolved.
+        let mut sighted = self.deadline.map(|_| Instant::now());
         loop {
             let wait_deadline = self.deadline.filter(|deadline| *deadline > Instant::now());
             let path = lock.clone();
@@ -291,7 +297,10 @@ impl VersionControlHold {
             );
             let present = tokio::select! {
                 biased;
-                () = context.validation.cancellation.cancelled() => return Ok(false),
+                () = context.validation.cancellation.cancelled() => {
+                    report_wait(&lock, sighted, "cancelled");
+                    return Ok(false);
+                },
                 () = async {
                     if let Some(deadline) = wait_deadline {
                         tokio::time::sleep_until(deadline).await;
@@ -300,20 +309,31 @@ impl VersionControlHold {
                     }
                 } => {
                     self.report_expiration(&lock);
+                    report_wait(&lock, sighted, "timeout");
                     return Ok(true);
                 },
                 result = present => result?,
             };
+            if present && sighted.is_none() {
+                sighted = Some(Instant::now());
+            }
             match self.decision(present, Instant::now()) {
-                HoldDecision::Proceed => return Ok(true),
+                HoldDecision::Proceed => {
+                    report_wait(&lock, sighted, "ok");
+                    return Ok(true);
+                }
                 HoldDecision::Expired => {
                     self.report_expiration(&lock);
+                    report_wait(&lock, sighted, "timeout");
                     return Ok(true);
                 }
                 HoldDecision::WaitUntil(deadline) => {
                     tokio::select! {
                         biased;
-                        () = context.validation.cancellation.cancelled() => return Ok(false),
+                        () = context.validation.cancellation.cancelled() => {
+                            report_wait(&lock, sighted, "cancelled");
+                            return Ok(false);
+                        },
                         () = tokio::time::sleep_until(deadline.min(Instant::now() + INDEX_DEBOUNCE)) => {},
                     }
                 }
@@ -327,6 +347,22 @@ impl VersionControlHold {
             self.expiration_reported = true;
         }
     }
+}
+
+/// Records how one wait on the Git index lock at `lock` ended, when the wait found it
+/// present at `sighted`: one `INFO` record per wait that met the lock, none otherwise.
+fn report_wait(lock: &std::path::Path, sighted: Option<Instant>, outcome: &'static str) {
+    let Some(sighted) = sighted else {
+        return;
+    };
+    rift_tracing::info!(
+        component = "index",
+        operation = "index.lock",
+        path = %lock.display(),
+        elapsed_ms = Instant::now().saturating_duration_since(sighted).as_millis(),
+        outcome,
+        "Git index lock wait ended"
+    );
 }
 
 #[cfg(test)]
@@ -588,6 +624,56 @@ mod tests {
             hold.decision(true, Instant::now()),
             HoldDecision::WaitUntil(_)
         ));
+    }
+
+    /// A wait that finds the Git index lock present records one `Git index lock wait
+    /// ended` with the outcome `ok` once the lock goes away; a wait that finds no lock
+    /// records nothing.
+    #[tokio::test]
+    async fn a_wait_that_met_the_git_index_lock_records_its_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn old() {}\n")?;
+        let (context, _invalidations) = stable_context(directory.path())?;
+        let lock = directory.path().join("index.lock");
+        let mut hold = VersionControlHold::new(Some(lock.clone()), &ServerConfiguration::default());
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        assert!(
+            hold.wait(&context).await?,
+            "an absent lock lets the turn run"
+        );
+        std::fs::write(&lock, "")?;
+        let removal = {
+            let lock = lock.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(INDEX_DEBOUNCE * 2).await;
+                std::fs::remove_file(lock)
+            })
+        };
+        assert!(
+            hold.wait(&context).await?,
+            "a removed lock lets the turn run"
+        );
+        removal.await??;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let ended = records
+            .iter()
+            .filter(|record| record.message() == "Git index lock wait ended")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ended.len(),
+            1,
+            "one record per wait that met the lock: {records:?}"
+        );
+        assert_eq!(ended[0].level(), "info");
+        assert_eq!(ended[0].operation(), "index.lock");
+        let fields: serde_json::Value = serde_json::from_str(ended[0].fields())?;
+        assert_eq!(fields["outcome"], "ok");
+        assert!(fields["elapsed_ms"].is_string(), "{fields}");
+        Ok(())
     }
 
     /// One span closes for each stage of the visible-file capture that follows the
