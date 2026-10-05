@@ -40,6 +40,30 @@ fn rift_binary() -> TestResult<PathBuf> {
         .ok_or_else(|| "test runner must provide CARGO_BIN_EXE_rift".into())
 }
 
+/// A command running [`rift_binary`] that carries the test's
+/// [`harness::TEST_CASE_NAME_ATTRIBUTE`].
+fn rift_command() -> TestResult<Command> {
+    let mut command = Command::new(rift_binary()?);
+    harness::with_test_case_name(&mut command);
+    Ok(command)
+}
+
+/// What a foreground server's failure window registers it as.
+const FOREGROUND_LABEL: &str = "rift server start --foreground";
+
+/// The exit status of `child` once it exited, recorded in the test's failure window.
+fn exited(child: &mut Child) -> Option<std::process::ExitStatus> {
+    let status = child.try_wait().ok().flatten()?;
+    harness::record_exit(child.id(), status);
+    Some(status)
+}
+
+/// The text of `server.json` in `root`, or why it could not be read, for a failure that
+/// finds the document still there.
+fn document_text(root: &Path) -> String {
+    fs::read_to_string(document_path(root)).unwrap_or_else(|error| format!("not read: {error}"))
+}
+
 /// Pause between polls of any awaited condition.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Poll attempts while waiting on a server to disappear, a child to exit,
@@ -186,10 +210,10 @@ impl StopOnDrop {
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let Ok(binary) = rift_binary() else {
+        let Ok(mut command) = rift_command() else {
             return;
         };
-        let _ = Command::new(binary)
+        let _ = command
             .args(["server", "stop"])
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -222,9 +246,14 @@ struct StderrMarks {
 }
 
 impl StderrWatch {
-    /// Drains `stream` on another thread so the foreground server can keep writing startup
-    /// records. The retained prefix stays bounded for the failure message.
-    fn spawn(mut stream: ChildStderr) -> Self {
+    /// Drains the piped stderr of `child` on another thread so the foreground server can
+    /// keep writing startup records. The retained prefix stays bounded for the failure
+    /// message. The child is registered in the test's failure window under `label`, and
+    /// every byte read lands in its stderr copy there.
+    fn spawn(child: &mut Child, label: &str) -> TestResult<Self> {
+        let mut stream: ChildStderr = child.stderr.take().ok_or("the child's stderr is piped")?;
+        harness::register_process(child.id(), label);
+        let mut copy = harness::stderr_copy(child.id());
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&bytes);
         let marks = Arc::new(Mutex::new(StderrMarks::default()));
@@ -239,6 +268,9 @@ impl StderrWatch {
                     Ok(count) => count,
                 };
                 let now = std::time::Instant::now();
+                if let Some(copy) = &mut copy {
+                    copy.write(&buffer[..count]);
+                }
                 carried.extend_from_slice(&buffer[..count]);
                 {
                     let mut marks = marked
@@ -266,11 +298,11 @@ impl StderrWatch {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .closed = Some(std::time::Instant::now());
         });
-        Self {
+        Ok(Self {
             bytes,
             marks,
             reader,
-        }
+        })
     }
 
     /// When the reader saw the server reach each point of its stop so far.
@@ -338,7 +370,7 @@ fn wait_for_foreground_server(
     }) {
         Ok(serving) => Ok(serving),
         Err(error) => {
-            let status = child.try_wait()?;
+            let status = exited(child);
             Err(format!(
                 "{error}; foreground server status: {status:?}; stderr: {}",
                 harness::bounded_tail(&stderr.snapshot())
@@ -361,7 +393,7 @@ fn rift_with_variables(
     arguments: &[&str],
     variables: &[(&str, &str)],
 ) -> TestResult<Output> {
-    Ok(Command::new(rift_binary()?)
+    Ok(rift_command()?
         .args(arguments)
         .envs(SERVER_LOG_VARIABLES)
         .envs(variables.iter().copied())
@@ -634,7 +666,7 @@ fn start_foreground_server_with(
     root: &Path,
     variables: &[(&str, &str)],
 ) -> TestResult<(Child, ServerLock, StderrWatch)> {
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .envs(SERVER_LOG_VARIABLES)
         .envs(variables.iter().copied())
@@ -643,12 +675,14 @@ fn start_foreground_server_with(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     match wait_for_foreground_server(root, &mut child, &stderr) {
         Ok(serving) => Ok((child, serving, stderr)),
         Err(error) => {
             let _ = child.kill();
-            let _ = child.wait();
+            if let Ok(status) = child.wait() {
+                harness::record_exit(child.id(), status);
+            }
             Err(error)
         }
     }
@@ -663,7 +697,7 @@ fn start_foreground_server_with(
 fn stop_foreground_server(root: &Path, child: &mut Child, stderr: &StderrWatch) -> TestResult {
     let started = std::time::Instant::now();
     let deadline = started + DATABASE_REOPEN_STOP_BOUND;
-    let mut stop = Command::new(rift_binary()?)
+    let mut stop = rift_command()?
         .args(["server", "stop"])
         .envs(SERVER_LOG_VARIABLES)
         .current_dir(root)
@@ -674,7 +708,7 @@ fn stop_foreground_server(root: &Path, child: &mut Child, stderr: &StderrWatch) 
     let mut exits = StopExits::default();
     loop {
         let stop_status = stop.try_wait()?;
-        let server_status = child.try_wait()?;
+        let server_status = exited(child);
         exits.observe(stop_status.is_some(), server_status.is_some());
         if let (Some(stop_status), Some(server_status)) = (stop_status, server_status) {
             let stop_output = stop.wait_with_output()?;
@@ -712,7 +746,9 @@ fn stop_foreground_server(root: &Path, child: &mut Child, stderr: &StderrWatch) 
                 format!("{status:?} (the server's own exit status)")
             } else {
                 let _ = child.kill();
-                format!("{:?} (the harness killed the server)", child.wait()?)
+                let status = child.wait()?;
+                harness::record_exit(child.id(), status);
+                format!("{status:?} (the harness killed the server)")
             };
             return Err(format!(
                 "stop and process exit exceeded {DATABASE_REOPEN_STOP_BOUND:?}; still running \
@@ -842,7 +878,8 @@ fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
     );
     assert!(
         !document_path(root).exists(),
-        "a graceful stop retires server.json"
+        "a graceful stop retires server.json; server.json: {}",
+        document_text(root)
     );
     assert!(
         serving_document(root).is_none(),
@@ -946,7 +983,7 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
 
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .envs(SERVER_LOG_VARIABLES)
         .current_dir(root)
@@ -954,7 +991,7 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -987,7 +1024,7 @@ impl ListeningForeground {
     fn start(root: &Path, variables: &[(&str, &str)]) -> TestResult<Self> {
         use std::io::BufRead as _;
 
-        let mut child = Command::new(rift_binary()?)
+        let mut child = rift_command()?
             .args(["server", "start", "--foreground"])
             .envs(SERVER_LOG_VARIABLES)
             .envs(variables.iter().copied())
@@ -1277,7 +1314,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
 
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
@@ -1285,7 +1322,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -1297,7 +1334,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "the foreground child to exit",
-        || child.try_wait().ok().flatten(),
+        || exited(&mut child),
     )?;
     let status = child.wait()?;
     assert!(
@@ -1436,7 +1473,7 @@ fn a_stop_during_a_probe_whose_child_holds_the_pipes_ends_cleanly() -> TestResul
         let server = wait_for(
             GONE_POLL_ATTEMPT_COUNT,
             "the foreground server to exit",
-            || child.try_wait().ok().flatten(),
+            || exited(&mut child),
         )?;
         Ok((stop, server))
     });
@@ -1489,7 +1526,7 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
 
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
@@ -1497,7 +1534,7 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -1509,7 +1546,7 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
     let status = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "the stopped server's process to exit after the listener binds",
-        || child.try_wait().ok().flatten(),
+        || exited(&mut child),
     )?;
     assert!(
         status.success(),
@@ -1523,7 +1560,8 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
     );
     assert!(
         !document_path(root).exists(),
-        "a graceful stop retires server.json"
+        "a graceful stop retires server.json; server.json: {}",
+        document_text(root)
     );
     failure_window.passed();
     Ok(())
@@ -1538,7 +1576,7 @@ fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
 
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
@@ -1546,7 +1584,7 @@ fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -1560,7 +1598,7 @@ fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
     let status = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "the stopped server's process to exit after the source rewrite",
-        || child.try_wait().ok().flatten(),
+        || exited(&mut child),
     )?;
     assert!(
         status.success(),
@@ -1574,7 +1612,8 @@ fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
     );
     assert!(
         !document_path(root).exists(),
-        "a graceful stop retires server.json"
+        "a graceful stop retires server.json; server.json: {}",
+        document_text(root)
     );
     failure_window.passed();
     Ok(())
@@ -1589,7 +1628,7 @@ fn stop_after_large_fixture_rewrite_ends_the_process_as_the_document_goes() -> T
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
 
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .env("RUST_LOG", STARTUP_TRACE_FILTER)
@@ -1598,7 +1637,7 @@ fn stop_after_large_fixture_rewrite_ends_the_process_as_the_document_goes() -> T
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -1617,9 +1656,9 @@ fn stop_after_large_fixture_rewrite_ends_the_process_as_the_document_goes() -> T
         "the stopped server's process to exit after the source rewrite",
         || {
             let document_present = document_path(root).exists();
-            let exited = child.try_wait().ok().flatten();
-            observations.push((document_present, exited.is_some()));
-            exited
+            let exit = exited(&mut child);
+            observations.push((document_present, exit.is_some()));
+            exit
         },
     )?;
     assert!(
@@ -1649,7 +1688,8 @@ fn stop_after_large_fixture_rewrite_ends_the_process_as_the_document_goes() -> T
     );
     assert!(
         !document_path(root).exists(),
-        "a graceful stop retires server.json"
+        "a graceful stop retires server.json; server.json: {}",
+        document_text(root)
     );
     failure_window.passed();
     Ok(())
@@ -1664,7 +1704,7 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
 
-    let mut child = Command::new(rift_binary()?)
+    let mut child = rift_command()?
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .env("RUST_LOG", STARTUP_TRACE_FILTER)
@@ -1673,7 +1713,7 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let stderr = StderrWatch::spawn(&mut child, FOREGROUND_LABEL)?;
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -1724,7 +1764,7 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "the stopped server's process to exit after its stop reported success",
-        || child.try_wait().ok().flatten(),
+        || exited(&mut child),
     )?;
     child.wait()?;
     assert!(
@@ -1738,7 +1778,8 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     );
     assert!(
         !document_path(root).exists(),
-        "a graceful stop retires server.json"
+        "a graceful stop retires server.json; server.json: {}",
+        document_text(root)
     );
     let _ = searching.join();
     failure_window.passed();
@@ -1755,7 +1796,7 @@ fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
     let mut children = Vec::with_capacity(CONCURRENT_START_COUNT);
     for _ in 0..CONCURRENT_START_COUNT {
         children.push(
-            Command::new(rift_binary()?)
+            rift_command()?
                 .args(["server", "start"])
                 .current_dir(root)
                 .stdin(Stdio::null())
@@ -1834,6 +1875,184 @@ fn a_refused_foreground_start_names_the_published_holder() -> TestResult {
 /// Run it after the nextest run, alone, so it prints no window of a test still running:
 /// `cargo nextest run -p rift --test server_cli --run-ignored only --no-tests fail -E
 /// 'test(=failure_windows_of_ended_tests)'`.
+/// An attempt id in the form nextest documents: run id, binary id, stress index, test name.
+const FIXTURE_ATTEMPT: &str =
+    "55459fda-13fe-406a-b4e3-0230fd52bb03:rift::server_cli@stress-3$a_case";
+
+/// The window files of [`FIXTURE_ATTEMPT`] in the `default` profile below `reports`.
+fn fixture_window_files(reports: &Path) -> harness::WindowFiles {
+    harness::WindowFiles::new(
+        reports.join("default").join("failure-windows"),
+        FIXTURE_ATTEMPT,
+    )
+}
+
+/// A window that fails in its test's own process keeps its start and appends `ended_at`,
+/// writes what it printed beside it, and prints each registered process's label, the exit
+/// the test observed or that it observed none, and the tail of its stderr copy.
+#[test]
+fn a_failing_window_keeps_its_files_and_prints_each_registered_process() -> TestResult {
+    let reports = tempfile::tempdir()?;
+    let files = fixture_window_files(reports.path());
+    let window = harness::FailureWindow::begin_in(Some(files.clone()), Some(FIXTURE_ATTEMPT), &[]);
+    files.register_process(4242, FOREGROUND_LABEL)?;
+    files.register_process(4343, "rift mcp")?;
+    let relay = harness::RelayedStderr::spawn(
+        &b"MCP server stopping\nMCP server stopped\n"[..],
+        files.stderr_copy(4242)?,
+    );
+    let relayed = tokio::runtime::Builder::new_current_thread()
+        .build()?
+        .block_on(relay.text())?;
+    assert_eq!(relayed, "MCP server stopping\nMCP server stopped\n");
+    let status = std::process::ExitStatus::default();
+    files.record_exit(4242, status)?;
+    files.record_exit(4242, status)?;
+    files.record_exit(5555, status)?;
+
+    drop(window);
+
+    let start = harness::WindowStart::read(&files.start())?;
+    assert!(start.ended_at.is_some(), "{start:?}");
+    assert_eq!(start.attempt.as_deref(), Some(FIXTURE_ATTEMPT));
+    assert_eq!(
+        start.processes,
+        [
+            harness::RegisteredProcess {
+                pid: 4242,
+                label: FOREGROUND_LABEL.to_owned(),
+                exit: Some(format!("{status:?}")),
+            },
+            harness::RegisteredProcess {
+                pid: 4343,
+                label: "rift mcp".to_owned(),
+                exit: None,
+            },
+        ]
+    );
+    let text = fs::read_to_string(files.text())?;
+    for expected in [
+        format!("---- process 4242: {FOREGROUND_LABEL} ----\nexit: {status:?}\n"),
+        format!(
+            "---- {} ----\nMCP server stopping\nMCP server stopped\n",
+            files.stderr(4242).display()
+        ),
+        "---- process 4343: rift mcp ----\nexit: still running at the window".to_owned(),
+        format!(
+            "---- {} ----\nabsent: the harness drained no stderr",
+            files.stderr(4343).display()
+        ),
+    ] {
+        assert!(text.contains(&expected), "{expected:?} in {text}");
+    }
+    assert!(
+        harness::killed_window_starts(reports.path())?.is_empty(),
+        "a window carrying ended_at is left to the reader of its files"
+    );
+    Ok(())
+}
+
+/// A window that closes passed removes its start, its text, and every stderr copy.
+#[test]
+fn a_passing_window_removes_every_file_it_wrote() -> TestResult {
+    let reports = tempfile::tempdir()?;
+    let files = fixture_window_files(reports.path());
+    let window = harness::FailureWindow::begin_in(Some(files.clone()), Some(FIXTURE_ATTEMPT), &[]);
+    files.register_process(4242, FOREGROUND_LABEL)?;
+    files
+        .stderr_copy(4242)?
+        .ok_or("a window with a start keeps a stderr copy")?
+        .write(b"MCP server ready\n");
+    files.record_exit(4242, std::process::ExitStatus::default())?;
+    assert!(files.stderr(4242).exists());
+
+    window.passed();
+
+    let left: Vec<PathBuf> = fs::read_dir(reports.path().join("default").join("failure-windows"))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()?;
+    assert!(left.is_empty(), "{left:?}");
+    Ok(())
+}
+
+/// A start file reads back every key; a start without `ended_at` is a killed test's,
+/// and a line the contract does not name is refused.
+#[test]
+fn a_start_file_reads_back_every_key() -> TestResult {
+    let reports = tempfile::tempdir()?;
+    let files = fixture_window_files(reports.path());
+    fs::create_dir_all(files.start().parent().ok_or("the start has a directory")?)?;
+    let start = format!(
+        "test=a_case NEXTEST_ATTEMPT_ID={FIXTURE_ATTEMPT}\nattempt={FIXTURE_ATTEMPT}\n\
+         started_at=2026-10-05T10:00:00Z\nroot=/tmp/fixture\n\
+         process=4242 {FOREGROUND_LABEL}\nexit=4242 ExitStatus(unix_wait_status(0))\n"
+    );
+    fs::write(files.start(), &start)?;
+
+    let read = harness::WindowStart::read(&files.start())?;
+    assert_eq!(
+        read.test,
+        format!("a_case NEXTEST_ATTEMPT_ID={FIXTURE_ATTEMPT}")
+    );
+    assert_eq!(read.attempt.as_deref(), Some(FIXTURE_ATTEMPT));
+    assert_eq!(
+        read.started_at,
+        "2026-10-05T10:00:00Z".parse::<jiff::Timestamp>()?
+    );
+    assert_eq!(read.roots, [PathBuf::from("/tmp/fixture")]);
+    assert_eq!(
+        read.processes,
+        [harness::RegisteredProcess {
+            pid: 4242,
+            label: FOREGROUND_LABEL.to_owned(),
+            exit: Some("ExitStatus(unix_wait_status(0))".to_owned()),
+        }]
+    );
+    assert_eq!(read.ended_at, None);
+    assert_eq!(
+        harness::killed_window_starts(reports.path())?,
+        [files.start()]
+    );
+
+    fs::write(
+        files.start(),
+        format!("{start}ended_at=2026-10-05T10:00:01Z\n"),
+    )?;
+    let ended = harness::WindowStart::read(&files.start())?;
+    assert_eq!(ended.ended_at, Some("2026-10-05T10:00:01Z".parse()?));
+    assert!(harness::killed_window_starts(reports.path())?.is_empty());
+
+    for refused in [
+        "exit=5555 ExitStatus(unix_wait_status(0))\n",
+        "stage=stopping\n",
+    ] {
+        fs::write(files.start(), format!("{start}{refused}"))?;
+        assert!(
+            harness::WindowStart::read(&files.start()).is_err(),
+            "{refused:?} is refused"
+        );
+    }
+    Ok(())
+}
+
+/// The variable carries the test case name verbatim when it holds no character the SDK's
+/// parse splits or trims at, writes those as `%XX`, and keeps inherited entries ahead.
+#[test]
+fn the_test_case_name_attribute_encodes_what_the_sdk_parse_splits_at() {
+    assert_eq!(
+        harness::resource_attributes(None, FIXTURE_ATTEMPT),
+        format!("test.case.name={FIXTURE_ATTEMPT}")
+    );
+    assert_eq!(
+        harness::resource_attributes(Some("service.namespace=ci"), "a, b%c\n"),
+        "service.namespace=ci,test.case.name=a%2C%20b%25c%0A"
+    );
+    assert_eq!(
+        harness::resource_attributes(Some(" "), "a"),
+        "test.case.name=a"
+    );
+}
+
 #[test]
 #[ignore = "run after a nextest run, to print the windows of the tests it ended"]
 fn failure_windows_of_ended_tests() -> TestResult {
@@ -2065,7 +2284,7 @@ fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     let output = tempfile::tempdir()?;
     let stdout_path = output.path().join("start.stdout");
     let stderr_path = output.path().join("start.stderr");
-    let mut start = Command::new(rift_binary()?)
+    let mut start = rift_command()?
         .args(["server", "start"])
         .current_dir(root)
         .stdin(Stdio::null())

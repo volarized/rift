@@ -193,12 +193,73 @@ pub(crate) const CHILD_LOG_FILTER: &str = "rift=info,rift_mcp=info,rift_server=i
 
 /// Sets [`CHILD_LOG_FILTER`] and `NO_COLOR` on one `rift` child: the traced lines
 /// end up in a test's captured output rather than on a terminal, so they stay plain.
+/// The child also carries the test's [`TEST_CASE_NAME_ATTRIBUTE`]
+/// ([`with_test_case_name`]).
 pub(crate) fn with_child_log_variables(
     command: &mut std::process::Command,
 ) -> &mut std::process::Command {
-    command
+    with_test_case_name(command)
         .env("RUST_LOG", CHILD_LOG_FILTER)
         .env("NO_COLOR", "1")
+}
+
+/// The OpenTelemetry resource attribute naming the test that spawned a `rift` process.
+pub(crate) const TEST_CASE_NAME_ATTRIBUTE: &str = "test.case.name";
+/// The variable the OpenTelemetry SDK's `EnvResourceDetector` reads resource attributes
+/// from, as `key=value` entries separated by `,`.
+const RESOURCE_ATTRIBUTES_VARIABLE: &str = "OTEL_RESOURCE_ATTRIBUTES";
+
+/// The name of the running test: the nextest attempt id, which names one attempt of one
+/// test in one run, or the test thread's name outside nextest.
+pub(crate) fn test_case_name() -> String {
+    std::env::var("NEXTEST_ATTEMPT_ID").unwrap_or_else(|_| {
+        std::thread::current()
+            .name()
+            .unwrap_or("unnamed test")
+            .to_owned()
+    })
+}
+
+/// Sets `OTEL_RESOURCE_ATTRIBUTES` on one `rift` child so it carries
+/// [`TEST_CASE_NAME_ATTRIBUTE`] with the [`test_case_name`]. Every process the child
+/// spawns inherits the variable: a detached server's command inherits its caller's
+/// environment. Entries the test process inherited stay, ahead of this one.
+///
+/// Call it on the test's own thread: outside nextest the name is the thread's.
+pub(crate) fn with_test_case_name(
+    command: &mut std::process::Command,
+) -> &mut std::process::Command {
+    let inherited = std::env::var(RESOURCE_ATTRIBUTES_VARIABLE).ok();
+    command.env(
+        RESOURCE_ATTRIBUTES_VARIABLE,
+        resource_attributes(inherited.as_deref(), &test_case_name()),
+    )
+}
+
+/// The `OTEL_RESOURCE_ATTRIBUTES` value carrying `inherited`'s entries, then
+/// [`TEST_CASE_NAME_ATTRIBUTE`] set to `test_case_name`.
+///
+/// `opentelemetry_sdk` 0.33 splits the value at `,`, splits each entry at its first `=`,
+/// trims both sides, and decodes nothing; a later entry of the same key replaces an
+/// earlier one. The value therefore writes `,`, `%`, whitespace, and control characters
+/// as `%XX` of their UTF-8 bytes, and carries every other character as it is, so a nextest
+/// attempt id, which holds none of them, arrives unchanged.
+pub(crate) fn resource_attributes(inherited: Option<&str>, test_case_name: &str) -> String {
+    let mut value = String::with_capacity(test_case_name.len());
+    for character in test_case_name.chars() {
+        if matches!(character, ',' | '%') || character.is_whitespace() || character.is_control() {
+            let mut bytes = [0_u8; 4];
+            for byte in character.encode_utf8(&mut bytes).bytes() {
+                let _ = write!(value, "%{byte:02X}");
+            }
+        } else {
+            value.push(character);
+        }
+    }
+    match inherited.filter(|inherited| !inherited.trim().is_empty()) {
+        Some(inherited) => format!("{inherited},{TEST_CASE_NAME_ATTRIBUTE}={value}"),
+        None => format!("{TEST_CASE_NAME_ATTRIBUTE}={value}"),
+    }
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
@@ -270,6 +331,17 @@ const REPORT_DIRECTORY: &str = "target/nextest";
 const OPEN_WINDOWS_DIRECTORY: &str = "failure-windows";
 /// Extension of the file one open failure window's start is written to.
 const START_FILE_EXTENSION: &str = "window";
+/// Extension of the file a window that ended in its test's own process writes its printed
+/// text to.
+const TEXT_FILE_EXTENSION: &str = "text";
+/// Extension of the file one registered process's stderr is copied to.
+const STDERR_FILE_EXTENSION: &str = "stderr";
+/// Bytes of one registered process's stderr its window file keeps: the first ones. The
+/// bytes past it are read and dropped, and one notice line ends the file, so the tail a
+/// window prints of a cut file is the bytes before the bound, not the stream's end.
+const STDERR_FILE_BYTES_MAX: u64 = 16 << 20;
+/// Exit text of a registered process whose exit the test did not observe.
+const EXIT_NOT_OBSERVED: &str = "still running at the window, as far as the test observed";
 /// Most windows [`print_ended_windows`] prints in one run; each spends up to
 /// [`WINDOW_READ_MAX`], and the rest are named and left for the next run.
 #[allow(
@@ -285,9 +357,11 @@ const ENDED_WINDOWS_MAX: usize = 8;
 /// server's persisted records from the test's start to the failure, read through the
 /// window query of `rift server logs` (`--since`, `--until`): the newest
 /// [`WINDOW_RECORDS_MAX`] log records and the newest record of the table of operations in
-/// flight; then the detached server's `.rift/server.stderr`. The stderr of a `rift mcp` child is
-/// relayed onto the test's own as it arrives ([`RelayedStderr`]), so it already sits
-/// above the window. Each source prints at most [`WINDOW_SOURCE_BYTES_MAX`] bytes and
+/// flight; then the detached server's `.rift/server.stderr`. Then, for each process the
+/// test registered (a foreground server, a `rift mcp` child), its label, its exit status,
+/// and the tail of the copy of its stderr the harness kept beside the start. The stderr of
+/// a `rift mcp` child is also relayed onto the test's own as it arrives
+/// ([`RelayedStderr`]). Each source prints at most [`WINDOW_SOURCE_BYTES_MAX`] bytes and
 /// says once what its bound cut, and all reads together wait at most
 /// [`WINDOW_READ_MAX`], so one workspace prints at most two sources of that size
 /// and one record; a source that could not be read says why, beside the failure and
@@ -298,10 +372,14 @@ const ENDED_WINDOWS_MAX: usize = 8;
 /// deadline. The case calls [`FailureWindow::passed`] as its last step; an early
 /// return through `?` or a panic leaves the window open, and its drop prints it.
 ///
-/// Under nextest the window writes its start, identity, and workspaces into the
-/// report directory when it begins, and removes the file when it closes. A test that
-/// nextest ends at its deadline, or any other kill, runs no destructor and leaves the
-/// file; [`print_ended_windows`] prints those windows after the run.
+/// Under nextest the window keeps its files in the report directory ([`WindowFiles`]).
+/// It writes its start, identity, and workspaces when it begins; the harness appends
+/// each process the test registers and each exit the test observes, and copies each
+/// registered process's stderr beside it. A window that closes passed removes every
+/// file. A window that fails in the test's own process keeps them, writes its printed
+/// text beside them, and appends `ended_at` last. A test that nextest ends at its
+/// deadline, or any other kill, runs no destructor and leaves the files without
+/// `ended_at`; [`print_ended_windows`] prints those windows after the run.
 pub(crate) struct FailureWindow {
     /// The test's name and its nextest identity.
     test: String,
@@ -310,10 +388,10 @@ pub(crate) struct FailureWindow {
     /// When the test began, on the clock the server stamps its records with.
     started_at: jiff::Timestamp,
     /// When the test began, for the age the heading prints; absent once the test's
-    /// process is gone.
+    /// process is gone, for a window [`print_ended_windows`] restored.
     began: Option<std::time::Instant>,
-    /// The file the start was written to, nothing outside nextest, or why the write failed.
-    start_file: Result<Option<PathBuf>, String>,
+    /// The window's files, nothing outside nextest, or why the start was not written.
+    files: Result<Option<WindowFiles>, String>,
     open: bool,
 }
 
@@ -326,15 +404,31 @@ impl FailureWindow {
     /// Opens the window of one test serving every workspace of `roots`, before the
     /// test starts a process.
     pub(crate) fn begin_over(roots: &[&Path]) -> Self {
+        Self::begin_in(
+            WindowFiles::of_this_test(),
+            std::env::var("NEXTEST_ATTEMPT_ID").ok().as_deref(),
+            roots,
+        )
+    }
+
+    /// Opens a window whose start `files` hold, of the test attempt `attempt`.
+    pub(crate) fn begin_in(
+        files: Option<WindowFiles>,
+        attempt: Option<&str>,
+        roots: &[&Path],
+    ) -> Self {
         let mut window = Self {
             test: test_identity(),
             roots: roots.iter().map(|root| root.to_path_buf()).collect(),
             started_at: jiff::Timestamp::now(),
             began: Some(std::time::Instant::now()),
-            start_file: Ok(None),
+            files: Ok(None),
             open: true,
         };
-        window.start_file = window.write_start();
+        window.files = match files {
+            Some(files) => window.write_start(&files, attempt).map(|()| Some(files)),
+            None => Ok(None),
+        };
         window
     }
 
@@ -343,30 +437,20 @@ impl FailureWindow {
         self.open = false;
     }
 
-    /// Writes this window's start into the report directory of the running nextest
-    /// profile, and names the file; outside nextest it writes nothing.
-    fn write_start(&self) -> Result<Option<PathBuf>, String> {
-        let (Ok(workspace), Ok(profile), Ok(attempt)) = (
-            std::env::var("NEXTEST_WORKSPACE_ROOT"),
-            std::env::var("NEXTEST_PROFILE"),
-            std::env::var("NEXTEST_ATTEMPT_ID"),
-        ) else {
-            return Ok(None);
-        };
-        let directory = Path::new(&workspace)
-            .join(REPORT_DIRECTORY)
-            .join(profile)
-            .join(OPEN_WINDOWS_DIRECTORY);
-        let path = directory.join(format!("{}.{START_FILE_EXTENSION}", file_name_of(&attempt)));
-        let mut text = format!("test={}\nstarted_at={}\n", self.test, self.started_at);
-        for root in &self.roots {
-            text.push_str("root=");
-            text.push_str(&root.display().to_string());
-            text.push('\n');
+    /// Writes this window's start, `test`, `attempt`, `started_at`, and one `root` per
+    /// workspace, into `files`.
+    fn write_start(&self, files: &WindowFiles, attempt: Option<&str>) -> Result<(), String> {
+        let mut text = format!("test={}\n", self.test);
+        if let Some(attempt) = attempt {
+            let _ = writeln!(text, "attempt={attempt}");
         }
-        fs::create_dir_all(&directory)
+        let _ = writeln!(text, "started_at={}", self.started_at);
+        for root in &self.roots {
+            let _ = writeln!(text, "root={}", root.display());
+        }
+        let path = files.start();
+        fs::create_dir_all(&files.directory)
             .and_then(|()| fs::write(&path, text))
-            .map(|()| Some(path.clone()))
             .map_err(|error| format!("{}: {error}", path.display()))
     }
 
@@ -376,35 +460,23 @@ impl FailureWindow {
         reason = "`server_cli` alone prints ended windows; each suite compiles this file"
     )]
     fn restored(path: &Path) -> TestResult<Self> {
-        let text = fs::read_to_string(path)?;
-        let mut identity = None;
-        let mut started_at = None;
-        let mut roots = Vec::new();
-        for line in text.lines() {
-            match line.split_once('=') {
-                Some(("test", value)) => identity = Some(value.to_owned()),
-                Some(("started_at", value)) => started_at = Some(value.parse()?),
-                Some(("root", value)) => roots.push(PathBuf::from(value)),
-                _ => return Err(format!("{}: unexpected line {line:?}", path.display()).into()),
-            }
-        }
+        let start = WindowStart::read(path)?;
         Ok(Self {
-            test: identity.ok_or_else(|| format!("{}: no test line", path.display()))?,
-            roots,
-            started_at: started_at
-                .ok_or_else(|| format!("{}: no started_at line", path.display()))?,
+            test: start.test,
+            roots: start.roots,
+            started_at: start.started_at,
             began: None,
-            start_file: Ok(Some(path.to_owned())),
+            files: Ok(Some(WindowFiles::of_start(path)?)),
             open: true,
         })
     }
 
-    /// The window's text, every source read now: the window ends at this call.
-    fn text(&self) -> String {
+    /// The window's text, every source read now; the window ends at `ended_at`.
+    fn text(&self, ended_at: jiff::Timestamp) -> String {
         let budget = ReadBudget::new();
         let since = millisecond_text(self.started_at.as_millisecond());
         // The query's upper bound excludes its own millisecond; the next one keeps it.
-        let until = millisecond_text(jiff::Timestamp::now().as_millisecond().saturating_add(1));
+        let until = millisecond_text(ended_at.as_millisecond().saturating_add(1));
         let age = self.began.map_or_else(
             || "the test's process ended before its window printed".to_owned(),
             |began| format!("{:?} after the test began", began.elapsed()),
@@ -413,7 +485,7 @@ impl FailureWindow {
             "\n==== failure window: {test}, {age} ====\nfrom {since} to {until}\n",
             test = self.test,
         );
-        if let Err(error) = &self.start_file {
+        if let Err(error) = &self.files {
             let _ = writeln!(
                 text,
                 "[the start was not written ({error}): a kill of this test leaves no window]"
@@ -430,22 +502,392 @@ impl FailureWindow {
         for workspace in &workspaces {
             text.push_str(&workspace.text());
         }
-        text.push_str(
-            "---- rift mcp stderr: relayed above as it arrived ----\n\
-             ==== end of failure window ====\n",
-        );
+        text.push_str(&self.processes_text());
+        text.push_str("==== end of failure window ====\n");
+        text
+    }
+
+    /// The part of the window each registered process holds: its label, its exit status,
+    /// and the tail of its stderr copy.
+    fn processes_text(&self) -> String {
+        let mut text = String::from("---- processes the test registered ----\n");
+        let files = match &self.files {
+            Ok(Some(files)) => files,
+            Ok(None) => {
+                text.push_str("none recorded: outside nextest the window keeps no files\n");
+                return text;
+            }
+            Err(_) => {
+                text.push_str("none recorded: the start was not written\n");
+                return text;
+            }
+        };
+        let start = match WindowStart::read(&files.start()) {
+            Ok(start) => start,
+            Err(error) => {
+                let _ = writeln!(text, "not read: {error}");
+                return text;
+            }
+        };
+        if start.processes.is_empty() {
+            text.push_str("none registered\n");
+        }
+        for process in &start.processes {
+            let stderr = files.stderr(process.pid);
+            let _ = writeln!(
+                text,
+                "---- process {pid}: {label} ----\nexit: {exit}\n---- {path} ----\n{tail}",
+                pid = process.pid,
+                label = process.label,
+                exit = process.exit.as_deref().unwrap_or(EXIT_NOT_OBSERVED),
+                path = stderr.display(),
+                tail = file_tail(
+                    &stderr,
+                    "absent: the harness drained no stderr of this process, or could not \
+                     create the copy and said why on the test's stderr"
+                ),
+            );
+        }
         text
     }
 }
 
 impl Drop for FailureWindow {
     fn drop(&mut self) {
-        if self.open {
-            let _ = std::io::stderr().write_all(self.text().as_bytes());
+        let files = self.files.as_ref().ok().and_then(Option::as_ref);
+        if !self.open {
+            if let Some(files) = files {
+                files.remove_all();
+            }
+            return;
         }
-        if let Ok(Some(path)) = &self.start_file {
-            let _ = fs::remove_file(path);
+        let ended_at = jiff::Timestamp::now();
+        let text = self.text(ended_at);
+        let _ = std::io::stderr().write_all(text.as_bytes());
+        let Some(files) = files else {
+            return;
+        };
+        if self.began.is_none() {
+            // A restored window is printed once, by `print_ended_windows`.
+            files.remove_all();
+            return;
         }
+        // The text lands first and `ended_at` last, so a start carrying `ended_at` has its
+        // text beside it, and a kill during the reads leaves a window `print_ended_windows`
+        // prints.
+        let kept = fs::write(files.text(), &text)
+            .and_then(|()| files.append("ended_at", &ended_at.to_string()));
+        if let Err(error) = kept {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[the window's files in {} were not completed: {error}]",
+                files.directory.display()
+            );
+        }
+    }
+}
+
+/// The files of one test attempt's failure window in the report directory of the running
+/// nextest profile, each named after the attempt id ([`file_name_of`]):
+///
+/// - `<stem>.window`, the start: one `key=value` line each, `test`, `attempt`,
+///   `started_at`, and `root` per workspace when the window begins; `process=<pid> <label>`
+///   per registered process; `exit=<pid> <exit status>` per observed exit; `ended_at`, in
+///   RFC 3339, when the window failed in the test's own process.
+/// - `<stem>.text`, what that window printed.
+/// - `<stem>.<pid>.stderr`, the copy of one registered process's stderr.
+#[derive(Clone, Debug)]
+pub(crate) struct WindowFiles {
+    directory: PathBuf,
+    stem: String,
+}
+
+impl WindowFiles {
+    /// The files of the running nextest attempt; nothing outside nextest.
+    fn of_this_test() -> Option<Self> {
+        let (Ok(workspace), Ok(profile), Ok(attempt)) = (
+            std::env::var("NEXTEST_WORKSPACE_ROOT"),
+            std::env::var("NEXTEST_PROFILE"),
+            std::env::var("NEXTEST_ATTEMPT_ID"),
+        ) else {
+            return None;
+        };
+        let directory = Path::new(&workspace)
+            .join(REPORT_DIRECTORY)
+            .join(profile)
+            .join(OPEN_WINDOWS_DIRECTORY);
+        Some(Self::new(directory, &attempt))
+    }
+
+    /// The files of the attempt `attempt` in `directory`.
+    pub(crate) fn new(directory: PathBuf, attempt: &str) -> Self {
+        Self {
+            directory,
+            stem: file_name_of(attempt),
+        }
+    }
+
+    /// The files whose start is `path`.
+    #[allow(
+        dead_code,
+        reason = "`server_cli` alone prints ended windows; each suite compiles this file"
+    )]
+    fn of_start(path: &Path) -> TestResult<Self> {
+        let directory = path
+            .parent()
+            .ok_or_else(|| format!("{}: no directory", path.display()))?;
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| format!("{}: no UTF-8 stem", path.display()))?;
+        Ok(Self {
+            directory: directory.to_owned(),
+            stem: stem.to_owned(),
+        })
+    }
+
+    pub(crate) fn start(&self) -> PathBuf {
+        self.directory
+            .join(format!("{}.{START_FILE_EXTENSION}", self.stem))
+    }
+
+    pub(crate) fn text(&self) -> PathBuf {
+        self.directory
+            .join(format!("{}.{TEXT_FILE_EXTENSION}", self.stem))
+    }
+
+    pub(crate) fn stderr(&self, pid: u32) -> PathBuf {
+        self.directory
+            .join(format!("{}.{pid}.{STDERR_FILE_EXTENSION}", self.stem))
+    }
+
+    /// Appends the line `key=value` to the start; a test whose window has no start
+    /// writes nothing.
+    fn append(&self, key: &str, value: &str) -> std::io::Result<()> {
+        match fs::OpenOptions::new().append(true).open(self.start()) {
+            Ok(mut start) => start.write_all(format!("{key}={value}\n").as_bytes()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Records the process `pid` the test spawned, under `label`.
+    pub(crate) fn register_process(&self, pid: u32, label: &str) -> std::io::Result<()> {
+        self.append("process", &format!("{pid} {}", label.replace('\n', " ")))
+    }
+
+    /// Records the exit the test observed of the registered process `pid`, once per
+    /// process; the exit of a process the start does not register is not recorded.
+    pub(crate) fn record_exit(
+        &self,
+        pid: u32,
+        status: std::process::ExitStatus,
+    ) -> std::io::Result<()> {
+        let start = match fs::read_to_string(self.start()) {
+            Ok(start) => start,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let registered = format!("process={pid} ");
+        let recorded = format!("exit={pid} ");
+        if !start.lines().any(|line| line.starts_with(&registered))
+            || start.lines().any(|line| line.starts_with(&recorded))
+        {
+            return Ok(());
+        }
+        self.append("exit", &format!("{pid} {status:?}"))
+    }
+
+    /// A new copy of the stderr of the process `pid`, when the window has a start.
+    pub(crate) fn stderr_copy(&self, pid: u32) -> std::io::Result<Option<StderrCopy>> {
+        if !self.start().exists() {
+            return Ok(None);
+        }
+        Ok(Some(StderrCopy {
+            file: fs::File::create(self.stderr(pid))?,
+            written: 0,
+            cut: false,
+        }))
+    }
+
+    /// Removes the start, the text, and every stderr copy, best effort.
+    fn remove_all(&self) {
+        let _ = fs::remove_file(self.start());
+        let _ = fs::remove_file(self.text());
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return;
+        };
+        let prefix = format!("{}.", self.stem);
+        let suffix = format!(".{STDERR_FILE_EXTENSION}");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let copy = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|rest| rest.strip_suffix(&suffix))
+                .is_some_and(|pid| {
+                    !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            if copy {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Records, in the running test's failure window, the process `pid` it spawned under
+/// `label`, such as `rift server start --foreground`; a test with no open window under
+/// nextest records nothing.
+pub(crate) fn register_process(pid: u32, label: &str) {
+    if let Some(files) = WindowFiles::of_this_test()
+        && let Err(error) = files.register_process(pid, label)
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[the window did not record process {pid} ({label}): {error}]"
+        );
+    }
+}
+
+/// Records, in the running test's failure window, the exit status the test observed of
+/// the process `pid`; only its first observation is recorded.
+pub(crate) fn record_exit(pid: u32, status: std::process::ExitStatus) {
+    if let Some(files) = WindowFiles::of_this_test()
+        && let Err(error) = files.record_exit(pid, status)
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[the window did not record the exit of process {pid}: {error}]"
+        );
+    }
+}
+
+/// A new copy of the stderr of the process `pid` in the running test's failure window,
+/// when the window has a start; why it could not be created goes to the test's stderr.
+pub(crate) fn stderr_copy(pid: u32) -> Option<StderrCopy> {
+    let files = WindowFiles::of_this_test()?;
+    files.stderr_copy(pid).unwrap_or_else(|error| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[the window keeps no stderr copy of process {pid}: {}: {error}]",
+            files.stderr(pid).display()
+        );
+        None
+    })
+}
+
+/// The copy of one registered process's stderr, bounded by [`STDERR_FILE_BYTES_MAX`].
+pub(crate) struct StderrCopy {
+    file: fs::File,
+    written: u64,
+    cut: bool,
+}
+
+impl StderrCopy {
+    /// Appends `bytes`, up to the bound; the first write the bound cuts appends one
+    /// notice line, and every later write is dropped.
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
+        if self.cut {
+            return;
+        }
+        let room = STDERR_FILE_BYTES_MAX.saturating_sub(self.written);
+        let kept = bytes.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        let _ = self.file.write_all(&bytes[..kept]);
+        self.written = self
+            .written
+            .saturating_add(u64::try_from(kept).unwrap_or(u64::MAX));
+        if kept < bytes.len() {
+            self.cut = true;
+            let _ = writeln!(
+                self.file,
+                "\n[the copy reached its {STDERR_FILE_BYTES_MAX}-byte bound; the rest is read \
+                 and dropped]"
+            );
+        }
+    }
+}
+
+/// One registered process of a window's start.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RegisteredProcess {
+    pub(crate) pid: u32,
+    pub(crate) label: String,
+    /// The exit status the test observed, as `Debug` printed it.
+    pub(crate) exit: Option<String>,
+}
+
+/// What one start file holds.
+#[derive(Debug)]
+pub(crate) struct WindowStart {
+    pub(crate) test: String,
+    #[allow(
+        dead_code,
+        reason = "`server_cli` alone reads it back; each suite compiles this file"
+    )]
+    pub(crate) attempt: Option<String>,
+    pub(crate) started_at: jiff::Timestamp,
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) processes: Vec<RegisteredProcess>,
+    /// When the window failed in the test's own process.
+    #[allow(
+        dead_code,
+        reason = "`server_cli` alone reads it back; each suite compiles this file"
+    )]
+    pub(crate) ended_at: Option<jiff::Timestamp>,
+}
+
+impl WindowStart {
+    /// Reads the start file at `path`; an exit of a process the start does not register
+    /// is refused.
+    pub(crate) fn read(path: &Path) -> TestResult<Self> {
+        let refused = |what: String| format!("{}: {what}", path.display());
+        let contents = fs::read_to_string(path)?;
+        let mut test = None;
+        let mut attempt = None;
+        let mut started_at = None;
+        let mut ended_at = None;
+        let mut roots = Vec::new();
+        let mut processes: Vec<RegisteredProcess> = Vec::new();
+        for line in contents.lines() {
+            let pid_and = |value: &str| -> TestResult<(u32, String)> {
+                let (pid, rest) = value
+                    .split_once(' ')
+                    .ok_or_else(|| refused(format!("no pid and text in {line:?}")))?;
+                Ok((pid.parse()?, rest.to_owned()))
+            };
+            match line.split_once('=') {
+                Some(("test", value)) => test = Some(value.to_owned()),
+                Some(("attempt", value)) => attempt = Some(value.to_owned()),
+                Some(("started_at", value)) => started_at = Some(value.parse()?),
+                Some(("ended_at", value)) => ended_at = Some(value.parse()?),
+                Some(("root", value)) => roots.push(PathBuf::from(value)),
+                Some(("process", value)) => {
+                    let (pid, label) = pid_and(value)?;
+                    processes.push(RegisteredProcess {
+                        pid,
+                        label,
+                        exit: None,
+                    });
+                }
+                Some(("exit", value)) => {
+                    let (pid, status) = pid_and(value)?;
+                    let process = processes
+                        .iter_mut()
+                        .find(|process| process.pid == pid)
+                        .ok_or_else(|| refused(format!("exit of unregistered process {pid}")))?;
+                    process.exit = Some(status);
+                }
+                _ => return Err(refused(format!("unexpected line {line:?}")).into()),
+            }
+        }
+        Ok(Self {
+            test: test.ok_or_else(|| refused("no test line".to_owned()))?,
+            attempt,
+            started_at: started_at.ok_or_else(|| refused("no started_at line".to_owned()))?,
+            roots,
+            processes,
+            ended_at,
+        })
     }
 }
 
@@ -490,9 +932,10 @@ fn millisecond_text(milliseconds: i64) -> String {
 
 /// Prints the failure window of every test of the compiled binary whose process
 /// ended before its own window printed - a nextest timeout or another kill - from the
-/// start files left in the report directory of every profile, and removes each file it
-/// printed. Answers how many it printed. At most [`ENDED_WINDOWS_MAX`] print; the rest
-/// are named, and kept for the next run.
+/// start files without `ended_at` left in the report directory of every profile, and
+/// removes the files of each window it printed. Answers how many it printed. At most
+/// [`ENDED_WINDOWS_MAX`] print; the rest are named, and kept for the next run. The files
+/// of a window that failed in its test's own process carry `ended_at`; it leaves them.
 ///
 /// A window printed here ends when this run reads it: the test's own end is unknown.
 /// Run it after nextest returns, never beside a running test, whose open window it
@@ -504,23 +947,7 @@ fn millisecond_text(milliseconds: i64) -> String {
 pub(crate) fn print_ended_windows() -> TestResult<usize> {
     let workspace = std::env::var("NEXTEST_WORKSPACE_ROOT")
         .map_err(|_| "run under nextest, which names the workspace root")?;
-    let reports = Path::new(&workspace).join(REPORT_DIRECTORY);
-    let mut starts = Vec::new();
-    if let Ok(profiles) = fs::read_dir(&reports) {
-        for profile in profiles {
-            let directory = profile?.path().join(OPEN_WINDOWS_DIRECTORY);
-            let Ok(files) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for file in files {
-                let path = file?.path();
-                if path.extension() == Some(START_FILE_EXTENSION.as_ref()) {
-                    starts.push(path);
-                }
-            }
-        }
-    }
-    starts.sort();
+    let starts = killed_window_starts(&Path::new(&workspace).join(REPORT_DIRECTORY))?;
     let printed = starts.len().min(ENDED_WINDOWS_MAX);
     for start in &starts[..printed] {
         // The restored window is open: dropping it prints it and removes its start.
@@ -534,6 +961,36 @@ pub(crate) fn print_ended_windows() -> TestResult<usize> {
         );
     }
     Ok(printed)
+}
+
+/// The start files, sorted, below every profile directory of `reports` whose window
+/// carries no `ended_at`: the test's process ended before its window printed.
+#[allow(
+    dead_code,
+    reason = "`server_cli` alone prints ended windows; each suite compiles this file"
+)]
+pub(crate) fn killed_window_starts(reports: &Path) -> TestResult<Vec<PathBuf>> {
+    let mut starts = Vec::new();
+    if let Ok(profiles) = fs::read_dir(reports) {
+        for profile in profiles {
+            let directory = profile?.path().join(OPEN_WINDOWS_DIRECTORY);
+            let Ok(files) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for file in files {
+                let path = file?.path();
+                if path.extension() == Some(START_FILE_EXTENSION.as_ref())
+                    && !fs::read_to_string(&path)?
+                        .lines()
+                        .any(|line| line.starts_with("ended_at="))
+                {
+                    starts.push(path);
+                }
+            }
+        }
+    }
+    starts.sort();
+    Ok(starts)
 }
 
 /// The [`WINDOW_READ_MAX`] budget every read of one failure window shares.
@@ -668,7 +1125,10 @@ impl WorkspaceReads {
             text,
             "---- {} ----\n{}",
             stderr_file.display(),
-            file_tail(&stderr_file)
+            file_tail(
+                &stderr_file,
+                "absent: only a server `rift server start` spawned writes this file"
+            )
         );
         text
     }
@@ -759,14 +1219,12 @@ fn run_window_read(
     Ok((printed, took))
 }
 
-/// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of the file at `path`, or why it could
-/// not be read.
-fn file_tail(path: &Path) -> String {
+/// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of the file at `path`, `absent` when there
+/// is no such file, or why it could not be read.
+fn file_tail(path: &Path, absent: &str) -> String {
     match fs::File::open(path) {
         Ok(mut file) => tail_of(&mut file).unwrap_or_else(|error| format!("unreadable: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            "absent: only a server `rift server start` spawned writes this file".to_owned()
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent.to_owned(),
         Err(error) => format!("unreadable: {error}"),
     }
 }
@@ -810,17 +1268,14 @@ fn cut_notice(cut: u64) -> String {
 /// Runs the real binary with `arguments` inside the fixture workspace,
 /// off the async runtime.
 pub(crate) async fn run_rift(root: &Path, arguments: &[&str]) -> TestResult<std::process::Output> {
-    let root = root.to_owned();
-    let arguments: Vec<String> = arguments.iter().map(|&argument| argument.into()).collect();
-    let output = tokio::task::spawn_blocking(move || {
-        let mut command = std::process::Command::new(rift_binary());
-        with_child_log_variables(&mut command)
-            .args(&arguments)
-            .current_dir(&root)
-            .stdin(Stdio::null())
-            .output()
-    })
-    .await??;
+    // The command is built on the test's thread, whose name outside nextest is the
+    // test case name the child carries.
+    let mut command = std::process::Command::new(rift_binary());
+    with_child_log_variables(&mut command)
+        .args(arguments)
+        .current_dir(root)
+        .stdin(Stdio::null());
+    let output = tokio::task::spawn_blocking(move || command.output()).await??;
     Ok(output)
 }
 
@@ -851,7 +1306,7 @@ pub(crate) async fn within<Value>(
 /// the rmcp transport wrapper or a raw-pipe session spawns it.
 ///
 /// The child runs under [`with_child_log_variables`]; the server the proxy
-/// spawns inherits both variables. `arguments` follow the `mcp` subcommand.
+/// spawns inherits them. `arguments` follow the `mcp` subcommand.
 fn base_command(root: &Path, arguments: &[&str]) -> tokio::process::Command {
     let mut command = std::process::Command::new(rift_binary());
     with_child_log_variables(&mut command)
@@ -900,16 +1355,41 @@ async fn relayed_proxy_client_with(
 ) -> TestResult<(RunningService<RoleClient, ()>, RelayedStderr)> {
     let (reader, writer) = std::io::pipe()?;
     let (transport, _stderr) = proxy_command(root, arguments).stderr(writer).spawn()?;
-    let stderr = RelayedStderr::spawn(reader);
+    let copy = transport.id().and_then(|pid| {
+        register_process(
+            pid,
+            &["rift", "mcp"]
+                .iter()
+                .chain(arguments)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        stderr_copy(pid)
+    });
+    let stderr = RelayedStderr::spawn(reader, copy);
     Ok((().serve(transport).await?, stderr))
+}
+
+/// Takes the piped stderr of `child`, a `rift` process the test spawned, registers the
+/// child in the test's failure window under `label`, and relays the stream like a
+/// `rift mcp` child's.
+pub(crate) fn relayed_child_stderr(
+    child: &mut std::process::Child,
+    label: &str,
+) -> TestResult<RelayedStderr> {
+    let stream = child.stderr.take().ok_or("the child's stderr is piped")?;
+    register_process(child.id(), label);
+    Ok(RelayedStderr::spawn(stream, stderr_copy(child.id())))
 }
 
 /// Bytes of one child's stderr the relay writes and keeps; the rest is read
 /// and dropped, so the child never blocks on a full pipe.
 const RELAYED_STDERR_BYTES_MAX: usize = 1 << 20;
 
-/// A child's stderr, copied onto this test process's stderr as it arrives
-/// and kept for the test to assert on.
+/// A child's stderr, copied onto this test process's stderr as it arrives,
+/// into the child's [`StderrCopy`] when the test's window keeps one, and kept
+/// for the test to assert on.
 ///
 /// Nextest prints a test's captured output when the test fails or times
 /// out, and it ends a timed-out test by killing it - on Windows at once,
@@ -928,12 +1408,12 @@ impl RelayedStderr {
     /// The relay stays off tokio's blocking pool: the runtime's shutdown
     /// joins every blocking thread, so a read parked there would hold the
     /// test's end until the stream closed.
-    fn spawn(stream: impl Read + Send + 'static) -> Self {
+    pub(crate) fn spawn(stream: impl Read + Send + 'static, copy: Option<StderrCopy>) -> Self {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&bytes);
         Self {
             bytes,
-            relay: std::thread::spawn(move || relay_until_closed(stream, &captured)),
+            relay: std::thread::spawn(move || relay_until_closed(stream, &captured, copy)),
         }
     }
 
@@ -968,7 +1448,12 @@ impl RelayedStderr {
 ///
 /// The first read the bound cuts writes one notice after the relayed bytes;
 /// the notice is not retained, so a case's assertions see the child's bytes alone.
-fn relay_until_closed(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
+/// `copy` receives every byte read, under its own bound.
+fn relay_until_closed(
+    mut stream: impl Read,
+    captured: &Mutex<Vec<u8>>,
+    mut copy: Option<StderrCopy>,
+) {
     let mut buffer = [0_u8; rift_core::STREAM_READ_BYTES];
     let mut cut_reported = false;
     loop {
@@ -976,6 +1461,9 @@ fn relay_until_closed(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
             Ok(0) | Err(_) => break,
             Ok(read_bytes) => read_bytes,
         };
+        if let Some(copy) = &mut copy {
+            copy.write(&buffer[..read_bytes]);
+        }
         let relayed = {
             let mut retained = captured
                 .lock()

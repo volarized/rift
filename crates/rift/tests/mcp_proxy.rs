@@ -203,9 +203,15 @@ async fn repository_foreground(
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?,
     );
+    // The relay thread copies the stream onto the test's stderr, as the inherited stream
+    // did, and into the window's copy, until the stream closes; nothing joins it.
+    drop(harness::relayed_child_stderr(
+        &mut child.0,
+        "rift server start --foreground --repository",
+    )?);
     let serving = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "repository foreground startup",
@@ -233,6 +239,7 @@ async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForegroun
     require_success(&stopped, "repository foreground stop")?;
     loop {
         if let Some(status) = child.0.try_wait()? {
+            harness::record_exit(child.0.id(), status);
             assert!(
                 status.success(),
                 "repository foreground exits cleanly: {status:?}"

@@ -1,6 +1,14 @@
 //! Proves `rift update` fails typed on an unreachable network, never
 //! panicking on the async runtime and never drawing progress off a terminal.
 
+// The shared end-to-end harness names the test each spawned `rift` serves.
+#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
+mod engine_fixture;
+#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
+mod harness;
+#[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
+mod rust_engine;
+
 use std::process::Command;
 
 /// A proxy address nothing listens on: port 9 (discard) on the loopback.
@@ -11,17 +19,18 @@ const DEAD_PROXY: &str = "http://127.0.0.1:9";
 
 #[test]
 fn update_reports_a_typed_failure_off_the_runtime() {
-    let output = Command::new(
+    let mut command = Command::new(
         std::env::var_os("CARGO_BIN_EXE_rift")
             .expect("test runner must provide CARGO_BIN_EXE_rift"),
-    )
-    .arg("update")
-    .env("HTTP_PROXY", DEAD_PROXY)
-    .env("HTTPS_PROXY", DEAD_PROXY)
-    .env_remove("NO_PROXY")
-    .env_remove("no_proxy")
-    .output()
-    .expect("the update invocation must run");
+    );
+    let output = harness::with_test_case_name(&mut command)
+        .arg("update")
+        .env("HTTP_PROXY", DEAD_PROXY)
+        .env("HTTPS_PROXY", DEAD_PROXY)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("the update invocation must run");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.code(),
