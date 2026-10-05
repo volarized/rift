@@ -24,6 +24,7 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 
 use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
 use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
+use crate::snapshot::{METRIC_TARGET, SNAPSHOT_VALUES_FIELD};
 
 /// Records the queue holds before a send drops one. The queue exists to absorb a burst
 /// while the drain writes; a workspace that emits more than this between two flushes is
@@ -209,6 +210,10 @@ where
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
         let mut fields = RecordedFields::default();
         event.record(&mut fields);
+        if event.metadata().target() == METRIC_TARGET {
+            self.send(fields.metric_snapshot(event.metadata().level().as_str()));
+            return;
+        }
         let mut members = fields.members();
         let RecordedFields {
             message,
@@ -409,6 +414,26 @@ impl RecordedFields {
             let _ = write!(members, "{}:{}", quoted(name), quoted(value));
         }
         members
+    }
+
+    /// The metric snapshot record of a snapshot event: its `values` field is already the
+    /// JSON object the record's fields hold, written within the record's fields bound.
+    fn metric_snapshot(&self, level: &str) -> LogRecord {
+        let values = self
+            .rest
+            .iter()
+            .find(|(name, _)| name == SNAPSHOT_VALUES_FIELD)
+            .map_or("{}", |(_, values)| values.as_str());
+        LogRecord::new(
+            now_ms(),
+            level,
+            METRIC_TARGET,
+            &self.component,
+            &self.operation,
+            &self.message,
+            values,
+        )
+        .into_metric()
     }
 
     /// The remaining fields as a JSON object, always well formed.

@@ -5,9 +5,13 @@ use tokio::sync::mpsc;
 
 use super::{
     PROCESS_SAMPLE_INTERVAL_MIN, ProcessReader, ProcessReading, ProcessSampler, SampleSeries,
-    SystemProcessReader,
+    SystemProcessReader, TickEvidence,
 };
+use crate::RecordKind;
+use crate::flight::{FlightEntry, FlightKind, FlightTable};
 use crate::metrics::{MetricValues, SeriesValue};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// A reading with every value the platforms report.
 fn reading(
@@ -206,7 +210,12 @@ async fn the_sampler_publishes_one_sample_per_tick_until_it_stops() {
     let (sent, mut reads) = mpsc::unbounded_channel();
     let values = Arc::new(MetricValues::default());
     let reader = CountingReader { reads: 0, sent };
-    let sampler = ProcessSampler::spawn(reader, Duration::from_secs(1), Arc::clone(&values));
+    let sampler = ProcessSampler::spawn(
+        reader,
+        Duration::from_secs(1),
+        Arc::clone(&values),
+        TickEvidence::default(),
+    );
 
     for expected in 1..=3 {
         let read = tokio::time::timeout(Duration::from_secs(5), reads.recv())
@@ -235,9 +244,65 @@ async fn an_interval_below_the_minimum_samples_at_the_minimum() {
     let values = Arc::new(MetricValues::default());
     let reader = CountingReader { reads: 0, sent };
     let started = tokio::time::Instant::now();
-    let sampler = ProcessSampler::spawn(reader, Duration::from_millis(1), values);
+    let sampler = ProcessSampler::spawn(
+        reader,
+        Duration::from_millis(1),
+        values,
+        TickEvidence::default(),
+    );
     assert_eq!(reads.recv().await, Some(1), "the first tick reads at once");
     assert_eq!(reads.recv().await, Some(2));
     assert!(started.elapsed() >= PROCESS_SAMPLE_INTERVAL_MIN);
     sampler.stopped().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tick_reports_an_entry_past_the_stall_delay_once_with_a_snapshot() -> TestResult {
+    let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
+    let flights = Arc::new(FlightTable::default());
+    flights.join(
+        1,
+        FlightEntry::opened(
+            "lexical.commit",
+            FlightKind::Operation,
+            Some("search.request"),
+            Duration::ZERO,
+            0,
+        ),
+    );
+    let (sent, mut reads) = mpsc::unbounded_channel();
+    let values = Arc::new(MetricValues::default());
+    let reader = CountingReader { reads: 0, sent };
+    let evidence = TickEvidence {
+        flights: Some(Arc::clone(&flights)),
+        stall_delay: Some(Duration::ZERO),
+    };
+    let sampler = ProcessSampler::spawn(reader, Duration::from_secs(1), values, evidence);
+    for expected in 1..=2 {
+        assert_eq!(reads.recv().await, Some(expected));
+    }
+    sampler.stopped().await;
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let stalled: Vec<_> = records
+        .iter()
+        .filter(|record| record.message() == "operations in flight past the stall delay")
+        .collect();
+    assert_eq!(stalled.len(), 1, "an entry is reported once");
+    assert_eq!(stalled[0].level(), "warn");
+    let fields: serde_json::Value = serde_json::from_str(stalled[0].fields())?;
+    assert_eq!(fields["reason"], "stall_delay");
+    assert!(stalled[0].fields().contains("lexical.commit"));
+    let snapshots: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind() == RecordKind::Metric)
+        .collect();
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "the stall tick forces one snapshot, the idle one none"
+    );
+    assert_eq!(snapshots[0].operation(), "process");
+    Ok(())
 }

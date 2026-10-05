@@ -193,6 +193,28 @@ pub fn parent_span(parent: &Span) -> Span {
 ///   variable that is not `Copy` cannot appear both in a field and in an
 ///   `async move` block; bind the field value to a local first.
 ///
+/// # Operations in flight
+///
+/// Every operation sits in the table of operations in flight from its span's opening to
+/// its close, where [`publish_in_flight`](crate::publish_in_flight) and the stall report
+/// read it. The detailed form takes `open = true` right after `operation` to also record
+/// the opening: one `INFO` event with the target `rift_tracing::flight` and the message
+/// `operation opened`, inside the operation's span, so a test or a reader of the store sees
+/// the operation before it closes:
+///
+/// ```
+/// # async fn commit() -> u8 {
+/// rift_tracing::traced!(
+///     component = "lexical",
+///     operation = "lexical.commit",
+///     open = true,
+///     async { 1 }
+/// )
+/// .await
+/// # }
+/// # let _ = commit();
+/// ```
+///
 /// # Completion metrics
 ///
 /// Every operation records `traces.span.metrics.calls` and
@@ -237,14 +259,23 @@ pub fn parent_span(parent: &Span) -> Span {
 macro_rules! traced {
     ($(parent: $parent:expr,)? $operation:literal, async move $work:block $(,)?) => {
         $crate::__rift_traced_future!(
-            [$($parent)?] [] $operation [] async move $work
+            [$($parent)?] [] $operation [] [] async move $work
         )
     };
     ($(parent: $parent:expr,)? $operation:literal, async $work:block $(,)?) => {
-        $crate::__rift_traced_future!([$($parent)?] [] $operation [] async $work)
+        $crate::__rift_traced_future!([$($parent)?] [] $operation [] [] async $work)
     };
     ($(parent: $parent:expr,)? $operation:literal, $work:expr $(,)?) => {
-        $crate::__rift_traced_block!([$($parent)?] [] $operation [] $work)
+        $crate::__rift_traced_block!([$($parent)?] [] $operation [] [] $work)
+    };
+    (
+        $(parent: $parent:expr,)?
+        component = $component:expr,
+        operation = $operation:literal,
+        open = true,
+        $($rest:tt)+
+    ) => {
+        $crate::__rift_traced_fields!([$($parent)?] [$component] $operation [open] [] $($rest)+)
     };
     (
         $(parent: $parent:expr,)?
@@ -252,7 +283,7 @@ macro_rules! traced {
         operation = $operation:literal,
         $($rest:tt)+
     ) => {
-        $crate::__rift_traced_fields!([$($parent)?] [$component] $operation [] $($rest)+)
+        $crate::__rift_traced_fields!([$($parent)?] [$component] $operation [] [] $($rest)+)
     };
 }
 
@@ -264,35 +295,37 @@ macro_rules! traced {
 #[macro_export]
 macro_rules! __rift_traced_fields {
     (
-        [$($parent:expr)?] [$component:expr] $operation:literal
+        [$($parent:expr)?] [$component:expr] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr,)*] async move $work:block $(,)?
     ) => {
         $crate::__rift_traced_future!(
-            [$($parent)?] [$component] $operation [$($field = $value),*] async move $work
+            [$($parent)?] [$component] $operation [$($open)?] [$($field = $value),*]
+            async move $work
         )
     };
     (
-        [$($parent:expr)?] [$component:expr] $operation:literal
+        [$($parent:expr)?] [$component:expr] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr,)*] async $work:block $(,)?
     ) => {
         $crate::__rift_traced_future!(
-            [$($parent)?] [$component] $operation [$($field = $value),*] async $work
+            [$($parent)?] [$component] $operation [$($open)?] [$($field = $value),*] async $work
         )
     };
     (
-        [$($parent:expr)?] [$component:expr] $operation:literal
+        [$($parent:expr)?] [$component:expr] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr,)*] $work:block $(,)?
     ) => {
         $crate::__rift_traced_block!(
-            [$($parent)?] [$component] $operation [$($field = $value),*] $work
+            [$($parent)?] [$component] $operation [$($open)?] [$($field = $value),*] $work
         )
     };
     (
-        [$($parent:expr)?] [$component:expr] $operation:literal
+        [$($parent:expr)?] [$component:expr] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr,)*] $next:ident = $next_value:expr, $($rest:tt)+
     ) => {
         $crate::__rift_traced_fields!(
-            [$($parent)?] [$component] $operation [$($field = $value,)* $next = $next_value,]
+            [$($parent)?] [$component] $operation [$($open)?]
+            [$($field = $value,)* $next = $next_value,]
             $($rest)+
         )
     };
@@ -303,7 +336,7 @@ macro_rules! __rift_traced_fields {
 #[macro_export]
 macro_rules! __rift_traced_block {
     (
-        [$($parent:expr)?] [$($component:expr)?] $operation:literal
+        [$($parent:expr)?] [$($component:expr)?] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
         let __rift_completion = $crate::__private::completion($operation);
@@ -316,8 +349,18 @@ macro_rules! __rift_traced_block {
             $($field = $value),*
         )
         .entered();
+        $($crate::__rift_traced_opened!($open);)?
         $work
     }};
+}
+
+/// The record an operation declared with `open = true` emits inside its span as it opens.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rift_traced_opened {
+    (open) => {
+        $crate::__private::tracing::info!(target: "rift_tracing::flight", "operation opened")
+    };
 }
 
 /// The future form of [`traced!`]: keep the parent now, open the span on first poll.
@@ -325,14 +368,16 @@ macro_rules! __rift_traced_block {
 #[macro_export]
 macro_rules! __rift_traced_future {
     (
-        [$($parent:expr)?] [$($component:expr)?] $operation:literal
+        [$($parent:expr)?] [$($component:expr)?] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
         $(let __rift_parent = $crate::__private::parent_span($parent);)?
         $crate::__private::traced_future($operation, $work, move || {
-            $crate::__rift_traced_span!(
+            let __rift_span = $crate::__rift_traced_span!(
                 [$(__rift_parent $parent)?] [$($component)?] $operation [$($field = $value),*]
-            )
+            );
+            $(__rift_span.in_scope(|| $crate::__rift_traced_opened!($open));)?
+            __rift_span
         })
     }};
 }

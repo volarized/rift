@@ -12,12 +12,12 @@ use rift_error::RiftError;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, Row, params_from_iter};
 
-use crate::record::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord};
+use crate::record::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, RecordKind, StoredLogRecord};
 use crate::store::{METRICS_BUSY_TIMEOUT, METRICS_SCHEMA_VERSION, store_failure};
 
 /// The columns one page selects, in the order [`stored_record`] reads them.
-const SELECT_RECORDS: &str = "SELECT id, recorded_at, level, target, component, operation, \
-                              message, fields FROM log_records";
+const SELECT_RECORDS: &str = "SELECT id, kind, recorded_at, level, target, component, \
+                              operation, message, fields FROM log_records";
 
 /// Opens read connections to one metrics database file.
 #[derive(Clone, Debug)]
@@ -164,8 +164,12 @@ impl LogReads {
         if !self.holds_records {
             return Ok(Vec::new());
         }
-        let mut conditions: Vec<&str> = Vec::with_capacity(4);
-        let mut values: Vec<Value> = Vec::with_capacity(5);
+        let mut conditions: Vec<&str> = Vec::with_capacity(6);
+        let mut values: Vec<Value> = Vec::with_capacity(7);
+        if let Some(kind) = query.kind {
+            conditions.push("kind = ?");
+            values.push(Value::Text(kind.label().to_owned()));
+        }
         if let Some(level) = &query.level {
             conditions.push("level = ?");
             values.push(Value::Text(level.clone()));
@@ -181,6 +185,10 @@ impl LogReads {
         if let Some(since_ms) = query.since_ms {
             conditions.push("recorded_at >= ?");
             values.push(Value::Integer(since_ms));
+        }
+        if let Some(until_ms) = query.until_ms {
+            conditions.push("recorded_at < ?");
+            values.push(Value::Integer(until_ms));
         }
         let limit = query.limit.min(LOG_PAGE_RECORDS_MAX);
         values.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
@@ -204,13 +212,14 @@ fn stored_record(row: &Row<'_>) -> rusqlite::Result<StoredLogRecord> {
     Ok(StoredLogRecord {
         identity: row.get(0)?,
         record: LogRecord {
-            recorded_at_ms: row.get(1)?,
-            level: row.get(2)?,
-            target: row.get(3)?,
-            component: row.get(4)?,
-            operation: row.get(5)?,
-            message: row.get(6)?,
-            fields: row.get(7)?,
+            kind: RecordKind::from_label(&row.get::<_, String>(1)?),
+            recorded_at_ms: row.get(2)?,
+            level: row.get(3)?,
+            target: row.get(4)?,
+            component: row.get(5)?,
+            operation: row.get(6)?,
+            message: row.get(7)?,
+            fields: row.get(8)?,
         },
     })
 }
