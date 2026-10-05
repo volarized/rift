@@ -17,7 +17,15 @@ struct Node<'a> {
     children: BTreeMap<&'a str, Node<'a>>,
 }
 
-pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> {
+/// One registry rendered as a parent module and one file per top-level namespace.
+pub(crate) struct Module {
+    /// Constants plus one `pub mod <namespace>;` line per namespace.
+    pub parent: String,
+    /// File content keyed by namespace, the first path segment after the registry namespace.
+    pub namespaces: BTreeMap<String, String>,
+}
+
+fn tree(registry: &ir::Registry) -> Node<'_> {
     let mut root = Node::default();
     for error in &registry.errors {
         let mut node = &mut root;
@@ -26,9 +34,10 @@ pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> 
         }
         node.error = Some(error);
     }
+    root
+}
 
-    let mut output = String::new();
-    output.push_str("use rift_error::__rift_error_definition;\n\n");
+fn render_constants(output: &mut String, registry: &ir::Registry) {
     output.push_str("#[doc(hidden)]\n");
     let _ = writeln!(
         output,
@@ -40,10 +49,47 @@ pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> 
         let _ = writeln!(output, "{INDENT}{},", literal(&error.slug));
     }
     output.push_str("];\n");
-    render_children(&mut output, &root, &registry.namespace, 0);
+}
 
+fn parsed(output: String) -> Result<String, CodegenError> {
     syn::parse_file(&output).map_err(|error| CodegenError::Rust(error.to_string()))?;
     Ok(output)
+}
+
+pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> {
+    let root = tree(registry);
+    let mut output = String::new();
+    output.push_str("use rift_error::__rift_error_definition;\n\n");
+    render_constants(&mut output, registry);
+    render_children(&mut output, &root, &registry.namespace, 0);
+    parsed(output)
+}
+
+pub(crate) fn generate_module(registry: &ir::Registry) -> Result<Module, CodegenError> {
+    let root = tree(registry);
+    let mut parent = String::new();
+    if root.children.values().any(|child| child.error.is_some()) {
+        parent.push_str("use rift_error::__rift_error_definition;\n\n");
+    }
+    render_constants(&mut parent, registry);
+    let mut namespaces = BTreeMap::new();
+    for (name, child) in &root.children {
+        parent.push('\n');
+        if let Some(error) = child.error {
+            render_error(&mut parent, error, "");
+            continue;
+        }
+        let namespace = format!("{}.{name}", registry.namespace);
+        let _ = writeln!(parent, "/// Registered errors under `{namespace}`.");
+        let _ = writeln!(parent, "pub mod {name};");
+        let mut file = String::from("use rift_error::__rift_error_definition;\n");
+        render_children(&mut file, child, &namespace, 0);
+        namespaces.insert((*name).to_owned(), parsed(file)?);
+    }
+    Ok(Module {
+        parent: parsed(parent)?,
+        namespaces,
+    })
 }
 
 fn render_children(output: &mut String, node: &Node<'_>, namespace: &str, depth: usize) {

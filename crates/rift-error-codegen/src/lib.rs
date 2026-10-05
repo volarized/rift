@@ -90,7 +90,12 @@ mod schema;
 mod validate;
 
 pub use crate::validate::CodegenError;
-use crate::{generate::generate, validate::validate};
+use std::collections::BTreeMap;
+
+use crate::{
+    generate::{generate, generate_module as render_module},
+    validate::validate,
+};
 
 /// Parses, validates, and formats one registry as Rust source.
 pub fn generate_source(source: &str) -> Result<String, CodegenError> {
@@ -99,9 +104,34 @@ pub fn generate_source(source: &str) -> Result<String, CodegenError> {
     generate(&registry)
 }
 
+/// One registry as a parent module file and one file per namespace.
+///
+/// A namespace is the first path segment after the registry namespace, such as
+/// `analysis` in `rift.analysis.context7_malformed`. The parent declares each
+/// namespace with `pub mod <namespace>;`, so the registry lays out as `<module>.rs`
+/// beside `<module>/<namespace>.rs`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedModule {
+    /// Registry constants and the `pub mod` declarations, in namespace order.
+    pub parent: String,
+    /// File content keyed by namespace, sorted by namespace.
+    pub namespaces: BTreeMap<String, String>,
+}
+
+/// Parses, validates, and formats one registry as a parent module and one file per namespace.
+pub fn generate_module(source: &str) -> Result<GeneratedModule, CodegenError> {
+    let registry = schema::parse(source)?;
+    let registry = validate(registry)?;
+    let module = render_module(&registry)?;
+    Ok(GeneratedModule {
+        parent: module.parent,
+        namespaces: module.namespaces,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::generate_source;
+    use super::{generate_module, generate_source};
 
     #[test]
     fn emits_compact_semantic_declarations() {
@@ -163,13 +193,116 @@ pub mod auth {
     }
 
     #[test]
-    fn committed_registry_stays_within_generated_line_bound() {
-        let generated = generate_source(include_str!("../../rift-error/errors.toml"))
+    fn committed_registry_files_stay_within_generated_line_bound() {
+        let module = generate_module(include_str!("../../rift-error/errors.toml"))
             .expect("generate committed registry");
+        for (name, file) in &module.namespaces {
+            assert!(
+                file.lines().count() <= 1_000,
+                "generated namespace file {name} exceeds 1,000 lines"
+            );
+        }
         assert!(
-            generated.lines().count() <= 4_500,
-            "generated source exceeds 4,500 lines"
+            module.parent.lines().count() <= 1_000,
+            "generated parent module exceeds 1,000 lines"
         );
+    }
+
+    #[test]
+    fn module_emits_one_file_per_namespace_in_sorted_order() {
+        let source = r#"
+[registry]
+namespace = "rift"
+schema = 1
+
+[error.zeta.late]
+message = "late"
+action = "retry"
+
+[error.alpha.second]
+message = "second"
+action = "retry"
+
+[error.alpha.first]
+message = "first"
+action = "retry"
+"#;
+        let module = generate_module(source).expect("generate module");
+        assert_eq!(
+            module
+                .namespaces
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        let expected_parent = r#"#[doc(hidden)]
+pub const REGISTRY_NAMESPACE: &str = "rift";
+#[doc(hidden)]
+pub const REGISTERED_SLUGS: &[&str] = &[
+    "rift.alpha.first",
+    "rift.alpha.second",
+    "rift.zeta.late",
+];
+
+/// Registered errors under `rift.alpha`.
+pub mod alpha;
+
+/// Registered errors under `rift.zeta`.
+pub mod zeta;
+"#;
+        assert_eq!(module.parent, expected_parent);
+        let expected_alpha = r#"use rift_error::__rift_error_definition;
+
+__rift_error_definition!(
+    first,
+    slug = "rift.alpha.first",
+    message = "first",
+    action = "retry",
+    fields = {},
+);
+
+__rift_error_definition!(
+    second,
+    slug = "rift.alpha.second",
+    message = "second",
+    action = "retry",
+    fields = {},
+);
+"#;
+        assert_eq!(module.namespaces["alpha"], expected_alpha);
+        assert_eq!(module, generate_module(source).expect("generate again"));
+    }
+
+    #[test]
+    fn module_files_are_rustfmt_stable() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let module = generate_module(include_str!("../../rift-error/errors.toml"))
+            .expect("generate committed registry");
+        for (name, file) in module
+            .namespaces
+            .iter()
+            .map(|(name, file)| (name.as_str(), file))
+            .chain([("parent", &module.parent)])
+        {
+            let mut rustfmt = Command::new("rustfmt")
+                .args(["--edition", "2024", "--emit", "stdout"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("run rustfmt");
+            rustfmt
+                .stdin
+                .take()
+                .expect("rustfmt stdin")
+                .write_all(file.as_bytes())
+                .expect("write generated source to rustfmt");
+            let output = rustfmt.wait_with_output().expect("wait for rustfmt");
+            assert!(output.status.success(), "rustfmt rejected {name}");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), *file, "{name}");
+        }
     }
 
     #[test]

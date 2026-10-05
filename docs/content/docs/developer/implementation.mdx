@@ -761,10 +761,12 @@ store that published it, and deciding which identities win does not.
 ## Error registry
 
 `crates/rift-error/errors.toml` defines concrete Rift failures and evidence fields. `rift-error-codegen` validates those
-definitions and writes `crates/rift-error/src/generated.rs`: one `__rift_error_definition!` declaration per error,
-carrying only its name, slug, message, action, and fields. Builder types, bounds, conversions, typestate, and setter
-names are derived by the macros, not written into the file. The `committed_registry_stays_within_generated_line_bound`
-test in `rift-error-codegen` holds the generated file under a fixed line bound.
+definitions and writes the `errors` module of `rift-error`: `crates/rift-error/src/errors.rs` holds the registry
+constants and one `pub mod` line per namespace, and `crates/rift-error/src/errors/<namespace>.rs` holds one
+`__rift_error_definition!` declaration per error in that namespace, carrying only its name, slug, message, action, and
+fields. A namespace is the slug segment after `rift.`, such as `analysis` or `cli`. Builder types, bounds, conversions, typestate, and setter
+names are derived by the macros, not written into the file. The `committed_registry_files_stay_within_generated_line_bound`
+test in `rift-error-codegen` holds each generated file under a fixed line bound.
 
 ```rust
 __rift_error_definition!(
@@ -801,8 +803,9 @@ The registry does not contain transport codes. The MCP adapter maps each slug to
 retry directive, then supplies the request phase with `.tool_error(phase)`. Calling `.fail()` on
 that representation returns its JSON-RPC error. `cargo xtask errors generate` updates generated
 Rust. The generator writes the declarations as text in the layout above, which `rustfmt` leaves
-unchanged, and parses the result before returning it. `cargo xtask errors check` compares generated output without writing it; CI
-runs that check through `just generate-check`.
+unchanged, and parses the result before returning it. `cargo xtask errors generate` also removes any file under `crates/rift-error/src/errors/` that the registry no longer
+generates. `cargo xtask errors check` compares generated output without writing it and fails on a differing, missing,
+or unexpected file; CI runs that check through `just generate-check`.
 
 ## Vector search
 
