@@ -13,17 +13,20 @@ use std::task::{Context, Poll};
 use tracing::instrument::{Instrument as _, Instrumented};
 
 use crate::Span;
+use crate::metrics::{Completion, future_completion};
 
 pin_project_lite::pin_project! {
     /// Where an awaited operation is: not yet polled, running under its span, or done.
     ///
-    /// `Spent` holds nothing: the operation completed, or its span constructor
-    /// panicked while the work moved into its span.
+    /// `Running` holds the operation's completion guard beside its work, so dropping
+    /// the future before the work returns records a cancelled operation. `Spent` holds
+    /// nothing: the operation completed, or its span constructor panicked while the work
+    /// moved into its span.
     #[project = StageProjection]
     #[project_replace = StageReplacement]
     enum Stage<Work, Open> {
-        Waiting { work: Work, open: Open },
-        Running { #[pin] work: Instrumented<Work> },
+        Waiting { operation: &'static str, work: Work, open: Open },
+        Running { #[pin] work: Instrumented<Work>, completion: Completion },
         Spent,
     }
 }
@@ -52,31 +55,46 @@ where
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let mut stage = self.project().stage;
         if let StageProjection::Waiting { .. } = stage.as_mut().project()
-            && let StageReplacement::Waiting { work, open } =
-                stage.as_mut().project_replace(Stage::Spent)
+            && let StageReplacement::Waiting {
+                operation,
+                work,
+                open,
+            } = stage.as_mut().project_replace(Stage::Spent)
         {
+            let completion = future_completion(operation);
             stage.set(Stage::Running {
                 work: work.instrument(open()),
+                completion,
             });
         }
-        let StageProjection::Running { work } = stage.as_mut().project() else {
+        let StageProjection::Running { work, completion } = stage.as_mut().project() else {
             panic!("a traced future was polled after it completed or its span constructor panicked")
         };
         let output = std::task::ready!(work.poll(context));
+        completion.finished();
         stage.set(Stage::Spent);
         Poll::Ready(output)
     }
 }
 
-/// Wraps `work` so the span `open` builds starts on the first poll.
+/// Wraps `work` so the span `open` builds, and the completion of `operation`, start on
+/// the first poll.
 #[doc(hidden)]
-pub fn traced_future<Work, Open>(work: Work, open: Open) -> impl Future<Output = Work::Output>
+pub fn traced_future<Work, Open>(
+    operation: &'static str,
+    work: Work,
+    open: Open,
+) -> impl Future<Output = Work::Output>
 where
     Work: Future,
     Open: FnOnce() -> tracing::Span,
 {
     TracedFuture {
-        stage: Stage::Waiting { work, open },
+        stage: Stage::Waiting {
+            operation,
+            work,
+            open,
+        },
     }
 }
 
@@ -174,6 +192,17 @@ pub fn parent_span(parent: &Span) -> Span {
 ///   `Copy`, and the value recorded is the one it has at the first poll. A
 ///   variable that is not `Copy` cannot appear both in a field and in an
 ///   `async move` block; bind the field value to a local first.
+///
+/// # Completion metrics
+///
+/// Every operation records `traces.span.metrics.calls` and
+/// `traces.span.metrics.duration`, in seconds, labeled with the operation literal as
+/// `span.name` and its outcome as `status.code`: `Ok` when the work finished, by any path
+/// out of a block or by returning from a future, and `Error` with `error.type` `panic` or
+/// `cancelled` when it panicked or an awaited future was dropped before it returned. The
+/// recording follows the operation, not its span: a clone of the span held elsewhere
+/// does not lengthen the duration, and the span's filters do not select it. A thread
+/// whose dispatcher holds no metric values records nothing and reads no clock for it.
 ///
 /// A computed operation name is refused at compile time:
 ///
@@ -277,6 +306,7 @@ macro_rules! __rift_traced_block {
         [$($parent:expr)?] [$($component:expr)?] $operation:literal
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
+        let __rift_completion = $crate::__private::completion($operation);
         let __rift_entered = $crate::__private::tracing::span!(
             $(parent: $parent,)?
             $crate::__private::tracing::Level::INFO,
@@ -299,7 +329,7 @@ macro_rules! __rift_traced_future {
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
         $(let __rift_parent = $crate::__private::parent_span($parent);)?
-        $crate::__private::traced_future($work, move || {
+        $crate::__private::traced_future($operation, $work, move || {
             $crate::__rift_traced_span!(
                 [$(__rift_parent $parent)?] [$($component)?] $operation [$($field = $value),*]
             )

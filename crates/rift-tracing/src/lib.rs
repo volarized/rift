@@ -25,6 +25,12 @@
 //! [`TracingRuntime::shutdown`]. [`LogRecord::rendered`] prints a record the way
 //! `rift server logs` shows it.
 //!
+//! Code records values into typed instruments: [`metrics`] returns the ones Rift declares,
+//! and [`Counter`], [`Gauge`], and [`Histogram`] declare more. Every [`traced!`] operation
+//! records its duration and outcome, and the runtime's process sampler publishes the
+//! process's memory, CPU, open files, and disk bytes. [`TracingRuntime::metrics`] reads
+//! every value in process, in every build.
+//!
 //! A test captures what the code under test records through a `ScopedRecorder`, which the
 //! `fixtures` feature compiles in; dependent crates enable it from their
 //! dev-dependencies only, so a release build carries no recorder.
@@ -32,6 +38,7 @@
 mod capture;
 mod drain;
 mod measurement;
+mod metrics;
 mod otlp;
 mod reads;
 mod record;
@@ -39,6 +46,7 @@ mod record;
 mod recorder;
 mod render;
 mod runtime;
+mod sampler;
 mod span;
 mod stderr;
 mod store;
@@ -49,6 +57,12 @@ pub use capture::{
 };
 pub use drain::{LOG_SETTLE_TIMEOUT, LogDrain, LogLane, RunningLogDrain, settle_for_read};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
+pub use metrics::{
+    Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue,
+    HISTOGRAM_BOUNDARIES_MAX, Histogram, HistogramSelection, Instrument, InstrumentKind,
+    METRIC_LABELS_MAX, METRIC_SERIES_MAX_DEFAULT, MetricSeries, MetricSnapshot, Metrics,
+    ProcessGauge, SeriesValue, metrics,
+};
 pub use reads::{LogReader, LogReads};
 pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
@@ -62,6 +76,7 @@ pub use recorder::{
 pub use runtime::{
     LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder, validate_log_filter,
 };
+pub use sampler::PROCESS_SAMPLE_INTERVAL_MIN;
 pub use span::Span;
 pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, WalCheckpoint};
@@ -71,6 +86,7 @@ pub use tracing::{debug, error, info, trace, warn};
 #[doc(hidden)]
 pub mod __private {
     pub use crate::measurement::monotonic_now;
+    pub use crate::metrics::{Completion, completion};
     pub use crate::span::span_from;
     pub use crate::traced::{parent_span, traced_future};
     pub use tracing;
