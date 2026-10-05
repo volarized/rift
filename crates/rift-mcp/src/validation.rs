@@ -7100,7 +7100,7 @@ pub(crate) mod tests {
         let (context, _invalidations) = initial_preparation_context(root)?;
         let partial = Arc::clone(&context.published.blocking_read().current);
         let complete = stable_candidate(root, 0)?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
         let publish = |candidate| {
@@ -7144,7 +7144,7 @@ pub(crate) mod tests {
         let (context, _invalidations) = initial_preparation_context(root)?;
         let complete = stable_candidate(root, 0)?;
         context.validation.observe_whole_workspace()?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -7188,7 +7188,7 @@ pub(crate) mod tests {
                 cancellation.cancel();
             }
             let batch = complete_initial_batch(&context, initial);
-            let (sink, mut drain) = crate::logs::log_capture();
+            let (sink, mut drain) = rift_tracing::log_capture();
             let subscriber = tracing_subscriber::registry().with(sink);
             let outcome = tokio::task::spawn_blocking(move || {
                 tracing::subscriber::with_default(subscriber, || {
@@ -7708,7 +7708,7 @@ pub(crate) mod tests {
     async fn a_refused_trigram_batch_is_recorded_and_the_next_write_owes_another() -> TestResult {
         let directory = tempfile::tempdir()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
         let double = StoreDouble::new();
@@ -7955,7 +7955,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -8003,7 +8003,7 @@ pub(crate) mod tests {
     }
 
     /// Drains what the queue currently holds, without a store.
-    fn queued_records(drain: &mut crate::logs::LogDrain) -> Vec<rift_tracing::LogRecord> {
+    fn queued_records(drain: &mut rift_tracing::LogDrain) -> Vec<rift_tracing::LogRecord> {
         let mut records = Vec::new();
         while let Ok(record) = drain.try_recv_record() {
             records.push(record);
@@ -8472,7 +8472,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -8556,7 +8556,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -9017,7 +9017,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -9611,7 +9611,7 @@ pub(crate) mod tests {
             !before.is_empty(),
             "the lexical lane must publish the declaration"
         );
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
         super::populate_search(&index, &published, rift_search::Embedding::Every).await;
@@ -10289,7 +10289,7 @@ pub(crate) mod tests {
         backlog.owe_whole("the store refused".to_owned());
         backlog.end_running();
         let owed = backlog.report_of(&first);
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         tracing::subscriber::with_default(subscriber, || {
             for report in [

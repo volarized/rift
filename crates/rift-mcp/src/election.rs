@@ -1438,7 +1438,7 @@ mod tests {
     fn a_lost_election_is_recorded_at_info() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         tracing::subscriber::with_default(subscriber, || {
             super::record_start_failure(&errors::mcp::election_already_serving().error());
@@ -1734,7 +1734,7 @@ mod tests {
         let guard = claim(directory.path())?;
         let mut document = valid_document();
         document.port = dead_port()?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let mut presences = Vec::new();
         tracing::subscriber::with_default(subscriber, || -> TestResult {

@@ -197,7 +197,7 @@ impl LogQuery {
 
 /// `value` truncated to at most `maximum` UTF-8 bytes, cut at a character
 /// boundary.
-fn bounded(value: &str, maximum: usize) -> String {
+pub(crate) fn bounded(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         return value.to_owned();
     }

@@ -21,14 +21,15 @@ use jiff::tz::TimeZone;
 
 use rift_error::{ErrorContext, RiftError, errors};
 use rift_mcp::{
-    LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence,
+    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence,
     SpawnPollOutcome, SpawnedServer, StaleReason, StartSpawns, StartedServer, StopRequestFailure,
-    TokenCheck, WorkspaceStorage, install_panic_hook, probe, read_serving,
-    serve_elected_with_storage, spawn_detached_server,
+    TokenCheck, WorkspaceStorage, probe, read_serving, serve_elected_with_storage,
+    spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use rift_tracing::{
-    LOG_PAGE_RECORDS_MAX, LogQuery, LogReader, LogReads, LogRecord, StoredLogRecord,
+    LOG_PAGE_RECORDS_MAX, LogDrain, LogQuery, LogReader, LogReads, LogRecord, RunningLogDrain,
+    StoredLogRecord, install_panic_hook,
 };
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -66,6 +67,10 @@ const _: () = assert!(
     SERVER_DATABASE_STOP_RESERVE.as_millis() + SERVER_LOG_FLUSH_RESERVE.as_millis()
         < SERVER_STOP_DEADLINE.as_millis()
 );
+// The final log drain, aborted by the stop's deadline at the latest, leaves a five-second
+// stop request time to observe the process exit.
+const _: () =
+    assert!(SERVER_STOP_DEADLINE.as_millis() < rift_mcp::STOP_REQUEST_TIMEOUT.as_millis());
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The form `--tail` accepts, named in every refusal.
@@ -1047,71 +1052,23 @@ fn foreground_selection(
     Ok(Some(selected))
 }
 
-/// A log drain task the stop joins, with its own stop token and its lane.
+/// Stops the diagnostics drain and joins it by `deadline`, as the `log drain` stop stage;
+/// answers the records left unwritten when the drain had to be aborted.
 ///
-/// The drain stops on its own token rather than the serving one, so records the stop
-/// stages emit after serving ended still reach the queue it drains.
-#[derive(Debug)]
-struct RunningLogDrain {
-    task: tokio::task::JoinHandle<()>,
-    lane: rift_mcp::LogLane,
-    stop: CancellationToken,
-}
-
-impl RunningLogDrain {
-    /// Starts `drain` writing into `store`.
-    fn spawn(
-        drain: LogDrain,
-        store: std::sync::Arc<rift_tracing::LogStore>,
-        retention_records: u64,
-    ) -> Self {
-        let lane = drain.lane();
-        let stop = CancellationToken::new();
-        let task = tokio::spawn(drain.run(store, retention_records, stop.clone()));
-        Self { task, lane, stop }
-    }
-}
-
-/// Stops the diagnostics drain and joins it by `deadline`; answers the records left
-/// unwritten when the drain had to be aborted.
-///
-/// The drain closes its queue, then flushes what it holds within what the stages before
-/// it left of `deadline`. When the metrics database refuses the flush past that, the
-/// drain is aborted, and the "log drain outlasted the stop deadline" warning carries
-/// `unwritten`: the records the lane accepted and never wrote. The join runs as the
-/// `log drain` stop stage, so it records its elapsed time beside the other stages.
+/// [`RunningLogDrain::stop`] flushes what the drain holds within what the stages before
+/// it left of `deadline`, and aborts a drain the metrics database holds past it. The stage
+/// records its elapsed time beside the other stages.
 async fn stop_log_drain(
     drain: Option<RunningLogDrain>,
     deadline: tokio::time::Instant,
 ) -> Option<u64> {
-    let RunningLogDrain {
-        mut task,
-        lane,
-        stop,
-    } = drain?;
-    stop.cancel();
-    let joined = rift_mcp::stop_stage("log drain", deadline, async {
-        Ok(match tokio::time::timeout_at(deadline, &mut task).await {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => {
-                tracing::warn!(component = "logs", %error, "log drain task failed");
-                None
-            }
-            Err(_) => {
-                task.abort();
-                let _ = task.await;
-                let unwritten = lane.unwritten();
-                tracing::warn!(
-                    component = "logs",
-                    unwritten,
-                    "log drain outlasted the stop deadline"
-                );
-                Some(unwritten)
-            }
-        })
+    let drain = drain?;
+    rift_mcp::stop_stage("log drain", deadline, async {
+        Ok(drain.stop(deadline).await)
     })
-    .await;
-    joined.ok().flatten()
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Cancels `shutdown` when the process receives an interrupt.
@@ -1593,7 +1550,6 @@ mod tests {
     use std::future::IntoFuture as _;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
@@ -1802,87 +1758,37 @@ mod tests {
         assert_eq!(AuthMode::default(), AuthMode::Token);
     }
 
-    /// A running drain over `task`, on a lane of its own.
-    fn running_drain(task: tokio::task::JoinHandle<()>) -> RunningLogDrain {
-        RunningLogDrain {
-            task,
-            lane: rift_mcp::log_capture().1.lane(),
-            stop: tokio_util::sync::CancellationToken::new(),
-        }
-    }
-
+    /// The `log drain` stop stage flushes what the drain holds into the metrics database
+    /// and leaves nothing unwritten when it joins by its deadline.
     #[tokio::test]
-    async fn a_failed_log_drain_is_joined() {
-        let drain = tokio::spawn(async { panic!("injected log drain failure") });
+    async fn a_joined_log_drain_leaves_its_records_written() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = Arc::new(
+            rift_tracing::LogStore::open(&directory.path().join("metrics"), None)
+                .await
+                .expect("the metrics database opens"),
+        );
+        let (sink, drain) = rift_tracing::log_capture();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
+            tracing::info!(component = "test", "written by the final flush");
+        });
+        let running = RunningLogDrain::spawn(drain, Arc::clone(&store), 100);
 
         let unwritten = stop_log_drain(
-            Some(running_drain(drain)),
+            Some(running),
             tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
         )
         .await;
 
         assert_eq!(unwritten, None, "a joined drain leaves nothing to count");
-    }
-
-    /// A drain aborted at its bound reports every record the lane accepted and never
-    /// wrote.
-    #[tokio::test(start_paused = true)]
-    async fn an_aborted_log_drain_counts_the_records_it_never_wrote() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        const ACCEPTED: u64 = 3;
-        let (sink, drain) = rift_mcp::log_capture();
-        let lane = drain.lane();
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
-            for record in 0..ACCEPTED {
-                tracing::info!(component = "test", record, "accepted and never written");
-            }
-        });
-        // The task holds the drain's queue open and never writes it, as a drain does whose
-        // store refuses every batch.
-        let task = tokio::spawn(async move {
-            let _held = drain;
-            std::future::pending::<()>().await;
-        });
-        let running = RunningLogDrain {
-            task,
-            lane,
-            stop: tokio_util::sync::CancellationToken::new(),
-        };
-
-        let started = tokio::time::Instant::now();
-        let unwritten = stop_log_drain(Some(running), started + SERVER_STOP_DEADLINE).await;
-
-        assert_eq!(unwritten, Some(ACCEPTED));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_log_drain_is_aborted_at_its_deadline() {
-        struct Stopped(Arc<AtomicBool>);
-        impl Drop for Stopped {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
-        let stopped = Arc::new(AtomicBool::new(false));
-        let task_stopped = Arc::clone(&stopped);
-        let drain = tokio::spawn(async move {
-            let _stopped = Stopped(task_stopped);
-            std::future::pending::<()>().await;
-        });
-        tokio::task::yield_now().await;
-
-        let started = tokio::time::Instant::now();
-        let unwritten =
-            stop_log_drain(Some(running_drain(drain)), started + SERVER_STOP_DEADLINE).await;
-
-        assert_eq!(unwritten, Some(0), "an empty lane leaves nothing unwritten");
-        assert!(stopped.load(Ordering::Acquire));
-        assert!(
-            started.elapsed() < rift_mcp::STOP_REQUEST_TIMEOUT,
-            "the final log drain must leave time for a five-second stop to observe process exit"
-        );
+        let stored = store
+            .reader()
+            .connect()
+            .and_then(|reads| reads.count())
+            .expect("the count reads");
+        assert_eq!(stored, 1, "the final flush wrote the record");
     }
 
     #[test]

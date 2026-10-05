@@ -993,7 +993,7 @@ mod tests {
             }),
             spawn_count: START_SPAWN_COUNT_MAX,
         };
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let outcome =
             tracing::subscriber::with_default(subscriber, || spawns.poll::<u32>(None, false));

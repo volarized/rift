@@ -32,7 +32,7 @@ const LOGS_URI: &str = "rift://logs";
 /// Longest one case waits for a log read to answer with records, the reads included.
 ///
 /// The drain writes every 250 milliseconds, and a read waits at most
-/// [`rift_mcp::LOG_SETTLE_TIMEOUT`] for it, so this covers several of those waits.
+/// [`rift_tracing::LOG_SETTLE_TIMEOUT`] for it, so this covers several of those waits.
 /// With [`harness::WINDOW_READ_MAX`] and the proxy's [`rift_mcp::START_WAIT_MAX`] before
 /// it, the case stays inside nextest's one-minute deadline, so a server that records
 /// nothing, or stops answering, fails with its failure window instead of being ended

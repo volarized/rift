@@ -15,7 +15,13 @@
 //! [`error!`], and measure elapsed time they act on with [`measure_elapsed!`]. The event macros keep the caller's
 //! module path as the event target, so a filter such as `rift_mcp=debug`
 //! selects the same callers.
+//!
+//! A serving process records what its filter admits: [`log_capture`] builds the
+//! [`LogSink`] layer and its [`LogDrain`], and [`RunningLogDrain`] writes the queue into
+//! the metrics database until a stop joins it.
 
+mod capture;
+mod drain;
 mod measurement;
 mod reads;
 mod record;
@@ -23,6 +29,10 @@ mod span;
 mod store;
 mod traced;
 
+pub use capture::{
+    LOG_QUEUE_RECORDS, LogSink, PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture,
+};
+pub use drain::{LOG_SETTLE_TIMEOUT, LogDrain, LogLane, RunningLogDrain, settle_for_read};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use reads::{LogReader, LogReads};
 pub use record::{

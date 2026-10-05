@@ -2215,7 +2215,7 @@ mod tests {
 
     #[test]
     fn service_state_transition_is_logged_once_and_redacted() {
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let observation = Arc::new(Mutex::new(None::<ServiceState>));
         let route = GlobalRoute::unanswered(
