@@ -1,3 +1,4 @@
+use rift_error::{ErrorSlug, RiftError, errors};
 use rift_protocol::error::{
     ErrorCause, ErrorCode, ErrorData as WireErrorData, ErrorPhase, LimitEvidence, RetryDirective,
 };
@@ -7,7 +8,7 @@ use rmcp::model::{CallToolResponse, ErrorCode as RpcCode};
 use serde_json::json;
 
 use super::ToolFailure;
-use crate::failure::RIFT_ERROR_CODE;
+use crate::failure::{McpFailure, RIFT_ERROR_CODE, WireFailure as _};
 
 fn limit_failure() -> WireErrorData {
     WireErrorData {
@@ -85,5 +86,26 @@ fn a_rift_code_with_data_that_does_not_decode_stays_the_json_rpc_error() {
             panic!("undecodable data must stay an error");
         };
         assert_eq!(passed, error);
+    }
+}
+
+#[test]
+fn every_registered_error_served_by_a_tool_path_completes_as_an_execution_failure() {
+    assert!(
+        !errors::REGISTERED_SLUGS.is_empty(),
+        "the registry lists errors"
+    );
+    for slug in errors::REGISTERED_SLUGS {
+        let error = RiftError::new(ErrorSlug::new(slug), "message", "action", Vec::new());
+        let tool_error = McpFailure::new(error).tool_error(ErrorPhase::Read);
+        assert_eq!(tool_error.code, RIFT_ERROR_CODE, "{slug}");
+        let Ok(CallToolResponse::Complete(result)) =
+            ToolFailure::from(tool_error).into_call_tool_result()
+        else {
+            panic!("{slug} stays a protocol error");
+        };
+        assert_eq!(result.is_error, Some(true), "{slug}");
+        assert_eq!(result.structured_content, None, "{slug}");
+        assert_eq!(result.content.len(), 1, "{slug}");
     }
 }
