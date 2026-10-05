@@ -122,6 +122,36 @@ enum WorkerAdmission {
     TimedOut,
 }
 
+/// `worker_pool.permit.count`: the blocking pool's worker permits, by
+/// `worker_pool.permit.state` = `available` or `used`, read on the sampler tick.
+const WORKER_PERMIT_COUNT: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+    "worker_pool.permit.count",
+    "{permit}",
+    &["worker_pool.permit.state"],
+);
+
+/// A sampler hook that records [`WORKER_PERMIT_COUNT`] of `operations`, a semaphore of
+/// `permits` permits, while the executor that holds it lives; the hook holds the
+/// semaphore weakly.
+fn permit_sampling(
+    operations: &Arc<Semaphore>,
+    permits: usize,
+) -> Option<Arc<rift_tracing::SampleHook>> {
+    let operations = Arc::downgrade(operations);
+    rift_tracing::sample_hook(move || {
+        if let Some(operations) = operations.upgrade() {
+            let available = operations.available_permits();
+            let used = permits.saturating_sub(available);
+            for (state, count) in [("available", available), ("used", used)] {
+                WORKER_PERMIT_COUNT
+                    .labeled_value([state], u64::try_from(count).unwrap_or(u64::MAX))
+                    .record();
+            }
+        }
+    })
+    .map(Arc::new)
+}
+
 /// Bounded Tokio acceptance for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockingExecutor {
@@ -129,6 +159,8 @@ pub(crate) struct BlockingExecutor {
     pub(crate) queue_timeout_ms: u64,
     rayon_pool: Arc<ThreadPool>,
     content_cache: rift_index::WorkspaceContentCache,
+    /// Records the permit counts on each sampler tick while a clone of the executor lives.
+    _permit_sampling: Option<Arc<rift_tracing::SampleHook>>,
 }
 
 impl BlockingExecutor {
@@ -150,8 +182,10 @@ impl BlockingExecutor {
                     .detail(error.to_string())
                     .error()
             })?;
+        let operations = Arc::new(Semaphore::new(workers));
         Ok(Self {
-            operations: Arc::new(Semaphore::new(workers)),
+            _permit_sampling: permit_sampling(&operations, workers),
+            operations,
             queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
             rayon_pool: Arc::new(rayon_pool),
             content_cache: rift_index::WorkspaceContentCache::default(),
@@ -174,8 +208,10 @@ impl BlockingExecutor {
             .thread_name(|index| format!("rift-index-{index}"))
             .build()
             .expect("test worker pool must build");
+        let operations = Arc::new(Semaphore::new(operations_max));
         Self {
-            operations: Arc::new(Semaphore::new(operations_max)),
+            _permit_sampling: permit_sampling(&operations, operations_max),
+            operations,
             queue_timeout_ms,
             rayon_pool: Arc::new(rayon_pool),
             content_cache: rift_index::WorkspaceContentCache::default(),
@@ -6664,6 +6700,37 @@ done
             .await
             .expect_err("closed semaphore must fail acceptance");
         assert_eq!(error.slug(), errors::server::read_task::SLUG);
+    }
+
+    /// A sampler tick records the blocking pool's available and used permits.
+    #[tokio::test]
+    async fn a_sampler_tick_records_the_worker_permits() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(2, 1_000);
+        let held = Arc::clone(&executor.operations).acquire_owned().await?;
+        assert_eq!(recorder.run_sample_hooks(), 1, "the executor's hook runs");
+        let snapshot = recorder.metrics();
+        let permits = |state| {
+            snapshot
+                .find(
+                    "worker_pool.permit.count",
+                    &[("worker_pool.permit.state", state)],
+                )
+                .map(|series| series.value().clone())
+        };
+        assert_eq!(
+            permits("available"),
+            Some(rift_tracing::SeriesValue::Last(1.0))
+        );
+        assert_eq!(permits("used"), Some(rift_tracing::SeriesValue::Last(1.0)));
+        drop(held);
+        drop(executor);
+        assert_eq!(
+            recorder.run_sample_hooks(),
+            0,
+            "the dropped executor's hook left"
+        );
+        Ok(())
     }
 
     /// Every request the server answers lands in `mcp.server.operation.duration` under its
