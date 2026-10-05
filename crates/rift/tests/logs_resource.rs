@@ -422,6 +422,56 @@ fn a_stop_records_the_operations_still_in_flight() -> TestResult {
     Ok(())
 }
 
+/// `[search] busy_timeout` of the case that holds the index database's write lock: past
+/// [`RECORDED_WAIT_MAX`], so a log read that waited on that lock would outlast its bound.
+const HELD_INDEX_BUSY_TIMEOUT: &str = "30s";
+
+/// Another process's write lock on `.rift/index` delays no log read: while a second
+/// connection holds `BEGIN IMMEDIATE` on the index database of a serving workspace,
+/// `rift://logs` and `rift server logs` both answer with records inside the bound this
+/// suite gives a log read. The index database waits `[search] busy_timeout` for that lock,
+/// and the fixture sets it past that bound.
+#[tokio::test]
+async fn a_held_index_write_lock_delays_no_log_read() -> TestResult {
+    let directory = harness::laid_out_workspace(
+        &[("lib.rs", harness::LIBRARY)],
+        &format!(
+            "{}[search]\nbusy_timeout = \"{HELD_INDEX_BUSY_TIMEOUT}\"\n",
+            harness::assigned_port_key()?
+        ),
+    )?;
+    let root = directory.path();
+    let _stop = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    let client = proxy_client(root).await?;
+    within("a tool listing", client.list_tools(None)).await??;
+    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
+    holder.busy_timeout(RECORDED_WAIT_MAX)?;
+    holder.execute_batch("BEGIN IMMEDIATE")?;
+
+    let read = recorded(&client, LOGS_URI).await?;
+    let printed = tokio::time::timeout(
+        RECORDED_WAIT_MAX,
+        run_rift(root, &["server", "logs", "--tail", "5"]),
+    )
+    .await
+    .map_err(|_elapsed| "rift server logs waited past its bound")??;
+    let still_held = !holder.is_autocommit();
+    holder.execute_batch("ROLLBACK")?;
+    drop(holder);
+
+    assert!(
+        still_held,
+        "the index write lock stayed held through both reads"
+    );
+    assert!(!read.is_empty(), "{read:?}");
+    require_success(&printed, "rift server logs")?;
+    assert!(!printed_lines(&printed).is_empty(), "{printed:?}");
+    client.cancel().await?;
+    failure_window.passed();
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_unrecorded_workspace_says_so_and_creates_no_state() -> TestResult {
     let directory = tempfile::tempdir()?;
