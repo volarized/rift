@@ -1,6 +1,6 @@
 """Collect Rift's exported spans in memory and summarize them per operation.
 
-`rift` built with `--features otlp` exports its `traced!`/`traced_async!` spans over
+`rift` built with `--features otlp` exports its `traced!` spans over
 OTLP/HTTP, protobuf-encoded (`opentelemetry-otlp`'s `http-proto` feature), once
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a receiver. The collector here is that
 receiver: it accepts `POST /v1/traces`, keeps each span's name and duration in
