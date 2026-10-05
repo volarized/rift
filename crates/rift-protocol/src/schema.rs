@@ -1218,25 +1218,15 @@ pub fn declare_dependencies_ranges(schema: &mut Schema) {
 }
 
 /// A [`LogsConfiguration`](crate::configuration::LogsConfiguration) states its
-/// `Duration` and `ByteSize` floors and ceilings as `rift:range` on `sample_interval`,
-/// `stall_delay`, and `stderr_limit`: schema validation alone cannot compare `"1s"` or
+/// `Duration` and `ByteSize` floors and ceilings as `rift:range` on `stall_delay` and
+/// `stderr_limit`: schema validation alone cannot compare `"1s"` or
 /// `"1mb"` against a bound, so the server enforces them at load and the schema carries
 /// them for readers.
 pub fn declare_logs_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        ByteSize, Duration, LOGS_SAMPLE_INTERVAL_MS_MAX, LOGS_SAMPLE_INTERVAL_MS_MIN,
-        LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN, LOGS_STDERR_BYTES_MAX,
-        LOGS_STDERR_BYTES_MIN, LogsConfiguration,
+        ByteSize, Duration, LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN,
+        LOGS_STDERR_BYTES_MAX, LOGS_STDERR_BYTES_MIN, LogsConfiguration,
     };
-    annotate_property(
-        schema,
-        property!(LogsConfiguration, sample_interval),
-        RIFT_RANGE,
-        range(
-            &Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MIN),
-            &Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MAX),
-        ),
-    );
     annotate_property(
         schema,
         property!(LogsConfiguration, stall_delay),
@@ -2318,31 +2308,6 @@ mod tests {
             schema["properties"]["max_chunk"][RIFT_RANGE],
             json!({ "min": "1kb", "max": "16mb" }),
             "max_chunk must state its accepted range"
-        );
-    }
-
-    #[test]
-    fn logs_configuration_schema_states_range_and_default_on_sample_interval() {
-        use crate::configuration::{
-            Duration, LOGS_SAMPLE_INTERVAL_MS_DEFAULT, LOGS_SAMPLE_INTERVAL_MS_MAX,
-            LOGS_SAMPLE_INTERVAL_MS_MIN,
-        };
-        let schema = serde_json::to_value(schema_for!(crate::configuration::LogsConfiguration))
-            .expect("schema");
-        let interval = &schema["properties"]["sample_interval"];
-        assert_eq!(
-            interval[RIFT_RANGE],
-            json!({
-                "min": Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MIN),
-                "max": Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MAX),
-            }),
-            "sample_interval must state the range acceptance enforces"
-        );
-        assert_eq!(interval[RIFT_RANGE], json!({ "min": "200ms", "max": "1h" }));
-        assert_eq!(
-            interval[keyword::DEFAULT],
-            json!(Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT)),
-            "sample_interval must advertise the model's default"
         );
     }
 

@@ -721,7 +721,7 @@
     },
     "LogsConfiguration": {
       "additionalProperties": false,
-      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nwhich targets are captured at all, how often the server samples its own\nprocess, and how much it writes to a standard error that is not a terminal. The server reads the table at startup, so a change applies on the next\nstart.",
+      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nwhich targets are captured at all, when an operation still open is reported,\nand how much it writes to a standard error that is not a terminal. The server\nreads the table at startup, so a change applies on the next start.",
       "properties": {
         "capture": {
           "default": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
@@ -745,19 +745,10 @@
           "minimum": 100,
           "type": "integer"
         },
-        "sample_interval": {
-          "$ref": "#/$defs/Duration",
-          "default": "1s",
-          "description": "Wall-clock span between two samples of the server process: its resident\nand virtual memory, CPU time and usage, open files, and disk bytes, 200ms\nto 1h.",
-          "rift:range": {
-            "max": "1h",
-            "min": "200ms"
-          }
-        },
         "stall_delay": {
           "$ref": "#/$defs/Duration",
           "default": "10s",
-          "description": "Age past which an operation, lock wait, or held lock still open is reported\nonce, on the sample tick, as a record of the operations in flight, 1s to 1h.",
+          "description": "Age past which an operation, lock wait, or held lock still open is reported\nonce, as a record of the operations in flight, 1s to 1h.",
           "rift:range": {
             "max": "1h",
             "min": "1s"
@@ -1541,7 +1532,6 @@
         "capture": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
         "page_records": 500,
         "retention_records": 50000,
-        "sample_interval": "1s",
         "stall_delay": "10s",
         "stderr_limit": "1mb"
       },

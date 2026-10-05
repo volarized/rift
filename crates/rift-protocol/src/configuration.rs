@@ -66,15 +66,8 @@ pub const LOGS_CAPTURE_BYTES_MAX: usize = 512;
 /// stderr diagnostics carry, and the index's own warnings, which name each
 /// file a build left out.
 const LOGS_CAPTURE_DEFAULT: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
-/// Milliseconds between two samples of the server process, at least: CPU usage is the CPU
-/// time spent between two samples, and reads reliably only with 200 ms between them.
-pub const LOGS_SAMPLE_INTERVAL_MS_MIN: u64 = 200;
-/// Milliseconds between two samples of the server process, at most: one hour.
-pub const LOGS_SAMPLE_INTERVAL_MS_MAX: u64 = 3_600_000;
-/// Milliseconds `logs.sample_interval` holds when the key is absent.
-pub const LOGS_SAMPLE_INTERVAL_MS_DEFAULT: u64 = 1_000;
 /// Milliseconds an operation stays open before the server reports it, at least: one
-/// second, five sampler ticks at the shortest `sample_interval`.
+/// second.
 pub const LOGS_STALL_DELAY_MS_MIN: u64 = 1_000;
 /// Milliseconds an operation stays open before the server reports it, at most: one hour.
 pub const LOGS_STALL_DELAY_MS_MAX: u64 = 3_600_000;
@@ -882,9 +875,9 @@ impl PortRange {
 /// The `[logs]` table. The server records its own diagnostics in the metrics
 /// database at `.rift/metrics`, where `rift://logs` reads them back, and this
 /// table bounds how many records the store keeps, how many one read returns,
-/// which targets are captured at all, how often the server samples its own
-/// process, and how much it writes to a standard error that is not a terminal. The server reads the table at startup, so a change applies on the next
-/// start.
+/// which targets are captured at all, when an operation still open is reported,
+/// and how much it writes to a standard error that is not a terminal. The server
+/// reads the table at startup, so a change applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_logs_ranges)]
@@ -900,12 +893,8 @@ pub struct LogsConfiguration {
     /// never reaches the store, whatever the stderr diagnostics carry.
     #[schemars(length(max = 512))]
     pub capture: String,
-    /// Wall-clock span between two samples of the server process: its resident
-    /// and virtual memory, CPU time and usage, open files, and disk bytes, 200ms
-    /// to 1h.
-    pub sample_interval: Duration,
     /// Age past which an operation, lock wait, or held lock still open is reported
-    /// once, on the sample tick, as a record of the operations in flight, 1s to 1h.
+    /// once, as a record of the operations in flight, 1s to 1h.
     pub stall_delay: Duration,
     /// Bytes the server's standard error passes, when it is not a terminal, before it
     /// prints one notice and discards the rest, 1kb to 1gb. The log drain's stop records
@@ -919,7 +908,6 @@ impl Default for LogsConfiguration {
             retention_records: LOGS_RETENTION_RECORDS_DEFAULT,
             page_records: LOGS_PAGE_RECORDS_DEFAULT,
             capture: LOGS_CAPTURE_DEFAULT.to_owned(),
-            sample_interval: Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT),
             stall_delay: Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT),
             stderr_limit: ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT),
         }
@@ -946,12 +934,6 @@ impl LogsConfiguration {
         .or_else(|| self.capture_violation())
         .or_else(|| {
             first_out_of_range([
-                (
-                    "logs.sample_interval",
-                    self.sample_interval.milliseconds(),
-                    LOGS_SAMPLE_INTERVAL_MS_MIN,
-                    LOGS_SAMPLE_INTERVAL_MS_MAX,
-                ),
                 (
                     "logs.stall_delay",
                     self.stall_delay.milliseconds(),
@@ -4030,33 +4012,6 @@ mod tests {
         }
         for value in [1, SERVER_WORKSPACES_MAX] {
             configuration.server.workspaces = value;
-            assert_eq!(configuration.validate(), Ok(()));
-        }
-    }
-
-    #[test]
-    fn test_logs_sample_interval_bounds_are_enforced() {
-        let mut configuration = WorkspaceConfiguration::default();
-        assert_eq!(
-            configuration.logs.sample_interval,
-            Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT)
-        );
-        for value in [
-            0,
-            LOGS_SAMPLE_INTERVAL_MS_MIN - 1,
-            LOGS_SAMPLE_INTERVAL_MS_MAX + 1,
-        ] {
-            configuration.logs.sample_interval = Duration::from_millis(value);
-            assert!(matches!(
-                configuration.validate(),
-                Err(ConfigurationViolation::LimitOutOfRange {
-                    field: "logs.sample_interval",
-                    ..
-                })
-            ));
-        }
-        for value in [LOGS_SAMPLE_INTERVAL_MS_MIN, LOGS_SAMPLE_INTERVAL_MS_MAX] {
-            configuration.logs.sample_interval = Duration::from_millis(value);
             assert_eq!(configuration.validate(), Ok(()));
         }
     }
