@@ -157,11 +157,12 @@ impl LazyDatabase {
             .await
             .inspect_err(|error| {
                 let causes = causes(error).join(": ");
+                let path = self.path.display();
                 rift_tracing::warn!(
                     component = "storage",
                     operation = "database.open",
                     database = %self.name,
-                    path = %self.path.display(),
+                    path = %path,
                     error = %error,
                     causes,
                     "the database failed to open; the next operation that needs it opens it again"

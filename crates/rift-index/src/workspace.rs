@@ -10308,6 +10308,31 @@ mod tests {
         );
     }
 
+    /// A semantics build the publication refuses fails the index build, naming the
+    /// operation and the workspace root. A zero declaration bound is the refusal here:
+    /// `WorkspaceIndexLimits` refuses one before any build, so only this entry passes it.
+    #[test]
+    fn a_refused_semantics_build_names_the_index_build_and_the_workspace() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let error = built_contents(root.path(), IndexContents::default(), 0, None)
+            .err()
+            .expect("a zero declaration bound refuses the publication");
+        assert_eq!(error.slug(), errors::provider::publication_zero_limit::SLUG);
+        let context: Vec<(String, String)> = error
+            .context()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect();
+        let workspace = root.path().display().to_string();
+        assert!(
+            context.contains(&("operation".to_owned(), "index.build".to_owned())),
+            "{context:?}"
+        );
+        assert!(
+            context.contains(&("workspace".to_owned(), workspace)),
+            "{context:?}"
+        );
+    }
+
     #[test]
     fn test_a_path_the_wire_can_address_publishes_a_document() {
         // The document shape's address ceiling is the wire's own, so a path at the
@@ -10878,6 +10903,92 @@ mod tests {
         let error = outcome.expect_err("a read this process cannot make fails the capture");
         assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
         assert_eq!(error_path(&error), Some(sealed.clone()));
+    }
+
+    /// A visible capture reads the files no language or text rule selects, so one the
+    /// process cannot read fails it, naming the file, while the indexed capture never
+    /// opens that file.
+    #[cfg(unix)]
+    #[test]
+    fn test_visible_capture_refuses_an_unselected_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, _) = two_file_workspace();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let sealed = root.join("sealed.bin");
+        fs::write(&sealed, b"sealed\0bytes").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024);
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let indexed =
+            capture_digests_with_languages(&root, limits, &visibility, &text, &languages, &last);
+        let visible = capture_visible_digests_with_languages_cancellable(
+            &root,
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &last,
+            &|| false,
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore read");
+        indexed.expect("the indexed capture never opens an unselected file");
+        let error = visible.expect_err("a read this process cannot make fails the visible capture");
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+        assert_eq!(error_path(&error), Some(sealed.clone()));
+    }
+
+    /// Every cancellation check a visible capture makes refuses it as cancelled: the
+    /// indexed capture's, the source policy's, and each visible read's.
+    #[test]
+    fn test_visible_capture_stops_when_cancelled_at_each_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let checks = AtomicUsize::new(0);
+        let counted = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        capture_visible_digests_with_languages_cancellable(
+            root,
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &last,
+            &counted,
+        )
+        .expect("an uncancelled visible capture completes");
+        let made = checks.load(Ordering::SeqCst);
+        for passed in 0..made {
+            let checks = AtomicUsize::new(0);
+            let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= passed;
+            let error = capture_visible_digests_with_languages_cancellable(
+                root,
+                limits,
+                &visibility,
+                &text,
+                &languages,
+                &last,
+                &cancelled,
+            )
+            .expect_err("a cancelled visible capture refuses");
+            assert_eq!(
+                error.slug(),
+                errors::index::workspace_cancelled::SLUG,
+                "the check after {passed} passed checks"
+            );
+        }
     }
 
     #[test]
