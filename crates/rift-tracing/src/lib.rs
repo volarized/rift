@@ -71,7 +71,7 @@ pub use capture::{
 };
 pub use drain::{LOG_SETTLE_TIMEOUT, LogDrain, LogLane, RunningLogDrain, settle_for_read};
 pub use flight::{OPERATIONS_IN_FLIGHT_MAX, publish_in_flight};
-pub use lock::{Acquire, Held, Lock, lock};
+pub use lock::{Acquire, Held, Lock, Refusal, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use metrics::{
     Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue,

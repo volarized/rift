@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::{Pin, pin};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use tokio::time::error::Elapsed;
@@ -67,7 +67,7 @@ impl LockMode {
 enum WaitOutcome {
     /// The lock was acquired.
     Acquired,
-    /// The attempt was refused at once.
+    /// The attempt was refused, or failed.
     Refused,
     /// The wait ran past its timeout.
     Timeout,
@@ -92,6 +92,16 @@ impl WaitOutcome {
             other => other.label(),
         }
     }
+}
+
+/// Why an acquisition [`Lock::acquire_fallible`] awaits ended without the lock, carrying
+/// the caller's own failure.
+#[derive(Debug)]
+pub enum Refusal<Failure> {
+    /// The lock was refused, or the attempt failed: the wait ends `refused`.
+    Refused(Failure),
+    /// The wait ran past its budget: the wait ends `timeout`.
+    Timeout(Failure),
 }
 
 /// One lock, named, in one mode: the start of a recorded acquisition.
@@ -133,11 +143,7 @@ impl Lock {
         acquisition: Acquisition,
     ) -> Acquire<Acquisition> {
         Acquire {
-            acquisition,
-            lock: self,
-            started: None,
-            wait: None,
-            ending: WaitOutcome::Cancelled,
+            wait: Wait::new(self, acquisition),
         }
     }
 
@@ -148,6 +154,10 @@ impl Lock {
     ///
     /// Returns [`Elapsed`] when `timeout` passes before the lock is acquired.
     ///
+    /// The future's output is the guard whatever it holds: an acquisition that can fail,
+    /// such as a semaphore's that answers a `Result`, takes [`Self::acquire_fallible`] so
+    /// its failure does not record as `acquired`.
+    ///
     /// # Cancel safety
     ///
     /// As cancel-safe as `acquisition`; the timeout drops it.
@@ -156,12 +166,62 @@ impl Lock {
         timeout: Duration,
         acquisition: Acquisition,
     ) -> Result<Held<Acquisition::Output>, Elapsed> {
-        let mut wait = pin!(self.acquire(acquisition));
-        match tokio::time::timeout(timeout, wait.as_mut()).await {
+        let mut acquire = pin!(self.acquire(acquisition));
+        match tokio::time::timeout(timeout, acquire.as_mut()).await {
             Ok(held) => Ok(held),
             Err(elapsed) => {
-                *wait.as_mut().project().ending = WaitOutcome::Timeout;
+                acquire.project().wait.end_as(WaitOutcome::Timeout);
                 Err(elapsed)
+            }
+        }
+    }
+
+    /// Awaits `acquisition`, a wait that answers the guard or a [`Refusal`], and answers
+    /// the guard inside a [`Held`] or the caller's failure.
+    ///
+    /// The wait is recorded as [`Self::acquire`] records it, and ends `acquired` with the
+    /// guard, `refused` with [`Refusal::Refused`], and `timeout` with
+    /// [`Refusal::Timeout`]. A wait that ends without the lock always closes a `lock.wait`
+    /// span with that outcome, even when it ended at its first poll, and opens no
+    /// `lock.held` span.
+    ///
+    /// ```
+    /// # async fn run() {
+    /// use rift_tracing::Refusal;
+    ///
+    /// let permits = tokio::sync::Semaphore::new(1);
+    /// let permit = rift_tracing::lock("worker.permit")
+    ///     .acquire_fallible(async { permits.acquire().await.map_err(Refusal::Refused) })
+    ///     .await;
+    /// assert!(permit.is_ok());
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure the [`Refusal`] carries.
+    ///
+    /// # Cancel safety
+    ///
+    /// As cancel-safe as `acquisition`: dropping the future drops it, and the wait ends
+    /// `cancelled`.
+    pub async fn acquire_fallible<Guard, Failure>(
+        self,
+        acquisition: impl Future<Output = Result<Guard, Refusal<Failure>>>,
+    ) -> Result<Held<Guard>, Failure> {
+        let (answer, waited) = Wait::new(self, acquisition).await;
+        match answer {
+            Ok(guard) => {
+                let contended = waited.ended(WaitOutcome::Acquired);
+                Ok(Held::acquired(self, guard, contended))
+            }
+            Err(Refusal::Refused(failure)) => {
+                waited.ended(WaitOutcome::Refused);
+                Err(failure)
+            }
+            Err(Refusal::Timeout(failure)) => {
+                waited.ended(WaitOutcome::Timeout);
+                Err(failure)
             }
         }
     }
@@ -175,20 +235,22 @@ impl Lock {
     /// # Errors
     ///
     /// Returns the attempt's own error when it refuses.
-    pub fn try_acquire<Guard, Refusal>(
+    pub fn try_acquire<Guard, Refused>(
         self,
-        attempt: impl FnOnce() -> Result<Guard, Refusal>,
-    ) -> Result<Held<Guard>, Refusal> {
-        let started = monotonic_now();
+        attempt: impl FnOnce() -> Result<Guard, Refused>,
+    ) -> Result<Held<Guard>, Refused> {
+        let waited = Waited {
+            lock: self,
+            started: monotonic_now(),
+            span: None,
+        };
         match attempt() {
             Ok(guard) => {
-                self.record_wait(started, WaitOutcome::Acquired);
+                waited.ended(WaitOutcome::Acquired);
                 Ok(Held::acquired(self, guard, false))
             }
             Err(refusal) => {
-                let span = self.wait_span();
-                span.record("outcome", WaitOutcome::Refused.label());
-                self.record_wait(started, WaitOutcome::Refused);
+                waited.ended(WaitOutcome::Refused);
                 Err(refusal)
             }
         }
@@ -225,25 +287,53 @@ fn current_operation() -> Option<&'static str> {
         .map(tracing::Metadata::name)
 }
 
+/// A wait that ended with the acquisition's answer, not yet recorded.
+#[derive(Debug)]
+struct Waited {
+    lock: Lock,
+    started: Duration,
+    span: Option<tracing::Span>,
+}
+
+impl Waited {
+    /// Records the wait's end as `outcome`, and answers whether it had to wait: whether its
+    /// `lock.wait` span was open before it ended. An end without the lock opens that span
+    /// when no poll opened it, so every refusal and timeout leaves a record.
+    fn ended(self, outcome: WaitOutcome) -> bool {
+        let contended = self.span.is_some();
+        let span = match (outcome, self.span) {
+            (WaitOutcome::Acquired, span) => span,
+            (_, Some(span)) => Some(span),
+            (_, None) => Some(self.lock.wait_span()),
+        };
+        if let Some(span) = span {
+            span.record("outcome", outcome.label());
+        }
+        self.lock.record_wait(self.started, outcome);
+        contended
+    }
+}
+
 pin_project_lite::pin_project! {
-    /// The future [`Lock::acquire`] returns: the caller's acquisition, recorded.
-    #[must_use = "a lock is acquired only when the future is awaited"]
-    pub struct Acquire<Acquisition> {
+    /// The caller's acquisition, polled as the caller would, with its wait recorded: a
+    /// `lock.wait` span from the first poll that finds it pending, and the outcome
+    /// `ending` when it drops before it answers.
+    struct Wait<Acquisition> {
         #[pin]
         acquisition: Acquisition,
         lock: Lock,
         started: Option<Duration>,
-        wait: Option<tracing::Span>,
+        span: Option<tracing::Span>,
         ending: WaitOutcome,
     }
 
-    impl<Acquisition> PinnedDrop for Acquire<Acquisition> {
+    impl<Acquisition> PinnedDrop for Wait<Acquisition> {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
             let Some(started) = this.started.take() else {
                 return;
             };
-            if let Some(span) = this.wait.take() {
+            if let Some(span) = this.span.take() {
                 span.record("outcome", this.ending.label());
             }
             this.lock.record_wait(started, *this.ending);
@@ -251,29 +341,66 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<Acquisition: Future> Future for Acquire<Acquisition> {
-    type Output = Held<Acquisition::Output>;
+impl<Acquisition> Wait<Acquisition> {
+    const fn new(lock: Lock, acquisition: Acquisition) -> Self {
+        Self {
+            acquisition,
+            lock,
+            started: None,
+            span: None,
+            ending: WaitOutcome::Cancelled,
+        }
+    }
+
+    /// Records `outcome` in place of `cancelled` when the wait drops before it answers.
+    fn end_as(self: Pin<&mut Self>, outcome: WaitOutcome) {
+        *self.project().ending = outcome;
+    }
+}
+
+impl<Acquisition: Future> Future for Wait<Acquisition> {
+    type Output = (Acquisition::Output, Waited);
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let started = *this.started.get_or_insert_with(monotonic_now);
         match this.acquisition.poll(context) {
-            Poll::Ready(guard) => {
+            Poll::Ready(answer) => {
                 *this.started = None;
-                let contended = this.wait.take().is_some_and(|span| {
-                    span.record("outcome", WaitOutcome::Acquired.label());
-                    true
-                });
-                this.lock.record_wait(started, WaitOutcome::Acquired);
-                Poll::Ready(Held::acquired(*this.lock, guard, contended))
+                let waited = Waited {
+                    lock: *this.lock,
+                    started,
+                    span: this.span.take(),
+                };
+                Poll::Ready((answer, waited))
             }
             Poll::Pending => {
-                if this.wait.is_none() {
-                    *this.wait = Some(this.lock.wait_span());
+                if this.span.is_none() {
+                    *this.span = Some(this.lock.wait_span());
                 }
                 Poll::Pending
             }
         }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The future [`Lock::acquire`] returns: the caller's acquisition, recorded.
+    #[must_use = "a lock is acquired only when the future is awaited"]
+    pub struct Acquire<Acquisition> {
+        #[pin]
+        wait: Wait<Acquisition>,
+    }
+}
+
+impl<Acquisition: Future> Future for Acquire<Acquisition> {
+    type Output = Held<Acquisition::Output>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let (guard, waited) = ready!(self.project().wait.poll(context));
+        let lock = waited.lock;
+        let contended = waited.ended(WaitOutcome::Acquired);
+        Poll::Ready(Held::acquired(lock, guard, contended))
     }
 }
 
@@ -285,7 +412,14 @@ impl<Acquisition: Future> Future for Acquire<Acquisition> {
 /// suspension it was held across. The drop never blocks, awaits, or panics.
 #[must_use = "dropping a held lock releases it at once"]
 pub struct Held<Guard> {
+    /// Declared first: the guard drops, releasing the lock, before the hold is recorded.
     guard: Guard,
+    hold: Hold,
+}
+
+/// The record of one hold: its `lock.held` span and its start, closed and recorded when
+/// it drops.
+struct Hold {
     span: tracing::Span,
     lock: Lock,
     acquired: Duration,
@@ -316,9 +450,22 @@ impl<Guard> Held<Guard> {
         };
         Self {
             guard,
-            span,
-            lock,
-            acquired: monotonic_now(),
+            hold: Hold {
+                span,
+                lock,
+                acquired: monotonic_now(),
+            },
+        }
+    }
+
+    /// The same hold over `map(guard)`, such as the file whose lock the guard stands for.
+    ///
+    /// The `lock.held` span, the table entry, and the start of the hold carry over; the
+    /// mapped value drops where the guard would, and the hold is recorded after it.
+    pub fn map<Mapped>(self, map: impl FnOnce(Guard) -> Mapped) -> Held<Mapped> {
+        Held {
+            guard: map(self.guard),
+            hold: self.hold,
         }
     }
 }
@@ -341,13 +488,13 @@ impl<Guard> std::fmt::Debug for Held<Guard> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Held")
-            .field("lock", &self.lock.name)
-            .field("mode", &self.lock.mode.label())
+            .field("lock", &self.hold.lock.name)
+            .field("mode", &self.hold.lock.mode.label())
             .finish_non_exhaustive()
     }
 }
 
-impl<Guard> Drop for Held<Guard> {
+impl Drop for Hold {
     fn drop(&mut self) {
         let held = monotonic_now().saturating_sub(self.acquired);
         let labels = [self.lock.name, self.lock.mode.label()];

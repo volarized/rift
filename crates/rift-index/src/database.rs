@@ -30,6 +30,7 @@ use rift_core::constants::{
     INDEX_DATABASE_FILE_NAME, VECTORS_DATABASE_FILE_NAME, WRITE_AHEAD_LOG_SUFFIX,
 };
 use rift_error::{RiftError, errors};
+use rift_tracing::Refusal;
 use toasty::db::{Connection, Transaction};
 use toasty::migration::MigrationSet;
 use toasty::stmt::{Type, Value};
@@ -729,9 +730,8 @@ enum ConnectionAccess {
 /// and with the process when the process exits.
 #[derive(Debug)]
 struct MigrationLock {
-    /// Declared first: the file closes, releasing the lock, before the hold is recorded.
-    _file: File,
-    _held: rift_tracing::Held<Result<(), RiftError>>,
+    /// The locked file: it closes, releasing the lock, before the hold is recorded.
+    _file: rift_tracing::Held<File>,
 }
 
 impl MigrationLock {
@@ -742,8 +742,9 @@ impl MigrationLock {
     /// the budget divided by that span, plus one, attempts; the last one runs at the first
     /// poll at or past the budget. The whole wait is recorded once as the lock
     /// [`DatabaseName::migration_lock_name`], and the hold stays in the table of operations
-    /// in flight until the value drops. The record's outcome is `acquired` whenever the
-    /// attempts end, a refusal included: the refusal reaches the caller as the error.
+    /// in flight until the value drops. The wait ends `acquired` with the lock, `timeout`
+    /// when another process still holds it once the budget has passed, and `refused` when
+    /// the lock file cannot be locked; a wait that ends without the lock records no hold.
     ///
     /// # Errors
     ///
@@ -772,23 +773,21 @@ impl MigrationLock {
                 match file.try_lock() {
                     Ok(()) => return Ok(()),
                     Err(TryLockError::Error(source)) => {
-                        return Err(name.failed(&lock_path, source));
+                        return Err(Refusal::Refused(name.failed(&lock_path, source)));
                     }
                     Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
                         let held = migration_lock_held(pool.busy_timeout_ms());
-                        return Err(name.failed(&lock_path, held));
+                        return Err(Refusal::Timeout(name.failed(&lock_path, held)));
                     }
                     Err(TryLockError::WouldBlock) => tokio::time::sleep(MIGRATION_LOCK_POLL).await,
                 }
             }
         };
-        let mut held = rift_tracing::lock(name.migration_lock_name())
-            .acquire(attempts)
-            .await;
-        std::mem::replace(&mut *held, Ok(()))?;
+        let held = rift_tracing::lock(name.migration_lock_name())
+            .acquire_fallible(attempts)
+            .await?;
         Ok(Self {
-            _file: file,
-            _held: held,
+            _file: held.map(|()| file),
         })
     }
 }
@@ -1720,11 +1719,12 @@ mod tests {
         Ok(())
     }
 
-    /// A wait the budget ends still writes one `lock.wait` record naming the waiter and the
-    /// holder. The record says `acquired`, because the attempts resolved; the refusal
-    /// reaches the caller as the error.
+    /// A wait the budget ends writes one `lock.wait` record naming the waiter and the
+    /// holder, with the outcome `timeout`, and records no hold: the one `lock.held` record
+    /// is the holder's. The refusal reaches the caller as the error at the budget exactly,
+    /// the attempt at the first poll at or past it.
     #[tokio::test(start_paused = true)]
-    async fn a_migration_lock_wait_past_the_budget_records_one_wait() -> TestResult {
+    async fn a_migration_lock_wait_past_the_budget_ends_timeout_and_holds_nothing() -> TestResult {
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
@@ -1732,6 +1732,7 @@ mod tests {
             MigrationLock::acquire(&path, DatabaseName::Vectors, pool()).await
         })
         .await?;
+        let started = tokio::time::Instant::now();
 
         let refused =
             rift_tracing::traced!(component = "storage", operation = "database.open", async {
@@ -1739,16 +1740,40 @@ mod tests {
             })
             .await
             .expect_err("a held migration lock refuses once the budget passes");
+        let waited = started.elapsed();
         drop(holder);
+        let metrics = recorder.metrics();
         drop(recorder);
 
+        assert_eq!(
+            waited,
+            Duration::from_millis(u64::from(pool().busy_timeout_ms())),
+            "the refusal lands at the attempt on the budget"
+        );
         let causes = rift_error::causes(&refused).join(": ");
         assert!(causes.contains("busy-wait budget"), "{causes}");
-        let wait = lock_wait(&drain.queued_records())?;
+        let records = drain.queued_records();
+        let wait = lock_wait(&records)?;
         assert_eq!(wait["lock.name"], "vectors.migration");
         assert_eq!(wait["waiter"], "database.open");
         assert_eq!(wait["holder"], "search.open");
-        assert_eq!(wait["outcome"], "acquired");
+        assert_eq!(wait["outcome"], "timeout");
+        let holds: Vec<serde_json::Value> = records
+            .iter()
+            .filter(|record| record.message() == "lock.held")
+            .map(|record| serde_json::from_str(record.fields()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(holds.len(), 1, "the refused wait opens no hold: {holds:?}");
+        assert_eq!(holds[0]["holder"], "search.open");
+        let timeout = metrics.find(
+            "lock.wait.duration",
+            &[
+                ("lock.name", "vectors.migration"),
+                ("lock.mode", "exclusive"),
+                ("error.type", "timeout"),
+            ],
+        );
+        assert!(timeout.is_some(), "the wait records as a timeout");
         Ok(())
     }
 
