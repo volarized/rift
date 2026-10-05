@@ -326,9 +326,6 @@ pub struct WorkspaceDatabase {
     writes: Mutex<()>,
     /// Whether a shutdown has already run the close checkpoint.
     checkpointed: AtomicBool,
-    /// Whether the close checkpoint started before its deadline and was still waiting on
-    /// the worker when the deadline passed.
-    checkpoint_outlasted: AtomicBool,
     /// Keeps the file sizes and the worker's queue length reported while the database
     /// lives; absent where the process installed no meter.
     _readings: [Option<rift_tracing::ObservationGuard>; 2],
@@ -504,7 +501,6 @@ impl WorkspaceDatabase {
             thread,
             writes: Mutex::new(()),
             checkpointed: AtomicBool::new(false),
-            checkpoint_outlasted: AtomicBool::new(false),
             _readings: [file_sizes, queue_length],
         };
         opened.record_pool();
@@ -562,19 +558,18 @@ impl WorkspaceDatabase {
     /// whatever the log holds at the next open. The worker drops every connection it holds,
     /// and the last connection's close removes the log file.
     ///
-    /// A checkpoint that started before `deadline` and outlasted it leaves the worker
-    /// running the statement, so the worker's stop outlasts `deadline` too. That stop does
-    /// not fail the close either: it is recorded as a `warn` event, the worker keeps running
-    /// until it finishes or the process exits, and every transaction committed before the
-    /// close is in the log the next open recovers.
+    /// A worker whose stop outlasts `deadline` does not fail the close either, whatever it
+    /// was running: a checkpoint that started before `deadline`, or other work that held it
+    /// when a close started past `deadline`. The stop is recorded as a `warn` event, the
+    /// worker keeps running until it finishes or the process exits, and every transaction
+    /// committed before the close is in the log the next open recovers; one still open is
+    /// rolled back there.
     ///
     /// Only the first call checkpoints; a later one awaits the worker's stop alone.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] when the worker stops with an error or panics, or outlasts
-    /// `deadline` while no checkpoint of this close was running: a close that started past
-    /// `deadline`, or a worker held by other work.
+    /// Returns [`RiftError`] when the worker stops with an error or panics.
     ///
     /// # Cancel safety
     ///
@@ -588,9 +583,7 @@ impl WorkspaceDatabase {
         }
         match self.thread.stop(deadline).await {
             Ok(()) => Ok(()),
-            Err(ShutdownFailure::Deadline(error))
-                if self.checkpoint_outlasted.load(Ordering::Acquire) =>
-            {
+            Err(ShutdownFailure::Deadline(error)) => {
                 rift_tracing::warn!(
                     component = "storage",
                     operation = "database.close",
@@ -630,10 +623,6 @@ impl WorkspaceDatabase {
                 "database checkpoint failed; the write-ahead log stays for the next open"
             ),
             Err(_elapsed) => {
-                // A checkpoint that started past the deadline never ran; one that started
-                // before it is still queued on, or running in, the worker.
-                self.checkpoint_outlasted
-                    .store(started < deadline, Ordering::Release);
                 rift_tracing::warn!(
                     component = "storage",
                     operation = "database.close",
@@ -2773,9 +2762,10 @@ mod tests {
     }
 
     /// A close that starts past its deadline runs no checkpoint, and the worker it finds
-    /// held fails the close.
+    /// held outlasts it without failing the close: the stop is a `warn` record.
     #[tokio::test]
-    async fn a_close_that_starts_past_its_deadline_fails_on_a_held_worker() -> TestResult {
+    async fn a_close_that_starts_past_its_deadline_outlasts_a_held_worker_without_failing()
+    -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = DatabaseName::Index.path(directory.path());
         let database = limited_database(&path, DatabaseName::Index).await?;
@@ -2783,13 +2773,28 @@ mod tests {
         holding.await?;
         tokio::time::pause();
 
-        let refused = database.shutdown(tokio::time::Instant::now()).await;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        database.shutdown(tokio::time::Instant::now()).await?;
+        drop(recorder);
 
-        let refused = refused.expect_err("a held worker fails a close past its deadline");
-        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
-        assert_eq!(failed_database(&refused).as_deref(), Some("index"));
-        let causes = rift_error::causes(&refused).join(": ");
-        assert!(causes.contains("exceeded deadline"), "{causes}");
+        let records = drain.queued_records();
+        let outlasted = records
+            .iter()
+            .find(|record| {
+                record.message()
+                    == "SQLite worker outlasted the shutdown deadline; the write-ahead log \
+                        stays for the next open"
+            })
+            .ok_or("the outlasted stop is recorded")?;
+        assert_eq!(outlasted.level(), "warn");
+        let fields: serde_json::Value = serde_json::from_str(outlasted.fields())?;
+        assert_eq!(fields["database"], "index", "{fields}");
+        assert!(
+            fields["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("exceeded deadline")),
+            "{fields}"
+        );
         release.send(()).map_err(|()| "the held worker resumes")?;
         tokio::time::resume();
         database
@@ -2884,9 +2889,7 @@ mod tests {
                 metrics.close(closed).await?;
                 let (holding, release) = kept.thread.hold_for_test().await?;
                 holding.await?;
-                kept.shutdown(tokio::time::Instant::now())
-                    .await
-                    .expect_err("the held worker outlasts a close past its deadline");
+                kept.shutdown(tokio::time::Instant::now()).await?;
                 Box::new(move || {
                     release
                         .send(())

@@ -980,9 +980,9 @@ fn process_absent(error: &io::Error) -> bool {
 /// runs the checkpoint keeps running until it finishes or the process exits, and
 /// the next open recovers every committed transaction from the write-ahead log.
 /// A metrics close ends `timeout` the same way whatever stage the bound passed
-/// in, a close still queued behind an earlier command included. An index or
-/// vectors close that started past its bound still fails the stop on a worker
-/// that outlasts it. An index supervisor still running at its bound is aborted
+/// in, a close still queued behind an earlier command included, and so does an
+/// index or vectors close that started past its bound on a worker that outlasts
+/// it. An index supervisor still running at its bound is aborted
 /// the same way a checkpoint is left behind: its stage ends `timeout` with the
 /// table of operations in flight and fails nothing, and blocking work it
 /// started ends with the process.

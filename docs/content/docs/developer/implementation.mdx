@@ -238,9 +238,10 @@ close's bound. Such a close ends its stage with `timeout`: the thread running th
 it finishes or the process exits, and the next open recovers every committed transaction from the
 write-ahead log. A metrics close ends with `timeout` whatever stage its bound passed in, a close
 still queued behind an earlier write included. An index or vectors close that started past its
-bound still fails the stop. An index supervisor still running at its bound is aborted the same
-way: its stage ends with `timeout` and the table of operations in flight, and blocking work it
-started ends with the process.
+bound ends with `timeout` too when the worker it finds still running outlasts it; a transaction
+that worker left open is rolled back at the next open. An index supervisor still running at its
+bound is aborted the same way: its stage ends with `timeout` and the table of operations in
+flight, and blocking work it started ends with the process.
 
 <VersionBadge version="v0.0.62" />
 
