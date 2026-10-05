@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rift_tracing::{Counter, Gauge, Histogram, PerformanceMeasurement};
 use toasty_core::Schema;
-use toasty_core::driver::operation::Operation;
+use toasty_core::driver::operation::{Operation, Transaction, TransactionMode};
 use toasty_core::driver::{
     Capability, ConnectContext, Connection as DriverConnection, Driver, ExecResponse,
 };
@@ -19,10 +21,52 @@ use crate::database::DatabaseName;
 
 const CONNECTION_REAP_SPAN: Duration = Duration::from_millis(100);
 
+/// `db.client.operation.duration`: one driver operation's execution on the worker, its
+/// time in the queue left out.
+const OPERATION_DURATION: Histogram<3> = Histogram::declare(
+    "db.client.operation.duration",
+    &["db.namespace", "db.operation.name", "error.type"],
+);
+/// `sqlite.queue.wait.duration`: one driver operation's round trip to the worker less its
+/// execution there: the wait to enter the queue, the wait in it, and the reply.
+const QUEUE_WAIT: Histogram<2> = Histogram::declare(
+    "sqlite.queue.wait.duration",
+    &["db.namespace", "db.operation.name"],
+);
+/// `sqlite.queue.timeouts`: requests the full queue refused once the busy timeout passed.
+const QUEUE_TIMEOUTS: Counter<1> =
+    Counter::declare("sqlite.queue.timeouts", "{timeout}", &["db.namespace"]);
+/// `sqlite.write_lock.wait.duration`: one `BEGIN IMMEDIATE` on the worker, the wait for
+/// another connection's write lock inside `SQLite` included.
+const WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+    "sqlite.write_lock.wait.duration",
+    &["db.namespace", "error.type"],
+);
+/// `sqlite.transaction.active`: transactions begun and not yet ended, per database.
+const TRANSACTION_ACTIVE: Gauge<u64, 1> = Gauge::declare(
+    "sqlite.transaction.active",
+    "{transaction}",
+    &["db.namespace"],
+);
+/// `sqlite.commit.duration`: one `COMMIT` on the worker, a checkpoint it runs included.
+const COMMIT_DURATION: Histogram<1> =
+    Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+
+/// The `error.type` of a failed driver operation. The driver's `SQLite` result code sits
+/// inside a `rusqlite` error this crate does not name, so every failure shares one value.
+const OPERATION_FAILED: &str = "_OTHER";
+
 pub(crate) struct DatabaseThread {
+    name: DatabaseName,
     sender: mpsc::Sender<Command>,
     join: Mutex<JoinState>,
     queue_timeout: Duration,
+    /// Whether the last request refused at the queue: the first refusal of a run of them
+    /// publishes the table of operations in flight, and the next accepted request ends
+    /// the run.
+    queue_refused: AtomicBool,
+    /// Transactions begun on the database's connections and not yet ended.
+    transactions_active: AtomicU64,
 }
 
 enum JoinState {
@@ -103,9 +147,12 @@ impl DatabaseThread {
             return Err(error);
         }
         Ok(Arc::new(Self {
+            name,
             sender,
             join: Mutex::new(JoinState::Thread(Some(join))),
             queue_timeout,
+            queue_refused: AtomicBool::new(false),
+            transactions_active: AtomicU64::new(0),
         }))
     }
 
@@ -140,13 +187,36 @@ impl DatabaseThread {
         let (reply, response) = oneshot::channel();
         let command = command(reply);
         let deadline = Instant::now() + self.queue_timeout;
-        timeout_at(deadline, self.sender.send(command))
-            .await
-            .map_err(|_| worker_error("SQLite worker queue wait exceeded configured busy timeout"))?
-            .map_err(|_| worker_error("SQLite worker stopped before accepting operation"))?;
+        let Ok(sent) = timeout_at(deadline, self.sender.send(command)).await else {
+            QUEUE_TIMEOUTS.labeled([self.name.label()]).add(1);
+            if !self.queue_refused.swap(true, Ordering::Relaxed) {
+                rift_tracing::publish_in_flight("SQLite worker queue wait");
+            }
+            return Err(worker_error(
+                "SQLite worker queue wait exceeded configured busy timeout",
+            ));
+        };
+        if self.queue_refused.load(Ordering::Relaxed) {
+            self.queue_refused.store(false, Ordering::Relaxed);
+        }
+        sent.map_err(|_| worker_error("SQLite worker stopped before accepting operation"))?;
         response
             .await
             .map_err(|_| worker_error("SQLite worker stopped before returning operation"))?
+    }
+
+    /// Counts one transaction begun, or with `begun` false one ended, and records the count.
+    fn count_transaction(&self, begun: bool) {
+        let active = if begun {
+            self.transactions_active.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.transactions_active
+                .fetch_sub(1, Ordering::Relaxed)
+                .saturating_sub(1)
+        };
+        TRANSACTION_ACTIVE
+            .labeled_value([self.name.label()], active)
+            .record();
     }
 
     pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), toasty_core::Error> {
@@ -245,6 +315,7 @@ impl Driver for SqliteThreadDriver {
             actor: Arc::clone(&self.actor),
             id,
             _lease: lease,
+            transaction_open: false,
         }))
     }
 
@@ -266,11 +337,105 @@ struct SqliteThreadConnection {
     actor: Arc<DatabaseThread>,
     id: u64,
     _lease: Arc<()>,
+    /// Whether a transaction began on the connection and has not ended.
+    transaction_open: bool,
 }
 
 impl Drop for SqliteThreadConnection {
     fn drop(&mut self) {
+        if std::mem::take(&mut self.transaction_open) {
+            self.actor.count_transaction(false);
+        }
         let _ = self.actor.sender.try_send(Command::Close { id: self.id });
+    }
+}
+
+/// What one driver operation is to the measurements: its name, and its place in a
+/// transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationRole {
+    /// `BEGIN IMMEDIATE`: takes the write lock.
+    BeginImmediate,
+    /// Any other `BEGIN`.
+    Begin,
+    Commit,
+    Rollback,
+    /// A statement, or a savepoint inside a transaction.
+    Statement,
+}
+
+impl OperationRole {
+    fn of(operation: &Operation) -> Self {
+        match operation {
+            Operation::Transaction(Transaction::Start {
+                mode: TransactionMode::Immediate,
+                ..
+            }) => Self::BeginImmediate,
+            Operation::Transaction(Transaction::Start { .. }) => Self::Begin,
+            Operation::Transaction(Transaction::Commit) => Self::Commit,
+            Operation::Transaction(Transaction::Rollback) => Self::Rollback,
+            _ => Self::Statement,
+        }
+    }
+}
+
+/// What the worker answers a driver operation with: the driver's result and how long the
+/// worker spent executing it, absent when the clock regressed.
+#[derive(Debug)]
+struct Executed {
+    result: Result<ExecResponse, toasty_core::Error>,
+    took: Option<Duration>,
+}
+
+impl SqliteThreadConnection {
+    /// Records one operation the worker executed: its duration, its queue wait, and the
+    /// transaction it began or ended. `round_trip` spans the request from its send to its
+    /// reply.
+    fn record(
+        &mut self,
+        operation: &'static str,
+        role: OperationRole,
+        executed: &Executed,
+        round_trip: Option<PerformanceMeasurement>,
+    ) {
+        let database = self.actor.name.label();
+        let failed = if executed.result.is_err() {
+            OPERATION_FAILED
+        } else {
+            ""
+        };
+        if let Some(took) = executed.took {
+            OPERATION_DURATION
+                .labeled([database, operation, failed])
+                .record(took);
+            if let Some(round_trip) = round_trip {
+                QUEUE_WAIT
+                    .labeled([database, operation])
+                    .record(round_trip.elapsed().saturating_sub(took));
+            }
+            if role == OperationRole::BeginImmediate {
+                WRITE_LOCK_WAIT.labeled([database, failed]).record(took);
+            }
+            if role == OperationRole::Commit && executed.result.is_ok() {
+                COMMIT_DURATION.labeled([database]).record(took);
+            }
+        }
+        let ended = match role {
+            OperationRole::BeginImmediate | OperationRole::Begin => {
+                if executed.result.is_ok() && !self.transaction_open {
+                    self.transaction_open = true;
+                    self.actor.count_transaction(true);
+                }
+                false
+            }
+            // A refused commit leaves the transaction open for its rollback.
+            OperationRole::Commit => executed.result.is_ok(),
+            OperationRole::Rollback => true,
+            OperationRole::Statement => false,
+        };
+        if ended && std::mem::take(&mut self.transaction_open) {
+            self.actor.count_transaction(false);
+        }
     }
 }
 
@@ -283,14 +448,25 @@ impl DriverConnection for SqliteThreadConnection {
     ) -> Result<ExecResponse, toasty_core::Error> {
         let id = self.id;
         let schema = Arc::clone(schema);
-        self.actor
-            .request(|reply| Command::Exec {
-                id,
-                schema,
-                operation: Box::new(operation),
-                reply,
-            })
-            .await
+        let name = operation.name();
+        let role = OperationRole::of(&operation);
+        let answered;
+        let round_trip = rift_tracing::measure_elapsed!("sqlite.queue", {
+            answered = self
+                .actor
+                .request(|reply| Command::Exec {
+                    id,
+                    schema,
+                    operation: Box::new(operation),
+                    reply,
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), round_trip)| round_trip);
+        let executed = answered?;
+        self.record(name, role, &executed, round_trip);
+        executed.result
     }
 
     async fn push_schema(&mut self, schema: &Schema) -> Result<(), toasty_core::Error> {
@@ -349,7 +525,7 @@ enum Command {
         id: u64,
         schema: Arc<Schema>,
         operation: Box<Operation>,
-        reply: oneshot::Sender<Result<ExecResponse, toasty_core::Error>>,
+        reply: oneshot::Sender<Result<Executed, toasty_core::Error>>,
     },
     PushSchema {
         id: u64,
@@ -559,7 +735,7 @@ impl DatabaseWorker {
         id: u64,
         schema: Arc<Schema>,
         operation: Box<Operation>,
-        reply: oneshot::Sender<Result<ExecResponse, toasty_core::Error>>,
+        reply: oneshot::Sender<Result<Executed, toasty_core::Error>>,
     ) {
         let operation = *operation;
         #[cfg(test)]
@@ -569,11 +745,16 @@ impl DatabaseWorker {
             let _ = started.send(());
             let _ = release.await;
         }
-        let result = match self.connections.get_mut(&id) {
-            Some(owned) => owned.connection.exec(&schema, operation).await,
-            None => Err(worker_error("SQLite connection is closed")),
-        };
-        let _ = reply.send(result);
+        let result;
+        let took = rift_tracing::measure_elapsed!("db.client.operation", {
+            result = match self.connections.get_mut(&id) {
+                Some(owned) => owned.connection.exec(&schema, operation).await,
+                None => Err(worker_error("SQLite connection is closed")),
+            };
+        })
+        .ok()
+        .map(|((), took)| took.elapsed());
+        let _ = reply.send(Ok(Executed { result, took }));
     }
 
     async fn push_schema(
@@ -822,6 +1003,81 @@ mod tests {
             error.to_string().contains("test SQLite worker panic"),
             "shutdown error must preserve worker panic payload: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_of_queue_refusals_publishes_the_operations_in_flight_once() {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the recorder installs");
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, driver) = driver(&directory.path().join("db"), Duration::from_millis(20)).await;
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("hold command must queue");
+        is_started.await.expect("worker must hold queue");
+        let (done, completed) = oneshot::channel();
+        actor
+            .sender
+            .try_send(Command::Noop(done))
+            .expect("one queued command must fill bounded queue");
+        let refusals: u8 = 3;
+        for _ in 0..refusals {
+            rift_tracing::traced!(component = "lexical", operation = "lexical.commit", async {
+                driver.connect(&ConnectContext::default()).await
+            })
+            .await
+            .expect_err("full queue must refuse after configured wait");
+        }
+        release.send(()).expect("worker must resume");
+        completed.await.expect("queued command must complete");
+        drop(
+            driver
+                .connect(&ConnectContext::default())
+                .await
+                .expect("a drained queue accepts the next request"),
+        );
+        let metrics = recorder.metrics();
+        drop(recorder);
+
+        let tables = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.message() == "operations in flight")
+            .collect::<Vec<_>>();
+        assert_eq!(tables.len(), 1, "one table per run of refusals");
+        let fields: serde_json::Value =
+            serde_json::from_str(tables[0].fields()).expect("table fields are JSON");
+        assert_eq!(fields["reason"], "SQLite worker queue wait");
+        assert!(
+            fields["operations"]
+                .as_str()
+                .is_some_and(|listed| listed.contains("lexical.commit")),
+            "the refused operation is in flight: {fields}"
+        );
+        assert!(
+            !actor.queue_refused.load(super::Ordering::Relaxed),
+            "an accepted request ends the run"
+        );
+        let timeouts = metrics
+            .find("sqlite.queue.timeouts", &[("db.namespace", "index")])
+            .expect("the refusals were counted");
+        assert_eq!(timeouts.instrument().unit(), "{timeout}");
+        assert_eq!(
+            timeouts.value(),
+            &rift_tracing::SeriesValue::Sum(f64::from(refusals))
+        );
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("worker must stop");
     }
 
     #[tokio::test]
