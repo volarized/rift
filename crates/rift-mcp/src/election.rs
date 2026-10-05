@@ -376,20 +376,140 @@ pub fn probe(root: &Path) -> ServerPresence {
 #[must_use]
 #[doc(hidden)]
 pub fn probe_state_directory(state_directory: &Path) -> ServerPresence {
-    match (
-        election_state_in(state_directory),
-        published_document_in(state_directory),
-    ) {
-        (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => ServerPresence::Serving(lock),
-        (ElectionState::Held, Ok(lock)) => {
-            ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid })
+    observe_state_directory(state_directory).presence
+}
+
+/// One probe of the workspace at `root`, with the reads that decided it.
+#[must_use]
+pub(crate) fn observe(root: &Path) -> ElectionObservation {
+    observe_state_directory(&root.join(RIFT_STATE_DIRECTORY))
+}
+
+/// One probe of an election whose files live in `state_directory`, with the
+/// reads that decided it. [`probe_state_directory`] answers its presence.
+fn observe_state_directory(state_directory: &Path) -> ElectionObservation {
+    let (election, election_failure) = election_state_in(state_directory);
+    let (presence, document_failure) = match (election, published_document_in(state_directory)) {
+        (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => {
+            (ServerPresence::Serving(lock), None)
         }
-        (ElectionState::Held, Err(_)) => ServerPresence::Starting,
-        (ElectionState::Unheld, Ok(_)) => ServerPresence::Stale(StaleReason::ElectionUnheld),
-        (ElectionState::Unobservable, Ok(_)) => {
-            ServerPresence::Stale(StaleReason::ElectionUnobservable)
+        (ElectionState::Held, Ok(lock)) => (
+            ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid }),
+            None,
+        ),
+        (ElectionState::Held, Err(miss)) => (ServerPresence::Starting, miss.failure),
+        (ElectionState::Unheld, Ok(_)) => {
+            (ServerPresence::Stale(StaleReason::ElectionUnheld), None)
         }
-        (_, Err(presence)) => *presence,
+        (ElectionState::Unobservable, Ok(_)) => (
+            ServerPresence::Stale(StaleReason::ElectionUnobservable),
+            None,
+        ),
+        (_, Err(miss)) => (*miss.presence, miss.failure),
+    };
+    ElectionObservation {
+        presence,
+        reads: ProbeReads {
+            election,
+            election_failure,
+            document_failure,
+        },
+        document_path: document_path_in(state_directory),
+    }
+}
+
+/// One call that read the election file or the lock document and failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadFailure {
+    /// The call that failed, as `std` names it.
+    call: &'static str,
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+impl ReadFailure {
+    fn of(call: &'static str, error: &io::Error) -> Self {
+        Self {
+            call,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+/// What the reads of one probe found: the election state, and each read that
+/// failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeReads {
+    election: ElectionState,
+    election_failure: Option<ReadFailure>,
+    document_failure: Option<ReadFailure>,
+}
+
+/// One probe's presence and the reads that decided it.
+#[derive(Debug)]
+pub(crate) struct ElectionObservation {
+    pub(crate) presence: ServerPresence,
+    reads: ProbeReads,
+    document_path: PathBuf,
+}
+
+impl ElectionObservation {
+    /// The observation of a probe that did not finish: its election state
+    /// could not be observed, and it read nothing.
+    pub(crate) fn unobservable(root: &Path) -> Self {
+        Self {
+            presence: ServerPresence::Stale(StaleReason::ElectionUnobservable),
+            reads: ProbeReads {
+                election: ElectionState::Unobservable,
+                election_failure: None,
+                document_failure: None,
+            },
+            document_path: document_path(root),
+        }
+    }
+
+    /// Logs the reads that failed when they differ from the reads `reported`
+    /// holds, so a poll of repeated probes logs each change once, not once
+    /// per poll round. Reads that all succeeded log nothing.
+    pub(crate) fn report_change(&self, reported: &mut Option<ProbeReads>) {
+        if *reported == Some(self.reads) {
+            return;
+        }
+        *reported = Some(self.reads);
+        let ProbeReads {
+            election,
+            election_failure,
+            document_failure,
+        } = self.reads;
+        if election_failure.is_none() && document_failure.is_none() {
+            return;
+        }
+        let kind = |failure: ReadFailure| tracing::field::debug(failure.kind);
+        tracing::info!(
+            component = "mcp",
+            path = %self.document_path.display(),
+            election = ?election,
+            presence = %presence_field(&self.presence),
+            election_call = election_failure.map(|failure| failure.call),
+            election_error_kind = election_failure.map(kind),
+            election_raw_os_error = election_failure.and_then(|failure| failure.raw_os_error),
+            document_call = document_failure.map(|failure| failure.call),
+            document_error_kind = document_failure.map(kind),
+            document_raw_os_error = document_failure.and_then(|failure| failure.raw_os_error),
+            "election probe read failed"
+        );
+    }
+}
+
+/// `presence` as a record field: the variant and its reason, never the
+/// document's token.
+pub(crate) fn presence_field(presence: &ServerPresence) -> String {
+    match presence {
+        ServerPresence::Serving(lock) => {
+            format!("Serving {{ pid: {}, port: {} }}", lock.pid, lock.port)
+        }
+        other => format!("{other:?}"),
     }
 }
 
@@ -411,30 +531,55 @@ pub(crate) fn document_path_in(state_directory: &Path) -> PathBuf {
     state_directory.join(SERVER_LOCK_FILE_NAME)
 }
 
+/// Why one read of the lock document found none that validates.
+struct DocumentMiss {
+    /// What the miss says about a serving process.
+    presence: Box<ServerPresence>,
+    /// The read call that failed, when one did.
+    failure: Option<ReadFailure>,
+}
+
+impl DocumentMiss {
+    fn stale(reason: StaleReason) -> Self {
+        Self {
+            presence: Box::new(ServerPresence::Stale(reason)),
+            failure: None,
+        }
+    }
+}
+
 /// The published document when it exists, parses, and validates.
-fn published_document_in(state_directory: &Path) -> Result<ServerLock, Box<ServerPresence>> {
-    let bytes = match std::fs::read(document_path_in(state_directory)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(Box::new(ServerPresence::Absent));
-        }
-        Err(_) => {
-            return Err(Box::new(ServerPresence::Stale(
-                StaleReason::DocumentUnreadable,
-            )));
-        }
-    };
+///
+/// Reads through the calls `std::fs::read` makes, so a failure names the
+/// one that failed.
+fn published_document_in(state_directory: &Path) -> Result<ServerLock, DocumentMiss> {
+    let bytes = read_document_in(state_directory).map_err(|failure| DocumentMiss {
+        presence: Box::new(if failure.kind == io::ErrorKind::NotFound {
+            ServerPresence::Absent
+        } else {
+            ServerPresence::Stale(StaleReason::DocumentUnreadable)
+        }),
+        failure: Some(failure),
+    })?;
     let Ok(lock) = serde_json::from_slice::<ServerLock>(&bytes) else {
-        return Err(Box::new(ServerPresence::Stale(
-            StaleReason::DocumentMalformed,
-        )));
+        return Err(DocumentMiss::stale(StaleReason::DocumentMalformed));
     };
     match lock.validate() {
         Ok(()) => Ok(lock),
-        Err(violation) => Err(Box::new(ServerPresence::Stale(
-            StaleReason::DocumentInvalid(violation),
-        ))),
+        Err(violation) => Err(DocumentMiss::stale(StaleReason::DocumentInvalid(violation))),
     }
+}
+
+/// The lock document's bytes, or the read call that failed.
+fn read_document_in(state_directory: &Path) -> Result<Vec<u8>, ReadFailure> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(document_path_in(state_directory))
+        .map_err(|error| ReadFailure::of("File::open", &error))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ReadFailure::of("Read::read_to_end", &error))?;
+    Ok(bytes)
 }
 
 /// Restricts the staged document to its owner before the token is written.
@@ -454,22 +599,32 @@ fn restrict_to_owner(_file: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-fn election_state_in(state_directory: &Path) -> ElectionState {
+/// The election file's state, with the read call that failed when one did.
+fn election_state_in(state_directory: &Path) -> (ElectionState, Option<ReadFailure>) {
     let election_path = state_directory.join(SERVER_ELECTION_FILE_NAME);
     let election_file = match OpenOptions::new().read(true).open(&election_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return ElectionState::Unheld,
-        Err(_) => return ElectionState::Unobservable,
+        Err(error) => {
+            let state = if error.kind() == io::ErrorKind::NotFound {
+                ElectionState::Unheld
+            } else {
+                ElectionState::Unobservable
+            };
+            return (state, Some(ReadFailure::of("File::open", &error)));
+        }
     };
     match election_file.try_lock_shared() {
         // Nothing holds the exclusive lock. The probe releases its shared
         // lock at once, ahead of the handle's close.
         Ok(()) => {
             release_election_lock(&election_file);
-            ElectionState::Unheld
+            (ElectionState::Unheld, None)
         }
-        Err(TryLockError::WouldBlock) => ElectionState::Held,
-        Err(TryLockError::Error(_)) => ElectionState::Unobservable,
+        Err(TryLockError::WouldBlock) => (ElectionState::Held, None),
+        Err(TryLockError::Error(error)) => (
+            ElectionState::Unobservable,
+            Some(ReadFailure::of("File::try_lock_shared", &error)),
+        ),
     }
 }
 
@@ -1564,6 +1719,67 @@ mod tests {
             !document.exists(),
             "the caller's retire removes the document"
         );
+        Ok(())
+    }
+
+    /// A held election whose document is absent logs the failed read once - the call,
+    /// the OS error, the election state it paired with, and the path - however many
+    /// probes repeat it. A read that succeeds logs nothing, and the next failure after
+    /// it logs again.
+    #[test]
+    fn a_failed_document_read_is_recorded_once_per_change() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let mut document = valid_document();
+        document.port = dead_port()?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let mut presences = Vec::new();
+        tracing::subscriber::with_default(subscriber, || -> TestResult {
+            let mut reported = None;
+            for _ in 0..3 {
+                let observation = super::observe(directory.path());
+                observation.report_change(&mut reported);
+                presences.push(observation.presence);
+            }
+            guard.publish(&document)?;
+            super::observe(directory.path()).report_change(&mut reported);
+            guard.retire();
+            super::observe(directory.path()).report_change(&mut reported);
+            Ok(())
+        })?;
+        assert!(
+            presences
+                .iter()
+                .all(|presence| matches!(presence, ServerPresence::Starting)),
+            "{presences:?}"
+        );
+        let mut records = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            records.push(record);
+        }
+        assert_eq!(records.len(), 2, "one record per change of failed reads");
+        let record = &records[0];
+        assert_eq!(record.level(), "info");
+        assert_eq!(record.component(), "mcp");
+        assert_eq!(record.message(), "election probe read failed");
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert_eq!(fields["document_call"], "File::open");
+        assert_eq!(fields["document_error_kind"], "NotFound");
+        assert_eq!(fields["election"], "Held");
+        assert_eq!(fields["presence"], "Starting");
+        assert_eq!(
+            fields["path"],
+            document_path(directory.path()).display().to_string()
+        );
+        assert!(
+            fields["document_raw_os_error"].is_string(),
+            "the OS error code rides the record: {fields}"
+        );
+        assert!(fields.get("election_call").is_none(), "{fields}");
+        assert_eq!(records[1].fields(), record.fields());
         Ok(())
     }
 }
