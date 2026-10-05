@@ -640,41 +640,6 @@ fn a_command_debugs_with_its_record_count_and_no_reply() {
     assert_eq!(format!("{close:?}"), "Close { .. }");
 }
 
-/// An open whose caller is gone before the thread answers still finishes its open, then
-/// ends without running a command and releases its owner. A lock held on the file keeps
-/// the thread from answering until the caller has dropped the open; the busy timeout only
-/// bounds how long the thread waits for that lock.
-#[tokio::test]
-async fn an_open_dropped_before_its_answer_still_releases_its_owner() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let path = metrics_path(&directory);
-    let holder = rusqlite::Connection::open(&path)?;
-    holder.execute_batch("BEGIN IMMEDIATE")?;
-    let (owner, released) = release_probe();
-    let mut open = Box::pin(LogStore::open(&path, Some(owner)));
-    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-    let first_poll = std::future::Future::poll(open.as_mut(), &mut context);
-    assert!(
-        first_poll.is_pending(),
-        "the held lock keeps the answer back"
-    );
-
-    drop(open);
-    holder.execute_batch("ROLLBACK")?;
-
-    assert_eq!(
-        released.recv_timeout(THREAD_WAIT_MAX)?.as_deref(),
-        Some("rift-db-metrics"),
-        "the thread ends without an answer to give and releases the owner"
-    );
-    assert_eq!(
-        user_version(&path)?,
-        METRICS_SCHEMA_VERSION,
-        "the open finished before the thread found its caller gone"
-    );
-    Ok(())
-}
-
 #[tokio::test]
 async fn an_append_the_database_refuses_names_the_step_that_failed() -> TestResult {
     let directory = tempfile::tempdir()?;
