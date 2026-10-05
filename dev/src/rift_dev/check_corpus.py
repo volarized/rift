@@ -69,7 +69,11 @@ from rift_dev.rift_test_client import (
     string_value,
     utc_now,
 )
-from rift_dev.trace import Collector, collector
+from rift_dev.trace import TEST_CASE_KEY, Collector, collector, resource_attribute
+
+# The OpenTelemetry specification's "Disable the SDK for all signals"; any value other than
+# "true" leaves the export enabled.
+SDK_DISABLED = "OTEL_SDK_DISABLED"
 
 # The budgets bounding one corpus case each stand strictly inside the one outside them,
 # so a breach fails naming the action that ran long instead of tearing down whatever the
@@ -202,11 +206,29 @@ class Corpus:
             root or self.root,
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
-            env={"RUST_LOG": LOG_FILTER, "NO_COLOR": "1"},
+            env={
+                "RUST_LOG": LOG_FILTER,
+                "NO_COLOR": "1",
+                "OTEL_RESOURCE_ATTRIBUTES": resource_attribute(
+                    TEST_CASE_KEY, self.test_case_name()
+                ),
+                # The nextest runner disables export in every test process; the server
+                # this case starts exports to the case's collector.
+                SDK_DISABLED: "false",
+            },
             collector=self.telemetry,
         )
         self.servers.append(server)
         return server
+
+    def test_case_name(self) -> str:
+        """The `test.case.name` every server of this case carries: the nextest attempt
+        that runs the case, as the nextest runner files telemetry under it, else the
+        repository and case."""
+        return (
+            os.environ.get("NEXTEST_ATTEMPT_ID")
+            or f"corpus:{self.pin.name}:{self.case}"
+        )
 
     def work_seconds(self) -> float:
         """The wall clock this case's own actions get.

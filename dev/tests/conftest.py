@@ -7,7 +7,7 @@ from contextlib import contextmanager
 
 import pytest
 from rift_dev import check_agent, check_artifact, check_corpus
-from rift_dev.trace import Collector, collector
+from rift_dev.trace import TEST_CASE_KEY, Collector, collector, resource_attribute
 
 
 @contextmanager
@@ -30,3 +30,15 @@ def otlp_collector() -> Iterator[Collector]:
     """A served collector for one test, stopped when the test ends."""
     with collector() as served:
         yield served
+
+
+@pytest.fixture(autouse=True)
+def test_case_name(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every process a test starts carries the test's node id as its `test.case.name`
+    resource attribute, so a collector files what it exports under the test."""
+    monkeypatch.setenv(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        resource_attribute(TEST_CASE_KEY, request.node.nodeid),
+    )

@@ -531,3 +531,5 @@ def test_the_case_collector_reaches_every_server_and_the_report(
     server = corpus.server(tmp_path / "workspace")
     assert server.collector is corpus.telemetry
     assert server.env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
+    assert server.env["OTEL_SDK_DISABLED"] == "false"
+    assert server.env["OTEL_RESOURCE_ATTRIBUTES"].startswith("test.case.name=")
