@@ -327,8 +327,8 @@ pub struct WorkspaceDatabase {
     /// Whether the close checkpoint started before its deadline and was still waiting on
     /// the worker when the deadline passed.
     checkpoint_outlasted: AtomicBool,
-    /// Records the file sizes on each tick of the process sampler while the database
-    /// lives; absent where no dispatcher holds metric values.
+    /// Records the file sizes and the worker's queue length on each tick of the process
+    /// sampler while the database lives; absent where no dispatcher holds metric values.
     _file_size_sampling: Option<rift_tracing::SampleHook>,
 }
 
@@ -484,6 +484,7 @@ impl WorkspaceDatabase {
             .await
             .map_err(|source| name.failed(database_path, source))?;
         drop(migration_lock);
+        let record_queue_length = thread.queue_length_reader();
         let opened = Self {
             name,
             path: database_path.to_owned(),
@@ -495,7 +496,10 @@ impl WorkspaceDatabase {
             checkpoint_outlasted: AtomicBool::new(false),
             _file_size_sampling: rift_tracing::sample_hook({
                 let path = database_path.to_owned();
-                move || record_file_sizes(name, &path)
+                move || {
+                    record_file_sizes(name, &path);
+                    record_queue_length();
+                }
             }),
         };
         opened.record_pool();
@@ -1526,7 +1530,9 @@ mod tests {
 
         let vectors = ("db.namespace", "vectors");
         let per_transaction = [vectors, ("db.operation.name", "transaction")];
-        let operation = series(&metrics, "db.client.operation.duration", &per_transaction)?;
+        let system = ("db.system.name", "sqlite");
+        let per_operation = [system, vectors, ("db.operation.name", "transaction")];
+        let operation = series(&metrics, "db.client.operation.duration", &per_operation)?;
         assert_eq!(operation.instrument().unit(), "s");
         assert!(
             observations(operation) >= 2,
@@ -1543,6 +1549,18 @@ mod tests {
         assert!(
             last(active).abs() < f64::EPSILON,
             "the commit ended the transaction"
+        );
+        let result = ("sqlite.transaction.result", "commit");
+        let lasted = series(&metrics, "sqlite.transaction.duration", &[vectors, result])?;
+        assert_eq!(observations(lasted), 1, "one committed transaction");
+        let statements = series(&metrics, "sqlite.transaction.statement.count", &[vectors])?;
+        assert_eq!(statements.instrument().unit(), "{statement}");
+        assert!(
+            matches!(
+                statements.value(),
+                rift_tracing::SeriesValue::Buckets { count: 1, sum, .. } if *sum >= 1.0
+            ),
+            "the transaction ran its insert: {statements:?}"
         );
 
         let pool_name = ("db.client.connection.pool.name", "vectors");
@@ -1575,9 +1593,9 @@ mod tests {
         Ok(())
     }
 
-    /// An open database registers its file sizes with the process sampler: a tick records
-    /// the write-ahead log the writes grew, and once the database drops no tick runs its
-    /// hook.
+    /// An open database registers its file sizes and its worker's queue length with the
+    /// process sampler: a tick records the write-ahead log the writes grew and the empty
+    /// queue, and once the database drops no tick runs its hook.
     #[tokio::test]
     async fn an_open_database_records_its_file_sizes_on_each_sampler_tick() -> TestResult {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
@@ -1600,6 +1618,15 @@ mod tests {
             wal_size(&recorder.metrics()),
             Some(rift_tracing::SeriesValue::Last(4_096.0)),
             "the tick read the size the file has now"
+        );
+        let queued = recorder
+            .metrics()
+            .find("sqlite.queue.length", &[("db.namespace", "index")])
+            .map(|series| (series.instrument().unit(), series.value().clone()));
+        assert_eq!(
+            queued,
+            Some(("{command}", rift_tracing::SeriesValue::Last(0.0))),
+            "no command waits in the idle worker's queue"
         );
         drop(database);
         assert_eq!(

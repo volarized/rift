@@ -18,8 +18,10 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
 
+use crate::metrics::{Gauge, Histogram};
 use crate::reads::LogReader;
 use crate::record::{LOG_BATCH_RECORDS_MAX, LogRecord};
+use crate::sampler::SampleHook;
 
 /// The schema version `.rift/metrics` carries in `PRAGMA user_version`.
 ///
@@ -52,6 +54,66 @@ const CLOSE_CLEAR_BUSY_TIMEOUT: usize = 1;
 const CLOSE_CHECKPOINT: usize = 2;
 /// [`CLOSE_STAGES`] index of the connection's close.
 const CLOSE_CONNECTION: usize = 3;
+
+/// The `db.namespace` every signal of the metrics database carries.
+const DB_NAMESPACE: &str = "metrics";
+/// The `db.operation.name` of an append's queue wait.
+const APPEND_OPERATION: &str = "append";
+/// `sqlite.queue.wait.duration`: one append from its send to the writer's dequeue.
+const QUEUE_WAIT: Histogram<2> = Histogram::declare(
+    "sqlite.queue.wait.duration",
+    &["db.namespace", "db.operation.name"],
+);
+/// `sqlite.queue.length`: commands sent to the writer and not yet received, read on the
+/// sampler tick.
+const QUEUE_LENGTH: Gauge<u64, 1> =
+    Gauge::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
+/// `sqlite.write_lock.wait.duration`: one `BEGIN IMMEDIATE` of an append, with the result
+/// code as `error.type` when it failed.
+const WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+    "sqlite.write_lock.wait.duration",
+    &["db.namespace", "error.type"],
+);
+/// `sqlite.transaction.duration`: one append transaction from its begin to its commit or
+/// rollback, by `sqlite.transaction.result`.
+const TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+    "sqlite.transaction.duration",
+    &["db.namespace", "sqlite.transaction.result"],
+);
+/// `sqlite.commit.duration`: one append's `COMMIT`, a checkpoint it runs included.
+const COMMIT_DURATION: Histogram<1> =
+    Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+/// `sqlite.file.size`: the size of the metrics database file and of its write-ahead log,
+/// read on the sampler tick.
+const FILE_SIZE: Gauge<u64, 2> = Gauge::declare(
+    "sqlite.file.size",
+    "By",
+    &["db.namespace", "sqlite.file.type"],
+);
+
+/// The `error.type` of a failed `BEGIN IMMEDIATE`: `SQLite`'s result code for busy, `5`,
+/// and for locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
+fn error_type(failure: &rusqlite::Error) -> &'static str {
+    match failure.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy) => "5",
+        Some(rusqlite::ErrorCode::DatabaseLocked) => "6",
+        _ => "_OTHER",
+    }
+}
+
+/// Records the sizes of the database file at `path` and of its write-ahead log; a file
+/// that does not exist records nothing.
+fn record_file_sizes(path: &Path) {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    for (kind, file) in [("database", path), ("wal", Path::new(&wal))] {
+        if let Ok(metadata) = std::fs::metadata(file) {
+            FILE_SIZE
+                .labeled_value([DB_NAMESPACE, kind], metadata.len())
+                .record();
+        }
+    }
+}
 
 /// The metrics database's tables, created when the file holds no schema version.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS log_records(
@@ -324,6 +386,8 @@ enum Command {
     Append {
         records: Vec<LogRecord>,
         retention_records: u64,
+        /// When the caller started to send it.
+        queued: std::time::Instant,
         reply: oneshot::Sender<Result<u64, RiftError>>,
     },
     /// Checkpoint, close the connection, release the owner, then answer.
@@ -342,6 +406,9 @@ pub struct LogStore {
     sender: mpsc::Sender<Command>,
     closed: OnceLock<StoreClose>,
     progress: Arc<CloseProgress>,
+    /// Records the queue length and the file sizes on each sampler tick while the store
+    /// lives; absent where no dispatcher holds metric values.
+    _sampling: Option<SampleHook>,
 }
 
 impl std::fmt::Debug for Command {
@@ -379,10 +446,20 @@ impl LogStore {
         let thread_path = Arc::clone(&database);
         let progress = Arc::new(CloseProgress::default());
         let thread_progress = Arc::clone(&progress);
+        // The writer records its measurements into the dispatcher current at the open,
+        // without making it the thread's default: nothing on the thread logs.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         thread::Builder::new()
             .name(WRITER_THREAD_NAME.to_owned())
             .spawn(move || {
-                MetricsWriter::run(&thread_path, owner, receiver, ready, &thread_progress);
+                MetricsWriter::run(
+                    &thread_path,
+                    owner,
+                    receiver,
+                    ready,
+                    &thread_progress,
+                    dispatch,
+                );
             })
             .map_err(|source| store_failure("start the writer thread", path, source))?;
         answer.await.map_err(|_| {
@@ -392,11 +469,22 @@ impl LogStore {
                 std::io::Error::other("the writer thread stopped before it answered"),
             )
         })??;
+        let queue = sender.downgrade();
+        let sampled = Arc::clone(&database);
         Ok(Self {
             path: database,
             sender,
             closed: OnceLock::new(),
             progress,
+            _sampling: crate::sampler::sample_hook(move || {
+                if let Some(sender) = queue.upgrade() {
+                    let queued = sender.max_capacity().saturating_sub(sender.capacity());
+                    QUEUE_LENGTH
+                        .labeled_value([DB_NAMESPACE], u64::try_from(queued).unwrap_or(u64::MAX))
+                        .record();
+                }
+                record_file_sizes(&sampled);
+            }),
         })
     }
 
@@ -449,6 +537,7 @@ impl LogStore {
         let command = Command::Append {
             records: records.to_vec(),
             retention_records,
+            queued: std::time::Instant::now(),
             reply,
         };
         self.request(command, answer, "append").await
@@ -547,10 +636,12 @@ impl LogStore {
     }
 }
 
-/// The writer thread's state: the one write connection and the file it writes.
+/// The writer thread's state: the one write connection, the file it writes, and the
+/// dispatcher its measurements land in.
 struct MetricsWriter {
     connection: Connection,
     path: Arc<Path>,
+    dispatch: tracing::Dispatch,
 }
 
 impl MetricsWriter {
@@ -562,8 +653,9 @@ impl MetricsWriter {
         mut receiver: mpsc::Receiver<Command>,
         ready: oneshot::Sender<Result<(), RiftError>>,
         progress: &CloseProgress,
+        dispatch: tracing::Dispatch,
     ) {
-        let mut writer = match Self::open(path) {
+        let mut writer = match Self::open(path, dispatch) {
             Ok(writer) => writer,
             Err(error) => {
                 let _ = ready.send(Err(error));
@@ -578,8 +670,14 @@ impl MetricsWriter {
                 Command::Append {
                     records,
                     retention_records,
+                    queued,
                     reply,
                 } => {
+                    QUEUE_WAIT.record_in(
+                        &writer.dispatch,
+                        [DB_NAMESPACE, APPEND_OPERATION],
+                        queued.elapsed(),
+                    );
                     let _ = reply.send(writer.append(&records, retention_records));
                 }
                 Command::Close { reply } => {
@@ -593,7 +691,7 @@ impl MetricsWriter {
     }
 
     /// Opens the write connection, sets its PRAGMAs once, and prepares the schema.
-    fn open(path: &Arc<Path>) -> Result<Self, RiftError> {
+    fn open(path: &Arc<Path>, dispatch: tracing::Dispatch) -> Result<Self, RiftError> {
         let failure =
             |operation: &str, source: rusqlite::Error| store_failure(operation, path, source);
         let mut connection = Connection::open(path).map_err(|source| failure("open", source))?;
@@ -613,6 +711,7 @@ impl MetricsWriter {
         Ok(Self {
             connection,
             path: Arc::clone(path),
+            dispatch,
         })
     }
 
@@ -620,12 +719,22 @@ impl MetricsWriter {
     /// immediate transaction. Answers the count the trim dropped.
     fn append(&mut self, records: &[LogRecord], retention_records: u64) -> Result<u64, RiftError> {
         let path = Arc::clone(&self.path);
+        let dispatch = &self.dispatch;
         let failure =
             |operation: &str, source: rusqlite::Error| store_failure(operation, &path, source);
-        let transaction = self
+        let started = std::time::Instant::now();
+        let begun = self
             .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| failure("begin append", source))?;
+            .transaction_with_behavior(TransactionBehavior::Immediate);
+        let failed = begun.as_ref().err().map_or("", error_type);
+        WRITE_LOCK_WAIT.record_in(dispatch, [DB_NAMESPACE, failed], started.elapsed());
+        let transaction = begun.map_err(|source| failure("begin append", source))?;
+        // A transaction dropped on an early return rolls back.
+        let mut ended = TransactionEnd {
+            dispatch,
+            begun: std::time::Instant::now(),
+            result: "rollback",
+        };
         let newest: i64 = transaction
             .query_row("SELECT COALESCE(MAX(id), 0) FROM log_records", [], |row| {
                 row.get(0)
@@ -658,9 +767,11 @@ impl MetricsWriter {
             .prepare_cached(TRIM_RECORDS)
             .and_then(|mut trim| trim.execute([last.saturating_sub(retained)]))
             .map_err(|source| failure("trim records", source))?;
-        transaction
-            .commit()
-            .map_err(|source| failure("commit append", source))?;
+        let commit = std::time::Instant::now();
+        let committed = transaction.commit();
+        COMMIT_DURATION.record_in(dispatch, [DB_NAMESPACE], commit.elapsed());
+        committed.map_err(|source| failure("commit append", source))?;
+        ended.result = "commit";
         Ok(dropped as u64)
     }
 
@@ -668,7 +779,9 @@ impl MetricsWriter {
     /// closes the connection. No transaction is open: the thread runs one command at a time.
     /// Starts each stage in `progress` before running it.
     fn close(self, progress: &CloseProgress) -> Result<WalCheckpoint, RiftError> {
-        let Self { connection, path } = self;
+        let Self {
+            connection, path, ..
+        } = self;
         let failure =
             |operation: &str, source: rusqlite::Error| store_failure(operation, &path, source);
         progress.start(CLOSE_CLEAR_BUSY_TIMEOUT);
@@ -692,6 +805,24 @@ impl MetricsWriter {
             .map_err(|(_connection, source)| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
         progress.end();
         Ok(checkpoint)
+    }
+}
+
+/// Records `sqlite.transaction.duration` for one append transaction when it drops, under
+/// the `sqlite.transaction.result` it ended with.
+struct TransactionEnd<'dispatch> {
+    dispatch: &'dispatch tracing::Dispatch,
+    begun: std::time::Instant,
+    result: &'static str,
+}
+
+impl Drop for TransactionEnd<'_> {
+    fn drop(&mut self) {
+        TRANSACTION_DURATION.record_in(
+            self.dispatch,
+            [DB_NAMESPACE, self.result],
+            self.begun.elapsed(),
+        );
     }
 }
 

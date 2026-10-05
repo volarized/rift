@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rift_tracing::{Counter, Gauge, Histogram, PerformanceMeasurement};
+use rift_tracing::{CountHistogram, Counter, Gauge, Histogram, PerformanceMeasurement};
 use toasty_core::Schema;
 use toasty_core::driver::operation::{Operation, Transaction, TransactionMode};
 use toasty_core::driver::{
@@ -23,10 +23,40 @@ const CONNECTION_REAP_SPAN: Duration = Duration::from_millis(100);
 
 /// `db.client.operation.duration`: one driver operation's execution on the worker, its
 /// time in the queue left out.
-const OPERATION_DURATION: Histogram<3> = Histogram::declare(
+const OPERATION_DURATION: Histogram<5> = Histogram::declare(
     "db.client.operation.duration",
-    &["db.namespace", "db.operation.name", "error.type"],
+    &[
+        "db.system.name",
+        "db.namespace",
+        "db.operation.name",
+        "db.response.status_code",
+        "error.type",
+    ],
 );
+/// The `db.system.name` of every database the worker serves.
+const DB_SYSTEM: &str = "sqlite";
+/// `sqlite.queue.length`: commands sent to the worker and not yet received, read on the
+/// sampler tick.
+const QUEUE_LENGTH: Gauge<u64, 1> =
+    Gauge::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
+/// `sqlite.transaction.duration`: one transaction from its begin's answer to its commit's
+/// or rollback's answer, by `sqlite.transaction.result`.
+const TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+    "sqlite.transaction.duration",
+    &["db.namespace", "sqlite.transaction.result"],
+);
+/// `sqlite.transaction.statement.count`: the statements one transaction ran, its begin,
+/// its savepoints, and its end left out.
+const TRANSACTION_STATEMENTS: CountHistogram<1> = CountHistogram::declare(
+    "sqlite.transaction.statement.count",
+    "{statement}",
+    &["db.namespace"],
+    &STATEMENT_BOUNDARIES,
+);
+/// Upper bucket bounds of [`TRANSACTION_STATEMENTS`], in statements.
+const STATEMENT_BOUNDARIES: [f64; 13] = [
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+];
 /// `sqlite.queue.wait.duration`: one driver operation's round trip to the worker less its
 /// execution there: the wait to enter the queue, the wait in it, and the reply.
 const QUEUE_WAIT: Histogram<2> = Histogram::declare(
@@ -52,9 +82,34 @@ const TRANSACTION_ACTIVE: Gauge<u64, 1> = Gauge::declare(
 const COMMIT_DURATION: Histogram<1> =
     Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
 
-/// The `error.type` of a failed driver operation. The driver's `SQLite` result code sits
-/// inside a `rusqlite` error this crate does not name, so every failure shares one value.
+/// The `error.type` of a failed driver operation; its `SQLite` result code, when it has
+/// one, is the `db.response.status_code` beside it.
 const OPERATION_FAILED: &str = "_OTHER";
+
+/// The primary `SQLite` result codes as `db.response.status_code` text, indexed by code.
+const RESULT_CODES: [&str; 29] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28",
+];
+
+/// The `db.response.status_code` of `failure`: the primary result code of the `SQLite`
+/// failure in its source chain, or no value when none carries one.
+fn result_code(failure: &toasty_core::Error) -> &'static str {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(failure);
+    while let Some(current) = source {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            current.downcast_ref::<rusqlite::Error>()
+        {
+            return usize::try_from(code.extended_code & 0xff)
+                .ok()
+                .and_then(|primary| RESULT_CODES.get(primary))
+                .copied()
+                .unwrap_or(OPERATION_FAILED);
+        }
+        source = current.source();
+    }
+    ""
+}
 
 pub(crate) struct DatabaseThread {
     name: DatabaseName,
@@ -242,6 +297,22 @@ impl DatabaseThread {
             .map_err(|_| worker_error("SQLite worker stopped before returning operation"))?
     }
 
+    /// A reader that records `sqlite.queue.length`, the commands sent to the worker and not
+    /// yet received, for a sampler hook. It holds the queue weakly, so it keeps no worker
+    /// running, and records nothing once the queue closed.
+    pub(crate) fn queue_length_reader(&self) -> impl Fn() + Send + Sync + 'static {
+        let name = self.name;
+        let queue = self.sender.downgrade();
+        move || {
+            if let Some(sender) = queue.upgrade() {
+                let queued = sender.max_capacity().saturating_sub(sender.capacity());
+                QUEUE_LENGTH
+                    .labeled_value([name.label()], u64::try_from(queued).unwrap_or(u64::MAX))
+                    .record();
+            }
+        }
+    }
+
     /// Counts one transaction begun, or with `begun` false one ended, and records the count.
     fn count_transaction(&self, begun: bool) {
         let active = if begun {
@@ -362,6 +433,7 @@ impl Driver for SqliteThreadDriver {
             id,
             _lease: lease,
             transaction_open: false,
+            transaction: None,
         }))
     }
 
@@ -385,6 +457,16 @@ struct SqliteThreadConnection {
     _lease: Arc<()>,
     /// Whether a transaction began on the connection and has not ended.
     transaction_open: bool,
+    /// The open transaction's measurements, absent outside one.
+    transaction: Option<OpenTransaction>,
+}
+
+/// What one open transaction measures until it ends: when its begin was answered and the
+/// statements it ran since.
+#[derive(Clone, Copy, Debug)]
+struct OpenTransaction {
+    begun: Instant,
+    statements: u64,
 }
 
 impl Drop for SqliteThreadConnection {
@@ -392,6 +474,8 @@ impl Drop for SqliteThreadConnection {
         if std::mem::take(&mut self.transaction_open) {
             self.actor.count_transaction(false);
         }
+        // Closing a connection inside a transaction rolls it back.
+        self.end_transaction(TRANSACTION_ROLLBACK);
         let _ = self.actor.sender.try_send(Command::Close { id: self.id });
     }
 }
@@ -406,7 +490,9 @@ enum OperationRole {
     Begin,
     Commit,
     Rollback,
-    /// A statement, or a savepoint inside a transaction.
+    /// A savepoint inside a transaction: set, released, or rolled back to.
+    Savepoint,
+    /// A statement.
     Statement,
 }
 
@@ -420,6 +506,7 @@ impl OperationRole {
             Operation::Transaction(Transaction::Start { .. }) => Self::Begin,
             Operation::Transaction(Transaction::Commit) => Self::Commit,
             Operation::Transaction(Transaction::Rollback) => Self::Rollback,
+            Operation::Transaction(_) => Self::Savepoint,
             _ => Self::Statement,
         }
     }
@@ -445,14 +532,13 @@ impl SqliteThreadConnection {
         round_trip: Option<PerformanceMeasurement>,
     ) {
         let database = self.actor.name.label();
-        let failed = if executed.result.is_err() {
-            OPERATION_FAILED
-        } else {
-            ""
+        let (status, failed) = match &executed.result {
+            Ok(_) => ("", ""),
+            Err(failure) => (result_code(failure), OPERATION_FAILED),
         };
         if let Some(took) = executed.took {
             OPERATION_DURATION
-                .labeled([database, operation, failed])
+                .labeled([DB_SYSTEM, database, operation, status, failed])
                 .record(took);
             if let Some(round_trip) = round_trip {
                 QUEUE_WAIT
@@ -471,19 +557,53 @@ impl SqliteThreadConnection {
                 if executed.result.is_ok() && !self.transaction_open {
                     self.transaction_open = true;
                     self.actor.count_transaction(true);
+                    self.transaction = Some(OpenTransaction {
+                        begun: Instant::now(),
+                        statements: 0,
+                    });
                 }
-                false
+                None
             }
             // A refused commit leaves the transaction open for its rollback.
-            OperationRole::Commit => executed.result.is_ok(),
-            OperationRole::Rollback => true,
-            OperationRole::Statement => false,
+            OperationRole::Commit => executed.result.is_ok().then_some(TRANSACTION_COMMIT),
+            OperationRole::Rollback => Some(TRANSACTION_ROLLBACK),
+            OperationRole::Savepoint => None,
+            OperationRole::Statement => {
+                if let Some(open) = &mut self.transaction {
+                    open.statements = open.statements.saturating_add(1);
+                }
+                None
+            }
         };
-        if ended && std::mem::take(&mut self.transaction_open) {
-            self.actor.count_transaction(false);
+        if let Some(result) = ended {
+            if std::mem::take(&mut self.transaction_open) {
+                self.actor.count_transaction(false);
+            }
+            self.end_transaction(result);
         }
     }
+
+    /// Records the open transaction's duration under `result` and its statement count,
+    /// and forgets it; outside a transaction it records nothing.
+    fn end_transaction(&mut self, result: &'static str) {
+        let Some(open) = self.transaction.take() else {
+            return;
+        };
+        let database = self.actor.name.label();
+        TRANSACTION_DURATION
+            .labeled([database, result])
+            .record(open.begun.elapsed());
+        TRANSACTION_STATEMENTS
+            .labeled([database])
+            .record(open.statements);
+    }
 }
+
+/// The `sqlite.transaction.result` of a committed transaction.
+const TRANSACTION_COMMIT: &str = "commit";
+/// The `sqlite.transaction.result` of a transaction rolled back, by request or by closing
+/// its connection.
+const TRANSACTION_ROLLBACK: &str = "rollback";
 
 #[async_trait]
 impl DriverConnection for SqliteThreadConnection {
@@ -1356,5 +1476,26 @@ mod tests {
                 .await
                 .expect("worker must stop");
         }
+    }
+
+    /// A driver failure names the primary result code of the `SQLite` failure it wraps,
+    /// an extended code included, and a failure that wraps none names no code.
+    #[test]
+    fn a_driver_failure_names_its_primary_sqlite_result_code() {
+        use rusqlite::ffi;
+
+        let failure = |code| {
+            toasty_core::Error::driver_operation_failed(rusqlite::Error::SqliteFailure(
+                ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert_eq!(super::result_code(&failure(ffi::SQLITE_BUSY)), "5");
+        assert_eq!(
+            super::result_code(&failure(ffi::SQLITE_LOCKED_SHAREDCACHE)),
+            "6"
+        );
+        assert_eq!(super::result_code(&failure(ffi::SQLITE_IOERR_READ)), "10");
+        assert_eq!(super::result_code(&super::worker_error("stopped")), "");
     }
 }
