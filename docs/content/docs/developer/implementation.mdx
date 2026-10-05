@@ -695,7 +695,10 @@ records `process.memory.usage`, `process.memory.virtual`, `process.cpu.utilizati
 `process.cpu.time`, `process.disk.io`, and the open file count:
 `process.unix.file_descriptor.count`, or `process.windows.handle.count` on Windows. A value the
 platform does not report stays absent and is never recorded as zero, and CPU usage is absent
-until a second sample at least 200 ms after the first. With the `otlp` feature and
+until a second sample at least 200 ms after the first. The same blocking read runs every sample
+hook registered through `rift_tracing::sample_hook`: each open `.rift/index` and `.rift/vectors`
+database registers one that records `sqlite.file.size` for the database file and its write-ahead
+log, so the sizes move on each tick between open and close. With the `otlp` feature and
 `OTEL_EXPORTER_OTLP_ENDPOINT` set, every recorded value is also forwarded to an OpenTelemetry
 meter whose reader exports at `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default.
 

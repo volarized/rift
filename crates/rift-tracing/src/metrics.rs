@@ -694,6 +694,11 @@ impl MetricLayer {
     pub(crate) const fn new(values: Arc<MetricValues>) -> Self {
         Self { values }
     }
+
+    /// The metric values the layer carries.
+    pub(crate) fn values(&self) -> &MetricValues {
+        &self.values
+    }
 }
 
 impl<S: Subscriber> Layer<S> for MetricLayer {}

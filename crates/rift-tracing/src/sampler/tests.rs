@@ -514,3 +514,124 @@ async fn a_tick_reads_the_runtime_into_the_runtime_group() {
         "the first tick read the runtime before the second read began"
     );
 }
+
+/// A dispatcher over `values` alone, as a runtime's carries them.
+fn dispatch_over(values: &Arc<MetricValues>) -> tracing::Dispatch {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    tracing::Dispatch::new(
+        tracing_subscriber::registry().with(crate::metrics::MetricLayer::new(Arc::clone(values))),
+    )
+}
+
+/// A hook runs on each tick and records into the values of the dispatcher it was
+/// registered under; once its owner drops it, it runs at most the tick already started and
+/// then leaves.
+#[tokio::test(start_paused = true)]
+async fn a_sample_hook_runs_on_each_tick_until_its_owner_drops() -> TestResult {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const HOOKED: crate::Gauge<u64, 0> = crate::Gauge::declare("test.hooked", "{run}", &[]);
+    let values = Arc::new(MetricValues::default());
+    let runs = Arc::new(AtomicU64::new(0));
+    let dispatch = dispatch_over(&values);
+    let hook = tracing::dispatcher::with_default(&dispatch, || {
+        let runs = Arc::clone(&runs);
+        crate::sample_hook(move || {
+            let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+            HOOKED.value(run).record();
+        })
+    })
+    .ok_or("the dispatcher holds metric values")?;
+    let (sent, mut reads) = mpsc::unbounded_channel();
+    let sampler = ProcessSampler::spawn(
+        CountingReader { reads: 0, sent },
+        Duration::from_secs(1),
+        Arc::clone(&values),
+        TickEvidence::default(),
+    );
+    for expected in 1..=3 {
+        assert_eq!(reads.recv().await, Some(expected));
+    }
+    let before_drop = runs.load(Ordering::SeqCst);
+    assert!(before_drop >= 2, "two ticks finished: {before_drop}");
+    assert_eq!(
+        unlabeled(&values, "test.hooked"),
+        Some(SeriesValue::Last(f64::from(u32::try_from(before_drop)?)))
+    );
+    drop(hook);
+    assert_eq!(reads.recv().await, Some(4));
+    let settled = runs.load(Ordering::SeqCst);
+    assert!(settled <= 3, "only the tick already started ran: {settled}");
+    assert_eq!(reads.recv().await, Some(5));
+    assert_eq!(reads.recv().await, Some(6));
+    sampler.stopped().await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        settled,
+        "no run after the owner dropped"
+    );
+    assert_eq!(values.hooks().registered(), 0, "the dropped hook left");
+    Ok(())
+}
+
+/// A dispatcher keeps at most `SAMPLE_HOOKS_MAX` hooks: one more is refused until an owner
+/// drops its own.
+#[test]
+fn sample_hooks_past_the_bound_are_refused_until_one_drops() -> TestResult {
+    let values = Arc::new(MetricValues::default());
+    let dispatch = dispatch_over(&values);
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut hooks: Vec<_> = (0..crate::SAMPLE_HOOKS_MAX)
+            .map(|_| crate::sample_hook(|| {}))
+            .collect::<Option<_>>()
+            .ok_or("every hook within the bound registers")?;
+        assert!(crate::sample_hook(|| {}).is_none(), "one past the bound");
+        hooks.pop();
+        let again = crate::sample_hook(|| {});
+        assert!(again.is_some(), "a dropped owner frees its place");
+        assert_eq!(values.hooks().registered(), crate::SAMPLE_HOOKS_MAX);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    assert!(
+        crate::sample_hook(|| {}).is_none(),
+        "a thread whose dispatcher holds no metric values registers nothing"
+    );
+    Ok(())
+}
+
+/// A hook that panics loses its own run; the sampler keeps ticking and the next hook runs.
+#[tokio::test(start_paused = true)]
+async fn a_panicking_sample_hook_leaves_the_sampler_ticking() -> TestResult {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let values = Arc::new(MetricValues::default());
+    let runs = Arc::new(AtomicU64::new(0));
+    let dispatch = dispatch_over(&values);
+    let (panicking, counting) = tracing::dispatcher::with_default(&dispatch, || {
+        let runs = Arc::clone(&runs);
+        (
+            crate::sample_hook(|| panic!("a hook that fails")),
+            crate::sample_hook(move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+    });
+    let (sent, mut reads) = mpsc::unbounded_channel();
+    let sampler = ProcessSampler::spawn(
+        CountingReader { reads: 0, sent },
+        Duration::from_secs(1),
+        Arc::clone(&values),
+        TickEvidence::default(),
+    );
+    for expected in 1..=3 {
+        assert_eq!(reads.recv().await, Some(expected));
+    }
+    sampler.stopped().await;
+    assert!(
+        runs.load(Ordering::SeqCst) >= 2,
+        "the next hook ran on every tick"
+    );
+    drop((panicking, counting));
+    Ok(())
+}
