@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
-use super::lock;
+use super::{Refusal, lock};
 use crate::flight::with_table;
 use crate::{LogRecord, MetricSnapshot, ScopedRecorder, SeriesValue};
 
@@ -338,4 +338,207 @@ async fn without_a_subscriber_a_lock_still_locks_and_records_nothing() {
     drop(turn);
     assert_eq!(*writes.lock().await, 1);
     assert!(with_table(|table| table.holder_of("index.write")).is_none());
+}
+
+#[tokio::test]
+async fn a_fallible_wait_refused_at_its_first_poll_ends_refused_and_holds_nothing() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let refused = crate::traced!("database.open", async {
+        lock("index.migration")
+            .acquire_fallible(async { Err::<(), _>(Refusal::Refused("locked elsewhere")) })
+            .await
+    })
+    .await;
+    let metrics = recorder.metrics();
+    drop(recorder);
+
+    assert_eq!(refused.err(), Some("locked elsewhere"));
+    let records = drain.queued_records();
+    let waits = closed(&records, "lock.wait");
+    assert_eq!(waits.len(), 1, "a refusal leaves a wait record");
+    let wait = fields(waits[0])?;
+    assert_eq!(wait["outcome"], "refused");
+    assert_eq!(wait["waiter"], "database.open");
+    assert!(closed(&records, "lock.held").is_empty(), "no hold");
+    let refused = [
+        ("lock.name", "index.migration"),
+        ("lock.mode", "exclusive"),
+        ("error.type", "refused"),
+    ];
+    assert_eq!(count(&metrics, "lock.wait.duration", &refused), 1);
+    let labels = [("lock.name", "index.migration"), ("lock.mode", "exclusive")];
+    assert_eq!(count(&metrics, "lock.held.duration", &labels), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fallible_wait_that_runs_out_its_budget_ends_timeout_at_the_budget() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let budget = Duration::from_millis(1_000);
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0_u32;
+    let timed_out = lock("index.migration")
+        .acquire_fallible(async {
+            let deadline = started + budget;
+            loop {
+                attempts += 1;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err::<(), _>(Refusal::Timeout("budget spent"));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    let waited = started.elapsed();
+    let metrics = recorder.metrics();
+    drop(recorder);
+
+    assert_eq!(timed_out.err(), Some("budget spent"));
+    assert_eq!(waited, budget, "the wait ends at the attempt on the budget");
+    assert_eq!(
+        attempts, 101,
+        "one attempt per poll, the last on the budget"
+    );
+    let records = drain.queued_records();
+    let waits = closed(&records, "lock.wait");
+    assert_eq!(waits.len(), 1);
+    assert_eq!(fields(waits[0])?["outcome"], "timeout");
+    assert!(closed(&records, "lock.held").is_empty(), "no hold");
+    let timeout = [
+        ("lock.name", "index.migration"),
+        ("lock.mode", "exclusive"),
+        ("error.type", "timeout"),
+    ];
+    match metrics
+        .find("lock.wait.duration", &timeout)
+        .map(crate::MetricSeries::value)
+    {
+        Some(SeriesValue::Buckets { count, .. }) => assert_eq!(*count, 1),
+        other => return Err(format!("no timeout series: {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fallible_wait_that_acquires_after_waiting_holds_like_any_other() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let writes = Mutex::new(());
+    let holder = lock("index.write").acquire(writes.lock()).await;
+    let mut waiter = pin!(crate::traced!("lexical.commit", async {
+        lock("index.write")
+            .acquire_fallible(async { Ok::<_, Refusal<()>>(writes.lock().await) })
+            .await
+    }));
+    assert!(pending_after_one_poll(&mut waiter).await);
+    drop(holder);
+    let turn = waiter.await.map_err(|()| "the wait acquires")?;
+    assert!(writes.try_lock().is_err(), "the guard holds the lock");
+    drop(turn);
+    assert!(writes.try_lock().is_ok(), "the guard drops with the hold");
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let waits = closed(&records, "lock.wait");
+    assert_eq!(waits.len(), 1);
+    assert_eq!(fields(waits[0])?["outcome"], "acquired");
+    let holds = closed(&records, "lock.held");
+    assert_eq!(holds.len(), 2);
+    assert_eq!(holds[1].level(), "info", "a contended hold reaches info");
+    assert_eq!(fields(holds[1])?["holder"], "lexical.commit");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fallible_wait_dropped_while_pending_ends_cancelled() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let writes = Mutex::new(());
+    let holder = lock("index.write").acquire(writes.lock()).await;
+    {
+        let mut waiter = pin!(
+            lock("index.write")
+                .acquire_fallible(async { Ok::<_, Refusal<()>>(writes.lock().await) })
+        );
+        assert!(pending_after_one_poll(&mut waiter).await);
+    }
+    drop(holder);
+    assert!(
+        writes.try_lock().is_ok(),
+        "the cancelled waiter left the queue"
+    );
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let waits = closed(&records, "lock.wait");
+    assert_eq!(waits.len(), 1);
+    assert_eq!(fields(waits[0])?["outcome"], "cancelled");
+    assert_eq!(closed(&records, "lock.held").len(), 1, "the holder's alone");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_mapped_hold_keeps_its_span_and_records_once() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let writes = Mutex::new(());
+    let turn = lock("index.write").acquire(writes.lock()).await;
+    let mapped = turn.map(|guard| (guard, 7_u8));
+    assert_eq!(mapped.1, 7);
+    assert!(
+        writes.try_lock().is_err(),
+        "the mapped value keeps the guard"
+    );
+    let holder = with_table(|table| table.listing(Duration::MAX).in_flight).ok_or("a table")?;
+    drop(mapped);
+    assert!(writes.try_lock().is_ok());
+    let metrics = recorder.metrics();
+    drop(recorder);
+
+    assert_eq!(holder, 1, "one hold in flight across the map");
+    assert_eq!(closed(&drain.queued_records(), "lock.held").len(), 1);
+    let labels = [("lock.name", "index.write"), ("lock.mode", "exclusive")];
+    assert_eq!(count(&metrics, "lock.held.duration", &labels), 1);
+    Ok(())
+}
+
+/// A guard that reports, as it drops, whether its hold was still in the table.
+struct Reporting(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for Reporting {
+    fn drop(&mut self) {
+        let in_flight =
+            with_table(|table| table.listing(Duration::MAX).in_flight).unwrap_or(u64::MAX);
+        self.0.store(in_flight, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_hold_releases_its_guard_before_it_closes_its_record() -> TestResult {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (recorder, _drain) = ScopedRecorder::builder().install()?;
+    let seen = Arc::new(AtomicU64::new(u64::MAX));
+    let held = lock("index.write")
+        .try_acquire(|| Ok::<_, ()>(Reporting(Arc::clone(&seen))))
+        .map_err(|()| "the attempt succeeds")?;
+    drop(held);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        1,
+        "the hold was open as the guard dropped"
+    );
+    let mapped = lock("index.write")
+        .try_acquire(|| Ok::<_, ()>(()))
+        .map_err(|()| "the attempt succeeds")?
+        .map(|()| Reporting(Arc::clone(&seen)));
+    seen.store(u64::MAX, Ordering::SeqCst);
+    drop(mapped);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        1,
+        "a mapped value drops first too"
+    );
+    let after = with_table(|table| table.listing(Duration::MAX).in_flight).ok_or("a table")?;
+    assert_eq!(after, 0, "the hold closed after the guard");
+    drop(recorder);
+    Ok(())
 }

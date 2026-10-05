@@ -727,8 +727,11 @@ runs and a killed server leaves it behind. `lexical.commit` opens this way.
 `mutex.lock()`, and polls it as the caller would, so the lock's queue order and cancellation
 stay its own. A wait that does not acquire at its first poll opens a `lock.wait` span naming
 `lock.name`, `lock.mode`, the `waiter` operation, and the `holder` operation, and closes it with
-`outcome` `acquired`, `refused`, `timeout`, or `cancelled`. The returned guard dereferences to the
-wrapped guard and keeps a `lock.held` span open until it drops. Both feed `lock.wait.duration`
+`outcome` `acquired`, `refused`, `timeout`, or `cancelled`. An acquisition that can fail, such as
+the migration lock's attempts within the busy-wait budget, goes through `acquire_fallible`, whose
+future answers the guard or a `Refusal`: `Refusal::Refused` ends the wait `refused`,
+`Refusal::Timeout` ends it `timeout`, and neither opens a hold. The returned guard dereferences to
+the wrapped guard and keeps a `lock.held` span open until it drops. Both feed `lock.wait.duration`
 and `lock.held.duration`. The write turn of `.rift/index` and `.rift/vectors` is recorded as
 `index.write` and `vectors.write`, so a lexical commit that waits for a documentation write shows
 as a `lock.wait` entry under `lexical.commit` while the holder's `lock.held` entry names the
