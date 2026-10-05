@@ -657,6 +657,13 @@ A foreground server whose stderr is not a terminal writes at most 1 MiB there. T
 crosses the bound is followed by one notice, `standard error reached its byte bound`, and every
 later write is discarded; the records the `LogSink` captured are unaffected.
 
+Every workspace crate other than `rift-tracing` emits through it: spans through `traced!`,
+`info_span!`, and `Span`, events through its `trace!` to `error!`, elapsed time a caller acts on
+through `measure_elapsed!`, and test capture through `ScopedRecorder`.
+The architecture check refuses a `tracing`, `tracing-subscriber`, `log`, or OpenTelemetry
+dependency or import in any other crate, and a normal dependency that enables `rift-tracing`'s
+`fixtures` feature, which compiles the test recorder into a release build.
+
 ## Shared ranking
 
 `rift-ranking` states the retrieval decisions every index makes: the document shape and its
