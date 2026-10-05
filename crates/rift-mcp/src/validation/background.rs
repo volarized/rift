@@ -55,7 +55,11 @@ pub(super) async fn start(
     Ok(Some((BackgroundValidation::new(&configuration), hold)))
 }
 
-/// A deadline that filesystem events and requests never postpone.
+/// A deadline that filesystem events and requests never move.
+///
+/// The validation that deadline makes due runs on the supervisor's next turn, with one
+/// exception: on the turn after a superseded rebuild the owed rebuild runs first, until
+/// the validation is one interval late. See [`Self::rebuild_runs_first`].
 pub(super) struct BackgroundValidation {
     interval: Duration,
     deadline: Instant,
@@ -84,6 +88,43 @@ impl BackgroundValidation {
             () = tokio::time::sleep_until(self.deadline) => Some(Trigger::Validation),
             received = invalidations.recv() => received.map(|()| Trigger::Filesystem),
         }
+    }
+
+    /// Whether the rebuild a superseded turn left owed runs before this due validation.
+    ///
+    /// The reads waiting on that rebuild already waited for a capture that published
+    /// nothing, and a validation ahead of it adds one whole-tree capture to their wait.
+    /// Each of those reads captured the tree itself, so the validation tells them nothing.
+    /// The rebuild runs first while the validation is less than one interval late. From
+    /// then on the validation runs first, so rebuilds superseded back to back delay a
+    /// check by one interval at most, plus the rebuild running when that interval ends.
+    pub(super) fn rebuild_runs_first(&self, now: Instant) -> bool {
+        now < self.deadline + self.interval
+    }
+
+    /// Whether this turn's validation waits for the owed rebuild, recording that it does.
+    ///
+    /// It waits when `trigger` made it due, the last rebuild turn ended superseded, and
+    /// [`Self::rebuild_runs_first`] still holds. The deadline stays elapsed, so the
+    /// validation takes the turn after that rebuild.
+    pub(super) fn defers(
+        &self,
+        trigger: Trigger,
+        after_superseded: bool,
+        observed_epoch: u64,
+    ) -> bool {
+        let deferred = after_superseded
+            && trigger == Trigger::Validation
+            && self.rebuild_runs_first(Instant::now());
+        if deferred {
+            tracing::debug!(
+                component = "index",
+                operation = "index.validate",
+                observed_epoch,
+                "background filesystem validation deferred"
+            );
+        }
+        deferred
     }
 
     /// Captures using the same inclusion and racy-stat rules as current-tree reads.
@@ -361,6 +402,176 @@ mod tests {
         );
         cancellation.cancel();
         assert_eq!(background.next(&mut receiver, &cancellation).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_runs_first_until_the_validation_is_one_interval_late() {
+        let background = BackgroundValidation::new(&ServerConfiguration::default());
+        let interval = background.interval;
+        tokio::time::advance(interval).await;
+        assert!(
+            background.rebuild_runs_first(Instant::now()),
+            "a validation that just came due lets the owed rebuild run"
+        );
+        tokio::time::advance(interval.saturating_sub(Duration::from_millis(1))).await;
+        assert!(background.rebuild_runs_first(Instant::now()));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            !background.rebuild_runs_first(Instant::now()),
+            "a validation one interval late runs before the rebuild"
+        );
+    }
+
+    /// Runs the supervisor over one edit whose rebuild is superseded at publication, with
+    /// a second file created without an observation, and answers the paths each capture
+    /// was asked for, in order, with the records the supervisor wrote.
+    ///
+    /// The first capture reads the edit and then waits. While it waits the test moves the
+    /// clock `late` past the supervisor's start, rewrites the edited file, observes it,
+    /// and creates the second file. Only a validation finds that file, so the paths the
+    /// second capture names say whether the validation ran before it.
+    async fn captures_after_a_superseded_rebuild(
+        late: Duration,
+    ) -> Result<(Vec<Vec<String>>, Vec<String>), Box<dyn std::error::Error>> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (sink, mut drain) = rift_tracing::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        std::fs::write(
+            root.join("rift.toml"),
+            "[server]\nvalidation_interval = \"1s\"\n",
+        )?;
+        std::fs::write(root.join("lib.rs"), "pub fn old() {}\n")?;
+        let (context, invalidations) = stable_context(root)?;
+        let published = Arc::clone(&context.published);
+        let validation = Arc::clone(&context.validation);
+        let (started, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let release_receiver = Mutex::new(Some(release_receiver));
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::clone(&captures);
+        let capture = Arc::new(
+            move |root: &std::path::Path,
+                  limits: rift_index::WorkspaceIndexLimits,
+                  request: &super::super::RebuildRequest| {
+                asked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(
+                        request
+                            .work
+                            .paths()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
+                    );
+                let candidate = super::super::build_workspace_candidate(root, limits, request);
+                let held = release_receiver
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(held) = held {
+                    let _ = started.send(());
+                    held.recv().expect("the test releases the first capture");
+                }
+                candidate
+            },
+        );
+        let watcher = super::super::unwatched(root, &validation)?;
+        let supervisor = tokio::spawn(super::super::run_index_supervisor_with(
+            watcher,
+            invalidations,
+            context,
+            move |root: &std::path::Path,
+                  limits: rift_index::WorkspaceIndexLimits,
+                  request: &super::super::RebuildRequest| {
+                capture(root, limits, request)
+            },
+        ));
+        let edited = rift_core::ProjectPath::new("lib.rs")?;
+        std::fs::write(root.join("lib.rs"), "pub fn first() {}\n")?;
+        validation.observe_paths([edited.clone()])?;
+        started_receiver
+            .recv()
+            .await
+            .ok_or("the supervisor must start the first capture")?;
+        tokio::time::advance(late).await;
+        std::fs::write(root.join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths([edited])?;
+        std::fs::write(root.join("unreported.rs"), "pub fn unreported() {}\n")?;
+        release
+            .send(())
+            .map_err(|_| "the first capture must still wait when the test releases it")?;
+        let unreported = rift_core::ProjectPath::new("unreported.rs")?;
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let changed = validation.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let (current, failure) = published.read().await.snapshot();
+                if failure.is_none() && current.reads.workspace_digests().get(&unreported).is_some()
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        validation.cancellation.cancel();
+        supervisor.await?;
+        settled.map_err(|_| "the unreported file must publish")?;
+        let mut messages = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            messages.push(record.message().to_owned());
+        }
+        let captures = captures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok((captures, messages))
+    }
+
+    const VALIDATION_DEFERRED: &str = "background filesystem validation deferred";
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_runs_the_owed_rebuild_before_a_due_validation_after_a_superseded_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (captures, messages) =
+            captures_after_a_superseded_rebuild(Duration::from_secs(1)).await?;
+        assert_eq!(
+            captures,
+            [["lib.rs"], ["lib.rs"], ["unreported.rs"]],
+            "the rebuild the superseded one left owed runs before the due validation"
+        );
+        let deferred = messages
+            .iter()
+            .filter(|message| *message == VALIDATION_DEFERRED)
+            .count();
+        assert_eq!(deferred, 1, "one record for the one deferred validation");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_runs_a_validation_one_interval_late_before_the_owed_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (captures, messages) =
+            captures_after_a_superseded_rebuild(Duration::from_secs(2)).await?;
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0], ["lib.rs"]);
+        assert_eq!(
+            captures[1],
+            ["lib.rs", "unreported.rs"],
+            "a validation one interval late runs first, and one rebuild reads both files"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message == VALIDATION_DEFERRED),
+            "nothing was deferred"
+        );
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
