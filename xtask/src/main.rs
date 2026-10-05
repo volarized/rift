@@ -37,6 +37,14 @@ fn workspace_root() -> Result<&'static std::path::Path, &'static str> {
         .ok_or("xtask manifest has no workspace parent")
 }
 
+/// A repository-relative path spelled with `/` on every platform.
+fn slash_form(path: &std::path::Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Every generated file, as a path under `crates/rift-error/src` and its content.
 fn expected_files(
     module: rift_error_codegen::GeneratedModule,
@@ -87,10 +95,11 @@ fn execute(root: &std::path::Path, command: Command) -> Result<(), Box<dyn std::
         std::path::Path::new("errors"),
         &mut present,
     )?;
-    let stale = present
+    let mut stale = present
         .into_iter()
         .filter(|path| !expected.contains_key(path))
         .collect::<Vec<_>>();
+    stale.sort_by_key(|path| slash_form(path));
 
     match command {
         Command::Generate => {
@@ -107,9 +116,9 @@ fn execute(root: &std::path::Path, command: Command) -> Result<(), Box<dyn std::
             for (path, content) in &expected {
                 match std::fs::read_to_string(source_root.join(path)) {
                     Ok(current) if current == *content => {}
-                    Ok(_) => problems.push(format!("differs: {}", path.display())),
+                    Ok(_) => problems.push(format!("differs: {}", slash_form(path))),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        problems.push(format!("missing: {}", path.display()));
+                        problems.push(format!("missing: {}", slash_form(path)));
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -117,7 +126,7 @@ fn execute(root: &std::path::Path, command: Command) -> Result<(), Box<dyn std::
             problems.extend(
                 stale
                     .iter()
-                    .map(|path| format!("unexpected: {}", path.display())),
+                    .map(|path| format!("unexpected: {}", slash_form(path))),
             );
             if !problems.is_empty() {
                 return Err(format!(
@@ -133,7 +142,7 @@ fn execute(root: &std::path::Path, command: Command) -> Result<(), Box<dyn std::
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, execute, parse_command};
+    use super::{Command, execute, parse_command, slash_form};
 
     const REGISTRY: &str = r#"
 [registry]
@@ -156,6 +165,14 @@ fields = { field = { type = "string" } }
         )
         .expect("write test registry");
         directory
+    }
+
+    #[test]
+    fn slash_form_joins_components_with_forward_slashes() {
+        let path = std::path::Path::new("errors").join("test.rs");
+        assert_eq!(slash_form(&path), "errors/test.rs");
+        assert!(!slash_form(&path).contains('\\'));
+        assert_eq!(slash_form(std::path::Path::new("errors.rs")), "errors.rs");
     }
 
     #[test]
