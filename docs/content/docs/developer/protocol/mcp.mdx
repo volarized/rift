@@ -1878,8 +1878,8 @@ For `search` and `get_symbol`, the server **MUST** append ` · page P/T` to the 
 When the result carries warnings, the server **MUST** write the warnings section after the items section: the title `N warnings`, or `1 warning`, then one line per warning. A result without warnings has no warnings section. The line of a warning has these parts:
 
 - the `code` of the warning
-- each payload field except `detail`, as ` · name value`, in the order the warning declares them; a list joins its items with `, `, a package identity is `name@version (manager)`, and a package context entry is `name@version` or `name requirement` followed by `(manager)`, with the availability added after the manager unless it is `canonical`
-- `: ` and the `detail`, when the warning carries one
+- each payload field except `detail`, as ` · name value`, in the order the warning declares them; a list joins its items with `, `, a package identity is `name@version (manager)`, and a package context entry is `name@version` or `name requirement` followed by `(manager)`, with the availability added after the manager unless it is `canonical`; a value holding ` · ` or `: ` is quoted
+- `: ` and the `detail`, when the warning carries one, quoted when it holds ` · ` or `: `
 
 When the result holds more than one item, the server **MUST** start each item with `[n] ` at one level, counting from 1 in result order, and write every further line of the item at two levels. A result with one item carries no marker and writes every line at one level.
 
@@ -1964,7 +1964,7 @@ A `get_symbol` hit has these lines:
 - the declaration, as for a symbol hit of `search`
 - the location, then the symbol identity or the byte range, then one line of the exceptional facts below
 - each documentation text, after a blank line, with its lines unchanged
-- `documentation:` or `documentation (truncated):` when the call requested documentation, then each referenced block as its location and heading path, with its excerpt indented below
+- `documentation:` or `documentation (truncated):` when the call requested documentation, then each referenced block as its location and heading path, with its excerpt indented below, then one line per warning of the documentation context, written as the `documentation` warning line of the warnings section
 - `history:` or `history (incomplete):` when the call requested history, then one entry per version as the date, the revision, the kind, and the author, with the path added when it differs from the hit's path, and the summary indented below
 - a blank line, then the source, last
 
@@ -1993,15 +1993,19 @@ The layout leaves these fields to `structuredContent`:
 - the `distance` of a walk hit, which the level of its branch shows, and the `relationship` entry of its `matched_by`, which the tree shows
 - the size and languages of a file hit
 - the unit, language, other facets, parent, and byte range of a node
+- the `node` of a `get_symbol` hit, the `reference` of a referenced block, the `source` and `documentation_revision` of a documentation hit and of a referenced block, and the `documentation_revision` of a documentation context
 
 The server **MUST** write a value that is lowercase hex of at least 8 characters as its first 8 characters: the revision of a commit hit or a history entry, and each digest in a warning line or a resource text. The server resolves a request revision with git revision parsing, which accepts a commit id prefix, so a caller **MAY** send the cut value wherever a request takes a revision. `structuredContent` carries the full revision.
 
-The server **MUST** write source, documentation text, a commit message, and excerpts line by line,
+The server **MUST** write source, documentation text, and excerpts line by line,
 with their bytes unchanged apart from the indent. A caller then recovers the text by
-removing the leading tabs of the indent, with no unescaping. The server writes every other fact on one line, with
-`\n`, `\r`, `\t`, and `\u{HEX}` for the control characters it holds.
+removing the leading tabs of the indent, with no unescaping. A documentation text that holds
+only whitespace writes nothing. The subject of a commit message is one fact; the lines after
+the blank line that follows the subject are written line by line, without the blank lines at
+their start and the whitespace at the end of the message. The server writes every other fact on one line, with
+`\n`, `\r`, `\t`, and `\u{HEX}` for the control characters it holds. A value that holds ` · ` or `: ` is written between double quotes, with each `"` and `\` inside written after a `\`; a value without either stays bare.
 
-The server writes every requested fact, so a caller that requests `score`, `source`,
+A caller that requests `score`, `source`,
 `documentation`, or `history` finds it in the compact text. The server enforces a byte limit on one
 answer's text and refuses an answer that crosses it.
 
@@ -2347,7 +2351,7 @@ A read of a resource answers `contents` with two entries, both naming the reques
 
 The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves the compact text as the only content of a read.
 
-The compact text of a resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
+The compact text of a resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
 
 ### Server logs [#resource-logs]
 
@@ -2374,8 +2378,9 @@ The compact text has these parts:
 - `: ` and the `message`, when it is not empty
 - each entry of `fields` as ` · key value`; a `fields` value that is not an object is written as ` · ` and its text
 - when the store could not be opened, the section `1 warning` after `0 records`, with the line `unavailable: <reason>` indented by one level
+- a `message`, field value, or `unavailable` reason holding ` · ` or `: ` is quoted
 
-The text does not write `identity` or `target`. A `recorded_at_ms` before the epoch or after the year 9999 is written as its count. A read of a level or component template names the requested `uri` in both contents.
+The text does not write `identity` or `target`. A `recorded_at_ms` before -9999-01-02 01:59:59 UTC or after 9999-12-30 22:00:00 UTC, which bounds the years -9999 to 9999, is written as its count. A read of a level or component template names the requested `uri` in both contents.
 
 The tabs below show a read of `rift://logs` that answers two records, the newer one with an `operation` and the older one without:
 
