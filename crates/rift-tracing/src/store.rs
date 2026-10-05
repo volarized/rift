@@ -89,6 +89,62 @@ static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
     &["db.namespace", "sqlite.file.type"],
 );
 
+/// `db.client.operation.duration`: one statement of the close on the writer thread, or the
+/// connection's close, by `db.operation.name`; a failed one adds `error.type` `_OTHER`, and
+/// the busy or locked result code as `db.response.status_code`.
+static OPERATION_DURATION: Histogram<5> = Histogram::declare(
+    "db.client.operation.duration",
+    &[
+        "db.system.name",
+        "db.namespace",
+        "db.operation.name",
+        "db.response.status_code",
+        "error.type",
+    ],
+);
+/// The `db.system.name` of the metrics database.
+const DB_SYSTEM: &str = "sqlite";
+/// The close statement that clears the busy handler, so the checkpoint never waits on
+/// another connection's lock. `SQLite` evaluates `PRAGMA busy_timeout = N` as
+/// `sqlite3_busy_timeout(db, N)`, and a timeout of zero clears every busy handler.
+const BUSY_TIMEOUT_STATEMENT: &str = "PRAGMA busy_timeout";
+/// The close checkpoint that reads the frames the log holds and moves none.
+const CHECKPOINT_NOOP: &str = "PRAGMA wal_checkpoint(NOOP)";
+/// The close checkpoint that moves every frame and empties the log file.
+const CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+/// The `db.operation.name` of the connection's close: the last connection's close
+/// checkpoints and removes the write-ahead log.
+const CONNECTION_CLOSE: &str = "close";
+
+/// Runs one close step named `statement` and records its duration in
+/// `db.client.operation.duration`, labeled by the `SQLite` failure `cause` finds in its
+/// error. A regressed clock records nothing and keeps the step's result.
+fn timed<Answer, Failure>(
+    statement: &'static str,
+    run: impl FnOnce() -> Result<Answer, Failure>,
+    cause: impl FnOnce(&Failure) -> &rusqlite::Error,
+) -> Result<Answer, Failure> {
+    let result;
+    let took = crate::measure_elapsed!("db.client.operation", {
+        result = run();
+    })
+    .ok()
+    .map(|((), measurement)| measurement.elapsed());
+    if let Some(took) = took {
+        let (status, failed) = match &result {
+            Ok(_) => ("", ""),
+            Err(failure) => match error_type(cause(failure)) {
+                "_OTHER" => ("", "_OTHER"),
+                code => (code, "_OTHER"),
+            },
+        };
+        OPERATION_DURATION
+            .labeled([DB_SYSTEM, DB_NAMESPACE, statement, status, failed])
+            .record(took);
+    }
+    result
+}
+
 /// The `error.type` of a failed `BEGIN IMMEDIATE`: `SQLite`'s result code for busy, `5`,
 /// and for locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
 fn error_type(failure: &rusqlite::Error) -> &'static str {
@@ -698,32 +754,44 @@ impl MetricsWriter {
 
     /// Truncates the write-ahead log without waiting on another connection's lock, then
     /// closes the connection. No transaction is open: the thread runs one command at a time.
-    /// Starts each stage in `progress` before running it.
+    /// Starts each stage in `progress` before running it, and records each statement and the
+    /// connection's close as one `db.client.operation.duration` point.
     fn close(self, progress: &CloseProgress) -> Result<WalCheckpoint, RiftError> {
         let Self {
             connection, path, ..
         } = self;
         let failure =
             |operation: &str, source: rusqlite::Error| store_failure(operation, &path, source);
+        let checkpoint_row = |statement: &'static str| {
+            timed(
+                statement,
+                || connection.query_row(statement, [], CheckpointRow::read),
+                |source| source,
+            )
+            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))
+        };
         progress.start(CLOSE_CLEAR_BUSY_TIMEOUT);
-        connection
-            .busy_timeout(Duration::ZERO)
-            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CLEAR_BUSY_TIMEOUT], source))?;
+        timed(
+            BUSY_TIMEOUT_STATEMENT,
+            || connection.pragma_update(None, "busy_timeout", 0),
+            |source| source,
+        )
+        .map_err(|source| failure(CLOSE_STAGES[CLOSE_CLEAR_BUSY_TIMEOUT], source))?;
         progress.start(CLOSE_CHECKPOINT);
         #[cfg(any(test, feature = "fixtures"))]
         progress.checkpoint_held();
         let started = std::time::Instant::now();
-        let before = connection
-            .query_row("PRAGMA wal_checkpoint(NOOP)", [], CheckpointRow::read)
-            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))?;
-        let truncate = connection
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], CheckpointRow::read)
-            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))?;
+        let before = checkpoint_row(CHECKPOINT_NOOP)?;
+        let truncate = checkpoint_row(CHECKPOINT_TRUNCATE)?;
         let checkpoint = WalCheckpoint::after(before, truncate, started.elapsed());
         progress.start(CLOSE_CONNECTION);
-        connection
-            .close()
-            .map_err(|(_connection, source)| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
+        // A refused close hands the connection back; dropping it closes it again.
+        timed(
+            CONNECTION_CLOSE,
+            || connection.close().map_err(|(_connection, source)| source),
+            |source| source,
+        )
+        .map_err(|source| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
         progress.end();
         Ok(checkpoint)
     }

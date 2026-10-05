@@ -949,3 +949,39 @@ async fn an_append_records_the_metrics_database_signals() -> TestResult {
     );
     Ok(())
 }
+
+/// The close records each statement it runs and the connection's close as one
+/// `db.client.operation.duration` point named for it.
+#[tokio::test]
+async fn the_close_records_each_statement_it_runs() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store.append(&[record("written")], KEEP_EVERY).await?;
+
+    closed(&store).await?;
+    let metrics = recorder.metrics();
+
+    for statement in [
+        "PRAGMA busy_timeout",
+        "PRAGMA wal_checkpoint(NOOP)",
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        "close",
+    ] {
+        let labels = [
+            ("db.system.name", "sqlite"),
+            ("db.namespace", "metrics"),
+            ("db.operation.name", statement),
+        ];
+        assert!(
+            matches!(
+                metrics
+                    .find("db.client.operation.duration", &labels)
+                    .map(crate::MetricSeries::value),
+                Some(SeriesValue::Buckets { count: 1, .. })
+            ),
+            "{statement}: {metrics:?}"
+        );
+    }
+    Ok(())
+}

@@ -885,7 +885,9 @@ wal_checkpoint(NOOP)`, or `PRAGMA wal_checkpoint(TRUNCATE)` records that text as
 transaction records `sqlite.transaction.duration` by `sqlite.transaction.result`,
 `commit` or `rollback`, and `sqlite.transaction.statement.count`. Each append to `.rift/metrics`
 records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
-`sqlite.transaction.duration`, and `sqlite.commit.duration` under `db.namespace` `metrics`.
+`sqlite.transaction.duration`, and `sqlite.commit.duration` under `db.namespace` `metrics`. Its
+close records `PRAGMA busy_timeout`, both checkpoints, and `close` in
+`db.client.operation.duration`, as the index close does.
 
 <VersionBadge version="v0.0.62" />
 
