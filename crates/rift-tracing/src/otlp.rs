@@ -314,7 +314,14 @@ fn configured(variable: &str) -> bool {
 
 /// Whether [`SDK_DISABLED_VAR`] reads `true`, in any case.
 fn sdk_disabled() -> bool {
-    std::env::var(SDK_DISABLED_VAR).is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
+    disables_sdk(std::env::var(SDK_DISABLED_VAR).ok().as_deref())
+}
+
+/// Whether `value`, the text of [`SDK_DISABLED_VAR`] or `None` when it is unset or not
+/// Unicode, disables the export: `true` in any case, around blanks; any other value or
+/// none does not.
+fn disables_sdk(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 /// The resource every exported span, metric, and log record carries: `service.name`,
@@ -1252,6 +1259,19 @@ mod tests {
             .as_ref()
             .map(|providers| providers.logs.is_some());
         assert_eq!(holds_logs, Some(false));
+    }
+
+    /// `OTEL_SDK_DISABLED` disables the export when it reads `true` in any case; any other
+    /// value, and its absence, leave the export on.
+    #[test]
+    fn only_true_in_any_case_disables_the_sdk() {
+        for disabling in ["true", "TRUE", "True", " true "] {
+            assert!(super::disables_sdk(Some(disabling)), "{disabling:?}");
+        }
+        for enabling in ["false", "1", "yes", "", "truex"] {
+            assert!(!super::disables_sdk(Some(enabling)), "{enabling:?}");
+        }
+        assert!(!super::disables_sdk(None));
     }
 
     /// Fields cut at their bound are no longer a JSON object, and export whole.
