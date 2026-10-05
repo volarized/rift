@@ -164,7 +164,15 @@ async fn main() -> ExitCode {
             .stall_delay(stall_delay)
             .stderr_limit(logs.stderr_limit.bytes());
     }
-    let (tracing_runtime, drain) = tracing_builder.install();
+    // `main` installs once; a refusal means something installed tracing before it, and
+    // that installation stays in place while the process reports the refusal and leaves.
+    let (tracing_runtime, drain) = match tracing_builder.install() {
+        Ok(installed) => installed,
+        Err(error) => {
+            eprintln!("rift: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
     let succeeded = match run(cli, drain, retention_records).await {
         Ok(Some(outcome)) => {

@@ -9834,7 +9834,7 @@ done
         rift_tracing::validate_log_filter(&capture)?;
         let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
             .capture(&capture)
-            .install();
+            .install()?;
         let drain = drain.ok_or("a capture filter returns a drain")?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
@@ -9908,7 +9908,7 @@ done
         rift_tracing::validate_log_filter(&capture)?;
         let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
             .capture(&capture)
-            .install();
+            .install()?;
         let drain = drain.ok_or("a capture filter returns a drain")?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;

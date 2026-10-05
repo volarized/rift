@@ -17,7 +17,7 @@ use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter, Parse
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::{Filter, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::util::{SubscriberInitExt as _, TryInitError};
 use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::capture::{LogSink, log_capture};
@@ -106,6 +106,30 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     sink.with_filter(reevaluated(filter))
+}
+
+/// A [`TracingRuntimeBuilder::install`] that found the process's global subscriber, or a
+/// `log` logger, already installed.
+///
+/// The installation already in place stays as it was: it keeps receiving every span and
+/// event, and the refused builder started no sampler and holds no export.
+#[derive(Debug)]
+pub struct InstallError(TryInitError);
+
+impl fmt::Display for InstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "tracing is already installed in this process: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
 }
 
 /// The installed subscriber's handle, held until the process stops tracing.
@@ -224,10 +248,12 @@ impl TracingRuntimeBuilder {
     /// the calling Tokio runtime; called outside one, the runtime samples nothing and says
     /// so on stderr.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when a global subscriber is already installed.
-    pub fn install(self) -> (TracingRuntime, Option<LogDrain>) {
+    /// Returns [`InstallError`] when the process already has a global subscriber, or a
+    /// `log` logger: `tracing-subscriber`'s `try_init` refuses a second one. The
+    /// installation in place stays untouched, and this builder starts no sampler.
+    pub fn install(self) -> Result<(TracingRuntime, Option<LogDrain>), InstallError> {
         let (sink, drain) = match self.capture {
             Some(capture) => {
                 let (sink, drain) = log_capture();
@@ -261,7 +287,7 @@ impl TracingRuntimeBuilder {
         };
         let stderr_layer = StderrLines::new(writer, color);
         let flights = Arc::new(FlightTable::default());
-        crate::capture::registry()
+        let installed = crate::capture::registry()
             .with(MetricLayer::new(Arc::clone(&values)))
             .with(FlightLayer::new(Arc::clone(&flights)))
             .with(
@@ -272,7 +298,11 @@ impl TracingRuntimeBuilder {
             )
             .with(sink)
             .with(otlp_layer)
-            .init();
+            .try_init();
+        if let Err(error) = installed {
+            export.shutdown();
+            return Err(InstallError(error));
+        }
         let sampler = self.sample_interval.and_then(|interval| {
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 eprintln!("rift: warning: no Tokio runtime runs the process sampler");
@@ -289,14 +319,14 @@ impl TracingRuntimeBuilder {
                 },
             ))
         });
-        (
+        Ok((
             TracingRuntime {
                 export,
                 values,
                 sampler,
             },
             drain,
-        )
+        ))
     }
 }
 

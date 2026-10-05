@@ -91,7 +91,8 @@ pub use recorder::{
 };
 pub use render::LogLines;
 pub use runtime::{
-    LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder, validate_log_filter,
+    InstallError, LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder,
+    validate_log_filter,
 };
 pub use sampler::{PROCESS_SAMPLE_INTERVAL_MIN, SAMPLE_HOOKS_MAX, SampleHook, sample_hook};
 pub use span::Span;
