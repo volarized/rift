@@ -33,4 +33,5 @@ validator.workspace = true
 [dev-dependencies]
 axum.workspace = true
 jsonschema.workspace = true
+rift-tracing = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true

@@ -381,6 +381,13 @@ pub struct GlobalClient {
     inner: Arc<Inner>,
 }
 
+/// The name the capabilities flight's waits and holds are recorded under: one
+/// capabilities request at a time, held across the request.
+const CAPABILITIES_FLIGHT_LOCK: &str = "global.capabilities";
+/// The name the resolutions flight's waits and holds are recorded under: one
+/// resolution request at a time, held across the request.
+const RESOLUTIONS_FLIGHT_LOCK: &str = "global.resolutions";
+
 struct Inner {
     http: HttpClient,
     endpoint: Url,
@@ -568,7 +575,9 @@ impl GlobalClient {
         if let Some(failure) = self.recorded_failure().await {
             return Err(failure);
         }
-        let _flight = self.inner.capabilities_flight.lock().await;
+        let _flight = rift_tracing::lock(CAPABILITIES_FLIGHT_LOCK)
+            .acquire(self.inner.capabilities_flight.lock())
+            .await;
         if let Some(cached) = self.inner.capabilities.read().await.as_ref()
             && cached.expires > Instant::now()
         {
@@ -667,7 +676,9 @@ impl GlobalClient {
         {
             return Ok(value.value.clone());
         }
-        let _flight = self.inner.resolutions_flight.lock().await;
+        let _flight = rift_tracing::lock(RESOLUTIONS_FLIGHT_LOCK)
+            .acquire(self.inner.resolutions_flight.lock())
+            .await;
         if let Some(value) = self.inner.resolution.read().await.as_ref()
             && value.analyzer_revision == capabilities.analyzer_revision
             && value.corpus_revision == capabilities.corpus_revision

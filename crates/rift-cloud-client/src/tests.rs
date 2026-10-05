@@ -1689,6 +1689,61 @@ async fn test_fixture_capabilities_single_flight() {
 }
 
 #[tokio::test]
+async fn test_fixture_capabilities_flight_records_the_wait_and_its_holder() {
+    let server = FixtureServer::start(FixtureMode::Capabilities)
+        .await
+        .expect("fixture server");
+    let client = GlobalClient::new(server.config()).expect("fixture client");
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .install()
+        .expect("the default filter parses");
+    let holding =
+        rift_tracing::traced!(component = "global", operation = "global.request", async {
+            rift_tracing::lock(CAPABILITIES_FLIGHT_LOCK)
+                .acquire(client.inner.capabilities_flight.lock())
+                .await
+        })
+        .await;
+    let mut asking = Box::pin(client.get_capabilities());
+    let waiting = tokio::select! {
+        biased;
+        _ = &mut asking => false,
+        () = std::future::ready(()) => true,
+    };
+    assert!(waiting, "a second caller waits for the flight");
+    drop(holding);
+    assert!(asking.await.is_ok());
+    let metrics = recorder.metrics();
+    drop(recorder);
+
+    let flight = [
+        ("lock.name", CAPABILITIES_FLIGHT_LOCK),
+        ("lock.mode", "exclusive"),
+    ];
+    for name in ["lock.wait.duration", "lock.held.duration"] {
+        let count = match metrics
+            .find(name, &flight)
+            .map(rift_tracing::MetricSeries::value)
+        {
+            Some(rift_tracing::SeriesValue::Buckets { count, .. }) => *count,
+            _ => 0,
+        };
+        assert_eq!(count, 2, "{name}: the holder and the caller");
+    }
+    let records = drain.queued_records();
+    let wait = records
+        .iter()
+        .find(|record| {
+            record.message() == "lock.wait" && record.fields().contains("\"span\":\"closed\"")
+        })
+        .expect("the waiting caller opened a wait span");
+    let wait: serde_json::Value = serde_json::from_str(wait.fields()).expect("fields");
+    assert_eq!(wait["lock.name"], CAPABILITIES_FLIGHT_LOCK, "{wait}");
+    assert_eq!(wait["outcome"], "acquired", "{wait}");
+    assert_eq!(wait["holder"], "global.request", "{wait}");
+}
+
+#[tokio::test]
 async fn test_fixture_in_flight_bound() {
     let server = FixtureServer::start(FixtureMode::Delay(Duration::from_millis(50)))
         .await

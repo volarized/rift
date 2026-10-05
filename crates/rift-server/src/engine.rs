@@ -284,6 +284,10 @@ impl EnginePool {
     }
 }
 
+/// The name the slot lock's waits and holds are recorded under: a request holds it for
+/// its whole exchange, and a stop holds it across the engine's shutdown.
+const ENGINE_SLOT_LOCK: &str = "engine.slot";
+
 /// One accepted LSP process definition and the session state behind it.
 #[derive(Debug)]
 pub struct EngineSlot {
@@ -765,12 +769,23 @@ impl EngineSlot {
         )
     }
 
+    /// Takes the slot's lock, recording the wait and the hold as `engine.slot`.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up its place in the lock's queue.
+    async fn hold(&self) -> rift_tracing::Held<tokio::sync::MutexGuard<'_, SlotState>> {
+        rift_tracing::lock(ENGINE_SLOT_LOCK)
+            .acquire(self.state.lock())
+            .await
+    }
+
     /// Ends the running session under the slot's lock and reports the slot stopped.
     ///
     /// A start still in flight is aborted, and a start that already finished is shut
     /// down as a running session is.
     async fn end_session(self: Arc<Self>) {
-        let mut held = self.state.lock().await;
+        let mut held = self.hold().await;
         if let Some(start) = held.starting.take() {
             start.abort();
             if let Ok(Ok(started)) = start.await {
@@ -1121,7 +1136,7 @@ impl EngineSlot {
         mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
     ) -> Result<T, RiftError> {
         let retry = self.configuration.retry;
-        let mut held = self.state.lock().await;
+        let mut held = self.hold().await;
         let mut guarded = RequestSessionGuard {
             state: &mut held,
             reported_state: &self.reported_state,
@@ -1378,11 +1393,13 @@ impl EngineSlot {
         ) {
             (Some(engine), _) => {
                 let launch = self.embedded_launch(engine);
-                tokio::spawn(async move { crate::embedded::started_session(launch, &root).await })
+                tokio::spawn(async move {
+                    Box::pin(crate::embedded::started_session(launch, &root)).await
+                })
             }
             (None, Some(command)) => {
                 let launch = self.launch(command);
-                tokio::spawn(async move { EngineSession::start(launch, &root).await })
+                tokio::spawn(async move { Box::pin(EngineSession::start(launch, &root)).await })
             }
             (None, None) => {
                 unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
@@ -1598,6 +1615,68 @@ mod tests {
                 |error| error.to_string(),
                 |_child| "the program must not exist".to_owned(),
             )
+    }
+
+    /// A stop that finds the slot taken records its wait on `engine.slot`, names the
+    /// operation holding the slot, and records the time it then held the slot.
+    #[tokio::test]
+    async fn a_stop_waiting_for_the_slot_records_the_wait_and_the_holder() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let configuration: LspConfiguration =
+            serde_json::from_value(serde_json::json!({ "embedded": "ty" })).expect("configuration");
+        let key = LspProcessKey::named("python");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        let slot = pool.engines.get(&key).expect("slot");
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let holding =
+            rift_tracing::traced!(component = "engine", operation = "search.request", async {
+                slot.hold().await
+            })
+            .await;
+        let mut stop = Box::pin(Arc::clone(slot).end_session());
+        let waiting = tokio::select! {
+            biased;
+            () = &mut stop => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(waiting, "the stop waits while the slot is held");
+        drop(holding);
+        stop.await;
+        let metrics = recorder.metrics();
+        drop(recorder);
+        pool.shutdown().await;
+
+        let count = |name: &str, labels: &[(&str, &str)]| match metrics
+            .find(name, labels)
+            .map(rift_tracing::MetricSeries::value)
+        {
+            Some(rift_tracing::SeriesValue::Buckets { count, .. }) => *count,
+            _ => 0,
+        };
+        let slot_lock = [("lock.name", ENGINE_SLOT_LOCK), ("lock.mode", "exclusive")];
+        assert_eq!(
+            count("lock.wait.duration", &slot_lock),
+            2,
+            "two acquisitions"
+        );
+        assert_eq!(count("lock.held.duration", &slot_lock), 2, "both released");
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| {
+                record.message() == "lock.wait" && record.fields().contains("\"span\":\"closed\"")
+            })
+            .expect("the contended stop opened a wait span");
+        let wait = fields(wait);
+        assert_eq!(wait["lock.name"], ENGINE_SLOT_LOCK, "{wait}");
+        assert_eq!(wait["outcome"], "acquired", "{wait}");
+        assert_eq!(wait["holder"], "search.request", "{wait}");
     }
 
     /// A configured program that does not exist reaches the caller as `launch_failed`, and
