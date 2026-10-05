@@ -109,9 +109,11 @@ version_control_timeout = "3s"
 workspaces = 16
 ```
 
-- `validation_interval` bounds the interval between background filesystem checks, 1s to 1h.
-  Requests and filesystem events do not reset the deadline; an unchanged check without a recorded
-  failure queues no rebuild.
+- `validation_interval` sets the deadline of each background filesystem check, 1s to 1h.
+  Requests and filesystem events do not reset the deadline. A due check waits behind the rebuild
+  that follows a superseded one, so it starts at most one interval after its deadline, plus the
+  rebuild running when that interval ends. An unchanged check without a recorded failure queues
+  no rebuild.
 - `version_control_timeout` bounds the wait for the worktree's Git `index.lock`, 1ms to 30s.
   A lock retained past the bound is passed and named in the log; the server leaves the lock in place.
 - `workspaces` caps the workspaces retained by one repository process, 1 to 64.

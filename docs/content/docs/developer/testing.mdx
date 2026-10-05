@@ -27,8 +27,12 @@ and database cases force queue exhaustion, cancellation, publication ordering, a
 resource cases verify published paging without recapturing every source file.
 
 Background validation tests force elapsed deadlines under continuous events and recover edits
-without watcher reports. Git lock cases verify bounded waits, retained-lock expiration, linked
-worktree control paths, and publication equal to a cold build.
+without watcher reports. Supervisor tests hold one capture under a paused clock, supersede it,
+and read the order from the paths each later capture names: the owed rebuild runs before a due
+check, and a check one interval late runs first.
+
+Git lock cases verify bounded waits, retained-lock expiration, linked worktree control paths, and
+publication equal to a cold build.
 
 A failed rebuild followed by byte-identical restoration must recover without a watcher event,
 retain its read service, and equal the cold digests and derived facts.

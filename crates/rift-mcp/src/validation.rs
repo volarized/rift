@@ -3377,6 +3377,10 @@ pub(crate) enum RebuildOutcome {
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
 ///
+/// Each turn runs a due background validation, then the rebuild pending work owes. On the
+/// turn after a superseded rebuild the owed rebuild runs first and the validation takes
+/// the following turn; `BackgroundValidation::rebuild_runs_first` bounds that order.
+///
 /// A published rebuild hands its snapshot to the population lane, then moves on to the
 /// next batch. The supervisor awaiting a pass itself
 /// would hold the whole reconciliation loop for as long as that pass ran, and the filesystem
@@ -3905,6 +3909,8 @@ pub(crate) async fn run_index_supervisor_with(
     {
         publish_rebuild_failure(&context, epoch, failure.error).await;
     }
+    // Whether the last rebuild turn ended superseded, so its work is owed again.
+    let mut superseded = false;
     loop {
         let Some(trigger) = background
             .next(&mut invalidations, &validation.cancellation)
@@ -3924,7 +3930,11 @@ pub(crate) async fn run_index_supervisor_with(
                 continue;
             }
         }
+        // After a superseded rebuild, the rebuild it left owed runs before a due validation.
+        let after_superseded = std::mem::take(&mut superseded);
+        let deferred = background.defers(trigger, after_superseded, validation.observed_epoch());
         if trigger == background::Trigger::Validation
+            && !deferred
             && let Err(error) = background.validate(&context).await
         {
             if validation.cancellation.is_cancelled() {
@@ -3962,6 +3972,7 @@ pub(crate) async fn run_index_supervisor_with(
                 epoch
             ))
             .await;
+        superseded = matches!(result, Ok(RebuildOutcome::Superseded));
         match result {
             Ok(RebuildOutcome::Published) => {
                 let (current, _) = published.read().await.snapshot();

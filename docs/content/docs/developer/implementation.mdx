@@ -266,9 +266,15 @@ no path. The observer and publisher share the publication lane, where the candid
 and source policy are checked before the complete value changes.
 
 Background validation uses that same source discovery and stat comparison even without watcher
-events. Its deadline follows `[server] validation_interval` and is independent of requests and
-filesystem activity. An unchanged check without a recorded failure queues no rebuild; changed paths use the existing
+events. Its deadline follows `[server] validation_interval`, and requests and filesystem events
+do not move it. An unchanged check without a recorded failure queues no rebuild; changed paths use the existing
 incremental comparison, while a changed configuration or ignore policy requires a complete pass.
+
+A due check runs on the supervisor's next turn, before the rebuild that turn owes. The turn after
+a superseded rebuild is the exception: the owed rebuild runs first, because the reads waiting on
+it already waited for a rebuild that published nothing, and the check takes the following turn.
+A check that is one interval late runs before the rebuild, so a check starts at most one interval
+after its deadline, plus the rebuild running when that interval ends.
 
 A recorded rebuild failure is retried even after the tree returns to the publication's exact
 bytes. An empty incremental recovery reuses the read service and clears the failure without
