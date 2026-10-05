@@ -616,6 +616,35 @@ count; meanwhile the queue fills and then drops, and the next batch written carr
 `the log queue was full and dropped records` record with the `dropped` count. The stop's
 deadline bounds the retry: a drain aborted there reports what it held as `unwritten`.
 
+An event record names the spans it was emitted in, so the records of one request group by its
+`request_id` even while a background task logs between them. When a span opens, the `LogSink`
+writes its name and fields as one JSON object into the span's extensions, and writes it again
+when the span records a field later. An event inside the span copies that object into its
+`fields` as `root_span` for the outermost span, and as `nearest_span` for the span it was
+emitted in when that span is not the outermost. The `worker admission started` record of a
+search request carries:
+
+```json
+{
+  "work": "workspace fingerprint",
+  "queue_timeout_ms": "30000",
+  "root_span": {
+    "name": "mcp.request",
+    "fields": {"component": "mcp", "operation": "tools/call", "request_id": "2", "tool": "search"}
+  },
+  "nearest_span": {
+    "name": "worker.queue",
+    "fields": {"component": "worker", "operation": "worker.queue", "work": "workspace fingerprint"}
+  }
+}
+```
+
+A span keeps at most 1 KiB of field members: a member that does not fit is left out whole and
+counted in `fields_left_out`, so the object stays valid JSON and both objects fit the record's
+8 KiB fields bound. A task spawned without `.instrument` runs outside the span that spawned it,
+so its events carry neither member. A field the code itself names `root_span`, `nearest_span`,
+or `fields_left_out` is not recorded.
+
 The CLI starts tracing through `TracingRuntime::builder` in `rift-tracing`, which installs one
 subscriber with a filter per layer:
 

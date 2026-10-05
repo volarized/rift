@@ -2366,13 +2366,15 @@ A read answers the [two contents](#resource-contents) of a resource. The JSON co
 
 Each record names its `identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`, `component`, `operation`, `message`, and the remaining `fields`. The `fields` are an object, or the stored text as a string when it is not a JSON object. A span that closed carries the fields it recorded beside `elapsed_ms`, which is how long the work it wrapped took.
 
+A record emitted inside a span carries two more `fields` members: `root_span` for the outermost span around it, and `nearest_span` for the span it was emitted in when that span is not the outermost. Each is an object holding the span's `name` and its `fields`, among them `component`, `operation`, and, on a tool call, the `request_id` and `tool` of the request. A record emitted outside every span carries neither. When a span's fields cross the server's bound, the object leaves out the members past it and carries their count as `fields_left_out`. A caller **MAY** relate the records of one request by the `request_id` of `root_span`; the order of records alone does not relate them, because a background task can record between two records of one request.
+
 The compact text has these parts:
 
 - the title `N records`, or `1 record`
 - directly below the title, one line for each record, indented by one level, in the order of the JSON `records`
 - on each line, the time as `YYYY-MM-DD HH:MM:SS.mmm` in UTC from `recorded_at_ms`, then the `level`, the `component`, and the `operation`, with `-` for a `component` or `operation` that is empty
 - `: ` and the `message`, when it is not empty
-- each entry of `fields` as ` · key value`; a `fields` value that is not an object is written as ` · ` and its text
+- each entry of `fields` as ` · key value`, an object value such as `root_span` written as compact JSON; a `fields` value that is not an object is written as ` · ` and its text
 - when the store could not be opened, the section `1 warning` after `0 records`, with the line `unavailable: <reason>` indented by one level
 
 The text does not write `identity` or `target`. A `recorded_at_ms` before the epoch or after the year 9999 is written as its count. A read of a level or component template names the requested `uri` in both contents.
