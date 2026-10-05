@@ -710,7 +710,13 @@ async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestRes
         .close(Instant::now() + Duration::from_millis(50))
         .await;
 
-    assert!(missed.is_err(), "the close misses its deadline: {missed:?}");
+    let missed = missed.expect_err("the close misses its deadline");
+    let rendered = format!("{missed}: {}", rift_error::causes(&missed).join(": "));
+    assert!(
+        rendered.contains("stage queued running for")
+            && rendered.contains("the queue held 1 of 1 commands at the close request"),
+        "the missed close names the stage it waited in and the queue it waited behind: {rendered}"
+    );
     assert!(
         weak.upgrade().is_some(),
         "the held thread keeps the owner past the missed deadline"
