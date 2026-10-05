@@ -74,10 +74,11 @@ pub use flight::{OPERATIONS_IN_FLIGHT_MAX, publish_in_flight, warn_in_flight};
 pub use lock::{Acquire, Held, Lock, Refusal, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use metrics::{
-    Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue,
-    HISTOGRAM_BOUNDARIES_MAX, Histogram, HistogramSelection, Instrument, InstrumentKind,
-    METRIC_LABELS_MAX, METRIC_SERIES_MAX_DEFAULT, MetricSeries, MetricSnapshot, Metrics,
-    ProcessGauge, SeriesValue, metrics,
+    CountHistogram, CountHistogramSelection, Counter, CounterSelection,
+    DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue, HISTOGRAM_BOUNDARIES_MAX,
+    Histogram, HistogramSelection, Instrument, InstrumentKind, METRIC_LABELS_MAX,
+    METRIC_SERIES_MAX_DEFAULT, MetricSeries, MetricSnapshot, Metrics, ProcessGauge, SeriesValue,
+    metrics,
 };
 pub use reads::{LogReader, LogReads};
 pub use record::{

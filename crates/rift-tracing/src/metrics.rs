@@ -543,6 +543,73 @@ impl HistogramSelection<'_> {
     }
 }
 
+/// Counts of recorded item counts per bucket, with their count and sum, such as the
+/// statements one transaction ran.
+#[derive(Clone, Copy, Debug)]
+pub struct CountHistogram<const LABELS: usize> {
+    instrument: Instrument,
+}
+
+impl<const LABELS: usize> CountHistogram<LABELS> {
+    /// Declares a histogram named `name`, in `unit`, whose values name the `label_keys`,
+    /// bucketed at the ascending upper bounds `boundaries`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on more than [`HISTOGRAM_BOUNDARIES_MAX`] boundaries; in a `const`
+    /// declaration, that fails compilation.
+    #[must_use]
+    pub const fn declare(
+        name: &'static str,
+        unit: &'static str,
+        label_keys: &'static [&'static str; LABELS],
+        boundaries: &'static [f64],
+    ) -> Self {
+        assert!(
+            boundaries.len() <= HISTOGRAM_BOUNDARIES_MAX,
+            "a histogram declares at most HISTOGRAM_BOUNDARIES_MAX boundaries"
+        );
+        let mut instrument =
+            Instrument::declared(name, unit, InstrumentKind::Histogram, label_keys);
+        instrument.boundaries = boundaries;
+        Self { instrument }
+    }
+
+    /// The declaration this handle records into.
+    #[must_use]
+    pub const fn instrument(&self) -> &Instrument {
+        &self.instrument
+    }
+
+    /// Selects the series the label `values` name, in declaration order.
+    pub fn labeled(&self, values: [&'static str; LABELS]) -> CountHistogramSelection<'_> {
+        CountHistogramSelection {
+            instrument: &self.instrument,
+            labels: labels(values),
+        }
+    }
+}
+
+/// One series of a count histogram, selected by its label values; [`Self::record`]
+/// records.
+#[derive(Clone, Copy, Debug)]
+#[must_use = "a selection records nothing until `record` runs"]
+pub struct CountHistogramSelection<'histogram> {
+    instrument: &'histogram Instrument,
+    labels: Labels,
+}
+
+impl CountHistogramSelection<'_> {
+    /// Records one count into the selected series, in the instrument's unit.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a count past 2^53 items loses its last digits, which no reader acts on"
+    )]
+    pub fn record(self, count: u64) {
+        with_installed(|values| values.observe(self.instrument, self.labels, count as f64));
+    }
+}
+
 /// The instruments `rift-tracing` declares and Rift code records into.
 #[derive(Debug)]
 #[non_exhaustive]

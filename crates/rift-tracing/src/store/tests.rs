@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use super::{LogStore, METRICS_SCHEMA_VERSION, StoreClose, WalCheckpoint};
 use crate::{
     LOG_BATCH_RECORDS_MAX, LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogReader,
-    LogReads, LogRecord, RecordKind,
+    LogReads, LogRecord, RecordKind, SeriesValue,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -713,6 +713,7 @@ async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestRes
         .send(super::Command::Append {
             records: vec![record("held")],
             retention_records: KEEP_EVERY,
+            queued: std::time::Instant::now(),
             reply,
         })
         .await
@@ -848,6 +849,7 @@ fn a_command_debugs_with_its_record_count_and_no_reply() {
     let append = super::Command::Append {
         records: vec![record("first"), record("second")],
         retention_records: 5,
+        queued: std::time::Instant::now(),
         reply,
     };
     let (reply, _answer) = tokio::sync::oneshot::channel();
@@ -875,5 +877,50 @@ async fn an_append_the_database_refuses_names_the_step_that_failed() -> TestResu
     );
     let rendered = refusal.to_string();
     assert!(rendered.contains("read the newest identity"), "{rendered}");
+    Ok(())
+}
+
+/// One append records the metrics database's queue wait, write lock wait, commit, and
+/// transaction, and a sampler tick records its queue length and file size.
+#[tokio::test]
+async fn an_append_records_the_metrics_database_signals() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store.append(&[record("measured")], KEEP_EVERY).await?;
+    assert_eq!(recorder.run_sample_hooks(), 1, "the store's hook runs");
+    let metrics = recorder.metrics();
+
+    let metrics_namespace = ("db.namespace", "metrics");
+    let observed = |name: &str, labels: &[(&str, &str)]| match metrics
+        .find(name, labels)
+        .map(crate::MetricSeries::value)
+    {
+        Some(SeriesValue::Buckets { count, .. }) => *count,
+        _ => 0,
+    };
+    let append = [metrics_namespace, ("db.operation.name", "append")];
+    assert_eq!(observed("sqlite.queue.wait.duration", &append), 1);
+    assert_eq!(
+        observed("sqlite.write_lock.wait.duration", &[metrics_namespace]),
+        1
+    );
+    assert_eq!(observed("sqlite.commit.duration", &[metrics_namespace]), 1);
+    let committed = [metrics_namespace, ("sqlite.transaction.result", "commit")];
+    assert_eq!(observed("sqlite.transaction.duration", &committed), 1);
+    assert_eq!(
+        metrics
+            .find("sqlite.queue.length", &[metrics_namespace])
+            .map(crate::MetricSeries::value),
+        Some(&SeriesValue::Last(0.0))
+    );
+    let database_file = [metrics_namespace, ("sqlite.file.type", "database")];
+    assert!(
+        matches!(
+            metrics.find("sqlite.file.size", &database_file).map(crate::MetricSeries::value),
+            Some(SeriesValue::Last(size)) if *size > 0.0
+        ),
+        "{metrics:?}"
+    );
     Ok(())
 }
