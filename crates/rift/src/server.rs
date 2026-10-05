@@ -15,8 +15,6 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jiff::tz::TimeZone;
-
 use rift_error::{ErrorContext, RiftError, errors};
 use rift_mcp::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence,
@@ -26,8 +24,8 @@ use rift_mcp::{
 };
 use rift_protocol::lock::ServerLock;
 use rift_tracing::{
-    LOG_PAGE_RECORDS_MAX, LogDrain, LogQuery, LogReader, LogReads, RecordKind, RunningLogDrain,
-    StoredLogRecord, install_panic_hook,
+    LOG_PAGE_RECORDS_MAX, LogDrain, LogLines, LogQuery, LogReader, LogReads, RecordKind,
+    RunningLogDrain, StoredLogRecord, install_panic_hook,
 };
 use tokio_util::sync::CancellationToken;
 use waitpid_any::WaitHandle;
@@ -444,8 +442,7 @@ pub(super) async fn run(
         } => {
             let window = LogsWindow { since, until, kind };
             let query = logs_query(tail, window, level, component.as_deref());
-            let time_zone = TimeZone::system();
-            print_logs(root, &query, tail, &logs_mode(follow), &time_zone)
+            print_logs(root, &query, tail, &logs_mode(follow))
                 .await
                 .map(|()| None)
         }
@@ -1392,24 +1389,30 @@ fn logs_query(
 /// answers, with no server, no index database, and no valid `rift.toml`. A workspace
 /// holding no `.rift/metrics` prints nothing, says so on stderr, and creates no state
 /// directory.
+///
+/// The records print through `rift-tracing`'s [`LogLines`], in UTC: as a stored page, each
+/// group padded to its own widths, or, when following, as the live stream stderr prints.
 async fn print_logs(
     root: &Path,
     query: &LogQuery,
     tail: TailCount,
     mode: &LogsMode,
-    time_zone: &TimeZone,
 ) -> Result<(), RiftError> {
     let Some(reader) = WorkspaceStorage::open_logs(root) else {
         eprintln!("{NO_RECORDED_LOGS}");
         return Ok(());
     };
+    let mut lines = match mode {
+        LogsMode::Once => LogLines::stored_page(),
+        LogsMode::Following => LogLines::live_stream(),
+    };
     let printed = match tail {
-        TailCount::All => print_records_after(&reader, query, 0, time_zone).await?,
-        TailCount::Newest(_) => print_newest_records(&reader, query, time_zone).await?,
+        TailCount::All => print_records_after(&reader, query, 0, &mut lines).await?,
+        TailCount::Newest(_) => print_newest_records(&reader, query, &mut lines).await?,
     };
     match mode {
         LogsMode::Once => Ok(()),
-        LogsMode::Following => follow_records(&reader, query, printed, time_zone).await,
+        LogsMode::Following => follow_records(&reader, query, printed, &mut lines).await,
     }
 }
 
@@ -1446,15 +1449,14 @@ async fn print_records_after(
     reader: &LogReader,
     query: &LogQuery,
     after: i64,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<i64, RiftError> {
     let mut newest = after;
     loop {
         let page = read_records(reader, query.clone().after(newest), LogReads::following).await?;
-        for stored in &page {
-            let line = stored.record().rendered(time_zone);
-            println!("{line}");
-            newest = stored.identity();
+        print_page(&page, lines);
+        if let Some(last) = page.last() {
+            newest = last.identity();
         }
         if page.len() < query.limit() {
             return Ok(newest);
@@ -1467,17 +1469,21 @@ async fn print_records_after(
 async fn print_newest_records(
     reader: &LogReader,
     query: &LogQuery,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<i64, RiftError> {
     let mut records = read_records(reader, query.clone(), LogReads::recent).await?;
     records.reverse();
-    let mut newest = 0;
-    for stored in &records {
-        let line = stored.record().rendered(time_zone);
-        println!("{line}");
-        newest = stored.identity();
-    }
-    Ok(newest)
+    print_page(&records, lines);
+    Ok(records.last().map_or(0, StoredLogRecord::identity))
+}
+
+/// Prints `page` on stdout as `lines` lays it out.
+fn print_page(page: &[StoredLogRecord], lines: &mut LogLines) {
+    let records = page
+        .iter()
+        .map(|stored| stored.record().clone())
+        .collect::<Vec<_>>();
+    print!("{}", lines.lines(&records));
 }
 
 /// Prints records as the server writes them, until the operator interrupts.
@@ -1485,11 +1491,11 @@ async fn follow_records(
     reader: &LogReader,
     query: &LogQuery,
     printed: i64,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<(), RiftError> {
     let interrupted = CancellationToken::new();
     let interrupt = tokio::spawn(cancel_on_interrupt(interrupted.clone()));
-    let followed = follow_until_interrupt(reader, query, printed, &interrupted, time_zone).await;
+    let followed = follow_until_interrupt(reader, query, printed, &interrupted, lines).await;
     interrupt.abort();
     let _ = interrupt.await;
     followed
@@ -1505,11 +1511,11 @@ async fn follow_until_interrupt(
     query: &LogQuery,
     printed: i64,
     interrupted: &CancellationToken,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<(), RiftError> {
     let mut newest = printed;
     while !interrupted.is_cancelled() {
-        newest = print_records_after(reader, query, newest, time_zone).await?;
+        newest = print_records_after(reader, query, newest, lines).await?;
         tokio::select! {
             () = interrupted.cancelled() => {}
             () = tokio::time::sleep(LOG_FOLLOW_POLL_INTERVAL) => {}
@@ -1543,7 +1549,6 @@ mod tests {
         foreground_refused, logs_mode, logs_query, now_ms, print_logs, request_stop,
         stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain, token_check,
     };
-    use jiff::tz::TimeZone;
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
@@ -3065,14 +3070,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
-        print_logs(
-            directory.path(),
-            &query,
-            TailCount::All,
-            &LogsMode::Once,
-            &TimeZone::UTC,
-        )
-        .await?;
+        print_logs(directory.path(), &query, TailCount::All, &LogsMode::Once).await?;
 
         assert!(
             !directory.path().join(".rift").exists(),
@@ -3108,20 +3106,12 @@ mod tests {
             .await?;
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
-        print_logs(
-            directory.path(),
-            &query,
-            TailCount::All,
-            &LogsMode::Once,
-            &TimeZone::UTC,
-        )
-        .await?;
+        print_logs(directory.path(), &query, TailCount::All, &LogsMode::Once).await?;
         print_logs(
             directory.path(),
             &query,
             TailCount::Newest(5),
             &LogsMode::Once,
-            &TimeZone::UTC,
         )
         .await?;
 
@@ -3174,15 +3164,9 @@ mod tests {
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
         for tail in [TailCount::All, TailCount::Newest(5)] {
-            let refused = print_logs(
-                directory.path(),
-                &query,
-                tail,
-                &LogsMode::Once,
-                &TimeZone::UTC,
-            )
-            .await
-            .expect_err("a file that is not a database cannot be read");
+            let refused = print_logs(directory.path(), &query, tail, &LogsMode::Once)
+                .await
+                .expect_err("a file that is not a database cannot be read");
 
             assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
             let rendered = refused.to_string();
@@ -3224,7 +3208,7 @@ mod tests {
     /// A follow whose read is refused fails at once rather than waiting to poll again.
     #[tokio::test]
     async fn a_follow_whose_read_is_refused_fails_before_it_waits() -> TestResult {
-        use super::{LogReader, follow_until_interrupt};
+        use super::{LogLines, LogReader, follow_until_interrupt};
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("metrics");
@@ -3237,7 +3221,7 @@ mod tests {
             &query,
             0,
             &interrupted,
-            &TimeZone::UTC,
+            &mut LogLines::live_stream(),
         )
         .await
         .expect_err("a file that is not a database cannot be followed");
@@ -3251,7 +3235,7 @@ mod tests {
     /// the poll interval, so the interrupt always lands inside the loop.
     #[tokio::test]
     async fn a_follow_ends_after_the_read_in_flight_when_interrupted() -> TestResult {
-        use super::follow_until_interrupt;
+        use super::{LogLines, follow_until_interrupt};
         use std::task::{Context, Waker};
 
         let directory = tempfile::tempdir()?;
@@ -3261,13 +3245,13 @@ mod tests {
         let reader = store.reader();
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
         let interrupted = tokio_util::sync::CancellationToken::new();
-        let time_zone = TimeZone::UTC;
+        let mut lines = LogLines::live_stream();
         let mut follow = Box::pin(follow_until_interrupt(
             &reader,
             &query,
             0,
             &interrupted,
-            &time_zone,
+            &mut lines,
         ));
         let mut context = Context::from_waker(Waker::noop());
         let first_poll = std::future::Future::poll(follow.as_mut(), &mut context);
@@ -3295,13 +3279,11 @@ mod tests {
         let kept = LogRecord::new(0, "info", "rift", "index", "index.build", "kept", "{}");
         store.append(&[kept], 1_000).await?;
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
-        let time_zone = TimeZone::UTC;
         let following = print_logs(
             directory.path(),
             &query,
             TailCount::Newest(5),
             &LogsMode::Following,
-            &time_zone,
         );
 
         let followed = tokio::time::timeout(std::time::Duration::from_secs(2), following).await;

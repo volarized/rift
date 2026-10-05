@@ -219,12 +219,17 @@ fn span_carries_name_component_operation_and_fields() {
         .expect("the span is named after the operation literal");
     assert_eq!(
         detailed.fields,
-        " component=\"documentation\" operation=\"documentation.collect\" sources=3"
+        " component=\"documentation\" operation=\"documentation.collect\" sources=3 \
+         code.function.name=\"rift_tracing::traced::tests::span_carries_name_component_operation_and_fields\""
     );
     let short = recorder
         .named("fingerprint.fold")
         .expect("the short form opens a span too");
-    assert_eq!(short.fields, " operation=\"fingerprint.fold\"");
+    assert_eq!(
+        short.fields,
+        " operation=\"fingerprint.fold\" code.function.name=\"rift_tracing::traced::tests::\
+         span_carries_name_component_operation_and_fields\""
+    );
 }
 
 #[test]
@@ -281,7 +286,8 @@ fn future_runs_once_and_returns_value_unchanged() {
         .expect("the future opens a span named after the operation literal");
     assert_eq!(
         span.fields,
-        " component=\"lexical\" operation=\"lexical.documents\" documents=4"
+        " component=\"lexical\" operation=\"lexical.documents\" documents=4 \
+         code.function.name=\"rift_tracing::traced::tests::future_runs_once_and_returns_value_unchanged\""
     );
 }
 
@@ -325,7 +331,8 @@ fn future_evaluates_fields_at_first_poll() {
         .expect("the first poll opens the span");
     assert_eq!(
         span.fields,
-        " component=\"search\" operation=\"search.read_store\" attempt=2"
+        " component=\"search\" operation=\"search.read_store\" attempt=2 \
+         code.function.name=\"rift_tracing::traced::tests::future_evaluates_fields_at_first_poll\""
     );
 }
 
@@ -506,7 +513,11 @@ fn span_records_declared_fields_and_runs_work_in_scope() {
     let opened = recorder
         .named("cloud.request")
         .expect("the span was recorded");
-    assert_eq!(opened.fields, " status=200");
+    assert_eq!(
+        opened.fields,
+        " code.function.name=\"rift_tracing::traced::tests::\
+         span_records_declared_fields_and_runs_work_in_scope\" status=200"
+    );
     assert_eq!(inside, Some(opened.id.clone()));
     assert_eq!(child, 3);
     let decode = recorder

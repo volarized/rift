@@ -1,31 +1,78 @@
-//! One record as the line stderr and `rift server logs` print.
+//! One record as the line stderr, `rift server logs`, and a failure window print.
+//!
+//! A line holds, in order: the time in UTC, the level, the function, the context, the
+//! nested operation, and the message.
+//!
+//! ```text
+//! 2026-10-04 20:42:58.798Z INFO  rift_mcp::server::RiftMcp::nodes   component=mcp operation=tools/call req=11 tool=nodes  ↳ fingerprint.fold component=index operation=fingerprint.fold close ✓ busy=12.1µs idle=13.2µs
+//! ```
+//!
+//! - The function is the `code.function.name` of the root span, the outermost span around
+//!   the record; outside every span, the record's own; for a metric snapshot record, the
+//!   instrument group. A record that carries none prints its target.
+//! - The context is the root span's fields: `component`, `operation`, then the rest sorted
+//!   by key, `request_id` under the label `req`. A record outside every span prints its
+//!   own `component`, `operation`, and fields there instead.
+//! - The nested operation is `↳`, the nearest span's name, and its fields, when the
+//!   record belongs to a span below the root.
+//! - The message is `close`, a mark, the reason the operation did not complete, then
+//!   `busy` and `idle` for a span close; a mark and the message for a lifecycle record;
+//!   the values for a metric snapshot record; the message and the record's own fields
+//!   otherwise.
+//!
+//! A group is a run of consecutive records of one request; without a request, of one
+//! root span; without a span, of one function. Each metric snapshot record is a group of
+//! its own. A blank line separates two groups. A stored page pads each column to the
+//! widest value of its group; a live stream, which does not know a group ahead, pads to
+//! fixed widths.
 
 use std::fmt::Write as _;
 
 use jiff::Timestamp;
-use jiff::fmt::temporal::DateTimePrinter;
-use jiff::tz::TimeZone;
 use serde_json::{Map, Value};
 
-use crate::record::LogRecord;
+use crate::record::{LogRecord, RecordKind};
 
-/// Renders a logged instant with exactly 3 fractional-second digits.
-///
-/// `DateTimePrinter::new` and `precision` are both `const fn`, so the
-/// configured printer is a compile-time value shared by every render.
-const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(3));
+/// The time a line prints: UTC with milliseconds, `2026-10-04 20:42:58.787Z`.
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3fZ";
 /// The member of a record's fields that carries the outermost span around it.
 const ROOT_SPAN_MEMBER: &str = "root_span";
 /// The member of a record's fields that carries the span it was emitted in, when that span
 /// is not the outermost.
 const NEAREST_SPAN_MEMBER: &str = "nearest_span";
-/// The field the root and nearest span print under a shorter label, and that label.
+/// The field that names the function that opened a span or emitted an event.
+const FUNCTION_FIELD: &str = "code.function.name";
+/// The field the context prints under a shorter label, and that label.
 const REQUEST_LABEL: (&str, &str) = ("request_id", "req");
-/// The mark before the nearest span of a record nested deeper than the root span.
+/// The members a span close record adds to the span's own fields.
+const CLOSE_MEMBERS: [&str; 6] = [
+    "span",
+    "elapsed_ms",
+    "busy_ns",
+    "idle_ns",
+    "status.code",
+    "error.type",
+];
+/// The mark before the nearest span of a record nested below the root span.
 const NESTED_MARK: &str = "↳";
-/// What ends the root and nearest span fields, so the message starts after a wider gap than
-/// the one between two of those fields.
+/// The mark of a phase that starts.
+const STARTED_MARK: &str = "→";
+/// The mark of an operation or a phase that completed.
+const COMPLETED_MARK: &str = "✓";
+/// The mark of an operation that failed, panicked, or was cancelled, or a phase that failed.
+const FAILED_MARK: &str = "✗";
+/// What follows the function column.
+const FUNCTION_END: &str = "   ";
+/// What follows the context column.
 const CONTEXT_END: &str = "  ";
+/// The width a live stream pads the function column to.
+const LIVE_FUNCTION_WIDTH: usize = 36;
+/// The width a live stream pads the context column to.
+const LIVE_CONTEXT_WIDTH: usize = 48;
+/// The width a live stream pads the nearest span's name to.
+const LIVE_NESTED_NAME_WIDTH: usize = 24;
+/// The width a live stream pads the nearest span's fields to.
+const LIVE_NESTED_FIELDS_WIDTH: usize = 40;
 
 /// Whether a rendered line colors its level with ANSI escape codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,41 +84,561 @@ pub(crate) enum LevelColor {
 }
 
 impl LogRecord {
-    /// The record as the operator reads it: when it happened in `time_zone`, how severe
-    /// it was, its `component` and `operation`, the request or operation it ran inside,
-    /// what it said, and the fields it carried.
-    ///
-    /// Inside a span, the line names the outermost span's fields, then `↳` and the name
-    /// and fields of the span it was emitted in, then two spaces before the message. A
-    /// span field already printed as the `component` or `operation` column is left out,
-    /// and `request_id` prints as `req`.
+    /// The record as one line of a live stream: its columns padded to the fixed widths,
+    /// without a trailing newline.
     #[must_use]
-    pub fn rendered(&self, time_zone: &TimeZone) -> String {
-        self.rendered_line(time_zone, LevelColor::Plain)
+    pub fn rendered(&self) -> String {
+        self.rendered_line(LevelColor::Plain)
     }
 
     /// [`Self::rendered`], with the level in `color`.
-    pub(crate) fn rendered_line(&self, time_zone: &TimeZone, color: LevelColor) -> String {
-        let timestamp = rendered_timestamp(self.recorded_at_ms(), time_zone);
-        let level = escaped(&self.level().to_uppercase());
-        let component = escaped(label(self.component()));
-        let operation = escaped(label(self.operation()));
-        let mut line = format!("{timestamp} ");
-        match level_color(self.level()).filter(|_| color == LevelColor::Ansi) {
-            Some(code) => {
-                let _ = write!(line, "\x1b[{code}m{level:<5}\x1b[0m");
-            }
-            None => {
-                let _ = write!(line, "{level:<5}");
-            }
+    pub(crate) fn rendered_line(&self, color: LevelColor) -> String {
+        LineParts::of(self).line(&Widths::LIVE, color)
+    }
+}
+
+/// Prints records as lines: one record per line, a blank line between two groups.
+///
+/// A stored page, `rift server logs` and a failure window, holds every record of a call
+/// and pads each column to the widest value of its group; a live stream, stderr and
+/// `rift server logs --follow`, pads to fixed widths. Both remember the group of the last
+/// line they printed, so the records of one run printed over several calls break where
+/// the group changes and nowhere else.
+#[derive(Debug)]
+pub struct LogLines {
+    padding: Padding,
+    color: LevelColor,
+    previous: Option<Group>,
+    printed: bool,
+}
+
+/// How [`LogLines`] pads the columns of a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Padding {
+    /// To the widest value of the group.
+    Group,
+    /// To the fixed widths of a live stream.
+    Live,
+}
+
+impl LogLines {
+    /// Lines of a stored page: every column padded to the widest value of its group.
+    #[must_use]
+    pub const fn stored_page() -> Self {
+        Self::new(Padding::Group, LevelColor::Plain)
+    }
+
+    /// Lines of a live stream: every column padded to a fixed width.
+    #[must_use]
+    pub const fn live_stream() -> Self {
+        Self::new(Padding::Live, LevelColor::Plain)
+    }
+
+    const fn new(padding: Padding, color: LevelColor) -> Self {
+        Self {
+            padding,
+            color,
+            previous: None,
+            printed: false,
         }
-        let _ = write!(line, " {component:<8} {operation:<12} ");
-        let fields = RecordFields::parsed(self.fields());
-        fields.write_context(&mut line, self.component(), self.operation());
-        push_escaped(&mut line, self.message());
-        fields.write_own(&mut line);
+    }
+
+    /// The lines of `records`, oldest first, each ending in a newline, with a blank line
+    /// wherever the group changes, including against the last record of the previous call.
+    #[must_use]
+    pub fn lines(&mut self, records: &[LogRecord]) -> String {
+        let parts = records.iter().map(LineParts::of).collect::<Vec<_>>();
+        let mut text = String::new();
+        let mut start = 0;
+        while start < parts.len() {
+            let first = parts[start].group.as_ref();
+            let end = (start + 1..parts.len())
+                .find(|index| !Group::same(first, parts[*index].group.as_ref()))
+                .unwrap_or(parts.len());
+            let group = &parts[start..end];
+            let widths = match self.padding {
+                Padding::Live => Widths::LIVE,
+                Padding::Group => Widths::of(group),
+            };
+            if self.printed && !Group::same(self.previous.as_ref(), group[0].group.as_ref()) {
+                text.push('\n');
+            }
+            for part in group {
+                text.push_str(&part.line(&widths, self.color));
+                text.push('\n');
+            }
+            self.previous.clone_from(&group[group.len() - 1].group);
+            self.printed = true;
+            start = end;
+        }
+        text
+    }
+}
+
+/// One record as a line of a live stream, rendered apart from the stream it joins, so
+/// many threads render at once and the stream is held only to place the line.
+#[derive(Debug)]
+pub(crate) struct LiveLine {
+    group: Option<Group>,
+    line: String,
+}
+
+impl LiveLine {
+    /// `record` as a live stream line, the level in `color`.
+    pub(crate) fn of(record: &LogRecord, color: LevelColor) -> Self {
+        let parts = LineParts::of(record);
+        let mut line = parts.line(&Widths::LIVE, color);
+        line.push('\n');
+        Self {
+            group: parts.group,
+            line,
+        }
+    }
+}
+
+impl LogLines {
+    /// The text that places `line` in the stream: the line, after a blank line when its
+    /// group differs from the line before.
+    pub(crate) fn placed(&mut self, line: LiveLine) -> String {
+        let LiveLine { group, mut line } = line;
+        if self.printed && !Group::same(self.previous.as_ref(), group.as_ref()) {
+            line.insert(0, '\n');
+        }
+        self.previous = group;
+        self.printed = true;
         line
     }
+}
+
+/// What makes consecutive records one group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Group {
+    /// The records of one request: the root span's `request_id`.
+    Request(String),
+    /// The records of one root span without a request: its name and context.
+    Span(String),
+    /// The records outside every span, of one function.
+    Function(String),
+}
+
+impl Group {
+    /// Whether two records of these groups belong to one: a record without a group, a
+    /// metric snapshot record, belongs to none but its own.
+    fn same(first: Option<&Self>, second: Option<&Self>) -> bool {
+        matches!((first, second), (Some(first), Some(second)) if first == second)
+    }
+}
+
+/// The widths one line pads its columns to.
+#[derive(Clone, Copy, Debug)]
+struct Widths {
+    function: usize,
+    context: usize,
+    nested_name: usize,
+    nested_fields: usize,
+}
+
+impl Widths {
+    const LIVE: Self = Self {
+        function: LIVE_FUNCTION_WIDTH,
+        context: LIVE_CONTEXT_WIDTH,
+        nested_name: LIVE_NESTED_NAME_WIDTH,
+        nested_fields: LIVE_NESTED_FIELDS_WIDTH,
+    };
+
+    /// The widest value of each column in `group`.
+    fn of(group: &[LineParts]) -> Self {
+        let width = |text: &str| text.chars().count();
+        let mut widths = Self {
+            function: 0,
+            context: 0,
+            nested_name: 0,
+            nested_fields: 0,
+        };
+        for part in group {
+            widths.function = widths.function.max(width(&part.function));
+            widths.context = widths.context.max(width(&part.context));
+            if let Some((name, fields)) = &part.nested {
+                widths.nested_name = widths.nested_name.max(width(name));
+                widths.nested_fields = widths.nested_fields.max(width(fields));
+            }
+        }
+        widths
+    }
+}
+
+/// One record's columns, each escaped, before padding.
+#[derive(Debug)]
+struct LineParts {
+    timestamp: String,
+    level: String,
+    color: Option<u8>,
+    function: String,
+    context: String,
+    nested: Option<(String, String)>,
+    message: String,
+    group: Option<Group>,
+}
+
+impl LineParts {
+    /// The columns of `record`.
+    fn of(record: &LogRecord) -> Self {
+        let mut parts = Self {
+            timestamp: rendered_timestamp(record.recorded_at_ms()),
+            level: escaped(&record.level().to_uppercase()),
+            color: level_color(record.level()),
+            function: String::new(),
+            context: String::new(),
+            nested: None,
+            message: String::new(),
+            group: None,
+        };
+        if record.kind() == RecordKind::Metric {
+            parts.function = escaped(label(record.operation()));
+            parts.message = own_pairs(&parsed_fields(record.fields()).unwrap_or_default());
+            return parts;
+        }
+        let Some(mut own) = parsed_fields(record.fields()) else {
+            parts.function = escaped(record.target());
+            parts.context = labels_context(record, &Map::new());
+            parts.message = escaped(record.message());
+            push_separated(&mut parts.message, &escaped(record.fields()));
+            parts.group = Some(Group::Function(parts.function.clone()));
+            return parts;
+        };
+        let root = span_member(&mut own, ROOT_SPAN_MEMBER);
+        let nearest = span_member(&mut own, NEAREST_SPAN_MEMBER);
+        let closed = own.get("span").and_then(Value::as_str) == Some("closed");
+        let function = |fields: &Map<String, Value>| {
+            fields
+                .get(FUNCTION_FIELD)
+                .and_then(Value::as_str)
+                .map_or_else(|| escaped(record.target()), escaped)
+        };
+        match (&root, closed) {
+            (Some(root), _) => {
+                let root_fields = span_fields(root);
+                parts.function = function(&root_fields);
+                parts.context = context_pairs(&root_fields);
+                parts.group = Some(span_group(root, &root_fields));
+            }
+            (None, true) => {
+                parts.function = function(&own);
+                parts.context = labels_context(record, &span_own(&own));
+                let name = escaped(record.message());
+                parts.group = Some(match own.get(REQUEST_LABEL.0) {
+                    Some(request) => Group::Request(plain_value(request)),
+                    None => Group::Span(format!("{name} {}", parts.context)),
+                });
+            }
+            (None, false) => {
+                parts.function = function(&own);
+                parts.context = labels_context(record, &own);
+                parts.group = Some(match own.get(REQUEST_LABEL.0) {
+                    Some(request) => Group::Request(plain_value(request)),
+                    None => Group::Function(parts.function.clone()),
+                });
+            }
+        }
+        if closed {
+            if root.is_some() {
+                let fields = labels_context(record, &span_own(&own));
+                parts.nested = Some((escaped(record.message()), fields));
+            }
+            parts.message = close_message(&own);
+            return parts;
+        }
+        let nearest_fields = nearest.as_ref().map(span_fields);
+        if let (Some(nearest), Some(fields)) = (&nearest, &nearest_fields) {
+            let name = nearest.get("name").and_then(Value::as_str).unwrap_or("");
+            parts.nested = Some((escaped(name), context_pairs(fields)));
+        }
+        parts.message = lifecycle_mark(&own).map_or_else(
+            || escaped(record.message()),
+            |mark| format!("{mark} {}", escaped(record.message())),
+        );
+        if let Some(root) = &root {
+            let root_fields = span_fields(root);
+            let mut pairs = String::new();
+            for (key, label) in [
+                ("component", record.component()),
+                ("operation", record.operation()),
+            ] {
+                let carried = nearest_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get(key))
+                    .or_else(|| root_fields.get(key))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !label.is_empty() && label != carried {
+                    push_separated(&mut pairs, &pair(key, &Value::from(label)));
+                }
+            }
+            push_separated(&mut pairs, &own_pairs(&own));
+            push_separated(&mut parts.message, &pairs);
+        }
+        parts
+    }
+
+    /// The line, its columns padded to `widths`, the level in `color`.
+    fn line(&self, widths: &Widths, color: LevelColor) -> String {
+        let mut line = format!("{} ", self.timestamp);
+        match self.color.filter(|_| color == LevelColor::Ansi) {
+            Some(code) => {
+                let _ = write!(line, "\x1b[{code}m{:<5}\x1b[0m", self.level);
+            }
+            None => {
+                let _ = write!(line, "{:<5}", self.level);
+            }
+        }
+        let _ = write!(
+            line,
+            " {:<width$}{FUNCTION_END}",
+            self.function,
+            width = widths.function
+        );
+        if !self.context.is_empty() {
+            let _ = write!(
+                line,
+                "{:<width$}{CONTEXT_END}",
+                self.context,
+                width = widths.context
+            );
+        }
+        if let Some((name, fields)) = &self.nested {
+            let _ = write!(
+                line,
+                "{NESTED_MARK} {name:<width$} ",
+                width = widths.nested_name
+            );
+            if !fields.is_empty() {
+                let _ = write!(line, "{fields:<width$} ", width = widths.nested_fields);
+            }
+        }
+        line.push_str(&self.message);
+        let end = line.trim_end_matches(' ').len();
+        line.truncate(end);
+        line
+    }
+}
+
+/// `fields` parsed as a JSON object; `None` for text that is not one.
+fn parsed_fields(fields: &str) -> Option<Map<String, Value>> {
+    if fields.is_empty() {
+        return Some(Map::new());
+    }
+    serde_json::from_str::<Map<String, Value>>(fields).ok()
+}
+
+/// Takes the span object under `member` out of `fields`, when it is one.
+fn span_member(fields: &mut Map<String, Value>, member: &str) -> Option<Map<String, Value>> {
+    match fields.remove(member)? {
+        Value::Object(span) => Some(span),
+        other => {
+            fields.insert(member.to_owned(), other);
+            None
+        }
+    }
+}
+
+/// The `fields` object of one span member.
+fn span_fields(span: &Map<String, Value>) -> Map<String, Value> {
+    match span.get("fields") {
+        Some(Value::Object(fields)) => fields.clone(),
+        _ => Map::new(),
+    }
+}
+
+/// The group of the records inside the root span `root`.
+fn span_group(root: &Map<String, Value>, fields: &Map<String, Value>) -> Group {
+    if let Some(request) = fields.get(REQUEST_LABEL.0) {
+        return Group::Request(plain_value(request));
+    }
+    let name = root.get("name").and_then(Value::as_str).unwrap_or("");
+    Group::Span(format!("{} {}", escaped(name), context_pairs(fields)))
+}
+
+/// A span close record's own fields: the span's fields without the members the close
+/// adds.
+fn span_own(own: &Map<String, Value>) -> Map<String, Value> {
+    own.iter()
+        .filter(|(key, _)| !CLOSE_MEMBERS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// The context of a record outside every span, or of a span's own close: the record's
+/// `component` and `operation`, then `fields` as [`context_pairs`] prints them.
+fn labels_context(record: &LogRecord, fields: &Map<String, Value>) -> String {
+    let mut labeled = fields.clone();
+    for (key, value) in [
+        ("component", record.component()),
+        ("operation", record.operation()),
+    ] {
+        if !value.is_empty() {
+            labeled.insert(key.to_owned(), Value::from(value));
+        }
+    }
+    context_pairs(&labeled)
+}
+
+/// Span fields as `key=value` pairs: `component`, `operation`, then the rest sorted by
+/// key, `request_id` under the label `req`, `code.function.name` left out.
+fn context_pairs(fields: &Map<String, Value>) -> String {
+    let mut pairs = String::new();
+    for key in ["component", "operation"] {
+        if let Some(value) = fields.get(key) {
+            push_separated(&mut pairs, &pair(key, value));
+        }
+    }
+    let mut rest = fields
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "component" | "operation" | FUNCTION_FIELD))
+        .collect::<Vec<_>>();
+    rest.sort_by_key(|(key, _)| *key);
+    for (key, value) in rest {
+        let key = if key == REQUEST_LABEL.0 {
+            REQUEST_LABEL.1
+        } else {
+            key
+        };
+        push_separated(&mut pairs, &pair(key, value));
+    }
+    pairs
+}
+
+/// A record's own fields as `key=value` pairs sorted by key, `code.function.name` left
+/// out.
+fn own_pairs(fields: &Map<String, Value>) -> String {
+    let mut sorted = fields
+        .iter()
+        .filter(|(key, _)| key.as_str() != FUNCTION_FIELD)
+        .collect::<Vec<_>>();
+    sorted.sort_by_key(|(key, _)| *key);
+    let mut pairs = String::new();
+    for (key, value) in sorted {
+        push_separated(&mut pairs, &pair(key, value));
+    }
+    pairs
+}
+
+/// The message of a span close: `close`, the mark, the reason the operation did not
+/// complete, then `busy` and `idle`.
+///
+/// A close record written without `busy_ns` and `idle_ns` prints its `elapsed_ms`, and
+/// one without `status.code` prints no mark.
+fn close_message(own: &Map<String, Value>) -> String {
+    let text = |key: &str| own.get(key).map(plain_value);
+    let mut message = String::from("close");
+    match text("status.code").as_deref() {
+        Some("Ok") => {
+            message.push(' ');
+            message.push_str(COMPLETED_MARK);
+        }
+        Some(_) => {
+            message.push(' ');
+            message.push_str(FAILED_MARK);
+            match text("error.type").as_deref() {
+                Some("panic") => message.push_str(" panicked"),
+                Some("cancelled") => message.push_str(" cancelled"),
+                Some(other) => {
+                    message.push(' ');
+                    message.push_str(&pair("error.type", &Value::from(other)));
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    let nanoseconds = |key: &str| text(key).and_then(|value| value.parse::<u64>().ok());
+    match (nanoseconds("busy_ns"), nanoseconds("idle_ns")) {
+        (Some(busy), Some(idle)) => {
+            let _ = write!(
+                message,
+                " busy={} idle={}",
+                rendered_duration(busy),
+                rendered_duration(idle)
+            );
+        }
+        _ => {
+            if let Some(elapsed) = own.get("elapsed_ms") {
+                message.push(' ');
+                message.push_str(&pair("elapsed_ms", elapsed));
+            }
+        }
+    }
+    message
+}
+
+/// The mark of a lifecycle record, from the fields that state its transition:
+/// `phase = "start"` starts a phase, `outcome = "ok"` completes it, and
+/// `outcome = "error"` fails it. `None` for any other record.
+fn lifecycle_mark(own: &Map<String, Value>) -> Option<&'static str> {
+    let text = |key: &str| own.get(key).and_then(Value::as_str);
+    match (text("phase"), text("outcome")) {
+        (Some("start"), _) => Some(STARTED_MARK),
+        (_, Some("ok")) => Some(COMPLETED_MARK),
+        (_, Some("error")) => Some(FAILED_MARK),
+        _ => None,
+    }
+}
+
+/// A duration in nanoseconds with three significant digits and the unit `ns`, `µs`,
+/// `ms`, or `s`.
+///
+/// The rule of `tracing-subscriber`'s `TimingDisplay` (`fmt/format/mod.rs`), which that
+/// crate declares `pub(super)`: two decimals below 10, one below 100, none below 1,000,
+/// then the next unit; seconds past 1,000 print whole.
+fn rendered_duration(nanoseconds: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a duration past 2^53 nanoseconds, 104 days, prints three digits"
+    )]
+    let mut value = nanoseconds as f64;
+    for unit in ["ns", "µs", "ms", "s"] {
+        if value < 10.0 {
+            return format!("{value:.2}{unit}");
+        } else if value < 100.0 {
+            return format!("{value:.1}{unit}");
+        } else if value < 1_000.0 {
+            return format!("{value:.0}{unit}");
+        }
+        value /= 1_000.0;
+    }
+    format!("{:.0}s", value * 1_000.0)
+}
+
+/// `key=value`, both escaped, a string value without the quotes JSON puts around it.
+///
+/// An array or object value prints as the JSON `serde_json` writes, which escapes C0
+/// controls alone, so its text is escaped as well.
+fn pair(key: &str, value: &Value) -> String {
+    let mut text = escaped(key);
+    text.push('=');
+    match value {
+        Value::String(value) => push_escaped(&mut text, value),
+        other => push_escaped(&mut text, &other.to_string()),
+    }
+    text
+}
+
+/// A field value as text: a string without its quotes, any other value as JSON.
+fn plain_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Appends `text` to `line`, after one space when `line` holds something already.
+fn push_separated(line: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !line.is_empty() {
+        line.push(' ');
+    }
+    line.push_str(text);
 }
 
 /// The SGR color code `tracing-subscriber` paints one level in on a terminal
@@ -93,165 +660,17 @@ fn label(value: &str) -> &str {
     if value.is_empty() { "-" } else { value }
 }
 
-/// A record's fields split into the spans it ran inside and its own.
-enum RecordFields {
-    /// A JSON object: the root and nearest span members apart from the record's own.
-    Object {
-        root: Option<Map<String, Value>>,
-        nearest: Option<Map<String, Value>>,
-        own: Map<String, Value>,
-    },
-    /// Text the store holds that is not a JSON object, printed as it is.
-    Text(String),
-}
-
-impl RecordFields {
-    fn parsed(fields: &str) -> Self {
-        if fields.is_empty() {
-            return Self::Object {
-                root: None,
-                nearest: None,
-                own: Map::new(),
-            };
-        }
-        let Ok(mut own) = serde_json::from_str::<Map<String, Value>>(fields) else {
-            return Self::Text(fields.to_owned());
-        };
-        let root = span_member(&mut own, ROOT_SPAN_MEMBER);
-        let nearest = span_member(&mut own, NEAREST_SPAN_MEMBER);
-        Self::Object { root, nearest, own }
-    }
-
-    /// Writes the outermost span's fields, `↳` and the nearest span, then the gap before the
-    /// message; nothing for a record outside every span.
-    fn write_context(&self, line: &mut String, component: &str, operation: &str) {
-        let Self::Object { root, nearest, .. } = self else {
-            return;
-        };
-        let before = line.len();
-        if let Some(root) = root {
-            write_span_fields(line, root, component, operation);
-        }
-        if let Some(nearest) = nearest {
-            if line.len() > before {
-                line.push(' ');
-            }
-            line.push_str(NESTED_MARK);
-            if let Some(Value::String(name)) = nearest.get("name") {
-                line.push(' ');
-                push_escaped(line, name);
-            }
-            let length = line.len();
-            line.push(' ');
-            write_span_fields(line, nearest, component, operation);
-            if line.len() == length + 1 {
-                line.truncate(length);
-            }
-        }
-        if line.len() > before {
-            line.push_str(CONTEXT_END);
-        }
-    }
-
-    /// Writes the record's own fields as ` key=value` pairs sorted by key, or ` ` and the
-    /// stored text.
-    fn write_own(&self, line: &mut String) {
-        match self {
-            Self::Object { own, .. } => {
-                let mut fields = own.iter().collect::<Vec<_>>();
-                fields.sort_by_key(|(key, _)| *key);
-                for (key, value) in fields {
-                    line.push(' ');
-                    write_pair(line, key, value);
-                }
-            }
-            Self::Text(text) => {
-                line.push(' ');
-                push_escaped(line, text);
-            }
-        }
-    }
-}
-
-/// Takes the span object under `member` out of `fields`, when it is one.
-fn span_member(fields: &mut Map<String, Value>, member: &str) -> Option<Map<String, Value>> {
-    match fields.remove(member)? {
-        Value::Object(span) => Some(span),
-        other => {
-            fields.insert(member.to_owned(), other);
-            None
-        }
-    }
-}
-
-/// Writes the `fields` of one span object as `key=value` pairs separated by one space:
-/// `component`, `operation`, then the rest sorted by key. A `component` or `operation`
-/// equal to the record's column is left out.
-fn write_span_fields(
-    line: &mut String,
-    span: &Map<String, Value>,
-    component: &str,
-    operation: &str,
-) {
-    let Some(Value::Object(fields)) = span.get("fields") else {
-        return;
-    };
-    let start = line.len();
-    let separate = |line: &mut String| {
-        if line.len() > start {
-            line.push(' ');
-        }
-    };
-    for (key, column) in [("component", component), ("operation", operation)] {
-        match fields.get(key) {
-            Some(Value::String(value)) if value == column => {}
-            Some(value) => {
-                separate(line);
-                write_pair(line, key, value);
-            }
-            None => {}
-        }
-    }
-    let mut rest = fields
-        .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "component" | "operation"))
-        .collect::<Vec<_>>();
-    rest.sort_by_key(|(key, _)| *key);
-    for (key, value) in rest {
-        separate(line);
-        let key = if key == REQUEST_LABEL.0 {
-            REQUEST_LABEL.1
-        } else {
-            key
-        };
-        write_pair(line, key, value);
-    }
-}
-
-/// Writes `key=value`, a string value without the quotes JSON puts around it.
-///
-/// An array or object value prints as the JSON `serde_json` writes, which escapes C0
-/// controls alone, so its text goes through [`push_escaped`] as well.
-fn write_pair(line: &mut String, key: &str, value: &Value) {
-    push_escaped(line, key);
-    line.push('=');
-    match value {
-        Value::String(text) => push_escaped(line, text),
-        other => push_escaped(line, &other.to_string()),
-    }
-}
-
 /// Appends `text` to `line` with every character [`is_escaped`] names written as
 /// [`char::escape_debug`] writes it (`\u{1b}`, `\n`, `\u{202e}`), every other character
 /// as it is.
 ///
 /// Every piece of record text a line carries passes through here: the message, the
-/// level, `component`, `operation`, span names, field keys and values, and the JSON of an
-/// array or object value. A record's text comes partly from outside the process (file
-/// paths, tool arguments, text of an indexed repository), and a line reaches a terminal on
-/// stderr and through `rift server logs`, so no record can move the cursor, recolor the
-/// terminal, end its line early, or reorder the text a reader sees. The only escape
-/// sequences a line carries are the level colors [`LevelColor::Ansi`] writes.
+/// level, `component`, `operation`, the function, span names, field keys and values, and
+/// the JSON of an array or object value. A record's text comes partly from outside the
+/// process (file paths, tool arguments, text of an indexed repository), and a line reaches
+/// a terminal on stderr and through `rift server logs`, so no record can move the cursor,
+/// recolor the terminal, end its line early, or reorder the text a reader sees. The only
+/// escape sequences a line carries are the level colors [`LevelColor::Ansi`] writes.
 ///
 /// A backslash prints as it is: a Windows path stays readable, and the text `\u{1b}` a
 /// record carried reads the same as an escaped ESC without acting as one.
@@ -295,298 +714,14 @@ pub(crate) const fn is_escaped(character: char) -> bool {
         )
 }
 
-/// One recorded instant as an RFC 3339 timestamp in `time_zone`'s local offset.
-///
-/// Local offset needs the tz database; jiff owns both parsing the recorded
-/// millisecond count and rendering it, with exactly 3 fractional digits and
-/// a numeric offset - never `Z`, since the offset is always known here. A
-/// millisecond count outside jiff's representable range falls back to the
-/// raw count instead of panicking.
-fn rendered_timestamp(recorded_at_ms: i64, time_zone: &TimeZone) -> String {
-    let Ok(timestamp) = Timestamp::from_millisecond(recorded_at_ms) else {
-        return recorded_at_ms.to_string();
-    };
-    let offset = time_zone.to_offset(timestamp);
-    TIMESTAMP_PRINTER.timestamp_with_offset_to_string(&timestamp, offset)
+/// One recorded instant in UTC with milliseconds, `2026-10-04 20:42:58.787Z`. A
+/// millisecond count outside jiff's representable range prints the raw count.
+fn rendered_timestamp(recorded_at_ms: i64) -> String {
+    Timestamp::from_millisecond(recorded_at_ms).map_or_else(
+        |_| recorded_at_ms.to_string(),
+        |timestamp| timestamp.strftime(TIMESTAMP_FORMAT).to_string(),
+    )
 }
 
 #[cfg(test)]
-mod tests {
-    use jiff::tz::{Offset, TimeZone};
-
-    use serde_json::json;
-
-    use super::{LevelColor, is_escaped, label, level_color, rendered_timestamp};
-    use crate::record::LogRecord;
-
-    /// Text a record can carry from outside the process, each holding characters a terminal
-    /// or a line reader acts on, and the escaped form a line prints for one of them.
-    const HOSTILE: [(&str, &str); 11] = [
-        ("\u{1b}[31mred\u{1b}[0m", "\\u{1b}[31mred"),
-        ("\u{1b}]0;title\u{7}", "\\u{1b}]0;title\\u{7}"),
-        ("\u{1b}[2J\u{1b}[H", "\\u{1b}[2J"),
-        ("left\rright", "left\\rright"),
-        ("first\nsecond", "first\\nsecond"),
-        ("nul\0byte", "nul\\0byte"),
-        ("del\u{7f}byte", "del\\u{7f}byte"),
-        ("csi\u{9b}31m", "csi\\u{9b}31m"),
-        ("next\u{85}line", "next\\u{85}line"),
-        ("override\u{202e}txt.exe", "override\\u{202e}txt.exe"),
-        (
-            "isolate\u{2066}x\u{2069} sep\u{2028}end",
-            "isolate\\u{2066}x\\u{2069}",
-        ),
-    ];
-
-    /// One record carrying `text` in the message, a field key, a field value, an array
-    /// value, the component, the root span's name and field, and the nearest span's name
-    /// and field.
-    fn records_carrying(text: &str) -> Vec<LogRecord> {
-        let span = |name: &str, key: &str, value: &str| {
-            let fields = json!({ "component": "mcp", key: value });
-            json!({ "name": name, "fields": fields })
-        };
-        let with_fields = |fields: serde_json::Value| {
-            LogRecord::new(
-                0,
-                "info",
-                "rift",
-                "mcp",
-                "tools/call",
-                "plain",
-                &fields.to_string(),
-            )
-        };
-        vec![
-            LogRecord::new(0, "info", "rift", "mcp", "tools/call", text, "{}"),
-            LogRecord::new(0, "info", "rift", text, text, "plain", "{}"),
-            with_fields(json!({ "path": text })),
-            with_fields(json!({ text: "value" })),
-            with_fields(json!({ "arguments": [text, { "nested": text }] })),
-            with_fields(json!({ "root_span": span(text, "tool", "search") })),
-            with_fields(json!({ "root_span": span("mcp.request", "tool", text) })),
-            with_fields(json!({ "root_span": span("mcp.request", text, "search") })),
-            with_fields(json!({
-                "root_span": span("mcp.request", "tool", "search"),
-                "nearest_span": span(text, "path", "lib.rs"),
-            })),
-            with_fields(json!({
-                "root_span": span("mcp.request", "tool", "search"),
-                "nearest_span": span("index.read", "path", text),
-            })),
-            LogRecord::new(0, "info", "rift", "mcp", "", "plain", text),
-        ]
-    }
-
-    /// `line` without the level colors [`LevelColor::Ansi`] writes.
-    fn without_level_colors(line: &str) -> String {
-        let mut plain = line.to_owned();
-        for code in [31, 32, 33, 34, 35, 0] {
-            plain = plain.replace(&format!("\u{1b}[{code}m"), "");
-        }
-        plain
-    }
-
-    /// No record text reaches a line as a control character, a line separator, or a
-    /// bidirectional control: each prints escaped, and the record stays one line, colored
-    /// or not.
-    #[test]
-    fn record_text_never_reaches_a_line_as_a_control_character() {
-        for (text, escaped_form) in HOSTILE {
-            for record in records_carrying(text) {
-                for color in [LevelColor::Plain, LevelColor::Ansi] {
-                    let line = record.rendered_line(&TimeZone::UTC, color);
-                    let plain = without_level_colors(&line);
-                    let raw = plain.chars().filter(|character| is_escaped(*character));
-                    assert_eq!(raw.count(), 0, "{text:?} reached {line:?}");
-                    assert_eq!(line.lines().count(), 1, "{line:?}");
-                    assert!(!line.contains(['\n', '\r']), "{line:?}");
-                }
-                let line = record.rendered(&TimeZone::UTC);
-                // `serde_json` writes a C0 control inside an array as `\u001b` itself, and a
-                // line names the nearest span alone.
-                let fields = record.fields();
-                if !fields.contains("arguments")
-                    && !fields.starts_with(
-                        "{\"root_span\":{\"fields\":{\"component\":\"mcp\",\"tool\":\"search\"}",
-                    )
-                {
-                    assert!(
-                        line.contains(escaped_form),
-                        "{line:?} shows {escaped_form:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The only escape sequences a line carries are its level colors, written on a
-    /// terminal alone.
-    #[test]
-    fn a_plain_line_carries_no_escape_sequence_and_a_terminal_line_only_its_color() {
-        let record = LogRecord::new(0, "warn", "rift", "mcp", "", "\u{1b}[31mred", "{}");
-
-        let plain = record.rendered_line(&TimeZone::UTC, LevelColor::Plain);
-        let terminal = record.rendered_line(&TimeZone::UTC, LevelColor::Ansi);
-
-        assert!(!plain.contains('\u{1b}'), "{plain:?}");
-        assert_eq!(terminal.matches('\u{1b}').count(), 2, "{terminal:?}");
-        assert!(
-            terminal.contains("\u{1b}[33mWARN \u{1b}[0m"),
-            "{terminal:?}"
-        );
-        assert!(terminal.ends_with("\\u{1b}[31mred"), "{terminal:?}");
-    }
-
-    #[test]
-    fn a_rendered_line_carries_every_column() {
-        let record = LogRecord::new(
-            1_756_552_944_123,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "rebuild",
-            "published 412 units",
-            "{\"unit_count\":412}",
-        );
-
-        assert_eq!(
-            record.rendered(&TimeZone::UTC),
-            "2025-08-30T11:22:24.123+00:00 INFO  index    rebuild      \
-             published 412 units unit_count=412"
-        );
-    }
-
-    #[test]
-    fn a_record_without_labels_prints_a_dash_in_each_column() {
-        let record = LogRecord::new(0, "warn", "rift", "", "", "late", "{}");
-
-        assert_eq!(
-            record.rendered(&TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00 WARN  -        -            late"
-        );
-        assert_eq!(label(""), "-");
-        assert_eq!(label("index"), "index");
-    }
-
-    /// The root span's fields print before the message, a field the columns already show
-    /// left out and `request_id` as `req`; the nearest span follows `↳`.
-    #[test]
-    fn a_record_inside_two_spans_prints_the_root_and_the_nearest_span() {
-        let record = LogRecord::new(
-            0,
-            "debug",
-            "rift_index::workspace",
-            "index",
-            "fingerprint.discover",
-            "walked the workspace",
-            "{\"files\":\"12\",\"root_span\":{\"name\":\"mcp.request\",\"fields\":\
-             {\"component\":\"mcp\",\"operation\":\"tools/call\",\"request_id\":\"18\",\
-             \"tool\":\"get_symbol\"}},\"nearest_span\":{\"name\":\"fingerprint.discover\",\
-             \"fields\":{\"component\":\"index\",\"operation\":\"fingerprint.discover\"}}}",
-        );
-
-        assert_eq!(
-            record.rendered(&TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00 DEBUG index    fingerprint.discover \
-             component=mcp operation=tools/call req=18 tool=get_symbol ↳ fingerprint.discover  \
-             walked the workspace files=12"
-        );
-    }
-
-    /// A `root_span` that is not an object is a field of the record like any other.
-    #[test]
-    fn a_span_member_that_is_not_an_object_prints_as_a_field() {
-        let record = LogRecord::new(0, "info", "rift", "mcp", "", "odd", "{\"root_span\":\"7\"}");
-
-        assert_eq!(
-            record.rendered(&TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00 INFO  mcp      -            odd root_span=7"
-        );
-    }
-
-    #[test]
-    fn a_terminal_line_colors_the_level_alone() {
-        let record = LogRecord::new(0, "warn", "rift", "mcp", "server.stop", "late", "{}");
-
-        assert_eq!(
-            record.rendered_line(&TimeZone::UTC, LevelColor::Ansi),
-            "1970-01-01T00:00:00.000+00:00 \u{1b}[33mWARN \u{1b}[0m mcp      server.stop  late"
-        );
-        for (level, code) in [
-            ("error", Some(31)),
-            ("warn", Some(33)),
-            ("info", Some(32)),
-            ("debug", Some(34)),
-            ("trace", Some(35)),
-            ("loud", None),
-        ] {
-            assert_eq!(level_color(level), code, "{level}");
-        }
-    }
-
-    #[test]
-    fn fields_print_as_pairs_or_as_the_text_the_store_holds() {
-        let line = |fields: &str| {
-            LogRecord::new(0, "info", "rift", "a", "b", "m", fields).rendered(&TimeZone::UTC)
-        };
-        let prefix = "1970-01-01T00:00:00.000+00:00 INFO  a        b            m";
-        assert_eq!(line("{}"), prefix);
-        assert_eq!(line(""), prefix);
-        assert_eq!(
-            line("{\"epoch\":\"4\",\"count\":7}"),
-            format!("{prefix} count=7 epoch=4")
-        );
-        assert_eq!(line("not json"), format!("{prefix} not json"));
-        assert_eq!(line("[1]"), format!("{prefix} [1]"));
-    }
-
-    #[test]
-    fn rendered_timestamp_uses_the_given_time_zones_offset() {
-        assert_eq!(
-            rendered_timestamp(0, &TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00"
-        );
-        assert_eq!(
-            rendered_timestamp(-1, &TimeZone::UTC),
-            "1969-12-31T23:59:59.999+00:00"
-        );
-
-        let positive = TimeZone::fixed(Offset::from_hours(2).expect("+2h must be a valid offset"));
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &positive),
-            "2025-08-30T13:22:24.123+02:00"
-        );
-
-        let negative = TimeZone::fixed(Offset::from_hours(-5).expect("-5h must be a valid offset"));
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &negative),
-            "2025-08-30T06:22:24.123-05:00"
-        );
-
-        let berlin =
-            TimeZone::get("Europe/Berlin").expect("the tz database must carry Europe/Berlin");
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &berlin),
-            "2025-08-30T13:22:24.123+02:00",
-            "August is daylight saving time in Berlin, CEST"
-        );
-        assert_eq!(
-            rendered_timestamp(1_736_940_144_123, &berlin),
-            "2025-01-15T12:22:24.123+01:00",
-            "January is standard time in Berlin, CET"
-        );
-    }
-
-    #[test]
-    fn an_out_of_range_millisecond_count_falls_back_to_the_raw_count() {
-        assert_eq!(
-            rendered_timestamp(i64::MAX, &TimeZone::UTC),
-            i64::MAX.to_string()
-        );
-        assert_eq!(
-            rendered_timestamp(i64::MIN, &TimeZone::UTC),
-            i64::MIN.to_string()
-        );
-    }
-}
+mod tests;

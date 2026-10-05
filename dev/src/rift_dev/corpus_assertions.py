@@ -397,7 +397,7 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
             continue
         closed = closes_span(record, INDEX_BUILD)
         completed = (
-            closed and re.search(epoch_pattern, record.rest) is not None
+            closed and re.search(epoch_pattern, record.text) is not None
         ) or record.operation == INDEX_PUBLISH
         require(not completed, f"{operation} completed before stop on stderr: {row}")
     return rows[start]

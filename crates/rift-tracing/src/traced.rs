@@ -43,6 +43,20 @@ pin_project_lite::pin_project! {
         #[pin]
         stage: Stage<Work, Open>,
     }
+
+    impl<Work, Open> PinnedDrop for TracedFuture<Work, Open> {
+        /// Records `error.type = "cancelled"` on the span of work dropped after its first
+        /// poll and before it returned, ahead of the span's close, so the close record
+        /// states the operation did not complete. A drop while the thread unwinds a panic
+        /// records nothing here: the close reads the panic itself.
+        fn drop(this: Pin<&mut Self>) {
+            if let StageProjection::Running { work, .. } = this.project().stage.project()
+                && !std::thread::panicking()
+            {
+                work.span().record("error.type", "cancelled");
+            }
+        }
+    }
 }
 
 impl<Work, Open> Future for TracedFuture<Work, Open>
@@ -222,6 +236,8 @@ pub fn parent_span(parent: &Span) -> Span {
 /// `span.name` and its outcome as `status.code`: `Ok` when the work finished, by any path
 /// out of a block or by returning from a future, and `Error` with `error.type` `panic` or
 /// `cancelled` when it panicked or an awaited future was dropped before it returned. The
+/// span's close record states the same outcome as `status.code` and `error.type`, and
+/// the span records `code.function.name`, the function the macro expands in. The metric
 /// recording follows the operation, not its span: a clone of the span held elsewhere
 /// does not lengthen the duration, and the span's filters do not select it. A thread
 /// whose dispatcher holds no metric values records nothing and reads no clock for it.
@@ -346,7 +362,9 @@ macro_rules! __rift_traced_block {
             $operation,
             $(component = $component,)?
             operation = $operation,
-            $($field = $value),*
+            $($field = $value,)*
+            code.function.name = $crate::__rift_function_name!(),
+            error.type = $crate::__private::tracing::field::Empty
         )
         .entered();
         $($crate::__rift_traced_opened!($open);)?
@@ -396,7 +414,9 @@ macro_rules! __rift_traced_span {
             $operation,
             $(component = $component,)?
             operation = $operation,
-            $($field = $value),*
+            $($field = $value,)*
+            code.function.name = $crate::__rift_function_name!(),
+            error.type = $crate::__private::tracing::field::Empty
         )
     };
 }

@@ -30,11 +30,12 @@ use crate::sampler::{ProcessSampler, SystemProcessReader, TickEvidence};
 use crate::stderr::{BoundedStderr, StderrLines};
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
-const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+pub(crate) const DEFAULT_TRACING_FILTER: &str =
+    "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
 /// Default stderr filter: the default targets, without metric snapshot records and with
 /// only the stall reports of the table of operations in flight. Both reach the capture
 /// under its own filter.
-const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
+pub(crate) const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
                                      rift_tracing::metric=off,rift_tracing::flight=warn";
 
 /// How much the process may write to its standard error.
@@ -256,7 +257,7 @@ impl TracingRuntimeBuilder {
                 },
             ))
         });
-        tracing_subscriber::registry()
+        crate::capture::registry()
             .with(MetricLayer::new(Arc::clone(&values)))
             .with(FlightLayer::new(Arc::clone(&flights)))
             .with(

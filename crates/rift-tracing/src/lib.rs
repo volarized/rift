@@ -22,8 +22,8 @@
 //!
 //! A binary starts tracing once through [`TracingRuntime::builder`], which installs stderr,
 //! the capture, and the optional OTLP export under filters of their own, and stops it with
-//! [`TracingRuntime::shutdown`]. [`LogRecord::rendered`] prints a record the way
-//! `rift server logs` shows it.
+//! [`TracingRuntime::shutdown`]. [`LogLines`] prints records the way stderr and
+//! `rift server logs` show them.
 //!
 //! Code records values into typed instruments: [`metrics`] returns the ones Rift declares,
 //! and [`Counter`], [`Gauge`], and [`Histogram`] declare more. Every [`traced!`] operation
@@ -89,6 +89,7 @@ pub use recorder::{
     SCOPED_RECORDER_PRINT_BYTES_MAX, SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder,
     ScopedRecorderBuilder,
 };
+pub use render::LogLines;
 pub use runtime::{
     LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder, validate_log_filter,
 };
@@ -96,7 +97,6 @@ pub use sampler::{PROCESS_SAMPLE_INTERVAL_MIN, SAMPLE_HOOKS_MAX, SampleHook, sam
 pub use span::Span;
 pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, WalCheckpoint};
-pub use tracing::{debug, error, info, trace, warn};
 
 /// Times a whole function as one [`traced!`] operation.
 ///
@@ -174,7 +174,7 @@ pub use rift_tracing_macros::timed;
 pub mod __private {
     pub use crate::measurement::monotonic_now;
     pub use crate::metrics::{Completion, completion};
-    pub use crate::span::span_from;
+    pub use crate::span::{function_name, span_from};
     pub use crate::traced::{parent_span, traced_future};
     pub use tracing;
 }

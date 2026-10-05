@@ -11,11 +11,9 @@
 //! panics, so a failed assertion carries what the code recorded before it.
 
 use std::collections::VecDeque;
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use jiff::tz::TimeZone;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::log_capture;
@@ -23,6 +21,7 @@ use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable};
 use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::record::LogRecord;
+use crate::render::LogLines;
 use crate::runtime::{LogFilterError, capture_layer, parsed_filter};
 
 /// Most records a panicking test's recorder prints: the newest ones it captured.
@@ -163,7 +162,7 @@ impl ScopedRecorderBuilder {
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
         let values = Arc::new(MetricValues::default());
-        let subscriber = tracing_subscriber::registry()
+        let subscriber = crate::capture::registry()
             .with(MetricLayer::new(Arc::clone(&values)))
             .with(FlightLayer::new(Arc::new(FlightTable::default())))
             .with(capture_layer(sink, filter));
@@ -205,29 +204,32 @@ impl RetainedRecords {
     }
 
     /// The text a panic prints: one line stating the records captured and left out, then
-    /// the newest records that fit [`SCOPED_RECORDER_PRINT_BYTES_MAX`], oldest first, each
-    /// rendered the way `rift server logs` prints it, in UTC.
+    /// the newest records that fit [`SCOPED_RECORDER_PRINT_BYTES_MAX`], oldest first, as
+    /// the stored page `rift server logs` prints, in UTC. A record fits by the length of
+    /// its live stream line.
     fn printed(&self) -> String {
         let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut lines = Vec::new();
+        let mut kept = 0;
         let mut bytes = 0;
         for record in records.iter().rev() {
-            let line = record.rendered(&TimeZone::UTC);
-            if bytes + line.len() + 1 > SCOPED_RECORDER_PRINT_BYTES_MAX {
+            let length = record.rendered().len() + 1;
+            if bytes + length > SCOPED_RECORDER_PRINT_BYTES_MAX {
                 break;
             }
-            bytes += line.len() + 1;
-            lines.push(line);
+            bytes += length;
+            kept += 1;
         }
         let left_out = self.left_out.load(Ordering::Relaxed)
-            + u64::try_from(records.len() - lines.len()).unwrap_or(u64::MAX);
+            + u64::try_from(records.len() - kept).unwrap_or(u64::MAX);
+        let newest = records
+            .iter()
+            .skip(records.len() - kept)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut printed = format!(
-            "scoped recorder: {} records printed, {left_out} earlier records left out\n",
-            lines.len()
+            "scoped recorder: {kept} records printed, {left_out} earlier records left out\n"
         );
-        for line in lines.iter().rev() {
-            let _ = writeln!(printed, "{line}");
-        }
+        printed.push_str(&LogLines::stored_page().lines(&newest));
         printed
     }
 }

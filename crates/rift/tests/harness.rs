@@ -601,7 +601,7 @@ impl WorkspaceReads {
         let mut records = read_heading(&arguments);
         let in_flight = match read_window(root, &arguments, budget) {
             Ok(read) => {
-                let count = read.printed.lines().count();
+                let count = read.printed.lines().filter(|line| !line.is_empty()).count();
                 let newest = newest_in_flight(read.printed.lines());
                 records.push_str(&bounded_tail(&read.printed));
                 records.push_str(&read.took);
@@ -638,7 +638,7 @@ impl WorkspaceReads {
         self.snapshots = read_heading(&arguments);
         match read_window(&self.root, &arguments, budget) {
             Ok(read) => {
-                let count = read.printed.lines().count();
+                let count = read.printed.lines().filter(|line| !line.is_empty()).count();
                 self.snapshots.push_str(&bounded_tail(&read.printed));
                 self.snapshots.push_str(&read.took);
                 if count >= WINDOW_SNAPSHOT_RECORDS_MAX {

@@ -60,7 +60,9 @@ pub fn span_from(span: tracing::Span) -> Span {
 /// Opens a [`Span`] at the info level, with the caller's module path as its target.
 ///
 /// The arguments are those of a `traced!` span: a name literal, then fields;
-/// `parent: &span` names an explicit parent.
+/// `parent: &span` names an explicit parent. The span also records the field
+/// `code.function.name`: the function that opened it, the column a line prints for every
+/// record inside it.
 ///
 /// ```
 /// let span = rift_tracing::info_span!("cloud.request", status = 0_u16);
@@ -69,11 +71,12 @@ pub fn span_from(span: tracing::Span) -> Span {
 #[macro_export]
 macro_rules! info_span {
     ($($arguments:tt)+) => {
-        $crate::__private::span_from($crate::__private::tracing::info_span!($($arguments)+))
+        $crate::__private::span_from($crate::__rift_named_span!(info_span [] $($arguments)+))
     };
 }
 
-/// Opens a [`Span`] at the debug level, with the caller's module path as its target.
+/// Opens a [`Span`] at the debug level, with the caller's module path as its target, and
+/// the field `code.function.name` as [`info_span!`] records it.
 ///
 /// ```
 /// # async fn read() -> u8 { 1 }
@@ -85,7 +88,222 @@ macro_rules! info_span {
 #[macro_export]
 macro_rules! debug_span {
     ($($arguments:tt)+) => {
-        $crate::__private::span_from($crate::__private::tracing::debug_span!($($arguments)+))
+        $crate::__private::span_from($crate::__rift_named_span!(debug_span [] $($arguments)+))
+    };
+}
+
+/// Opens a `tracing` span through `$macro` with `code.function.name` right after its name
+/// literal, ahead of the caller's fields and any trailing comma they end with.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rift_named_span {
+    ($macro:ident [$($parent:tt)*] parent: $value:expr, $($rest:tt)+) => {
+        $crate::__rift_named_span!($macro [parent: $value,] $($rest)+)
+    };
+    ($macro:ident [$($parent:tt)*] $name:literal $(,)?) => {
+        $crate::__private::tracing::$macro!(
+            $($parent)* $name,
+            code.function.name = $crate::__rift_function_name!()
+        )
+    };
+    ($macro:ident [$($parent:tt)*] $name:literal, $($fields:tt)+) => {
+        $crate::__private::tracing::$macro!(
+            $($parent)* $name,
+            code.function.name = $crate::__rift_function_name!(),
+            $($fields)+
+        )
+    };
+    ($macro:ident [$($parent:tt)*] $($arguments:tt)+) => {
+        $crate::__private::tracing::$macro!($($parent)* $($arguments)+)
+    };
+}
+
+/// The fully-qualified name of the function the macro expands in, as the field
+/// `code.function.name` records it: `rift_mcp::server::RiftMcp::search`.
+///
+/// `tracing`'s metadata holds a module path and no function, and `type_name` is not a
+/// `const fn` on a stable compiler, so the name is read when a record is made: the
+/// `type_name` of an item `f` declared here, trimmed by
+/// [`function_name`](crate::__private::function_name). The standard library leaves the
+/// format of that text unspecified, so the name is display text alone.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rift_function_name {
+    () => {
+        $crate::__private::function_name({
+            fn f() {}
+            ::core::any::type_name_of_val(&f)
+        })
+    };
+}
+
+/// `raw`, the `type_name` of an item `f` declared inside a function body, without its
+/// trailing `::f` and `::{{closure}}` segments: the function that declares the body.
+///
+/// `rift_mcp::server::Server::nodes::{{closure}}::f`, the item inside an async method,
+/// names `rift_mcp::server::Server::nodes`.
+#[doc(hidden)]
+#[must_use]
+pub fn function_name(raw: &'static str) -> &'static str {
+    let mut name = raw.strip_suffix("::f").unwrap_or(raw);
+    while let Some(outer) = name.strip_suffix("::{{closure}}") {
+        name = outer;
+    }
+    name
+}
+
+/// Emits an event at the `trace` level, with the caller's module path as its target.
+///
+/// The arguments are those of `tracing::trace!`. The event also records the field
+/// `code.function.name`: the function that emitted it, the column a line prints for a
+/// record outside every span.
+#[macro_export]
+macro_rules! trace {
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            target: $target,
+            $crate::__private::tracing::Level::TRACE,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            parent: $parent,
+            $crate::__private::tracing::Level::TRACE,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    ($($rest:tt)+) => {
+        $crate::__private::tracing::trace!(
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+}
+
+/// Emits an event at the `debug` level, with the caller's module path as its target.
+///
+/// The arguments are those of `tracing::debug!`. The event also records the field
+/// `code.function.name`: the function that emitted it, the column a line prints for a
+/// record outside every span.
+#[macro_export]
+macro_rules! debug {
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            target: $target,
+            $crate::__private::tracing::Level::DEBUG,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            parent: $parent,
+            $crate::__private::tracing::Level::DEBUG,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    ($($rest:tt)+) => {
+        $crate::__private::tracing::debug!(
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+}
+
+/// Emits an event at the `info` level, with the caller's module path as its target.
+///
+/// The arguments are those of `tracing::info!`. The event also records the field
+/// `code.function.name`: the function that emitted it, the column a line prints for a
+/// record outside every span.
+#[macro_export]
+macro_rules! info {
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            target: $target,
+            $crate::__private::tracing::Level::INFO,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            parent: $parent,
+            $crate::__private::tracing::Level::INFO,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    ($($rest:tt)+) => {
+        $crate::__private::tracing::info!(
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+}
+
+/// Emits an event at the `warn` level, with the caller's module path as its target.
+///
+/// The arguments are those of `tracing::warn!`. The event also records the field
+/// `code.function.name`: the function that emitted it, the column a line prints for a
+/// record outside every span.
+#[macro_export]
+macro_rules! warn {
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            target: $target,
+            $crate::__private::tracing::Level::WARN,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            parent: $parent,
+            $crate::__private::tracing::Level::WARN,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    ($($rest:tt)+) => {
+        $crate::__private::tracing::warn!(
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+}
+
+/// Emits an event at the `error` level, with the caller's module path as its target.
+///
+/// The arguments are those of `tracing::error!`. The event also records the field
+/// `code.function.name`: the function that emitted it, the column a line prints for a
+/// record outside every span.
+#[macro_export]
+macro_rules! error {
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            target: $target,
+            $crate::__private::tracing::Level::ERROR,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::__private::tracing::event!(
+            parent: $parent,
+            $crate::__private::tracing::Level::ERROR,
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
+    };
+    ($($rest:tt)+) => {
+        $crate::__private::tracing::error!(
+            code.function.name = $crate::__rift_function_name!(),
+            $($rest)+
+        )
     };
 }
 

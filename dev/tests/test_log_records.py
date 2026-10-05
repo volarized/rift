@@ -15,53 +15,65 @@ from rift_dev.log_records import (
     stop_measurements,
 )
 
-# Lines a foreground server printed on stderr, as `rift server logs` prints them too:
-# a record inside a span prints the outermost span's fields and two spaces first.
+# Lines a foreground server printed on stderr, as `rift server logs` prints them too: the
+# function, the root span's fields, `↳` and the nearest span, then the message.
 CHECKPOINT = (
-    "2026-10-05T10:27:23.437+00:00 INFO  storage  database.close component=mcp "
-    "operation=server.stop stage=SQLite worker shutdown  database checkpointed its "
-    "write-ahead log busy=0 checkpointed=12 database=index log=12"
+    "2026-10-05 11:57:50.507Z INFO  rift_mcp::http::stop_stage             "
+    "component=mcp operation=server.stop stage=SQLite worker shutdown  database "
+    "checkpointed its write-ahead log component=storage operation=database.close "
+    "busy=0 checkpointed=12 database=index elapsed_ms=1 log=12"
 )
 STAGE = (
-    "2026-10-05T10:27:23.435+00:00 INFO  mcp      server.stop  stage=SQLite worker "
-    "shutdown  stop stage ended outcome=ok remaining=4.9s stage=SQLite worker shutdown"
+    "2026-10-05 11:57:50.505Z INFO  rift_mcp::http::stop_stage             "
+    "component=mcp operation=server.stop stage=SQLite worker shutdown  ✓ stop stage "
+    "ended outcome=ok remaining=4.9s stage=SQLite worker shutdown"
 )
 FAILED_STAGE = (
-    "2026-10-05T10:27:23.436+00:00 WARN  mcp      server.stop  stage=metrics database "
-    "close  stop stage ended causes=timed out: late error=late outcome=error "
-    "remaining=0ns stage=metrics database close"
+    "2026-10-05 11:57:50.506Z WARN  rift_mcp::http::stop_stage             "
+    "component=mcp operation=server.stop stage=metrics database close  ✗ stop stage "
+    "ended causes=timed out: late error=late outcome=error remaining=0ns "
+    "stage=metrics database close"
 )
 IN_FLIGHT = (
-    "2026-10-05T10:27:23.432+00:00 INFO  -        -            operations in flight "
-    'in_flight=1 left_out=0 operations=[{"operation":"index.build"}] '
-    "reason=stop untracked=0"
+    "2026-10-05 11:57:50.504Z INFO  rift_tracing::flight   in_flight=1 left_out=0 "
+    'operations=[{"operation":"index.build"}] reason=stop untracked=0  '
+    "operations in flight"
 )
 STALL = (
-    "2026-10-05T10:27:23.500+00:00 WARN  -        -            "
-    "operations in flight past the stall delay in_flight=1 reason=stall_delay"
+    "2026-10-05 11:57:50.600Z WARN  rift_tracing::flight   in_flight=1 "
+    "reason=stall_delay  operations in flight past the stall delay"
 )
 NESTED = (
-    "2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=1 "
-    "trigger=filesystem ↳ worker.run component=worker operation=worker.run "
-    "work=filesystem index rebuild  index capture started epoch=1 phase=start"
+    "2026-10-05 11:57:37.429Z DEBUG rift_mcp::validation::run_index_supervisor_with   "
+    "component=index epoch=1 trigger=filesystem        ↳ worker.run               "
+    "component=worker operation=worker.run work=filesystem index rebuild → index capture "
+    "started component=index operation=index.build epoch=1 phase=start"
 )
 CLOSE = (
-    "2026-10-05T10:27:17.487+00:00 INFO  index    -            index.build "
-    "elapsed_ms=18 epoch=1 span=closed trigger=filesystem"
+    "2026-10-05 11:57:37.444Z INFO  rift_mcp::validation::run_index_supervisor_with   "
+    "component=index epoch=1 trigger=filesystem  ↳ index.build component=index "
+    "changed_count=1 outcome=ok close ✓ busy=7.95ms idle=19.3µs"
+)
+ROOT_CLOSE = (
+    "2026-10-05 11:57:15.826Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+    "component=history operation=history.batch  close ✓ busy=65.3µs idle=7.08µs"
+)
+TRAIT_METHOD = (
+    "2026-10-05 11:57:41.276Z INFO  <rift_mcp::server::RiftMcp as "
+    "rmcp::handler::server::ServerHandler>::call_tool   component=mcp "
+    "operation=tools/call req=1 tool=get_symbol  close ✓ busy=1.23ms idle=1.70ms"
 )
 
 
-def test_a_line_splits_into_its_labels_and_message() -> None:
+def test_a_line_splits_into_its_columns() -> None:
     record = parse_line(CHECKPOINT)
     assert record is not None
-    assert (record.level, record.component, record.operation) == (
-        "INFO",
-        "storage",
-        "database.close",
-    )
-    assert record.time == datetime(2026, 10, 5, 10, 27, 23, 437000, tzinfo=UTC)
+    assert record.level == "INFO"
+    assert record.function == "rift_mcp::http::stop_stage"
+    assert (record.component, record.operation) == ("storage", "database.close")
+    assert record.time == datetime(2026, 10, 5, 11, 57, 50, 507000, tzinfo=UTC)
     assert record.is_message("database checkpointed its write-ahead log")
-    assert record.spans == (
+    assert record.context == (
         "component=mcp operation=server.stop stage=SQLite worker shutdown"
     )
 
@@ -74,29 +86,45 @@ def test_the_span_fields_and_the_nearest_span_stay_out_of_the_message() -> None:
         "index",
         "index.build",
     )
-    assert record.spans.startswith("epoch=1 trigger=filesystem ↳ worker.run ")
+    assert record.context == "component=index epoch=1 trigger=filesystem"
+    assert record.nested_name == "worker.run"
     assert record.is_message("index capture started")
-    assert record.fields("index capture started") == {"epoch": "1", "phase": "start"}
+    assert record.fields("index capture started")["phase"] == "start"
+    assert record.fields("index capture started")["epoch"] == "1"
 
 
-def test_a_span_close_names_the_span_and_reads_closed() -> None:
-    record = parse_line(CLOSE)
-    assert record is not None
-    assert record.spans == ""
-    assert closes_span(record, "index.build")
-    assert not closes_span(record, "index.publish")
-    nested = parse_line(NESTED)
+def test_a_span_close_names_the_span_after_the_mark_or_by_its_operation() -> None:
+    nested = parse_line(CLOSE)
+    root = parse_line(ROOT_CLOSE)
     assert nested is not None
-    assert not closes_span(nested, "index.build")
+    assert root is not None
+    assert closes_span(nested, "index.build")
+    assert not closes_span(nested, "index.publish")
+    assert closes_span(root, "history.batch")
+    started = parse_line(NESTED)
+    assert started is not None
+    assert not closes_span(started, "index.build")
 
 
-def test_an_empty_message_inside_a_span_keeps_its_fields() -> None:
-    record = parse_line(
-        "2026-10-05T10:27:17.470+00:00 INFO  index    index.build  epoch=1   count=3"
-    )
+def test_a_trait_method_function_keeps_its_spaces() -> None:
+    record = parse_line(TRAIT_METHOD)
     assert record is not None
-    assert record.spans == "epoch=1"
-    assert record.rest == "count=3"
+    assert record.function == (
+        "<rift_mcp::server::RiftMcp as rmcp::handler::server::ServerHandler>::call_tool"
+    )
+    assert record.operation == "tools/call"
+    assert record.closes()
+
+
+def test_an_escaped_control_character_stays_on_its_line() -> None:
+    escaped = (
+        "2026-10-05 11:57:41.276Z WARN  rift_mcp::server::read   component=mcp "
+        "path=a\\u{1b}[2Jb\\nc  read refused"
+    )
+    assert [record.is_message("read refused") for record in lines(escaped)] == [True]
+    record = parse_line(escaped)
+    assert record is not None
+    assert record.fields("read refused")["path"] == "a\\u{1b}[2Jb\\nc"
 
 
 def test_a_line_of_another_shape_is_not_a_record() -> None:
@@ -104,7 +132,8 @@ def test_a_line_of_another_shape_is_not_a_record() -> None:
     assert parse_line(cut) is None
     assert parse_line("") is None
     assert parse_line("not-a-time INFO a b message") is None
-    assert [record.level for record in lines(f"{cut}\n{STAGE}\n")] == ["INFO"]
+    assert parse_line("2026-10-05T10:27:23.437+00:00 INFO  mcp  -  late") is None
+    assert [record.level for record in lines(f"{cut}\n{STAGE}\n\n")] == ["INFO"]
 
 
 def test_an_instant_reads_the_runners_timestamps() -> None:
@@ -143,9 +172,9 @@ def test_a_missing_record_kind_is_named_never_omitted() -> None:
 
 def test_a_close_without_a_checkpoint_row_keeps_its_message() -> None:
     skipped = (
-        "2026-10-05T09:00:05.000+00:00 WARN  storage  database.close "
-        "database checkpoint outlasted the shutdown deadline; the write-ahead log "
-        "stays for the next open database=vectors"
+        "2026-10-05 09:00:05.000Z WARN  rift_index::database::close   component=storage "
+        "operation=database.close database=vectors  database checkpoint outlasted the "
+        "shutdown deadline; the write-ahead log stays for the next open"
     )
     entry = stop_measurements(skipped)["database_close"][0]
     assert entry["database"] == "vectors"
@@ -154,7 +183,7 @@ def test_a_close_without_a_checkpoint_row_keeps_its_message() -> None:
 
 
 def test_records_of_an_earlier_server_are_left_out() -> None:
-    since = datetime(2026, 10, 5, 10, 27, 23, 436000, tzinfo=UTC)
+    since = datetime(2026, 10, 5, 11, 57, 50, 506000, tzinfo=UTC)
     found = stop_measurements(f"{STAGE}\n{CHECKPOINT}", since)
     assert found["stop_stages"] == []
     assert found["lacks"] == ["stop stage ended"]
@@ -180,10 +209,7 @@ def test_the_newest_operations_in_flight_is_not_a_stall_report() -> None:
 
 def test_the_newest_snapshot_of_each_group_is_kept() -> None:
     def snapshot(second: int, group: str) -> str:
-        return (
-            f"2026-10-05T09:00:0{second}.000+00:00 INFO  -        {group:<12} "
-            "metric snapshot a=1"
-        )
+        return f"2026-10-05 09:00:0{second}.000Z INFO  {group}   a=1"
 
     kept = newest_snapshots(
         lines(

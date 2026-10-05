@@ -1,13 +1,22 @@
 """Read the lines `rift server logs` and server stderr print.
 
-A line is `<timestamp> <LEVEL> <component> <operation> <message>` followed by ` key=value`
-pairs, sorted by key, with string values printed without quotes (`LogRecord::rendered`
-in `crates/rift-tracing/src/render.rs`). A label a record did not carry prints as `-`.
-A record emitted or closed inside a span prints, before its message, the outermost span's
-`key=value` fields, then `↳`, the nearest span's name and fields, and two spaces. Stderr
-prints the same line with the time in UTC. The runners parse two kinds of record from a
-stopped server's output, `database.close` and `stop stage ended`, and pick the newest
-`operations in flight` and `metric snapshot` records for a failure window.
+A line is `<date> <time>Z <LEVEL> <function>`, three spaces, the context, two spaces, the
+nested operation, and the message (`LogLines` in `crates/rift-tracing/src/render.rs`):
+
+```text
+2026-10-04 20:42:58.798Z INFO  rift_mcp::server::RiftMcp::nodes   component=mcp operation=tools/call req=11 tool=nodes  ↳ fingerprint.fold component=index operation=fingerprint.fold close ✓ busy=12.1µs idle=13.2µs
+```
+
+The context holds the root span's `key=value` fields, or, for a record outside every
+span, the record's own `component`, `operation`, and fields. The nested operation is `↳`,
+the nearest span's name, and its fields. The message is `close`, a mark, and `busy` and
+`idle` for a span close; a mark (`→`, `✓`, `✗`) and the message for a lifecycle record;
+the message and the record's own fields otherwise. A metric snapshot record prints its
+instrument group as the function and its values as the message. A stored page pads each
+column to the widest value of its group and puts a blank line between groups; a live
+stream pads to fixed widths. The runners parse two kinds of record from a stopped
+server's output, `database.close` and `stop stage ended`, and pick the newest
+`operations in flight` and metric snapshot records for a failure window.
 """
 
 from __future__ import annotations
@@ -21,17 +30,26 @@ CHECKPOINTED = "database checkpointed its write-ahead log"
 STAGE_ENDED = "stop stage ended"
 IN_FLIGHT = "operations in flight"
 STALL_REPORT = "operations in flight past the stall delay"
-METRIC_SNAPSHOT = "metric snapshot"
 DATABASE_CLOSE = "database.close"
+# The instrument groups a metric snapshot record prints in the function column.
+SNAPSHOT_GROUPS = frozenset(
+    ["operations", "locks", "database", "runtime", "process", "lifecycle"]
+)
 # Entries one report keeps per record kind. A stop writes a handful; the newest win.
 ENTRIES_MAX = 64
 # Characters of a free-text value the report keeps.
 VALUE_CHARS_MAX = 300
 FIELD_MARK = re.compile(r"(?:^|\s)([A-Za-z_][\w.]*)=")
-# The start of the root and nearest span fields a line prints before its message.
-SPAN_FIELDS_START = re.compile(r"^(?:[A-Za-z_][\w.]*=|↳ )")
-# What ends the root and nearest span fields: the message starts after it.
-SPAN_FIELDS_END = "  "
+# One `key=value` field of the nearest span, its value up to the next space.
+NESTED_FIELD = re.compile(r"[A-Za-z_][\w.]*=\S*\s*")
+# What ends the context: the nested operation or the message starts after it.
+CONTEXT_END = "  "
+# The mark before the nearest span of a record nested below the root span.
+NESTED_MARK = "↳ "
+# The marks a span close or a lifecycle record prints before its message.
+MARKS = "→✓✗"
+# A span close: `close`, then its mark when the record states one.
+CLOSE = re.compile(r"^close(?: [✓✗])?(?:\s|$)")
 
 
 Entry = dict[str, int | str | None]
@@ -47,65 +65,142 @@ class Measurements(TypedDict):
 
 
 class Line(NamedTuple):
-    """One printed record, its labels split from its message and fields.
+    """One printed record, its columns split.
 
-    `spans` holds the root and nearest span fields printed before the message, empty for
-    a record outside every span; `rest` holds the message and the record's own fields.
+    `context` and `nested` hold the `key=value` fields of the root and the nearest span,
+    `nested_name` the nearest span's name, empty for a record of the root span; `rest`
+    holds the message and the record's own fields.
     """
 
     time: datetime
     level: str
-    component: str
-    operation: str
+    function: str
+    context: str
+    nested_name: str
+    nested: str
     rest: str
     text: str
-    spans: str = ""
+
+    @property
+    def component(self) -> str:
+        """The record's `component`: its own, else the nearest span's, else the root's."""
+        return self.label("component")
+
+    @property
+    def operation(self) -> str:
+        """The record's `operation`: its own, else the nearest span's, else the root's.
+
+        A metric snapshot record names its instrument group here.
+        """
+        if self.is_snapshot():
+            return self.function
+        return self.label("operation")
+
+    def label(self, key: str) -> str:
+        """`key` among the record's own fields, then the nearest span's, then the root's."""
+        for text in (self.rest, self.nested, self.context):
+            value = fields(text).get(key)
+            if value is not None:
+                return value
+        return ""
+
+    def is_snapshot(self) -> bool:
+        """Whether the line is a metric snapshot record: an instrument group, not a
+        function, in the function column."""
+        return self.function in SNAPSHOT_GROUPS and not self.context
+
+    def message_end(self, message: str) -> int | None:
+        """Where `message` ends in `rest`, after an optional mark; None when absent.
+
+        The message starts the rest, or follows a value of the nearest span that holds
+        spaces, which the line prints without quotes.
+        """
+        pattern = rf"(?:^|\s)(?:[{MARKS}] )?{re.escape(message)}(?=\s|$)"
+        found = re.search(pattern, self.rest)
+        return None if found is None else found.end()
 
     def is_message(self, message: str) -> bool:
-        """Whether the message is exactly `message`, with fields or nothing after it."""
-        return self.rest == message or self.rest.startswith(message + " ")
+        """Whether the record's message is `message`, with fields or nothing after it."""
+        return self.message_end(message) is not None
 
     def fields(self, message: str) -> dict[str, str]:
-        """The `key=value` pairs after `message`; later duplicates win."""
-        return fields(self.rest.removeprefix(message))
+        """The `key=value` pairs of the root span, the nearest span, and the record after
+        `message`; later ones win, so the record's own fields come last."""
+        end = self.message_end(message)
+        own = self.rest[end:] if end is not None else self.rest
+        return {**fields(self.context), **fields(self.nested), **fields(own)}
+
+    def closes(self) -> bool:
+        """Whether the record is a span close."""
+        return CLOSE.search(self.rest) is not None
 
 
 def parse_line(line: str) -> Line | None:
     """The record a printed line holds, or None for a line of another shape.
 
-    A line that does not start with an ISO 8601 timestamp is not a record, such as
-    the cut notice a records file starts with.
+    A line that does not start with a UTC timestamp is not a record, such as the cut
+    notice a records file starts with or the blank line between two groups.
     """
-    parts = line.split(None, 4)
-    if len(parts) < 4:
+    parts = line.split(None, 3)
+    if len(parts) < 4 or not parts[1].endswith("Z"):
         return None
     try:
-        time = datetime.fromisoformat(parts[0])
+        time = datetime.fromisoformat(f"{parts[0]}T{parts[1][:-1]}+00:00")
     except ValueError:
         return None
-    if time.tzinfo is None:
-        return None
-    spans, rest = split_spans(parts[4] if len(parts) == 5 else "")
-    return Line(time, parts[1], parts[2], parts[3], rest, line, spans)
+    function, after = split_function(parts[3])
+    context, nested_name, nested, rest = split_columns(after)
+    return Line(time, parts[2], function, context, nested_name, nested, rest, line)
 
 
-def split_spans(text: str) -> tuple[str, str]:
-    """The root and nearest span fields at the start of `text`, and what follows them.
+def split_function(text: str) -> tuple[str, str]:
+    """The function column at the start of `text`, and what follows it.
 
-    Span fields print as `key=value` pairs or `↳ name`, and two spaces end them; text
-    that starts with neither is the message alone.
+    A trait method prints as `<Type as Trait>::method`, which holds spaces.
     """
-    if SPAN_FIELDS_START.match(text) is None:
-        return "", text
-    spans, separator, rest = text.partition(SPAN_FIELDS_END)
-    if not separator:
-        return "", text
-    return spans, rest.lstrip(" ")
+    if text.startswith("<"):
+        close = text.find(">::")
+        if close != -1:
+            end = text.find(" ", close)
+            end = len(text) if end == -1 else end
+            return text[:end], text[end:].lstrip(" ")
+    function, _, after = text.partition(" ")
+    return function, after.lstrip(" ")
+
+
+def split_columns(text: str) -> tuple[str, str, str, str]:
+    """The context, the nearest span's name and fields, and the rest of `text`.
+
+    The context is `key=value` pairs ended by two spaces; without them, `text` is the
+    message alone. The nearest span's fields follow its name up to the first word that is
+    not `key=value`.
+    """
+    context = ""
+    if FIELD_MARK.match(text) and CONTEXT_END in text:
+        context, _, text = text.partition(CONTEXT_END)
+        text = text.lstrip(" ")
+    if not text.startswith(NESTED_MARK):
+        return context.rstrip(), "", "", text
+    name, _, after = text[len(NESTED_MARK) :].partition(" ")
+    after = after.lstrip(" ")
+    position = 0
+    while (found := NESTED_FIELD.match(after, position)) is not None:
+        position = found.end()
+    return context.rstrip(), name, after[:position].rstrip(), after[position:]
 
 
 def closes_span(record: Line, name: str) -> bool:
-    """Whether `record` is the close record of the span `name`."""
-    return record.is_message(name) and record.fields(name).get("span") == "closed"
+    """Whether `record` is the close record of the span `name`.
+
+    A nested close names its span after `↳`. A root span prints no name, so its close is
+    the close of the span whose `operation` is `name`, as `traced!` names a span after its
+    operation.
+    """
+    if not record.closes():
+        return False
+    if record.nested_name:
+        return record.nested_name == name
+    return fields(record.context).get("operation") == name
 
 
 def instant(text: str) -> datetime | None:
@@ -169,7 +264,7 @@ def database_closes(records: Iterable[Line]) -> list[Entry]:
                 }
             )
         else:
-            values = fields(record.rest)
+            values = {"database": record.label("database") or None}
             found.append(
                 {
                     "database": number_or_text(values.get("database")),
@@ -238,13 +333,13 @@ def newest_in_flight(records: Iterable[Line]) -> Line | None:
 
 
 def newest_snapshots(records: Iterable[Line]) -> list[Line]:
-    """The newest `metric snapshot` record of each group, oldest first.
+    """The newest metric snapshot record of each group, oldest first.
 
     A snapshot record names its group, one of operations, locks, database, runtime,
-    process, or lifecycle, in the operation column.
+    process, or lifecycle, in the function column.
     """
     newest: dict[str, Line] = {}
     for record in records:
-        if record.is_message(METRIC_SNAPSHOT):
-            newest[record.operation] = record
+        if record.is_snapshot():
+            newest[record.function] = record
     return sorted(newest.values(), key=lambda record: record.time)

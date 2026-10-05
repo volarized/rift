@@ -675,6 +675,7 @@ fn fill_failed(error: &str) {
     rift_tracing::warn!(
         component = "history",
         operation = "history.fill",
+        outcome = "error",
         error,
         "a history store fill stopped; the next fill plans again from what the store holds"
     );

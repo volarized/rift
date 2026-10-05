@@ -10,18 +10,18 @@
 //! and a full queue drops the record and counts it. Losing a record is the correct
 //! failure here, because the alternative is a log write pausing the code being logged.
 
+use std::cell::RefCell;
 use std::fmt::{self, Write as _};
-use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::{self, Sender, error::TrySendError};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
-use tracing_subscriber::Layer;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::registry::{LookupSpan, SpanRef};
+use tracing_subscriber::layer::{Context, Layered, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{Layer, Registry};
 
 use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
 use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
@@ -47,12 +47,26 @@ const NEAREST_SPAN_MEMBER: &str = "nearest_span";
 /// The member that counts the field members a span's set left out at
 /// [`SPAN_FIELDS_BYTES_MAX`].
 const FIELDS_LEFT_OUT_MEMBER: &str = "fields_left_out";
+/// The member of a span close record that holds the nanoseconds the span was entered.
+const BUSY_MEMBER: &str = "busy_ns";
+/// The member of a span close record that holds the nanoseconds the span was open and not
+/// entered.
+const IDLE_MEMBER: &str = "idle_ns";
+/// The member of a span close record that states whether its operation completed: `Ok`, or
+/// `Error` beside `error.type`. The spelling of the operation metrics' label.
+const STATUS_CODE_MEMBER: &str = "status.code";
+/// The member naming why an operation did not complete: `panic`, `cancelled`, or the
+/// registered error identity. The spelling of the operation metrics' label.
+const ERROR_TYPE_MEMBER: &str = "error.type";
 /// Field names the layer writes itself. A span or event field under one of them is not
 /// recorded, so a member the layer writes never meets a field of the same name.
-const RESERVED_FIELD_NAMES: [&str; 3] = [
+const RESERVED_FIELD_NAMES: [&str; 6] = [
     ROOT_SPAN_MEMBER,
     NEAREST_SPAN_MEMBER,
     FIELDS_LEFT_OUT_MEMBER,
+    BUSY_MEMBER,
+    IDLE_MEMBER,
+    STATUS_CODE_MEMBER,
 ];
 /// Most bytes of [`FIELDS_LEFT_OUT_MEMBER`] with its leading comma: a `u64` count prints
 /// in at most 20 digits.
@@ -148,13 +162,73 @@ impl<S> Layer<S> for LogSink
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
+    fn on_close(&self, id: tracing::span::Id, context: Context<'_, S>) {
+        if let Some(record) = closed_record(&id, &context) {
+            self.send(record);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
+        self.send(event_record(event, &context));
+    }
+}
+
+/// The registry every subscriber that writes records composes on: the bare registry with
+/// [`SpanContextLayer`] first, so every span carries what its records need before any
+/// record layer runs.
+pub(crate) fn registry() -> Layered<SpanContextLayer, Registry> {
+    tracing_subscriber::registry().with(SpanContextLayer)
+}
+
+/// The `tracing` layer that keeps, for every span, what the records written inside it
+/// carry: its labels and fields, its root span, and how long it was busy and idle.
+///
+/// It runs unfiltered and first, before the stderr lines and the capture, which run each
+/// under a filter of its own. A per-layer filter hands its layer only the spans it
+/// admitted, so a record layer that kept its own labels lost the spans its filter refused:
+/// an event inside a span `[logs] capture` left out was stored without that span while
+/// stderr printed it. Kept here once, a span's context reaches every record layer whether
+/// or not that layer's filter admitted the span, and both layers write one record.
+///
+/// The busy and idle time follow `tracing-subscriber`'s own close timing
+/// (`fmt/fmt_layer.rs`, `on_enter`, `on_exit`, `on_close`): busy is the time the span was
+/// entered, idle the time it was not, both from its opening to its close.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SpanContextLayer;
+
+impl<S> Layer<S> for SpanContextLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
     fn on_new_span(
         &self,
         attributes: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
         context: Context<'_, S>,
     ) {
-        span_opened::<Self, S>(attributes, id, &context);
+        let Some(span) = context.span(id) else {
+            return;
+        };
+        let mut fields = RecordedFields::default();
+        attributes.record(&mut fields);
+        let parent = span.parent().and_then(|parent| {
+            parent
+                .extensions()
+                .get::<SpanEntry>()
+                .and_then(SpanEntry::context)
+        });
+        let labeled = span.metadata().target().starts_with(RIFT_TARGET)
+            || !(fields.component.is_empty() && fields.operation.is_empty());
+        let node = Arc::new(SpanNode::opened(span.name(), &fields, parent.clone()));
+        span.extensions_mut().replace(SpanEntry {
+            context: if labeled {
+                Some(Arc::clone(&node))
+            } else {
+                parent
+            },
+            node,
+            timings: Timings::opened(),
+        });
     }
 
     fn on_record(
@@ -163,66 +237,222 @@ where
         values: &tracing::span::Record<'_>,
         context: Context<'_, S>,
     ) {
-        span_recorded::<Self, S>(id, values, &context);
+        let Some(span) = context.span(id) else {
+            return;
+        };
+        let mut fields = RecordedFields::default();
+        values.record(&mut fields);
+        if let Some(entry) = span.extensions().get::<SpanEntry>() {
+            entry.node.labels_mut().extend(&fields.rest);
+        }
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, context: Context<'_, S>) {
+        if let Some(span) = context.span(id)
+            && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
+        {
+            entry.timings.entered();
+        }
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, context: Context<'_, S>) {
+        if let Some(span) = context.span(id)
+            && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
+        {
+            entry.timings.exited();
+        }
     }
 
     fn on_close(&self, id: tracing::span::Id, context: Context<'_, S>) {
-        if let Some(record) = closed_record::<Self, S>(&id, &context) {
-            self.send(record);
+        if let Some(span) = context.span(&id)
+            && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
+        {
+            entry.timings.closed();
         }
     }
 
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
-        self.send(event_record::<Self, S>(event, &context));
+        let node = context.event_span(event).and_then(|span| {
+            span.extensions()
+                .get::<SpanEntry>()
+                .and_then(SpanEntry::context)
+        });
+        EVENT_SPAN.with(|held| *held.borrow_mut() = (event_key(event), node));
     }
 }
 
-/// Keeps the labels of the span `id` opened with `attributes`, for the records of the layer
-/// `Owner`.
+thread_local! {
+    /// The span the event this thread is dispatching was emitted in, as
+    /// [`SpanContextLayer`] found it, keyed by [`event_key`].
+    ///
+    /// A record layer under a filter finds an event's spans through its own filter alone,
+    /// so it reads the event's span here. The layer runs first for every event, so the
+    /// value a record layer reads was written for the event it is handed.
+    static EVENT_SPAN: RefCell<(usize, Option<Arc<SpanNode>>)> = const { RefCell::new((0, None)) };
+}
+
+/// The identity of `event` while it is dispatched: every layer is handed one reference.
+fn event_key(event: &Event<'_>) -> usize {
+    std::ptr::from_ref(event).addr()
+}
+
+/// The span `event` was emitted in: the one [`SpanContextLayer`] found, or, on a
+/// subscriber without that layer, the nearest span `context` admits.
+fn event_span<S>(event: &Event<'_>, context: &Context<'_, S>) -> Option<Arc<SpanNode>>
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    let key = event_key(event);
+    let held = EVENT_SPAN.with(|held| {
+        let held = held.borrow();
+        (held.0 == key).then(|| held.1.clone())
+    });
+    held.unwrap_or_else(|| {
+        context.event_span(event).and_then(|span| {
+            span.extensions()
+                .get::<SpanEntry>()
+                .and_then(SpanEntry::context)
+        })
+    })
+}
+
+/// The start every Rift crate's target shares.
+const RIFT_TARGET: &str = "rift";
+
+/// What [`SpanContextLayer`] keeps in one span's extensions: the span's own node, the
+/// node the records inside it name as their span, and its timings.
 ///
-/// Each layer that writes records keeps its own [`OwnedLabels`]: a per-layer filter hands a
-/// layer only the spans it admitted, so the capture and the stderr lines may each see a
-/// span the other does not.
-pub(crate) fn span_opened<Owner: 'static, S>(
-    attributes: &tracing::span::Attributes<'_>,
-    id: &tracing::span::Id,
-    context: &Context<'_, S>,
-) where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    let Some(span) = context.span(id) else {
-        return;
-    };
-    let mut fields = RecordedFields::default();
-    attributes.record(&mut fields);
-    let labels = SpanLabels::opened(span.name(), &fields);
-    span.extensions_mut()
-        .replace(OwnedLabels::<Owner>::new(labels));
+/// A dependency's span that carries neither `component` nor `operation`, such as `rmcp`'s
+/// `serve_inner` around Rift's request span, names no context of its own: the records
+/// inside it, and the spans that open inside it, see the Rift span around it. Its own
+/// close record still names it.
+struct SpanEntry {
+    node: Arc<SpanNode>,
+    context: Option<Arc<SpanNode>>,
+    timings: Timings,
 }
 
-/// Adds the fields the span `id` recorded after it opened to the labels `Owner` keeps.
-pub(crate) fn span_recorded<Owner: 'static, S>(
-    id: &tracing::span::Id,
-    values: &tracing::span::Record<'_>,
-    context: &Context<'_, S>,
-) where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    let Some(span) = context.span(id) else {
-        return;
-    };
-    let mut fields = RecordedFields::default();
-    values.record(&mut fields);
-    let mut extensions = span.extensions_mut();
-    if let Some(owned) = extensions.get_mut::<OwnedLabels<Owner>>() {
-        owned.labels.extend(&fields.rest);
+impl SpanEntry {
+    fn context(&self) -> Option<Arc<SpanNode>> {
+        self.context.clone()
     }
 }
 
-/// The record of the span `id` closing: its name as the message, its own fields, `span`,
-/// `elapsed_ms`, and, when it closes inside another span, `root_span` for the outermost
-/// span around it. `None` when `Owner` kept no labels for the span.
-pub(crate) fn closed_record<Owner: 'static, S>(
+/// How long one span was busy and idle, in nanoseconds, as `tracing-subscriber`'s close
+/// timing counts them: busy while entered at least once, idle otherwise.
+#[derive(Debug)]
+struct Timings {
+    busy_ns: u64,
+    idle_ns: u64,
+    last: Instant,
+    entered: u64,
+}
+
+impl Timings {
+    fn opened() -> Self {
+        Self {
+            busy_ns: 0,
+            idle_ns: 0,
+            last: Instant::now(),
+            entered: 0,
+        }
+    }
+
+    /// Nanoseconds since the last change, the clock read once.
+    fn lap(&mut self) -> u64 {
+        let now = Instant::now();
+        let lap =
+            u64::try_from(now.saturating_duration_since(self.last).as_nanos()).unwrap_or(u64::MAX);
+        self.last = now;
+        lap
+    }
+
+    fn entered(&mut self) {
+        if self.entered == 0 {
+            self.idle_ns = self.idle_ns.saturating_add(self.lap());
+        }
+        self.entered = self.entered.saturating_add(1);
+    }
+
+    fn exited(&mut self) {
+        self.entered = self.entered.saturating_sub(1);
+        if self.entered == 0 {
+            self.busy_ns = self.busy_ns.saturating_add(self.lap());
+        }
+    }
+
+    /// Ends the count at the close: the time since the last exit is idle, or busy for a
+    /// span closed while entered.
+    fn closed(&mut self) {
+        let lap = self.lap();
+        if self.entered == 0 {
+            self.idle_ns = self.idle_ns.saturating_add(lap);
+        } else {
+            self.busy_ns = self.busy_ns.saturating_add(lap);
+        }
+    }
+}
+
+/// One span as the records inside it see it: its labels and fields, the span it opened
+/// in, and the outermost span around it.
+#[derive(Debug)]
+pub(crate) struct SpanNode {
+    labels: RwLock<SpanLabels>,
+    parent: Option<Arc<Self>>,
+    root: Option<Arc<Self>>,
+}
+
+impl SpanNode {
+    /// The node of the span `name` opened with `fields` inside `parent`.
+    fn opened(name: &str, fields: &RecordedFields, parent: Option<Arc<Self>>) -> Self {
+        let root = parent
+            .as_ref()
+            .map(|parent| parent.root.clone().unwrap_or_else(|| Arc::clone(parent)));
+        Self {
+            labels: RwLock::new(SpanLabels::opened(name, fields)),
+            parent,
+            root,
+        }
+    }
+
+    fn labels(&self) -> RwLockReadGuard<'_, SpanLabels> {
+        self.labels.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn labels_mut(&self) -> RwLockWriteGuard<'_, SpanLabels> {
+        self.labels.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The `component` and `operation` an event inside this span is filed under when it
+    /// names none itself: each from the nearest span, this one first, that names it.
+    fn inherited(&self, component: &mut String, operation: &mut String) {
+        let mut node = Some(self);
+        while let Some(current) = node {
+            if !component.is_empty() && !operation.is_empty() {
+                return;
+            }
+            let labels = current.labels();
+            if component.is_empty() {
+                component.clone_from(&labels.component);
+            }
+            if operation.is_empty() {
+                operation.clone_from(&labels.operation);
+            }
+            drop(labels);
+            node = current.parent.as_deref();
+        }
+    }
+}
+
+/// The record of the span `id` closing: its name as the message, its own fields, then
+/// `span`, `elapsed_ms`, `busy_ns`, `idle_ns`, `status.code`, `error.type` when it did not
+/// complete, and, when it closes inside another span, `root_span` for the outermost span
+/// around it. `None` when the span carries no [`SpanContextLayer`] entry.
+///
+/// The span completed (`status.code` `Ok`) unless it recorded an `error.type` itself, as
+/// `traced!` does for an awaited operation dropped before it returned (`cancelled`), or it
+/// closes while its thread unwinds a panic (`panic`).
+pub(crate) fn closed_record<S>(
     id: &tracing::span::Id,
     context: &Context<'_, S>,
 ) -> Option<LogRecord>
@@ -231,25 +461,35 @@ where
 {
     let span = context.span(id)?;
     let mut fields = String::from("{");
-    let (component, operation) = {
-        let extensions = span.extensions();
-        let labels = &extensions.get::<OwnedLabels<Owner>>()?.labels;
-        let elapsed_ms = labels.opened_at.elapsed().as_millis();
-        if labels.fields.write_into(&mut fields) {
-            fields.push(',');
-        }
+    let extensions = span.extensions();
+    let entry = extensions.get::<SpanEntry>()?;
+    let labels = entry.node.labels();
+    let Timings {
+        busy_ns, idle_ns, ..
+    } = entry.timings;
+    let elapsed_ms = busy_ns.saturating_add(idle_ns) / 1_000_000;
+    if labels.fields.write_into(&mut fields) {
+        fields.push(',');
+    }
+    let _ = write!(
+        fields,
+        "\"span\":\"closed\",\"elapsed_ms\":\"{elapsed_ms}\",\"{BUSY_MEMBER}\":\"{busy_ns}\",\
+         \"{IDLE_MEMBER}\":\"{idle_ns}\","
+    );
+    if labels.error_type {
+        let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Error\"");
+    } else if std::thread::panicking() {
         let _ = write!(
             fields,
-            "\"span\":\"closed\",\"elapsed_ms\":\"{elapsed_ms}\""
+            "\"{STATUS_CODE_MEMBER}\":\"Error\",\"{ERROR_TYPE_MEMBER}\":\"panic\""
         );
-        (labels.component.clone(), labels.operation.clone())
-    };
-    let root = span
-        .scope()
-        .skip(1)
-        .filter(|ancestor| ancestor.extensions().get::<OwnedLabels<Owner>>().is_some())
-        .last();
-    push_span_member::<Owner, _>(&mut fields, ROOT_SPAN_MEMBER, root.as_ref());
+    } else {
+        let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Ok\"");
+    }
+    let (component, operation) = (labels.component.clone(), labels.operation.clone());
+    drop(labels);
+    push_span_member(&mut fields, ROOT_SPAN_MEMBER, entry.node.root.as_deref());
+    drop(extensions);
     fields.push('}');
     Some(LogRecord::new(
         now_ms(),
@@ -264,11 +504,8 @@ where
 
 /// The record of `event`: a metric snapshot record for a snapshot event, otherwise a log
 /// record carrying the event's fields, then `root_span` and `nearest_span` from the spans
-/// around it that `Owner` kept labels for.
-pub(crate) fn event_record<Owner: 'static, S>(
-    event: &Event<'_>,
-    context: &Context<'_, S>,
-) -> LogRecord
+/// around it, whether or not the calling layer's filter admitted them.
+pub(crate) fn event_record<S>(event: &Event<'_>, context: &Context<'_, S>) -> LogRecord
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
@@ -284,31 +521,16 @@ where
         mut operation,
         rest: _,
     } = fields;
-    let mut nearest = None;
-    let mut root = None;
-    for span in context.event_scope(event).into_iter().flatten() {
-        let extensions = span.extensions();
-        let Some(owned) = extensions.get::<OwnedLabels<Owner>>() else {
-            continue;
-        };
-        if component.is_empty() {
-            component.clone_from(&owned.labels.component);
-        }
-        if operation.is_empty() {
-            operation.clone_from(&owned.labels.operation);
-        }
-        drop(extensions);
-        if nearest.is_none() {
-            nearest = Some(span);
-        } else {
-            root = Some(span);
+    if let Some(nearest) = event_span(event, context) {
+        nearest.inherited(&mut component, &mut operation);
+        match nearest.root.as_deref() {
+            Some(root) => {
+                push_span_member(&mut members, ROOT_SPAN_MEMBER, Some(root));
+                push_span_member(&mut members, NEAREST_SPAN_MEMBER, Some(&nearest));
+            }
+            None => push_span_member(&mut members, ROOT_SPAN_MEMBER, Some(&nearest)),
         }
     }
-    if root.is_none() {
-        root = nearest.take();
-    }
-    push_span_member::<Owner, _>(&mut members, ROOT_SPAN_MEMBER, root.as_ref());
-    push_span_member::<Owner, _>(&mut members, NEAREST_SPAN_MEMBER, nearest.as_ref());
     LogRecord::new(
         now_ms(),
         event.metadata().level().as_str(),
@@ -324,60 +546,31 @@ where
 ///
 /// The object was written when the span opened and when it recorded a field, so a record
 /// pays one copy of at most [`SPAN_CONTEXT_BYTES_MAX`] bytes per span member.
-fn push_span_member<'a, Owner: 'static, R>(
-    members: &mut String,
-    member: &str,
-    span: Option<&SpanRef<'a, R>>,
-) where
-    R: LookupSpan<'a>,
-{
+fn push_span_member(members: &mut String, member: &str, span: Option<&SpanNode>) {
     let Some(span) = span else {
-        return;
-    };
-    let extensions = span.extensions();
-    let Some(owned) = extensions.get::<OwnedLabels<Owner>>() else {
         return;
     };
     if !(members.is_empty() || members.ends_with('{')) {
         members.push(',');
     }
-    let _ = write!(members, "\"{member}\":{}", owned.labels.context);
+    let _ = write!(members, "\"{member}\":{}", span.labels().context);
 }
 
-/// The [`SpanLabels`] one record layer keeps in a span's extensions, keyed by the layer
-/// type `Owner`, so two record layers on one subscriber never share or overwrite them.
-struct OwnedLabels<Owner> {
-    labels: SpanLabels,
-    owner: PhantomData<fn() -> Owner>,
-}
-
-impl<Owner> OwnedLabels<Owner> {
-    const fn new(labels: SpanLabels) -> Self {
-        Self {
-            labels,
-            owner: PhantomData,
-        }
-    }
-}
-
-/// What one span keeps in its extensions for the records written while it is open: its
-/// labels, its fields, the object the events inside it carry, and the moment it opened.
+/// What one span keeps for the records written while it is open: its labels, its fields,
+/// and the object the events inside it carry.
 ///
 /// An event takes `component` and `operation` from the nearest span that names them when
 /// it names none itself. A span sets them once and every event inside it is filed under
 /// them, which is what makes a component read return a lane's whole story rather than the
 /// lines that repeated the label.
 ///
-/// The moment is what lets a closing span record how long it took: a store fed by events
-/// alone could say a rebuild happened and never how long it ran - the first question a
-/// wedged workspace raises.
-///
 /// `fields` carries every other field the span recorded, as JSON object members, so the
 /// close record says what the span did and not only that it ended. `context` is the
 /// object an event record carries for the span, `{"name":…,"fields":{…}}`, its `fields`
 /// holding `component`, `operation`, and the span's other fields. Both member sets keep
 /// [`SPAN_FIELDS_BYTES_MAX`]. `context` is written when the span opens and again when it
-/// records a field, never per event.
+/// records a field, never per event. `error_type` is whether the span recorded an
+/// `error.type`, so its close states it did not complete.
 #[derive(Debug)]
 struct SpanLabels {
     component: String,
@@ -386,7 +579,7 @@ struct SpanLabels {
     context_fields: SpanFields,
     quoted_name: String,
     context: String,
-    opened_at: Instant,
+    error_type: bool,
 }
 
 impl SpanLabels {
@@ -408,7 +601,7 @@ impl SpanLabels {
             context_fields,
             quoted_name: quoted(&bounded(name, LOG_LABEL_BYTES_MAX)),
             context: String::new(),
-            opened_at: Instant::now(),
+            error_type: false,
         };
         labels.extend(&fields.rest);
         labels
@@ -420,6 +613,7 @@ impl SpanLabels {
             return;
         }
         for (name, value) in rest {
+            self.error_type |= name == ERROR_TYPE_MEMBER;
             self.fields.push(name, value);
             self.context_fields.push(name, value);
         }

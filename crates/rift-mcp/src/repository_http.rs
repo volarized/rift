@@ -127,6 +127,7 @@ pub(crate) async fn serve_repository_http(
         component = "mcp",
         transport = "http",
         port,
+        outcome = "ok",
         "MCP server ready"
     );
     Ok(HttpServer {

@@ -141,7 +141,12 @@ pub(crate) async fn serve_http_with_storage(
     check: TokenCheck,
     checkout: BuildCheckout,
 ) -> Result<HttpServer, RiftError> {
-    rift_tracing::info!(component = "mcp", transport = "http", "MCP server starting");
+    rift_tracing::info!(
+        component = "mcp",
+        transport = "http",
+        phase = "start",
+        "MCP server starting"
+    );
     let logs = storage.logs();
     let server = RiftMcp::build_with_storage(root, limits, storage, checkout).await?;
     let identity = server.product_identity().clone();
@@ -172,6 +177,7 @@ pub(crate) async fn serve_http_with_storage(
         component = "mcp",
         transport = "http",
         port,
+        outcome = "ok",
         "MCP server ready"
     );
     Ok(HttpServer {

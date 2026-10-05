@@ -386,9 +386,9 @@ def stopped_corpus(tmp_path: Path) -> tuple[Corpus, Mock, Path]:
     server.records_path = tmp_path / "out" / "r.server-1.records.log"
     server.started_at = "2026-10-05T09:00:00.000+00:00"
     server.read_records.return_value = (
-        "2026-10-05T08:00:00.000+00:00 INFO  storage  database.close "
-        "database checkpointed its write-ahead log busy=0 checkpointed=1 "
-        "database=earlier log=1\n"
+        "2026-10-05 08:00:00.000Z INFO  rift_index::database::close   "
+        "component=storage operation=database.close busy=0 checkpointed=1 "
+        "database=earlier log=1  database checkpointed its write-ahead log\n"
     )
     return corpus, server, root
 
@@ -432,12 +432,13 @@ def test_a_failing_records_read_is_noted_and_the_case_continues(
 
 
 STOP_RECORDS = (
-    "2026-10-05T09:00:05.100+00:00 INFO  mcp      server.stop  stage=SQLite worker "
-    "shutdown  stop stage ended outcome=ok remaining=4.9s stage=SQLite worker shutdown\n"
-    "2026-10-05T09:00:05.200+00:00 INFO  storage  database.close component=mcp "
+    "2026-10-05 09:00:05.100Z INFO  rift_mcp::http::stop_stage   component=mcp "
+    "operation=server.stop stage=SQLite worker shutdown  ✓ stop stage ended outcome=ok "
+    "remaining=4.9s stage=SQLite worker shutdown\n"
+    "2026-10-05 09:00:05.200Z INFO  rift_mcp::http::stop_stage   component=mcp "
     "operation=server.stop stage=SQLite worker shutdown  "
-    "database checkpointed its write-ahead log "
-    "busy=0 checkpointed=12 database=index log=12\n"
+    "database checkpointed its write-ahead log component=storage "
+    "operation=database.close busy=0 checkpointed=12 database=index log=12\n"
 )
 
 
