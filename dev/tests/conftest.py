@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
-from rift_dev import check_agent, check_artifact, check_corpus
+from rift_dev import check_agent, check_artifact, check_corpus, rift_test_client
 from rift_dev.trace import TEST_CASE_KEY, Collector, collector, resource_attribute
 
 
@@ -41,4 +42,13 @@ def test_case_name(
     monkeypatch.setenv(
         "OTEL_RESOURCE_ATTRIBUTES",
         resource_attribute(TEST_CASE_KEY, request.node.nodeid),
+    )
+
+
+@pytest.fixture(autouse=True)
+def integration_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runners under test keep their files under the test's own directory, never under
+    the repository's `target/integration/`."""
+    monkeypatch.setattr(
+        rift_test_client, "INTEGRATION_DIRECTORY", tmp_path / "integration"
     )

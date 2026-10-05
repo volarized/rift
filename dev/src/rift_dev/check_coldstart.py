@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import tempfile
 import time
 import uuid
 from collections.abc import Sequence
@@ -36,6 +34,7 @@ from rift_dev.rift_test_client import (
     object_value,
     remaining_seconds,
     require,
+    retained_directory,
     stderr_log,
     tail_text,
     utc_now,
@@ -284,7 +283,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             START,
         )
         failure: BaseException | None = None
-        proxy_log = Path(tempfile.mkdtemp(prefix="rift-coldstart-")) / "proxy.log"
+        proxy_log = retained_directory("coldstart") / "proxy.log"
         started = utc_now()
         try:
             command.with_timeout(START_SECONDS).with_deadline(
@@ -335,7 +334,6 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                 error.add_note(note)
             raise
         finally:
-            shutil.rmtree(proxy_log.parent, ignore_errors=True)
             try:
                 DockerCommand("rm", "--force", name).with_timeout(30).output()
             except (RuntimeError, OSError) as cleanup_error:

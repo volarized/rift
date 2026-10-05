@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
 from pathlib import Path
 
 from rift_dev.check_artifact import (
@@ -22,6 +21,8 @@ from rift_dev.rift_test_client import (
     gate_deadline,
     object_value,
     require,
+    retain_collector,
+    retained_directory,
     string_value,
     verify_version,
 )
@@ -133,38 +134,35 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
     async with gate_deadline("agent", AGENT_SECONDS):
         if version is not None:
             verify_version(binary, version)
-        with tempfile.TemporaryDirectory(prefix="rift-agent-") as directory:
-            base = Path(directory)
-            root = base / "workspace"
-            root.mkdir()
-            lay_out_workspace(root)
-            configuration = root / "rift.toml"
-            configuration.write_text(
-                configuration.read_text() + PYTHON_CONFIGURATION,
-                encoding="utf-8",
-                newline="",
-            )
-            (root / "service.py").write_text(
-                PYTHON_SOURCE, encoding="utf-8", newline=""
-            )
-            with (
-                collector() as telemetry,
-                Server(
-                    binary, root, base / "server.log", collector=telemetry
-                ) as server,
-            ):
-                try:
-                    async with server.connect() as client:
-                        await check_resources(client)
-                        await check_reads(client)
-                        await check_external_change(client, root)
-                        await check_embedded_references(client, root)
-                        await declaration_node(client, "beacon_one")
-                        client.require_complete(READ_TOOLS)
-                    server.stop()
-                except BaseException as error:
-                    for note in server.evidence():
-                        error.add_note(note)
-                    error.add_note(collector_line(telemetry))
-                    raise
-                print(collector_line(telemetry), flush=True)
+        base = retained_directory("agent")
+        root = base / "workspace"
+        root.mkdir()
+        lay_out_workspace(root)
+        configuration = root / "rift.toml"
+        configuration.write_text(
+            configuration.read_text() + PYTHON_CONFIGURATION,
+            encoding="utf-8",
+            newline="",
+        )
+        (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
+        with (
+            collector() as telemetry,
+            Server(binary, root, base / "server.log", collector=telemetry) as server,
+        ):
+            try:
+                async with server.connect() as client:
+                    await check_resources(client)
+                    await check_reads(client)
+                    await check_external_change(client, root)
+                    await check_embedded_references(client, root)
+                    await declaration_node(client, "beacon_one")
+                    client.require_complete(READ_TOOLS)
+                server.stop()
+            except BaseException as error:
+                for note in server.evidence():
+                    error.add_note(note)
+                error.add_note(collector_line(telemetry))
+                raise
+            finally:
+                retain_collector(base, telemetry)
+            print(collector_line(telemetry), flush=True)

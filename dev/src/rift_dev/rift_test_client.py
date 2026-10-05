@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -414,6 +415,27 @@ def collector_counts(collector: Collector | None) -> JsonObject | None:
         "spans": collector.spans.received,
         "dropped": dict(collector.dropped().counts()),
     }
+
+
+# Where each runner keeps its server log, served workspace, and collector counts, in a
+# directory of its own; the CI job uploads this directory.
+INTEGRATION_DIRECTORY = REPOSITORY / "target" / "integration"
+
+
+def retained_directory(runner: str) -> Path:
+    """`target/integration/<runner>/`, created empty, kept after the runner ends."""
+    directory = INTEGRATION_DIRECTORY / runner
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True)
+    return directory
+
+
+def retain_collector(directory: Path, collector: Collector | None) -> None:
+    """Write `collector_counts` to `collector.json` in `directory`."""
+    (directory / "collector.json").write_text(
+        json.dumps(collector_counts(collector), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def collector_line(collector: Collector | None) -> str:

@@ -12,7 +12,7 @@ from types import TracebackType
 from typing import Any, Self
 
 import pytest
-from rift_dev import check_agent, check_artifact
+from rift_dev import check_agent, check_artifact, rift_test_client
 from rift_dev.rift_test_client import Client, Server, collector_line
 from rift_dev.trace import Collector, MetricPoint
 
@@ -85,8 +85,11 @@ class StubServer(Server):
 
 
 @pytest.fixture(params=[check_artifact, check_agent], ids=["artifact", "agent"])
-def runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Any:
+def runner(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Any:
     module = request.param
+    monkeypatch.setattr(rift_test_client, "INTEGRATION_DIRECTORY", tmp_path / "kept")
     STARTED.clear()
     POINTS[:] = [1]
     monkeypatch.setattr(module, "collector", received)
@@ -137,3 +140,28 @@ def test_the_entry_is_one_json_line() -> None:
     assert (entry["points"], entry["spans"]) == (0, 0)
     assert set(entry["dropped"].values()) == {0}
     assert collector_line(None) == "collector: null"
+
+
+def test_a_run_keeps_its_workspace_and_collector_counts_under_the_integration_directory(
+    runner: Any, tmp_path: Path
+) -> None:
+    name = runner.__name__.rsplit("_", 1)[1]
+    with pytest.raises(AssertionError, match="served read failed"):
+        run(runner, tmp_path / "rift")
+    kept = tmp_path / "kept" / name
+    assert (kept / "workspace" / "rift.toml").is_file()
+    counts = json.loads((kept / "collector.json").read_text(encoding="utf-8"))
+    assert (counts["points"], counts["spans"]) == (1, 0)
+    (server,) = STARTED
+    assert server.log_path == kept / "server.log"
+
+
+def test_a_run_starts_from_an_empty_directory_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rift_test_client, "INTEGRATION_DIRECTORY", tmp_path / "kept")
+    first = rift_test_client.retained_directory("agent")
+    (first / "stale.log").write_text("old", encoding="utf-8")
+    second = rift_test_client.retained_directory("agent")
+    assert second == first
+    assert list(second.iterdir()) == []
