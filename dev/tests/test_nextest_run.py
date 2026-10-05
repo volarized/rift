@@ -24,6 +24,7 @@ CHILD = textwrap.dedent(
     from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    assert os.environ.get("OTEL_SDK_DISABLED") == "true"
     case, mode = sys.argv[1], sys.argv[2]
     now = time.time_ns()
 

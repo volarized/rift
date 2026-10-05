@@ -11,6 +11,10 @@ pub(crate) const TEST_CASE_NAME_ATTRIBUTE: &str = "test.case.name";
 /// The variable the OpenTelemetry SDK's `EnvResourceDetector` reads resource attributes
 /// from, as `key=value` entries separated by `,`.
 const RESOURCE_ATTRIBUTES_VARIABLE: &str = "OTEL_RESOURCE_ATTRIBUTES";
+/// The variable the test runner sets to `true` in every test process, so a test that
+/// installs Rift's tracing in its own process exports nothing; a spawned `rift` process
+/// does not inherit it and exports to the runner's collector.
+const SDK_DISABLED_VARIABLE: &str = "OTEL_SDK_DISABLED";
 
 /// The name of the running test: the nextest attempt id, which names one attempt of one
 /// test in one run, or the test thread's name outside nextest.
@@ -33,10 +37,12 @@ pub(crate) fn with_test_case_name(
     command: &mut std::process::Command,
 ) -> &mut std::process::Command {
     let inherited = std::env::var(RESOURCE_ATTRIBUTES_VARIABLE).ok();
-    command.env(
-        RESOURCE_ATTRIBUTES_VARIABLE,
-        resource_attributes(inherited.as_deref(), &test_case_name()),
-    )
+    command
+        .env(
+            RESOURCE_ATTRIBUTES_VARIABLE,
+            resource_attributes(inherited.as_deref(), &test_case_name()),
+        )
+        .env_remove(SDK_DISABLED_VARIABLE)
 }
 
 /// The `OTEL_RESOURCE_ATTRIBUTES` value carrying `inherited`'s entries, then

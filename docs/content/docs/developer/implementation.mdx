@@ -888,7 +888,10 @@ set, the process installs a meter whose reader exports over OTLP/HTTP protobuf e
 `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default; spans export when `OTEL_EXPORTER_OTLP_ENDPOINT` is
 set; log records export to `/v1/logs` when it or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set,
 batched every `OTEL_BLRP_SCHEDULE_DELAY`, 1 s by default. With none of them, the process builds no
-exporter, so it never dials OTLP's default `http://localhost:4318`.
+exporter, so it never dials OTLP's default `http://localhost:4318`. `OTEL_SDK_DISABLED=true`, in any case, turns
+every export off whatever endpoint is set, as the OpenTelemetry specification defines it. The
+`rift-dev` test runner sets it in each test process, so a test that installs tracing in its own
+process exports nothing, and the test harness removes it from every `rift` process it spawns.
 
 An exported log record is the record the `LogSink` stores, for each event and each span close:
 its level as the severity, its target as the instrumentation scope name, its message as the body,

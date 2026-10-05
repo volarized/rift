@@ -61,6 +61,9 @@ STATUS_LINE = re.compile(
     r"(?:\[\s*(?P<iteration>\d+)/\d+\]\s+)?(?:\([^)]*\)\s+)*"
     r"(?P<binary>\S+)\s+(?P<test>\S+)\s*$"
 )
+# The OpenTelemetry specification's "Disable the SDK for all signals": "true" makes the
+# test processes themselves export nothing (`crates/rift-tracing/src/otlp.rs`).
+SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Statuses that end a test without a failure.
 PASSED = ("PASS", "LEAK", "FLAKY")
 # The report directory below the repository, which CI uploads.
@@ -454,7 +457,10 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     cases = CaseStore()
     outcomes: dict[str, Outcome] = {}
     with collector(cases=cases) as served:
-        command.with_env(**served.environment())
+        # A test process that installs Rift's tracing itself must not export: its
+        # in-process export would differ from the runs the test was written for. The
+        # harness removes the variable from every `rift` process it spawns.
+        command.with_env(**served.environment(), **{SDK_DISABLED: "true"})
         with command.spawn() as process:
             assert process.stdout is not None
             for raw in process.stdout:

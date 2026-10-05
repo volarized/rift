@@ -300,9 +300,21 @@ const LOG_ENDPOINT_VARS: [&str; 2] = [
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 ];
 
-/// Whether the process sets `variable`.
+/// The variable that disables every export: the OpenTelemetry specification's "Disable
+/// the SDK for all signals", where "true", in any case, means "a no-op SDK implementation
+/// will be used for all telemetry signals" and "Any other value or absence of the variable
+/// will have no effect". `opentelemetry_sdk` 0.33 reads no such variable itself.
+const SDK_DISABLED_VAR: &str = "OTEL_SDK_DISABLED";
+
+/// Whether the process sets `variable` and leaves the export enabled: under
+/// [`SDK_DISABLED_VAR`] set to `true` no endpoint variable counts, so nothing exports.
 fn configured(variable: &str) -> bool {
-    std::env::var_os(variable).is_some()
+    std::env::var_os(variable).is_some() && !sdk_disabled()
+}
+
+/// Whether [`SDK_DISABLED_VAR`] reads `true`, in any case.
+fn sdk_disabled() -> bool {
+    std::env::var(SDK_DISABLED_VAR).is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 /// The resource every exported span, metric, and log record carries: `service.name`,

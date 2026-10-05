@@ -1153,7 +1153,8 @@ impl TraceReceiver {
         };
         let receiver = axum::Router::new()
             .route("/v1/traces", route("/v1/traces"))
-            .route("/v1/metrics", route("/v1/metrics"));
+            .route("/v1/metrics", route("/v1/metrics"))
+            .route("/v1/logs", route("/v1/logs"));
         runtime.spawn(async move { axum::serve(listener, receiver).await });
         Ok(Self {
             _runtime: runtime,
