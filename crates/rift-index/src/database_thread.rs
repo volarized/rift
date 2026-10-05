@@ -35,6 +35,31 @@ static OPERATION_DURATION: Histogram<5> = Histogram::declare(
 );
 /// The `db.system.name` of every database the worker serves.
 const DB_SYSTEM: &str = "sqlite";
+/// Statements recorded under their own text as `db.operation.name`, in place of the
+/// driver's `raw_sql`: the busy timeout a checkout or the close sets, and the close's two
+/// checkpoints. A raw statement whose text starts with one of these is recorded under it,
+/// so the set of names stays closed whatever value the statement carries.
+const NAMED_STATEMENTS: [&str; 3] = [
+    "PRAGMA busy_timeout",
+    "PRAGMA wal_checkpoint(NOOP)",
+    "PRAGMA wal_checkpoint(TRUNCATE)",
+];
+/// The `db.operation.name` of one connection's close when the worker stops: the last
+/// connection's close checkpoints and removes the write-ahead log.
+const CONNECTION_CLOSE: &str = "close";
+
+/// The `db.operation.name` of `operation`: the statement of [`NAMED_STATEMENTS`] a raw
+/// statement starts with, or the driver's operation name.
+fn operation_name(operation: &Operation) -> &'static str {
+    if let Operation::RawSql(raw) = operation
+        && let Some(statement) = NAMED_STATEMENTS
+            .iter()
+            .find(|statement| raw.sql.starts_with(**statement))
+    {
+        return statement;
+    }
+    operation.name()
+}
 /// `sqlite.queue.length`: commands sent to the worker and not yet received, read when the
 /// meter collects.
 static QUEUE_LENGTH: rift_tracing::ObservableUpDownCounter<1> =
@@ -186,7 +211,7 @@ impl DatabaseThread {
                 match runtime {
                     Ok(runtime) => {
                         if ready_tx.send(Ok(())).is_ok() {
-                            runtime.block_on(run_database_thread(driver, receiver, capacity));
+                            runtime.block_on(run_database_thread(name, driver, receiver, capacity));
                         }
                     }
                     Err(error) => {
@@ -617,7 +642,7 @@ impl DriverConnection for SqliteThreadConnection {
     ) -> Result<ExecResponse, toasty_core::Error> {
         let id = self.id;
         let schema = Arc::clone(schema);
-        let name = operation.name();
+        let name = operation_name(&operation);
         let role = OperationRole::of(&operation);
         let answered;
         let round_trip = rift_tracing::measure_elapsed!("sqlite.queue", {
@@ -746,16 +771,18 @@ struct OwnedConnection {
 }
 
 async fn run_database_thread(
+    name: DatabaseName,
     driver: Arc<Sqlite>,
     receiver: mpsc::Receiver<Command>,
     connections_max: usize,
 ) {
-    DatabaseWorker::new(driver, connections_max)
+    DatabaseWorker::new(name, driver, connections_max)
         .run(receiver)
         .await;
 }
 
 struct DatabaseWorker {
+    name: DatabaseName,
     driver: Arc<Sqlite>,
     connections: HashMap<u64, OwnedConnection>,
     next_id: u64,
@@ -765,8 +792,9 @@ struct DatabaseWorker {
 }
 
 impl DatabaseWorker {
-    fn new(driver: Arc<Sqlite>, connections_max: usize) -> Self {
+    fn new(name: DatabaseName, driver: Arc<Sqlite>, connections_max: usize) -> Self {
         Self {
+            name,
             driver,
             connections: HashMap::new(),
             next_id: 0,
@@ -832,7 +860,7 @@ impl DatabaseWorker {
                 }
             }
             Command::Shutdown { reply } => {
-                self.connections.clear();
+                self.close_connections();
                 let _ = reply.send(Ok(()));
                 return false;
             }
@@ -866,6 +894,21 @@ impl DatabaseWorker {
             }
         }
         true
+    }
+
+    /// Closes every connection the worker holds, recording each close as one
+    /// `db.client.operation.duration` point named [`CONNECTION_CLOSE`]. The driver closes a
+    /// connection when it drops and reports no failure of that close.
+    fn close_connections(&mut self) {
+        let database = self.name.label();
+        for (_, owned) in self.connections.drain() {
+            let closed = rift_tracing::measure_elapsed!("db.client.operation", drop(owned));
+            if let Ok(((), took)) = closed {
+                OPERATION_DURATION
+                    .labeled([DB_SYSTEM, database, CONNECTION_CLOSE, "", ""])
+                    .record(took.elapsed());
+            }
+        }
     }
 
     async fn open(

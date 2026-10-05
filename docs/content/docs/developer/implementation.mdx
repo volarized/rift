@@ -879,7 +879,10 @@ JSON-RPC error records its code as both `error.type` and `rpc.response.status_co
 Each `.rift/index` and `.rift/vectors` operation records `db.client.operation.duration` with
 `db.system.name` `sqlite`, `db.namespace`, and `db.operation.name`; a failed one adds
 `error.type` `_OTHER` and the SQLite primary result code as `db.response.status_code`, such as
-`5` for busy. A transaction records `sqlite.transaction.duration` by `sqlite.transaction.result`,
+`5` for busy. A raw statement that starts with `PRAGMA busy_timeout`, `PRAGMA
+wal_checkpoint(NOOP)`, or `PRAGMA wal_checkpoint(TRUNCATE)` records that text as its
+`db.operation.name`, and each connection the worker closes at its stop records `close`. A
+transaction records `sqlite.transaction.duration` by `sqlite.transaction.result`,
 `commit` or `rollback`, and `sqlite.transaction.statement.count`. Each append to `.rift/metrics`
 records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
 `sqlite.transaction.duration`, and `sqlite.commit.duration` under `db.namespace` `metrics`.

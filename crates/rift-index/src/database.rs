@@ -556,7 +556,11 @@ impl WorkspaceDatabase {
     /// `database.close` event. A turn not free by `deadline`, a busy answer, or a refused
     /// checkpoint does not fail the close: the worker still stops, and `SQLite` recovers
     /// whatever the log holds at the next open. The worker drops every connection it holds,
-    /// and the last connection's close removes the log file.
+    /// and the last connection's close removes the log file. The wait for the write turn is
+    /// the lock wait [`Self::writing`] records; each statement and each connection close is
+    /// one `db.client.operation.duration` point whose `db.operation.name` is the statement
+    /// (`PRAGMA busy_timeout`, `PRAGMA wal_checkpoint(NOOP)`, `PRAGMA
+    /// wal_checkpoint(TRUNCATE)`) or `close`.
     ///
     /// A worker whose stop outlasts `deadline` does not fail the close either, whatever it
     /// was running: a checkpoint that started before `deadline`, or other work that held it
@@ -2659,6 +2663,48 @@ mod tests {
             "every frame moved: {fields}"
         );
         assert!(count("elapsed_ms").is_some(), "{fields}");
+        Ok(())
+    }
+
+    /// The close records each statement it runs, and each connection the worker closes,
+    /// as a `db.client.operation.duration` point named for it.
+    #[tokio::test]
+    async fn the_close_records_each_statement_it_runs() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let path = DatabaseName::Index.path(directory.path());
+        let database = limited_database(&path, DatabaseName::Index).await?;
+        write_past_the_limit(&database).await?;
+
+        database
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await?;
+        let metrics = recorder.metrics();
+        drop(recorder);
+
+        for statement in [
+            "PRAGMA busy_timeout",
+            "PRAGMA wal_checkpoint(NOOP)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "close",
+        ] {
+            let labels = [
+                ("db.system.name", "sqlite"),
+                ("db.namespace", "index"),
+                ("db.operation.name", statement),
+            ];
+            let statement_series = series(&metrics, "db.client.operation.duration", &labels)?;
+            assert!(
+                observations(statement_series) >= 1,
+                "{statement}: {statement_series:?}"
+            );
+        }
+        let truncate = [
+            ("db.namespace", "index"),
+            ("db.operation.name", "PRAGMA wal_checkpoint(TRUNCATE)"),
+        ];
+        let queued = series(&metrics, "sqlite.queue.wait.duration", &truncate)?;
+        assert_eq!(observations(queued), 1, "one truncate checkpoint");
         Ok(())
     }
 
