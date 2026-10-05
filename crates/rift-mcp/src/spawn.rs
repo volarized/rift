@@ -880,27 +880,27 @@ mod tests {
     /// spent and waits; it neither asks for another spawn nor announces one.
     #[test]
     fn a_spent_spawn_count_waits_without_announcing_another_spawn() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let mut spawns = StartSpawns::<StartupCapture> {
             latest: SpawnWatch::Exited(StartExit::LostElection {
                 stderr: String::new(),
             }),
             spawn_count: START_SPAWN_COUNT_MAX,
         };
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let outcome =
-            tracing::subscriber::with_default(subscriber, || spawns.poll::<u32>(None, false));
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let outcome = spawns.poll::<u32>(None, false);
+        drop(recorder);
 
         assert!(
             matches!(outcome, SpawnPollOutcome::Waiting),
             "a spent count asks for no spawn: {outcome:?}"
         );
-        let mut messages = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            messages.push(record.message().to_owned());
-        }
+        let messages: Vec<String> = drain
+            .queued_records()
+            .iter()
+            .map(|record| record.message().to_owned())
+            .collect();
         assert_eq!(
             messages,
             ["the spawn count is spent; the start window passes as a wait"],

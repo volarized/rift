@@ -1437,22 +1437,16 @@ mod tests {
     /// refusal, at `INFO`, and the process still exits on it.
     #[test]
     fn a_lost_election_is_recorded_at_info() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        tracing::subscriber::with_default(subscriber, || {
-            super::record_start_failure(&errors::mcp::election_already_serving().error());
-        });
-        let recorded = drain
-            .try_recv_record()
-            .expect("the lost election is recorded");
-        assert_eq!(recorded.level(), "info");
-        assert_eq!(recorded.operation(), "server.start");
-        assert!(
-            drain.try_recv_record().is_err(),
-            "one record, no error event"
-        );
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        super::record_start_failure(&errors::mcp::election_already_serving().error());
+        drop(recorder);
+        let records = drain.queued_records();
+        let only = records.first().expect("the lost election is recorded");
+        assert_eq!(only.level(), "info");
+        assert_eq!(only.operation(), "server.start");
+        assert_eq!(records.len(), 1, "one record, no error event");
     }
 
     #[test]

@@ -433,11 +433,7 @@ mod tests {
     async fn captures_after_a_superseded_rebuild(
         late: Duration,
     ) -> Result<(Vec<Vec<String>>, Vec<String>), Box<dyn std::error::Error>> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         std::fs::write(
@@ -522,10 +518,11 @@ mod tests {
         validation.cancellation.cancel();
         supervisor.await?;
         settled.map_err(|_| "the unreported file must publish")?;
-        let mut messages = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            messages.push(record.message().to_owned());
-        }
+        let messages = drain
+            .queued_records()
+            .iter()
+            .map(|record| record.message().to_owned())
+            .collect();
         let captures = captures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -598,8 +595,6 @@ mod tests {
     #[test]
     fn validation_capture_closes_one_span_for_each_visible_stage()
     -> Result<(), Box<dyn std::error::Error>> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn old() {}\n")?;
         std::fs::write(
@@ -607,9 +602,7 @@ mod tests {
             "unclassified bytes",
         )?;
         let configuration = super::super::ConfigurationState::accept(directory.path());
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let (_indexed, visible, _next) = capture_visible_digests_with_languages_cancellable(
             directory.path(),
             configuration.index_limits(rift_index::WorkspaceIndexLimits::default())?,
@@ -619,14 +612,14 @@ mod tests {
             &LastCapture::default(),
             &|| false,
         )?;
-        drop(guard);
+        drop(recorder);
         assert_eq!(visible.len(), 2);
-        let mut closed = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            if record.fields().contains("\"span\":\"closed\"") {
-                closed.push(record.message().to_owned());
-            }
-        }
+        let closed: Vec<String> = drain
+            .queued_records()
+            .iter()
+            .filter(|record| record.fields().contains("\"span\":\"closed\""))
+            .map(|record| record.message().to_owned())
+            .collect();
         for stage in [
             "fingerprint.source_policy",
             "fingerprint.visible_paths",
