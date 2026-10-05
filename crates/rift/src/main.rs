@@ -124,9 +124,11 @@ async fn main() -> ExitCode {
     let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
     if let Some(logs) = &logs {
         let sample_interval = Duration::from_millis(logs.sample_interval.milliseconds());
+        let stall_delay = Duration::from_millis(logs.stall_delay.milliseconds());
         tracing_builder = tracing_builder
             .capture(&logs.capture)
-            .sample_interval(sample_interval);
+            .sample_interval(sample_interval)
+            .stall_delay(stall_delay);
     }
     let (tracing_runtime, drain) = tracing_builder.install();
     let retention_records = logs.map_or(0, |logs| logs.retention_records);

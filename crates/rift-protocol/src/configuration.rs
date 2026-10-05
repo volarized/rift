@@ -73,6 +73,13 @@ pub const LOGS_SAMPLE_INTERVAL_MS_MIN: u64 = 200;
 pub const LOGS_SAMPLE_INTERVAL_MS_MAX: u64 = 3_600_000;
 /// Milliseconds `logs.sample_interval` holds when the key is absent.
 pub const LOGS_SAMPLE_INTERVAL_MS_DEFAULT: u64 = 1_000;
+/// Milliseconds an operation stays open before the server reports it, at least: one
+/// second, five sampler ticks at the shortest `sample_interval`.
+pub const LOGS_STALL_DELAY_MS_MIN: u64 = 1_000;
+/// Milliseconds an operation stays open before the server reports it, at most: one hour.
+pub const LOGS_STALL_DELAY_MS_MAX: u64 = 3_600_000;
+/// Milliseconds `logs.stall_delay` holds when the key is absent.
+pub const LOGS_STALL_DELAY_MS_DEFAULT: u64 = 10_000;
 
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -890,6 +897,9 @@ pub struct LogsConfiguration {
     /// and virtual memory, CPU time and usage, open files, and disk bytes, 200ms
     /// to 1h.
     pub sample_interval: Duration,
+    /// Age past which an operation, lock wait, or held lock still open is reported
+    /// once, on the sample tick, as a record of the operations in flight, 1s to 1h.
+    pub stall_delay: Duration,
 }
 
 impl Default for LogsConfiguration {
@@ -899,6 +909,7 @@ impl Default for LogsConfiguration {
             page_records: LOGS_PAGE_RECORDS_DEFAULT,
             capture: LOGS_CAPTURE_DEFAULT.to_owned(),
             sample_interval: Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT),
+            stall_delay: Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT),
         }
     }
 }
@@ -922,12 +933,20 @@ impl LogsConfiguration {
         ])
         .or_else(|| self.capture_violation())
         .or_else(|| {
-            first_out_of_range([(
-                "logs.sample_interval",
-                self.sample_interval.milliseconds(),
-                LOGS_SAMPLE_INTERVAL_MS_MIN,
-                LOGS_SAMPLE_INTERVAL_MS_MAX,
-            )])
+            first_out_of_range([
+                (
+                    "logs.sample_interval",
+                    self.sample_interval.milliseconds(),
+                    LOGS_SAMPLE_INTERVAL_MS_MIN,
+                    LOGS_SAMPLE_INTERVAL_MS_MAX,
+                ),
+                (
+                    "logs.stall_delay",
+                    self.stall_delay.milliseconds(),
+                    LOGS_STALL_DELAY_MS_MIN,
+                    LOGS_STALL_DELAY_MS_MAX,
+                ),
+            ])
         })
     }
 
@@ -4020,6 +4039,29 @@ mod tests {
         }
         for value in [LOGS_SAMPLE_INTERVAL_MS_MIN, LOGS_SAMPLE_INTERVAL_MS_MAX] {
             configuration.logs.sample_interval = Duration::from_millis(value);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_logs_stall_delay_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        assert_eq!(
+            configuration.logs.stall_delay,
+            Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT)
+        );
+        for value in [0, LOGS_STALL_DELAY_MS_MIN - 1, LOGS_STALL_DELAY_MS_MAX + 1] {
+            configuration.logs.stall_delay = Duration::from_millis(value);
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "logs.stall_delay",
+                    ..
+                })
+            ));
+        }
+        for value in [LOGS_STALL_DELAY_MS_MIN, LOGS_STALL_DELAY_MS_MAX] {
+            configuration.logs.stall_delay = Duration::from_millis(value);
             assert_eq!(configuration.validate(), Ok(()));
         }
     }

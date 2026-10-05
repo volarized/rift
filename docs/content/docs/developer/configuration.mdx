@@ -142,6 +142,7 @@ retention_records = 50000
 page_records = 500
 capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
 sample_interval = "1s"
+stall_delay = "10s"
 ```
 
 - `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
@@ -152,7 +153,13 @@ sample_interval = "1s"
   excludes never reaches the store, whatever the terminal shows
 - `sample_interval` is how often the server samples its own process, 200ms to 1h: resident and
   virtual memory, CPU time and usage, open files, and bytes read and written. CPU usage is the
-  CPU time spent between two samples, so the first sample after a start carries none
+  CPU time spent between two samples, so the first sample after a start carries none. A tick at
+  which an instrument other than the process's own moved also writes metric snapshot records
+  into the store, kind `metric`, which `rift server logs --kind metric` prints
+- `stall_delay` is how long an operation, lock wait, or held lock stays open before the server
+  reports it, 1s to 1h. The sample tick reports each such entry once, in one record of the
+  operations in flight with their age, so a request that runs out its deadline leaves the work
+  it waited on in the store
 
 The server reads this table at startup, so a change applies on the next start. The records
 outlive the process that wrote them. The metrics database is a file apart from the search
