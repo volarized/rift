@@ -11,9 +11,7 @@ mod runtime;
 pub mod ctx;
 
 /// Generated error builders, grouped by registry namespace.
-pub mod errors {
-    include!("generated.rs");
-}
+pub mod errors;
 
 pub use evidence::EvidenceFor;
 pub use representation::IntoRiftError;

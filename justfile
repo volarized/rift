@@ -7,6 +7,7 @@ format:
 
 generate:
     {{ rift_dev }} generate
+    cargo xtask errors generate
 
 generate-check:
     {{ rift_dev }} generate --check
