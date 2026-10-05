@@ -1148,7 +1148,16 @@ async fn test_lexical_search_index_replace_all_against_external_writer_surfaces_
     blocker.rollback().await?;
 
     let error = outcome.expect_err("an externally held write lock must surface a storage failure");
-    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
+    assert_eq!(error.slug(), errors::index::database_failed::SLUG);
+    assert_eq!(
+        error
+            .context()
+            .find(|(key, _)| *key == "database")
+            .map(|(_, value)| value)
+            .as_deref(),
+        Some("index"),
+        "the refused transaction start names its database"
+    );
     assert!(
         std::error::Error::source(&error).is_some(),
         "storage_error must preserve the underlying toasty/SQLite cause"

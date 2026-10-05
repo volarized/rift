@@ -1638,7 +1638,16 @@ async fn a_rank_that_meets_a_held_pool_names_the_missing_connection() -> TestRes
         .rank(REVISION, &parsed, QueryPhase::Precise, 10)
         .await
         .expect_err("a rank that meets no free slot refuses");
-    assert_eq!(refused.slug(), errors::index::lexical_storage::SLUG);
+    assert_eq!(refused.slug(), errors::index::database_failed::SLUG);
+    assert_eq!(
+        refused
+            .context()
+            .find(|(key, _)| *key == "database")
+            .map(|(_, value)| value)
+            .as_deref(),
+        Some("index"),
+        "the refused checkout names its database"
+    );
     assert!(std::error::Error::source(&refused).is_some());
 
     drop(held);
