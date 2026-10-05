@@ -403,25 +403,39 @@ class Decisions(unittest.TestCase):
     def test_synchronous_rebuild_requires_matching_epoch_without_completion(
         self,
     ) -> None:
-        start = 'DEBUG rift_mcp::validation: index capture started component="index" operation="index.build" phase="start" epoch=7\n'
+        start = (
+            "2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=7 "
+            "trigger=filesystem ↳ worker.run component=worker operation=worker.run "
+            "work=filesystem index rebuild  index capture started epoch=7 phase=start\n"
+        )
         self.assertEqual(active_stdout(start, "rebuild", "7"), start.strip())
         self.assertEqual(active_stdout(start, "rebuild", None), start.strip())
-        wrong_close = 'INFO index.build{component="index" epoch=6}: rift_mcp::validation: close time.busy=1s\n'
+        wrong_close = (
+            "2026-10-05T10:27:17.487+00:00 INFO  index    -            index.build "
+            "elapsed_ms=18 epoch=6 span=closed trigger=filesystem\n"
+        )
+        nested_close = (
+            "2026-10-05T10:27:17.486+00:00 INFO  worker   worker.run   epoch=7 "
+            "trigger=filesystem  worker.run elapsed_ms=1 span=closed\n"
+        )
         self.assertEqual(
-            active_stdout(start + wrong_close, "rebuild", "7"), start.strip()
+            active_stdout(start + wrong_close + nested_close, "rebuild", "7"),
+            start.strip(),
         )
         matching_close = wrong_close.replace("epoch=6", "epoch=7")
         for output, epoch in ((start, "8"), (start + matching_close, "7"), ("", "7")):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", epoch)
         for output in (
-            start.replace('component="index"', 'component="dependency"'),
-            start.replace('operation="index.build"', 'operation="index.publish"'),
-            start.replace('phase="start"', 'phase="complete"'),
+            start.replace("DEBUG index    index.build", "DEBUG dependency index.build"),
+            start.replace("index.build  epoch", "index.publish epoch"),
+            start.replace("phase=start", "phase=complete"),
             start.replace("epoch=7", "epoch=0"),
             start.replace("epoch=7", ""),
             start + matching_close,
-            start + 'INFO index snapshot published operation="index.publish"\n',
+            start
+            + "2026-10-05T10:27:17.487+00:00 INFO  index    index.publish epoch=7 "
+            "trigger=filesystem  index snapshot published epoch=7 trigger=filesystem\n",
         ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", None)
@@ -429,19 +443,21 @@ class Decisions(unittest.TestCase):
     def test_synchronous_history_requires_an_open_batch_with_pending_commits(
         self,
     ) -> None:
-        span = 'history.batch{component="history" operation="history.batch"}'
         start = (
-            f"DEBUG {span}: rift_mcp::history: history batch started "
-            'component="history" operation="history.batch" phase="start" pending=4\n'
+            "2026-10-05T10:27:14.892+00:00 DEBUG history  history.batch history batch "
+            "started pending=4 phase=start\n"
         )
-        close = f"INFO {span}: rift_mcp::history: close time.busy=1ms time.idle=2s\n"
+        close = (
+            "2026-10-05T10:27:14.913+00:00 INFO  history  history.batch history.batch "
+            "elapsed_ms=17 span=closed\n"
+        )
         analyzed = (
-            f'INFO {span}:history.analyze{{component="history" operation="history.analyze"}}:'
-            " rift_mcp::history: close time.busy=1s\n"
+            "2026-10-05T10:27:14.898+00:00 INFO  history  history.analyze "
+            "operation=history.batch  history.analyze elapsed_ms=2 span=closed\n"
         )
         written = (
-            f'INFO {span}:history.write{{component="history" operation="history.write"}}:'
-            " rift_mcp::history: close time.busy=1ms\n"
+            "2026-10-05T10:27:14.913+00:00 INFO  history  history.write "
+            "operation=history.batch  history.write elapsed_ms=3 span=closed\n"
         )
         self.assertEqual(active_stdout(start, "history", None), start.strip())
         self.assertEqual(
@@ -458,6 +474,7 @@ class Decisions(unittest.TestCase):
             start.replace("pending=4", "pending=0"),
             start.replace(" pending=4", ""),
             start.replace("history batch started", "history batch opened"),
+            start.replace("DEBUG history ", "DEBUG mcp     "),
             start + close + start.replace("pending=4", "pending=0"),
         ):
             with self.assertRaises(AssertionError):

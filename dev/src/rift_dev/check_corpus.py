@@ -39,6 +39,7 @@ from rift_dev.corpus_assertions import (
     probe_units,
     records,
     sample_symbols,
+    startup_published,
     stop_sizes,
     token_past_chunk,
     warnings,
@@ -97,7 +98,7 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-STARTUP_PUBLICATION = 'operation="index.publish" trigger="startup"'
+STARTUP_PUBLICATION = "the startup index publication"
 CONFIGURATION = (
     f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
     "[search.vector]\ndisabled = true\n"
@@ -1056,7 +1057,9 @@ class Corpus:
     async def stop_during_rebuild(self) -> None:
         """Observe filesystem rebuild output without a proxy that restarts a stopped server."""
         with self.server() as server:
-            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
+            startup = await observed_state(
+                server, 0, STARTUP_PUBLICATION, startup_published
+            )
             (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
             output = await observed_output(
                 server, len(startup), "index capture started"
