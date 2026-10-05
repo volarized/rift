@@ -15,8 +15,6 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jiff::Timestamp;
-use jiff::fmt::temporal::DateTimePrinter;
 use jiff::tz::TimeZone;
 
 use rift_error::{ErrorContext, RiftError, errors};
@@ -28,10 +26,9 @@ use rift_mcp::{
 };
 use rift_protocol::lock::ServerLock;
 use rift_tracing::{
-    LOG_PAGE_RECORDS_MAX, LogDrain, LogQuery, LogReader, LogReads, LogRecord, RunningLogDrain,
+    LOG_PAGE_RECORDS_MAX, LogDrain, LogQuery, LogReader, LogReads, RunningLogDrain,
     StoredLogRecord, install_panic_hook,
 };
-use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 use waitpid_any::WaitHandle;
 
@@ -78,12 +75,6 @@ const TAIL_COUNT_EXPECTED: &str = "`all`, or a positive integer such as `20`";
 /// What a workspace holding no recorded diagnostics prints on stderr.
 const NO_RECORDED_LOGS: &str = "💤 no server diagnostics recorded for this workspace yet; \
                                 start one with `rift server start`";
-/// Renders a logged instant with exactly 3 fractional-second digits.
-///
-/// `DateTimePrinter::new` and `precision` are both `const fn`, so the
-/// configured printer is a compile-time value shared by every render.
-const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(3));
-
 fn stop_timeout(process: ProcessExit, holder: &ServerLock) -> Result<(), RiftError> {
     let mut builder = errors::cli::server_stop_timed_out()
         .waited(STOP_WAIT_MAX)
@@ -1391,7 +1382,7 @@ async fn print_records_after(
     loop {
         let page = read_records(reader, query.clone().after(newest), LogReads::following).await?;
         for stored in &page {
-            let line = rendered_record(stored, time_zone);
+            let line = stored.record().rendered(time_zone);
             println!("{line}");
             newest = stored.identity();
         }
@@ -1412,7 +1403,7 @@ async fn print_newest_records(
     records.reverse();
     let mut newest = 0;
     for stored in &records {
-        let line = rendered_record(stored, time_zone);
+        let line = stored.record().rendered(time_zone);
         println!("{line}");
         newest = stored.identity();
     }
@@ -1457,85 +1448,6 @@ async fn follow_until_interrupt(
     Ok(())
 }
 
-/// One stored record as one printed line.
-fn rendered_record(stored: &StoredLogRecord, time_zone: &TimeZone) -> String {
-    rendered_line(stored.record(), time_zone)
-}
-
-/// One record as the operator reads it: when it happened, how severe it was,
-/// where it came from, what it said, and the fields it carried.
-fn rendered_line(record: &LogRecord, time_zone: &TimeZone) -> String {
-    let timestamp = rendered_timestamp(record.recorded_at_ms(), time_zone);
-    let glyph = level_glyph(record.level());
-    let level = record.level().to_uppercase();
-    let component = label(record.component());
-    let operation = label(record.operation());
-    let message = record.message();
-    let fields = rendered_fields(record.fields());
-    format!("{timestamp} {glyph} {level:<5} {component:<8} {operation:<12} {message}{fields}")
-}
-
-/// The glyph one severity prints under. A level outside the five the store
-/// records prints under the least severe one.
-fn level_glyph(level: &str) -> &'static str {
-    match level {
-        "error" => "🔴",
-        "warn" => "🟡",
-        "info" => "🔵",
-        "debug" => "⚪",
-        _ => "⚫",
-    }
-}
-
-/// The label a record carried, or `-` when it carried none.
-fn label(value: &str) -> &str {
-    if value.is_empty() { "-" } else { value }
-}
-
-/// The record's remaining fields as ` key=value` pairs, or as the text the
-/// store holds when that text is not a JSON object.
-fn rendered_fields(fields: &str) -> String {
-    if fields.is_empty() {
-        return String::new();
-    }
-    let Ok(named) = serde_json::from_str::<Map<String, Value>>(fields) else {
-        return format!(" {fields}");
-    };
-    let mut fields = named.iter().collect::<Vec<_>>();
-    fields.sort_by_key(|(key, _)| *key);
-    let mut rendered = String::new();
-    for (key, value) in fields {
-        rendered.push(' ');
-        rendered.push_str(key);
-        rendered.push('=');
-        rendered.push_str(&rendered_value(value));
-    }
-    rendered
-}
-
-/// One field value without the quotes JSON puts around a string.
-fn rendered_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// One recorded instant as an RFC 3339 timestamp in `time_zone`'s local offset.
-///
-/// Local offset needs the tz database; jiff owns both parsing the recorded
-/// millisecond count and rendering it, with exactly 3 fractional digits and
-/// a numeric offset - never `Z`, since the offset is always known here. A
-/// millisecond count outside jiff's representable range falls back to the
-/// raw count instead of panicking.
-fn rendered_timestamp(recorded_at_ms: i64, time_zone: &TimeZone) -> String {
-    let Ok(timestamp) = Timestamp::from_millisecond(recorded_at_ms) else {
-        return recorded_at_ms.to_string();
-    };
-    let offset = time_zone.to_offset(timestamp);
-    TIMESTAMP_PRINTER.timestamp_with_offset_to_string(&timestamp, offset)
-}
-
 /// Milliseconds since the Unix epoch, or zero on a clock before it.
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -1557,12 +1469,11 @@ mod tests {
         STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns,
         StartedServer, TailCount, TokenCheck, await_election_released,
         await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
-        await_stopped_with_probe, discard_stale_document, foreground_refused, label, level_glyph,
-        logs_mode, logs_query, now_ms, print_logs, rendered_fields, rendered_line,
-        rendered_timestamp, request_stop, stale_reason_phrase, start_detached, start_mode, status,
-        stop, stop_log_drain, token_check,
+        await_stopped_with_probe, discard_stale_document, foreground_refused, logs_mode,
+        logs_query, now_ms, print_logs, request_stop, stale_reason_phrase, start_detached,
+        start_mode, status, stop, stop_log_drain, token_check,
     };
-    use jiff::tz::{Offset, TimeZone};
+    use jiff::tz::TimeZone;
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
@@ -3271,111 +3182,5 @@ mod tests {
 
         assert!(followed.is_err(), "a follow ends only on the interrupt");
         Ok(())
-    }
-
-    #[test]
-    fn a_rendered_line_carries_every_column() {
-        let record = LogRecord::new(
-            1_756_552_944_123,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "rebuild",
-            "published 412 units",
-            "{\"unit_count\":412}",
-        );
-
-        assert_eq!(
-            rendered_line(&record, &TimeZone::UTC),
-            "2025-08-30T11:22:24.123+00:00 🔵 INFO  index    rebuild      \
-             published 412 units unit_count=412"
-        );
-    }
-
-    #[test]
-    fn a_record_without_labels_prints_a_dash_in_each_column() {
-        let record = LogRecord::new(0, "warn", "rift", "", "", "late", "{}");
-
-        assert_eq!(
-            rendered_line(&record, &TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00 🟡 WARN  -        -            late"
-        );
-        assert_eq!(label(""), "-");
-        assert_eq!(label("index"), "index");
-    }
-
-    #[test]
-    fn every_level_prints_its_own_glyph() {
-        for (level, glyph) in [
-            ("error", "🔴"),
-            ("warn", "🟡"),
-            ("info", "🔵"),
-            ("debug", "⚪"),
-            ("trace", "⚫"),
-            ("loud", "⚫"),
-        ] {
-            assert_eq!(level_glyph(level), glyph, "{level}");
-        }
-    }
-
-    #[test]
-    fn fields_print_as_pairs_or_as_the_text_the_store_holds() {
-        assert_eq!(rendered_fields("{}"), "");
-        assert_eq!(rendered_fields(""), "");
-        assert_eq!(
-            rendered_fields("{\"epoch\":\"4\",\"count\":7}"),
-            " count=7 epoch=4"
-        );
-        assert_eq!(rendered_fields("not json"), " not json");
-        assert_eq!(rendered_fields("[1]"), " [1]");
-    }
-
-    #[test]
-    fn rendered_timestamp_uses_the_given_time_zones_offset() {
-        assert_eq!(
-            rendered_timestamp(0, &TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00"
-        );
-        assert_eq!(
-            rendered_timestamp(-1, &TimeZone::UTC),
-            "1969-12-31T23:59:59.999+00:00"
-        );
-
-        let positive = TimeZone::fixed(Offset::from_hours(2).expect("+2h must be a valid offset"));
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &positive),
-            "2025-08-30T13:22:24.123+02:00"
-        );
-
-        let negative = TimeZone::fixed(Offset::from_hours(-5).expect("-5h must be a valid offset"));
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &negative),
-            "2025-08-30T06:22:24.123-05:00"
-        );
-
-        let berlin =
-            TimeZone::get("Europe/Berlin").expect("the tz database must carry Europe/Berlin");
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &berlin),
-            "2025-08-30T13:22:24.123+02:00",
-            "August is daylight saving time in Berlin, CEST"
-        );
-        assert_eq!(
-            rendered_timestamp(1_736_940_144_123, &berlin),
-            "2025-01-15T12:22:24.123+01:00",
-            "January is standard time in Berlin, CET"
-        );
-    }
-
-    #[test]
-    fn an_out_of_range_millisecond_count_falls_back_to_the_raw_count() {
-        assert_eq!(
-            rendered_timestamp(i64::MAX, &TimeZone::UTC),
-            i64::MAX.to_string()
-        );
-        assert_eq!(
-            rendered_timestamp(i64::MIN, &TimeZone::UTC),
-            i64::MIN.to_string()
-        );
     }
 }

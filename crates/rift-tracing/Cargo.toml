@@ -22,6 +22,7 @@ otlp = [
 workspace = true
 
 [dependencies]
+jiff.workspace = true
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
