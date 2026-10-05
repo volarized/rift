@@ -45,6 +45,12 @@ from rift_dev.corpus_assertions import (
 )
 from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
+from rift_dev.log_records import (
+    DATABASE_CLOSE,
+    STAGE_ENDED,
+    instant,
+    stop_measurements,
+)
 from rift_dev.rift_test_client import (
     LOG_FILTER,
     Client,
@@ -162,6 +168,8 @@ class Corpus:
         self.sequence = 0
         self.started = time.monotonic()
         self.mark = utc_now()
+        # The action `mark` is the end of; None before the first one finishes.
+        self.last_action: str | None = None
 
     def record(self, action: str, **values: Json) -> None:
         """Append one finished action.
@@ -178,6 +186,7 @@ class Corpus:
             "elapsed_seconds": time.monotonic() - self.started,
         }
         self.mark = ended
+        self.last_action = action
         self.actions.append(entry)
 
     def server(self, root: Path | None = None) -> Server:
@@ -261,7 +270,11 @@ class Corpus:
 
         The served tree still exists here. The report's `stops` entry names the
         records file, or the error of a records read that failed; a failed read
-        never fails the case.
+        never fails the case. From the records of this server alone it also carries
+        the `database.close` values (`database_close`: `busy`, `log`, and
+        `checkpointed` per database) and the `stop stage ended` values (`stop_stages`:
+        `stage`, `remaining`, `outcome`). `lacks` names each kind the records did
+        not hold, and `records_lines` counts the records read.
         """
         server.stop()
         entry: JsonObject = {
@@ -270,10 +283,17 @@ class Corpus:
             "records": str(server.records_path),
         }
         try:
-            server.read_records()
+            text = server.read_records()
         except (OSError, RuntimeError, ValueError) as error:
             entry["records"] = None
             entry["records_error"] = str(error)
+            entry["lacks"] = [DATABASE_CLOSE, STAGE_ENDED]
+        else:
+            measured = stop_measurements(text, instant(server.started_at))
+            entry["records_lines"] = measured["records_lines"]
+            entry["database_close"] = list(measured["database_close"])
+            entry["stop_stages"] = list(measured["stop_stages"])
+            entry["lacks"] = list(measured["lacks"])
         self.stops.append(entry)
 
     def collect_evidence(self) -> None:
@@ -283,8 +303,21 @@ class Corpus:
         each stream is written to stderr, which a pass never receives. The served
         tree still exists here, so `rift server logs` can read its `.rift/metrics`.
         """
+        previous = self.last_action
+        lower_bound = (
+            f"the end of the last recorded action, {previous}; the failing action "
+            "began at or after it"
+            if previous is not None
+            else "the start of the case; no action had finished"
+        )
         for index, server in enumerate(self.servers, 1):
-            for note in server.evidence():
+            since = max(self.mark, server.started_at)
+            bound = (
+                lower_bound
+                if since == self.mark
+                else "the start of this server, later than the last recorded action"
+            )
+            for note in server.evidence(since, bound):
                 sys.stderr.write(note if note.endswith("\n") else note + "\n")
             self.evidence.append(
                 {
@@ -294,6 +327,9 @@ class Corpus:
                     "stderr_cut": server.output_cut,
                     "proxy_stderr": [str(path) for path in server.proxy_logs],
                     "records": str(server.records_path),
+                    "window": str(server.window_path),
+                    "window_since": since,
+                    "window_lower_bound": bound,
                 }
             )
         sys.stderr.flush()

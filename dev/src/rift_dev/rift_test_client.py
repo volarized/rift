@@ -18,7 +18,14 @@ import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -41,6 +48,7 @@ from rift_dev.commands import (
     owned_environment,
     termination_handler,
 )
+from rift_dev.log_records import lines, newest_in_flight, newest_snapshots
 
 # `list` and `dict` are invariant, so a `list[JsonObject]` an assertion builds is
 # not a `list[Json]` and cannot be passed where a JSON value is expected. The
@@ -65,6 +73,9 @@ RECORD_TAIL = 5000
 # The newest bytes of one records file. Older bytes are replaced by a line naming
 # how many were left out.
 RECORDS_FILE_BYTES = 1024 * 1024
+# The newest bytes of one record the window prints. A table of operations in flight
+# carries a JSON array of its open entries.
+WINDOW_RECORD_BYTES = 16 * 1024
 EVIDENCE_SECONDS = 10.0
 MESSAGE_BYTES_MAX = 16 * 1024 * 1024
 PAGE_COUNT_MAX = 32
@@ -267,6 +278,103 @@ def tail_text(
 def utc_now() -> str:
     """The current UTC time, to the millisecond, as ISO 8601."""
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+# Runs `rift server logs` with these arguments and returns its stdout.
+LogsReader: TypeAlias = Callable[[Sequence[str]], str]
+
+
+def logs_arguments(
+    until: str, *, since: str | None = None, kind: str = "all", tail: int = RECORD_TAIL
+) -> list[str]:
+    """The arguments of a `rift server logs` read of records recorded before `until`.
+
+    `since` and `until` are RFC 3339 instants, as `utc_now` prints them. `--since`
+    keeps records at or after the instant and `--until` keeps those before it.
+    """
+    arguments = ["server", "logs", "--tail", str(tail), "--kind", kind]
+    if since is not None:
+        arguments += ["--since", since]
+    return [*arguments, "--until", until]
+
+
+def cut_record(text: str) -> str:
+    """One printed record cut to `WINDOW_RECORD_BYTES`, with the cut stated."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= WINDOW_RECORD_BYTES:
+        return text
+    kept = encoded[:WINDOW_RECORD_BYTES].decode("utf-8", errors="ignore")
+    return f"{kept} [{len(encoded) - WINDOW_RECORD_BYTES} later bytes were left out]"
+
+
+def failure_window(
+    read: LogsReader,
+    *,
+    since: str | None,
+    lower_bound: str,
+    until: str,
+    file: Path | None = None,
+) -> list[str]:
+    """The records of a failure's window, as notes for the failure to carry.
+
+    Two reads, each `RECORD_TAIL` records at most, each failing into a note and
+    never raising, so a pass cannot turn into a failure here and a failure keeps
+    its own error:
+
+    - every kind of record from `since` to `until`, in full, through `tail_text`; the
+      note states `lower_bound`, what `since` is, and when the read holds the newest
+      `RECORD_TAIL` records the older ones of the window are left out;
+    - the newest `operations in flight` record and the newest `metric snapshot`
+      record of each group before `until`, wherever they were recorded, when they
+      are among the newest `RECORD_TAIL` records before `until`.
+    """
+    heading = (
+        f"failure window: records of every kind from {since or 'the oldest kept record'} "
+        f"({lower_bound}) "
+        f"until {until}, the newest {RECORD_TAIL} at most"
+    )
+    notes: list[str] = []
+    try:
+        text = read(logs_arguments(until, since=since))
+    except (OSError, RuntimeError, ValueError) as error:
+        notes.append(f"{heading}\nunavailable: {error}")
+    else:
+        count = sum(1 for _ in lines(text))
+        cut = (
+            f"[the window holds {RECORD_TAIL} records; older records of the window "
+            "were left out]\n"
+            if count >= RECORD_TAIL
+            else ""
+        )
+        body = tail_text(text, file) if text else "(no records in the window)\n"
+        notes.append(f"{heading}\n{cut}{body}")
+    try:
+        before = list(lines(read(logs_arguments(until))))
+    except (OSError, RuntimeError, ValueError) as error:
+        notes.append(
+            f"newest operations in flight and metric snapshots unavailable: {error}"
+        )
+        return notes
+    flight = newest_in_flight(before)
+    notes.append(
+        "newest operations in flight record before "
+        f"{until}:\n"
+        + (
+            cut_record(flight.text)
+            if flight is not None
+            else f"(none among the newest {RECORD_TAIL} records)"
+        )
+    )
+    snapshots = newest_snapshots(before)
+    notes.append(
+        f"newest metric snapshot of each group before {until}:\n"
+        + (
+            "\n".join(cut_record(snapshot.text) for snapshot in snapshots)
+            if snapshots
+            else f"(none among the newest {RECORD_TAIL} records)"
+        )
+    )
+    return notes
 
 
 @contextmanager
@@ -556,6 +664,9 @@ def process_alive(process: psutil.Process) -> bool:
 class Server:
     """Own a foreground server, its external log, and observed descendants."""
 
+    # UTC time the server was started at, as `utc_now` prints it; empty before `start`.
+    started_at: str = ""
+
     def __init__(
         self,
         binary: Path,
@@ -590,6 +701,7 @@ class Server:
     def start(self, *, wait_for_publication: bool = True) -> Self:
         """Start once; callers may inspect output before awaiting publication."""
         require(self._reader is None, "server has already been started")
+        self.started_at = utc_now()
         require(
             not (self.root / ".rift" / "server.json").exists(),
             "workspace already has a server document; use a disposable workspace",
@@ -706,11 +818,64 @@ class Server:
             return f"persisted log records unavailable: {error}"
         return f"persisted log records ({path}):\n{tail_text(text, path)}"
 
-    def evidence(self) -> list[str]:
-        """What a failure keeps: server stderr, each proxy's stderr, and the persisted records.
+    @property
+    def window_path(self) -> Path:
+        """Where `window` keeps the failure window, beside the server log."""
+        return self.log_path.with_suffix(".window.log")
+
+    def read_logs(self, arguments: Sequence[str]) -> str:
+        """`rift` with `arguments` in this workspace, its stdout bounded to `LOG_BYTES_MAX`."""
+        return (
+            Command(self.binary, *arguments)
+            .with_cwd(self.root)
+            .with_environment(self.env)
+            .with_timeout(EVIDENCE_SECONDS)
+            .with_output_limit(LOG_BYTES_MAX)
+            .output()
+        )
+
+    def window(
+        self, since: str | None = None, lower_bound: str | None = None
+    ) -> list[str]:
+        """The failure window of this server as notes, from `since` until now.
+
+        `since` defaults to the server's start, a lower bound the server's own
+        clock confirms. A caller that knows a later lower bound, such as the end
+        of the last action the runner recorded, passes it with a `lower_bound` that
+        says what it is. The whole first read is kept in `window_path` beside the
+        server log, bounded by `RECORDS_FILE_BYTES`; the note carries the newest
+        `EVIDENCE_TAIL_BYTES` of it.
+        """
+        first = since or self.started_at or None
+        until = utc_now()
+        kept: list[str] = []
+
+        def read(arguments: Sequence[str]) -> str:
+            text = self.read_logs(arguments)
+            if not kept:
+                kept.append(text)
+                self.window_path.write_bytes(
+                    tail_text(text, None, RECORDS_FILE_BYTES).encode("utf-8")
+                )
+            return text
+
+        return failure_window(
+            read,
+            since=first,
+            lower_bound=lower_bound or "the server's start",
+            until=until,
+            file=self.window_path,
+        )
+
+    def evidence(
+        self, since: str | None = None, lower_bound: str | None = None
+    ) -> list[str]:
+        """What a failure keeps: server stderr, each proxy's stderr, the persisted
+        records, and the failure window.
 
         Each part is one note; a stream longer than `EVIDENCE_TAIL_BYTES` keeps its
-        newest bytes and names the file holding the rest.
+        newest bytes and names the file holding the rest. `since` and `lower_bound`
+        are those of `window`.
         """
         notes = [
             f"server stderr ({self.log_path}):\n"
@@ -724,6 +889,7 @@ class Server:
             )
             notes.append(f"rift mcp stderr ({proxy}):\n" + tail_text(text, proxy))
         notes.append(self.records())
+        notes.extend(self.window(since, lower_bound))
         return notes
 
     def await_publication(self) -> int:

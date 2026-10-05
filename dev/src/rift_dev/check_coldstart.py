@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -28,12 +29,14 @@ from rift_dev.rift_test_client import (
     ToolFailure,
     array_value,
     current_deadline,
+    failure_window,
     gate_deadline,
     object_value,
     remaining_seconds,
     require,
     stderr_log,
     tail_text,
+    utc_now,
 )
 
 COLDSTART_SECONDS = 240.0
@@ -170,14 +173,16 @@ async def check_missing_executable(client: Client, name: str) -> None:
     )
 
 
-def container_evidence(name: str, proxy_log: Path) -> list[str]:
+def container_evidence(name: str, proxy_log: Path, started: str) -> list[str]:
     """What a cold failure keeps: server stderr, proxy stderr, and the persisted records.
 
     The container still exists, so Docker returns the server's last
     `CONTAINER_LOG_LINES` lines of stderr and the container's own `rift server
     logs` reads `.rift/metrics`. Each read has its own bound and no gate
     deadline, because a timed-out gate is the failure this explains; a read that
-    fails is reported as text and never replaces the failure.
+    fails is reported as text and never replaces the failure. The failure window
+    runs from `started`, read just before the container was created, until now; it is
+    printed only, since the container and its files go with the case.
     """
     notes: list[str] = []
     reads = [
@@ -211,12 +216,30 @@ def container_evidence(name: str, proxy_log: Path) -> list[str]:
             notes.append(f"{label} unavailable: {error}")
         else:
             notes.append(f"{label}:\n{tail_text(text)}")
+
     try:
         proxy = proxy_log.read_bytes().decode("utf-8", errors="replace")
     except OSError as error:
         notes.append(f"rift mcp stderr unavailable: {error}")
     else:
         notes.append(f"rift mcp stderr ({proxy_log}):\n{tail_text(proxy, proxy_log)}")
+
+    def read(arguments: Sequence[str]) -> str:
+        return (
+            DockerCommand("exec", "--workdir", "/workspace", name, "/rift", *arguments)
+            .with_timeout(EVIDENCE_SECONDS)
+            .with_output_limit(LOG_BYTES_MAX)
+            .output()
+        )
+
+    notes.extend(
+        failure_window(
+            read,
+            since=started,
+            lower_bound="read just before the container was created",
+            until=utc_now(),
+        )
+    )
     return notes
 
 
@@ -260,6 +283,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
         )
         failure: BaseException | None = None
         proxy_log = Path(tempfile.mkdtemp(prefix="rift-coldstart-")) / "proxy.log"
+        started = utc_now()
         try:
             command.with_timeout(START_SECONDS).with_deadline(
                 current_deadline()
@@ -305,7 +329,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             stop_container(name, pid)
         except BaseException as error:
             failure = error
-            for note in container_evidence(name, proxy_log):
+            for note in container_evidence(name, proxy_log, started):
                 error.add_note(note)
             raise
         finally:

@@ -1072,6 +1072,8 @@ class SourceBound(unittest.TestCase):
     ) -> tuple[Corpus, MagicMock]:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
         server.root = Path("workspace")
         server.log_path = Path("server.log")
         client = AsyncMock(spec=Client)
@@ -1178,6 +1180,8 @@ class SourceBound(unittest.TestCase):
     def test_refusal_wait_keeps_one_deadline_and_closes_on_timeout(self) -> None:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
         server.root = Path("workspace")
         server.log_path = Path("server.log")
         client = AsyncMock(spec=Client)
@@ -1207,6 +1211,8 @@ class SourceBound(unittest.TestCase):
     def test_stop_failure_cannot_record_passed_source_bound(self) -> None:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
         server.root = Path("workspace")
         server.log_path = Path("server.log")
         server.stop.side_effect = AssertionError("server stop exceeded its deadline")
@@ -1244,6 +1250,8 @@ class ChurnPreparation(unittest.TestCase):
             corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
             corpus.root = Path(directory)
             server = MagicMock(spec=Server)
+            server.started_at = ""
+            server.read_records.return_value = ""
             server.root = Path("workspace")
             server.log_path = Path("server.log")
             server.__enter__.return_value = server

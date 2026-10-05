@@ -27,14 +27,26 @@ def test_failed_container_start_still_attempts_cleanup(
     monkeypatch.setattr(DockerCommand, "output", failed_output)
     with pytest.raises(RuntimeError, match="failed run") as captured:
         asyncio.run(check_coldstart.check_coldstart(binary, "ubuntu:24.04"))
-    assert [command[1] for command in commands] == ["run", "logs", "exec", "rm"]
+    assert [command[1] for command in commands] == [
+        "run",
+        "logs",
+        "exec",
+        "exec",
+        "exec",
+        "rm",
+    ]
     notes = captured.value.__notes__
     assert [note.split(":")[0] for note in notes[:3]] == [
         "server stderr (last 200 lines) unavailable",
         "persisted log records unavailable",
         "rift mcp stderr unavailable",
     ]
-    assert notes[3].startswith("container cleanup failed")
+    assert notes[3].startswith("failure window: records of every kind from")
+    assert notes[3].endswith("unavailable: failed exec")
+    assert notes[4] == (
+        "newest operations in flight and metric snapshots unavailable: failed exec"
+    )
+    assert notes[5].startswith("container cleanup failed")
     command = commands[0]
     assert command[command.index("--env") + 1] == f"RUST_LOG={LOG_FILTER}"
     assert command[command.index("--network") + 1] == "none"
@@ -74,7 +86,14 @@ def test_expired_gate_still_removes_container(
     monkeypatch.setattr(DockerCommand, "output", output)
     with pytest.raises(RuntimeError, match="command deadline expired"):
         asyncio.run(check_coldstart.check_coldstart(binary, "ubuntu:24.04"))
-    assert cleanup == [("logs", 10), ("exec", 10), ("rm", 30)]
+    # Evidence reads: stderr, records, then the failure window's two reads.
+    assert cleanup == [
+        ("logs", 10),
+        ("exec", 10),
+        ("exec", 10),
+        ("exec", 10),
+        ("rm", 30),
+    ]
     process.assert_not_called()
     assert rift_test_client.remaining_seconds(30.0) == 30.0
 
@@ -247,16 +266,27 @@ def test_container_evidence_keeps_server_stderr_proxy_stderr_and_records(
         return answers[command.arguments[0]]
 
     monkeypatch.setattr(DockerCommand, "output", output)
-    notes = check_coldstart.container_evidence("cold", proxy)
-    assert notes == [
+    notes = check_coldstart.container_evidence(
+        "cold", proxy, "2026-10-05T08:59:00.000+00:00"
+    )
+    assert notes[:3] == [
         "server stderr (last 200 lines):\nserver: panicked at index.rs\n",
         "persisted log records:\n2026-10-05T09:00:00Z ERROR index build failed\n",
         f"rift mcp stderr ({proxy}):\nproxy: connection reset\n",
     ]
+    # The window reads the container's own `rift server logs` twice: the window, then
+    # every record before the failure.
+    assert notes[3].startswith(
+        "failure window: records of every kind from 2026-10-05T08:59:00.000+00:00 "
+        "(read just before the container was created) until "
+    )
+    assert len(notes) == 6
     # Each read has its own bound and no gate deadline: a timed-out gate is what
     # the evidence explains.
     assert limits == [
         ("logs", check_coldstart.EVIDENCE_SECONDS, LOG_BYTES_MAX),
+        ("exec", check_coldstart.EVIDENCE_SECONDS, LOG_BYTES_MAX),
+        ("exec", check_coldstart.EVIDENCE_SECONDS, LOG_BYTES_MAX),
         ("exec", check_coldstart.EVIDENCE_SECONDS, LOG_BYTES_MAX),
     ]
 
@@ -268,7 +298,13 @@ def test_container_evidence_failure_never_raises(
         raise RuntimeError("docker is gone")
 
     monkeypatch.setattr(DockerCommand, "output", broken)
-    notes = check_coldstart.container_evidence("cold", tmp_path / "missing.log")
+    notes = check_coldstart.container_evidence(
+        "cold", tmp_path / "missing.log", "2026-10-05T08:59:00.000+00:00"
+    )
     assert notes[0] == "server stderr (last 200 lines) unavailable: docker is gone"
     assert notes[1] == "persisted log records unavailable: docker is gone"
     assert notes[2].startswith("rift mcp stderr unavailable:")
+    assert notes[3].endswith("unavailable: docker is gone")
+    assert notes[4] == (
+        "newest operations in flight and metric snapshots unavailable: docker is gone"
+    )

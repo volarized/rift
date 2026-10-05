@@ -43,6 +43,8 @@ def test_baseline_checks_symbol_floor_only_after_preparation(
         "records": [{"message": CONTEXT_SPAN}],
     }
     server = MagicMock(spec=Server)
+    server.started_at = ""
+    server.read_records.return_value = ""
     server.root = Path("workspace")
     server.log_path = Path("server.log")
     process = MagicMock(spec_set=Process)

@@ -31,6 +31,8 @@ def test_shallow_history_preserves_declaration_and_history_checks_after_preparat
     client.call.side_effect = [preparing, settled]
     client.resource.return_value = {"records": []}
     server = MagicMock(spec=Server)
+    server.started_at = ""
+    server.read_records.return_value = ""
     server.root = Path("workspace")
     server.log_path = Path("server.log")
     server.__enter__.return_value = server

@@ -201,6 +201,23 @@ absent file reads `"absent"`; `vectors` exists only after the first vector opera
 read that fails sets `records` to null and states the error in `records_error`; the case
 continues. One case keeps at most three records files, 3 MiB.
 
+Each `stops` entry also carries the values the stop recorded, read from the records of that server
+alone. `database_close` lists the `busy`, `log`, and `checkpointed` values of each `database.close`
+record, one per database. `stop_stages` lists the `stage`, `remaining`, and `outcome` of each
+`stop stage ended` record. `lacks` names each of the two record kinds the records did not hold, and
+`records_lines` counts the records read; a count of 5000 means older records may be missing.
+
+A failed case prints, for each server it started, the server's standard error, the standard error
+of each `rift mcp` proxy, the persisted records, and the failure window. The failure window is
+every kind of record that `rift server logs --kind all --since <start> --until <end>` selects, at
+most the newest 5000. The output carries the newest 256 KiB of it, and the newest 1 MiB is kept beside the
+report as `<report>.server-<n>.window.log`. Its start is the end of the last action the report
+recorded, or the start of the server when that is later; the failing action began at or after it.
+Its end is the moment the runner began collecting evidence. Two more notes follow the window: the
+newest `operations in flight` record before its end, and the newest `metric snapshot` record of each
+group before its end. Each note states a cut or a missing record instead of omitting it. The report
+names the files and the window bounds under `evidence`. A pass prints none of this.
+
 ## Artifact and agent checks
 
 Artifact checks run the native release binary from a temporary workspace. Agent checks use the
@@ -220,6 +237,10 @@ The artifact and agent checks require reads to observe external filesystem write
 check also reads incoming references through the embedded Python engine and verifies the source
 stays unchanged. The integration suite runs upstream MCP conformance checks against the same binary.
 
+When an artifact or agent check fails, the runner attaches the same notes to the error: the server's
+standard error, the standard error of each proxy, the persisted records, and the failure window from
+the start of the server to the failure.
+
 ## Cold first use
 
 The cold check needs Docker and a Linux binary matching the container architecture:
@@ -232,6 +253,10 @@ The container has no network, language servers, or existing Rift cache. It start
 workspace, then reads a newly created source file. After configuration selects a missing language
 server, an incoming-reference request must report the launch failure while syntax reads remain
 available. CI runs this check with its compiled Linux artifact; a local macOS run needs a Linux binary.
+
+When the cold check fails, it prints the container's standard error, the persisted records, the
+proxy's standard error, and the failure window read through `docker exec` from just before the
+container was created. The container and its files are removed afterwards, so nothing is kept.
 
 
 ## Local traces
