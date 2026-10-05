@@ -689,6 +689,15 @@ overflow series. Every `traced!` operation records `traces.span.metrics.calls` a
 the operation, not its span: a span clone held elsewhere does not lengthen the duration, and the
 span's filters do not select it.
 
+Every request `rift server` answers records `mcp.server.operation.duration`, and every request
+`rift mcp` forwards to it records `mcp.client.operation.duration`, in seconds, bucketed at the
+boundaries the MCP semantic conventions advise, from 10 ms to 300 s. A series names
+`mcp.method.name`: `tools/call`, `tools/list`, `resources/list`, `resources/templates/list`, or
+`resources/read`. A tool call also names `gen_ai.tool.name`, when the tool is `get_symbol`,
+`nodes`, or `search`. A tool answered with `isError` records `error.type` `tool_error`; a
+JSON-RPC error records its code as both `error.type` and `rpc.response.status_code`, such as
+`-32602`, or `error.type` `_OTHER` for a code outside the JSON-RPC, MCP, and Rift codes.
+
 A foreground server samples its own process every [`[logs]`](/docs/developer/configuration#logs)
 `sample_interval`. A sample reads the process once through `sysinfo`, on the blocking pool, and
 records `process.memory.usage`, `process.memory.virtual`, `process.cpu.utilization`,

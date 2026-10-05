@@ -61,6 +61,10 @@ use crate::global::{
 use crate::history::{AnalysisGate, HistoryLane};
 use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
+use crate::metrics::{
+    Ending, MCP_SERVER_OPERATION_DURATION, McpRequest, RESOURCE_TEMPLATES_LIST, RESOURCES_LIST,
+    RESOURCES_READ, TOOLS_LIST,
+};
 use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
 use crate::resource;
@@ -4107,6 +4111,7 @@ impl ServerHandler for RiftMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let measured = McpRequest::tool_call(&request.name);
         let span = rift_tracing::info_span!(
             "mcp.request",
             component = "mcp",
@@ -4114,17 +4119,29 @@ impl ServerHandler for RiftMcp {
             request_id = %context.id,
             tool = %request.name
         );
-        span.instrument(async {
-            rift_tracing::debug!("tool request started");
-            let routed = ToolCallContext::new(self, request, context);
-            let result = self.tool_router.call(routed).await;
-            rift_tracing::debug!(is_error = result.is_err(), "tool request completed");
-            match result {
-                Err(error) => ToolFailure::from(error).into_call_tool_result(),
-                Ok(response) => Ok(response),
-            }
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("tools/call", {
+            answered = span
+                .instrument(async {
+                    rift_tracing::debug!("tool request started");
+                    let routed = ToolCallContext::new(self, request, context);
+                    let result = self.tool_router.call(routed).await;
+                    rift_tracing::debug!(is_error = result.is_err(), "tool request completed");
+                    match result {
+                        Err(error) => ToolFailure::from(error).into_call_tool_result(),
+                        Ok(response) => Ok(response),
+                    }
+                })
+                .await;
         })
-        .await
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        measured.record(
+            &MCP_SERVER_OPERATION_DURATION,
+            elapsed,
+            Ending::of_tool_call(&answered),
+        );
+        answered
     }
 
     fn list_tools(
@@ -4135,9 +4152,20 @@ impl ServerHandler for RiftMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let tools;
+        let elapsed = rift_tracing::measure_elapsed!("tools/list", {
+            tools = self.tool_router.list_all();
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(TOOLS_LIST).record(
+            &MCP_SERVER_OPERATION_DURATION,
+            elapsed,
+            Ending::Answered,
+        );
         std::future::ready(Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
-            tools: self.tool_router.list_all(),
+            tools,
             meta: None,
             next_cursor: None,
             ttl_ms: supports_cache_hints.then_some(0),
@@ -4150,9 +4178,18 @@ impl ServerHandler for RiftMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> {
-        std::future::ready(Ok(ListResourcesResult::with_all_items(
-            resource::declared_resources(),
-        )))
+        let resources;
+        let elapsed = rift_tracing::measure_elapsed!("resources/list", {
+            resources = resource::declared_resources();
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_LIST).record(
+            &MCP_SERVER_OPERATION_DURATION,
+            elapsed,
+            Ending::Answered,
+        );
+        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
     }
 
     fn list_resource_templates(
@@ -4160,9 +4197,18 @@ impl ServerHandler for RiftMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> {
-        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
-            resource::declared_templates(),
-        )))
+        let templates;
+        let elapsed = rift_tracing::measure_elapsed!("resources/templates/list", {
+            templates = resource::declared_templates();
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCE_TEMPLATES_LIST).record(
+            &MCP_SERVER_OPERATION_DURATION,
+            elapsed,
+            Ending::Answered,
+        );
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
     }
 
     async fn read_resource(
@@ -4170,15 +4216,26 @@ impl ServerHandler for RiftMcp {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if resource::is_workspace_uri(&request.uri) {
-            Box::pin(self.read_workspace(&request.uri))
-                .await
-                .map(Into::into)
-        } else if request.uri == resource::MAP_URI {
-            self.read_map(&request.uri).await.map(Into::into)
-        } else {
-            self.read_logs(&request.uri).await.map(Into::into)
-        }
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/read", {
+            answered = if resource::is_workspace_uri(&request.uri) {
+                Box::pin(self.read_workspace(&request.uri))
+                    .await
+                    .map(Into::into)
+            } else if request.uri == resource::MAP_URI {
+                self.read_map(&request.uri).await.map(Into::into)
+            } else {
+                self.read_logs(&request.uri).await.map(Into::into)
+            };
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_READ).record(
+            &MCP_SERVER_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        answered
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -6450,6 +6507,37 @@ done
         Ok(())
     }
 
+    /// A blocking operation that finds the worker semaphore closed ends its wait `refused`
+    /// and records no hold, and the caller gets the read task error rather than a timeout.
+    #[tokio::test]
+    async fn a_closed_worker_semaphore_ends_the_wait_refused_and_holds_nothing() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        executor.operations.close();
+        let refusal =
+            rift_tracing::traced!(component = "search", operation = "search.read", async {
+                executor.run("closed operation", || Ok(())).await
+            })
+            .await
+            .expect_err("a closed semaphore admits nothing");
+        assert_eq!(refusal.slug(), errors::server::read_task::SLUG);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| record.message() == "lock.wait")
+            .ok_or("the wait closed with a record")?;
+        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
+        assert_eq!(wait["lock.name"], super::WORKER_PERMIT_LOCK, "{wait}");
+        assert_eq!(wait["outcome"], "refused", "{wait}");
+        assert!(
+            records.iter().all(|record| record.message() != "lock.held"),
+            "a refused wait records no hold"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn blocking_executor_preserves_work_error() {
         let executor = BlockingExecutor::isolated(1, 1_000);
@@ -6505,37 +6593,6 @@ done
         );
     }
 
-    /// A blocking operation that finds the worker semaphore closed ends its wait `refused`
-    /// and records no hold, and the caller gets the read task error rather than a timeout.
-    #[tokio::test]
-    async fn a_closed_worker_semaphore_ends_the_wait_refused_and_holds_nothing() -> TestResult {
-        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
-        let executor = BlockingExecutor::isolated(1, 1_000);
-        executor.operations.close();
-        let refusal =
-            rift_tracing::traced!(component = "search", operation = "search.read", async {
-                executor.run("closed operation", || Ok(())).await
-            })
-            .await
-            .expect_err("a closed semaphore admits nothing");
-        assert_eq!(refusal.slug(), errors::server::read_task::SLUG);
-        drop(recorder);
-
-        let records = drain.queued_records();
-        let wait = records
-            .iter()
-            .find(|record| record.message() == "lock.wait")
-            .ok_or("the wait closed with a record")?;
-        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
-        assert_eq!(wait["lock.name"], super::WORKER_PERMIT_LOCK, "{wait}");
-        assert_eq!(wait["outcome"], "refused", "{wait}");
-        assert!(
-            records.iter().all(|record| record.message() != "lock.held"),
-            "a refused wait records no hold"
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     async fn blocking_executor_classifies_worker_panic_as_join_failure() {
         let executor = BlockingExecutor::isolated(1, 1_000);
@@ -6572,6 +6629,98 @@ done
             .await
             .expect_err("closed semaphore must fail acceptance");
         assert_eq!(error.slug(), errors::server::read_task::SLUG);
+    }
+
+    /// Every request the server answers lands in `mcp.server.operation.duration` under its
+    /// method, its tool, and how it ended: a tool answered with `isError` as `tool_error`,
+    /// a refused read under its JSON-RPC code.
+    #[tokio::test]
+    async fn each_answered_request_records_its_server_operation_duration() -> TestResult {
+        use crate::metrics::tests::recorded;
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (_directory, server) = Box::pin(fixture()).await?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        client.list_all_tools().await?;
+        client.list_all_resources().await?;
+        client.list_all_resource_templates().await?;
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await?;
+        let refused = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": ""}))?),
+            )
+            .await?;
+        assert_eq!(refused.is_error, Some(true));
+        let unpublished = client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(
+                "rift://unpublished",
+            ))
+            .await;
+        assert!(unpublished.is_err(), "an unpublished URI is refused");
+        client.cancel().await?;
+        server_task.await?;
+
+        let snapshot = recorder.metrics();
+        let name = "mcp.server.operation.duration";
+        for method in ["tools/list", "resources/list", "resources/templates/list"] {
+            assert_eq!(
+                recorded(&snapshot, name, &[("mcp.method.name", method)]),
+                1,
+                "{method}: {snapshot:?}"
+            );
+        }
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("gen_ai.tool.name", "get_symbol"),
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("gen_ai.tool.name", "search"),
+                    ("error.type", "tool_error"),
+                ],
+            ),
+            1
+        );
+        let refused_reads: u64 = snapshot
+            .series()
+            .iter()
+            .filter(|series| {
+                series.name() == name
+                    && series.labels().first() == Some(&("mcp.method.name", "resources/read"))
+                    && series.labels().iter().any(|(key, _)| *key == "error.type")
+            })
+            .map(|series| match series.value() {
+                rift_tracing::SeriesValue::Buckets { count, .. } => *count,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(refused_reads, 1, "{snapshot:?}");
+        Ok(())
     }
 
     #[tokio::test]
