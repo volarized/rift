@@ -1516,6 +1516,26 @@ impl Drop for SupervisorRunning {
     }
 }
 
+/// Holds the filesystem watcher for as long as the index supervisor runs.
+///
+/// Dropping it with the supervisor - on return, on cancellation, or while a panic unwinds
+/// the task - drops the watcher, which ends its event delivery, and records that the watch
+/// stopped.
+struct WatchRunning {
+    watcher: Option<notify::RecommendedWatcher>,
+}
+
+impl Drop for WatchRunning {
+    fn drop(&mut self) {
+        drop(self.watcher.take());
+        rift_tracing::info!(
+            component = "index",
+            operation = "index.supervisor",
+            "index watch stopped"
+        );
+    }
+}
+
 /// What one native event tells the supervisor about the next rebuild.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) enum WatchImpact {
@@ -4053,11 +4073,16 @@ fn publish_preparation_after(
 /// A cancelled rebuild ends the loop: the token is cancelled only at shutdown, and the
 /// capture it interrupted finishes on its own thread with nothing left to publish.
 pub(crate) async fn run_index_supervisor_with(
-    _watcher: notify::RecommendedWatcher,
+    watcher: notify::RecommendedWatcher,
     mut invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
     capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) {
+    // Declared ahead of the running guard, so it drops after it: the supervisor's end is
+    // recorded, then the watcher's.
+    let _watch = WatchRunning {
+        watcher: Some(watcher),
+    };
     let validation = Arc::clone(&context.validation);
     let published = Arc::clone(&context.published);
     let population = context.population.clone();
@@ -7937,6 +7962,57 @@ pub(crate) mod tests {
         );
         validation.cancellation.cancel();
         supervisor.await?;
+        Ok(())
+    }
+
+    /// A supervisor that ends drops its watcher with it and records both ends, the
+    /// supervisor's first.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_ends_records_that_its_watch_stopped() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let current = stable_candidate(directory.path(), 0)?;
+        let published = Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        }));
+        let watcher = unwatched(directory.path(), &validation)?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let supervisor = tokio::spawn(super::run_index_supervisor(
+            watcher,
+            invalidations,
+            super::IndexSupervisorContext {
+                root: directory.path().to_path_buf(),
+                limits: WorkspaceIndexLimits::default(),
+                published,
+                validation: Arc::clone(&validation),
+                blocking: crate::server::BlockingExecutor::isolated(1, 60_000),
+                population: None,
+                lexical: None,
+            },
+        ));
+        validation.cancellation.cancel();
+        supervisor.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let position = |message: &str| {
+            records
+                .iter()
+                .position(|record| record.message() == message)
+                .ok_or(format!("a record says {message}: {records:?}"))
+        };
+        let supervisor_stopped = position(
+            "the index supervisor stopped; no further snapshot publishes in this process",
+        )?;
+        let watch_stopped = position("index watch stopped")?;
+        assert!(supervisor_stopped < watch_stopped, "{records:?}");
+        let stopped = &records[watch_stopped];
+        assert_eq!(stopped.level(), "info");
+        assert_eq!(stopped.component(), "index");
+        assert_eq!(stopped.operation(), "index.supervisor");
         Ok(())
     }
 
