@@ -7,8 +7,9 @@
 //! the only write connection, so writers in this process never compete for the file.
 
 use std::error::Error;
+use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +40,18 @@ const METRICS_JOURNAL_SIZE_LIMIT_BYTES: i64 = 4 << 20;
 const WRITER_THREAD_NAME: &str = "rift-db-metrics";
 /// Commands the writer's queue holds while the thread runs one.
 const WRITER_QUEUE_COMMANDS: usize = 1;
+/// The stages one close runs through, in order: the command waits in the writer's queue,
+/// then the thread clears the busy timeout, checkpoints the write-ahead log, and closes
+/// the connection. Each thread stage carries the operation its failure names.
+const CLOSE_STAGES: [&str; 4] = ["queued", "clear the busy timeout", "checkpoint", "close"];
+/// [`CLOSE_STAGES`] index of the command waiting in the queue.
+const CLOSE_QUEUED: usize = 0;
+/// [`CLOSE_STAGES`] index of the busy timeout's clearing.
+const CLOSE_CLEAR_BUSY_TIMEOUT: usize = 1;
+/// [`CLOSE_STAGES`] index of `PRAGMA wal_checkpoint(TRUNCATE)`.
+const CLOSE_CHECKPOINT: usize = 2;
+/// [`CLOSE_STAGES`] index of the connection's close.
+const CLOSE_CONNECTION: usize = 3;
 
 /// The metrics database's tables, created when the file holds no schema version.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS log_records(
@@ -94,6 +107,104 @@ impl WalCheckpoint {
     }
 }
 
+/// Where one close stands, shared by the closer and the writer thread.
+///
+/// The closer starts the queued stage before it sends the command; the thread starts each
+/// later stage before running it and marks the close ended after the connection closed. A
+/// close that misses its deadline renders this, so the failure names the stage the thread
+/// was in and how long each stage before it took.
+#[derive(Debug, Default)]
+struct CloseProgress {
+    stages: Mutex<CloseStages>,
+}
+
+/// The instants one close reached, each read on the monotonic clock.
+#[derive(Debug, Default)]
+struct CloseStages {
+    /// When each of [`CLOSE_STAGES`] started; `None` for a stage the close did not reach.
+    started: [Option<std::time::Instant>; CLOSE_STAGES.len()],
+    /// When the connection's close returned.
+    ended: Option<std::time::Instant>,
+    /// Commands the writer's queue held when the close was requested.
+    queue_depth: usize,
+}
+
+impl CloseProgress {
+    /// Starts a close: clears what an earlier close recorded and starts the queued stage.
+    fn request(&self, queue_depth: usize) {
+        *self.lock() = CloseStages {
+            queue_depth,
+            ..CloseStages::default()
+        };
+        self.start(CLOSE_QUEUED);
+    }
+
+    /// Records that `stage`, an index into [`CLOSE_STAGES`], started now.
+    fn start(&self, stage: usize) {
+        if let Some(started) = self.lock().started.get_mut(stage) {
+            *started = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Records that the connection's close returned.
+    fn end(&self) {
+        self.lock().ended = Some(std::time::Instant::now());
+    }
+
+    /// The stage the close was in at `now` and the time each stage took, as text a
+    /// failure carries: `stage checkpoint running for 1834 ms; queued took 0 ms, clear
+    /// the busy timeout took 0 ms; the queue held 0 of 1 commands at the close request`.
+    fn render(&self, now: std::time::Instant) -> String {
+        let stages = self.lock();
+        let reached: Vec<(&str, std::time::Instant)> = CLOSE_STAGES
+            .iter()
+            .zip(stages.started)
+            .filter_map(|(name, started)| started.map(|started| (*name, started)))
+            .collect();
+        let mut rendered = String::new();
+        match (reached.last(), stages.ended) {
+            (Some((name, started)), None) => {
+                let _ = write!(
+                    rendered,
+                    "stage {name} running for {} ms",
+                    now.saturating_duration_since(*started).as_millis()
+                );
+            }
+            (Some(_), Some(_)) => rendered.push_str("every stage ended"),
+            (None, _) => rendered.push_str("no stage started"),
+        }
+        let took = reached
+            .windows(2)
+            .map(|pair| (pair[0].0, pair[1].1.saturating_duration_since(pair[0].1)))
+            .chain(
+                reached
+                    .last()
+                    .zip(stages.ended)
+                    .map(|((name, started), ended)| {
+                        (*name, ended.saturating_duration_since(*started))
+                    }),
+            );
+        for (index, (name, elapsed)) in took.enumerate() {
+            let separator = if index == 0 { "; " } else { ", " };
+            let _ = write!(
+                rendered,
+                "{separator}{name} took {} ms",
+                elapsed.as_millis()
+            );
+        }
+        let _ = write!(
+            rendered,
+            "; the queue held {} of {WRITER_QUEUE_COMMANDS} commands at the close request",
+            stages.queue_depth
+        );
+        rendered
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CloseStages> {
+        self.stages.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// One command the writer thread runs.
 enum Command {
     /// Append one batch and trim back to `retention_records`.
@@ -117,6 +228,7 @@ pub struct LogStore {
     path: Arc<Path>,
     sender: mpsc::Sender<Command>,
     closed: OnceLock<WalCheckpoint>,
+    progress: Arc<CloseProgress>,
 }
 
 impl std::fmt::Debug for Command {
@@ -152,9 +264,13 @@ impl LogStore {
         let (sender, receiver) = mpsc::channel(WRITER_QUEUE_COMMANDS);
         let (ready, answer) = oneshot::channel();
         let thread_path = Arc::clone(&database);
+        let progress = Arc::new(CloseProgress::default());
+        let thread_progress = Arc::clone(&progress);
         thread::Builder::new()
             .name(WRITER_THREAD_NAME.to_owned())
-            .spawn(move || MetricsWriter::run(&thread_path, owner, receiver, ready))
+            .spawn(move || {
+                MetricsWriter::run(&thread_path, owner, receiver, ready, &thread_progress);
+            })
             .map_err(|source| store_failure("start the writer thread", path, source))?;
         answer.await.map_err(|_| {
             store_failure(
@@ -167,6 +283,7 @@ impl LogStore {
             path: database,
             sender,
             closed: OnceLock::new(),
+            progress,
         })
     }
 
@@ -235,7 +352,9 @@ impl LogStore {
     /// # Errors
     ///
     /// Returns `tracing.log_store_failed` when the deadline passes, the thread already
-    /// stopped, or `SQLite` refuses the checkpoint or the close.
+    /// stopped, or `SQLite` refuses the checkpoint or the close. A missed deadline names
+    /// the stage the close was in, from the queued command to the connection's close, the
+    /// time each earlier stage took, and the commands the queue held at the request.
     ///
     /// # Cancel safety
     ///
@@ -245,16 +364,21 @@ impl LogStore {
             return Ok(*checkpoint);
         }
         let (reply, answer) = oneshot::channel();
+        self.progress
+            .request(self.sender.max_capacity() - self.sender.capacity());
         let checkpoint = timeout_at(
             deadline,
             self.request(Command::Close { reply }, answer, "close"),
         )
         .await
         .map_err(|_| {
+            let stages = self.progress.render(std::time::Instant::now());
             store_failure(
                 "close",
                 &self.path,
-                std::io::Error::other("the writer thread outlasted the close deadline"),
+                std::io::Error::other(format!(
+                    "the writer thread outlasted the close deadline: {stages}"
+                )),
             )
         })??;
         Ok(*self.closed.get_or_init(|| checkpoint))
@@ -293,6 +417,7 @@ impl MetricsWriter {
         owner: Option<Arc<dyn Send + Sync>>,
         mut receiver: mpsc::Receiver<Command>,
         ready: oneshot::Sender<Result<(), RiftError>>,
+        progress: &CloseProgress,
     ) {
         let mut writer = match Self::open(path) {
             Ok(writer) => writer,
@@ -314,7 +439,7 @@ impl MetricsWriter {
                     let _ = reply.send(writer.append(&records, retention_records));
                 }
                 Command::Close { reply } => {
-                    let closed = writer.close();
+                    let closed = writer.close(progress);
                     drop(owner);
                     let _ = reply.send(closed);
                     return;
@@ -397,13 +522,16 @@ impl MetricsWriter {
 
     /// Truncates the write-ahead log without waiting on another connection's lock, then
     /// closes the connection. No transaction is open: the thread runs one command at a time.
-    fn close(self) -> Result<WalCheckpoint, RiftError> {
+    /// Starts each stage in `progress` before running it.
+    fn close(self, progress: &CloseProgress) -> Result<WalCheckpoint, RiftError> {
         let Self { connection, path } = self;
         let failure =
             |operation: &str, source: rusqlite::Error| store_failure(operation, &path, source);
+        progress.start(CLOSE_CLEAR_BUSY_TIMEOUT);
         connection
             .busy_timeout(Duration::ZERO)
-            .map_err(|source| failure("clear the busy timeout", source))?;
+            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CLEAR_BUSY_TIMEOUT], source))?;
+        progress.start(CLOSE_CHECKPOINT);
         let checkpoint = connection
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok(WalCheckpoint {
@@ -412,10 +540,12 @@ impl MetricsWriter {
                     checkpointed: row.get(2)?,
                 })
             })
-            .map_err(|source| failure("checkpoint", source))?;
+            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))?;
+        progress.start(CLOSE_CONNECTION);
         connection
             .close()
-            .map_err(|(_connection, source)| failure("close", source))?;
+            .map_err(|(_connection, source)| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
+        progress.end();
         Ok(checkpoint)
     }
 }
