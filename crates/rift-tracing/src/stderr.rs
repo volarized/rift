@@ -332,6 +332,43 @@ mod tests {
         assert_eq!(written.lines(), rendered);
     }
 
+    /// Text from outside the process reaches stderr escaped: one record, one line, and no
+    /// control character a terminal acts on.
+    #[test]
+    fn a_stderr_line_escapes_control_characters_in_record_text() {
+        let written = printed(|| {
+            let request = tracing::info_span!(
+                "mcp.request",
+                component = "mcp",
+                tool = "search\u{1b}[2J",
+                request_id = 3
+            );
+            let _request = request.enter();
+            let read = tracing::info_span!("index.read", path = "a\u{202e}b\nc");
+            read.in_scope(|| {
+                tracing::warn!(query = "q\r\u{9b}31m\u{7f}\0", "found\u{1b}]0;title\u{7}");
+            });
+        });
+
+        let bytes = written
+            .0
+            .lock()
+            .expect("the written bytes are not poisoned")
+            .clone();
+        let text = String::from_utf8(bytes).expect("a line is UTF-8");
+        assert_eq!(text.matches('\n').count(), 3, "{text:?}");
+        for line in text.lines() {
+            assert!(
+                !line.chars().any(super::super::render::is_escaped),
+                "{line:?}"
+            );
+        }
+        assert!(text.contains("search\\u{1b}[2J"), "{text:?}");
+        assert!(text.contains("a\\u{202e}b\\nc"), "{text:?}");
+        assert!(text.contains("q\\r\\u{9b}31m\\u{7f}\\0"), "{text:?}");
+        assert!(text.contains("found\\u{1b}]0;title\\u{7}"), "{text:?}");
+    }
+
     #[test]
     fn a_bounded_writer_passes_the_crossing_write_then_drops() -> TestResult {
         let written = AtomicU64::new(0);
