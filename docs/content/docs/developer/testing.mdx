@@ -212,16 +212,35 @@ The report also carries a `machine` section: `logical_cpus`, `cpu_model`, `memor
 from `RUNNER_OS`, `RUNNER_ARCH`, `ImageOS`, and `ImageVersion`. A fact the host does not give is
 null. The runner prints the same facts on one `machine:` line when the case starts.
 
+Each case starts an in-memory OTLP collector on `127.0.0.1` before its first server and stops it
+once the served tree is removed. Every server the case starts exports to it:
+`OTEL_EXPORTER_OTLP_ENDPOINT` names the collector, and `OTEL_METRIC_EXPORT_INTERVAL` and
+`OTEL_BSP_SCHEDULE_DELAY` set an export every 1000 ms. The report's `collector` entry counts the
+metric points and spans it received and what its bounds dropped.
+
 A failed case prints, for each server it started, the server's standard error, the standard error
 of each `rift mcp` proxy, the persisted records, and the failure window. The failure window is
-every kind of record that `rift server logs --kind all --since <start> --until <end>` selects, at
-most the newest 5000. The output carries the newest 256 KiB of it, and the newest 1 MiB is kept beside the
+the records that `rift server logs --tail 5000 --since <start> --until <end>` selects. The output
+carries the newest 256 KiB of it, and the newest 1 MiB is kept beside the
 report as `<report>.server-<n>.window.log`. Its start is the end of the last action the report
 recorded, or the start of the server when that is later; the failing action began at or after it.
-Its end is the moment the runner began collecting evidence. Two more notes follow the window: the
-newest `operations in flight` record before its end, and the newest `metric snapshot` record of each
-group before its end. Each note states a cut or a missing record instead of omitting it. The report
-names the files and the window bounds under `evidence`. A pass prints none of this.
+Its end is the moment the runner began collecting evidence.
+
+The newest `operations in flight` record before the window's end follows the window. Then come
+what the collector received inside the same window, oldest first:
+
+- the newest 200 metric points, each with its time, kind, name, the `service.instance.id` of the
+  server that sent it, its attributes, and its value
+- the newest 100 spans, each at its end time with its name, attributes, and elapsed time; a span
+  that carries `request_id` adds `records=`, the count of the window's log records whose `req` is
+  the same, so the span and the records of its request read together
+
+A point carries no request, so the window's time bounds are the one key that joins a point to the
+log records. A collector that received nothing prints `no metric points received` or
+`no spans received`, and a bound that dropped anything is stated.
+
+Each note states a cut or a missing record instead of omitting it. The report names the files and
+the window bounds under `evidence`. A pass prints none of this.
 
 ## Artifact and agent checks
 
@@ -242,9 +261,11 @@ The artifact and agent checks require reads to observe external filesystem write
 check also reads incoming references through the embedded Python engine and verifies the source
 stays unchanged. The integration suite runs upstream MCP conformance checks against the same binary.
 
-When an artifact or agent check fails, the runner attaches the same notes to the error: the server's
-standard error, the standard error of each proxy, the persisted records, and the failure window from
-the start of the server to the failure.
+Both checks start the same in-memory OTLP collector and point their server at it. When an artifact
+or agent check fails, the runner attaches the same notes to the error: the server's standard error,
+the standard error of each proxy, the persisted records, and the failure window from the start of
+the server to the failure, with the collector's points and spans. Pass or fail, the runner prints
+one `collector:` line with the points and spans received and what the bounds dropped.
 
 ## Cold first use
 
@@ -261,34 +282,41 @@ available. CI runs this check with its compiled Linux artifact; a local macOS ru
 
 When the cold check fails, it prints the container's standard error, the persisted records, the
 proxy's standard error, and the failure window read through `docker exec` from just before the
-container was created. The container and its files are removed afterwards, so nothing is kept.
+container was created. The container and its files are removed afterwards, so nothing is kept. The cold check starts no
+collector: the container runs with `--network none`, so the server inside cannot reach one.
 
 
 ## Local traces
 
 Rift times cold-start work through `tracing` spans, opened by the `traced!` macro of
-`rift-tracing`. Building `rift` with `--features otlp` turns on the same feature of
-`rift-tracing`, which adds an OTLP/HTTP export layer that sends those spans to a local collector
-once `OTEL_EXPORTER_OTLP_ENDPOINT` names one - the feature is off by default, so a plain build
-carries no OpenTelemetry stack.
+`rift-tracing`, and records its metrics through OpenTelemetry instruments. Every build carries an
+OTLP/HTTP export that sends both to a collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one;
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` alone exports the metrics. With neither set, a process
+builds no exporter.
 
-Start the collector, build with the feature, and point a run at it from a second terminal:
+Start the collector and point a run at it from a second terminal:
 
 ```sh
 just trace-collector
-cargo build --release -p rift --features otlp
+cargo build --release -p rift
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
 ```
 
 `just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans at
-`/v1/traces` and the exported metric values at `/v1/metrics` on port 4318 and keeps them in memory. `RIFT_OTLP_FILTER` overrides the export layer's own filter;
-unset, it keeps Rift's own crates at `info`. Stop the collector with Ctrl-C once the run is done,
-and it prints one JSON line per operation: the span count, total duration, p50, p95, and max, in
-milliseconds. It then prints one JSON line per metric name with its kind, unit, series count, data
-point count, and value; the value is the sum of the latest value of each series, and a histogram adds
-its recorded count. A request body is at most 8 MiB encoded and decoded, and the collector keeps at
-most 512 metric names and 256 series per name. A last `dropped` line counts what these bounds
-refused.
+`/v1/traces` and the exported metric points at `/v1/metrics` on port 4318 and keeps them in
+memory. `RIFT_OTLP_FILTER` overrides the span export's own filter; unset, it keeps Rift's own
+crates at `info`. The server exports metric points every `OTEL_METRIC_EXPORT_INTERVAL`
+milliseconds, 60 s when unset, and once more as it stops.
+
+Stop the collector with Ctrl-C once the run is done, and it prints one JSON line per operation:
+the span count, total duration, p50, p95, and max, in milliseconds. It then prints one JSON line
+per metric name with its kind, unit, series count, data point count, and value; the value is the
+sum of the latest value of each series, and a histogram adds its recorded count.
+
+A request body is at most 8 MiB encoded and decoded. The collector keeps at most 512 metric names
+and 256 series per name for these lines, and the newest 32,768 metric points and 8,192 spans for
+a failure window. A last `dropped` line counts what these bounds refused or dropped, when they
+did.
 
 The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
 errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at
