@@ -800,9 +800,10 @@ fn quoted(value: &str) -> String {
 /// A detached server's panic reaches nobody otherwise: its standard error is a file at
 /// best, and the default hook writes there alone. The installed hook emits one `ERROR`
 /// event carrying the payload and the source location, through whatever subscriber the
-/// panicking thread runs under, then hands the panic to the hook that was installed
-/// before it. Installing twice chains the hooks, so a second call records each panic
-/// twice; the server installs it once, before it serves.
+/// panicking thread runs under, then publishes the table of operations in flight as one
+/// `WARN` record with the reason `panic`, as [`crate::warn_in_flight`] does, and hands the
+/// panic to the hook that was installed before it. Installing twice chains the hooks, so a
+/// second call records each panic twice; the server installs it once, before it serves.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -825,6 +826,7 @@ pub fn install_panic_hook() {
             location,
             "the server panicked"
         );
+        crate::flight::warn_in_flight("panic");
         previous(info);
     }));
 }

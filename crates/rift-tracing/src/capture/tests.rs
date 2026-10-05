@@ -586,6 +586,41 @@ fn a_panic_under_the_hook_is_recorded_with_its_payload_and_location() {
     );
 }
 
+/// A panic publishes the table of operations in flight, at `WARN`, with the reason
+/// `panic`: the operation the panicking thread ran is still open when the hook runs.
+#[test]
+fn a_panic_under_the_hook_publishes_the_operations_in_flight()
+-> Result<(), Box<dyn std::error::Error>> {
+    install_panic_hook();
+    let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
+
+    let caught = std::panic::catch_unwind(|| {
+        crate::traced!(component = "mcp", operation = "server.stop", {
+            panic!("injected panic inside an operation");
+        });
+    });
+    drop(recorder);
+
+    assert!(caught.is_err(), "the operation must have panicked");
+    let records = drain.queued_records();
+    let published = records
+        .iter()
+        .find(|record| record.message() == "operations in flight")
+        .ok_or("the hook publishes the table")?;
+    assert_eq!(published.level(), "warn");
+    assert_eq!(published.target(), "rift_tracing::flight");
+    let fields: serde_json::Value = serde_json::from_str(published.fields())?;
+    assert_eq!(fields["reason"], "panic");
+    assert_eq!(fields["in_flight"], "1");
+    let operations: serde_json::Value = serde_json::from_str(
+        fields["operations"]
+            .as_str()
+            .ok_or("the table lists its entries as text")?,
+    )?;
+    assert_eq!(operations[0]["operation"], "server.stop");
+    Ok(())
+}
+
 #[test]
 fn a_panic_payload_is_text_cut_at_its_bound() {
     let literal: Box<dyn std::any::Any + Send> = Box::new("literal");
