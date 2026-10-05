@@ -81,6 +81,22 @@ READ_SECONDS = READINESS_SECONDS + 10.0
 # well above that outlier and strictly inside the readiness budget, so a steady read that
 # starts waiting for the index fails the case instead of hiding in the first read's room.
 STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
+# One `settled_local` call resends a read until the local index preparation warning
+# clears, so it spans the startup snapshot's publication, the wait for the next poll, the
+# server's answer, and the client's own handling of that answer. Over 17 passing runs of
+# the `nextjs` workspace case the interval from the first `search` to the return from
+# `settled_local` was 44.79 to 59.12 seconds: publication of the startup snapshot 41.68 to
+# 52.72 seconds after the first call, up to 3.36 seconds until the next poll, a server
+# answer of 1.35 to 1.63 seconds, and 1.16 to 2.34 seconds of client handling. A bound of
+# 60 seconds left 0.88 seconds at the closest, and job 111716521102 crossed it by at most
+# 0.53 seconds with the server's answer already sent at 58.47 seconds. The bound is twice
+# the longest passing interval, 59.12 seconds, rounded up. Callers are the `workspace`
+# case of `bun`, `nextjs`, and `fastapi` (the `shallow` read only for `fastapi`) and the
+# `nextjs` `churn` case, with work budgets of 510, 690, and 210 seconds (the pinned
+# 540, 720, and 240 less CLEANUP_RESERVE_SECONDS). The bound stands inside the smallest,
+# `fastapi` at 210. Reads of one case run in sequence, so a case where every read ran
+# to this bound would reach its work budget first and fail there, naming the action.
+LOCAL_PREPARATION_SECONDS = 120.0
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
@@ -1011,12 +1027,15 @@ async def observed_state(
 
 
 async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
-    """Resend partial local reads within the existing corpus observation budget."""
+    """Resend partial local reads until local index preparation completes.
+
+    The wait is bounded by `LOCAL_PREPARATION_SECONDS`.
+    """
     return await read_settled_local(
         client,
         name,
         request,
-        seconds=OBSERVATION_SECONDS,
+        seconds=LOCAL_PREPARATION_SECONDS,
         poll_seconds=POLL_SECONDS,
     )
 
