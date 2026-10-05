@@ -199,7 +199,12 @@ impl ReadService {
                 span.record("outcome", "error");
             })?;
             let revisions = captured_revisions(&index);
-            let context = Arc::new(resolved_context(root, &source_policy, &dependencies)?);
+            let context = Arc::new(resolved_context(
+                root,
+                &source_policy,
+                &dependencies,
+                cancelled,
+            )?);
             span.record("files_count", index.file_count());
             span.record("text_files_count", index.text_file_count());
             span.record("left_out_count", index.left_out_file_count());
@@ -244,18 +249,21 @@ impl ReadService {
         }
     }
 
-    /// Reads dependency context through one compiled source policy.
+    /// Reads dependency context through one compiled source policy, checking `cancelled`
+    /// before each version probe and while each one runs.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] if the policy cannot list visible paths or dependency
-    /// resolution refuses its configured input.
+    /// Returns [`RiftError`] if the policy cannot list visible paths, dependency
+    /// resolution refuses its configured input, or the read is cancelled; a cancelled read
+    /// answers no context.
     pub fn dependency_context_for_policy(
         root: &Path,
         source_policy: &WorkspaceSourcePolicy,
         dependencies: &DependenciesConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<DependencyContext, RiftError> {
-        resolved_context(root, source_policy, dependencies)
+        resolved_context(root, source_policy, dependencies, cancelled)
     }
 
     /// Every file's digest this snapshot indexed, in project-path order.
@@ -443,6 +451,7 @@ impl ReadService {
                 root,
                 &source_policy,
                 &self.dependency_configuration,
+                cancelled,
             )?);
             span.record("files_count", index.file_count());
             span.record("tree_revision", revisions.wire_tree_revision());
@@ -504,7 +513,7 @@ impl ReadService {
                     span.record("outcome", "error");
                 })?;
             let revisions = captured_revisions(&index);
-            let context = self.context_after(source_policy, changes, &index)?;
+            let context = self.context_after(source_policy, changes, &index, cancelled)?;
             span.record("files_count", index.file_count());
             span.record("tree_revision", revisions.wire_tree_revision());
             span.record("outcome", "ok");
@@ -535,6 +544,7 @@ impl ReadService {
         source_policy: &WorkspaceSourcePolicy,
         changes: &PathChanges,
         index: &WorkspaceIndex,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Arc<DependencyContext>, RiftError> {
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
@@ -550,6 +560,7 @@ impl ReadService {
             self.index.root(),
             source_policy,
             &self.dependency_configuration,
+            cancelled,
         )?;
         Ok(Arc::new(context))
     }
@@ -1695,6 +1706,7 @@ fn resolved_context(
     root: &Path,
     source_policy: &WorkspaceSourcePolicy,
     configuration: &DependenciesConfiguration,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<DependencyContext, RiftError> {
     let visible: Vec<ProjectPath> = source_policy
         .visible_paths()?
@@ -1702,13 +1714,14 @@ fn resolved_context(
         .map(project_path)
         .collect();
     let libraries = standard_libraries(source_policy, &visible);
-    Ok(crate::dependency::read_workspace_context(
+    crate::dependency::read_workspace_context(
         root,
         &visible,
         &configuration.packages,
         crate::dependency::ResolutionPolicy::from(configuration),
         &libraries,
-    ))
+        cancelled,
+    )
 }
 
 /// The standard libraries the workspace's languages rely on: one per library whose
@@ -1903,7 +1916,6 @@ pub(crate) mod tests {
     use std::error::Error;
     use std::fs::{self, OpenOptions};
     use std::path::Path;
-    use std::process::Command;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
@@ -2043,8 +2055,10 @@ pub(crate) mod tests {
         };
 
         let policy = service.filesystem_policy("read the dependency context")?;
-        let kept = service.context_after(policy, &changed("src/lib.rs"), &service.index)?;
-        let reread = service.context_after(policy, &changed("Cargo.toml"), &service.index)?;
+        let kept =
+            service.context_after(policy, &changed("src/lib.rs"), &service.index, &|| false)?;
+        let reread =
+            service.context_after(policy, &changed("Cargo.toml"), &service.index, &|| false)?;
 
         assert!(
             std::sync::Arc::ptr_eq(&kept, &service.context),
@@ -5198,7 +5212,7 @@ pub fn compute() -> i32 {
         options: &[&str],
         arguments: &[&str],
     ) -> TestResult<String> {
-        let mut command = Command::new("git");
+        let mut command = crate::process::Command::new("git");
         command
             .current_dir(root)
             .env("GIT_CONFIG_GLOBAL", global_config)
@@ -5225,8 +5239,13 @@ pub fn compute() -> i32 {
         }
         command.args(arguments);
 
-        let run = crate::process::run_bounded(&mut command, GIT_TIMEOUT, GIT_CAPTURE_BYTES)?;
-        assert!(!run.timed_out, "git {arguments:?} exceeded {GIT_TIMEOUT:?}");
+        let run =
+            crate::process::run_bounded(&mut command, GIT_TIMEOUT, GIT_CAPTURE_BYTES, &|| false)?;
+        assert_eq!(
+            run.ending,
+            crate::process::RunEnding::Exited,
+            "git {arguments:?} exceeded {GIT_TIMEOUT:?}"
+        );
         assert!(
             !run.stdout.truncated && !run.stderr.truncated,
             "git {:?} output exceeded {GIT_CAPTURE_BYTES} bytes: stdout={:?}, stderr={:?}",

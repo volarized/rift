@@ -4,7 +4,6 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use rift_dependency::{
@@ -17,10 +16,16 @@ use rift_protocol::dependencies::{
 };
 use rift_protocol::read::ProjectPath;
 
-use crate::process::{BoundedRun, run_bounded};
+use rift_error::RiftError;
+use rift_error::errors;
+
+use crate::process::{BoundedRun, Command, RunEnding, run_bounded};
 
 /// The reason every probe is refused under `resolution = "static"`.
 const STATIC_RESOLUTION_REASON: &str = "resolution = static: toolchains are not run";
+
+/// The reason a probe is refused, or its child killed, once the caller cancelled the read.
+const CANCELLED_REASON: &str = "cancelled";
 
 /// How the inputs answer a version probe: whether one runs at all, and how long it may
 /// take. Read from the `[dependencies]` table's `resolution` and `command_timeout`.
@@ -49,19 +54,39 @@ impl Default for ResolutionPolicy {
 }
 
 /// The context inputs that answer from this machine: its files and its `PATH`.
-#[derive(Debug)]
-pub(crate) struct FilesystemInputs {
+pub(crate) struct FilesystemInputs<'cancel> {
     policy: ResolutionPolicy,
+    /// Returns true when the read that owns these inputs should stop: no probe starts
+    /// after it does, and a running probe's child is killed.
+    cancelled: &'cancel (dyn Fn() -> bool + Sync),
 }
 
-impl FilesystemInputs {
-    /// Inputs running the version probes under `policy`.
+impl FilesystemInputs<'static> {
+    /// Inputs running the version probes under `policy`, never cancelled.
     pub(crate) const fn new(policy: ResolutionPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            cancelled: &never_cancelled,
+        }
     }
 }
 
-impl StaticInputs for FilesystemInputs {
+impl<'cancel> FilesystemInputs<'cancel> {
+    /// Inputs running the version probes under `policy` until `cancelled` answers true.
+    pub(crate) const fn cancellable(
+        policy: ResolutionPolicy,
+        cancelled: &'cancel (dyn Fn() -> bool + Sync),
+    ) -> Self {
+        Self { policy, cancelled }
+    }
+}
+
+/// The cancellation of inputs no read cancels.
+const fn never_cancelled() -> bool {
+    false
+}
+
+impl StaticInputs for FilesystemInputs<'_> {
     /// The regular file at `path` when it fits `bytes_max`. A larger file
     /// answers its size, and anything else answers absent.
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
@@ -97,18 +122,21 @@ impl StaticInputs for FilesystemInputs {
     }
 }
 
-impl ContextInputs for FilesystemInputs {
+impl ContextInputs for FilesystemInputs<'_> {
     /// Runs the program from `PATH` under the policy's bounds.
     ///
-    /// The run is cut at the policy's `command_timeout` and its standard output
-    /// at [`TOOLCHAIN_OUTPUT_BYTES_MAX`]; the command's environment overlay wins over
-    /// the inherited value. A program spelled as a path, and every
-    /// program while the policy runs no toolchain, is refused before anything
-    /// spawns.
+    /// The run is cut at the policy's `command_timeout`, or once the inputs' cancellation
+    /// answers true, and its standard output at [`TOOLCHAIN_OUTPUT_BYTES_MAX`]; the
+    /// command's environment overlay wins over the inherited value. A program spelled as
+    /// a path, every program while the policy runs no toolchain, and every program once
+    /// the inputs are cancelled, is refused before anything spawns.
     fn run(&mut self, command: &ToolchainCommand) -> Result<CommandOutput, CommandFailure> {
         let program = command.program;
         if !self.policy.execution {
             return Err(failure(program, STATIC_RESOLUTION_REASON));
+        }
+        if (self.cancelled)() {
+            return Err(failure(program, CANCELLED_REASON));
         }
         if !is_bare_program(program) {
             return Err(failure(
@@ -124,8 +152,13 @@ impl ContextInputs for FilesystemInputs {
         for name in &command.environment_removed {
             process.env_remove(name);
         }
-        let run = run_recorded(program, &mut process, self.policy.command_timeout)
-            .map_err(|io| failure(program, format!("failed to launch: {io}")))?;
+        let run = run_recorded(
+            program,
+            &mut process,
+            self.policy.command_timeout,
+            self.cancelled,
+        )
+        .map_err(|io| failure(program, format!("failed to launch: {io}")))?;
         output_of(program, run, self.policy.command_timeout)
     }
 }
@@ -138,12 +171,14 @@ impl ContextInputs for FilesystemInputs {
 /// output streams piped, so the child inherits none of the server's standard streams.
 /// After the run the operation records the child's process identifier `pid`, its
 /// `exit_code` when the platform reports one, and an `outcome`: `ok` when the child
-/// exited, `timeout` when it was killed at `timeout`, `error` when it failed to spawn or
-/// could not be observed.
+/// exited, `timeout` when it was killed at `timeout`, `cancelled` when it was killed once
+/// `cancelled` answered true, `error` when it failed to spawn or could not be observed. A
+/// killed run records `error.type` beside its `outcome`, so its close prints `✗`.
 fn run_recorded(
     program: &str,
     process: &mut Command,
     timeout: Duration,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<BoundedRun> {
     let name = Path::new(program)
         .file_name()
@@ -160,7 +195,7 @@ fn run_recorded(
         outcome = rift_tracing::empty!(),
         {
             let span = rift_tracing::Span::current();
-            let run = run_bounded(process, timeout, toolchain_capture_bytes());
+            let run = run_bounded(process, timeout, toolchain_capture_bytes(), cancelled);
             record_probe(&span, &run);
             run
         }
@@ -175,9 +210,13 @@ fn record_probe(span: &rift_tracing::Span, run: &std::io::Result<BoundedRun>) {
     };
     span.record("pid", run.pid);
     match &run.exit {
-        _ if run.timed_out => {
+        _ if run.ending == RunEnding::TimedOut => {
             span.record("outcome", "timeout");
             span.record("error.type", "timeout");
+        }
+        _ if run.ending == RunEnding::Cancelled => {
+            span.record("outcome", "cancelled");
+            span.record("error.type", "cancelled");
         }
         Ok(exit) => {
             if let Some(code) = exit.code() {
@@ -212,7 +251,10 @@ fn output_of(
     timeout: Duration,
 ) -> Result<CommandOutput, CommandFailure> {
     let exit = match run.exit {
-        _ if run.timed_out => {
+        _ if run.ending == RunEnding::Cancelled => {
+            return Err(failure(program, CANCELLED_REASON));
+        }
+        _ if run.ending == RunEnding::TimedOut => {
             let seconds = timeout.as_secs();
             return Err(failure(
                 program,
@@ -245,21 +287,34 @@ fn failure(program: &str, reason: impl Into<String>) -> CommandFailure {
 /// The one program the pass runs is a standard library version probe, under `policy`'s
 /// `command_timeout` and only while `policy` allows execution. The span records the entry count and
 /// whether an input went unread, and each degradation is logged once as a warning.
+///
+/// `cancelled` is read before each probe spawns and while each probe runs: once it answers
+/// true, no further probe starts and the running one is killed. A read `cancelled` stopped
+/// answers the cancellation and no context, so a degraded context that only the
+/// cancellation degraded is never cached, published, or logged as degraded.
+///
+/// # Errors
+///
+/// Returns `rift.server.read_cancelled` once `cancelled` answered true.
 pub(crate) fn read_workspace_context(
     root: &Path,
     visible: &[ProjectPath],
     configured: &[ConfiguredPackage],
     policy: ResolutionPolicy,
     libraries: &[StandardLibrary],
-) -> DependencyContext {
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<DependencyContext, RiftError> {
     let span = rift_tracing::info_span!(
         "dependency.context",
         component = "dependency",
         entries = rift_tracing::empty!(),
         degraded = rift_tracing::empty!(),
     );
-    span.in_scope(|| -> DependencyContext {
-        let mut inputs = FilesystemInputs::new(policy);
+    span.in_scope(|| -> Result<DependencyContext, RiftError> {
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
+        let mut inputs = FilesystemInputs::cancellable(policy, cancelled);
         let mut context = rift_dependency::resolve_context(
             root,
             visible,
@@ -276,6 +331,9 @@ pub(crate) fn read_workspace_context(
             &request,
             &mut inputs,
         ));
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
         span.record("entries", context.entries().len());
         span.record("degraded", context.is_degraded());
         for degradation in context.degradations() {
@@ -286,7 +344,7 @@ pub(crate) fn read_workspace_context(
                 "dependency context degraded"
             );
         }
-        context
+        Ok(context)
     })
 }
 
@@ -307,7 +365,7 @@ mod tests {
         }
     }
 
-    fn inputs() -> FilesystemInputs {
+    fn inputs() -> FilesystemInputs<'static> {
         FilesystemInputs::new(ResolutionPolicy::default())
     }
 
@@ -530,6 +588,97 @@ mod tests {
         assert!(pid_of(&probes[0]) > 0, "{}", probes[0]);
     }
 
+    /// A cancellation the wait reads while the probe's child runs kills the child: the
+    /// probe answers the cancellation and its close records `outcome` and `error.type`
+    /// `cancelled`, the pair the close mark renders as `✗ cancelled`.
+    #[test]
+    fn test_probe_killed_at_cancellation_records_the_cancelled_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Reads that answer false: the one before the spawn and one wake of the wait.
+        const READS_BEFORE_CANCEL: usize = 2;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let reads = AtomicUsize::new(0);
+        let cancelled = || reads.fetch_add(1, Ordering::Relaxed) >= READS_BEFORE_CANCEL;
+        let mut inputs = FilesystemInputs::cancellable(ResolutionPolicy::default(), &cancelled);
+        let started = std::time::Instant::now();
+        let probes = probes_recorded(|| {
+            let probe = command("sleep", &["30"], directory.path());
+            let failure = inputs
+                .run(&probe)
+                .expect_err("a cancelled probe has no output");
+            assert_eq!(failure.reason, CANCELLED_REASON, "{failure}");
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the kill must not wait out the sleep: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert_eq!(probes[0]["program"], "sleep");
+        assert_eq!(probes[0]["outcome"], "cancelled");
+        assert_eq!(probes[0]["error.type"], "cancelled");
+        assert!(pid_of(&probes[0]) > 0, "{}", probes[0]);
+    }
+
+    /// Once the inputs are cancelled no probe spawns, and no probe operation opens.
+    #[test]
+    fn test_run_refuses_every_program_once_cancelled_before_spawning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let marker = directory.path().join("ran");
+        let touch = format!("touch {}", marker.display());
+        let mut inputs = FilesystemInputs::cancellable(ResolutionPolicy::default(), &|| true);
+        let probes = probes_recorded(|| {
+            let failure = inputs
+                .run(&command("sh", &["-c", &touch], directory.path()))
+                .expect_err("a cancelled read runs nothing");
+            assert_eq!(failure.reason, CANCELLED_REASON);
+        });
+        assert!(probes.is_empty(), "{probes:?}");
+        assert!(!marker.exists(), "the program must not have run");
+    }
+
+    /// A context read cancelled once it started answers the cancellation and no context:
+    /// every later probe is refused before it spawns, and no degradation the cancellation
+    /// caused is logged.
+    #[test]
+    fn test_context_read_cancelled_after_it_started_answers_no_context() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let visible = write_locked_project(directory.path());
+        let reads = AtomicUsize::new(0);
+        // The read's own first check passes; every later read answers true.
+        let cancelled = || reads.fetch_add(1, Ordering::Relaxed) >= 1;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let read = read_workspace_context(
+            directory.path(),
+            &visible,
+            &[],
+            ResolutionPolicy::default(),
+            &[StandardLibrary::Rust],
+            &cancelled,
+        );
+        drop(recorder);
+        let error = read.expect_err("a cancelled read answers no context");
+        assert_eq!(error.slug(), errors::server::read_cancelled::SLUG);
+        let records = drain.queued_records();
+        assert!(
+            records
+                .iter()
+                .all(|record| record.operation() != "dependency.probe"),
+            "no probe spawns once cancelled: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.message() != "dependency context degraded"),
+            "{records:?}"
+        );
+    }
+
     #[test]
     fn test_run_refuses_a_program_spelled_as_a_path_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -578,7 +727,7 @@ mod tests {
         let run = BoundedRun {
             pid: 0,
             exit: Ok(std::process::ExitStatus::from_raw(9)),
-            timed_out: true,
+            ending: RunEnding::TimedOut,
             stdout: rift_core::CapturedStream::default(),
             stderr: rift_core::CapturedStream::default(),
         };
@@ -595,7 +744,7 @@ mod tests {
         let run = BoundedRun {
             pid: 0,
             exit: Err(std::io::Error::other("lost the child")),
-            timed_out: false,
+            ending: RunEnding::Exited,
             stdout: rift_core::CapturedStream::default(),
             stderr: rift_core::CapturedStream::default(),
         };
@@ -692,7 +841,9 @@ mod tests {
                 StandardLibrary::Node,
                 StandardLibrary::Python,
             ],
-        );
+            &|| false,
+        )
+        .expect("nothing cancels the read");
 
         assert_eq!(snapshot(root), files_before);
         assert_eq!(installed_toolchains(), toolchains_before);
@@ -726,5 +877,67 @@ mod tests {
         );
         assert_eq!(selector("node"), Some((Some("22.3.0".to_owned()), None)));
         assert_eq!(selector("python"), Some((None, Some(">=0".to_owned()))));
+    }
+}
+
+/// Probe runs every platform makes, through the process runner's test-binary fixture.
+#[cfg(test)]
+mod fixture_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::process::fixture::{FIXTURE_SLEEP, held_pid, holding_command, kill_pid};
+
+    /// A cancellation that lands while the probe's child left a process holding both
+    /// output pipes: the probe still closes within the runner's bound, recording
+    /// `outcome` and `error.type` `cancelled`, and answers the cancellation.
+    #[test]
+    fn test_probe_cancelled_while_its_child_holds_the_pipes_records_the_cancellation() {
+        /// The runner's bound after a cancellation, plus the fixture's own start and
+        /// scheduling slack; far below the fixture's sleep.
+        const CANCEL_LATENCY_MAX: Duration = Duration::from_secs(10);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pid_file = directory.path().join("held.pid");
+        let fired = AtomicBool::new(false);
+        let cancelled = || {
+            if pid_file.exists() {
+                fired.store(true, Ordering::Relaxed);
+            }
+            fired.load(Ordering::Relaxed)
+        };
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let started = std::time::Instant::now();
+        let run = run_recorded(
+            "fixture",
+            &mut holding_command(&pid_file),
+            FIXTURE_SLEEP,
+            &cancelled,
+        )
+        .expect("the fixture launches");
+        let elapsed = started.elapsed();
+        drop(recorder);
+        if let Some(pid) = held_pid(&pid_file) {
+            kill_pid(pid);
+        }
+
+        assert!(
+            elapsed < CANCEL_LATENCY_MAX,
+            "the probe must not wait on the held pipes: {elapsed:?}"
+        );
+        let failure =
+            output_of("fixture", run, FIXTURE_SLEEP).expect_err("a cancelled probe has no output");
+        assert_eq!(failure.reason, CANCELLED_REASON, "{failure}");
+        let probes: Vec<serde_json::Value> = drain
+            .queued_records()
+            .iter()
+            .filter(|record| record.operation() == "dependency.probe")
+            .map(|record| serde_json::from_str(record.fields()).expect("fields are JSON"))
+            .filter(|fields: &serde_json::Value| fields["span"] == "closed")
+            .collect();
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert_eq!(probes[0]["outcome"], "cancelled");
+        assert_eq!(probes[0]["error.type"], "cancelled");
     }
 }

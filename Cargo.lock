@@ -4893,6 +4893,7 @@ dependencies = [
  "ty_python_core",
  "url",
  "which",
+ "windows-spawn",
 ]
 
 [[package]]

@@ -52,6 +52,11 @@ ty_python_core.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 
+# A dependency probe's child runs inside a Job object of its own, created with the child,
+# so a cancellation or a timeout ends every process the child started.
+[target.'cfg(windows)'.dependencies]
+windows-spawn.workspace = true
+
 [dev-dependencies]
 ignore.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }

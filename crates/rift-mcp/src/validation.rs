@@ -3607,6 +3607,7 @@ async fn publish_initial_empty(
             "initial index empty publication",
             cancellation,
             move |token| {
+                let cancelled = || token.is_cancelled();
                 let preparation_state = (total > 0).then(|| LocalIndexPreparation {
                     prepared: 0,
                     total: Some(total),
@@ -3622,6 +3623,7 @@ async fn publish_initial_empty(
                     &configuration,
                     preparation_state,
                     validation.observed_epoch(),
+                    &cancelled,
                 )?;
                 if token.is_cancelled() {
                     return errors::server::read_cancelled().fail();
@@ -3850,6 +3852,7 @@ fn prepare_initial_batch(
         &batch.configuration,
         candidate_state,
         batch.validation.observed_epoch(),
+        &cancelled,
     )?;
     let handoff = if batch.complete {
         batch
@@ -3868,6 +3871,13 @@ fn prepare_initial_batch(
     Ok((preparation, last, outcome))
 }
 
+/// Builds the publication of one preparation batch: the dependency context and every
+/// visible digest for the complete batch, the prepared counts alone for a partial one.
+///
+/// `cancelled` is read before the build starts, before and during each dependency version
+/// probe, and before the visible digests are read. A cancelled build answers
+/// `rift.server.read_cancelled` and builds nothing, so no context read under the
+/// cancellation is published.
 fn preparation_publication(
     root: &Path,
     index: rift_index::WorkspaceIndex,
@@ -3875,13 +3885,18 @@ fn preparation_publication(
     configuration: &ConfigurationState,
     preparation: Option<LocalIndexPreparation>,
     epoch: u64,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Arc<PublishedWorkspace>, RiftError> {
+    if cancelled() {
+        return errors::server::read_cancelled().fail();
+    }
     let context = match &preparation {
         Some(_) => DependencyContext::default(),
         None => ReadService::dependency_context_for_policy(
             root,
             &source_policy,
             &configuration.dependencies_configuration(),
+            cancelled,
         )?,
     };
     let reads = ReadService::from_prepared_index(
@@ -3897,6 +3912,9 @@ fn preparation_publication(
             refused: Arc::new(BTreeMap::new()),
         }
     } else {
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
         complete_visible_digests(root, &reads, &source_policy)?
     };
     let map = publication_map(&reads, preparation.as_ref());
@@ -8009,6 +8027,60 @@ pub(crate) mod tests {
                 let fields: serde_json::Value = serde_json::from_str(publications[0].fields())?;
                 assert_eq!(fields["trigger"], "startup");
             }
+        }
+        Ok(())
+    }
+
+    /// The complete batch's publication reads its cancellation at four points under a
+    /// static `[dependencies]` table: before it starts, as the dependency read starts,
+    /// after the version probes, and before the visible digests. A cancellation seen at
+    /// any of them answers `rift.server.read_cancelled` and builds no publication, so no
+    /// dependency context read under it is published.
+    #[tokio::test]
+    async fn complete_publication_answers_cancelled_at_each_of_its_checks() -> TestResult {
+        use std::sync::atomic::AtomicUsize;
+
+        /// The checks one uncancelled build reads.
+        const CHECKS: usize = 4;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            root.join("rift.toml"),
+            "[dependencies]\nresolution = \"static\"\n",
+        )?;
+        for cancelled_from in 0..=CHECKS {
+            let (context, _invalidations) = initial_preparation_context(root)?;
+            let initial = super::discover_initial_workspace(&context)
+                .await?
+                .ok_or("initial discovery was cancelled")?;
+            let index = initial.preparation.empty_snapshot()?;
+            let reads = AtomicUsize::new(0);
+            let cancelled = || reads.fetch_add(1, Ordering::Relaxed) >= cancelled_from;
+            let built = super::preparation_publication(
+                root,
+                index,
+                Arc::clone(&initial.source_policy),
+                &initial.configuration,
+                None,
+                0,
+                &cancelled,
+            );
+            if cancelled_from < CHECKS {
+                let error = built.err().ok_or("a cancelled build publishes nothing")?;
+                assert_eq!(
+                    error.slug(),
+                    errors::server::read_cancelled::SLUG,
+                    "cancelled from check {cancelled_from}"
+                );
+            } else {
+                assert!(built.is_ok(), "an uncancelled build completes");
+                assert_eq!(reads.load(Ordering::Relaxed), CHECKS);
+            }
+            assert!(
+                context.published.read().await.current.preparation.is_some(),
+                "the build itself publishes nothing"
+            );
         }
         Ok(())
     }
