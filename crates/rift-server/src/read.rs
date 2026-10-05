@@ -164,56 +164,57 @@ impl ReadService {
             cancelled,
             content_cache,
         } = build;
-        let span = tracing::info_span!(
+        let span = rift_tracing::info_span!(
             "index.build",
             component = "index",
-            files_count = tracing::field::Empty,
-            text_files_count = tracing::field::Empty,
-            left_out_count = tracing::field::Empty,
-            tree_revision = tracing::field::Empty,
-            outcome = tracing::field::Empty,
+            files_count = rift_tracing::empty!(),
+            text_files_count = rift_tracing::empty!(),
+            left_out_count = rift_tracing::empty!(),
+            tree_revision = rift_tracing::empty!(),
+            outcome = rift_tracing::empty!(),
         );
-        let _entered = span.enter();
-        let cache = content_cache.cloned().unwrap_or_default();
-        let index = WorkspaceIndex::build_with_languages_cancellable_and_cache(
-            root,
-            limits,
-            visibility,
-            text_inclusion,
-            languages,
-            &cache,
-            cancelled,
-        )
-        .inspect_err(|_| {
-            span.record("outcome", "error");
-        })?;
-        let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
-            root,
-            limits,
-            visibility,
-            text_inclusion,
-            languages,
-            cancelled,
-        )
-        .inspect_err(|_| {
-            span.record("outcome", "error");
-        })?;
-        let revisions = captured_revisions(&index);
-        let context = Arc::new(resolved_context(root, &source_policy, &dependencies)?);
-        span.record("files_count", index.file_count());
-        span.record("text_files_count", index.text_file_count());
-        span.record("left_out_count", index.left_out_file_count());
-        span.record("tree_revision", revisions.wire_tree_revision());
-        span.record("outcome", "ok");
-        Ok(Self {
-            index,
-            revisions,
-            revision: None,
-            history,
-            source_policy: Some(Arc::new(source_policy)),
-            context,
-            dependency_configuration: dependencies,
-            stored_history: OnceLock::new(),
+        span.in_scope(|| -> Result<Self, RiftError> {
+            let cache = content_cache.cloned().unwrap_or_default();
+            let index = WorkspaceIndex::build_with_languages_cancellable_and_cache(
+                root,
+                limits,
+                visibility,
+                text_inclusion,
+                languages,
+                &cache,
+                cancelled,
+            )
+            .inspect_err(|_| {
+                span.record("outcome", "error");
+            })?;
+            let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+                root,
+                limits,
+                visibility,
+                text_inclusion,
+                languages,
+                cancelled,
+            )
+            .inspect_err(|_| {
+                span.record("outcome", "error");
+            })?;
+            let revisions = captured_revisions(&index);
+            let context = Arc::new(resolved_context(root, &source_policy, &dependencies)?);
+            span.record("files_count", index.file_count());
+            span.record("text_files_count", index.text_file_count());
+            span.record("left_out_count", index.left_out_file_count());
+            span.record("tree_revision", revisions.wire_tree_revision());
+            span.record("outcome", "ok");
+            Ok(Self {
+                index,
+                revisions,
+                revision: None,
+                history,
+                source_policy: Some(Arc::new(source_policy)),
+                context,
+                dependency_configuration: dependencies,
+                stored_history: OnceLock::new(),
+            })
         })
     }
 
@@ -411,50 +412,51 @@ impl ReadService {
         languages: &LanguageFileSelections,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
-        let span = tracing::info_span!(
+        let span = rift_tracing::info_span!(
             "index.build",
             component = "index",
             mode = "rescan",
-            files_count = tracing::field::Empty,
-            tree_revision = tracing::field::Empty,
-            outcome = tracing::field::Empty,
+            files_count = rift_tracing::empty!(),
+            tree_revision = rift_tracing::empty!(),
+            outcome = rift_tracing::empty!(),
         );
-        let _entered = span.enter();
-        let built = self
-            .index
-            .rescanned_cancellable(visibility, cancelled)
-            .and_then(|index| {
-                let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
-                    root,
-                    self.index.limits(),
-                    visibility,
-                    text_inclusion,
-                    languages,
-                    cancelled,
-                )?;
-                Ok((index, source_policy))
-            });
-        let (index, source_policy) = built.inspect_err(|_| {
-            span.record("outcome", "error");
-        })?;
-        let revisions = captured_revisions(&index);
-        let context = Arc::new(resolved_context(
-            root,
-            &source_policy,
-            &self.dependency_configuration,
-        )?);
-        span.record("files_count", index.file_count());
-        span.record("tree_revision", revisions.wire_tree_revision());
-        span.record("outcome", "ok");
-        Ok(Self {
-            index,
-            revisions,
-            revision: self.revision.clone(),
-            history: self.history.clone(),
-            source_policy: Some(Arc::new(source_policy)),
-            context,
-            dependency_configuration: self.dependency_configuration.clone(),
-            stored_history: self.carried_history(),
+        span.in_scope(|| -> Result<Self, RiftError> {
+            let built = self
+                .index
+                .rescanned_cancellable(visibility, cancelled)
+                .and_then(|index| {
+                    let source_policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+                        root,
+                        self.index.limits(),
+                        visibility,
+                        text_inclusion,
+                        languages,
+                        cancelled,
+                    )?;
+                    Ok((index, source_policy))
+                });
+            let (index, source_policy) = built.inspect_err(|_| {
+                span.record("outcome", "error");
+            })?;
+            let revisions = captured_revisions(&index);
+            let context = Arc::new(resolved_context(
+                root,
+                &source_policy,
+                &self.dependency_configuration,
+            )?);
+            span.record("files_count", index.file_count());
+            span.record("tree_revision", revisions.wire_tree_revision());
+            span.record("outcome", "ok");
+            Ok(Self {
+                index,
+                revisions,
+                revision: self.revision.clone(),
+                history: self.history.clone(),
+                source_policy: Some(Arc::new(source_policy)),
+                context,
+                dependency_configuration: self.dependency_configuration.clone(),
+                stored_history: self.carried_history(),
+            })
         })
     }
 
@@ -486,35 +488,36 @@ impl ReadService {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
         let source_policy = self.filesystem_policy("incremental rebuild")?;
-        let span = tracing::info_span!(
+        let span = rift_tracing::info_span!(
             "index.build",
             component = "index",
             changed_count = changes.len(),
-            files_count = tracing::field::Empty,
-            tree_revision = tracing::field::Empty,
-            outcome = tracing::field::Empty,
+            files_count = rift_tracing::empty!(),
+            tree_revision = rift_tracing::empty!(),
+            outcome = rift_tracing::empty!(),
         );
-        let _entered = span.enter();
-        let index = self
-            .index
-            .rebuilt_cancellable(changes, cancelled)
-            .inspect_err(|_| {
-                span.record("outcome", "error");
-            })?;
-        let revisions = captured_revisions(&index);
-        let context = self.context_after(source_policy, changes, &index)?;
-        span.record("files_count", index.file_count());
-        span.record("tree_revision", revisions.wire_tree_revision());
-        span.record("outcome", "ok");
-        Ok(Self {
-            index,
-            revisions,
-            revision: self.revision.clone(),
-            history: self.history.clone(),
-            source_policy: self.source_policy.clone(),
-            context,
-            dependency_configuration: self.dependency_configuration.clone(),
-            stored_history: self.carried_history(),
+        span.in_scope(|| -> Result<Self, RiftError> {
+            let index = self
+                .index
+                .rebuilt_cancellable(changes, cancelled)
+                .inspect_err(|_| {
+                    span.record("outcome", "error");
+                })?;
+            let revisions = captured_revisions(&index);
+            let context = self.context_after(source_policy, changes, &index)?;
+            span.record("files_count", index.file_count());
+            span.record("tree_revision", revisions.wire_tree_revision());
+            span.record("outcome", "ok");
+            Ok(Self {
+                index,
+                revisions,
+                revision: self.revision.clone(),
+                history: self.history.clone(),
+                source_policy: self.source_policy.clone(),
+                context,
+                dependency_configuration: self.dependency_configuration.clone(),
+                stored_history: self.carried_history(),
+            })
         })
     }
 

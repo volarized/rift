@@ -97,7 +97,7 @@ impl ReadService {
         let stored = self.commit_store()?;
         let reads = stored.connect()?;
         let results_max = self.index().results_max();
-        let matched = rift_core::traced!(component = "search", operation = "search.commits", {
+        let matched = rift_tracing::traced!(component = "search", operation = "search.commits", {
             matched_commits(&reads, &parsed, results_max)
         })?;
         let (ids, pagination) = page(matched.ids, params.page_index, limit);

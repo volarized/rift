@@ -352,7 +352,7 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<Option<rift_ranking::Pattern>, RiftError> {
-        rift_core::traced!(component = "search", operation = "search.validate", {
+        rift_tracing::traced!(component = "search", operation = "search.validate", {
             references.validate_revision(self)?;
             validate_search(params)
         })?;
@@ -365,17 +365,17 @@ impl ReadService {
         target: SearchParamsTarget,
         references: &EngineReferences,
     ) -> Vec<ReadWarning> {
-        let _span = tracing::info_span!(
-            "search.initial_warnings",
+        rift_tracing::traced!(
             component = "search",
-            operation = "search.initial_warnings"
+            operation = "search.initial_warnings",
+            {
+                let mut warnings = self.warnings();
+                warnings.extend(selected.warnings());
+                warnings.extend(self.documentation_warnings(target));
+                warnings.extend(references.warnings());
+                warnings
+            }
         )
-        .entered();
-        let mut warnings = self.warnings();
-        warnings.extend(selected.warnings());
-        warnings.extend(self.documentation_warnings(target));
-        warnings.extend(references.warnings());
-        warnings
     }
 
     fn documentation_warnings(&self, target: SearchParamsTarget) -> Vec<ReadWarning> {
@@ -439,33 +439,29 @@ impl ReadService {
     /// Returns [`RiftError`] for an invalid glob, or a `force_include` matching more
     /// files than `FORCE_INCLUDE_FILES_MAX`.
     fn selected_paths(&self, selector: Option<&PathSelector>) -> Result<SelectedPaths, RiftError> {
-        let _span = tracing::info_span!(
-            "search.selected_paths",
-            component = "search",
-            operation = "search.selected_paths"
-        )
-        .entered();
-        let index = self.index();
-        let matcher = path_matcher(index.root(), selector)?;
-        let lockfiles = selected_lockfiles(index, selector, matcher.as_ref());
-        let skipped = index
-            .skipped_paths()
-            .filter(|path| includes(matcher.as_ref(), index.root(), path))
-            .count();
-        let force_include = match selector {
-            Some(selector) if !selector.force_include.is_empty() => {
-                Some(index.force_include_index(
-                    &pattern_strings(&selector.force_include),
-                    FORCE_INCLUDE_FILES_MAX,
-                )?)
-            }
-            _ => None,
-        };
-        Ok(SelectedPaths {
-            matcher,
-            force_include,
-            lockfiles,
-            skipped,
+        rift_tracing::traced!(component = "search", operation = "search.selected_paths", {
+            let index = self.index();
+            let matcher = path_matcher(index.root(), selector)?;
+            let lockfiles = selected_lockfiles(index, selector, matcher.as_ref());
+            let skipped = index
+                .skipped_paths()
+                .filter(|path| includes(matcher.as_ref(), index.root(), path))
+                .count();
+            let force_include = match selector {
+                Some(selector) if !selector.force_include.is_empty() => {
+                    Some(index.force_include_index(
+                        &pattern_strings(&selector.force_include),
+                        FORCE_INCLUDE_FILES_MAX,
+                    )?)
+                }
+                _ => None,
+            };
+            Ok(SelectedPaths {
+                matcher,
+                force_include,
+                lockfiles,
+                skipped,
+            })
         })
     }
 
@@ -488,86 +484,82 @@ impl ReadService {
         (query, store): (&ParsedQuery, &StoreAnswer),
         (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
     ) -> Result<Option<usize>, RiftError> {
-        let _span = tracing::info_span!(
-            "search.query_hits",
-            component = "search",
-            operation = "search.query_hits"
-        )
-        .entered();
-        let index = self.index();
-        let root = index.root();
-        let matcher = selected.matcher.as_ref();
-        let fetch_limit = index.results_max();
-        let sources = IdentifierSources {
-            project: scope != SearchScope::Global,
-            force_include: (scope != SearchScope::Global)
-                .then_some(selected.force_include.as_ref())
-                .flatten(),
-        };
-        let resolution = Resolution {
-            force_include: sources.force_include,
-        };
-        let documentation = matches!(
-            criteria.target,
-            SearchParamsTarget::Documentation | SearchParamsTarget::All
-        )
-        .then(|| {
-            rift_core::traced!(
-                component = "search",
-                operation = "search.documentation_projection",
-                { SearchDocumentation::new(index, scope, resolution) }
+        rift_tracing::traced!(component = "search", operation = "search.query_hits", {
+            let index = self.index();
+            let root = index.root();
+            let matcher = selected.matcher.as_ref();
+            let fetch_limit = index.results_max();
+            let sources = IdentifierSources {
+                project: scope != SearchScope::Global,
+                force_include: (scope != SearchScope::Global)
+                    .then_some(selected.force_include.as_ref())
+                    .flatten(),
+            };
+            let resolution = Resolution {
+                force_include: sources.force_include,
+            };
+            let documentation = matches!(
+                criteria.target,
+                SearchParamsTarget::Documentation | SearchParamsTarget::All
             )
-        });
-        if let Some(documentation) = &documentation {
-            warnings.extend(documentation.warnings().iter().cloned());
-        }
-        let body = BodyMatching::for_request(criteria.target, store, query);
-        let screen = CandidateScreen {
-            index,
-            matcher,
-            root,
-            target: criteria.target,
-            resolution,
-            documentation: documentation.as_ref(),
-            body: body.as_ref(),
-        };
-        let mut inputs = vec![rift_core::traced!(
-            component = "search",
-            operation = "search.identifier_ranking",
-            { identifier_input(index, matcher, root, query, sources, fetch_limit) }
-        )?];
-        inputs.extend(store.precise().iter().cloned());
-        let screened = screen.projected(&inputs, query, QueryPhase::Precise)?;
-        let mut ranked = rift_core::traced!(
-            component = "search",
-            operation = "search.fusion",
-            phase = "precise",
-            { fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit) }
-        );
-        // The widened inputs join only when the precise phase came up short: a full pool
-        // leaves no slot a broad match could take.
-        if ranked.len() < fetch_limit {
-            let screened = screen.projected(store.broad(), query, QueryPhase::Broad)?;
-            let broad = rift_core::traced!(
+            .then(|| {
+                rift_tracing::traced!(
+                    component = "search",
+                    operation = "search.documentation_projection",
+                    { SearchDocumentation::new(index, scope, resolution) }
+                )
+            });
+            if let Some(documentation) = &documentation {
+                warnings.extend(documentation.warnings().iter().cloned());
+            }
+            let body = BodyMatching::for_request(criteria.target, store, query);
+            let screen = CandidateScreen {
+                index,
+                matcher,
+                root,
+                target: criteria.target,
+                resolution,
+                documentation: documentation.as_ref(),
+                body: body.as_ref(),
+            };
+            let mut inputs = vec![rift_tracing::traced!(
+                component = "search",
+                operation = "search.identifier_ranking",
+                { identifier_input(index, matcher, root, query, sources, fetch_limit) }
+            )?];
+            inputs.extend(store.precise().iter().cloned());
+            let screened = screen.projected(&inputs, query, QueryPhase::Precise)?;
+            let mut ranked = rift_tracing::traced!(
                 component = "search",
                 operation = "search.fusion",
-                phase = "broad",
-                { fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit) }
+                phase = "precise",
+                { fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit) }
             );
-            ranked.append_phase(broad, fetch_limit);
-        }
-        let ranked = screen.with_body_matches(ranked, fetch_limit);
-        rift_core::traced!(component = "search", operation = "search.hit_resolution", {
-            resolve_ranked_hits(
-                index,
-                criteria,
-                resolution,
-                documentation.as_ref(),
-                &ranked,
-                results,
-            )
-        })?;
-        Ok(ranked.truncated_at())
+            // The widened inputs join only when the precise phase came up short: a full pool
+            // leaves no slot a broad match could take.
+            if ranked.len() < fetch_limit {
+                let screened = screen.projected(store.broad(), query, QueryPhase::Broad)?;
+                let broad = rift_tracing::traced!(
+                    component = "search",
+                    operation = "search.fusion",
+                    phase = "broad",
+                    { fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit) }
+                );
+                ranked.append_phase(broad, fetch_limit);
+            }
+            let ranked = screen.with_body_matches(ranked, fetch_limit);
+            rift_tracing::traced!(component = "search", operation = "search.hit_resolution", {
+                resolve_ranked_hits(
+                    index,
+                    criteria,
+                    resolution,
+                    documentation.as_ref(),
+                    &ranked,
+                    results,
+                )
+            })?;
+            Ok(ranked.truncated_at())
+        })
     }
 
     /// Derives the lexical write one change set owes: the paths whose stored units go, and
@@ -1089,24 +1081,27 @@ impl CandidateScreen<'_> {
         query: &ParsedQuery,
         phase: QueryPhase,
     ) -> Result<Vec<RankingInput>, RiftError> {
-        let _span = tracing::info_span!(
-            "search.projected",
+        rift_tracing::traced!(
             component = "search",
             operation = "search.projected",
-            phase = phase.label()
-        )
-        .entered();
-        let screened = rift_core::traced!(component = "search", operation = "search.screened", {
-            self.screened(inputs)
-        });
-        rift_core::traced!(
-            component = "search",
-            operation = "search.documentation_project",
+            phase = phase.label(),
             {
-                match self.documentation {
-                    Some(documentation) => documentation.project(&screened, self.target, query),
-                    None => Ok(screened),
-                }
+                let screened =
+                    rift_tracing::traced!(component = "search", operation = "search.screened", {
+                        self.screened(inputs)
+                    });
+                rift_tracing::traced!(
+                    component = "search",
+                    operation = "search.documentation_project",
+                    {
+                        match self.documentation {
+                            Some(documentation) => {
+                                documentation.project(&screened, self.target, query)
+                            }
+                            None => Ok(screened),
+                        }
+                    }
+                )
             }
         )
     }
@@ -1460,38 +1455,35 @@ fn populate_symbol_lines(
     index: &WorkspaceIndex,
     force_include: Option<&WorkspaceIndex>,
 ) -> Result<(), RiftError> {
-    let _span = tracing::info_span!(
-        "search.symbol_lines",
-        component = "search",
-        operation = "search.symbol_lines"
-    )
-    .entered();
-    for hit in results {
-        // A package declaration a walk reached carries its unit and no local bytes.
-        let local_symbol = matches!(hit.hit, SearchHitTarget::Symbol { .. }) && hit.unit.is_none();
-        if hit.line.is_some() || !local_symbol {
-            continue;
+    rift_tracing::traced!(component = "search", operation = "search.symbol_lines", {
+        for hit in results {
+            // A package declaration a walk reached carries its unit and no local bytes.
+            let local_symbol =
+                matches!(hit.hit, SearchHitTarget::Symbol { .. }) && hit.unit.is_none();
+            if hit.line.is_some() || !local_symbol {
+                continue;
+            }
+            let (Some(path), Some(range)) = (hit.path.as_ref(), hit.range.as_ref()) else {
+                unreachable!(
+                    "a deferred project symbol carries its path and range: has_path={}, has_range={}",
+                    hit.path.is_some(),
+                    hit.range.is_some()
+                );
+            };
+            let path = ProjectPath::new(path.0.clone()).map_err(|error| {
+                errors::server::read_invalid()
+                    .field("path")
+                    .violation(error.to_string())
+                    .error()
+            })?;
+            let file = index
+                .file(&path)
+                .or_else(|| force_include.and_then(|extra| extra.file(&path)))
+                .ok_or_else(|| errors::server::read_not_found().path(path.as_str()).error())?;
+            hit.line = Some(line::line_number_at(file.source(), range.start));
         }
-        let (Some(path), Some(range)) = (hit.path.as_ref(), hit.range.as_ref()) else {
-            unreachable!(
-                "a deferred project symbol carries its path and range: has_path={}, has_range={}",
-                hit.path.is_some(),
-                hit.range.is_some()
-            );
-        };
-        let path = ProjectPath::new(path.0.clone()).map_err(|error| {
-            errors::server::read_invalid()
-                .field("path")
-                .violation(error.to_string())
-                .error()
-        })?;
-        let file = index
-            .file(&path)
-            .or_else(|| force_include.and_then(|extra| extra.file(&path)))
-            .ok_or_else(|| errors::server::read_not_found().path(path.as_str()).error())?;
-        hit.line = Some(line::line_number_at(file.source(), range.start));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Builds one syntax-indexed file's hit: the whole file as the target, positioned at the
@@ -1655,14 +1647,10 @@ fn order_and_bound_hits(
     order: ResultOrder,
     results_max: usize,
 ) -> Option<usize> {
-    let _span = tracing::info_span!(
-        "search.order",
-        component = "search",
-        operation = "search.order"
-    )
-    .entered();
-    order_hits(results, order);
-    bound_hits(results, results_max)
+    rift_tracing::traced!(component = "search", operation = "search.order", {
+        order_hits(results, order);
+        bound_hits(results, results_max)
+    })
 }
 
 /// Cuts an ordered hit set to the server's result bound, answering the bound when the set

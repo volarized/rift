@@ -184,7 +184,7 @@ impl<'current> ComparedRevisions<'current> {
         };
         let head = repository.resolve(&head.0)?;
         let changed =
-            rift_core::traced!(component = "search", operation = "search.change_paths", {
+            rift_tracing::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_files(&base, &head, &compared, paths_max)
             })?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
@@ -201,11 +201,11 @@ impl<'current> ComparedRevisions<'current> {
             )
         };
         let base_index =
-            rift_core::traced!(component = "search", operation = "search.change_base", {
+            rift_tracing::traced!(component = "search", operation = "search.change_base", {
                 index_side(&base)
             })?;
         let head_index =
-            rift_core::traced!(component = "search", operation = "search.change_head", {
+            rift_tracing::traced!(component = "search", operation = "search.change_head", {
                 index_side(&head)
             })?;
         Ok(Self {
@@ -251,14 +251,14 @@ impl<'current> ComparedRevisions<'current> {
             |path: &str| (served.contains(path) || !root.join(path).exists()) && compared(path);
         let paths_max = usize::try_from(SEARCH_CHANGE_PATHS_MAX).unwrap_or(usize::MAX);
         let changed =
-            rift_core::traced!(component = "search", operation = "search.change_paths", {
+            rift_tracing::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_working_files(base, &served_paths, &listed, paths_max)
             })?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let mut forms = repository.working_forms()?;
         let mut unconverted: BTreeMap<String, Unconverted> = BTreeMap::new();
         let base_index =
-            rift_core::traced!(component = "search", operation = "search.change_base", {
+            rift_tracing::traced!(component = "search", operation = "search.change_base", {
                 WorkspaceIndex::at_revision_with_blob_reader(
                     repository,
                     base,

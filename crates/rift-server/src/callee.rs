@@ -240,7 +240,7 @@ fn registry_sources(cargo_home: Option<&Path>) -> Vec<PathBuf> {
     folders.sort();
     let listed = folders.len();
     if listed > REGISTRY_SOURCES_MAX {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "engine",
             folders = listed,
             bound = REGISTRY_SOURCES_MAX,

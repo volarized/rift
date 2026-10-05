@@ -434,7 +434,7 @@ impl HistoryAnalysis {
         }
         record.paths = changed.blobs().iter().map(changed_path).collect();
         record.renames =
-            rift_core::traced!(component = "history", operation = "history.renames", {
+            rift_tracing::traced!(component = "history", operation = "history.renames", {
                 ChangedPath::pure_renames(&record.paths)
             });
         let renamed: HashSet<&str> = record
@@ -463,7 +463,7 @@ impl HistoryAnalysis {
             .count();
         if deletions <= self.move_deletions_max {
             record.moves =
-                rift_core::traced!(component = "history", operation = "history.moves", {
+                rift_tracing::traced!(component = "history", operation = "history.moves", {
                     candidates.pair(&mut declarations)
                 });
         }

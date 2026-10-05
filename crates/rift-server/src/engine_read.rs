@@ -453,7 +453,7 @@ async fn extend_references(
         references.incoming.insert(identity, edges);
     }
     if !references.unconfirmed.is_empty() {
-        tracing::info!(
+        rift_tracing::info!(
             component = "engine",
             unconfirmed = ?references.unconfirmed,
             "incoming walk took unconfirmed answers"
@@ -656,7 +656,7 @@ async fn extend_callees(
         references.package_callees.extend(held);
     }
     if !references.unconfirmed.is_empty() || references.dropped_callees > 0 {
-        tracing::info!(
+        rift_tracing::info!(
             component = "engine",
             unconfirmed = ?references.unconfirmed,
             dropped_callees = references.dropped_callees,
@@ -977,7 +977,7 @@ impl ReferenceTarget {
             let path = path.clone();
             Box::pin(async move {
                 if let Err(error) = session.close(&path).await {
-                    tracing::warn!(
+                    rift_tracing::warn!(
                         component = "engine",
                         operation = "textDocument/didClose",
                         %error,

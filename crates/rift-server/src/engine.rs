@@ -262,7 +262,7 @@ impl EnginePool {
         }
         while let Some(ended) = ending.join_next().await {
             if let Err(error) = ended {
-                tracing::warn!(component = "engine", %error, "an engine shutdown task failed");
+                rift_tracing::warn!(component = "engine", %error, "an engine shutdown task failed");
             }
         }
     }
@@ -783,7 +783,7 @@ impl EngineSlot {
         let stderr = session.shutdown().await;
         self.report_state(LspState::Stopped);
         let engine = self.name();
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "engine",
             engine,
             stderr_bytes = stderr.total_bytes,
@@ -1245,7 +1245,7 @@ impl EngineSlot {
             Transient::Refused(refusal)
                 if walk && refusal.slug() == errors::lsp::engine_refused_retryable::SLUG =>
             {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1255,7 +1255,7 @@ impl EngineSlot {
                 errors::lsp::engine_analyzing().attempts(attempts).fail()
             }
             Transient::Analyzing | Transient::Unready => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1264,7 +1264,7 @@ impl EngineSlot {
                 errors::lsp::engine_analyzing().attempts(attempts).fail()
             }
             Transient::Refused(refusal) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1273,7 +1273,7 @@ impl EngineSlot {
                 Err(refusal)
             }
             Transient::AnsweredNothing(answer) => {
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1324,7 +1324,7 @@ impl EngineSlot {
                     .as_ref()
                     .map_or_else(String::new, ToString::to_string);
                 let cause = reported.as_ref().map_or_else(String::new, start_cause);
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     program = self.program(),
@@ -1412,7 +1412,7 @@ impl EngineSlot {
     /// `launch_failed` and left the workspace log holding nothing that says
     /// which program was missing.
     fn record_start_failure(&self, failure: &RiftError, retrying: bool) {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "engine",
             engine = self.name(),
             program = self.program(),
@@ -1498,14 +1498,14 @@ impl EngineSlot {
         let stderr = replaced.shutdown().await;
         let engine = self.name();
         if ended {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "engine",
                 engine,
                 stderr = %stderr.text,
                 "language engine ended and was reaped"
             );
         } else {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "engine",
                 engine,
                 owed_changes_max = OWED_CHANGES_MAX,
