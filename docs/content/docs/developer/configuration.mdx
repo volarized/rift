@@ -141,6 +141,7 @@ agent meets can be explained without an operator reading the server's terminal:
 retention_records = 50000
 page_records = 500
 capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
+sample_interval = "1s"
 ```
 
 - `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
@@ -149,6 +150,9 @@ capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
 - `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
   `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
   excludes never reaches the store, whatever the terminal shows
+- `sample_interval` is how often the server samples its own process, 200ms to 1h: resident and
+  virtual memory, CPU time and usage, open files, and bytes read and written. CPU usage is the
+  CPU time spent between two samples, so the first sample after a start carries none
 
 The server reads this table at startup, so a change applies on the next start. The records
 outlive the process that wrote them. The metrics database is a file apart from the search
