@@ -3361,6 +3361,7 @@ impl RiftMcp {
                 detail = detail.as_str(),
                 "a request spent its whole readiness budget"
             );
+            rift_tracing::publish_in_flight("readiness_timeout");
             return errors::server::read_unavailable()
                 .operation("current workspace read")
                 .detail(detail)
@@ -9338,6 +9339,7 @@ done
             "request capture requested a rebuild",
             "request waiting for publication",
             "a request spent its whole readiness budget",
+            "operations in flight",
         ] {
             assert!(
                 records.iter().any(|record| record.message() == event),

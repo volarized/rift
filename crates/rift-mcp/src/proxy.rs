@@ -453,6 +453,7 @@ impl RiftProxy {
                     "the workspace server did not answer a forwarded request within its budget; \
                      the request is cancelled"
                 );
+                rift_tracing::publish_in_flight("forward budget");
                 errors::mcp::forward_unanswered()
                     .waited(budget)
                     .mcp()
@@ -2176,6 +2177,7 @@ mod tests {
     /// refusal is one the caller can retry.
     #[tokio::test(start_paused = true)]
     async fn a_forward_the_server_never_answers_refuses_at_its_budget() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         std::fs::write(
             directory.path().join("rift.toml"),
@@ -2193,9 +2195,13 @@ mod tests {
         }
 
         let started = tokio::time::Instant::now();
-        let forward = proxy.forward(super::list_tools_request(None), |result| match result {
-            ServerResult::ListToolsResult(result) => Some(result),
-            _ => None,
+        let forward = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            proxy
+                .forward(super::list_tools_request(None), |result| match result {
+                    ServerResult::ListToolsResult(result) => Some(result),
+                    _ => None,
+                })
+                .await
         });
         let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
             .await
@@ -2216,6 +2222,24 @@ mod tests {
             refusal.message.contains("did not answer"),
             "{}",
             refusal.message
+        );
+        drop(recorder);
+        let records = drain.queued_records();
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the budget's end published the operations in flight")?;
+        let table: serde_json::Value = serde_json::from_str(table.fields())?;
+        assert_eq!(table["reason"], "forward budget", "{table}");
+        let listed: serde_json::Value =
+            serde_json::from_str(table["operations"].as_str().ok_or("operations")?)?;
+        assert!(
+            listed
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["operation"] == "tools/call"),
+            "{table}"
         );
 
         // The silent server received the request, then its cancellation, both naming
