@@ -9,15 +9,17 @@
 use std::fmt;
 use std::io::IsTerminal as _;
 
+use tracing::Subscriber;
 use tracing::subscriber::Interest;
 use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter, ParseError};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::{Filter, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{EnvFilter, Layer as _};
+use tracing_subscriber::{EnvFilter, Layer};
 
-use crate::capture::log_capture;
+use crate::capture::{LogSink, log_capture};
 use crate::drain::LogDrain;
 use crate::otlp;
 use crate::stderr::BoundedStderr;
@@ -78,9 +80,20 @@ impl std::error::Error for LogFilterError {
 /// Returns [`LogFilterError`] when `filter` is not a list of `target=level` directives
 /// `tracing` accepts.
 pub fn validate_log_filter(filter: &str) -> Result<(), LogFilterError> {
-    EnvFilter::try_new(filter)
-        .map(|_| ())
-        .map_err(LogFilterError)
+    parsed_filter(filter).map(|_| ())
+}
+
+/// `filter` parsed in the `RUST_LOG` spelling.
+pub(crate) fn parsed_filter(filter: &str) -> Result<EnvFilter, LogFilterError> {
+    EnvFilter::try_new(filter).map_err(LogFilterError)
+}
+
+/// The capture layer: `sink` under `filter`, asked at every span and event.
+pub(crate) fn capture_layer<S>(sink: LogSink, filter: EnvFilter) -> impl Layer<S>
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    sink.with_filter(reevaluated(filter))
 }
 
 /// The installed subscriber's handle, held until the process stops tracing.
@@ -147,9 +160,9 @@ impl TracingRuntimeBuilder {
         let (sink, drain) = match self.capture {
             Some(capture) => {
                 let (sink, drain) = log_capture();
-                let filter = EnvFilter::try_new(capture)
+                let filter = parsed_filter(&capture)
                     .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
-                (Some(sink.with_filter(reevaluated(filter))), Some(drain))
+                (Some(capture_layer(sink, filter)), Some(drain))
             }
             None => (None, None),
         };

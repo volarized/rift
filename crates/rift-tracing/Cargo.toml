@@ -8,6 +8,9 @@ publish.workspace = true
 description = "The metrics database and the instrumentation Rift crates emit through"
 
 [features]
+# The scoped recorder for dependent crates' tests; never a production feature. Enable it
+# from `[dev-dependencies]` only, so a release build carries no recorder.
+fixtures = []
 # Off by default so a release artifact carries no OpenTelemetry export stack. With it
 # compiled in, `TracingRuntimeBuilder::install` still installs no exporter until an operator
 # sets `OTEL_EXPORTER_OTLP_ENDPOINT`.
