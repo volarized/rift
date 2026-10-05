@@ -109,6 +109,9 @@ EXPECTED_EDGES = {
     "rift-syntax -> rift-provider",
     "rift-syntax -> rift-tracing",
     "rift-tracing -> rift-error",
+    "rift-tracing -> rift-tracing-macros",
+    # Development edge only: the attribute's suite compiles against rift-tracing renamed.
+    "rift-tracing-macros -> rift-tracing",
 }
 
 
