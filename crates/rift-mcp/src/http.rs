@@ -2120,4 +2120,105 @@ mod tests {
         drop(migration_lock);
         Ok(())
     }
+
+    /// A stop failure of the index database lands in the metrics database: another
+    /// connection holds the write lock on `.rift/index` while a lexical write waits on it
+    /// past the index close, so the close's checkpoint and worker stop outlast their
+    /// deadline, and the drain's final flush writes their `database.close` records to
+    /// `.rift/metrics`.
+    ///
+    /// The close starts only once the lexical write holds the write turn: its
+    /// `lexical.write_turn` span has ended, so its transaction start is waiting on the
+    /// held lock, and the checkpoint cannot take the turn before that lock is released.
+    #[tokio::test]
+    async fn an_index_close_behind_a_held_write_lock_is_recorded_in_the_metrics_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rift_index::{
+            DatabaseName, DatabasePool, LazyDatabase, LexicalIndexLimits, LexicalSearchIndex,
+            WorkspaceDatabase,
+        };
+
+        /// Failure bound on one wait in this case; never a way to order two events.
+        const STEP_MAX: Duration = Duration::from_secs(10);
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir_all(&state_directory)?;
+        let metrics_path = state_directory.join("metrics");
+        let store = Arc::new(rift_tracing::LogStore::open(&metrics_path, None).await?);
+        let (recorder, drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let running = rift_tracing::RunningLogDrain::spawn(drain, Arc::clone(&store), 1_000);
+        let index_path = DatabaseName::Index.path(&state_directory);
+        let database = WorkspaceDatabase::open(
+            &index_path,
+            DatabaseName::Index,
+            DatabasePool::new(4, 30_000),
+        )
+        .await?;
+        let holder = rusqlite::Connection::open(&index_path)?;
+        holder.execute_batch("BEGIN IMMEDIATE")?;
+        let lexical =
+            LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
+        let writing = tokio::spawn(async move { lexical.replace_all(&[], "held").await });
+        tokio::time::timeout(STEP_MAX, async {
+            while recorder
+                .metrics()
+                .find(
+                    "traces.span.metrics.calls",
+                    &[("span.name", "lexical.write_turn"), ("status.code", "Ok")],
+                )
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_elapsed| "the lexical write never took the write turn")?;
+        let vectors = Arc::new(LazyDatabase::new(
+            &DatabaseName::Vectors.path(&state_directory),
+            DatabaseName::Vectors,
+            None,
+        ));
+        let search = rift_search::SearchIndex::attached(
+            database,
+            vectors,
+            rift_search::SearchIndexLimits::default(),
+        )?;
+        let mut shutdown = super::DeferredDatabaseShutdown(Some(Arc::new(search)), None);
+
+        shutdown
+            .close_search(Instant::now() + Duration::from_millis(200))
+            .await?;
+        let unwritten = running.stop(Instant::now() + STEP_MAX).await;
+        drop(recorder);
+        holder.execute_batch("ROLLBACK")?;
+        let _refused = tokio::time::timeout(STEP_MAX, writing).await??;
+        store.close(Instant::now() + STEP_MAX).await?;
+
+        assert_eq!(unwritten, None, "the final flush writes every record");
+        let stored = rift_tracing::LogReader::new(&metrics_path)
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(1_000))?;
+        let closes = stored
+            .iter()
+            .map(rift_tracing::StoredLogRecord::record)
+            .filter(|record| record.operation() == "database.close")
+            .map(|record| {
+                let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+                Ok((
+                    record.level().to_owned(),
+                    record.message().to_owned(),
+                    fields,
+                ))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+        let outlasted = closes
+            .iter()
+            .find(|(_, message, _)| {
+                message.starts_with("database checkpoint outlasted the shutdown deadline")
+            })
+            .ok_or_else(|| format!("the metrics database holds the index close: {closes:?}"))?;
+        assert_eq!(outlasted.0, "warn");
+        assert_eq!(outlasted.2["database"], "index", "{:?}", outlasted.2);
+        Ok(())
+    }
 }
