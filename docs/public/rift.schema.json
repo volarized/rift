@@ -721,7 +721,7 @@
     },
     "LogsConfiguration": {
       "additionalProperties": false,
-      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nwhich targets are captured at all, and how often the server samples its own\nprocess. The server reads the table at startup, so a change applies on the next\nstart.",
+      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nwhich targets are captured at all, how often the server samples its own\nprocess, and how much it writes to a standard error that is not a terminal. The server reads the table at startup, so a change applies on the next\nstart.",
       "properties": {
         "capture": {
           "default": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
@@ -761,6 +761,15 @@
           "rift:range": {
             "max": "1h",
             "min": "1s"
+          }
+        },
+        "stderr_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Bytes the server's standard error passes, when it is not a terminal, before it\nprints one notice and discards the rest, 1kb to 1gb. The log drain's stop records\nthe bytes discarded.",
+          "rift:range": {
+            "max": "1gb",
+            "min": "1kb"
           }
         }
       },
@@ -1533,7 +1542,8 @@
         "page_records": 500,
         "retention_records": 50000,
         "sample_interval": "1s",
-        "stall_delay": "10s"
+        "stall_delay": "10s",
+        "stderr_limit": "1mb"
       },
       "description": "The server's own log records: how many the metrics database keeps,\nhow many one read returns, and which targets are captured."
     },

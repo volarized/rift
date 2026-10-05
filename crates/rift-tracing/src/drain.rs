@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capture::{LogSink, now_ms};
 use crate::record::{LOG_BATCH_RECORDS_MAX, LogRecord};
+use crate::stderr::StderrBound;
 use crate::store::LogStore;
 
 /// Wall-clock span the drain waits for more records before writing what it holds.
@@ -165,13 +166,15 @@ pub async fn settle_for_read() {
 }
 
 /// What a stop asks of the log lane once its drain is joined or aborted: how many
-/// records it took and never wrote.
+/// records it took and never wrote, and, for a process whose standard error is cut at
+/// `[logs] stderr_limit`, how many bytes that bound discarded.
 ///
 /// A clone taken before the drain runs keeps answering after the drain task is aborted.
 #[derive(Clone, Debug)]
 pub struct LogLane {
     dropped: Arc<AtomicU64>,
     settlement: Arc<LogSettlement>,
+    stderr: Option<Arc<StderrBound>>,
 }
 
 impl LogLane {
@@ -197,6 +200,7 @@ pub struct LogDrain {
     receiver: Receiver<QueuedRecord>,
     dropped: Arc<AtomicU64>,
     settlement: Arc<LogSettlement>,
+    stderr: Option<Arc<StderrBound>>,
 }
 
 impl LogDrain {
@@ -210,7 +214,15 @@ impl LogDrain {
             receiver,
             dropped,
             settlement,
+            stderr: None,
         }
+    }
+
+    /// The drain of a process whose standard error is cut at `bound`: its stop records the
+    /// bytes discarded there.
+    pub(crate) fn with_stderr(mut self, bound: Arc<StderrBound>) -> Self {
+        self.stderr = Some(bound);
+        self
     }
 
     /// A handle on this drain's lane that outlives the drain task.
@@ -219,6 +231,7 @@ impl LogDrain {
         LogLane {
             dropped: Arc::clone(&self.dropped),
             settlement: Arc::clone(&self.settlement),
+            stderr: self.stderr.clone(),
         }
     }
 
@@ -423,6 +436,11 @@ impl RunningLogDrain {
     /// "log drain outlasted the stop deadline" warning carries `unwritten`: the records
     /// the lane accepted and never wrote, its held batch and queue included.
     ///
+    /// When the process's standard error is cut at `[logs] stderr_limit`, the stop first
+    /// records `standard error bytes discarded`, `INFO` with `stderr_limit` and the bytes
+    /// `discarded` so far, `WARN` when that count is not zero, so the drain writes the
+    /// count with its last batch.
+    ///
     /// # Cancel safety
     ///
     /// Dropping the future after the stop token is cancelled leaves the drain flushing
@@ -433,6 +451,24 @@ impl RunningLogDrain {
             lane,
             stop,
         } = self;
+        if let Some(bound) = &lane.stderr {
+            let (stderr_limit, discarded) = (bound.limit(), bound.discarded());
+            if discarded == 0 {
+                tracing::info!(
+                    component = "logs",
+                    stderr_limit,
+                    discarded,
+                    "standard error bytes discarded"
+                );
+            } else {
+                tracing::warn!(
+                    component = "logs",
+                    stderr_limit,
+                    discarded,
+                    "standard error bytes discarded"
+                );
+            }
+        }
         stop.cancel();
         match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(Ok(())) => None,

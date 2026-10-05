@@ -161,7 +161,8 @@ async fn main() -> ExitCode {
         tracing_builder = tracing_builder
             .capture(&logs.capture)
             .sample_interval(sample_interval)
-            .stall_delay(stall_delay);
+            .stall_delay(stall_delay)
+            .stderr_limit(logs.stderr_limit.bytes());
     }
     let (tracing_runtime, drain) = tracing_builder.install();
     let retention_records = logs.map_or(0, |logs| logs.retention_records);

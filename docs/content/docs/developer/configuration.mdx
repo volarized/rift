@@ -143,6 +143,7 @@ page_records = 500
 capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
 sample_interval = "1s"
 stall_delay = "10s"
+stderr_limit = "1mb"
 ```
 
 - `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
@@ -160,6 +161,11 @@ stall_delay = "10s"
   reports it, 1s to 1h. The sample tick reports each such entry once, in one record of the
   operations in flight with their age, so a request that runs out its deadline leaves the work
   it waited on in the store. A lock the server keeps for as long as it runs is never reported
+- `stderr_limit` <VersionBadge version="v0.0.62" inline /> is how many bytes a foreground server writes to a standard error that
+  is not a terminal, 1kb to 1gb. Past it the server prints one notice there and discards the
+  rest, counting the discarded bytes in `log.stderr.discarded`; the store keeps every record
+  `capture` admits either way. The server's stop records the count as
+  `standard error bytes discarded`
 
 The server reads this table at startup, so a change applies on the next start. The records
 outlive the process that wrote them. The metrics database is a file apart from the search

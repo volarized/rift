@@ -80,6 +80,13 @@ pub const LOGS_STALL_DELAY_MS_MIN: u64 = 1_000;
 pub const LOGS_STALL_DELAY_MS_MAX: u64 = 3_600_000;
 /// Milliseconds `logs.stall_delay` holds when the key is absent.
 pub const LOGS_STALL_DELAY_MS_DEFAULT: u64 = 10_000;
+/// Bytes a server's standard error passes before it discards, at least: room for the
+/// start's own lines.
+pub const LOGS_STDERR_BYTES_MIN: u64 = 1 << 10;
+/// Bytes a server's standard error passes before it discards, at most.
+pub const LOGS_STDERR_BYTES_MAX: u64 = 1 << 30;
+/// Bytes `logs.stderr_limit` holds when the key is absent.
+pub const LOGS_STDERR_BYTES_DEFAULT: u64 = 1 << 20;
 
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -875,8 +882,8 @@ impl PortRange {
 /// The `[logs]` table. The server records its own diagnostics in the metrics
 /// database at `.rift/metrics`, where `rift://logs` reads them back, and this
 /// table bounds how many records the store keeps, how many one read returns,
-/// which targets are captured at all, and how often the server samples its own
-/// process. The server reads the table at startup, so a change applies on the next
+/// which targets are captured at all, how often the server samples its own
+/// process, and how much it writes to a standard error that is not a terminal. The server reads the table at startup, so a change applies on the next
 /// start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -900,6 +907,10 @@ pub struct LogsConfiguration {
     /// Age past which an operation, lock wait, or held lock still open is reported
     /// once, on the sample tick, as a record of the operations in flight, 1s to 1h.
     pub stall_delay: Duration,
+    /// Bytes the server's standard error passes, when it is not a terminal, before it
+    /// prints one notice and discards the rest, 1kb to 1gb. The log drain's stop records
+    /// the bytes discarded.
+    pub stderr_limit: ByteSize,
 }
 
 impl Default for LogsConfiguration {
@@ -910,6 +921,7 @@ impl Default for LogsConfiguration {
             capture: LOGS_CAPTURE_DEFAULT.to_owned(),
             sample_interval: Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT),
             stall_delay: Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT),
+            stderr_limit: ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT),
         }
     }
 }
@@ -945,6 +957,12 @@ impl LogsConfiguration {
                     self.stall_delay.milliseconds(),
                     LOGS_STALL_DELAY_MS_MIN,
                     LOGS_STALL_DELAY_MS_MAX,
+                ),
+                (
+                    "logs.stderr_limit",
+                    self.stderr_limit.bytes(),
+                    LOGS_STDERR_BYTES_MIN,
+                    LOGS_STDERR_BYTES_MAX,
                 ),
             ])
         })
@@ -4041,6 +4059,42 @@ mod tests {
             configuration.logs.sample_interval = Duration::from_millis(value);
             assert_eq!(configuration.validate(), Ok(()));
         }
+    }
+
+    #[test]
+    fn test_logs_stderr_limit_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        assert_eq!(
+            configuration.logs.stderr_limit,
+            ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT)
+        );
+        assert_eq!(LOGS_STDERR_BYTES_DEFAULT, 1 << 20, "the default is 1mb");
+        for value in [0, LOGS_STDERR_BYTES_MIN - 1, LOGS_STDERR_BYTES_MAX + 1] {
+            configuration.logs.stderr_limit = ByteSize::from_bytes(value);
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "logs.stderr_limit",
+                    ..
+                })
+            ));
+        }
+        for value in [LOGS_STDERR_BYTES_MIN, LOGS_STDERR_BYTES_MAX] {
+            configuration.logs.stderr_limit = ByteSize::from_bytes(value);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_logs_stderr_limit_reads_a_byte_size() {
+        let parsed: LogsConfiguration =
+            serde_json::from_value(json!({"stderr_limit": "8mb"})).expect("a byte size parses");
+        assert_eq!(parsed.stderr_limit, ByteSize::from_bytes(8 << 20));
+        assert!(
+            serde_json::from_value::<LogsConfiguration>(json!({"stderr_limit": 1_048_576}))
+                .is_err(),
+            "a bare number names no unit"
+        );
     }
 
     #[test]
