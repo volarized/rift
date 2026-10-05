@@ -15,8 +15,8 @@ mod harness;
 mod rust_engine;
 
 use harness::{
-    StopOnDrop, TestResult, assigned_port_key, await_workspace_ready, laid_out_workspace,
-    proxied_call, proxy_client, require_success, run_rift, within,
+    FailureWindow, StopOnDrop, TestResult, assigned_port_key, await_workspace_ready,
+    laid_out_workspace, proxied_call, proxy_client, require_success, run_rift, within,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -98,6 +98,7 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     )?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     // Issue #511: full-text hits require local file preparation and lexical population.
     within("workspace preparation", await_workspace_ready(&client)).await??;
@@ -153,5 +154,6 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     client.cancel().await?;
     let stopped = run_rift(root, &["server", "stop"]).await?;
     require_success(&stopped, "stop after the text-lane search")?;
+    failure_window.passed();
     Ok(())
 }
