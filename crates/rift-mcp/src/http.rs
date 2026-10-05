@@ -1834,4 +1834,194 @@ mod tests {
         append.await?;
         Ok(())
     }
+
+    /// A server whose serve loop already ended, with no supervisor, no databases, and the
+    /// given idle watches and engine hold.
+    fn server_with_watches(
+        idle_watch: tokio::task::JoinHandle<()>,
+        repository_idle_watch: Option<tokio::task::JoinHandle<()>>,
+        engines: Option<Arc<EngineHold>>,
+    ) -> HttpServer {
+        HttpServer {
+            port: SERVER_PORT_MIN,
+            token: "a".repeat(SERVER_TOKEN_LENGTH),
+            identity: ProductIdentity {
+                version: "0.0.9".to_owned(),
+                schema_digest: "b".repeat(64),
+            },
+            server_configuration: ServerConfiguration::default(),
+            stop: CancellationToken::new(),
+            serving: tokio::spawn(std::future::ready(Ok::<(), std::io::Error>(()))),
+            idle_watch,
+            repository_idle_watch,
+            supervisor: None,
+            engines,
+            search_index: None,
+            logs: None,
+            repository_workspaces: None,
+        }
+    }
+
+    /// An idle watch task that panicked fails the stop under its own stage.
+    #[tokio::test]
+    async fn an_idle_watch_that_panicked_fails_the_stop() {
+        let idle_watch = tokio::spawn(async { panic!("the idle watch panicked") });
+        let server = server_with_watches(idle_watch, None, None);
+
+        let (_deadline, stopped) = server.stopped(Duration::from_secs(8)).await;
+
+        let error = stopped.expect_err("a panicked idle watch must fail the stop");
+        assert_eq!(error.slug(), errors::mcp::http_serve_failed::SLUG);
+        let rendered = error.to_string();
+        assert!(rendered.contains("idle watch task"), "{rendered}");
+    }
+
+    /// A repository idle watch task that panicked fails the stop under its own stage.
+    #[tokio::test]
+    async fn a_workspace_idle_watch_that_panicked_fails_the_stop() {
+        let repository_idle_watch =
+            tokio::spawn(async { panic!("the workspace idle watch panicked") });
+        let idle_watch = tokio::spawn(std::future::ready(()));
+        let server = server_with_watches(idle_watch, Some(repository_idle_watch), None);
+
+        let (_deadline, stopped) = server.stopped(Duration::from_secs(8)).await;
+
+        let error = stopped.expect_err("a panicked workspace idle watch must fail the stop");
+        assert_eq!(error.slug(), errors::mcp::http_serve_failed::SLUG);
+        let rendered = error.to_string();
+        assert!(rendered.contains("workspace idle watch task"), "{rendered}");
+    }
+
+    /// A repository idle watch still running at the stop deadline is aborted, and the
+    /// stop fails under the watch's stage exactly at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_workspace_idle_watch_that_outlasts_the_deadline_is_aborted_and_fails_the_stop() {
+        const STOP_BUDGET: Duration = Duration::from_secs(8);
+        let repository_idle_watch = tokio::spawn(std::future::pending::<()>());
+        let watch = repository_idle_watch.abort_handle();
+        let idle_watch = tokio::spawn(std::future::ready(()));
+        let server = server_with_watches(idle_watch, Some(repository_idle_watch), None);
+
+        let (deadline, stopped) = server.stopped(STOP_BUDGET).await;
+
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "the watch is given the whole budget"
+        );
+        let error = stopped.expect_err("a watch that never ends must fail the stop");
+        assert_eq!(error.slug(), errors::mcp::http_serve_failed::SLUG);
+        let rendered = error.to_string();
+        assert!(rendered.contains("workspace idle watch task"), "{rendered}");
+        assert!(
+            watch.is_finished(),
+            "the stop aborts the watch it gave up on"
+        );
+    }
+
+    /// An engine hold whose shutdown is still running when the stop deadline passes ends
+    /// the engines stage as an error. The idle watch spends the whole budget, and the
+    /// hold's one engine slot ends on a task the stop's first poll has not run yet, so the
+    /// stage starts at the deadline with its shutdown pending on every run.
+    #[tokio::test(start_paused = true)]
+    async fn an_engines_shutdown_the_deadline_ends_records_its_stage_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const STOP_BUDGET: Duration = Duration::from_secs(8);
+        let directory = tempfile::tempdir()?;
+        let key = rift_server::LspProcessKey::named("ty");
+        let configuration = serde_json::from_value(serde_json::json!({ "command": "uvx" }))?;
+        let engines = EngineHold::new(
+            directory.path().to_path_buf(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key)]),
+        );
+        let idle_watch = tokio::spawn(tokio::time::sleep(STOP_BUDGET));
+        let server = server_with_watches(idle_watch, None, Some(Arc::new(engines)));
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let (_deadline, stopped) = server.stopped(STOP_BUDGET).await;
+        drop(recorder);
+
+        stopped?;
+        let records = drain.queued_records();
+        let engines_stage = records
+            .iter()
+            .find(|record| {
+                record.message() == "stop stage ended"
+                    && record.fields().contains("\"stage\":\"engines shutdown\"")
+            })
+            .ok_or("the engines stage records how it ended")?;
+        let fields: serde_json::Value = serde_json::from_str(engines_stage.fields())?;
+        assert_eq!(fields["outcome"], "error", "{fields}");
+        let stopped_record = records
+            .iter()
+            .find(|record| record.message() == "MCP server stopped")
+            .ok_or("the stop records its outcome")?;
+        let fields: serde_json::Value = serde_json::from_str(stopped_record.fields())?;
+        assert_eq!(fields["outcome"], "error", "{fields}");
+        Ok(())
+    }
+
+    /// A search index whose vectors database is still in its first open at the deadline
+    /// fails `close_search` as a SQLite worker shutdown, and records the failure as a
+    /// `database.close` warning. The test holds the migration lock the open waits on, so
+    /// the open stays in flight past the deadline on every run.
+    #[tokio::test]
+    async fn a_search_close_that_outlasts_the_vectors_first_open_fails_and_records_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::task::{Context, Waker};
+
+        use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
+
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir_all(&state_directory)?;
+        let index_path = DatabaseName::Index.path(&state_directory);
+        let pool = DatabasePool::new(4, 60_000);
+        let database = WorkspaceDatabase::open(&index_path, DatabaseName::Index, pool).await?;
+        let vectors_path = DatabaseName::Vectors.path(&state_directory);
+        let vectors = Arc::new(LazyDatabase::new(
+            &vectors_path,
+            DatabaseName::Vectors,
+            None,
+        ));
+        let migration_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(DatabaseName::Vectors.migration_lock_path(&state_directory))?;
+        migration_lock.try_lock()?;
+        let mut opening = Box::pin(vectors.resolve(pool));
+        let first_poll =
+            std::future::Future::poll(opening.as_mut(), &mut Context::from_waker(Waker::noop()));
+        assert!(
+            first_poll.is_pending(),
+            "the held migration lock keeps the open waiting"
+        );
+        let limits = rift_search::SearchIndexLimits::default();
+        let search = rift_search::SearchIndex::attached(database, Arc::clone(&vectors), limits)?;
+        let mut shutdown = super::DeferredDatabaseShutdown(Some(Arc::new(search)), None);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let refusal = shutdown
+            .close_search(deadline)
+            .await
+            .expect_err("an open in flight outlasts the close deadline");
+        drop(recorder);
+
+        assert_eq!(refusal.slug(), errors::mcp::http_serve_failed::SLUG);
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("SQLite worker shutdown"), "{rendered}");
+        let records = drain.queued_records();
+        let failed = records
+            .iter()
+            .find(|record| record.message() == "the index or vectors database did not close")
+            .ok_or("the failed close is recorded")?;
+        assert_eq!(failed.level(), "warn");
+        assert_eq!(failed.operation(), "database.close");
+        drop(opening);
+        drop(migration_lock);
+        Ok(())
+    }
 }
