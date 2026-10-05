@@ -23,7 +23,8 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::log_capture;
 use crate::drain::LogDrain;
-use crate::flight::{FlightLayer, FlightTable};
+use crate::flight::{FlightLayer, FlightTable, observe_active};
+use crate::metrics::ObservationGuard;
 use crate::otlp::SDK_TARGET;
 use crate::record::LogRecord;
 use crate::render::LogLines;
@@ -72,6 +73,8 @@ const RECORDER_DEFAULT_CAPTURE: &str = "trace";
 pub struct ScopedRecorder {
     retained: Arc<RetainedRecords>,
     output: PanicOutput,
+    /// Keeps the recorder's table of operations in flight reported in `operation.active`.
+    _in_flight: Option<ObservationGuard>,
     _default: tracing::subscriber::DefaultGuard,
 }
 
@@ -91,7 +94,7 @@ impl ScopedRecorder {
     /// let calls = recorder.metrics();
     /// let parsed = calls.find(
     ///     "traces.span.metrics.calls",
-    ///     &[("span.name", "index.parse"), ("status.code", "Ok")],
+    ///     &[("span.name", "index.parse"), ("span.kind", "Internal"), ("status.code", "Ok")],
     /// );
     /// assert_eq!(parsed.map(|series| series.value().clone()), Some(rift_tracing::SeriesValue::Sum(1.0)));
     /// # Ok::<(), rift_tracing::LogFilterError>(())
@@ -99,14 +102,6 @@ impl ScopedRecorder {
     #[must_use]
     pub fn metrics(&self) -> MetricSnapshot {
         metrics::snapshot()
-    }
-
-    /// Runs every live [`SampleHook`](crate::SampleHook) of the process once, on the calling
-    /// thread, as a tick of the process sampler would; answers how many ran. A recorder
-    /// runs no sampler of its own.
-    #[must_use = "the count tells whether the hooks expected ran"]
-    pub fn run_sample_hooks(&self) -> usize {
-        crate::sampler::run_hooks(crate::sampler::live_hooks())
     }
 
     /// Prints into `buffer` instead of standard error, so a test can read what a panic
@@ -171,12 +166,15 @@ impl ScopedRecorderBuilder {
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
         metrics::install();
+        let flights = Arc::new(FlightTable::default());
+        let in_flight = observe_active(&flights);
         let subscriber = crate::capture::registry()
-            .with(FlightLayer::new(Arc::new(FlightTable::default())))
+            .with(FlightLayer::new(flights))
             .with(capture_layer(sink, filter));
         let recorder = ScopedRecorder {
             retained,
             output: PanicOutput::Stderr,
+            _in_flight: in_flight,
             _default: tracing::subscriber::set_default(subscriber),
         };
         Ok((recorder, drain))

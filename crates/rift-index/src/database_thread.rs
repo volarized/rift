@@ -35,10 +35,14 @@ static OPERATION_DURATION: Histogram<5> = Histogram::declare(
 );
 /// The `db.system.name` of every database the worker serves.
 const DB_SYSTEM: &str = "sqlite";
-/// `sqlite.queue.length`: commands sent to the worker and not yet received, read on the
-/// sampler tick.
-static QUEUE_LENGTH: Gauge<u64, 1> =
-    Gauge::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
+/// `sqlite.queue.length`: commands sent to the worker and not yet received, read when the
+/// meter collects.
+static QUEUE_LENGTH: rift_tracing::ObservableUpDownCounter<1> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        "sqlite.queue.length",
+        "{command}",
+        &["db.namespace"],
+    );
 /// `sqlite.transaction.duration`: one transaction from its begin's answer to its commit's
 /// or rollback's answer, by `sqlite.transaction.result`.
 static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
@@ -297,20 +301,19 @@ impl DatabaseThread {
             .map_err(|_| worker_error("SQLite worker stopped before returning operation"))?
     }
 
-    /// A reader that records `sqlite.queue.length`, the commands sent to the worker and not
-    /// yet received, for a sampler hook. It holds the queue weakly, so it keeps no worker
-    /// running, and records nothing once the queue closed.
-    pub(crate) fn queue_length_reader(&self) -> impl Fn() + Send + Sync + 'static {
+    /// Reports `sqlite.queue.length`, the commands sent to the worker and not yet received,
+    /// each time the meter collects, until the returned guard drops. The read holds the
+    /// queue weakly, so it keeps no worker running, and reports nothing once the queue
+    /// closed.
+    pub(crate) fn observe_queue_length(&self) -> Option<rift_tracing::ObservationGuard> {
         let name = self.name;
         let queue = self.sender.downgrade();
-        move || {
+        QUEUE_LENGTH.observe(move |observation| {
             if let Some(sender) = queue.upgrade() {
                 let queued = sender.max_capacity().saturating_sub(sender.capacity());
-                QUEUE_LENGTH
-                    .labeled_value([name.label()], u64::try_from(queued).unwrap_or(u64::MAX))
-                    .record();
+                observation.observe([name.label()], u64::try_from(queued).unwrap_or(u64::MAX));
             }
-        }
+        })
     }
 
     /// Counts one transaction begun, or with `begun` false one ended, and records the count.

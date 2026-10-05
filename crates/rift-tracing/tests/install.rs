@@ -33,6 +33,9 @@ fn a_second_install_is_refused_and_the_first_keeps_its_records() -> TestResult {
             .any(|record| record.message() == "recorded after the refused install"),
         "{records:?}"
     );
-    first.shutdown();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(first.shutdown());
     Ok(())
 }

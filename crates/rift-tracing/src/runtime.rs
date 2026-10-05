@@ -22,10 +22,11 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::capture::{LogSink, log_capture};
 use crate::drain::LogDrain;
-use crate::flight::{FlightLayer, FlightTable};
-use crate::otlp;
+use crate::flight::{FlightLayer, FlightTable, StallReport, observe_active};
+use crate::metrics::ObservationGuard;
+use crate::otlp::{self, OtlpExport};
 use crate::render::LevelColor;
-use crate::sampler::{ProcessSampler, SystemProcessReader, TickEvidence};
+use crate::sampler::{SystemProcessReader, observe_process, observe_runtime};
 use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrLines};
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
@@ -110,7 +111,7 @@ where
 /// `log` logger, already installed.
 ///
 /// The installation already in place stays as it was: it keeps receiving every span and
-/// event, and the refused builder started no sampler and holds no export.
+/// event, and the refused builder started no stall report and holds no export.
 #[derive(Debug)]
 pub struct InstallError(TryInitError);
 
@@ -132,37 +133,53 @@ impl std::error::Error for InstallError {
 
 /// The installed subscriber's handle, held until the process stops tracing.
 ///
-/// Its OTLP export holds nothing unless the `otlp` feature is compiled in and an OTLP
-/// endpoint variable names a collector; [`TracingRuntime::shutdown`] runs either way.
+/// Its OTLP export holds nothing unless an OTLP endpoint variable names a collector;
+/// [`TracingRuntime::shutdown`] runs either way.
 #[must_use = "the runtime flushes its export only when shut down"]
 pub struct TracingRuntime {
-    export: otlp::Export,
-    sampler: Option<ProcessSampler>,
+    export: OtlpExport,
+    stall: Option<StallReport>,
+    /// Keeps the table of operations in flight reported in `operation.active`.
+    _in_flight: Option<ObservationGuard>,
 }
 
+/// How long [`TracingRuntime::shutdown`] waits for the OTLP export's final flush and
+/// shutdown before the process leaves without them.
+pub const OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl TracingRuntime {
-    /// A builder whose subscriber writes stderr unbounded, captures nothing, and samples
-    /// no process.
+    /// A builder whose subscriber writes stderr unbounded, captures nothing, and reports
+    /// no stall.
     pub const fn builder() -> TracingRuntimeBuilder {
         TracingRuntimeBuilder {
             capture: None,
             stderr: StderrPolicy::Unbounded,
             stderr_limit: SERVER_STDERR_BYTES_MAX,
-            sample_interval: None,
             stall_delay: None,
         }
     }
 
-    /// Stops the process sampler, then flushes buffered spans and shuts the OTLP export
-    /// down.
+    /// The process's OTLP export, for a stop that shuts it down inside its own budget; a
+    /// later [`Self::shutdown`] then finds it shut down.
+    #[must_use]
+    pub fn export(&self) -> OtlpExport {
+        self.export.clone()
+    }
+
+    /// Stops the stall report and joins its task, then flushes buffered spans and metric
+    /// points and shuts the OTLP export down, waiting at most [`OTLP_SHUTDOWN_TIMEOUT`].
     ///
     /// The caller runs it before either exit path: a normal return drops every other
-    /// local first, and `process::exit` past it runs no destructor at all.
-    pub fn shutdown(self) {
-        if let Some(sampler) = self.sampler {
-            sampler.stop();
+    /// local first, and `process::exit` past it runs no destructor at all. An export that
+    /// fails or outlasts its bound is reported on stderr and fails nothing.
+    pub async fn shutdown(self) {
+        if let Some(stall) = self.stall {
+            stall.stop().await;
         }
-        self.export.shutdown();
+        let deadline = tokio::time::Instant::now() + OTLP_SHUTDOWN_TIMEOUT;
+        if let Err(error) = self.export.shutdown(deadline).await {
+            eprintln!("rift: warning: {error}");
+        }
     }
 }
 
@@ -173,7 +190,6 @@ pub struct TracingRuntimeBuilder {
     capture: Option<String>,
     stderr: StderrPolicy,
     stderr_limit: u64,
-    sample_interval: Option<Duration>,
     stall_delay: Option<Duration>,
 }
 
@@ -205,44 +221,32 @@ impl TracingRuntimeBuilder {
         self
     }
 
-    /// Samples the current process every `interval`: its resident and virtual memory, CPU
-    /// time and usage, open files, and disk bytes, and the Tokio runtime that installs the
-    /// subscriber: its workers, live tasks, global queue depth, worker busy time, and worker
-    /// parks. An interval below
-    /// [`PROCESS_SAMPLE_INTERVAL_MIN`](crate::PROCESS_SAMPLE_INTERVAL_MIN) samples at that
-    /// minimum.
+    /// Reports each operation, lock wait, or held lock that has stayed open for `delay`:
+    /// once per entry, as one `WARN` record of the table of operations in flight with the
+    /// reason `stall_delay`. The report's task reads the table every quarter of `delay`,
+    /// between a quarter second and five seconds, so a report comes at most that tick late.
     ///
-    /// `interval` is the accepted `[logs] sample_interval` value. Without this call the
-    /// runtime reads no process.
-    pub const fn sample_interval(mut self, interval: Duration) -> Self {
-        self.sample_interval = Some(interval);
-        self
-    }
-
-    /// Reports, on the process sampler's tick, each operation, lock wait, or held lock
-    /// that has stayed open for `delay`: once per entry, as one `WARN` record of the table
-    /// of operations in flight with the reason `stall_delay`.
-    ///
-    /// `delay` is the accepted `[logs] stall_delay` value. Without this call, or without
-    /// [`Self::sample_interval`], the runtime reports no stall.
+    /// `delay` is the accepted `[logs] stall_delay` value. Without this call the runtime
+    /// reports no stall.
     pub const fn stall_delay(mut self, delay: Duration) -> Self {
         self.stall_delay = Some(delay);
         self
     }
 
-    /// Installs the subscriber as the process's global default, and starts the process
-    /// sampler when [`Self::sample_interval`] ran.
+    /// Installs the subscriber as the process's global default, registers the process and
+    /// Tokio runtime readings when an OTLP endpoint installed a meter, and starts the stall
+    /// report when [`Self::stall_delay`] ran.
     ///
     /// The returned drain exists only when [`Self::capture`] ran; without it the
-    /// subscriber has no recording layer and allocates no log queue. The sampler runs on
-    /// the calling Tokio runtime; called outside one, the runtime samples nothing and says
-    /// so on stderr.
+    /// subscriber has no recording layer and allocates no log queue. The stall report runs
+    /// on the calling Tokio runtime, and the runtime readings read it; called outside one,
+    /// the runtime reports no stall, reads no runtime, and says so on stderr.
     ///
     /// # Errors
     ///
     /// Returns [`InstallError`] when the process already has a global subscriber, or a
     /// `log` logger: `tracing-subscriber`'s `try_init` refuses a second one. The
-    /// installation in place stays untouched, and this builder starts no sampler.
+    /// installation in place stays untouched, and this builder starts no stall report.
     pub fn install(self) -> Result<(TracingRuntime, Option<LogDrain>), InstallError> {
         let (sink, drain) = match self.capture {
             Some(capture) => {
@@ -285,26 +289,35 @@ impl TracingRuntimeBuilder {
             .with(otlp_layer)
             .try_init();
         if let Err(error) = installed {
-            export.shutdown();
+            // Dropping the providers blocks on their shutdown, which waits for export tasks
+            // this runtime drives; a thread of its own drops them instead.
+            let _ = std::thread::Builder::new()
+                .name("rift-otlp-shutdown".to_owned())
+                .spawn(move || drop(export));
             return Err(InstallError(error));
         }
         export.install_meter();
-        let sampler = self.sample_interval.and_then(|interval| {
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                eprintln!("rift: warning: no Tokio runtime runs the process sampler");
+        let in_flight = observe_active(&flights);
+        let _process = observe_process(SystemProcessReader::current());
+        let runtime = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = &runtime {
+            let _runtime = observe_runtime(&handle.metrics());
+        }
+        let stall = self.stall_delay.and_then(|delay| {
+            if runtime.is_err() {
+                eprintln!("rift: warning: no Tokio runtime runs the stall report");
                 return None;
-            };
-            Some(ProcessSampler::spawn(
-                SystemProcessReader::current(),
-                interval,
-                TickEvidence {
-                    runtime: Some(handle.metrics()),
-                    flights: Some(Arc::clone(&flights)),
-                    stall_delay: self.stall_delay,
-                },
-            ))
+            }
+            Some(StallReport::spawn(Arc::clone(&flights), delay))
         });
-        Ok((TracingRuntime { export, sampler }, drain))
+        Ok((
+            TracingRuntime {
+                export,
+                stall,
+                _in_flight: in_flight,
+            },
+            drain,
+        ))
     }
 }
 

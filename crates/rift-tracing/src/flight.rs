@@ -4,8 +4,8 @@
 //! Stderr and the store receive an operation when it closes, so neither shows the work a
 //! deadline failure needs to see: the work still running. The table keeps that work. An
 //! entry joins when its span opens and leaves when the span closes, and the runtime
-//! publishes the table as one record on demand ([`publish_in_flight`]) and on its sampler
-//! tick for each entry open past `[logs] stall_delay`. A held lock declared
+//! publishes the table as one record on demand ([`publish_in_flight`]) and, from the stall
+//! report's own task, for each entry open past `[logs] stall_delay`. A held lock declared
 //! [`lifelong`](crate::Lock::lifelong) is listed with that mark and left out of the stall
 //! report: its holder keeps it for as long as the holder runs.
 //!
@@ -28,6 +28,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::capture::now_ms;
 use crate::measurement::monotonic_now;
+use crate::metrics::{Counter, ObservableUpDownCounter, ObservationGuard};
 use crate::record::{LOG_LABEL_BYTES_MAX, bounded};
 
 /// Entries the table of operations in flight holds, at most. An operation that opens while
@@ -36,6 +37,13 @@ pub const OPERATIONS_IN_FLIGHT_MAX: usize = 1_024;
 /// Bytes of the `operations` field one table record lists, at most: the oldest entries that
 /// fit are listed, and the rest are counted in `left_out`.
 const OPERATIONS_LISTED_BYTES_MAX: usize = 4 << 10;
+/// `operation.active`: the entries the table holds open now, by `span.name`, read each time
+/// the meter collects.
+static OPERATION_ACTIVE: ObservableUpDownCounter<1> =
+    ObservableUpDownCounter::declare("operation.active", "{operation}", &["span.name"]);
+/// `operation.untracked`: the entries the table refused at [`OPERATIONS_IN_FLIGHT_MAX`].
+pub(crate) static OPERATION_UNTRACKED: Counter<0> =
+    Counter::declare("operation.untracked", "{operation}", &[]);
 /// The name of the span a contended lock wait opens.
 pub(crate) const LOCK_WAIT_SPAN: &str = "lock.wait";
 /// The name of the span a held lock keeps open until its guard drops.
@@ -190,14 +198,28 @@ impl FlightTable {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Adds `entry` under `identity`, or counts it untracked when the table is full.
+    /// Adds `entry` under `identity`, or counts it untracked when the table is full: in the
+    /// table, and in `operation.untracked` through the instrument the meter's install built,
+    /// since the join runs inside the table's `tracing` layer.
     pub(crate) fn join(&self, identity: u64, entry: FlightEntry) {
         let mut entries = self.lock();
         if entries.open.len() >= OPERATIONS_IN_FLIGHT_MAX {
             entries.untracked = entries.untracked.saturating_add(1);
+            drop(entries);
+            OPERATION_UNTRACKED.add_built([], 1);
             return;
         }
         entries.open.insert(identity, entry);
+    }
+
+    /// The open entries, counted by span name: at most [`OPERATIONS_IN_FLIGHT_MAX`] names.
+    fn active(&self) -> HashMap<&'static str, u64> {
+        let entries = self.lock();
+        let mut active = HashMap::new();
+        for entry in entries.open.values() {
+            *active.entry(entry.name).or_insert(0) += 1;
+        }
+        active
     }
 
     /// Removes the entry under `identity`, if the table tracked it.
@@ -375,6 +397,20 @@ where
     }
 }
 
+/// Reports the entries `table` holds open in `operation.active` each time the meter
+/// collects, until the guard drops; `None` when the process installed no meter. The read
+/// holds the table weakly, so a table its owner dropped reports nothing.
+pub(crate) fn observe_active(table: &Arc<FlightTable>) -> Option<ObservationGuard> {
+    let table = Arc::downgrade(table);
+    OPERATION_ACTIVE.observe(move |observation| {
+        if let Some(table) = table.upgrade() {
+            for (name, count) in table.active() {
+                observation.observe([name], count);
+            }
+        }
+    })
+}
+
 /// Runs `read` against the table of the thread's current dispatcher, when it keeps one.
 pub(crate) fn with_table<Answer>(read: impl FnOnce(&FlightTable) -> Answer) -> Option<Answer> {
     let mut read = Some(read);
@@ -444,12 +480,9 @@ pub fn warn_in_flight(reason: &'static str) {
 
 /// Publishes the entries of `table` open for `stall_delay` at `now` that no earlier tick
 /// reported, lifelong holds left out, as one `WARN` record with the fields of
-/// [`publish_in_flight`] and the reason `stall_delay`. Answers whether it published.
-pub(crate) fn publish_stalled(table: &FlightTable, now: Duration, stall_delay: Duration) -> bool {
-    let Some(listing) = table.stalled(now, stall_delay) else {
-        return false;
-    };
-    {
+/// [`publish_in_flight`] and the reason `stall_delay`.
+pub(crate) fn publish_stalled(table: &FlightTable, now: Duration, stall_delay: Duration) {
+    if let Some(listing) = table.stalled(now, stall_delay) {
         tracing::warn!(
             target: "rift_tracing::flight",
             reason = "stall_delay",
@@ -460,7 +493,79 @@ pub(crate) fn publish_stalled(table: &FlightTable, now: Duration, stall_delay: D
             "operations in flight past the stall delay"
         );
     }
-    true
+}
+
+/// The stall report's tick is `stall_delay` divided by this, within [`STALL_TICK_MIN`] and
+/// [`STALL_TICK_MAX`], so an entry is reported at most a quarter of its delay late.
+const STALL_TICKS_PER_DELAY: u32 = 4;
+/// The shortest stall report tick: a quarter of the shortest `[logs] stall_delay`, one
+/// second.
+pub(crate) const STALL_TICK_MIN: Duration = Duration::from_millis(250);
+/// The longest stall report tick, reached from a `[logs] stall_delay` of 20 s: a longer
+/// delay is still reported at most this late.
+pub(crate) const STALL_TICK_MAX: Duration = Duration::from_secs(5);
+
+/// The tick of a stall report under `stall_delay`: a quarter of it, clamped to
+/// [`STALL_TICK_MIN`] and [`STALL_TICK_MAX`].
+///
+/// An entry that crosses `stall_delay` right after a tick is reported on the next one, so
+/// a report comes at most one tick, plus the runtime's scheduling delay, after the entry
+/// crossed `stall_delay`.
+pub(crate) fn stall_tick(stall_delay: Duration) -> Duration {
+    (stall_delay / STALL_TICKS_PER_DELAY).clamp(STALL_TICK_MIN, STALL_TICK_MAX)
+}
+
+/// The running stall report: the task that reads the table every [`stall_tick`], and the
+/// token that stops it.
+#[derive(Debug)]
+pub(crate) struct StallReport {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StallReport {
+    /// Starts reporting the entries of `table` open past `stall_delay` on the current Tokio
+    /// runtime, aged on the monotonic clock.
+    pub(crate) fn spawn(table: Arc<FlightTable>, stall_delay: Duration) -> Self {
+        Self::spawn_with_clock(table, stall_delay, monotonic_now)
+    }
+
+    /// Starts the report with `now` as the clock entries age on.
+    pub(crate) fn spawn_with_clock(
+        table: Arc<FlightTable>,
+        stall_delay: Duration,
+        now: impl Fn() -> Duration + Send + 'static,
+    ) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(report_stalls(table, stall_delay, now, cancel.clone()));
+        Self { cancel, task }
+    }
+
+    /// Stops the report and waits for its task to end: the task holds no await but its
+    /// tick, so it ends at the cancellation.
+    pub(crate) async fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+}
+
+/// Publishes the stalled entries of `table` every [`stall_tick`] until `cancel` fires.
+async fn report_stalls(
+    table: Arc<FlightTable>,
+    stall_delay: Duration,
+    now: impl Fn() -> Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut ticks = tokio::time::interval(stall_tick(stall_delay));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        publish_stalled(&table, now(), stall_delay);
+    }
 }
 
 #[cfg(test)]

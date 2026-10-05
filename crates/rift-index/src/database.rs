@@ -80,12 +80,14 @@ static CONNECTION_TIMEOUTS: rift_tracing::Counter<1> = rift_tracing::Counter::de
     "{timeout}",
     &["db.client.connection.pool.name"],
 );
-/// `sqlite.file.size`: the size of the database file and of its write-ahead log.
-static FILE_SIZE: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
-    "sqlite.file.size",
-    "By",
-    &["db.namespace", "sqlite.file.type"],
-);
+/// `sqlite.file.size`: the size of the database file and of its write-ahead log, read when
+/// the meter collects.
+static FILE_SIZE: rift_tracing::ObservableUpDownCounter<2> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        "sqlite.file.size",
+        "By",
+        &["db.namespace", "sqlite.file.type"],
+    );
 
 /// Suffix the migration lock file appends to the database file's whole name: the
 /// database `.rift/index` is prepared under `.rift/index.lock`.
@@ -327,9 +329,9 @@ pub struct WorkspaceDatabase {
     /// Whether the close checkpoint started before its deadline and was still waiting on
     /// the worker when the deadline passed.
     checkpoint_outlasted: AtomicBool,
-    /// Records the file sizes and the worker's queue length on each tick of the process
-    /// sampler while the database lives; absent where the process installed no meter.
-    _file_size_sampling: Option<rift_tracing::SampleHook>,
+    /// Keeps the file sizes and the worker's queue length reported while the database
+    /// lives; absent where the process installed no meter.
+    _readings: [Option<rift_tracing::ObservationGuard>; 2],
 }
 
 /// The row one `PRAGMA wal_checkpoint` answers: whether it met another connection's lock,
@@ -490,7 +492,10 @@ impl WorkspaceDatabase {
             .await
             .map_err(|source| name.failed(database_path, source))?;
         drop(migration_lock);
-        let record_queue_length = thread.queue_length_reader();
+        let queue_length = thread.observe_queue_length();
+        let sizes = database_path.to_owned();
+        let file_sizes =
+            FILE_SIZE.observe(move |observation| observe_file_sizes(name, &sizes, observation));
         let opened = Self {
             name,
             path: database_path.to_owned(),
@@ -500,16 +505,9 @@ impl WorkspaceDatabase {
             writes: Mutex::new(()),
             checkpointed: AtomicBool::new(false),
             checkpoint_outlasted: AtomicBool::new(false),
-            _file_size_sampling: rift_tracing::sample_hook({
-                let path = database_path.to_owned();
-                move || {
-                    record_file_sizes(name, &path);
-                    record_queue_length();
-                }
-            }),
+            _readings: [file_sizes, queue_length],
         };
         opened.record_pool();
-        opened.record_file_sizes();
         Ok(Arc::new(opened))
     }
 
@@ -532,12 +530,6 @@ impl WorkspaceDatabase {
         CONNECTION_PENDING
             .labeled_value([pool], as_count(status.waiting))
             .record();
-    }
-
-    /// Records the size of the database file and of its write-ahead log, at open and close;
-    /// the process sampler records them on each tick between.
-    fn record_file_sizes(&self) {
-        record_file_sizes(self.name, &self.path);
     }
 
     /// Which database this is.
@@ -629,7 +621,6 @@ impl WorkspaceDatabase {
                     elapsed_ms = elapsed_ms(checkpoint.elapsed),
                     "database checkpointed its write-ahead log"
                 );
-                self.record_file_sizes();
             }
             Ok(Err(error)) => rift_tracing::warn!(
                 component = "storage",
@@ -922,10 +913,14 @@ fn migration_lock_path(database_path: &Path) -> PathBuf {
     appended(database_path, MIGRATION_LOCK_SUFFIX)
 }
 
-/// Records the size of the database file `path` of `name` and of its write-ahead log. A
-/// file that cannot be read, such as a log the close removed, records nothing: absent, not
-/// zero. The reads block on the file system.
-fn record_file_sizes(name: DatabaseName, path: &Path) {
+/// Reports the size of the database file `path` of `name` and of its write-ahead log: two
+/// `fs::metadata` calls, a few microseconds each. A file that cannot be read, such as a log
+/// the close removed, reports nothing: absent, not zero.
+fn observe_file_sizes(
+    name: DatabaseName,
+    path: &Path,
+    observation: &rift_tracing::Observation<'_, 2>,
+) {
     let database = name.label();
     let files = [
         ("database", path.to_owned()),
@@ -933,9 +928,7 @@ fn record_file_sizes(name: DatabaseName, path: &Path) {
     ];
     for (kind, path) in files {
         if let Ok(metadata) = std::fs::metadata(&path) {
-            FILE_SIZE
-                .labeled_value([database, kind], metadata.len())
-                .record();
+            observation.observe([database, kind], metadata.len());
         }
     }
 }
@@ -1610,7 +1603,10 @@ mod tests {
         let database_file = [vectors, ("sqlite.file.type", "database")];
         let size = series(&metrics, "sqlite.file.size", &database_file)?;
         assert_eq!(size.unit(), "By");
-        assert!(last(size) > 0.0, "the open database file has pages");
+        assert!(
+            matches!(size.value(), rift_tracing::SeriesValue::Sum(bytes) if *bytes > 0.0),
+            "the open database file has pages: {size:?}"
+        );
         assert!(
             metrics
                 .find("db.client.connection.timeouts", &[pool_name])
@@ -1620,11 +1616,11 @@ mod tests {
         Ok(())
     }
 
-    /// An open database registers its file sizes and its worker's queue length with the
-    /// process sampler: a tick records the write-ahead log the writes grew and the empty
-    /// queue, and once the database drops no tick runs its hook.
+    /// An open database reports its file sizes and its worker's queue length each time the
+    /// meter collects: the write-ahead log the writes grew and the empty queue. Once the
+    /// database drops, a collection reports neither.
     #[tokio::test]
-    async fn an_open_database_records_its_file_sizes_on_each_sampler_tick() -> TestResult {
+    async fn an_open_database_reports_its_file_sizes_at_each_collection() -> TestResult {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
@@ -1632,7 +1628,6 @@ mod tests {
         let wal = super::appended(&path, super::WRITE_AHEAD_LOG_SUFFIX);
         std::fs::write(&wal, [0_u8; 4_096])?;
 
-        assert_eq!(recorder.run_sample_hooks(), 1, "the database's hook runs");
         let wal_size = |metrics: &rift_tracing::MetricSnapshot| {
             metrics
                 .find(
@@ -1643,8 +1638,8 @@ mod tests {
         };
         assert_eq!(
             wal_size(&recorder.metrics()),
-            Some(rift_tracing::SeriesValue::Last(4_096.0)),
-            "the tick read the size the file has now"
+            Some(rift_tracing::SeriesValue::Sum(4_096.0)),
+            "the collection read the size the file has now"
         );
         let queued = recorder
             .metrics()
@@ -1652,14 +1647,21 @@ mod tests {
             .map(|series| (series.unit().to_owned(), series.value().clone()));
         assert_eq!(
             queued,
-            Some(("{command}".to_owned(), rift_tracing::SeriesValue::Last(0.0))),
+            Some(("{command}".to_owned(), rift_tracing::SeriesValue::Sum(0.0))),
             "no command waits in the idle worker's queue"
         );
         drop(database);
+        let closed = recorder.metrics();
         assert_eq!(
-            recorder.run_sample_hooks(),
-            0,
-            "the dropped database's hook left"
+            wal_size(&closed),
+            None,
+            "a dropped database reports no size"
+        );
+        assert!(
+            closed
+                .find("sqlite.queue.length", &[("db.namespace", "index")])
+                .is_none(),
+            "a dropped database reports no queue"
         );
         Ok(())
     }

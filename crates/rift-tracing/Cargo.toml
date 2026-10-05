@@ -11,27 +11,20 @@ description = "The metrics database and the instrumentation Rift crates emit thr
 # The scoped recorder for dependent crates' tests; never a production feature. Enable it
 # from `[dev-dependencies]` only, so a release build carries no recorder. Its metric reads
 # come from the SDK's in-memory exporter.
-fixtures = ["dep:opentelemetry_sdk", "opentelemetry_sdk/testing"]
-# Off by default so a release artifact carries no OpenTelemetry export stack. With it
-# compiled in, `TracingRuntimeBuilder::install` still installs no exporter until an operator
-# sets `OTEL_EXPORTER_OTLP_ENDPOINT` or, for metrics alone, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`.
-otlp = [
-    "opentelemetry/trace",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry_sdk",
-    "dep:tracing-opentelemetry",
-]
+fixtures = ["opentelemetry_sdk/testing"]
 
 [lints]
 workspace = true
 
 [dependencies]
+# The OTLP export of every build: `TracingRuntimeBuilder::install` installs no exporter until
+# an operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` or, for metrics alone,
+# `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`. The service instance identifier is random.
+getrandom.workspace = true
 jiff.workspace = true
-# The metrics API every instrument records through; without a meter provider it records
-# nothing, and the API crate's `metrics` feature pulls in no dependency.
-opentelemetry.workspace = true
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 pin-project-lite.workspace = true
 rift-error.workspace = true
 rift-tracing-macros.workspace = true
@@ -41,7 +34,7 @@ sysinfo.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-tracing-opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

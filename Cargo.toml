@@ -60,14 +60,14 @@ nix = { version = "0.31.3", features = ["signal"] }
 notify = "=8.2.0"
 oas3-gen-support = "=0.28.0"
 oas3 = "=0.22.0"
-# The otlp feature's export stack. tracing-opentelemetry pins the opentelemetry minor it
+# The OTLP export stack rift-tracing owns. tracing-opentelemetry pins the opentelemetry minor it
 # builds against (0.34.0 requires opentelemetry ^0.33.0), and opentelemetry_sdk /
 # opentelemetry-otlp move in lockstep with opentelemetry itself, so every member is
 # pinned exactly rather than left to drift independently. `internal-logs` turns the SDK's own
 # reports - the first span a full batch queue drops, the dropped total at shutdown, a failed
 # export - into `tracing` events on the `opentelemetry_sdk` target; without it they compile to
 # nothing and a full queue drops spans silently. rift-tracing's instruments record through
-# the `metrics` API in every build; `trace` comes with the otlp feature. The SDK aggregates
+# the `metrics` API, and its span export enables `trace`. The SDK aggregates
 # and its async-runtime periodic reader exports over the same Tokio-driven `reqwest` client
 # the span batches use.
 opentelemetry = { version = "=0.33.0", default-features = false, features = ["metrics"] }

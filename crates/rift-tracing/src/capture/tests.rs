@@ -992,7 +992,11 @@ fn a_failure_the_span_records_ends_the_record_the_line_and_the_metric_failed() {
             .unwrap_or_default();
         assert!(line.contains(close), "{message}: {line}");
         if message.starts_with("test.") {
-            let mut labels = vec![("span.name", message), ("status.code", status)];
+            let mut labels = vec![
+                ("span.name", message),
+                ("span.kind", "Internal"),
+                ("status.code", status),
+            ];
             labels.extend(label.map(|label| ("error.type", label)));
             assert!(
                 snapshot

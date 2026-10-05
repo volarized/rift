@@ -24,12 +24,21 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
 use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
+use crate::metrics::Counter;
 use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
 
 /// Records the queue holds before a send drops one. The queue exists to absorb a burst
 /// while the drain writes; a workspace that emits more than this between two flushes is
 /// emitting faster than any store could keep.
 pub const LOG_QUEUE_RECORDS: usize = 4_096;
+/// `log.queue.dropped`: records lost before the store, by `error.type`: `queue_full` for a
+/// record the full queue refused, `unwritten` for one a stopped drain never wrote.
+pub(crate) static LOG_QUEUE_DROPPED: Counter<1> =
+    Counter::declare("log.queue.dropped", "{record}", &["error.type"]);
+/// The `error.type` of a record the full queue refused.
+const QUEUE_FULL: &str = "queue_full";
+/// The `error.type` of a record a drain aborted at its stop deadline never wrote.
+pub(crate) const UNWRITTEN: &str = "unwritten";
 /// Bytes of a panic payload the recorded event keeps, at most.
 pub const PANIC_PAYLOAD_BYTES_MAX: usize = 4 << 10;
 /// Bytes of one span's field members a record keeps, at most: the members of the close
@@ -124,7 +133,9 @@ impl LogSink {
     ///
     /// The record takes its sequence before the send, and a send that finds no room
     /// finishes it again: a read waiting on the sequence must never wait for a record no
-    /// drain sees.
+    /// drain sees. A drop also adds one to `log.queue.dropped` with `error.type`
+    /// `queue_full`, through the instrument the meter's install built: the send runs inside
+    /// this layer, and building the instrument here would report through `tracing` into it.
     pub(crate) fn send(&self, record: LogRecord) {
         #[cfg(any(test, feature = "fixtures"))]
         if let Some(retained) = &self.retained {
@@ -135,6 +146,7 @@ impl LogSink {
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 self.settlement.finish_dropped();
+                LOG_QUEUE_DROPPED.add_built([QUEUE_FULL], 1);
             }
             Err(TrySendError::Closed(_)) => self.settlement.finish_dropped(),
             Ok(()) => {}

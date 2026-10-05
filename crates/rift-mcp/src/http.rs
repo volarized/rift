@@ -2262,7 +2262,11 @@ mod tests {
                 .metrics()
                 .find(
                     "traces.span.metrics.calls",
-                    &[("span.name", "lexical.write_turn"), ("status.code", "Ok")],
+                    &[
+                        ("span.name", "lexical.write_turn"),
+                        ("span.kind", "Internal"),
+                        ("status.code", "Ok"),
+                    ],
                 )
                 .is_none()
             {

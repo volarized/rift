@@ -8,7 +8,7 @@
 
 use std::error::Error;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -18,10 +18,9 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-use crate::metrics::{Gauge, Histogram};
+use crate::metrics::{Histogram, ObservableUpDownCounter, Observation, ObservationGuard};
 use crate::reads::LogReader;
 use crate::record::{LOG_BATCH_RECORDS_MAX, LOG_KIND, LogRecord};
-use crate::sampler::SampleHook;
 
 /// The schema version `.rift/metrics` carries in `PRAGMA user_version`.
 ///
@@ -64,10 +63,10 @@ static QUEUE_WAIT: Histogram<2> = Histogram::declare(
     "sqlite.queue.wait.duration",
     &["db.namespace", "db.operation.name"],
 );
-/// `sqlite.queue.length`: commands sent to the writer and not yet received, read on the
-/// sampler tick.
-static QUEUE_LENGTH: Gauge<u64, 1> =
-    Gauge::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
+/// `sqlite.queue.length`: commands sent to the writer and not yet received, read when the
+/// meter collects.
+static QUEUE_LENGTH: ObservableUpDownCounter<1> =
+    ObservableUpDownCounter::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
 /// `sqlite.write_lock.wait.duration`: one `BEGIN IMMEDIATE` of an append, with the result
 /// code as `error.type` when it failed.
 static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
@@ -84,8 +83,8 @@ static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
 static COMMIT_DURATION: Histogram<1> =
     Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
 /// `sqlite.file.size`: the size of the metrics database file and of its write-ahead log,
-/// read on the sampler tick.
-static FILE_SIZE: Gauge<u64, 2> = Gauge::declare(
+/// read when the meter collects.
+static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
     "sqlite.file.size",
     "By",
     &["db.namespace", "sqlite.file.type"],
@@ -101,16 +100,15 @@ fn error_type(failure: &rusqlite::Error) -> &'static str {
     }
 }
 
-/// Records the sizes of the database file at `path` and of its write-ahead log; a file
-/// that does not exist records nothing.
-fn record_file_sizes(path: &Path) {
+/// Reports the sizes of the database file at `path` and of its write-ahead log: two
+/// `fs::metadata` calls, a few microseconds each. A file that does not exist reports
+/// nothing.
+fn observe_file_sizes(path: &Path, observation: &Observation<'_, 2>) {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
     for (kind, file) in [("database", path), ("wal", Path::new(&wal))] {
         if let Ok(metadata) = std::fs::metadata(file) {
-            FILE_SIZE
-                .labeled_value([DB_NAMESPACE, kind], metadata.len())
-                .record();
+            observation.observe([DB_NAMESPACE, kind], metadata.len());
         }
     }
 }
@@ -406,9 +404,9 @@ pub struct LogStore {
     sender: mpsc::Sender<Command>,
     closed: OnceLock<StoreClose>,
     progress: Arc<CloseProgress>,
-    /// Records the queue length and the file sizes on each sampler tick while the store
-    /// lives; absent where the process installed no meter.
-    _sampling: Option<SampleHook>,
+    /// Keeps the queue length and the file sizes reported while the store lives; absent
+    /// where the process installed no meter.
+    _readings: [Option<ObservationGuard>; 2],
 }
 
 impl std::fmt::Debug for Command {
@@ -460,21 +458,23 @@ impl LogStore {
             )
         })??;
         let queue = sender.downgrade();
-        let sampled = Arc::clone(&database);
+        let sizes: PathBuf = database.to_path_buf();
+        // Both reads hold the queue weakly and copy the path, so neither keeps the writer.
+        let readings = [
+            QUEUE_LENGTH.observe(move |observation| {
+                if let Some(sender) = queue.upgrade() {
+                    let queued = sender.max_capacity().saturating_sub(sender.capacity());
+                    observation.observe([DB_NAMESPACE], u64::try_from(queued).unwrap_or(u64::MAX));
+                }
+            }),
+            FILE_SIZE.observe(move |observation| observe_file_sizes(&sizes, observation)),
+        ];
         Ok(Self {
             path: database,
             sender,
             closed: OnceLock::new(),
             progress,
-            _sampling: crate::sampler::sample_hook(move || {
-                if let Some(sender) = queue.upgrade() {
-                    let queued = sender.max_capacity().saturating_sub(sender.capacity());
-                    QUEUE_LENGTH
-                        .labeled_value([DB_NAMESPACE], u64::try_from(queued).unwrap_or(u64::MAX))
-                        .record();
-                }
-                record_file_sizes(&sampled);
-            }),
+            _readings: readings,
         })
     }
 

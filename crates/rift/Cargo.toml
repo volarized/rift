@@ -13,11 +13,6 @@ description = "Persistent filesystem projections and validated source transactio
 # uses it.
 autotests = false
 
-[features]
-# Off by default so a release artifact carries no OpenTelemetry export stack; `rift-tracing`
-# owns the export and its feature.
-otlp = ["rift-tracing/otlp"]
-
 [lints]
 workspace = true
 

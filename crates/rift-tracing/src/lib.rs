@@ -21,22 +21,22 @@
 //! the metrics database until a stop joins it.
 //!
 //! A binary starts tracing once through [`TracingRuntime::builder`], which installs stderr,
-//! the capture, and the optional OTLP export under filters of their own, and stops it with
+//! the capture, and the OTLP export under filters of their own, and stops it with
 //! [`TracingRuntime::shutdown`]. [`LogLines`] prints records the way stderr and
 //! `rift server logs` show them.
 //!
-//! Code records values into typed instruments over the OpenTelemetry metrics API:
-//! [`metrics`] returns the ones Rift declares, and [`Counter`], [`Gauge`], and
-//! [`Histogram`] declare more. Every [`traced!`] operation records its duration and
-//! outcome, and the runtime's process sampler records the process's memory, CPU, open
-//! files, and disk bytes. The OpenTelemetry SDK aggregates and exports them over OTLP when
-//! the `otlp` feature is compiled in and an endpoint is configured; otherwise a recording
-//! records nothing.
+//! Code records values into typed instruments over the OpenTelemetry metrics API declared
+//! through [`Counter`], [`Gauge`], and [`Histogram`]; an owner registers a quantity it holds
+//! as an [`ObservableUpDownCounter`]. Every [`traced!`] operation records its duration and
+//! outcome, and the runtime registers the process's memory, CPU time, open files, and disk
+//! bytes and the Tokio runtime's counts as observable instruments the SDK reads when it
+//! collects. The OpenTelemetry SDK aggregates and exports them over OTLP when an endpoint
+//! is configured; otherwise a recording records nothing.
 //!
 //! Work still running is evidence too. Every operation, and every wait for and hold of a
 //! lock recorded through [`lock`], stays in the table of operations in flight until it
-//! closes; [`publish_in_flight`] writes the table as one record, and the process sampler
-//! reports each entry open past `[logs] stall_delay`. [`LogQuery`] selects a window of
+//! closes; [`publish_in_flight`] writes the table as one record, and the runtime's stall
+//! report reports each entry open past `[logs] stall_delay`. [`LogQuery`] selects a window of
 //! records.
 //!
 //! A test captures what the code under test records through a `ScopedRecorder`, which the
@@ -74,9 +74,11 @@ pub use flight::{OPERATIONS_IN_FLIGHT_MAX, publish_in_flight, warn_in_flight};
 pub use lock::{Acquire, Held, Lock, Refusal, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use metrics::{
-    Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue,
-    Histogram, HistogramSelection, HistogramValue, Metrics, metrics,
+    CARDINALITY_LIMIT, Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge,
+    GaugeSelection, GaugeValue, Histogram, HistogramSelection, HistogramValue, OBSERVATIONS_MAX,
+    ObservableUpDownCounter, Observation, ObservationGuard,
 };
+pub use otlp::{ExportShutdownError, OtlpExport};
 pub use reads::{LogReader, LogReads};
 pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
@@ -89,10 +91,9 @@ pub use recorder::{
 };
 pub use render::LogLines;
 pub use runtime::{
-    InstallError, LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder,
-    validate_log_filter,
+    InstallError, LogFilterError, OTLP_SHUTDOWN_TIMEOUT, StderrPolicy, TracingRuntime,
+    TracingRuntimeBuilder, validate_log_filter,
 };
-pub use sampler::{PROCESS_SAMPLE_INTERVAL_MIN, SAMPLE_HOOKS_MAX, SampleHook, sample_hook};
 pub use span::Span;
 pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{

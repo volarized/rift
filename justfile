@@ -29,7 +29,7 @@ conformance *args:
     {{ rift_dev }} conformance {{ args }}
 
 # An in-memory OTLP/HTTP collector for timing `traced!`/`traced_async!` spans on
-# port 4318. Point a build compiled with the `otlp` feature at it with
+# port 4318. Point a `rift` process at it with
 # `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`; Ctrl-C prints one JSON line
 # per operation.
 trace-collector *args:

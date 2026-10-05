@@ -367,3 +367,150 @@ fn a_root_operation_opened_inside_another_lists_no_parent() -> TestResult {
     assert!(detached.get("parent").is_none(), "{detached}");
     Ok(())
 }
+
+/// The stall report ticks at a quarter of `stall_delay`, never under a quarter second and
+/// never over five seconds.
+#[test]
+fn the_stall_tick_is_a_quarter_of_the_delay_within_its_bounds() {
+    use super::{STALL_TICK_MAX, STALL_TICK_MIN, stall_tick};
+    assert_eq!(stall_tick(Duration::from_secs(1)), STALL_TICK_MIN);
+    assert_eq!(stall_tick(Duration::from_millis(100)), STALL_TICK_MIN);
+    assert_eq!(
+        stall_tick(Duration::from_secs(10)),
+        Duration::from_millis(2_500)
+    );
+    assert_eq!(stall_tick(Duration::from_secs(20)), STALL_TICK_MAX);
+    assert_eq!(stall_tick(Duration::from_secs(3_600)), STALL_TICK_MAX);
+}
+
+/// The stall reports `drain` holds now.
+fn stall_reports(drain: &mut crate::LogDrain) -> Vec<LogRecord> {
+    drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| record.message() == "operations in flight past the stall delay")
+        .collect()
+}
+
+/// Lets the stall report's task run every tick the paused clock reached.
+async fn settle() {
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// An entry is reported once, on the first tick at which it has been open for
+/// `stall_delay`; the ticks before and after report nothing. A lifelong hold beside it is
+/// never reported.
+#[tokio::test(start_paused = true)]
+async fn the_stall_report_reports_each_entry_once_on_its_own_tick() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let table = std::sync::Arc::new(FlightTable::default());
+    let mut held = FlightEntry::opened(
+        "lock.held",
+        FlightKind::Held,
+        Some("history.open"),
+        Duration::ZERO,
+        0,
+    );
+    held.lock = "history.live".to_owned();
+    held.lifelong = true;
+    table.join(1, held);
+    table.join(2, entry("lexical.commit", Duration::ZERO));
+    let started = tokio::time::Instant::now();
+    let stall_delay = Duration::from_secs(4);
+    let tick = super::stall_tick(stall_delay);
+    assert_eq!(tick, Duration::from_secs(1));
+    let report = super::StallReport::spawn_with_clock(
+        std::sync::Arc::clone(&table),
+        stall_delay,
+        move || started.elapsed(),
+    );
+    settle().await;
+    for second in 1..4 {
+        tokio::time::advance(tick).await;
+        settle().await;
+        assert!(
+            stall_reports(&mut drain).is_empty(),
+            "nothing is open past the delay at {second}s"
+        );
+    }
+    tokio::time::advance(tick).await;
+    settle().await;
+    let reported = stall_reports(&mut drain);
+    assert_eq!(reported.len(), 1, "the tick at the delay reports the entry");
+    assert_eq!(reported[0].level(), "warn");
+    let fields: Value = serde_json::from_str(reported[0].fields())?;
+    assert_eq!(fields["reason"], "stall_delay");
+    assert_eq!(fields["in_flight"], "1");
+    assert!(reported[0].fields().contains("lexical.commit"));
+    assert!(!reported[0].fields().contains("history.live"));
+    for _ in 0..3 {
+        tokio::time::advance(tick).await;
+        settle().await;
+    }
+    assert!(
+        stall_reports(&mut drain).is_empty(),
+        "an entry is reported once"
+    );
+    report.stop().await;
+    drop(recorder);
+    Ok(())
+}
+
+/// `operation.active` reports the entries open when the meter collects, by span name, and
+/// none once they close.
+#[test]
+fn operation_active_reports_the_entries_open_at_collection() {
+    let (recorder, _records) = ScopedRecorder::builder()
+        .install()
+        .expect("the default filter parses");
+    let labels = [("span.name", "test.active")];
+    let inside = crate::traced!(component = "test", operation = "test.active", {
+        recorder.metrics()
+    });
+    let series = inside
+        .find("operation.active", &labels)
+        .expect("the open operation is reported");
+    assert_eq!(series.unit(), "{operation}");
+    assert_eq!(series.labels(), labels);
+    assert_eq!(series.value(), &crate::SeriesValue::Sum(1.0));
+
+    let after = recorder.metrics();
+    assert_eq!(
+        after.find("operation.active", &labels),
+        None,
+        "a closed operation is no longer reported"
+    );
+}
+
+/// An operation that finds the table full adds one to `operation.untracked`, and the
+/// table's own entries are what `operation.active` reports.
+#[test]
+fn a_full_table_counts_the_refused_entry_in_operation_untracked() {
+    let (recorder, _records) = ScopedRecorder::builder()
+        .install()
+        .expect("the default filter parses");
+    let open: Vec<tracing::Span> = (0..=OPERATIONS_IN_FLIGHT_MAX)
+        .map(|_| tracing::info_span!("test.filled", operation = "test.filled"))
+        .collect();
+
+    let snapshot = recorder.metrics();
+    let untracked = snapshot
+        .find("operation.untracked", &[])
+        .expect("the refused entry is counted");
+    assert_eq!(untracked.unit(), "{operation}");
+    assert_eq!(untracked.value(), &crate::SeriesValue::Sum(1.0));
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the table bound converts exactly"
+    )]
+    let tracked = OPERATIONS_IN_FLIGHT_MAX as f64;
+    assert_eq!(
+        snapshot
+            .find("operation.active", &[("span.name", "test.filled")])
+            .map(|series| series.value().clone()),
+        Some(crate::SeriesValue::Sum(tracked))
+    );
+    drop(open);
+}

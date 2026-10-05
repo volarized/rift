@@ -97,7 +97,7 @@ def test_code_behind_an_inactive_feature_is_listed(tmp_path: Path) -> None:
         [dependency("opentelemetry_sdk", optional=True)],
         {
             "src/export.rs": (
-                '#[cfg(feature = "otlp")]\n'
+                '#[cfg(feature = "export")]\n'
                 "mod export {\n"
                 "    use opentelemetry_sdk::trace::Tracer;\n"
                 "}\n"
@@ -286,7 +286,7 @@ def test_target_table_declaration_names_its_line(tmp_path: Path) -> None:
         (
             f"consumer: {manifest}:4: [target.'cfg(windows)'.dependencies."
             "opentelemetry_sdk]: declares opentelemetry_sdk; remove the line and "
-            "build with the otlp feature, which rift-tracing owns"
+            "export through rift-tracing, which owns the OTLP export"
         )
     ]
 

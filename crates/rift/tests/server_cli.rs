@@ -1075,18 +1075,18 @@ fn sigterm_stops_a_foreground_server_through_its_stop() -> TestResult {
 }
 
 /// Every OTLP/HTTP export request one receiver answered, with when it arrived.
-#[cfg(all(unix, feature = "otlp"))]
+#[cfg(unix)]
 type ReceivedExports = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, usize)>>>;
 
 /// An OTLP/HTTP receiver on a loopback port that records each export and answers success.
-#[cfg(all(unix, feature = "otlp"))]
+#[cfg(unix)]
 struct TraceReceiver {
     _runtime: tokio::runtime::Runtime,
     port: u16,
     exports: ReceivedExports,
 }
 
-#[cfg(all(unix, feature = "otlp"))]
+#[cfg(unix)]
 impl TraceReceiver {
     fn start() -> TestResult<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1133,10 +1133,10 @@ impl TraceReceiver {
 
 /// The batch processor's export interval the flush test sets: ten minutes, so no scheduled
 /// export runs while the server serves and only the shutdown flush sends its spans.
-#[cfg(all(unix, feature = "otlp"))]
+#[cfg(unix)]
 const EXPORT_INTERVAL_PAST_THE_TEST_MS: &str = "600000";
 
-#[cfg(all(unix, feature = "otlp"))]
+#[cfg(unix)]
 #[test]
 fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     let directory = workspace()?;

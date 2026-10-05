@@ -3,8 +3,9 @@
 //!
 //! The first recorder a process installs builds one meter provider whose reader exports
 //! into the SDK's `InMemoryMetricExporter`, with cumulative temporality, and installs its
-//! meter. A read flushes the provider and takes the newest export: every series the SDK
-//! aggregated since the meter was installed. Nothing here aggregates; a series is one
+//! meter. The provider bounds each instrument at [`CARDINALITY_LIMIT`](crate::CARDINALITY_LIMIT)
+//! series, as the OTLP export's provider does. A read flushes the provider and takes the
+//! newest export: every series the SDK aggregated since the meter was installed. Nothing here aggregates; a series is one
 //! exported point, its labels and value as the SDK reported them.
 
 use std::sync::OnceLock;
@@ -34,6 +35,9 @@ fn meters() -> &'static RecorderMeters {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
             .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .with_view(crate::metrics::cardinality_view(
+                crate::metrics::CARDINALITY_LIMIT,
+            ))
             .build();
         crate::metrics::install_meter(provider.meter_with_scope(crate::metrics::scope()));
         RecorderMeters { provider, exporter }

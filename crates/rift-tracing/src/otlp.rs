@@ -1,49 +1,53 @@
-//! Optional OTLP export of Rift's `tracing` spans and metrics, behind the `otlp` cargo
-//! feature.
+//! The OTLP export of Rift's `tracing` spans and metrics.
 //!
-//! The `rift` binary's `otlp` feature turns this crate's on. Off by default, so a release
-//! binary built without `--features otlp` carries no
-//! OpenTelemetry export stack. Compiled in, the process still exports nothing until an
-//! operator sets an OTLP endpoint variable - for the in-memory collector `just
-//! trace-collector` runs, or any other OTLP/HTTP receiver. Spans export when
-//! `OTEL_EXPORTER_OTLP_ENDPOINT` is set; metrics when it or
-//! `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is.
+//! Every build carries the export, and a process exports nothing until an operator sets an
+//! OTLP endpoint variable - for the in-memory collector `just trace-collector` runs, or any
+//! other OTLP/HTTP receiver. Spans export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set;
+//! metrics when it or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is.
+//!
+//! Every exported span and metric carries the resource attributes `service.name` (`rift`),
+//! `service.version` (the workspace version), `service.instance.id` (random per process),
+//! and `process.pid`, so a collector that receives from several servers tells them apart.
 
-#[cfg(feature = "otlp")]
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
-#[cfg(feature = "otlp")]
 use opentelemetry::trace::TracerProvider as _;
-#[cfg(feature = "otlp")]
 use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig as _};
-#[cfg(feature = "otlp")]
 use opentelemetry_sdk::Resource;
-#[cfg(feature = "otlp")]
+use opentelemetry_sdk::error::OTelSdkError;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-#[cfg(feature = "otlp")]
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
-#[cfg(feature = "otlp")]
 use opentelemetry_sdk::runtime;
-#[cfg(feature = "otlp")]
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
-#[cfg(feature = "otlp")]
-use opentelemetry_sdk::trace::{BatchConfig, SdkTracerProvider};
-
+use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, SdkTracerProvider};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{LevelFilter, Targets};
-#[cfg(feature = "otlp")]
 use tracing_subscriber::registry::LookupSpan;
 
 /// The `service.name` resource attribute every exported span and metric carries.
-#[cfg(feature = "otlp")]
 const SERVICE_NAME: &str = "rift";
+/// The `service.version` resource attribute: the workspace version every Rift crate takes,
+/// the one `rift --version` starts with.
+const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Overrides the export layer's own filter; unset, [`DEFAULT_OTLP_FILTER`] applies.
-#[cfg(feature = "otlp")]
 const RIFT_OTLP_FILTER_VAR: &str = "RIFT_OTLP_FILTER";
 /// Keeps Rift's own crates - the ones `traced!` instruments - at info; a dependency's own
 /// spans stay out unless the operator names it.
-#[cfg(feature = "otlp")]
 const DEFAULT_OTLP_FILTER: &str =
     "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info";
+
+/// Most time one export of metrics or of a span batch takes before the SDK gives it up,
+/// when `OTEL_METRIC_EXPORT_TIMEOUT` or `OTEL_BSP_EXPORT_TIMEOUT` sets none: the SDK's own
+/// default is 30 s. A given-up export is reported on stderr and its points sent again by
+/// the next cumulative export.
+pub(crate) const OTLP_EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The variable the SDK reads the metric export timeout from.
+const METRIC_EXPORT_TIMEOUT_VAR: &str = "OTEL_METRIC_EXPORT_TIMEOUT";
+/// The variable the SDK reads the span export timeout from.
+const SPAN_EXPORT_TIMEOUT_VAR: &str = "OTEL_BSP_EXPORT_TIMEOUT";
 
 /// The target the OpenTelemetry SDK's own reports carry.
 pub(crate) const SDK_TARGET: &str = "opentelemetry_sdk";
@@ -55,75 +59,195 @@ pub(crate) const SDK_TARGET: &str = "opentelemetry_sdk";
 /// variable is unset, and drops a span it cannot queue. It reports the first drop and the
 /// dropped total at shutdown as warnings, and a failed export as an error, so a full queue
 /// or an unreachable collector reaches the operator instead of thinning the trace unseen.
-/// A build without the `otlp` feature links no SDK, and the target matches nothing.
 pub(crate) fn sdk_reports() -> Targets {
     Targets::new().with_target(SDK_TARGET, LevelFilter::WARN)
 }
 
-/// The installed exporter's tracer and meter providers, held so the caller can flush and
-/// shut them down before the process exits.
-///
-/// Holds nothing when the `otlp` feature is not compiled in, or when no collector
-/// endpoint was configured; [`Export::shutdown`] is then a no-op.
-pub(crate) struct Export {
-    #[cfg(feature = "otlp")]
-    provider: Option<SdkTracerProvider>,
-    #[cfg(feature = "otlp")]
+/// The installed exporter's tracer and meter providers, shut down at most once.
+struct Providers {
+    tracer: Option<SdkTracerProvider>,
     meters: Option<SdkMeterProvider>,
 }
 
-impl Export {
-    /// Flushes buffered spans and shuts the tracer provider down.
-    ///
-    /// A collector that is unreachable at shutdown is not this process's failure: the
-    /// server has already finished serving, and losing the last batch of spans must not
-    /// turn a clean run into a nonzero exit status.
-    #[cfg_attr(
-        not(feature = "otlp"),
-        expect(
-            clippy::unused_self,
-            reason = "a build without the otlp feature holds no provider to shut down"
-        )
-    )]
-    pub(crate) fn shutdown(self) {
-        #[cfg(feature = "otlp")]
-        if let Some(provider) = self.provider
-            && let Err(error) = provider.shutdown()
-        {
-            eprintln!("rift: warning: otlp shutdown failed: {error}");
+/// The process's OTLP export: the installed tracer and meter providers, held so the process
+/// flushes and shuts them down before it exits.
+///
+/// Holds nothing when no collector endpoint was configured; [`Self::shutdown`] then
+/// answers at once, as it does for [`OtlpExport::default`]. Clones share the providers, and
+/// the first shutdown takes them, so a later one answers at once.
+#[derive(Clone, Default)]
+pub struct OtlpExport {
+    providers: Arc<Mutex<Option<Providers>>>,
+}
+
+impl std::fmt::Debug for OtlpExport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self
+            .providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|providers| (providers.tracer.is_some(), providers.meters.is_some()));
+        formatter
+            .debug_struct("OtlpExport")
+            .field("tracer_and_meters", &held)
+            .finish()
+    }
+}
+
+/// Why an export shutdown did not end cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportShutdownError {
+    /// The deadline passed first. The shutdown keeps running on its own thread until the
+    /// process exits, and the points and spans it had not sent are lost.
+    TimedOut,
+    /// The final export or the shutdown failed, with the SDK's words.
+    Failed(String),
+}
+
+impl std::fmt::Display for ExportShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => formatter.write_str("the otlp export shutdown passed its deadline"),
+            Self::Failed(reason) => write!(formatter, "the otlp export shutdown failed: {reason}"),
         }
-        #[cfg(feature = "otlp")]
-        if let Some(meters) = self.meters
-            && let Err(error) = meters.shutdown()
-        {
-            eprintln!("rift: warning: otlp metric shutdown failed: {error}");
+    }
+}
+
+impl std::error::Error for ExportShutdownError {}
+
+impl OtlpExport {
+    /// An export that holds `tracer` and `meters`.
+    fn holding(tracer: Option<SdkTracerProvider>, meters: Option<SdkMeterProvider>) -> Self {
+        Self {
+            providers: Arc::new(Mutex::new(Some(Providers { tracer, meters }))),
         }
     }
 
     /// Makes the meter provider's meter the one every instrument records into, when one
     /// exports. The runtime calls it once its subscriber is installed.
-    #[cfg_attr(
-        not(feature = "otlp"),
-        expect(
-            clippy::unused_self,
-            reason = "a build without the otlp feature holds no meter provider"
-        )
-    )]
     pub(crate) fn install_meter(&self) {
-        #[cfg(feature = "otlp")]
-        if let Some(meters) = &self.meters {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(meters) = providers.as_ref().and_then(|held| held.meters.as_ref()) {
             crate::metrics::install_meter(meters.meter_with_scope(crate::metrics::scope()));
+        }
+    }
+
+    /// Flushes buffered spans and the final metric points, and shuts both providers down,
+    /// by `deadline`.
+    ///
+    /// The SDK's shutdown calls block and the async-runtime reader and batch processor
+    /// ignore the timeout they are handed: each waits for its worker task, which runs one
+    /// more export bounded by the export timeout alone. Each shutdown therefore runs on a
+    /// thread of its own, and this call stops waiting at `deadline` whatever the export
+    /// timeouts are set to. A thread past `deadline` keeps running until the process exits;
+    /// the runtime that drives the export is never asked to wait for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportShutdownError::TimedOut`] when `deadline` passed first, and
+    /// [`ExportShutdownError::Failed`] when a provider reported a failed final export or
+    /// shutdown. Neither is the process's failure: the export carries diagnostics only.
+    pub async fn shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let taken = self
+            .providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(Providers { tracer, meters }) = taken else {
+            return Ok(());
+        };
+        let tracer = tracer.map(|tracer| shut_down_on_thread(move || tracer.shutdown()));
+        let meters = meters.map(|meters| shut_down_on_thread(move || meters.shutdown()));
+        let waited = tokio::time::timeout_at(deadline, async move {
+            let mut failures = Vec::new();
+            for answer in [tracer, meters].into_iter().flatten() {
+                match answer.await {
+                    Ok(Ok(()) | Err(OTelSdkError::AlreadyShutdown)) => {}
+                    Ok(Err(error)) => failures.push(error.to_string()),
+                    Err(_) => failures.push("the shutdown thread did not start".to_owned()),
+                }
+            }
+            failures
+        })
+        .await;
+        match waited {
+            Err(_) => Err(ExportShutdownError::TimedOut),
+            Ok(failures) if failures.is_empty() => Ok(()),
+            Ok(failures) => Err(ExportShutdownError::Failed(failures.join("; "))),
         }
     }
 }
 
+/// Runs `shutdown` on a thread of its own, and answers its result when it returns.
+fn shut_down_on_thread(
+    shutdown: impl FnOnce() -> Result<(), OTelSdkError> + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<Result<(), OTelSdkError>> {
+    let (sent, answer) = tokio::sync::oneshot::channel();
+    // A thread that cannot start drops `sent`, and the answer reports it.
+    let _ = std::thread::Builder::new()
+        .name("rift-otlp-shutdown".to_owned())
+        .spawn(move || {
+            let _ = sent.send(shutdown());
+        });
+    answer
+}
+
 /// The variables that name where metrics export: the metrics endpoint, used as it is, or
 /// the base endpoint, which the exporter extends with `/v1/metrics`.
-#[cfg(feature = "otlp")]
 const METRIC_ENDPOINT_VARS: [&str; 2] = [
     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 ];
+
+/// Whether the process sets `variable`.
+fn configured(variable: &str) -> bool {
+    std::env::var_os(variable).is_some()
+}
+
+/// The resource every exported span and metric carries: `service.name`, `service.version`,
+/// a random `service.instance.id` in the UUID version 4 form, and `process.pid`.
+fn resource() -> Resource {
+    let mut builder = Resource::builder()
+        .with_service_name(SERVICE_NAME)
+        .with_attribute(KeyValue::new("service.version", SERVICE_VERSION));
+    if let Some(instance) = instance_id() {
+        builder = builder.with_attribute(KeyValue::new("service.instance.id", instance));
+    }
+    builder
+        .with_attribute(KeyValue::new("process.pid", i64::from(std::process::id())))
+        .build()
+}
+
+/// A random identifier in the UUID version 4 form, `None` when the platform's random
+/// source fails.
+fn instance_id() -> Option<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
 
 /// Installs an OTLP/HTTP export layer when `OTEL_EXPORTER_OTLP_ENDPOINT` names a
 /// collector, `None` otherwise, beside a meter provider when a metric endpoint variable
@@ -142,14 +266,13 @@ const METRIC_ENDPOINT_VARS: [&str; 2] = [
 /// default batch processor exports on a dedicated `std::thread` through
 /// `futures_executor::block_on`, which has no Tokio reactor to poll an async HTTP client
 /// on, and Rift never uses `reqwest::blocking`. Checking the endpoint variables before
-/// building anything keeps the feature from silently dialing OTLP's default
-/// `http://localhost:4318` the moment it is compiled in.
-#[cfg(feature = "otlp")]
-pub(crate) fn layer<S>() -> (Option<impl Layer<S> + Send + Sync>, Export)
+/// building anything keeps the export from silently dialing OTLP's default
+/// `http://localhost:4318`.
+pub(crate) fn layer<S>() -> (Option<impl Layer<S> + Send + Sync>, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    let configured = |variable: &str| std::env::var_os(variable).is_some();
+    let resource = resource();
     let meters = if METRIC_ENDPOINT_VARS
         .iter()
         .any(|variable| configured(variable))
@@ -159,7 +282,7 @@ where
             .with_protocol(Protocol::HttpBinary)
             .build()
         {
-            Ok(exporter) => Some(meter_provider(exporter)),
+            Ok(exporter) => Some(meter_provider(exporter, resource.clone())),
             Err(error) => {
                 eprintln!("rift: warning: otlp metric exporter did not build: {error}");
                 None
@@ -169,13 +292,7 @@ where
         None
     };
     if !configured("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        return (
-            None,
-            Export {
-                provider: None,
-                meters,
-            },
-        );
+        return (None, OtlpExport::holding(None, meters));
     }
     let exporter = match SpanExporter::builder()
         .with_http()
@@ -185,43 +302,54 @@ where
         Ok(exporter) => exporter,
         Err(error) => {
             eprintln!("rift: warning: otlp exporter did not build: {error}");
-            return (
-                None,
-                Export {
-                    provider: None,
-                    meters,
-                },
-            );
+            return (None, OtlpExport::holding(None, meters));
         }
     };
-    let provider = tracer_provider(exporter, BatchConfig::default());
+    let provider = tracer_provider(exporter, batch_config(), resource);
     let filter = std::env::var(RIFT_OTLP_FILTER_VAR)
         .ok()
         .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_OTLP_FILTER));
     (
         Some(export_layer(&provider, filter)),
-        Export {
-            provider: Some(provider),
-            meters,
-        },
+        OtlpExport::holding(Some(provider), meters),
     )
+}
+
+/// The batch processor's settings: the SDK's, read from the `OTEL_BSP_*` variables, with
+/// [`OTLP_EXPORT_TIMEOUT`] when `OTEL_BSP_EXPORT_TIMEOUT` sets no export timeout.
+fn batch_config() -> BatchConfig {
+    let builder = BatchConfigBuilder::default();
+    if configured(SPAN_EXPORT_TIMEOUT_VAR) {
+        builder.build()
+    } else {
+        builder.with_max_export_timeout(OTLP_EXPORT_TIMEOUT).build()
+    }
 }
 
 /// The meter provider that exports what every instrument records into `exporter`.
 ///
 /// Its reader exports on the Tokio runtime, at `OTEL_METRIC_EXPORT_INTERVAL` or the SDK's
 /// 60 s default, so the OTLP exporter posts over the same async `reqwest` client the span
-/// batches use. Must be called inside a Tokio runtime.
-#[cfg(feature = "otlp")]
-fn meter_provider<E>(exporter: E) -> SdkMeterProvider
+/// batches use. One export takes at most `OTEL_METRIC_EXPORT_TIMEOUT`, or
+/// [`OTLP_EXPORT_TIMEOUT`] when the variable is unset. Must be called inside a Tokio
+/// runtime.
+fn meter_provider<E>(exporter: E, resource: Resource) -> SdkMeterProvider
 where
     E: opentelemetry_sdk::metrics::exporter::PushMetricExporter,
 {
-    let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
+    let reader = PeriodicReader::builder(exporter, runtime::Tokio);
+    let reader = if configured(METRIC_EXPORT_TIMEOUT_VAR) {
+        reader
+    } else {
+        reader.with_timeout(OTLP_EXPORT_TIMEOUT)
+    };
     SdkMeterProvider::builder()
         .with_resource(resource)
-        .with_reader(PeriodicReader::builder(exporter, runtime::Tokio).build())
+        .with_reader(reader.build())
+        .with_view(crate::metrics::cardinality_view(
+            crate::metrics::CARDINALITY_LIMIT,
+        ))
         .build()
 }
 
@@ -229,15 +357,13 @@ where
 ///
 /// Must be called inside a Tokio runtime: the batch processor spawns its export task
 /// there.
-#[cfg(feature = "otlp")]
-fn tracer_provider<E>(exporter: E, batch: BatchConfig) -> SdkTracerProvider
+fn tracer_provider<E>(exporter: E, batch: BatchConfig, resource: Resource) -> SdkTracerProvider
 where
     E: opentelemetry_sdk::trace::SpanExporter + 'static,
 {
     let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
         .with_batch_config(batch)
         .build();
-    let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
     SdkTracerProvider::builder()
         .with_resource(resource)
         .with_span_processor(processor)
@@ -248,7 +374,6 @@ where
 ///
 /// `filter` is reevaluated at every span, so a span the export filter enables reaches
 /// `provider` whatever pass another layer's filter ran last on that thread.
-#[cfg(feature = "otlp")]
 fn export_layer<S>(
     provider: &SdkTracerProvider,
     filter: tracing_subscriber::EnvFilter,
@@ -261,16 +386,7 @@ where
         .with_filter(crate::runtime::reevaluated(filter))
 }
 
-/// Always `None`: no exporter exists to install without the `otlp` feature.
-#[cfg(not(feature = "otlp"))]
-pub(crate) fn layer<S>() -> (Option<impl Layer<S> + Send + Sync>, Export)
-where
-    S: tracing::Subscriber,
-{
-    (None::<tracing_subscriber::layer::Identity>, Export {})
-}
-
-#[cfg(all(test, feature = "otlp"))]
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -281,7 +397,9 @@ mod tests {
     use tracing_subscriber::layer::{Context, SubscriberExt as _};
     use tracing_subscriber::{EnvFilter, Layer};
 
-    use super::{Export, export_layer, meter_provider, tracer_provider};
+    use super::{
+        ExportShutdownError, OtlpExport, export_layer, meter_provider, resource, tracer_provider,
+    };
 
     /// Spans each test ends; enough that one lost span shows as a count mismatch.
     const SPANS: usize = 32;
@@ -442,7 +560,7 @@ mod tests {
         let runtime = runtime();
         let _entered = runtime.enter();
         let exporter = RecordingExporter::default();
-        let provider = tracer_provider(exporter.clone(), BatchConfig::default());
+        let provider = tracer_provider(exporter.clone(), BatchConfig::default(), resource());
         let stderr = tracing_subscriber::fmt::layer()
             .with_writer(std::io::sink)
             .with_filter(EnvFilter::new("warn,rift=info"));
@@ -470,7 +588,7 @@ mod tests {
         let runtime = runtime();
         let _entered = runtime.enter();
         let batch = BatchConfigBuilder::default().with_max_queue_size(1).build();
-        let provider = tracer_provider(StalledExporter, batch);
+        let provider = tracer_provider(StalledExporter, batch, resource());
         let stderr = Reports::default();
         let filter = crate::runtime::stderr_filter(EnvFilter::new("rift=info"));
         let subscriber = tracing_subscriber::registry().with(stderr.clone().with_filter(filter));
@@ -498,22 +616,47 @@ mod tests {
         );
     }
 
+    /// A metric exporter whose export never finishes: a collector that accepted the
+    /// connection and never answers.
+    #[derive(Debug)]
+    struct StalledMetricExporter;
+
+    impl opentelemetry_sdk::metrics::exporter::PushMetricExporter for StalledMetricExporter {
+        fn export(
+            &self,
+            _metrics: &opentelemetry_sdk::metrics::data::ResourceMetrics,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            std::future::pending()
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn temporality(&self) -> opentelemetry_sdk::metrics::Temporality {
+            opentelemetry_sdk::metrics::Temporality::Cumulative
+        }
+    }
+
     /// A value an instrument records reaches the meter provider the export installed,
-    /// under the instrument's own name and unit.
+    /// under the instrument's own name and unit, and the shutdown sends it.
     #[test]
     fn every_recorded_instrument_reaches_the_meter_provider() {
         let runtime = runtime();
         let _entered = runtime.enter();
         let exporter = RecordingMetricExporter::default();
-        let export = Export {
-            provider: None,
-            meters: Some(meter_provider(exporter.clone())),
-        };
+        let meters = meter_provider(exporter.clone(), resource());
+        let export = OtlpExport::holding(None, Some(meters.clone()));
         export.install_meter();
         crate::traced!(component = "search", operation = "search.request", {});
-        crate::metrics().memory.value(4096).record();
-        let provider = export.meters.as_ref().expect("the export holds its meters");
-        provider
+        assert!(crate::sampler::observe_process(
+            crate::sampler::SystemProcessReader::current()
+        ));
+        meters
             .force_flush()
             .expect("the reader collects and exports");
         let received = exporter
@@ -525,12 +668,77 @@ mod tests {
             ("traces.span.metrics.calls", "{call}"),
             ("traces.span.metrics.duration", "s"),
             ("process.memory.usage", "By"),
+            ("process.cpu.time", "s"),
         ] {
             assert!(
                 received.contains(&(name.to_owned(), unit.to_owned())),
                 "{name} in {unit} must be exported: {received:?}"
             );
         }
-        export.shutdown();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(runtime.block_on(export.shutdown(deadline)), Ok(()));
+        assert_eq!(
+            runtime.block_on(export.shutdown(deadline)),
+            Ok(()),
+            "a second shutdown finds nothing to shut down"
+        );
+    }
+
+    /// The bound the shutdown test waits at most past its deadline: thread start and the
+    /// answer's wake.
+    const SHUTDOWN_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// A collector that never answers holds the final metric export and the span flush;
+    /// the shutdown stops waiting at its deadline, long before the export timeout.
+    #[test]
+    fn a_stalled_collector_ends_the_shutdown_at_its_deadline() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let meters = meter_provider(StalledMetricExporter, resource());
+        let tracer = tracer_provider(StalledExporter, BatchConfig::default(), resource());
+        tracer.tracer("stalled").start("queued").end();
+        let export = OtlpExport::holding(Some(tracer), Some(meters));
+        let bound = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let ended = runtime.block_on(export.shutdown(tokio::time::Instant::now() + bound));
+        let elapsed = started.elapsed();
+        assert_eq!(ended, Err(ExportShutdownError::TimedOut));
+        assert!(
+            elapsed >= bound && elapsed < bound + SHUTDOWN_SLACK,
+            "the shutdown ends at its deadline: elapsed={elapsed:?}, bound={bound:?}"
+        );
+        assert!(bound + SHUTDOWN_SLACK < super::OTLP_EXPORT_TIMEOUT);
+    }
+
+    /// Every exported span and metric names the service, its version, this process's
+    /// instance, and its process identifier.
+    #[test]
+    fn the_resource_names_the_service_instance_and_process() {
+        use opentelemetry::{Key, Value};
+        let resource = resource();
+        assert_eq!(
+            resource.get(&Key::new("service.name")),
+            Some(Value::from("rift"))
+        );
+        assert_eq!(
+            resource.get(&Key::new("service.version")),
+            Some(Value::from(env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(
+            resource.get(&Key::new("process.pid")),
+            Some(Value::I64(i64::from(std::process::id())))
+        );
+        let instance = resource
+            .get(&Key::new("service.instance.id"))
+            .expect("the resource carries an instance identifier")
+            .to_string();
+        let groups: Vec<usize> = instance.split('-').map(str::len).collect();
+        assert_eq!(groups, [8, 4, 4, 4, 12], "{instance}");
+        assert_eq!(&instance[14..15], "4", "version 4: {instance}");
+        assert_ne!(
+            super::instance_id(),
+            Some(instance),
+            "each call draws a new identifier"
+        );
     }
 }

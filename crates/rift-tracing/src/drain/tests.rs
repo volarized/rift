@@ -402,9 +402,17 @@ async fn a_stop_behind_a_held_metrics_lock_warns_with_the_unwritten_count() {
     let unwritten = running
         .stop(tokio::time::Instant::now() + Duration::from_millis(500))
         .await;
+    let snapshot = recorder.metrics();
     drop(recorder);
 
     assert_eq!(unwritten, Some(ACCEPTED));
+    let dropped = snapshot
+        .find("log.queue.dropped", &[("error.type", "unwritten")])
+        .expect("the stop counts the records it never wrote");
+    assert_eq!(dropped.unit(), "{record}");
+    #[expect(clippy::cast_precision_loss, reason = "four records convert exactly")]
+    let expected = ACCEPTED as f64;
+    assert_eq!(dropped.value(), &crate::SeriesValue::Sum(expected));
     let warning = records
         .queued_records()
         .into_iter()
@@ -546,4 +554,26 @@ async fn a_stalled_log_drain_is_aborted_at_its_deadline() {
         STOP_DEADLINE,
         "the stop aborts the drain at its deadline"
     );
+}
+
+/// A record the full queue refuses adds one to `log.queue.dropped` with `error.type`
+/// `queue_full`, beside the sink's own count.
+#[test]
+fn a_full_queue_counts_each_refused_record_in_log_queue_dropped() {
+    let (recorder, _records) = crate::ScopedRecorder::builder()
+        .install()
+        .expect("the default filter parses");
+    let (sink, _drain) = log_capture();
+    for index in 0..=LOG_QUEUE_RECORDS {
+        sink.send(record(&format!("record {index}")));
+    }
+    assert_eq!(sink.dropped(), 1, "the queue refused one record");
+
+    let snapshot = recorder.metrics();
+    let dropped = snapshot
+        .find("log.queue.dropped", &[("error.type", "queue_full")])
+        .expect("the refused record is counted");
+    assert_eq!(dropped.unit(), "{record}");
+    assert_eq!(dropped.labels(), [("error.type", "queue_full")]);
+    assert_eq!(dropped.value(), &crate::SeriesValue::Sum(1.0));
 }

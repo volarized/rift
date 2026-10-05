@@ -4,14 +4,21 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::{
-    Counter, DURATION_BOUNDARIES_SECONDS, Gauge, Histogram, completion, meter_installed, metrics,
+    CARDINALITY_LIMIT, Counter, DURATION_BOUNDARIES_SECONDS, Gauge, Histogram,
+    ObservableUpDownCounter, completion, meter_installed,
 };
 use crate::{MetricSnapshot, ScopedRecorder, SeriesValue};
 
-static DROPS: Counter<1> = Counter::declare("log.queue.dropped", "{record}", &["error.type"]);
+static DROPS: Counter<1> = Counter::declare("test.dropped", "{record}", &["error.type"]);
 static PLAIN: Counter<0> = Counter::declare("test.plain", "{event}", &[]);
 static QUEUE: Gauge<u64, 0> = Gauge::declare("test.queue.length", "{task}", &[]);
-static RATIO: Gauge<f64, 0> = Gauge::declare("test.ratio", "1", &[]).scaled(0.01);
+static RATIO: Gauge<f64, 0> = Gauge::declare("test.ratio", "1", &[]);
+static HELD: ObservableUpDownCounter<1> =
+    ObservableUpDownCounter::declare("test.held", "{item}", &["test.kind"]);
+static CHURNED: ObservableUpDownCounter<0> =
+    ObservableUpDownCounter::declare("test.churned", "{item}", &[]);
+static BOUNDED: ObservableUpDownCounter<0> =
+    ObservableUpDownCounter::declare("test.bounded", "{item}", &[]);
 static WAIT: Histogram<0> = Histogram::declare("test.wait.duration", &[]);
 static SHORT: Histogram<0> = Histogram::declare("test.short.duration", &[]).boundaries(&[0.1, 1.0]);
 static STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
@@ -35,7 +42,7 @@ fn value(snapshot: &MetricSnapshot, name: &str, labels: &[(&str, &str)]) -> Opti
 }
 
 fn calls(snapshot: &MetricSnapshot, operation: &str, outcome: &[(&str, &str)]) -> Option<f64> {
-    let mut labels = vec![("span.name", operation)];
+    let mut labels = vec![("span.name", operation), ("span.kind", "Internal")];
     labels.extend_from_slice(outcome);
     match value(snapshot, "traces.span.metrics.calls", &labels)? {
         SeriesValue::Sum(sum) => Some(sum),
@@ -65,15 +72,11 @@ fn counter_adds_into_the_series_its_labels_select() {
         Some(SeriesValue::Sum(5.0))
     );
     assert_eq!(
-        value(
-            &snapshot,
-            "log.queue.dropped",
-            &[("error.type", "queue_full")]
-        ),
+        value(&snapshot, "test.dropped", &[("error.type", "queue_full")]),
         Some(SeriesValue::Sum(4.0))
     );
     let series = snapshot
-        .find("log.queue.dropped", &[("error.type", "unwritten")])
+        .find("test.dropped", &[("error.type", "unwritten")])
         .expect("the series exists");
     assert_eq!(series.value(), &SeriesValue::Sum(1.0));
     assert_eq!(series.unit(), "{record}");
@@ -130,11 +133,11 @@ fn a_selection_records_only_when_record_runs() {
 }
 
 #[test]
-fn gauge_keeps_the_latest_value_scaled_into_its_unit() {
+fn gauge_keeps_the_latest_value() {
     let recorder = recorder();
     QUEUE.value(3).record();
     QUEUE.value(9).record();
-    RATIO.value(250.0).record();
+    RATIO.value(2.5).record();
 
     let snapshot = recorder.metrics();
     assert_eq!(
@@ -143,8 +146,7 @@ fn gauge_keeps_the_latest_value_scaled_into_its_unit() {
     );
     assert_eq!(
         value(&snapshot, "test.ratio", &[]),
-        Some(SeriesValue::Last(2.5)),
-        "a percent past 100 records a utilization past 1"
+        Some(SeriesValue::Last(2.5))
     );
 }
 
@@ -156,7 +158,7 @@ fn a_float_that_measures_nothing_records_nothing() {
     }
     assert_eq!(value(&recorder.metrics(), "test.ratio", &[]), None);
 
-    RATIO.value(50.0).record();
+    RATIO.value(0.5).record();
     RATIO.value(f64::NAN).record();
     assert_eq!(
         value(&recorder.metrics(), "test.ratio", &[]),
@@ -165,22 +167,102 @@ fn a_float_that_measures_nothing_records_nothing() {
     );
 }
 
+/// Without a meter a read would report nothing, and none registers.
 #[test]
-fn the_process_instruments_carry_their_units() {
+fn a_process_without_a_meter_registers_no_observation() {
+    assert!(
+        HELD.observe(|observation| observation.observe(["any"], 1))
+            .is_none()
+    );
+}
+
+/// A registered read reports at every collection, under its own labels and unit, until its
+/// guard drops; the next collection then exports none of its series.
+#[test]
+fn an_observation_reports_at_each_collection_until_its_guard_drops() {
     let recorder = recorder();
-    metrics().memory.value(4096).record();
-    metrics().cpu.value(12.5).record();
-    let snapshot = recorder.metrics();
-    let memory = snapshot
-        .find("process.memory.usage", &[])
-        .expect("memory is recorded");
-    assert_eq!(memory.value(), &SeriesValue::Last(4096.0));
-    assert_eq!(memory.unit(), "By");
-    let cpu = snapshot
-        .find("process.cpu.utilization", &[])
-        .expect("CPU is recorded");
-    assert_eq!(cpu.value(), &SeriesValue::Last(0.125));
-    assert_eq!(cpu.unit(), "1");
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
+    let read = std::sync::Arc::downgrade(&held);
+    let guard = HELD
+        .observe(move |observation| {
+            if let Some(held) = read.upgrade() {
+                observation.observe(["parse"], held.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        })
+        .expect("a recorder installed the meter");
+    let held_now = |recorder: &ScopedRecorder| {
+        recorder
+            .metrics()
+            .find("test.held", &[("test.kind", "parse")])
+            .map(|series| (series.unit().to_owned(), series.value().clone()))
+    };
+    assert_eq!(
+        held_now(&recorder),
+        Some(("{item}".to_owned(), SeriesValue::Sum(3.0)))
+    );
+    held.store(7, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        held_now(&recorder),
+        Some(("{item}".to_owned(), SeriesValue::Sum(7.0))),
+        "each collection reads the quantity anew"
+    );
+    drop(guard);
+    assert_eq!(held_now(&recorder), None, "a dropped guard reports nothing");
+    assert_eq!(
+        std::sync::Arc::strong_count(&held),
+        1,
+        "the read kept no strong reference to its owner"
+    );
+}
+
+/// Owners that open and drop a thousand times leave one SDK callback and an empty list:
+/// the guard's drop removes its read, and no registration repeats.
+#[test]
+fn a_thousand_owners_leave_one_callback_and_no_read() {
+    let recorder = recorder();
+    let before = CHURNED.registered();
+    for _ in 0..1_000 {
+        let guard = CHURNED
+            .observe(|observation| observation.observe([], 1))
+            .expect("a recorder installed the meter");
+        assert_eq!(CHURNED.registered(), before + 1);
+        drop(guard);
+    }
+    assert!(CHURNED.callback_registered());
+    assert_eq!(CHURNED.registered(), before);
+    assert_eq!(
+        value(&recorder.metrics(), "test.churned", &[]),
+        None,
+        "no dropped owner reports"
+    );
+}
+
+/// Past `OBSERVATIONS_MAX` reads the instrument refuses the next one, records the refusal
+/// once however many follow, and accepts again once a guard drops.
+#[test]
+fn a_read_past_the_bound_is_refused_and_recorded_once() -> Result<(), Box<dyn std::error::Error>> {
+    let (_recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let mut guards: Vec<_> = (0..super::OBSERVATIONS_MAX)
+        .map(|_| BOUNDED.observe(|observation| observation.observe([], 1)))
+        .collect::<Option<_>>()
+        .ok_or("every read under the bound registers")?;
+    for _ in 0..3 {
+        assert!(BOUNDED.observe(|_| {}).is_none(), "the bound refuses");
+    }
+    let refusals = drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| record.message() == "observable instrument refused a read past its bound")
+        .collect::<Vec<_>>();
+    assert_eq!(refusals.len(), 1, "the refusal is recorded once");
+    assert_eq!(refusals[0].level(), "warn");
+    assert!(refusals[0].fields().contains("test.bounded"));
+    guards.pop();
+    assert!(
+        BOUNDED.observe(|_| {}).is_some(),
+        "a dropped guard frees a place"
+    );
+    Ok(())
 }
 
 #[test]
@@ -265,7 +347,7 @@ fn a_block_records_one_finished_call_and_its_duration_on_every_path_out() {
         Some(2.0),
         "a block left through `?` finished"
     );
-    let mut labels = vec![("span.name", "test.block")];
+    let mut labels = vec![("span.name", "test.block"), ("span.kind", "Internal")];
     labels.extend_from_slice(&OK);
     assert!(matches!(
         self::value(&snapshot, "traces.span.metrics.duration", &labels),
@@ -344,7 +426,11 @@ fn every_operation_instrument_names_the_span_metrics_connector_spelling() {
     let recorder = recorder();
     crate::traced!("test.spelled", {});
     let snapshot = recorder.metrics();
-    let labels = [("span.name", "test.spelled"), ("status.code", "Ok")];
+    let labels = [
+        ("span.name", "test.spelled"),
+        ("span.kind", "Internal"),
+        ("status.code", "Ok"),
+    ];
     let duration = snapshot
         .find("traces.span.metrics.duration", &labels)
         .expect("the duration is recorded");
@@ -353,6 +439,125 @@ fn every_operation_instrument_names_the_span_metrics_connector_spelling() {
         .expect("the call is recorded");
     assert_eq!(duration.unit(), "s");
     assert_eq!(calls.unit(), "{call}");
+    assert_eq!(
+        calls.labels(),
+        [
+            ("span.kind", "Internal"),
+            ("span.name", "test.spelled"),
+            ("status.code", "Ok"),
+        ],
+        "the kind is the one the exported span carries"
+    );
+}
+
+/// An instrument aggregates at most [`CARDINALITY_LIMIT`] series; one more label set
+/// records into the series the SDK labels `otel.metric.overflow`.
+#[test]
+fn an_instrument_past_its_cardinality_limit_records_into_the_overflow_series() {
+    static WIDE: Counter<1> = Counter::declare("test.wide", "{event}", &["test.key"]);
+    let recorder = recorder();
+    for index in 0..=CARDINALITY_LIMIT {
+        let value: &'static str = Box::leak(index.to_string().into_boxed_str());
+        WIDE.labeled([value]).add(1);
+    }
+
+    let snapshot = recorder.metrics();
+    let series: Vec<_> = snapshot
+        .series()
+        .iter()
+        .filter(|series| series.name() == "test.wide")
+        .collect();
+    assert_eq!(
+        series.len(),
+        CARDINALITY_LIMIT + 1,
+        "the bound, then overflow"
+    );
+    assert_eq!(
+        value(&snapshot, "test.wide", &[("otel.metric.overflow", "true")]),
+        Some(SeriesValue::Sum(1.0)),
+        "the label set past the bound joins the overflow series"
+    );
+}
+
+/// The view bounds each instrument at the limit it is given, and keeps the instrument's
+/// name, unit, and histogram boundaries.
+#[test]
+fn the_cardinality_view_bounds_each_instrument_at_its_limit() {
+    use opentelemetry::KeyValue;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .with_view(super::cardinality_view(2))
+        .build();
+    let meter = provider.meter_with_scope(super::scope());
+    let counter = meter.u64_counter("test.view").with_unit("{event}").build();
+    let histogram = meter
+        .f64_histogram("test.view.duration")
+        .with_unit("s")
+        .with_boundaries(vec![0.5])
+        .build();
+    for key in ["a", "b", "c"] {
+        counter.add(1, &[KeyValue::new("test.key", key)]);
+    }
+    histogram.record(0.1, &[]);
+    provider.force_flush().expect("the provider flushes");
+
+    let finished = exporter.get_finished_metrics().expect("an export");
+    let metrics: Vec<_> = finished
+        .last()
+        .expect("one export")
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .collect();
+    let view = metrics
+        .iter()
+        .find(|metric| metric.name() == "test.view")
+        .expect("the counter exports under its own name");
+    assert_eq!(view.unit(), "{event}");
+    let AggregatedMetrics::U64(MetricData::Sum(sum)) = view.data() else {
+        panic!("a counter exports a sum");
+    };
+    let overflowed = sum
+        .data_points()
+        .filter(|point| {
+            point
+                .attributes()
+                .any(|pair| pair.key.as_str() == "otel.metric.overflow")
+        })
+        .count();
+    assert_eq!(sum.data_points().count(), 3, "two series and the overflow");
+    assert_eq!(overflowed, 1);
+    let duration = metrics
+        .iter()
+        .find(|metric| metric.name() == "test.view.duration")
+        .expect("the histogram exports under its own name");
+    let AggregatedMetrics::F64(MetricData::Histogram(buckets)) = duration.data() else {
+        panic!("a histogram exports buckets");
+    };
+    let bounds: Vec<f64> = buckets
+        .data_points()
+        .flat_map(opentelemetry_sdk::metrics::data::HistogramDataPoint::bounds)
+        .collect();
+    assert_eq!(bounds, [0.5], "the declared boundaries stay");
+}
+
+/// [`Counter::add_built`] records only once [`Counter::build`] built the instrument.
+#[test]
+fn a_counter_records_through_add_built_only_once_built() {
+    static LATE: Counter<0> = Counter::declare("test.late", "{event}", &[]);
+    let recorder = recorder();
+    LATE.add_built([], 1);
+    assert_eq!(value(&recorder.metrics(), "test.late", &[]), None);
+    LATE.build();
+    LATE.add_built([], 2);
+    assert_eq!(
+        value(&recorder.metrics(), "test.late", &[]),
+        Some(SeriesValue::Sum(2.0))
+    );
 }
 
 /// The cost of one counter add and one histogram record from one thread, 1,000,000 of

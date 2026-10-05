@@ -35,7 +35,11 @@ fn calls(recorder: &ScopedRecorder, operation: &str) -> Option<SeriesValue> {
         .metrics()
         .find(
             "traces.span.metrics.calls",
-            &[("span.name", operation), ("status.code", "Ok")],
+            &[
+                ("span.name", operation),
+                ("span.kind", "Internal"),
+                ("status.code", "Ok"),
+            ],
         )
         .map(|series| series.value().clone())
 }
@@ -130,6 +134,7 @@ fn an_early_return_finishes_and_a_panic_records_an_error() {
         "traces.span.metrics.calls",
         &[
             ("span.name", "fixture.refuse"),
+            ("span.kind", "Internal"),
             ("status.code", "Error"),
             ("error.type", "panic"),
         ],

@@ -300,7 +300,7 @@ INSTEAD = {
     ),
     "rift-tracing alias": "import rift_tracing under its own name",
 }
-INSTEAD_OPENTELEMETRY = "build with the otlp feature, which rift-tracing owns"
+INSTEAD_OPENTELEMETRY = "export through rift-tracing, which owns the OTLP export"
 INSTEAD_OTHER = "reach the library through rift-tracing"
 
 

@@ -903,14 +903,14 @@ async fn an_append_the_database_refuses_names_the_step_that_failed() -> TestResu
 }
 
 /// One append records the metrics database's queue wait, write lock wait, commit, and
-/// transaction, and a sampler tick records its queue length and file size.
+/// transaction, and a collection reads its queue length and file size; once the store
+/// drops, a collection reads neither.
 #[tokio::test]
 async fn an_append_records_the_metrics_database_signals() -> TestResult {
     let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     store.append(&[record("measured")], KEEP_EVERY).await?;
-    assert_eq!(recorder.run_sample_hooks(), 1, "the store's hook runs");
     let metrics = recorder.metrics();
 
     let metrics_namespace = ("db.namespace", "metrics");
@@ -934,15 +934,23 @@ async fn an_append_records_the_metrics_database_signals() -> TestResult {
         metrics
             .find("sqlite.queue.length", &[metrics_namespace])
             .map(crate::MetricSeries::value),
-        Some(&SeriesValue::Last(0.0))
+        Some(&SeriesValue::Sum(0.0))
     );
     let database_file = [metrics_namespace, ("sqlite.file.type", "database")];
     assert!(
         matches!(
             metrics.find("sqlite.file.size", &database_file).map(crate::MetricSeries::value),
-            Some(SeriesValue::Last(size)) if *size > 0.0
+            Some(SeriesValue::Sum(size)) if *size > 0.0
         ),
         "{metrics:?}"
+    );
+    drop(store);
+    let closed = recorder.metrics();
+    assert!(closed.find("sqlite.file.size", &database_file).is_none());
+    assert!(
+        closed
+            .find("sqlite.queue.length", &[metrics_namespace])
+            .is_none()
     );
     Ok(())
 }

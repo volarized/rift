@@ -235,7 +235,8 @@ pub fn parent_span(parent: &Span) -> Span {
 ///
 /// Every operation records `traces.span.metrics.calls` and
 /// `traces.span.metrics.duration`, in seconds, labeled with the operation literal as
-/// `span.name` and its outcome as `status.code`: `Ok` when the work finished, by any path
+/// `span.name`, `span.kind` `Internal`, the kind its exported span carries, and its outcome
+/// as `status.code`: `Ok` when the work finished, by any path
 /// out of a block or by returning from a future, and `Error` with `error.type` `panic` or
 /// `cancelled` when it panicked or an awaited future was dropped before it returned. Work
 /// that records `error.type`, or an `outcome` other than `ok` or `acquired`, on the

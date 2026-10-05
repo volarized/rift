@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::capture::{LogSink, now_ms};
+use crate::capture::{LOG_QUEUE_DROPPED, LogSink, UNWRITTEN, now_ms};
 use crate::record::{LOG_BATCH_RECORDS_MAX, LogRecord};
 use crate::stderr::StderrBound;
 use crate::store::LogStore;
@@ -186,11 +186,16 @@ impl LogLane {
     /// held batch already carried in its notice are not counted again.
     #[must_use]
     pub fn unwritten(&self) -> u64 {
+        self.never_written()
+            .saturating_add(self.dropped.load(Ordering::Relaxed))
+    }
+
+    /// Records the lane accepted and neither wrote nor dropped at a full queue: after the
+    /// drain is aborted, the queued records and the batch it held.
+    fn never_written(&self) -> u64 {
         let accepted = self.settlement.accepted.load(Ordering::SeqCst);
         let finished = self.settlement.progress.borrow().finished;
-        accepted
-            .saturating_sub(finished)
-            .saturating_add(self.dropped.load(Ordering::Relaxed))
+        accepted.saturating_sub(finished)
     }
 }
 
@@ -434,7 +439,9 @@ impl RunningLogDrain {
     /// The drain closes its queue, then flushes what it holds, retrying a refused batch,
     /// within what is left of `deadline`. A drain that outlasts it is aborted, and the
     /// "log drain outlasted the stop deadline" warning carries `unwritten`: the records
-    /// the lane accepted and never wrote, its held batch and queue included.
+    /// the lane accepted and never wrote, its held batch and queue included. The held batch
+    /// and queue are added to `log.queue.dropped` with `error.type` `unwritten`; the full
+    /// queue's drops are there already as `queue_full`.
     ///
     /// When the process's standard error is cut at `[logs] stderr_limit`, the stop first
     /// records `standard error bytes discarded`, `INFO` with `stderr_limit` and the bytes
@@ -479,6 +486,11 @@ impl RunningLogDrain {
             Err(_) => {
                 task.abort();
                 let _ = task.await;
+                // A full queue's drops are already in `queue_full`; `unwritten` adds the
+                // records the drain held or had queued.
+                LOG_QUEUE_DROPPED
+                    .labeled([UNWRITTEN])
+                    .add(lane.never_written());
                 let unwritten = lane.unwritten();
                 tracing::warn!(
                     component = "logs",

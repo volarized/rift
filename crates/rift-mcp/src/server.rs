@@ -123,33 +123,40 @@ enum WorkerAdmission {
 }
 
 /// `worker_pool.permit.count`: the blocking pool's worker permits, by
-/// `worker_pool.permit.state` = `available` or `used`, read on the sampler tick.
-static WORKER_PERMIT_COUNT: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
-    "worker_pool.permit.count",
-    "{permit}",
-    &["worker_pool.permit.state"],
+/// `worker_pool.permit.state` = `available` or `used`, read when the meter collects.
+static WORKER_PERMIT_COUNT: rift_tracing::ObservableUpDownCounter<1> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        "worker_pool.permit.count",
+        "{permit}",
+        &["worker_pool.permit.state"],
+    );
+
+// Each retained workspace owns three databases whose sizes and queues are observed (index,
+// vectors, metrics) and one executor; the observation bound holds them all.
+const _: () = assert!(
+    rift_tracing::OBSERVATIONS_MAX as u64
+        >= 3 * rift_protocol::configuration::SERVER_WORKSPACES_MAX
 );
 
-/// A sampler hook that records [`WORKER_PERMIT_COUNT`] of `operations`, a semaphore of
-/// `permits` permits, while the executor that holds it lives; the hook holds the
-/// semaphore weakly.
-fn permit_sampling(
+/// Reports [`WORKER_PERMIT_COUNT`] of `operations`, a semaphore of `permits` permits, while
+/// the executor that holds the returned guard lives: one atomic load of the semaphore per
+/// collection. The read holds the semaphore weakly.
+fn permit_readings(
     operations: &Arc<Semaphore>,
     permits: usize,
-) -> Option<Arc<rift_tracing::SampleHook>> {
+) -> Option<Arc<rift_tracing::ObservationGuard>> {
     let operations = Arc::downgrade(operations);
-    rift_tracing::sample_hook(move || {
-        if let Some(operations) = operations.upgrade() {
-            let available = operations.available_permits();
-            let used = permits.saturating_sub(available);
-            for (state, count) in [("available", available), ("used", used)] {
-                WORKER_PERMIT_COUNT
-                    .labeled_value([state], u64::try_from(count).unwrap_or(u64::MAX))
-                    .record();
+    WORKER_PERMIT_COUNT
+        .observe(move |observation| {
+            if let Some(operations) = operations.upgrade() {
+                let available = operations.available_permits();
+                let used = permits.saturating_sub(available);
+                for (state, count) in [("available", available), ("used", used)] {
+                    observation.observe([state], u64::try_from(count).unwrap_or(u64::MAX));
+                }
             }
-        }
-    })
-    .map(Arc::new)
+        })
+        .map(Arc::new)
 }
 
 /// Bounded Tokio acceptance for blocking filesystem and parser work.
@@ -159,8 +166,8 @@ pub(crate) struct BlockingExecutor {
     pub(crate) queue_timeout_ms: u64,
     rayon_pool: Arc<ThreadPool>,
     content_cache: rift_index::WorkspaceContentCache,
-    /// Records the permit counts on each sampler tick while a clone of the executor lives.
-    _permit_sampling: Option<Arc<rift_tracing::SampleHook>>,
+    /// Keeps the permit counts reported while a clone of the executor lives.
+    _permit_readings: Option<Arc<rift_tracing::ObservationGuard>>,
 }
 
 impl BlockingExecutor {
@@ -184,7 +191,7 @@ impl BlockingExecutor {
             })?;
         let operations = Arc::new(Semaphore::new(workers));
         Ok(Self {
-            _permit_sampling: permit_sampling(&operations, workers),
+            _permit_readings: permit_readings(&operations, workers),
             operations,
             queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
             rayon_pool: Arc::new(rayon_pool),
@@ -210,7 +217,7 @@ impl BlockingExecutor {
             .expect("test worker pool must build");
         let operations = Arc::new(Semaphore::new(operations_max));
         Self {
-            _permit_sampling: permit_sampling(&operations, operations_max),
+            _permit_readings: permit_readings(&operations, operations_max),
             operations,
             queue_timeout_ms,
             rayon_pool: Arc::new(rayon_pool),
@@ -6701,13 +6708,13 @@ done
         assert_eq!(error.slug(), errors::server::read_task::SLUG);
     }
 
-    /// A sampler tick records the blocking pool's available and used permits.
+    /// A collection reads the blocking pool's available and used permits, until the
+    /// executor drops.
     #[tokio::test]
-    async fn a_sampler_tick_records_the_worker_permits() -> TestResult {
+    async fn a_collection_reads_the_worker_permits() -> TestResult {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let executor = BlockingExecutor::isolated(2, 1_000);
         let held = Arc::clone(&executor.operations).acquire_owned().await?;
-        assert_eq!(recorder.run_sample_hooks(), 1, "the executor's hook runs");
         let snapshot = recorder.metrics();
         let permits = |state| {
             snapshot
@@ -6719,15 +6726,20 @@ done
         };
         assert_eq!(
             permits("available"),
-            Some(rift_tracing::SeriesValue::Last(1.0))
+            Some(rift_tracing::SeriesValue::Sum(1.0))
         );
-        assert_eq!(permits("used"), Some(rift_tracing::SeriesValue::Last(1.0)));
+        assert_eq!(permits("used"), Some(rift_tracing::SeriesValue::Sum(1.0)));
         drop(held);
         drop(executor);
-        assert_eq!(
-            recorder.run_sample_hooks(),
-            0,
-            "the dropped executor's hook left"
+        assert!(
+            recorder
+                .metrics()
+                .find(
+                    "worker_pool.permit.count",
+                    &[("worker_pool.permit.state", "available")],
+                )
+                .is_none(),
+            "a dropped executor reports no permit"
         );
         Ok(())
     }

@@ -4922,6 +4922,7 @@ dependencies = [
 name = "rift-tracing"
 version = "0.0.62"
 dependencies = [
+ "getrandom 0.4.3",
  "jiff",
  "opentelemetry",
  "opentelemetry-otlp",

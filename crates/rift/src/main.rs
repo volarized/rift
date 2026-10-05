@@ -156,11 +156,9 @@ async fn main() -> ExitCode {
     let logs = serves.then(|| rift_mcp::logs_configuration(&logs_root(&cli, Path::new("."))));
     let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
     if let Some(logs) = &logs {
-        let sample_interval = Duration::from_millis(logs.sample_interval.milliseconds());
         let stall_delay = Duration::from_millis(logs.stall_delay.milliseconds());
         tracing_builder = tracing_builder
             .capture(&logs.capture)
-            .sample_interval(sample_interval)
             .stall_delay(stall_delay)
             .stderr_limit(logs.stderr_limit.bytes());
     }
@@ -185,9 +183,11 @@ async fn main() -> ExitCode {
             false
         }
     };
-    // Flushes buffered spans before either exit path: the normal return below drops
-    // every other local first, and `process::exit` past it runs no destructor at all.
-    tracing_runtime.shutdown();
+    // Flushes buffered spans and metric points before either exit path: the normal return
+    // below drops every other local first, and `process::exit` past it runs no destructor
+    // at all. A foreground server's stop already shut the export down inside its budget,
+    // and this finds nothing left to flush.
+    tracing_runtime.shutdown().await;
     if serves {
         // A foreground server's index build, a lane's pass, or a lexical transaction can
         // still be running when serving ends. Returning would drop the runtime, and that

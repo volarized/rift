@@ -1,118 +1,84 @@
-//! The runtime sample: the Tokio runtime the sampler runs on, read once per tick.
+//! The Tokio runtime readings: the runtime that installed the subscriber, read each time the
+//! meter's reader collects.
 //!
-//! Every reading comes from Tokio's stable `RuntimeMetrics`, so the sample needs no
-//! `tokio_unstable` build: the worker count, the live tasks, the global queue depth, and each
-//! worker's busy time and park count. A worker whose busy time fills the whole interval while
-//! the global queue grows is a runtime worker something blocked.
+//! Every reading comes from Tokio's stable `RuntimeMetrics`, so it needs no `tokio_unstable`
+//! build: the worker count, the live tasks, the global queue depth, and the busy time and
+//! park count summed over the workers. Each is a load of a counter Tokio keeps; none waits.
+//! A worker busy time that grows by the whole interval while the global queue grows names a
+//! runtime worker something blocked.
 
-use std::time::Duration;
-
+use opentelemetry::metrics::Meter;
 use tokio::runtime::RuntimeMetrics;
 
-use crate::metrics::{Counter, Gauge};
+use crate::metrics::with_meter;
 
-/// `tokio.runtime.worker.count`: the runtime's worker threads.
-static RUNTIME_WORKERS: Gauge<u64, 0> =
-    Gauge::declare("tokio.runtime.worker.count", "{thread}", &[]);
-/// `tokio.runtime.task.count`: the tasks alive in the runtime.
-static RUNTIME_TASKS: Gauge<u64, 0> = Gauge::declare("tokio.runtime.task.count", "{task}", &[]);
-/// `tokio.runtime.global_queue.length`: the tasks waiting in the runtime's global queue.
-static RUNTIME_GLOBAL_QUEUE: Gauge<u64, 0> =
-    Gauge::declare("tokio.runtime.global_queue.length", "{task}", &[]);
-/// `tokio.runtime.worker.busy.time`: the time every worker spent busy, in seconds.
-static RUNTIME_BUSY: Counter<0> = Counter::declare("tokio.runtime.worker.busy.time", "s", &[]);
-/// `tokio.runtime.worker.busy.time.max`: the busy time of the busiest worker over the last
-/// interval, in seconds.
-static RUNTIME_BUSY_MAX: Gauge<f64, 0> =
-    Gauge::declare("tokio.runtime.worker.busy.time.max", "s", &[]);
-/// `tokio.runtime.worker.parks`: the times every worker parked for lack of work.
-static RUNTIME_PARKS: Counter<0> = Counter::declare("tokio.runtime.worker.parks", "{park}", &[]);
+/// One count the runtime keeps: its instrument name, unit, and how it is read.
+type RuntimeCount = (&'static str, &'static str, fn(&RuntimeMetrics) -> usize);
 
-/// One read of a Tokio runtime.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct RuntimeReading {
-    /// Worker threads; one for a current-thread runtime.
-    pub(crate) workers: usize,
-    /// Tasks spawned and not yet finished.
-    pub(crate) alive_tasks: usize,
-    /// Tasks waiting in the global queue.
-    pub(crate) global_queue_depth: usize,
-    /// Each worker's busy time since the runtime started, by worker index; empty on a
-    /// target without 64-bit atomics, where Tokio does not count it.
-    pub(crate) busy: Vec<Duration>,
-    /// Each worker's park count since the runtime started, by worker index; empty where
-    /// [`Self::busy`] is.
-    pub(crate) parks: Vec<u64>,
+/// `value` as an up-down counter observes it.
+fn signed(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-impl RuntimeReading {
-    /// Reads `metrics`. The reads are loads of counters Tokio keeps; none waits.
-    pub(crate) fn of(metrics: &RuntimeMetrics) -> Self {
-        let workers = metrics.num_workers();
-        #[cfg(target_has_atomic = "64")]
-        let (busy, parks) = (0..workers)
-            .map(|worker| {
-                (
-                    metrics.worker_total_busy_duration(worker),
-                    metrics.worker_park_count(worker),
-                )
-            })
-            .unzip();
-        #[cfg(not(target_has_atomic = "64"))]
-        let (busy, parks) = (Vec::new(), Vec::new());
-        Self {
-            workers,
-            alive_tasks: metrics.num_alive_tasks(),
-            global_queue_depth: metrics.global_queue_depth(),
-            busy,
-            parks,
-        }
+/// Registers the readings of the runtime `metrics` describes with the installed meter;
+/// answers whether a meter was installed.
+///
+/// Each callback loads Tokio's counters: one per worker for the busy time and the parks,
+/// one for each count. On a target without 64-bit atomics Tokio counts no busy time and no
+/// park, and those two readings report nothing.
+pub(crate) fn observe_runtime(metrics: &RuntimeMetrics) -> bool {
+    with_meter(|meter| register(meter, metrics))
+}
+
+fn register(meter: &Meter, metrics: &RuntimeMetrics) {
+    let counts: [RuntimeCount; 3] = [
+        (
+            "tokio.runtime.worker.count",
+            "{thread}",
+            RuntimeMetrics::num_workers,
+        ),
+        (
+            "tokio.runtime.task.count",
+            "{task}",
+            RuntimeMetrics::num_alive_tasks,
+        ),
+        (
+            "tokio.runtime.global_queue.length",
+            "{task}",
+            RuntimeMetrics::global_queue_depth,
+        ),
+    ];
+    for (name, unit, count) in counts {
+        let runtime = metrics.clone();
+        let _count = meter
+            .i64_observable_up_down_counter(name)
+            .with_unit(unit)
+            .with_callback(move |instrument| instrument.observe(signed(count(&runtime)), &[]))
+            .build();
     }
-}
-
-/// The previous runtime reading the next one's changes are taken against.
-#[derive(Debug, Default)]
-pub(crate) struct RuntimeSeries {
-    previous: Option<RuntimeReading>,
-}
-
-impl RuntimeSeries {
-    /// Records `reading` into the runtime instruments: the counts as gauges, and, from the second reading on, the busy time and parks since the previous
-    /// reading, with the busiest worker's share. The first reading sets the base and
-    /// records no change; a worker whose totals went backwards adds none.
-    pub(crate) fn observe(&mut self, reading: RuntimeReading) {
-        for (gauge, count) in [
-            (&RUNTIME_WORKERS, reading.workers),
-            (&RUNTIME_TASKS, reading.alive_tasks),
-            (&RUNTIME_GLOBAL_QUEUE, reading.global_queue_depth),
-        ] {
-            gauge
-                .value(u64::try_from(count).unwrap_or(u64::MAX))
-                .record();
-        }
-        if let Some(previous) = self.previous.as_ref() {
-            let busy: Vec<Duration> = reading
-                .busy
-                .iter()
-                .zip(&previous.busy)
-                .map(|(now, before)| now.saturating_sub(*before))
-                .collect();
-            if !busy.is_empty() {
-                let total: Duration = busy.iter().sum();
-                RUNTIME_BUSY.labeled([]).add_fraction(total.as_secs_f64());
-                let busiest = busy.iter().max().copied().unwrap_or_default();
-                RUNTIME_BUSY_MAX.value(busiest.as_secs_f64()).record();
-            }
-            let parks: u64 = reading
-                .parks
-                .iter()
-                .zip(&previous.parks)
-                .map(|(now, before)| now.saturating_sub(*before))
-                .sum();
-            if !reading.parks.is_empty() {
-                RUNTIME_PARKS.add(parks);
-            }
-        }
-        self.previous = Some(reading);
+    #[cfg(target_has_atomic = "64")]
+    {
+        let runtime = metrics.clone();
+        let _busy = meter
+            .f64_observable_counter("tokio.runtime.worker.busy.time")
+            .with_unit("s")
+            .with_callback(move |instrument| {
+                let busy: std::time::Duration = (0..runtime.num_workers())
+                    .map(|worker| runtime.worker_total_busy_duration(worker))
+                    .sum();
+                instrument.observe(busy.as_secs_f64(), &[]);
+            })
+            .build();
+        let runtime = metrics.clone();
+        let _parks = meter
+            .u64_observable_counter("tokio.runtime.worker.parks")
+            .with_unit("{park}")
+            .with_callback(move |instrument| {
+                let parks: u64 = (0..runtime.num_workers())
+                    .map(|worker| runtime.worker_park_count(worker))
+                    .sum();
+                instrument.observe(parks, &[]);
+            })
+            .build();
     }
 }
