@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock, Weak};
 use std::time::Duration;
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
@@ -60,6 +60,9 @@ pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
 pub(crate) const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
 /// Complete capture retries while the tree keeps moving.
 pub(crate) const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
+/// Most observed paths one running capture reads again to decide whether a later
+/// observation supersedes it. Past it the capture runs to its end and publication decides.
+pub(crate) const RUNNING_CAPTURE_READS_MAX: usize = 64;
 
 /// What the next rebuild must cover, accumulated between publications.
 ///
@@ -146,7 +149,14 @@ pub(crate) struct RebuildRequest {
     pub(crate) previous: Option<Arc<PublishedWorkspace>>,
     /// Supervisor stop state, checked between files by index capture.
     pub(crate) cancellation: CancellationToken,
+    /// The validation whose observation this rebuild answers, asked between files and at
+    /// phase boundaries whether a later observation already supersedes the capture.
+    /// Absent for a request a test builds without one.
+    pub(crate) observation: Option<Weak<IndexValidation>>,
 }
+
+/// The record one capture read for each path its observation named.
+type CapturedRecords = BTreeMap<ProjectPath, Option<FileRecord>>;
 
 impl RebuildRequest {
     /// The rebuild startup runs: every visible file, with nothing to share.
@@ -157,6 +167,7 @@ impl RebuildRequest {
             work: PendingWork::whole_workspace(),
             previous: None,
             cancellation: CancellationToken::new(),
+            observation: None,
         }
     }
 
@@ -167,34 +178,48 @@ impl RebuildRequest {
     /// incremental change. A path whose bytes cannot be read for any reason other than its
     /// absence, a directory, or the per-file byte bound asks for a whole scan, because that
     /// scan decides whether the path is a refusal or a removal.
+    #[cfg(test)]
     fn change_set(&self, root: &Path, configuration: &ConfigurationState) -> ChangeSet {
+        self.change_set_with_records(root, configuration).0
+    }
+
+    /// Resolves this observation as [`Self::change_set`] documents, and keeps the record
+    /// read for each named path beside an incremental change set.
+    ///
+    /// The records are what a running capture compares a later observation with. A whole
+    /// scan, and a configuration change that reads no named path, keep none.
+    fn change_set_with_records(
+        &self,
+        root: &Path,
+        configuration: &ConfigurationState,
+    ) -> (ChangeSet, Option<CapturedRecords>) {
         let Some(previous) = self.previous.as_ref() else {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         };
         if self.work.whole_workspace {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         }
         if previous.configuration.fingerprint != configuration.fingerprint {
             if previous
                 .configuration
                 .index_configuration_differs(configuration)
             {
-                return ChangeSet::Full;
+                return (ChangeSet::Full, None);
             }
-            return ChangeSet::Incremental(PathChanges::default());
+            return (ChangeSet::Incremental(PathChanges::default()), None);
         }
         if previous.holds_files_below_a_gone_path(root, &self.work.paths) {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         }
         let Some(source_policy) = previous.source_policy.as_deref() else {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         };
         let Some(observed) = observed_records(root, &self.work.paths, source_policy) else {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         };
-        ChangeSet::Incremental(PathChanges::resolve(observed, |path| {
-            previous.file_record(path)
-        }))
+        let records = observed.iter().cloned().collect();
+        let changes = PathChanges::resolve(observed, |path| previous.file_record(path));
+        (ChangeSet::Incremental(changes), Some(records))
     }
 }
 
@@ -374,11 +399,32 @@ impl PublishedWorkspace {
     /// A file left out under the per-file byte bound matches only a publication that left
     /// it out the same way; an I/O error matches nothing.
     fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        self.holds_observed_beside(root, paths, &CapturedRecords::new())
+    }
+
+    /// Whether a capture resolved against this publication holds what every one of
+    /// `paths` holds on disk: the record in `records` for a path the capture read, and
+    /// this publication's own record for every other path.
+    ///
+    /// This is [`Self::holds_observed`] asked before the capture's candidate exists, with
+    /// the same reads and the same comparison.
+    fn holds_observed_beside(
+        &self,
+        root: &Path,
+        paths: &BTreeSet<ProjectPath>,
+        records: &CapturedRecords,
+    ) -> bool {
         self.source_policy
             .as_deref()
             .and_then(|policy| observed_records(root, paths, policy))
             .is_some_and(|observed| {
-                PathChanges::resolve(observed, |path| self.file_record(path)).is_empty()
+                PathChanges::resolve(observed, |path| {
+                    records
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| self.file_record(path))
+                })
+                .is_empty()
             })
     }
 
@@ -507,8 +553,8 @@ pub(crate) struct IndexValidation {
     pub(crate) watch_failed: Arc<AtomicBool>,
     pub(crate) invalidations: mpsc::Sender<()>,
     pub(crate) changed: Arc<Notify>,
-    /// Latest successful candidate whose publication was superseded. A publication at
-    /// or beyond this epoch makes the recorded movement obsolete.
+    /// Latest capture superseded while it ran or at publication. A publication at or
+    /// beyond this epoch makes the recorded movement obsolete.
     superseded_epoch: AtomicU64,
     /// The publication linearization point, holding the work the next rebuild owes.
     /// Observation and publication both take it, so a path observed between a rebuild's
@@ -895,7 +941,7 @@ impl IndexValidation {
 
     /// Takes the work the next rebuild owes, with the epoch it answers for, under the one
     /// lane observation also takes.
-    pub(crate) fn take_pending(&self) -> RebuildRequest {
+    pub(crate) fn take_pending(self: &Arc<Self>) -> RebuildRequest {
         let mut publication = self.locked_pending();
         let work = std::mem::take(&mut *publication);
         let epoch = self.observed_epoch();
@@ -905,6 +951,7 @@ impl IndexValidation {
             work,
             previous: None,
             cancellation: self.cancellation.clone(),
+            observation: Some(Arc::downgrade(self)),
         }
     }
 
@@ -958,17 +1005,24 @@ impl IndexValidation {
         self.observed_epoch.load(Ordering::SeqCst)
     }
 
-    /// Latest successful capture superseded after this publication was built, if any.
+    /// Latest capture superseded after this publication was built, if any.
     pub(crate) fn superseded_after(&self, published_epoch: u64) -> Option<u64> {
         let epoch = self.superseded_epoch();
         (epoch > published_epoch).then_some(epoch)
     }
 
-    /// Epoch of the latest successful capture superseded at publication.
+    /// Epoch of the latest capture superseded while it ran or at publication.
     ///
     /// Zero before the first one.
     pub(crate) fn superseded_epoch(&self) -> u64 {
         self.superseded_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Records that the capture answering `epoch` was superseded, and wakes the reads
+    /// waiting on its publication so each captures the tree again.
+    fn record_superseded(&self, epoch: u64) {
+        self.superseded_epoch.fetch_max(epoch, Ordering::SeqCst);
+        self.changed.notify_waiters();
     }
 
     /// Installs one publication under publication linearization.
@@ -1695,6 +1749,123 @@ pub(crate) enum WorkspaceCandidate {
     },
     /// Configuration moved during capture.
     ConfigurationChanged,
+    /// An observation made while the capture ran asks for the whole workspace, or names a
+    /// path whose bytes on disk differ from the record the capture holds for it. The
+    /// capture stopped between files or at a phase boundary and built no candidate.
+    Superseded,
+}
+
+/// One running capture's standing against the observation made since its rebuild took
+/// its work.
+///
+/// Publication decides whether a candidate answers a later observation; see
+/// [`answered_candidate`]. A capture that still runs asks the same question between files
+/// and at phase boundaries, so a rebuild publication would refuse stops there instead of
+/// running to its end. An observation that asks for the whole workspace supersedes every
+/// capture. An observation that names paths supersedes an incremental capture when one of
+/// them holds bytes other than the record the capture read for it, or than the
+/// publication's record for a path the capture did not name. A whole scan decides what
+/// it holds only when it ends, so a path observation leaves it running.
+///
+/// The comparison runs once for each observed epoch the capture meets. It reads one
+/// digest for each pending path, outside the publication lane, and at most
+/// [`RUNNING_CAPTURE_READS_MAX`] paths over one capture. A larger observation leaves the
+/// decision to publication.
+///
+/// The answer is a prediction about bytes that can move again before publication. A
+/// capture stopped here publishes nothing and returns its work, so a wrong prediction
+/// costs one repeated rebuild and never a publication.
+struct RunningCapture<'request> {
+    root: &'request Path,
+    request: &'request RebuildRequest,
+    /// The records an incremental capture read, absent for a whole scan.
+    records: Option<CapturedRecords>,
+    /// The validation's epoch counter, absent when the request names no validation or it
+    /// is already gone.
+    observed_epoch: Option<Arc<AtomicU64>>,
+    /// The observed epoch the last comparison answered for.
+    compared_epoch: AtomicU64,
+    /// Set once a comparison found the capture superseded; pending work never narrows
+    /// while the capture runs, so the answer stands.
+    superseded: AtomicBool,
+    /// Path reads the capture may still spend on comparisons.
+    reads_left: AtomicUsize,
+}
+
+impl<'request> RunningCapture<'request> {
+    fn new(
+        root: &'request Path,
+        request: &'request RebuildRequest,
+        records: Option<CapturedRecords>,
+    ) -> Self {
+        let observed_epoch = request
+            .observation
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|validation| Arc::clone(&validation.observed_epoch));
+        Self {
+            root,
+            request,
+            records,
+            observed_epoch,
+            compared_epoch: AtomicU64::new(request.epoch),
+            superseded: AtomicBool::new(false),
+            reads_left: AtomicUsize::new(RUNNING_CAPTURE_READS_MAX),
+        }
+    }
+
+    /// Whether an observation made since the rebuild took its work supersedes this
+    /// capture. An unmoved epoch costs one atomic read.
+    fn is_superseded(&self) -> bool {
+        let Some(observed_epoch) = self.observed_epoch.as_ref() else {
+            return false;
+        };
+        if self.superseded.load(Ordering::SeqCst) {
+            return true;
+        }
+        let observed = observed_epoch.load(Ordering::SeqCst);
+        if self.compared_epoch.swap(observed, Ordering::SeqCst) == observed {
+            return false;
+        }
+        let superseded = self
+            .request
+            .observation
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|validation| self.pending_supersedes(&validation));
+        if superseded {
+            self.superseded.store(true, Ordering::SeqCst);
+        }
+        superseded
+    }
+
+    /// Compares the publication lane's pending work with what this capture holds.
+    fn pending_supersedes(&self, validation: &IndexValidation) -> bool {
+        let incremental = self.records.as_ref().zip(self.request.previous.as_ref());
+        let pending = validation.locked_pending();
+        let whole_workspace = pending.covers_whole_workspace();
+        let named =
+            (incremental.is_some() && !whole_workspace && self.takes_reads(pending.paths.len()))
+                .then(|| pending.paths.clone());
+        drop(pending);
+        if whole_workspace {
+            return true;
+        }
+        incremental
+            .zip(named)
+            .is_some_and(|((records, previous), paths)| {
+                !previous.holds_observed_beside(self.root, &paths, records)
+            })
+    }
+
+    /// Spends `paths` reads of this capture's bound, or none when fewer are left.
+    fn takes_reads(&self, paths: usize) -> bool {
+        self.reads_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(paths)
+            })
+            .is_ok()
+    }
 }
 
 /// Builds one snapshot candidate and verifies configuration around its scan.
@@ -1732,9 +1903,10 @@ fn build_workspace_candidate_with_cache(
         "index capture started"
     );
     let configuration = ConfigurationState::accept(root);
-    let change_set = request.change_set(root, &configuration);
-    let cancelled = || request.cancellation.is_cancelled();
-    let candidate = match &change_set {
+    let (change_set, records) = request.change_set_with_records(root, &configuration);
+    let running = RunningCapture::new(root, request, records);
+    let cancelled = || request.cancellation.is_cancelled() || running.is_superseded();
+    let captured = match &change_set {
         ChangeSet::Full => {
             let sharing = request.previous.as_deref().filter(|previous| {
                 !previous
@@ -1749,7 +1921,7 @@ fn build_workspace_candidate_with_cache(
                 sharing,
                 &cancelled,
                 content_cache,
-            )?
+            )
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
@@ -1764,9 +1936,16 @@ fn build_workspace_candidate_with_cache(
                 configuration,
                 request.epoch,
                 &cancelled,
-            )?
+            )
         }
     };
+    // A capture stopped by its own comparison ends as superseded, whatever error the
+    // stop surfaced as; a supervisor stop keeps its error, which the caller reads as
+    // cancelled.
+    if !request.cancellation.is_cancelled() && running.is_superseded() {
+        return Ok(WorkspaceCandidate::Superseded);
+    }
+    let candidate = captured?;
     if candidate.configuration.fingerprint != configuration_fingerprint(root) {
         return Ok(WorkspaceCandidate::ConfigurationChanged);
     }
@@ -3790,7 +3969,8 @@ pub(crate) async fn run_index_supervisor_with(
                     lane.request(current);
                 }
             }
-            Ok(RebuildOutcome::Unchanged | RebuildOutcome::Superseded) => {}
+            Ok(RebuildOutcome::Unchanged) => {}
+            Ok(RebuildOutcome::Superseded) => trace_superseded(epoch, validation.observed_epoch()),
             Ok(RebuildOutcome::Cancelled) => return,
             Err(error) => publish_rebuild_failure(&context, epoch, error).await,
         }
@@ -3846,10 +4026,11 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// [`RebuildOutcome::Unchanged`]: nothing is recorded as a publication, and the supervisor
 /// hands nothing to the lanes.
 ///
-/// A superseded candidate hands nothing to the lane. A successful capture superseded at
-/// publication records its epoch and wakes reads, so a read captures the tree again and
-/// answers stale when it moved since that read's previous capture, while changes keep
-/// waiting for a current publication.
+/// A superseded candidate hands nothing to the lane. A capture superseded while it runs
+/// stops between files or at a phase boundary; see [`RunningCapture`]. That capture, and
+/// one superseded at publication, records its epoch and wakes reads, so a read captures
+/// the tree again and answers stale when it moved since that read's previous capture,
+/// while changes keep waiting for a current publication.
 ///
 /// Each blocking operation races the supervisor's cancellation token. A stop that lands
 /// while the capture scans a large tree answers [`RebuildOutcome::Cancelled`] at once
@@ -3989,7 +4170,8 @@ pub(crate) enum CapturedRebuild {
         /// The observation's work, returned to the supervisor when nothing publishes.
         work: PendingWork,
     },
-    /// The observation was already superseded, or configuration moved during the capture.
+    /// The observation was already superseded, a later observation superseded the capture
+    /// while it ran, or configuration moved during the capture.
     Superseded,
     /// The supervisor was cancelled before the capture ran, or before its candidate was
     /// handed on; the observation's work is returned and nothing publishes.
@@ -4010,6 +4192,11 @@ pub(crate) enum CapturedRebuild {
 /// read again and no lexical write is owed. Such a capture answers
 /// [`CapturedRebuild::Unchanged`], and the caller stamps the publication with the
 /// observation's epoch instead of publishing and handing on a twin of it.
+///
+/// A capture that a later observation superseded while it ran answers
+/// [`WorkspaceCandidate::Superseded`]. The attempt returns its work, records its epoch as
+/// superseded, and wakes the reads waiting on it, exactly as a candidate superseded at
+/// publication does.
 ///
 /// The supervisor's cancellation is checked at the phase boundaries: before the capture
 /// runs, and before the candidate's lexical write is derived. A stop that lands during a
@@ -4046,13 +4233,20 @@ pub(crate) fn capture_rebuild_with(
             return error.fail();
         }
     };
-    let WorkspaceCandidate::Stable {
-        published: candidate,
-        change_set,
-    } = candidate
-    else {
-        let _ = validation.observe_whole_workspace();
-        return Ok(CapturedRebuild::Superseded);
+    let (candidate, change_set) = match candidate {
+        WorkspaceCandidate::Stable {
+            published,
+            change_set,
+        } => (published, change_set),
+        WorkspaceCandidate::ConfigurationChanged => {
+            let _ = validation.observe_whole_workspace();
+            return Ok(CapturedRebuild::Superseded);
+        }
+        WorkspaceCandidate::Superseded => {
+            validation.restore_pending(request.work);
+            validation.record_superseded(request.epoch);
+            return Ok(CapturedRebuild::Superseded);
+        }
     };
     if validation.cancellation.is_cancelled() {
         validation.restore_pending(request.work);
@@ -4100,10 +4294,7 @@ pub(crate) fn finish_rebuild(
     } else {
         validation.restore_pending(work);
         if outcome == RebuildOutcome::Superseded {
-            validation
-                .superseded_epoch
-                .fetch_max(candidate.epoch, Ordering::SeqCst);
-            validation.changed.notify_waiters();
+            validation.record_superseded(candidate.epoch);
         }
     }
     outcome
@@ -4299,6 +4490,21 @@ pub(crate) fn record_rebuild_failure(
         .record_failure(epoch, observed_epoch, error);
     drop(publication);
     recorded
+}
+
+/// Emits the one record of a superseded rebuild: the epoch it answered for and the epoch
+/// the observation stood at when the supervisor took its outcome.
+///
+/// A superseded rebuild publishes nothing and records no failure, so this record is what
+/// names the rebuild a waiting read was woken by.
+fn trace_superseded(epoch: u64, observed_epoch: u64) {
+    tracing::debug!(
+        component = "index",
+        operation = "index.build",
+        epoch,
+        observed_epoch,
+        "index rebuild superseded"
+    );
 }
 
 /// Emits one path-free filesystem publication event.
@@ -4884,7 +5090,7 @@ pub(crate) mod tests {
     ) -> TestResult<Arc<PublishedWorkspace>> {
         match build_workspace_candidate(root, limits, &RebuildRequest::initial(epoch))? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
-            WorkspaceCandidate::ConfigurationChanged => {
+            WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                 Err("fixture configuration must remain stable".into())
             }
         }
@@ -6072,7 +6278,7 @@ pub(crate) mod tests {
     /// The change set one taken observation resolves to against `previous`.
     fn change_set_of(
         root: &std::path::Path,
-        validation: &IndexValidation,
+        validation: &Arc<IndexValidation>,
         previous: &Arc<PublishedWorkspace>,
     ) -> ChangeSet {
         let mut request = validation.take_pending();
@@ -6247,13 +6453,14 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([path.clone()]),
             previous: Some(Arc::clone(previous)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
         match build_workspace_candidate(root, WorkspaceIndexLimits::default(), &request)? {
             WorkspaceCandidate::Stable {
                 published,
                 change_set,
             } => Ok((published, change_set)),
-            WorkspaceCandidate::ConfigurationChanged => {
+            WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                 Err("fixture configuration must remain stable".into())
             }
         }
@@ -6453,6 +6660,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("pkg")?]),
             previous: Some(previous),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
         let configuration = ConfigurationState::accept(directory.path());
         assert_eq!(
@@ -6542,6 +6750,7 @@ pub(crate) mod tests {
                 work: super::PendingWork::whole_workspace(),
                 previous: Some(Arc::clone(&previous)),
                 cancellation: CancellationToken::new(),
+                observation: None,
             };
             match build_workspace_candidate(directory.path(), limits, &request)? {
                 WorkspaceCandidate::Stable {
@@ -6555,7 +6764,7 @@ pub(crate) mod tests {
                     );
                     Ok(published)
                 }
-                WorkspaceCandidate::ConfigurationChanged => {
+                WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                     Err("fixture configuration must remain stable".into())
                 }
             }
@@ -6593,6 +6802,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("lib.rs")?]),
             previous: Some(Arc::clone(&previous)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
 
         let limits = WorkspaceIndexLimits::default();
@@ -6626,6 +6836,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("lib.rs")?]),
             previous: Some(Arc::clone(&previous)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
 
         let limits = WorkspaceIndexLimits::default();
@@ -6661,6 +6872,7 @@ pub(crate) mod tests {
                 work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
                 previous: Some(Arc::clone(&previous)),
                 cancellation: CancellationToken::new(),
+                observation: None,
             };
 
             let WorkspaceCandidate::Stable {
@@ -6709,6 +6921,7 @@ pub(crate) mod tests {
                 work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
                 previous: Some(Arc::clone(&previous)),
                 cancellation: CancellationToken::new(),
+                observation: None,
             };
 
             let WorkspaceCandidate::Stable {
@@ -6969,6 +7182,362 @@ pub(crate) mod tests {
             1,
             "a moved configuration must trigger another observation"
         );
+        Ok(())
+    }
+
+    /// A publication of `lib.rs`, one observed rewrite of it, and the request that
+    /// rewrite's rebuild runs from, resolved against the publication.
+    type RunningCaptureFixture = (
+        tempfile::TempDir,
+        Arc<IndexValidation>,
+        RebuildRequest,
+        Option<super::CapturedRecords>,
+        tokio::sync::mpsc::Receiver<()>,
+    );
+
+    fn running_capture_fixture() -> TestResult<RunningCaptureFixture> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn first() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let mut request = validation.take_pending();
+        request.previous = Some(previous);
+        let configuration = ConfigurationState::accept(directory.path());
+        let (change_set, records) =
+            request.change_set_with_records(directory.path(), &configuration);
+        assert!(matches!(change_set, ChangeSet::Incremental(_)));
+        Ok((directory, validation, request, records, invalidations))
+    }
+
+    /// The recorded churn sequence: the path a capture already read is written again.
+    #[test]
+    fn a_running_capture_is_superseded_once_its_own_path_holds_other_bytes() -> TestResult {
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let root = directory.path();
+        let path = rift_core::ProjectPath::new("lib.rs")?;
+        let running = super::RunningCapture::new(root, &request, records);
+        assert!(!running.is_superseded(), "nothing was observed since");
+
+        validation.observe_paths([path.clone()])?;
+        assert!(
+            !running.is_superseded(),
+            "a late report of the bytes the capture read supersedes nothing"
+        );
+        fs::write(root.join("lib.rs"), "pub fn second() {}\n")?;
+        assert!(
+            !running.is_superseded(),
+            "an unmoved epoch asks for no comparison"
+        );
+        validation.observe_paths([path])?;
+        assert!(
+            running.is_superseded(),
+            "the observed path holds bytes the capture did not read"
+        );
+        fs::write(root.join("lib.rs"), "pub fn first() {}\n")?;
+        assert!(running.is_superseded(), "a superseded capture stays so");
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_capture_compares_an_unnamed_path_with_the_publication() -> TestResult {
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let root = directory.path();
+        let other = rift_core::ProjectPath::new("other.rs")?;
+        let running = super::RunningCapture::new(root, &request, records);
+
+        validation.observe_paths([other.clone()])?;
+        assert!(
+            !running.is_superseded(),
+            "a path absent from the disk and from the publication moved nothing"
+        );
+        fs::write(root.join("other.rs"), "pub fn other() {}\n")?;
+        validation.observe_paths([other])?;
+        assert!(
+            running.is_superseded(),
+            "the publication the capture shares holds no file at the observed path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_workspace_observation_supersedes_every_running_capture() -> TestResult {
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let root = directory.path();
+        let incremental = super::RunningCapture::new(root, &request, records);
+        let scan = super::RunningCapture::new(root, &request, None);
+
+        fs::write(root.join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        assert!(
+            !scan.is_superseded(),
+            "a whole scan decides what it holds only when it ends"
+        );
+        validation.observe_whole_workspace()?;
+        assert!(scan.is_superseded());
+        assert!(incremental.is_superseded());
+
+        let unobserved = RebuildRequest::initial(request.epoch);
+        assert!(
+            !super::RunningCapture::new(root, &unobserved, None).is_superseded(),
+            "a request that names no validation is never superseded while it runs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_capture_reads_no_more_paths_than_its_bound() -> TestResult {
+        let named = |count: usize| -> TestResult<Vec<rift_core::ProjectPath>> {
+            let mut paths = vec![rift_core::ProjectPath::new("lib.rs")?];
+            for index in 1..count {
+                paths.push(rift_core::ProjectPath::new(format!("absent{index}.rs"))?);
+            }
+            Ok(paths)
+        };
+
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let running = super::RunningCapture::new(directory.path(), &request, records);
+        fs::write(directory.path().join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths(named(super::RUNNING_CAPTURE_READS_MAX + 1)?)?;
+        assert!(
+            !running.is_superseded(),
+            "an observation past the bound leaves the decision to publication"
+        );
+
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let running = super::RunningCapture::new(directory.path(), &request, records);
+        fs::write(directory.path().join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths(named(super::RUNNING_CAPTURE_READS_MAX)?)?;
+        assert!(
+            running.is_superseded(),
+            "an observation at the bound is compared"
+        );
+        Ok(())
+    }
+
+    /// One published `lib.rs`, one observed rewrite of it, and the state a capture of
+    /// that rewrite publishes into.
+    type ObservedRewrite = (
+        tempfile::TempDir,
+        Arc<IndexValidation>,
+        RwLock<IndexState>,
+        u64,
+        tokio::sync::mpsc::Receiver<()>,
+    );
+
+    fn observed_rewrite() -> TestResult<ObservedRewrite> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        });
+        fs::write(directory.path().join("lib.rs"), "pub fn first() {}\n")?;
+        let epoch = validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        Ok((directory, validation, state, epoch, invalidations))
+    }
+
+    #[test]
+    fn a_capture_stops_once_a_later_observation_names_bytes_it_does_not_hold() -> TestResult {
+        use std::future::Future as _;
+
+        let (directory, validation, state, epoch, _invalidations) = observed_rewrite()?;
+        let request = validation.take_pending();
+        let woken = validation.changed.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        let observing = Arc::clone(&validation);
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            move |root, limits, request| {
+                fs::write(root.join("other.rs"), "pub fn other() {}\n")
+                    .expect("the later source must land");
+                observing.observe_paths([
+                    rift_core::ProjectPath::new("other.rs").expect("fixture path is valid")
+                ])?;
+                build_workspace_candidate(root, limits, request)
+            },
+        )?;
+        assert!(
+            matches!(outcome, super::CapturedRebuild::Superseded),
+            "the capture stops before it builds a candidate"
+        );
+        assert_eq!(
+            validation.superseded_after(0),
+            Some(epoch),
+            "the stopped capture records its epoch as superseded"
+        );
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            woken.as_mut().poll(&mut context).is_ready(),
+            "the stopped capture wakes the reads waiting on it"
+        );
+        let state = state.blocking_read();
+        assert_eq!(
+            state.current.epoch, 0,
+            "a stopped capture publishes nothing"
+        );
+        assert!(state.failure.is_none(), "a stopped capture is no failure");
+        drop(state);
+        let next = validation.take_pending();
+        let paths: Vec<&str> = next
+            .work
+            .paths()
+            .map(rift_core::ProjectPath::as_str)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["lib.rs", "other.rs"],
+            "the stopped capture returns its work beside what landed while it ran"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_scan_stops_once_a_later_observation_asks_for_the_whole_workspace() -> TestResult {
+        let (directory, validation, state, _epoch, _invalidations) = observed_rewrite()?;
+        let epoch = validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+        let observing = Arc::clone(&validation);
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            move |root, limits, request| {
+                observing.observe_whole_workspace()?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                assert!(matches!(candidate, WorkspaceCandidate::Superseded));
+                Ok(candidate)
+            },
+        )?;
+        assert!(matches!(outcome, super::CapturedRebuild::Superseded));
+        assert_eq!(validation.superseded_after(0), Some(epoch));
+        assert!(
+            validation.locked_pending().covers_whole_workspace(),
+            "the stopped scan leaves the whole workspace owed"
+        );
+        Ok(())
+    }
+
+    /// A read's own request and a watcher's late report both observe bytes the running
+    /// capture already read. That capture runs to its end and its candidate publishes
+    /// under the later epoch.
+    #[tokio::test]
+    async fn a_capture_holding_the_observed_bytes_still_publishes() -> TestResult {
+        let (directory, validation, state, _epoch, _invalidations) = observed_rewrite()?;
+        let published = Arc::new(state);
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let request = validation.take_pending();
+        let observing = Arc::clone(&validation);
+        let later = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reported = Arc::clone(&later);
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest| {
+            let path = rift_core::ProjectPath::new("lib.rs").expect("fixture path is valid");
+            reported.store(observing.observe_paths([path])?, Ordering::SeqCst);
+            build_workspace_candidate(root, limits, request)
+        };
+        let outcome = super::rebuild_workspace(&context, request, capture).await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let (current, failure) = published.read().await.snapshot();
+        assert!(failure.is_none());
+        assert_eq!(
+            current.epoch,
+            later.load(Ordering::SeqCst),
+            "the candidate answers the later observation as its twin"
+        );
+        assert_eq!(declarations_named(&current, "first")?, 1);
+        assert!(validation.superseded_after(0).is_none());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_records_a_superseded_rebuild_with_both_epochs() -> TestResult {
+        let (sink, mut drain) = rift_tracing::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let published = Arc::new(RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        }));
+        let watcher = unwatched(directory.path(), &validation)?;
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let observing = Arc::clone(&validation);
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&captures);
+        // The first capture meets a later observation of a file the publication does
+        // not hold; every later capture runs undisturbed.
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::write(root.join("other.rs"), "pub fn other() {}\n")
+                    .expect("the later source must land");
+                let path = rift_core::ProjectPath::new("other.rs").expect("fixture path is valid");
+                observing.observe_paths([path])?;
+            }
+            build_workspace_candidate(root, limits, request)
+        };
+        let supervisor = tokio::spawn(super::run_index_supervisor_with(
+            watcher,
+            invalidations,
+            cancellation_context(directory.path(), &validation, &published, &blocking),
+            capture,
+        ));
+        fs::write(directory.path().join("lib.rs"), "pub fn first() {}\n")?;
+        let epoch = validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let current = tokio::time::timeout(LANE_WAIT_MAX, async {
+            loop {
+                let changed = validation.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let current = published.read().await.snapshot().0;
+                if current.epoch > epoch {
+                    return current;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| "the rebuild after the superseded one must publish")?;
+        validation.cancellation.cancel();
+        supervisor.await?;
+
+        assert_eq!(current.epoch, epoch + 1);
+        assert_eq!(declarations_named(&current, "first")?, 1);
+        assert_eq!(declarations_named(&current, "other")?, 1);
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
+        let records = queued_records(&mut drain);
+        let superseded: Vec<_> = records
+            .iter()
+            .filter(|record| record.message() == "index rebuild superseded")
+            .collect();
+        assert_eq!(
+            superseded.len(),
+            1,
+            "one record for the one superseded rebuild"
+        );
+        assert_eq!(superseded[0].component(), "index");
+        assert_eq!(superseded[0].operation(), "index.build");
+        let fields: serde_json::Value = serde_json::from_str(superseded[0].fields())?;
+        assert_eq!(fields["epoch"], epoch.to_string());
+        assert_eq!(fields["observed_epoch"], (epoch + 1).to_string());
         Ok(())
     }
 
@@ -8042,6 +8611,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("moved.rs")?]),
             previous: Some(Arc::clone(&first)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
         let limits = WorkspaceIndexLimits::default();
         let WorkspaceCandidate::Stable {

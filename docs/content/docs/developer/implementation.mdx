@@ -236,6 +236,15 @@ report asks for the whole workspace, so it supersedes the rebuild the read asked
 read captures again: a capture that matches its previous one waits for the next rebuild, and only
 a capture that differs, a tree still moving, answers from the published index with `stale_index`.
 
+A rebuild that is still running asks the same question publication asks, between files and at
+each phase boundary: whether a later observation asks for the whole workspace, or names a path
+whose bytes differ from what the rebuild read there. Such a rebuild stops, returns its paths to
+the next rebuild, and wakes the waiting reads.
+
+A later observation of the bytes the rebuild already read, such as a read's own request, leaves
+it running, and its index publishes for that observation. The comparison reads at most 64
+observed paths over one rebuild; a larger observation is decided at publication.
+
 <VersionBadge version="v0.0.47" />
 
 The capture records each file's stat beside its digests: length and modification time, and on

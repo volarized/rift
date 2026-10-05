@@ -843,7 +843,7 @@ const STALE_INDEX_PATHS_MAX: usize = 5;
 enum ReadWait {
     /// The first capture checks content even when observations are ahead.
     Capture,
-    /// Changed source waits for publication, or for a successful capture superseded after
+    /// Changed source waits for publication, or for an index capture superseded after
     /// the read's last capture began.
     Rebuild {
         /// The latest superseded epoch recorded before that capture began.
@@ -912,10 +912,10 @@ impl PreviousCapture {
 enum StaleIndexReason<'a> {
     /// The rebuild recorded past that publication failed.
     RebuildFailed(&'a RecordedRebuildFailure),
-    /// A successful capture was superseded while the request's own captures found the
-    /// tree moving.
+    /// An index capture was superseded, while it ran or at publication, while the
+    /// request's own captures found the tree moving.
     RebuildSuperseded {
-        /// The successful candidate's filesystem epoch.
+        /// The superseded capture's filesystem epoch.
         epoch: u64,
         /// What this request's exact capture found ahead of the publication.
         changes: &'a PathChanges,
@@ -946,7 +946,7 @@ impl StaleIndexReason<'_> {
                     |named| format!("{named} moved"),
                 );
                 format!(
-                    "a successful index capture at epoch {epoch} was superseded before \
+                    "an index capture at epoch {epoch} was superseded before \
                      publication; the request-time capture found {found}{served}; \
                      the index supervisor keeps rebuilding the changed files"
                 )
@@ -3411,8 +3411,9 @@ impl RiftMcp {
     /// publication before the next capture; the last capture refuses if its configuration
     /// moved.
     ///
-    /// A successful capture superseded after the read's last capture began wakes the read
-    /// before that publication, and the read captures again. A capture that differs from
+    /// An index capture superseded after the read's last capture began, while it ran or
+    /// at publication, wakes the read before that publication, and the read captures
+    /// again. A capture that differs from
     /// the previous one proves the tree moved during the read, so the read answers stale
     /// with the superseded epoch, which keeps a workspace under back-to-back rebuilds
     /// readable.
@@ -3775,7 +3776,7 @@ impl RiftMcp {
     /// carries the failure.
     ///
     /// A read's first capture compares content even when observations are ahead. Changed
-    /// source then waits for publication, unless a successful capture was superseded after
+    /// source then waits for publication, unless an index capture was superseded after
     /// the current publication and after the read's last capture began. The read then
     /// captures again rather than wait for a publication a moving tree keeps superseding,
     /// and that capture decides whether the tree moved. A supersession recorded before the
@@ -5718,7 +5719,7 @@ done
             &RebuildRequest::initial(epoch),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
-            WorkspaceCandidate::ConfigurationChanged => {
+            WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                 Err("fixture configuration must remain stable".into())
             }
         }
@@ -8320,6 +8321,157 @@ done
             stale_index_of(&fresh.warnings).is_err(),
             "the published edit answers fresh"
         );
+        Ok(())
+    }
+
+    /// A capture stopped while it runs by an observation of what the read already
+    /// captured proves no movement, exactly as one superseded at publication does: the
+    /// read captures again, finds its previous tree, and keeps waiting for its rebuild.
+    #[tokio::test]
+    async fn a_capture_stopped_by_a_late_report_leaves_the_read_waiting() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "lantern"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+
+        let validation = Arc::clone(&server.validation);
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                validation.observe_whole_workspace()?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                assert!(
+                    matches!(candidate, WorkspaceCandidate::Superseded),
+                    "the capture stops before it builds a candidate"
+                );
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "a stopped capture that moved nothing must not answer the read"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the stopped capture woke the read"
+        );
+        assert_eq!(
+            server.validation.observed_epoch(),
+            2,
+            "a capture that matches the read's previous one asks for nothing again"
+        );
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "the publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the edited source answers: {fresh:?}");
+        assert!(
+            stale_index_of(&fresh.warnings).is_err(),
+            "the read answers from a current publication: {:?}",
+            fresh.warnings
+        );
+        Ok(())
+    }
+
+    /// A capture stopped while it runs wakes a waiting read. The tree that read captures
+    /// next differs from its previous capture, so it answers from the published index
+    /// with `stale_index`.
+    #[tokio::test]
+    async fn a_capture_stopped_by_moved_bytes_wakes_a_read_that_answers_stale() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern0() {}\n")?;
+        server
+            .validation
+            .observe_paths([CoreProjectPath::new("lib.rs")?])?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "beacon"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+        let (published, _) = server.published.read().await.snapshot();
+
+        let validation = Arc::clone(&server.validation);
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                fs::write(root.join("other.rs"), "pub fn other() {}\n")
+                    .expect("the later source must land");
+                let path = CoreProjectPath::new("other.rs").expect("fixture path is valid");
+                validation.observe_paths([path])?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                assert!(
+                    matches!(candidate, WorkspaceCandidate::Superseded),
+                    "the capture stops before it builds a candidate"
+                );
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+        assert_eq!(server.published.read().await.current.epoch, published.epoch);
+
+        let stale = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "a stopped capture must wake the waiting read")??;
+        assert_eq!(stale.hits.len(), 1);
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the woken read captured the tree that moved during it"
+        );
+        let (index, captured_revision, detail) = stale_index_of(&stale.warnings)?;
+        assert_eq!(index, published.reads.tree_revision());
+        assert_ne!(index, captured_revision);
+        assert!(detail.contains("other.rs"), "{detail}");
+        assert!(detail.contains("superseded before publication"), "{detail}");
         Ok(())
     }
 
