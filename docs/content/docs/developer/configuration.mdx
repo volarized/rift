@@ -151,12 +151,12 @@ stall_delay = "10s"
 - `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
   `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
   excludes never reaches the store, whatever the terminal shows
-- `sample_interval` is how often the server samples its own process, 200ms to 1h: resident and
+- `sample_interval` <VersionBadge version="v0.0.62" inline /> is how often the server samples its own process, 200ms to 1h: resident and
   virtual memory, CPU time and usage, open files, and bytes read and written. CPU usage is the
   CPU time spent between two samples, so the first sample after a start carries none. A tick at
   which an instrument other than the process's own moved also writes metric snapshot records
   into the store, kind `metric`, which `rift server logs --kind metric` prints
-- `stall_delay` is how long an operation, lock wait, or held lock stays open before the server
+- `stall_delay` <VersionBadge version="v0.0.62" inline /> is how long an operation, lock wait, or held lock stays open before the server
   reports it, 1s to 1h. The sample tick reports each such entry once, in one record of the
   operations in flight with their age, so a request that runs out its deadline leaves the work
   it waited on in the store. A lock the server keeps for as long as it runs is never reported
@@ -685,7 +685,7 @@ journal_size_limit = "64mb"
 - `busy_timeout` bounds how long a read or write waits for one of those connections to come
   free, and how long a connection waits for a database lock held by another process before
   failing with `SQLITE_BUSY`, 100ms to 30s
-- `journal_size_limit` bounds the size the write-ahead log of the index database, and
+- `journal_size_limit` <VersionBadge version="v0.0.62" inline /> bounds the size the write-ahead log of the index database, and
   separately of the vectors database, is cut back to at the commit that restarts it after a
   checkpoint, 0b to 64gb, default `64mb`. A transaction larger than the limit still grows the
   log past it until that commit
