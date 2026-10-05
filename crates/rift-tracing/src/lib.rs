@@ -24,6 +24,10 @@
 //! the capture, and the optional OTLP export under filters of their own, and stops it with
 //! [`TracingRuntime::shutdown`]. [`LogRecord::rendered`] prints a record the way
 //! `rift server logs` shows it.
+//!
+//! A test captures what the code under test records through a `ScopedRecorder`, which the
+//! `fixtures` feature compiles in; dependent crates enable it from their
+//! dev-dependencies only, so a release build carries no recorder.
 
 mod capture;
 mod drain;
@@ -31,6 +35,8 @@ mod measurement;
 mod otlp;
 mod reads;
 mod record;
+#[cfg(any(test, feature = "fixtures"))]
+mod recorder;
 mod render;
 mod runtime;
 mod span;
@@ -47,6 +53,11 @@ pub use reads::{LogReader, LogReads};
 pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
     LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord,
+};
+#[cfg(any(test, feature = "fixtures"))]
+pub use recorder::{
+    SCOPED_RECORDER_PRINT_BYTES_MAX, SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder,
+    ScopedRecorderBuilder,
 };
 pub use runtime::{
     LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder, validate_log_filter,

@@ -232,6 +232,17 @@ impl LogDrain {
         self.receiver.try_recv().map(|queued| queued.record)
     }
 
+    /// Every record the queue holds now, oldest first, without waiting; for a test that
+    /// asserts on what its [`ScopedRecorder`](crate::ScopedRecorder) captured.
+    ///
+    /// The queue holds at most [`LOG_QUEUE_RECORDS`](crate::LOG_QUEUE_RECORDS); a record
+    /// sent while it was full is dropped and absent here.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[must_use]
+    pub fn queued_records(&mut self) -> Vec<LogRecord> {
+        std::iter::from_fn(|| self.try_recv_record().ok()).collect()
+    }
+
     /// Writes records until the queue closes, draining buffered records after
     /// cancellation.
     ///
