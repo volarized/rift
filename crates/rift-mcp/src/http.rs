@@ -1221,35 +1221,35 @@ mod tests {
     /// outcome, and a failure's error.
     #[test]
     fn a_stop_stage_records_its_name_outcome_and_error() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("the fixture runtime must start");
         let deadline = Instant::now() + Duration::from_secs(4);
-        let (passed, failed) = tracing::subscriber::with_default(subscriber, || {
-            runtime.block_on(async {
-                let passed = super::stop_stage("passing stage", deadline, async {
-                    Ok::<_, rift_error::RiftError>(7)
-                })
-                .await;
-                let failed = super::stop_stage("failing stage", deadline, async {
-                    errors::mcp::http_serve_failed()
-                        .operation("failing stage")
-                        .source(std::io::Error::other("injected stage failure"))
-                        .fail::<()>()
-                })
-                .await;
-                (passed, failed)
+        let (passed, failed) = runtime.block_on(async {
+            let passed = super::stop_stage("passing stage", deadline, async {
+                Ok::<_, rift_error::RiftError>(7)
             })
+            .await;
+            let failed = super::stop_stage("failing stage", deadline, async {
+                errors::mcp::http_serve_failed()
+                    .operation("failing stage")
+                    .source(std::io::Error::other("injected stage failure"))
+                    .fail::<()>()
+            })
+            .await;
+            (passed, failed)
         });
+        drop(recorder);
 
         assert_eq!(passed.ok(), Some(7));
         assert!(failed.is_err(), "the stage failure passes through");
-        let ended = std::iter::from_fn(|| drain.try_recv_record().ok())
+        let ended = drain
+            .queued_records()
+            .into_iter()
             .filter(|record| record.message() == "stop stage ended")
             .collect::<Vec<_>>();
         assert_eq!(ended.len(), 2, "one record per stage: {ended:?}");
