@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{LogStore, METRICS_SCHEMA_VERSION};
+use super::{LogStore, METRICS_SCHEMA_VERSION, StoreClose, WalCheckpoint};
 use crate::{
     LOG_BATCH_RECORDS_MAX, LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogReader,
     LogReads, LogRecord, RecordKind,
@@ -43,6 +43,14 @@ fn reads(store: &LogStore) -> Result<LogReads, Box<dyn std::error::Error>> {
 
 fn close_deadline() -> Instant {
     Instant::now() + THREAD_WAIT_MAX
+}
+
+/// Closes `store` by [`close_deadline`] and answers the checkpoint of a close that ended.
+async fn closed(store: &LogStore) -> Result<WalCheckpoint, Box<dyn std::error::Error>> {
+    match store.close(close_deadline()).await? {
+        StoreClose::Closed(checkpoint) => Ok(checkpoint),
+        timeout @ StoreClose::Timeout { .. } => Err(format!("the close ended: {timeout:?}").into()),
+    }
 }
 
 /// The schema version the file at `path` carries, read on a connection of the test's own.
@@ -633,9 +641,13 @@ async fn a_close_removes_the_write_ahead_log() -> TestResult {
         "an open WAL database keeps its log"
     );
 
-    let checkpoint = store.close(close_deadline()).await?;
+    let checkpoint = closed(&store).await?;
 
     assert!(!checkpoint.is_busy());
+    assert!(
+        checkpoint.log() > 0,
+        "the checkpoint reads the frames the log held before it emptied it: {checkpoint:?}"
+    );
     assert_eq!(checkpoint.log(), checkpoint.checkpointed());
     assert!(
         !wal_path(store.path()).exists(),
@@ -652,7 +664,7 @@ async fn a_close_beside_another_connection_leaves_an_empty_write_ahead_log() -> 
     let other = reads(&store)?;
     assert_eq!(other.count()?, 1);
 
-    let checkpoint = store.close(close_deadline()).await?;
+    let checkpoint = closed(&store).await?;
 
     assert!(!checkpoint.is_busy());
     assert_eq!(std::fs::metadata(wal_path(store.path()))?.len(), 0);
@@ -734,6 +746,89 @@ async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestRes
     assert!(
         weak.upgrade().is_none(),
         "the close the thread ran released the owner"
+    );
+    Ok(())
+}
+
+/// Copies the metrics database and its write-ahead log, and no shared-memory index, into
+/// `into`: the files a process leaves when it exits with its connection open.
+fn copy_left_files(path: &Path, into: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let copied = into.join("metrics");
+    std::fs::copy(path, &copied)?;
+    std::fs::copy(wal_path(path), wal_path(&copied))?;
+    Ok(copied)
+}
+
+/// A close whose checkpoint outlasts its deadline answers a timeout naming the stage, and
+/// the files the running writer thread leaves recover every committed record from the log
+/// at the next open. The thread keeps its owner until it finishes.
+#[tokio::test]
+async fn a_checkpoint_past_the_close_deadline_times_out_and_the_next_open_recovers_the_log()
+-> TestResult {
+    let directory = tempfile::tempdir()?;
+    let (owner, released) = release_probe();
+    let weak = Arc::downgrade(&owner);
+    let store = LogStore::open(&metrics_path(&directory), Some(owner)).await?;
+    let written: Vec<LogRecord> = (0..8)
+        .map(|index| record(&format!("committed {index}")))
+        .collect();
+    store.append(&written, KEEP_EVERY).await?;
+    let (holding, release) = store.hold_next_checkpoint();
+    let deadline = Instant::now() + THREAD_WAIT_MAX;
+
+    // The held thread answers nothing, so the paused clock reaches the deadline only once
+    // the close waits inside the checkpoint.
+    let (answer, held) = tokio::join!(store.close(deadline), async {
+        let held = holding.await;
+        tokio::time::pause();
+        tokio::time::advance(THREAD_WAIT_MAX).await;
+        held
+    });
+
+    held?;
+    let StoreClose::Timeout { stage, elapsed } = answer? else {
+        return Err("a held checkpoint outlasts the deadline".into());
+    };
+    // The thread's stage times run on the monotonic clock the paused clock does not move.
+    assert_eq!(stage, "checkpoint", "{elapsed:?}");
+    assert!(
+        weak.upgrade().is_some(),
+        "the held thread keeps its owner past the deadline"
+    );
+    let copies = tempfile::tempdir()?;
+    let left = copy_left_files(store.path(), copies.path())?;
+    let main_alone = copies.path().join("main-alone");
+    std::fs::copy(&left, &main_alone)?;
+    let tables: i64 = rusqlite::Connection::open(&main_alone)?.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'log_records'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(tables, 0, "the committed records live in the log alone");
+    let recovered = rusqlite::Connection::open(&left)?;
+    let mut messages = recovered.prepare("SELECT message FROM log_records ORDER BY id")?;
+    let messages = messages
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        messages,
+        written
+            .iter()
+            .map(|record| record.message.clone())
+            .collect::<Vec<_>>(),
+        "the next open recovers every committed record"
+    );
+    tokio::time::resume();
+    release.send(())?;
+    assert_eq!(
+        released.recv_timeout(THREAD_WAIT_MAX)?.as_deref(),
+        Some("rift-db-metrics"),
+        "the thread finishes the close and releases its owner"
+    );
+    assert_eq!(
+        store.close(close_deadline()).await?,
+        StoreClose::Timeout { stage, elapsed },
+        "a second close answers what the first answered"
     );
     Ok(())
 }

@@ -75,6 +75,25 @@ enum JoinState {
     Complete(Result<(), String>),
 }
 
+/// Why a worker's stop did not end with the worker joined.
+#[derive(Debug)]
+pub(crate) enum ShutdownFailure {
+    /// The deadline passed while the worker still ran: in the queue, before its reply, or
+    /// before the thread ended.
+    Deadline(toasty_core::Error),
+    /// The worker stopped with an error, panicked, or stopped before it answered.
+    Failed(toasty_core::Error),
+}
+
+impl ShutdownFailure {
+    /// The driver error either kind carries.
+    pub(crate) fn into_error(self) -> toasty_core::Error {
+        match self {
+            Self::Deadline(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
 impl std::fmt::Debug for DatabaseThread {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseThread")
@@ -156,6 +175,24 @@ impl DatabaseThread {
         }))
     }
 
+    /// Holds the worker inside one command until the returned sender fires or drops; the
+    /// receiver answers once the worker holds.
+    #[cfg(test)]
+    pub(crate) async fn hold_for_test(
+        &self,
+    ) -> Result<(oneshot::Receiver<()>, oneshot::Sender<()>), toasty_core::Error> {
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        self.sender
+            .send(Command::Hold {
+                started,
+                release: release_rx,
+            })
+            .await
+            .map_err(|_| worker_error("SQLite worker stopped before accepting the hold"))?;
+        Ok((started_rx, release))
+    }
+
     #[cfg(test)]
     pub(crate) async fn hold_next_commit_for_test(
         &self,
@@ -219,40 +256,51 @@ impl DatabaseThread {
             .record();
     }
 
+    /// [`Self::stop`] with either failure as its driver error.
+    #[cfg(test)]
     pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), toasty_core::Error> {
+        self.stop(deadline)
+            .await
+            .map_err(ShutdownFailure::into_error)
+    }
+
+    /// Stops the worker and joins it by `deadline`, telling a deadline the worker outlasted
+    /// apart from a worker that stopped with an error.
+    pub(crate) async fn stop(&self, deadline: Instant) -> Result<(), ShutdownFailure> {
+        let outlasted = |message: &str| ShutdownFailure::Deadline(worker_error(message));
+        let failed = |message: &str| ShutdownFailure::Failed(worker_error(message));
         let mut join_state = timeout_at(deadline, self.join.lock())
             .await
-            .map_err(|_| worker_error("SQLite worker shutdown wait exceeded deadline"))?;
+            .map_err(|_| outlasted("SQLite worker shutdown wait exceeded deadline"))?;
         if let JoinState::Complete(result) = &*join_state {
-            return result.clone().map_err(|error| {
-                worker_error(&format!("SQLite worker stopped with error: {error}"))
-            });
+            return result
+                .clone()
+                .map_err(|error| failed(&format!("SQLite worker stopped with error: {error}")));
         }
 
         let already_joining = matches!(&*join_state, JoinState::Task(_));
         let response_outcome = if already_joining {
-            Ok(Ok(()))
+            Ok(())
         } else {
             let (reply, response) = oneshot::channel();
             match timeout_at(deadline, self.sender.reserve()).await {
                 Ok(Ok(permit)) => {
                     permit.send(Command::Shutdown { reply });
                     start_join(&mut join_state);
-                    timeout_at(deadline, response)
-                        .await
-                        .map_err(|_| worker_error("SQLite worker shutdown exceeded deadline"))
-                        .and_then(|reply| {
-                            reply.map_err(|_| {
-                                worker_error("SQLite worker stopped before shutdown completed")
-                            })
-                        })
+                    match timeout_at(deadline, response).await {
+                        Err(_) => Err(outlasted("SQLite worker shutdown exceeded deadline")),
+                        Ok(Err(_)) => {
+                            Err(failed("SQLite worker stopped before shutdown completed"))
+                        }
+                        Ok(Ok(reply)) => reply.map_err(ShutdownFailure::Failed),
+                    }
                 }
                 Ok(Err(_)) => {
                     start_join(&mut join_state);
-                    Err(worker_error("SQLite worker stopped before shutdown"))
+                    Err(failed("SQLite worker stopped before shutdown"))
                 }
                 Err(_) => {
-                    return Err(worker_error(
+                    return Err(outlasted(
                         "SQLite worker shutdown queue wait exceeded deadline",
                     ));
                 }
@@ -269,14 +317,12 @@ impl DatabaseThread {
         };
         if let Some(result) = joined {
             *join_state = JoinState::Complete(result.clone());
-            result.map_err(|error| {
-                worker_error(&format!("SQLite worker stopped with error: {error}"))
-            })?;
+            result
+                .map_err(|error| failed(&format!("SQLite worker stopped with error: {error}")))?;
         } else {
-            return Err(worker_error("SQLite worker join exceeded deadline"));
+            return Err(outlasted("SQLite worker join exceeded deadline"));
         }
-        response_outcome??;
-        Ok(())
+        response_outcome
     }
 }
 
@@ -1002,6 +1048,43 @@ mod tests {
         assert!(
             error.to_string().contains("test SQLite worker panic"),
             "shutdown error must preserve worker panic payload: {error}"
+        );
+    }
+
+    /// A held worker that outlasts the stop's deadline answers a deadline failure, and a
+    /// worker that panicked answers a failure of its own whatever the deadline.
+    #[tokio::test]
+    async fn a_stop_tells_a_worker_past_its_deadline_from_a_failed_one() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (held, _held_driver) =
+            driver(&directory.path().join("held"), Duration::from_secs(1)).await;
+        let (holding, release) = held.hold_for_test().await.expect("hold command must queue");
+        holding.await.expect("worker must hold");
+
+        let outlasted = held.stop(Instant::now() + Duration::from_millis(10)).await;
+
+        assert!(
+            matches!(outlasted, Err(super::ShutdownFailure::Deadline(_))),
+            "a held worker outlasts the deadline: {outlasted:?}"
+        );
+        release.send(()).expect("worker must resume");
+        held.stop(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("a released worker stops");
+
+        let (panicked, _panicked_driver) =
+            driver(&directory.path().join("panicked"), Duration::from_secs(1)).await;
+        panicked
+            .sender
+            .send(Command::Panic)
+            .await
+            .expect("panic command must queue");
+
+        let failed = panicked.stop(Instant::now() + Duration::from_secs(1)).await;
+
+        assert!(
+            matches!(failed, Err(super::ShutdownFailure::Failed(_))),
+            "a panicked worker fails its stop: {failed:?}"
         );
     }
 

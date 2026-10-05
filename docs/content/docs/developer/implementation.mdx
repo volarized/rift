@@ -198,7 +198,15 @@ stop begins, and each stage takes only what the one before it left:
 5. The election guard drops, right before the process exits.
 
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
-`stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure.
+`stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure. The outcome is `ok`
+for a stage that ended inside the deadline, `error` for a failure, and `timeout` for a stage that
+ended without a failure once its bound had passed. Only a failure makes the stop exit with status 1.
+
+A database close runs a checkpoint, and the checkpoint's file syncs can take longer than the
+close's bound. Such a close ends its stage with `timeout`: the thread running the checkpoint keeps running until
+it finishes or the process exits, and the next open recovers every committed transaction from the
+write-ahead log. A close that started past its bound still fails the stop, and so does a metrics
+close whose writer thread had not reached its checkpoint by the bound.
 
 <VersionBadge version="v0.0.62" />
 
@@ -525,13 +533,18 @@ is zero on the vectors database, and `journal_size_limit` comes from
 [`[search]`](/docs/developer/configuration#search) `journal_size_limit` on both.
 
 At close, `WorkspaceDatabase::shutdown` takes the write turn, sets the busy timeout of its write
-connection to zero, and runs `PRAGMA wal_checkpoint(TRUNCATE)`. It records the `busy`, `log`, and
-`checkpointed` row as a `database.close` record, then the worker drops its connections, and the
-last connection's close removes the write-ahead log.
+connection to zero, reads the frames the log holds with `PRAGMA wal_checkpoint(NOOP)`, and runs
+`PRAGMA wal_checkpoint(TRUNCATE)`. A truncate that succeeds reads zero frames from the log it
+emptied, so the `database.close` record takes `log` from the NOOP row, derives `checkpointed` from
+both rows, and adds `busy` and `elapsed_ms`. Then the worker drops its connections, and the last
+connection's close removes the write-ahead log.
 
 A turn not free by the deadline, a busy answer, or a refused checkpoint does not fail the close:
-SQLite recovers whatever the log holds at the next open. The metrics writer thread runs the same
-checkpoint when it closes, and the stop records its row as a `database.close` record too.
+SQLite recovers whatever the log holds at the next open. A checkpoint that outlasts the deadline
+keeps the worker busy, and the worker's stop past the deadline is a second `warn` record with
+operation `database.close`. The metrics writer thread runs the same checkpoint when it closes, and
+the stop records its row as a `database.close` record too, or, past the deadline, a `warn` record
+naming the close `stage` the thread was in and its `elapsed_ms`.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.

@@ -96,7 +96,9 @@ pub use runtime::{
 pub use sampler::{PROCESS_SAMPLE_INTERVAL_MIN, SAMPLE_HOOKS_MAX, SampleHook, sample_hook};
 pub use span::Span;
 pub use stderr::SERVER_STDERR_BYTES_MAX;
-pub use store::{LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, WalCheckpoint};
+pub use store::{
+    LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, StoreClose, WalCheckpoint,
+};
 
 /// Times a whole function as one [`traced!`] operation.
 ///
