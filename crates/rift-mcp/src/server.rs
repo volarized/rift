@@ -8517,8 +8517,8 @@ done
         Ok(())
     }
 
-    /// The same condition on `search`: the answer carries the publication's own rows and
-    /// the warning, rather than the refusal the spent bound used to raise.
+    /// The same condition on `search`: once the reconciliation bound is spent, the answer
+    /// carries the publication's own rows and the warning, and no refusal.
     #[tokio::test]
     async fn a_search_whose_tree_keeps_moving_answers_stale() -> TestResult {
         let (directory, server) = fixture().await?;
@@ -11348,8 +11348,8 @@ done
         Ok(())
     }
 
-    /// `fetch_limit` no longer scales with the requested `limit`, so `total_pages` reflects
-    /// the same candidate pool whatever page size the caller asks for: a `limit: 1` request
+    /// `fetch_limit` reads `results_max` whatever the requested `limit`, so `total_pages`
+    /// reflects the same candidate pool whatever page size the caller asks for: a `limit: 1` request
     /// reports as many pages as the pool a `limit` wide enough to fit it all serves on one
     /// page.
     #[tokio::test]

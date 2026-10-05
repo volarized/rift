@@ -251,10 +251,10 @@ mod tests {
         );
     }
 
-    /// Logs record and answer while the workspace database is refused: the metrics
-    /// database opens on its own.
+    /// Logs record and answer while the index database is refused: the metrics database
+    /// opens on its own.
     #[tokio::test]
-    async fn a_refused_workspace_database_leaves_the_logs_recording() {
+    async fn a_refused_index_database_leaves_the_logs_recording() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let database_path = directory
             .path()
