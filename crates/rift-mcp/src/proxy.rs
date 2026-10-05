@@ -657,7 +657,10 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
             spawns.spawn_captured(root);
         }
         match spawns.poll(adopted, election_held) {
-            SpawnPollOutcome::Ready(running) => return Ok(running),
+            SpawnPollOutcome::Ready(running) => {
+                closing.record_answered(started.elapsed());
+                return Ok(running);
+            }
             SpawnPollOutcome::Failed(capture) => return server_start_failed(&capture).fail(),
             SpawnPollOutcome::ElectionUnheld => spawns.spawn_captured(root),
             SpawnPollOutcome::Waiting => {}
@@ -670,7 +673,10 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
             let asked = ask_repository().await;
             asked.report_change(&mut reported);
             match asked {
-                RepositoryAsk::Connected(running) => return Ok(running),
+                RepositoryAsk::Connected(running) => {
+                    closing.record_answered(started.elapsed());
+                    return Ok(running);
+                }
                 RepositoryAsk::Transient(miss) => closing.repository_miss = Some(miss),
                 RepositoryAsk::Terminal(miss) => {
                     repository_transient = false;
@@ -691,8 +697,8 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
     refusal.fail()
 }
 
-/// What a start window that closed without a server that answers last saw,
-/// logged once as the window closes, beside the refusal it returns.
+/// What a start window last saw, logged once as the window closes: on a
+/// server that answers, or beside the refusal it returns.
 #[derive(Debug, Default)]
 struct StartWindowClose {
     /// The poll rounds the window ran.
@@ -720,6 +726,19 @@ impl StartWindowClose {
             wrote,
             refusal = %refusal.message,
             "start window closed without a server that answers"
+        );
+    }
+
+    /// Logs the window's close after `elapsed` on a server that answers: the poll rounds
+    /// it ran and the workspace election's presence at the last round.
+    fn record_answered(&self, elapsed: Duration) {
+        rift_tracing::info!(
+            component = "mcp",
+            rounds = self.rounds,
+            elapsed_ms = elapsed.as_millis(),
+            presence = %self.presence,
+            outcome = "ok",
+            "start window closed with a server that answers"
         );
     }
 }
@@ -2450,11 +2469,13 @@ mod tests {
     /// A repository server holds the workspace's election and publishes no
     /// document there, which the held election below stands in for. Its first
     /// ask misses through a transient arm, and the start window asks again on
-    /// the next poll round, which connects.
+    /// the next poll round, which connects. The window's close logs once,
+    /// naming the rounds it ran and the outcome.
     #[tokio::test(start_paused = true)]
     async fn a_transient_repository_miss_is_asked_again_inside_the_start_window() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = claim(directory.path())?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let (running, _kept_alive) = direct_upstream();
         let mut answers = vec![
             RepositoryAsk::Connected(running),
@@ -2477,6 +2498,19 @@ mod tests {
         .await;
         assert!(connected.is_ok(), "{connected:?}");
         assert_eq!(asked, 2, "the second ask connects");
+        drop(recorder);
+        let records = drain.queued_records();
+        let closed = records
+            .iter()
+            .filter(|record| record.message() == "start window closed with a server that answers")
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1, "the window's close logs once: {records:?}");
+        assert_eq!(closed[0].level(), "info");
+        let fields: serde_json::Value = serde_json::from_str(closed[0].fields())?;
+        assert_eq!(fields["rounds"], "1");
+        assert_eq!(fields["outcome"], "ok");
+        assert_eq!(fields["presence"], "Starting");
+        assert!(fields["elapsed_ms"].is_string(), "{fields}");
         Ok(())
     }
 
