@@ -5,15 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "The metrics database: the server's stored log records and their reads"
+description = "The metrics database and the instrumentation Rift crates emit through"
 
 [lints]
 workspace = true
 
 [dependencies]
+pin-project-lite.workspace = true
 rift-error.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
