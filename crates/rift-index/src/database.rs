@@ -571,6 +571,11 @@ impl WorkspaceDatabase {
     ///
     /// Only the first call checkpoints; a later one awaits the worker's stop alone.
     ///
+    /// Each call is the operation `database.close`, component `storage`, naming its
+    /// `database`: it records `operation opened` when it starts, sits in the table of
+    /// operations in flight while it runs, and its close record carries `elapsed_ms` and
+    /// its outcome.
+    ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when the worker stops with an error or panics.
@@ -580,26 +585,36 @@ impl WorkspaceDatabase {
     /// Dropping the future during the checkpoint releases the write turn; a worker stop
     /// already queued still completes.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
-        if !self.checkpointed.swap(true, Ordering::AcqRel) {
-            // Boxed: the checkpoint holds a write checkout, and every stop path that awaits
-            // this future would otherwise carry it inline.
-            Box::pin(self.checkpoint_before_close(deadline)).await;
-        }
-        match self.thread.stop(deadline).await {
-            Ok(()) => Ok(()),
-            Err(ShutdownFailure::Deadline(error)) => {
-                rift_tracing::warn!(
-                    component = "storage",
-                    operation = "database.close",
-                    database = self.name.label(),
-                    %error,
-                    "SQLite worker outlasted the shutdown deadline; the write-ahead log stays \
-                     for the next open"
-                );
-                Ok(())
+        let database = self.name.label();
+        rift_tracing::traced!(
+            component = "storage",
+            operation = "database.close",
+            open = true,
+            database = database,
+            async {
+                if !self.checkpointed.swap(true, Ordering::AcqRel) {
+                    // Boxed: the checkpoint holds a write checkout, and every stop path that
+                    // awaits this future would otherwise carry it inline.
+                    Box::pin(self.checkpoint_before_close(deadline)).await;
+                }
+                match self.thread.stop(deadline).await {
+                    Ok(()) => Ok(()),
+                    Err(ShutdownFailure::Deadline(error)) => {
+                        rift_tracing::warn!(
+                            component = "storage",
+                            operation = "database.close",
+                            database,
+                            %error,
+                            "SQLite worker outlasted the shutdown deadline; the write-ahead log \
+                             stays for the next open"
+                        );
+                        Ok(())
+                    }
+                    Err(failure) => Err(self.failed(failure.into_error())),
+                }
             }
-            Err(failure) => Err(self.failed(failure.into_error())),
-        }
+        )
+        .await
     }
 
     /// The truncate checkpoint of [`Self::shutdown`], recorded and never failing the close.
@@ -2609,13 +2624,17 @@ mod tests {
     /// One `database.close` record: its level, its message, and its parsed fields.
     type CloseRecord = (String, String, serde_json::Value);
 
-    /// The `database.close` records among `records`.
+    /// The `database.close` records among `records` that report the checkpoint or the
+    /// worker's stop: the operation's opening and its span close left out.
     fn close_records(
         records: &[rift_tracing::LogRecord],
     ) -> Result<Vec<CloseRecord>, Box<dyn std::error::Error>> {
         records
             .iter()
-            .filter(|record| record.operation() == "database.close")
+            .filter(|record| {
+                record.operation() == "database.close"
+                    && !matches!(record.message(), "operation opened" | "database.close")
+            })
             .map(|record| {
                 Ok((
                     record.level().to_owned(),
@@ -2663,6 +2682,45 @@ mod tests {
             "every frame moved: {fields}"
         );
         assert!(count("elapsed_ms").is_some(), "{fields}");
+        Ok(())
+    }
+
+    /// A close is the operation `database.close`: it records its opening and its close,
+    /// each naming its database, and the close carries its elapsed time and outcome.
+    #[tokio::test]
+    async fn a_close_records_its_opening_and_its_close() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let path = DatabaseName::Vectors.path(directory.path());
+        let database = limited_database(&path, DatabaseName::Vectors).await?;
+
+        database
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let operation: Vec<(&str, serde_json::Value)> = records
+            .iter()
+            .filter(|record| {
+                record.operation() == "database.close"
+                    && matches!(record.message(), "operation opened" | "database.close")
+            })
+            .map(|record| {
+                let fields = serde_json::from_str(record.fields()).unwrap_or_default();
+                (record.message(), fields)
+            })
+            .collect();
+        let [(opened, opened_fields), (closed, closed_fields)] = &operation[..] else {
+            return Err(format!("an opening and a close: {operation:?}").into());
+        };
+        assert_eq!(*opened, "operation opened");
+        assert_eq!(*closed, "database.close");
+        let opened_span = &opened_fields["root_span"]["fields"];
+        assert_eq!(opened_span["database"], "vectors", "{opened_fields}");
+        assert_eq!(closed_fields["database"], "vectors", "{closed_fields}");
+        assert!(closed_fields.get("elapsed_ms").is_some(), "{closed_fields}");
+        assert_eq!(closed_fields["status.code"], "Ok", "{closed_fields}");
         Ok(())
     }
 

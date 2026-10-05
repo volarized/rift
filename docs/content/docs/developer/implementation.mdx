@@ -591,6 +591,11 @@ Every checkout sets its pragmas again. `mmap_size` comes from
 is zero on the vectors database, and `journal_size_limit` comes from
 [`[search]`](/docs/developer/configuration#search) `journal_size_limit` on both.
 
+Each close is the operation `database.close`, component `storage`, naming its `database`: it
+records `operation opened` when it starts, sits in the table of operations in flight while it
+runs, and its close record carries `elapsed_ms` and the outcome. The close's wait for the write
+turn is the lock wait every writer records.
+
 At close, `WorkspaceDatabase::shutdown` takes the write turn, sets the busy timeout of its write
 connection to zero, reads the frames the log holds with `PRAGMA wal_checkpoint(NOOP)`, and runs
 `PRAGMA wal_checkpoint(TRUNCATE)`. A truncate that succeeds reads zero frames from the log it
