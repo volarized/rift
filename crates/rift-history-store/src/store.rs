@@ -222,7 +222,8 @@ impl HistoryStore {
     /// server's history task fills this store.
     ///
     /// The attempt is recorded as `history.fill`: its outcome, and the time the
-    /// filler keeps the lock.
+    /// filler keeps the lock. The hold is lifelong: the history task that takes it
+    /// keeps it from then on, so the stall report leaves it out.
     ///
     /// # Errors
     ///
@@ -239,7 +240,10 @@ impl HistoryStore {
                 .detail(source)
                 .error()
         })?;
-        match rift_tracing::lock(FILL_LOCK_NAME).try_acquire(|| lock.try_lock().map(|()| lock)) {
+        match rift_tracing::lock(FILL_LOCK_NAME)
+            .lifelong()
+            .try_acquire(|| lock.try_lock().map(|()| lock))
+        {
             Ok(fill) => StoreFiller::open(&self.location.database(), fill).map(Some),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(source)) => errors::history_store::folder()

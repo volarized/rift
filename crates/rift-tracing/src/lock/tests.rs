@@ -475,6 +475,72 @@ async fn a_fallible_wait_dropped_while_pending_ends_cancelled() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn a_lifelong_hold_is_marked_in_its_span_and_the_table() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let live = std::sync::Mutex::new(());
+    let held = crate::traced!("history.open", {
+        lock("history.live")
+            .shared()
+            .lifelong()
+            .try_acquire(|| live.try_lock())
+    })
+    .map_err(|_| "the lock is free")?;
+    let listing = with_table(|table| table.listing(Duration::MAX)).ok_or("a table")?;
+    let stalled =
+        with_table(|table| table.stalled(Duration::MAX, Duration::ZERO)).ok_or("a table")?;
+    drop(held);
+    drop(recorder);
+
+    let listed: Value = serde_json::from_str(&listing.operations)?;
+    let entry = listed
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["kind"] == "held"))
+        .ok_or("the hold is listed")?;
+    assert_eq!(entry["lifelong"], true);
+    assert_eq!(entry["lock.name"], "history.live");
+    assert_eq!(
+        entry["parent"], "history.open",
+        "the hold names the operation that took it"
+    );
+    assert_eq!(
+        listing.in_flight, 1,
+        "the operation that took the lock closed with its work: {listed}"
+    );
+    assert!(
+        stalled.is_none(),
+        "a lifelong hold is never reported stalled: {stalled:?}"
+    );
+    let holds = closed(&drain.queued_records(), "lock.held")
+        .into_iter()
+        .map(fields)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0]["lifelong"], "true", "stored fields are text");
+    assert_eq!(holds[0]["holder"], "history.open");
+    Ok(())
+}
+
+#[test]
+fn a_hold_not_declared_lifelong_carries_no_mark() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let writes = std::sync::Mutex::new(());
+    let held = lock("index.write")
+        .try_acquire(|| writes.try_lock())
+        .map_err(|_| "the lock is free")?;
+    let listing = with_table(|table| table.listing(Duration::MAX)).ok_or("a table")?;
+    drop(held);
+    drop(recorder);
+
+    let listed: Value = serde_json::from_str(&listing.operations)?;
+    assert_eq!(listed[0]["kind"], "held");
+    assert!(listed[0].get("lifelong").is_none(), "{listed}");
+    let records = drain.queued_records();
+    let holds = closed(&records, "lock.held");
+    assert!(fields(holds[0])?.get("lifelong").is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_mapped_hold_keeps_its_span_and_records_once() -> TestResult {
     let (recorder, mut drain) = ScopedRecorder::builder().install()?;

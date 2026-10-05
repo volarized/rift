@@ -43,6 +43,7 @@ pub const fn lock(name: &'static str) -> Lock {
     Lock {
         name,
         mode: LockMode::Exclusive,
+        lifelong: false,
     }
 }
 
@@ -110,6 +111,7 @@ pub enum Refusal<Failure> {
 pub struct Lock {
     name: &'static str,
     mode: LockMode,
+    lifelong: bool,
 }
 
 impl Lock {
@@ -125,6 +127,20 @@ impl Lock {
         self
     }
 
+    /// Declares the hold lifelong: its holder keeps it for as long as the holder runs, such
+    /// as a lock a server takes at start and keeps while it serves.
+    ///
+    /// The `lock.held` span carries `lifelong = true` and opens as a root, so the operation
+    /// that took the lock closes when its work ends; the table of operations in flight
+    /// lists the entry with `"lifelong": true` and that operation as its `parent`. The
+    /// stall report past `[logs] stall_delay` leaves the entry out, since its age measures
+    /// its holder's life rather than stuck work; every other publication of the table lists
+    /// it. The wait is recorded as any other.
+    pub const fn lifelong(mut self) -> Self {
+        self.lifelong = true;
+        self
+    }
+
     /// Awaits `acquisition`, such as `mutex.lock()`, and answers its guard inside a
     /// [`Held`].
     ///
@@ -133,6 +149,10 @@ impl Lock {
     /// the `lock.wait` span, naming the waiting operation and the operation that holds the
     /// lock, and closes it with the outcome `acquired`, or `cancelled` when the future is
     /// dropped first.
+    ///
+    /// The future's output is the guard whatever it holds: an acquisition that can fail,
+    /// such as a semaphore's that answers a `Result`, takes [`Self::acquire_fallible`] so
+    /// its failure does not record as `acquired`.
     ///
     /// # Cancel safety
     ///
@@ -153,10 +173,6 @@ impl Lock {
     /// # Errors
     ///
     /// Returns [`Elapsed`] when `timeout` passes before the lock is acquired.
-    ///
-    /// The future's output is the guard whatever it holds: an acquisition that can fail,
-    /// such as a semaphore's that answers a `Result`, takes [`Self::acquire_fallible`] so
-    /// its failure does not record as `acquired`.
     ///
     /// # Cancel safety
     ///
@@ -426,26 +442,40 @@ struct Hold {
 }
 
 impl<Guard> Held<Guard> {
-    /// Opens the `lock.held` span under the current span: at `INFO` when the acquisition
-    /// had to wait, so a contended hold reaches the store beside its wait, and at `DEBUG`
-    /// otherwise.
+    /// Opens the `lock.held` span: at `INFO` when the acquisition had to wait, so a
+    /// contended hold reaches the store beside its wait, and at `DEBUG` otherwise.
+    ///
+    /// The span opens under the current span, except a lifelong hold's: it opens as a root
+    /// carrying `lifelong = true`, because a child keeps its parent span open, and the
+    /// operation that took the lock would otherwise stay in flight, and close, only when
+    /// the hold ends. Its `holder` field and its table entry still name that operation.
     fn acquired(lock: Lock, guard: Guard, contended: bool) -> Self {
         let holder = current_operation();
+        let lifelong = lock.lifelong.then_some(true);
+        let parent = if lock.lifelong {
+            None
+        } else {
+            tracing::Span::current().id()
+        };
         let span = if contended {
             tracing::info_span!(
                 target: "rift_tracing::lock",
+                parent: parent,
                 LOCK_HELD_SPAN,
                 lock.name = lock.name,
                 lock.mode = lock.mode.label(),
                 holder,
+                lifelong,
             )
         } else {
             tracing::debug_span!(
                 target: "rift_tracing::lock",
+                parent: parent,
                 LOCK_HELD_SPAN,
                 lock.name = lock.name,
                 lock.mode = lock.mode.label(),
                 holder,
+                lifelong,
             )
         };
         Self {

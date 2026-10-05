@@ -706,8 +706,11 @@ operation, and start. The table holds at most 1,024 entries and counts each one 
 that bound as `untracked`. `rift_tracing::publish_in_flight(reason)` writes it as one
 `operations in flight` record, and the sample tick writes one `operations in flight past the
 stall delay` record, at `WARN`, for the entries open longer than `[logs]` `stall_delay`, each
-entry once. Both records list the open entries oldest first, with `age_ms`, as the JSON array
-in `operations`, keep it within 4 KiB, and count what did not fit in `left_out`:
+entry once. A hold its holder keeps for as long as it runs, such as a server's shared
+`history.live` lock and its `history.fill` lock, is declared with `.lifelong()`: the stall
+record leaves it out, and every other publication lists it with `"lifelong": true`. Both records
+list the open entries oldest first, with `age_ms`, as the JSON array in `operations`, keep it
+within 4 KiB, and count what did not fit in `left_out`:
 
 ```json
 [

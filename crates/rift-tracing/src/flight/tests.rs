@@ -272,3 +272,71 @@ async fn an_awaited_open_operation_records_its_opening_at_the_first_poll() -> Te
     drop(recorder);
     Ok(())
 }
+
+/// A published table lists a lifelong hold with its mark beside the open operations, so
+/// a reader of a stop or timeout record tells it from stuck work.
+#[test]
+fn a_published_table_marks_a_lifelong_hold() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let live = std::sync::Mutex::new(());
+    let live_hold = crate::traced!("history.open", {
+        crate::lock("history.live")
+            .shared()
+            .lifelong()
+            .try_acquire(|| live.try_lock())
+    })
+    .map_err(|_| "the lock is free")?;
+    crate::traced!(component = "mcp", operation = "server.stop", {
+        crate::publish_in_flight("stop");
+    });
+    drop(live_hold);
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let published = with_message(&records, "operations in flight");
+    assert_eq!(published.len(), 1);
+    let listed = operations(published[0])?;
+    let listed_hold = listed
+        .iter()
+        .find(|entry| entry["kind"] == "held")
+        .ok_or("the lifelong hold is listed")?;
+    assert_eq!(listed_hold["lifelong"], true);
+    assert_eq!(listed_hold["lock.name"], "history.live");
+    let stop = listed
+        .iter()
+        .find(|entry| entry["operation"] == "server.stop")
+        .ok_or("the stop is listed")?;
+    assert!(
+        stop.get("lifelong").is_none(),
+        "an operation carries no mark"
+    );
+    Ok(())
+}
+
+/// An operation opened as a root inside another, such as work detached from the request
+/// that started it, lists no parent: only a lifelong hold names the span it was opened in.
+#[test]
+fn a_root_operation_opened_inside_another_lists_no_parent() -> TestResult {
+    let (recorder, _drain) = ScopedRecorder::builder().install()?;
+    let listing = crate::traced!("search.request", {
+        let detached =
+            tracing::info_span!(parent: None, "index.reconcile", operation = "index.reconcile");
+        let listing = with_table(|table| table.listing(Duration::MAX));
+        drop(detached);
+        listing
+    })
+    .ok_or("the recorder keeps a table")?;
+    drop(recorder);
+
+    let listed: Value = serde_json::from_str(&listing.operations)?;
+    let detached = listed
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["operation"] == "index.reconcile")
+        })
+        .ok_or("the root operation is listed")?;
+    assert!(detached.get("parent").is_none(), "{detached}");
+    Ok(())
+}

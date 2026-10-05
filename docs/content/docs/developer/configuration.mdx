@@ -159,7 +159,7 @@ stall_delay = "10s"
 - `stall_delay` is how long an operation, lock wait, or held lock stays open before the server
   reports it, 1s to 1h. The sample tick reports each such entry once, in one record of the
   operations in flight with their age, so a request that runs out its deadline leaves the work
-  it waited on in the store
+  it waited on in the store. A lock the server keeps for as long as it runs is never reported
 
 The server reads this table at startup, so a change applies on the next start. The records
 outlive the process that wrote them. The metrics database is a file apart from the search

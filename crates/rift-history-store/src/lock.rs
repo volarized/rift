@@ -39,7 +39,9 @@ pub(crate) fn open_lock(path: &Path) -> std::io::Result<File> {
 /// replaced the file between the open and the lock.
 ///
 /// The lock is recorded as `history.live` in shared mode: each attempt's wait,
-/// and the time the returned lock stays held.
+/// and the time the returned lock stays held. The hold is lifelong: a server
+/// keeps it for as long as it runs, so the stall report leaves it out.
+///
 /// # Errors
 ///
 /// Returns [`RiftError`] when the lock file cannot be opened or locked, or
@@ -66,6 +68,7 @@ pub(crate) fn lock_live_checked(
         })?;
         let held = rift_tracing::lock(LIVE_LOCK_NAME)
             .shared()
+            .lifelong()
             .try_acquire(|| file.lock_shared().map(|()| file))
             .map_err(|source| {
                 errors::history_store::folder()
