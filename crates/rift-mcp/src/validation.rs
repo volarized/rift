@@ -10774,6 +10774,68 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A second native watcher on `root` that records what the platform delivers while
+    /// startup runs. Its stream is separate from the one `workspace_watcher` holds, so it
+    /// names the events this platform reported, not proof that the validation saw the
+    /// same ones.
+    fn native_event_recorder(
+        root: &std::path::Path,
+    ) -> TestResult<(
+        notify::RecommendedWatcher,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    )> {
+        use notify::Watcher as _;
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&delivered);
+        let mut recorder =
+            notify::recommended_watcher(move |outcome: notify::Result<notify::Event>| {
+                let line = match outcome {
+                    Ok(event) => format!(
+                        "{:?} need_rescan={} {:?}",
+                        event.kind,
+                        event.need_rescan(),
+                        event.paths
+                    ),
+                    Err(error) => format!("watch error: {error}"),
+                };
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line);
+            })?;
+        recorder.watch(root, notify::RecursiveMode::Recursive)?;
+        Ok((recorder, delivered))
+    }
+
+    /// The startup state a failed documentation-reference check reports.
+    fn missing_references_message(
+        startup: &PublishedWorkspace,
+        validation: &IndexValidation,
+        delivered: &std::sync::Mutex<Vec<String>>,
+    ) -> String {
+        let pending = format!(
+            "{:?}",
+            *validation
+                .publication_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        );
+        let events = delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        format!(
+            "fixture must publish documentation references: \
+             startup_epoch={}, tree_revision={:?}, preparation={:?}, held={:?}, \
+             observed_epoch={}, watch_failed={}, pending={pending}, delivered={events:?}",
+            startup.epoch,
+            startup.reads.tree_revision(),
+            startup.preparation,
+            startup.reads.workspace_digests(),
+            validation.observed_epoch(),
+            validation.watch_failed.load(Ordering::Acquire),
+        )
+    }
+
     /// A native workspace watcher publishes complete facts equal to a cold build.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn native_watcher_publication_matches_cold_indexed_facts() -> TestResult {
@@ -10790,21 +10852,22 @@ pub(crate) mod tests {
         let (context, invalidations) = initial_preparation_context(root)?;
         let validation = Arc::clone(&context.validation);
         let watcher = super::workspace_watcher(root, &validation)?;
+        let (_recorder, delivered) = native_event_recorder(root)?;
         let initial = super::discover_initial_workspace(&context)
             .await?
             .ok_or("initial discovery was cancelled")?;
         super::prepare_initial_workspace_from(&context, initial).await?;
         let state = Arc::clone(&context.published);
         let startup = Arc::clone(&state.read().await.current);
-        assert!(
-            !startup
-                .reads
-                .documentation_snapshot()
-                .index()
-                .references
-                .is_empty(),
-            "fixture must publish documentation references"
-        );
+        if startup
+            .reads
+            .documentation_snapshot()
+            .index()
+            .references
+            .is_empty()
+        {
+            return Err(missing_references_message(&startup, &validation, &delivered).into());
+        }
         let startup_facts = published_facts(&startup)?;
         let cold_a = stable_candidate(root, 0)?;
         assert!(
