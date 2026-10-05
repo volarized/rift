@@ -20,7 +20,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import collector
+from rift_dev.trace import TEST_CASE_KEY, collector, resource_attribute
 
 ARTIFACT_SECONDS = 240.0
 CONFIGURATION = "[search.vector]\ndisabled = true\n"
@@ -117,7 +117,18 @@ async def check_artifact(binary: Path, version: str) -> None:
         lay_out_workspace(root)
         with (
             collector() as telemetry,
-            Server(binary, root, base / "server.log", collector=telemetry) as server,
+            Server(
+                binary,
+                root,
+                base / "server.log",
+                # The server's export is filed under the runner as its `test.case.name`.
+                env={
+                    "OTEL_RESOURCE_ATTRIBUTES": resource_attribute(
+                        TEST_CASE_KEY, "artifact"
+                    )
+                },
+                collector=telemetry,
+            ) as server,
         ):
             try:
                 async with server.connect() as client:

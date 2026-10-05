@@ -165,3 +165,13 @@ def test_a_run_starts_from_an_empty_directory_of_its_own(
     second = rift_test_client.retained_directory("agent")
     assert second == first
     assert list(second.iterdir()) == []
+
+
+def test_a_runner_server_carries_the_runner_as_its_test_case_name(
+    runner: Any, tmp_path: Path
+) -> None:
+    name = runner.__name__.rsplit("_", 1)[1]
+    with pytest.raises(AssertionError, match="served read failed"):
+        run(runner, tmp_path / "rift")
+    (server,) = STARTED
+    assert server.env["OTEL_RESOURCE_ATTRIBUTES"] == f"test.case.name={name}"
