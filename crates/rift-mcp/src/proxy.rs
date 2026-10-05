@@ -37,7 +37,6 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
-use tracing::Instrument as _;
 
 use crate::election::{
     ElectionObservation, ServerPresence, StaleReason, observe, presence_field, probe,
@@ -88,7 +87,7 @@ pub async fn serve_proxy(
     checkout: BuildCheckout,
     output: OutputPolicy,
 ) -> Result<(), RiftError> {
-    tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
+    rift_tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
@@ -117,12 +116,12 @@ where
             .source(error)
             .error()
     })?;
-    tracing::info!(component = "mcp", transport = "stdio", "MCP proxy ready");
+    rift_tracing::info!(component = "mcp", transport = "stdio", "MCP proxy ready");
     let reason = service.waiting().await;
     let outcome = reason
         .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())
         .and_then(quit_reason_result);
-    tracing::info!(
+    rift_tracing::info!(
         component = "mcp",
         transport = "stdio",
         outcome = if outcome.is_ok() { "ok" } else { "error" },
@@ -155,7 +154,7 @@ fn quit_reason_result(reason: QuitReason) -> Result<(), RiftError> {
 /// demand through the same single-flight slot.
 async fn warm_up(proxy: RiftProxy) {
     if let Err(refusal) = proxy.leased_peer(None).await {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             refusal = %refusal.message,
             "upstream warmup did not connect"
@@ -398,7 +397,7 @@ impl RiftProxy {
             Err(error) if transport_failed(&error) => error,
             Err(error) => return forwarded_error(error).fail(),
         };
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             failure = %failure,
             "upstream connection lost; reconnecting"
@@ -435,9 +434,9 @@ impl RiftProxy {
             .await
         {
             Ok(handle) => {
-                tracing::debug!(component = "mcp", upstream_request_id = %handle.id, "forwarded request awaiting response");
+                rift_tracing::debug!(component = "mcp", upstream_request_id = %handle.id, "forwarded request awaiting response");
                 let result = handle.await_response().await;
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "mcp",
                     is_error = result.is_err(),
                     "forwarded request completed"
@@ -448,7 +447,7 @@ impl RiftProxy {
         };
         match answer {
             Err(ServiceError::Timeout { .. }) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     budget = ?budget,
                     "the workspace server did not answer a forwarded request within its budget; \
@@ -691,7 +690,7 @@ impl StartWindowClose {
     /// a database file changed during the window when the close read it, and
     /// the `refusal` the request gets.
     fn record(&self, elapsed: Duration, wrote: Option<bool>, refusal: &ErrorData) {
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             rounds = self.rounds,
             elapsed_ms = elapsed.as_millis(),
@@ -862,7 +861,7 @@ async fn adopt_presence(
     let lock = match presence {
         ServerPresence::Serving(lock) => lock,
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 pid,
                 "recorded server did not answer; treating the lock as stale"
@@ -883,7 +882,7 @@ async fn adopt_presence(
     }
     match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, root).await {
         Ok(running) => {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 port = lock.port,
                 pid = lock.pid,
@@ -893,7 +892,7 @@ async fn adopt_presence(
         }
         Err(failure) => {
             let detail = failure.detail();
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 %detail,
                 "recorded server did not answer; treating the lock as stale"
@@ -966,17 +965,17 @@ impl RepositoryMiss {
     fn report(&self) {
         match self {
             Self::NotRepository => {}
-            Self::SelectionRefused { detail } => tracing::info!(
+            Self::SelectionRefused { detail } => rift_tracing::info!(
                 component = "mcp",
                 %detail,
                 "server configuration selection refused; polling the workspace election"
             ),
-            Self::ElectionDirectory { detail } => tracing::info!(
+            Self::ElectionDirectory { detail } => rift_tracing::info!(
                 component = "mcp",
                 %detail,
                 "repository election directory unavailable; polling the workspace election"
             ),
-            Self::NotServing { presence } => tracing::info!(
+            Self::NotServing { presence } => rift_tracing::info!(
                 component = "mcp",
                 %presence,
                 "repository server not serving; polling the workspace election"
@@ -985,7 +984,7 @@ impl RepositoryMiss {
                 pid,
                 settings_match,
                 identity_adopted,
-            } => tracing::info!(
+            } => rift_tracing::info!(
                 component = "mcp",
                 pid,
                 settings_match,
@@ -997,7 +996,7 @@ impl RepositoryMiss {
                 port,
                 elapsed_ms,
                 detail,
-            } => tracing::info!(
+            } => rift_tracing::info!(
                 component = "mcp",
                 pid,
                 port,
@@ -1176,14 +1175,14 @@ impl Replacement {
         }
         match request_stop(lock).await {
             Ok(()) => self.accepted = true,
-            Err(StopRequestFailure::Failed(failure)) => tracing::warn!(
+            Err(StopRequestFailure::Failed(failure)) => rift_tracing::warn!(
                 component = "mcp",
                 pid = lock.pid,
                 failure = ?failure,
                 "the stop request to the workspace server failed in transport; the election decides"
             ),
             Err(failure @ StopRequestFailure::Refused(_)) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     pid = lock.pid,
                     failure = ?failure,
@@ -1193,7 +1192,7 @@ impl Replacement {
             }
         }
         let server_version = lock.identity.version.as_str();
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             pid = lock.pid,
             server_version,
@@ -1396,33 +1395,35 @@ impl ServerHandler for RiftProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let span = tracing::info_span!(
+        let span = rift_tracing::info_span!(
             "mcp.forward",
             component = "mcp",
             operation = "tools/call",
             request_id = %context.id,
             tool = %request.name
         );
-        let response = async {
-            tracing::debug!("tool forward started");
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-            let result = self
-                .forward(request, |result| match result {
-                    ServerResult::CallToolResult(result) => {
-                        Some(CallToolResponse::Complete(result))
-                    }
-                    ServerResult::InputRequiredResult(result) => {
-                        Some(CallToolResponse::InputRequired(result))
-                    }
-                    ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
-                    _ => None,
-                })
-                .await;
-            tracing::debug!(is_error = result.is_err(), "tool forward completed");
-            result
-        }
-        .instrument(span)
-        .await?;
+        let response = span
+            .instrument(async {
+                rift_tracing::debug!("tool forward started");
+                let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+                let result = self
+                    .forward(request, |result| match result {
+                        ServerResult::CallToolResult(result) => {
+                            Some(CallToolResponse::Complete(result))
+                        }
+                        ServerResult::InputRequiredResult(result) => {
+                            Some(CallToolResponse::InputRequired(result))
+                        }
+                        ServerResult::CreateTaskResult(result) => {
+                            Some(CallToolResponse::Task(result))
+                        }
+                        _ => None,
+                    })
+                    .await;
+                rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
+                result
+            })
+            .await?;
         Ok(self.selected_response(response))
     }
 

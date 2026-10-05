@@ -256,7 +256,7 @@ impl ElectionGuard {
         match std::fs::remove_file(&self.document_path) {
             Ok(()) => return,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => tracing::warn!(
+            Err(error) => rift_tracing::warn!(
                 component = "mcp",
                 path = %self.document_path.display(),
                 %error,
@@ -264,7 +264,7 @@ impl ElectionGuard {
             ),
         }
         if let Err(error) = std::fs::File::create(&self.document_path) {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "mcp",
                 path = %self.document_path.display(),
                 %error,
@@ -290,7 +290,7 @@ impl Drop for ElectionGuard {
 /// process holds it, so every lock this module takes is released explicitly.
 fn release_election_lock(election_file: &std::fs::File) {
     if let Err(error) = election_file.unlock() {
-        tracing::debug!(component = "mcp", %error, "election lock release reported a failure");
+        rift_tracing::debug!(component = "mcp", %error, "election lock release reported a failure");
     }
 }
 
@@ -486,7 +486,7 @@ impl ElectionObservation {
             return;
         }
         let kind = |failure: ReadFailure| tracing::field::debug(failure.kind);
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             path = %self.document_path.display(),
             election = ?election,
@@ -814,7 +814,7 @@ pub(crate) async fn serve_elected_at(
 /// Records why this process will not serve, before the caller exits on it.
 fn record_start_failure(error: &RiftError) {
     if error.slug() == errors::mcp::election_already_serving::SLUG {
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             operation = "server.start",
             "another rift server already serves this workspace; this process exits"
@@ -822,7 +822,7 @@ fn record_start_failure(error: &RiftError) {
         return;
     }
     let causes = causes(error).join(": ");
-    tracing::error!(
+    rift_tracing::error!(
         component = "mcp",
         operation = "server.start",
         error = %error,
@@ -883,7 +883,7 @@ async fn shut_down_unpublished(
     serving_stop.cancel();
     let (_deadline, outcome) = server.stopped(UNPUBLISHED_SHUTDOWN_DEADLINE).await;
     if let Err(error) = outcome {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             %error,
             "unpublished server reported a shutdown failure"

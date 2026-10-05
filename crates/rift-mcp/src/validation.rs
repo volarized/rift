@@ -49,7 +49,6 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
 use crate::server::{BlockingExecutor, EngineHold};
@@ -489,7 +488,7 @@ fn publication_map(
     reads: &ReadService,
     preparation: Option<&LocalIndexPreparation>,
 ) -> Arc<WorkspaceMap> {
-    let mut map = rift_core::traced!(component = "index", operation = "index.map", {
+    let mut map = rift_tracing::traced!(component = "index", operation = "index.map", {
         preparation.map_or_else(
             || reads.workspace_map(),
             |preparation| {
@@ -1377,7 +1376,7 @@ pub(crate) fn report_watch_outcome(
 ) {
     let Ok(event) = outcome else {
         let _ = validation.observe_watch_failure();
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "watch.receive",
             "index watch backend reported failure"
@@ -1398,12 +1397,12 @@ pub(crate) fn report_watch_outcome(
         })
     {
         if let Err(error) = validation.observe_whole_workspace() {
-            tracing::error!(component = "index", operation = "watch.observe", error = %error, "index watch failed");
+            rift_tracing::error!(component = "index", operation = "watch.observe", error = %error, "index watch failed");
         }
         return;
     }
     if validation.observe_event(roots, &event).is_err() {
-        tracing::error!(
+        rift_tracing::error!(
             component = "index",
             operation = "watch.observe",
             "index watch failed"
@@ -1432,7 +1431,7 @@ impl Drop for SupervisorRunning {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         self.changed.notify_waiters();
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "index.supervisor",
             "the index supervisor stopped; no further snapshot publishes in this process"
@@ -1897,7 +1896,7 @@ fn build_workspace_candidate_with_cache(
     request: &RebuildRequest,
     content_cache: &rift_index::WorkspaceContentCache,
 ) -> Result<WorkspaceCandidate, RiftError> {
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "index",
         operation = "index.build",
         phase = "start",
@@ -1972,7 +1971,7 @@ pub(crate) fn lexical_write(
     }
     match change_set {
         ChangeSet::Full => LexicalWrite::Whole,
-        ChangeSet::Incremental(changes) => rift_core::traced!(
+        ChangeSet::Incremental(changes) => rift_tracing::traced!(
             component = "index",
             operation = "index.lexical_write",
             paths = changes.len(),
@@ -2064,7 +2063,7 @@ fn whole_workspace_candidate(
         unreachable!("a current-tree read service always compiles its source policy")
     }));
     let visible_files =
-        rift_core::traced!(component = "index", operation = "index.visible_digests", {
+        rift_tracing::traced!(component = "index", operation = "index.visible_digests", {
             complete_visible_digests(
                 root,
                 &reads,
@@ -2136,7 +2135,7 @@ fn shared_workspace_candidate(
         }
     }
     let reads = previous.reads.rebuilt_cancellable(changes, cancelled)?;
-    let visible_files = rift_core::traced!(
+    let visible_files = rift_tracing::traced!(
         component = "index",
         operation = "index.visible_digests",
         paths = observed_paths.len(),
@@ -2182,7 +2181,7 @@ pub(crate) async fn populate_search(
     embedding: Embedding,
 ) {
     for (path, chunks) in published.reads.chunked_text_files() {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "search",
             operation = "search.populate",
             path = %path.as_str(),
@@ -2201,7 +2200,7 @@ pub(crate) async fn populate_search(
         .embed_described(&described, embedding, tree_revision)
         .await
     {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "search",
             operation = "search.populate",
             tree_revision = published.reads.tree_revision(),
@@ -2360,7 +2359,7 @@ fn within_unit_bound(
 /// form `file left out of the index` takes.
 fn record_units_left_out(left_out: &[IndexDocument], unit_bytes_max: usize) {
     for unit in left_out {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "index.build",
             path = unit.project_path().map_or("", ProjectPath::as_str),
@@ -2677,7 +2676,7 @@ impl LexicalCommitReport {
             LexicalCommitState::Owed { cause } => ("owed", Some(cause.as_str())),
             LexicalCommitState::Settled => return,
         };
-        tracing::info!(
+        rift_tracing::info!(
             component = "search",
             operation = "search.commit",
             tree_revision,
@@ -2802,7 +2801,7 @@ impl LexicalLane {
         let mut backlog = self.queue.locked();
         if backlog.ended {
             drop(backlog);
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "search",
                 operation = "search.commit",
                 tree_revision,
@@ -2816,7 +2815,7 @@ impl LexicalLane {
         let released = backlog.hand(LexicalCommit::new(write, published));
         drop(backlog);
         if released.is_some() {
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "search",
                 operation = "search.commit",
                 tree_revision,
@@ -2972,7 +2971,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         let running = tokio::spawn(async move { store.index_trigrams().await });
         match self.store_answer(running).await {
             Ok(batch) => {
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "search",
                     operation = "search.commit",
                     indexed = batch.indexed(),
@@ -2983,7 +2982,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             }
             Err(error) => {
                 if !self.cancellation.is_cancelled() {
-                    tracing::warn!(
+                    rift_tracing::warn!(
                         component = "search",
                         operation = "search.commit",
                         error = %error,
@@ -3235,7 +3234,7 @@ async fn abort_transaction<T>(running: JoinHandle<T>) {
 
 /// Records one transaction that ran past its deadline, once.
 fn record_commit_delay(tree_revision: &str, form: &'static str, deadline: Duration) {
-    tracing::error!(
+    rift_tracing::error!(
         component = "search",
         operation = "search.commit",
         tree_revision,
@@ -3249,7 +3248,7 @@ fn record_commit_delay(tree_revision: &str, form: &'static str, deadline: Durati
 /// Records one commit the store did not take, with its cause.
 fn record_commit_failure(tree_revision: &str, form: &'static str, error: &RiftError) {
     let causes = rift_error::causes(error).join("; ");
-    tracing::error!(
+    rift_tracing::error!(
         component = "search",
         operation = "search.commit",
         tree_revision,
@@ -3344,7 +3343,7 @@ impl PopulationLane {
             return;
         }
         if self.publications.is_closed() {
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "search",
                 operation = "search.populate",
                 "the population lane has ended, so this publication is not populated for"
@@ -3875,7 +3874,7 @@ fn publish_preparation_after(
     validation.changed.notify_waiters();
     if answer.preparation.is_none() {
         let published_epoch = answer.epoch;
-        tracing::info!(
+        rift_tracing::info!(
             component = "index",
             operation = "index.publish",
             trigger = "startup",
@@ -3970,21 +3969,21 @@ pub(crate) async fn run_index_supervisor_with(
         }
         let request = validation.take_pending();
         let epoch = request.epoch;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "watch.batch",
             epoch,
             whole_workspace = request.work.covers_whole_workspace(),
             "filesystem invalidations coalesced"
         );
-        let result = rebuild_workspace(&context, request, capture.clone())
-            .instrument(tracing::info_span!(
-                "index.build",
-                component = "index",
-                trigger = "filesystem",
-                epoch
-            ))
-            .await;
+        let result = rift_tracing::info_span!(
+            "index.build",
+            component = "index",
+            trigger = "filesystem",
+            epoch
+        )
+        .instrument(rebuild_workspace(&context, request, capture.clone()))
+        .await;
         superseded = matches!(result, Ok(RebuildOutcome::Superseded));
         match result {
             Ok(RebuildOutcome::Published) => {
@@ -4004,7 +4003,7 @@ pub(crate) async fn run_index_supervisor_with(
 /// Records one failed rebuild under the publication lane and wakes the requests waiting
 /// on it; a failure the pool can no longer record marks the watch unhealthy instead.
 async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, error: RiftError) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         epoch,
@@ -4522,7 +4521,7 @@ pub(crate) fn record_rebuild_failure(
 /// A superseded rebuild publishes nothing and records no failure, so this record is what
 /// names the rebuild a waiting read was woken by.
 fn trace_superseded(epoch: u64, observed_epoch: u64) {
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "index",
         operation = "index.build",
         epoch,
@@ -4533,7 +4532,7 @@ fn trace_superseded(epoch: u64, observed_epoch: u64) {
 
 /// Emits one path-free filesystem publication event.
 pub(crate) fn trace_publication(epoch: u64) {
-    tracing::info!(
+    rift_tracing::info!(
         component = "index",
         operation = "index.publish",
         trigger = "filesystem",

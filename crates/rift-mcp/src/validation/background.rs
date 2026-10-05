@@ -117,7 +117,7 @@ impl BackgroundValidation {
             && trigger == Trigger::Validation
             && self.rebuild_runs_first(Instant::now());
         if deferred {
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.validate",
                 observed_epoch,
@@ -157,7 +157,7 @@ impl BackgroundValidation {
                             &last,
                             &|| cancellation.is_cancelled(),
                         )?;
-                    tracing::debug!(
+                    rift_tracing::debug!(
                         component = "index",
                         operation = "index.validate",
                         read_paths = next.read_paths(),
@@ -323,7 +323,7 @@ impl VersionControlHold {
 
     fn report_expiration(&mut self, lock: &std::path::Path) {
         if !self.expiration_reported {
-            tracing::warn!(component = "index", operation = "index.lock", path = %lock.display(), "Git index lock wait expired");
+            rift_tracing::warn!(component = "index", operation = "index.lock", path = %lock.display(), "Git index lock wait expired");
             self.expiration_reported = true;
         }
     }
