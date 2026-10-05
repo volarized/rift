@@ -88,3 +88,24 @@ macro_rules! debug_span {
         $crate::__private::span_from($crate::__private::tracing::debug_span!($($arguments)+))
     };
 }
+
+/// A span field declared at opening and given its value later with [`Span::record`].
+///
+/// A field a span did not declare when it opened is ignored by `record`, so a value
+/// known only when the operation ends is declared with this placeholder, which records
+/// nothing until then.
+///
+/// ```
+/// let span = rift_tracing::info_span!(
+///     "global.request",
+///     component = "global",
+///     status = rift_tracing::empty!(),
+/// );
+/// span.record("status", 200_u16);
+/// ```
+#[macro_export]
+macro_rules! empty {
+    () => {
+        $crate::__private::tracing::field::Empty
+    };
+}
