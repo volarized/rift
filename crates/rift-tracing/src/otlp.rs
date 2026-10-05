@@ -32,7 +32,7 @@ use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
 use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, SdkTracerProvider};
 use tracing_subscriber::Layer;
-use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::filter::{FilterExt as _, LevelFilter, Targets};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
@@ -65,6 +65,44 @@ const LOG_EXPORT_TIMEOUT_VAR: &str = "OTEL_BLRP_EXPORT_TIMEOUT";
 
 /// The target the OpenTelemetry SDK's own reports carry.
 pub(crate) const SDK_TARGET: &str = "opentelemetry_sdk";
+
+/// The targets of the crates an export runs through: the OpenTelemetry API, SDK, and OTLP
+/// exporter, and the HTTP client stack that sends each batch. Neither export layer hands
+/// an event or span of these targets, or of a module below one, to its exporter, whatever
+/// filter admits it; stderr keeps them under its own filter.
+///
+/// An export's own records would otherwise be exported in turn: `opentelemetry` 0.33 names
+/// this "telemetry-induced-telemetry" and its consequence "Infinite telemetry feedback
+/// loops" and "Excessive resource consumption" (`Context::enter_telemetry_suppressed_scope`,
+/// `src/context.rs`), and the async-runtime batch processors this export uses enter no
+/// suppressed scope, nor does a request task the HTTP client spawns inherit one.
+pub(crate) const EXPORT_OWN_TARGETS: [&str; 10] = [
+    "opentelemetry",
+    "opentelemetry_sdk",
+    "opentelemetry_otlp",
+    "opentelemetry_http",
+    "reqwest",
+    "hyper",
+    "hyper_util",
+    "h2",
+    "tower",
+    "native_tls",
+];
+
+/// Whether `target` is one of [`EXPORT_OWN_TARGETS`] or a module below one.
+fn export_own(target: &str) -> bool {
+    EXPORT_OWN_TARGETS.iter().any(|own| {
+        target
+            .strip_prefix(own)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// A filter refusing every span and event of [`EXPORT_OWN_TARGETS`].
+fn export_others() -> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool>
+{
+    tracing_subscriber::filter::filter_fn(|metadata| !export_own(metadata.target()))
+}
 
 /// The OpenTelemetry SDK's own warnings and errors, which stderr carries whatever
 /// `RUST_LOG` names.
@@ -458,7 +496,7 @@ where
         logger: logs.provider.logger(SERVICE_NAME),
         open: Arc::clone(&logs.open),
     }
-    .with_filter(crate::runtime::reevaluated(filter))
+    .with_filter(crate::runtime::reevaluated(filter).and(export_others()))
 }
 
 /// The `tracing` layer that exports each event and each span close as an OTLP log record.
@@ -656,7 +694,7 @@ where
 {
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(SERVICE_NAME))
-        .with_filter(crate::runtime::reevaluated(filter))
+        .with_filter(crate::runtime::reevaluated(filter).and(export_others()))
 }
 
 #[cfg(test)]
@@ -1138,6 +1176,50 @@ mod tests {
                 .expect("the log exporter is readable")
                 .is_empty()
         );
+    }
+
+    /// A capture filter naming a bare level admits the export's own crates, and neither
+    /// export layer hands their records on: an event of the HTTP client or the SDK, as an
+    /// export writes on every batch, never reaches the log record exporter, so a refused or
+    /// slow collector cannot feed the next batch with records about the last one.
+    #[test]
+    fn the_export_never_exports_the_records_of_its_own_crates() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let records = InMemoryLogExporter::default();
+        let logs = logger_export(records.clone(), log_batch_config(), resource());
+        let subscriber =
+            crate::capture::registry().with(log_record_layer(&logs, EnvFilter::new("trace")));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::event!(target: "opentelemetry", tracing::Level::WARN, "own");
+            tracing::event!(target: "opentelemetry_sdk", tracing::Level::WARN, "own");
+            tracing::event!(target: "opentelemetry_otlp", tracing::Level::WARN, "own");
+            tracing::event!(target: "opentelemetry_http", tracing::Level::WARN, "own");
+            tracing::event!(target: "reqwest::connect", tracing::Level::DEBUG, "own");
+            tracing::event!(target: "hyper", tracing::Level::DEBUG, "own");
+            tracing::event!(target: "hyper_util::client", tracing::Level::DEBUG, "own");
+            tracing::event!(target: "h2::codec", tracing::Level::TRACE, "own");
+            tracing::event!(target: "tower", tracing::Level::DEBUG, "own");
+            tracing::event!(target: "native_tls", tracing::Level::DEBUG, "own");
+            tracing::event!(target: "hyper::client::pool", tracing::Level::DEBUG, "pooled");
+            tracing::event!(target: "reqwestish", tracing::Level::INFO, "kept: another crate");
+            crate::info!(component = "mcp", "kept: a rift record");
+        });
+        logs.provider.force_flush().expect("the log batch flushes");
+        let exported: Vec<String> = records
+            .get_emitted_logs()
+            .expect("the log exporter is readable")
+            .iter()
+            .filter_map(|log| log.record.body().map(|body| format!("{body:?}")))
+            .collect();
+        assert_eq!(exported.len(), 2, "{exported:?}");
+        assert!(
+            exported.iter().all(|body| body.contains("kept")),
+            "{exported:?}"
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let export = OtlpExport::holding(None, None, Some(logs));
+        assert_eq!(runtime.block_on(export.shutdown(deadline)), Ok(()));
     }
 
     /// Without an endpoint variable the process builds no logger provider, so no record is

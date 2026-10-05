@@ -781,6 +781,11 @@ subscriber with a filter per layer:
   without a capture, installed when `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or
   `OTEL_EXPORTER_OTLP_ENDPOINT` is set
 
+Neither OTLP export layer hands on a span or event of the crates the export runs through: the
+OpenTelemetry API, SDK, and OTLP exporter, and the HTTP client stack (`EXPORT_OWN_TARGETS` in
+`crates/rift-tracing/src/otlp.rs`). A filter that admits them, such as a bare `debug`, would
+otherwise export each batch's own records in the next one. Stderr keeps them under its own filter.
+
 A foreground server whose stderr is not a terminal writes at most `[logs]` `stderr_limit`
 there, 1 MiB by default. The write that crosses the bound is followed by one notice,
 `standard error reached its byte bound`, and every later write is discarded and counted in
