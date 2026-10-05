@@ -27,9 +27,7 @@ pub(super) enum Trigger {
 pub(super) async fn start(
     context: &IndexSupervisorContext,
 ) -> Result<Option<(BackgroundValidation, VersionControlHold)>, RiftError> {
-    let configuration = context
-        .published
-        .read()
+    let configuration = super::read_published(&context.published)
         .await
         .snapshot()
         .0
@@ -133,7 +131,7 @@ impl BackgroundValidation {
         &mut self,
         context: &IndexSupervisorContext,
     ) -> Result<(), RiftError> {
-        let (current, failure) = context.published.read().await.snapshot();
+        let (current, failure) = super::read_published(&context.published).await.snapshot();
         let recovering = failure.is_some();
         let root = context.root.clone();
         let limits = context.limits;

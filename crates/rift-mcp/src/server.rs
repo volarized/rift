@@ -74,7 +74,7 @@ use crate::validation::{
     IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitReport,
     LexicalCommitState, LexicalLane, LexicalWrite, PopulationLane, PublishedWorkspace,
     WatchWorkspace, capture_prepared_workspace, configuration_fingerprint,
-    empty_workspace_preparation, run_index_supervisor, workspace_watcher,
+    empty_workspace_preparation, read_published, run_index_supervisor, workspace_watcher,
 };
 
 /// Vector candidates one file may contribute to a fused ranking.
@@ -813,7 +813,7 @@ async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationL
         operation = "search.prepare",
         "the vector ranking is prepared"
     );
-    let (current, _) = published.read().await.snapshot();
+    let (current, _) = read_published(published).await.snapshot();
     population.request(current);
 }
 
@@ -2245,8 +2245,7 @@ impl RiftMcp {
     /// The `[server]` table from the currently published acceptance, or the
     /// default table while `rift.toml` is invalid.
     pub(crate) async fn server_configuration(&self) -> ServerConfiguration {
-        self.published
-            .read()
+        read_published(&self.published)
             .await
             .current
             .configuration
@@ -3437,7 +3436,7 @@ impl RiftMcp {
     async fn readiness_stall(&self, timeout: Duration) -> String {
         let observed = self.validation.observed_epoch();
         let published = {
-            let state = self.published.read().await;
+            let state = read_published(&self.published).await;
             let (current, _failure) = state.snapshot();
             current.epoch
         };
@@ -3471,7 +3470,7 @@ impl RiftMcp {
             operation = "index.readiness",
             "reading request readiness budget"
         );
-        let state = self.published.read().await;
+        let state = read_published(&self.published).await;
         let (current, _failure) = state.snapshot();
         rift_tracing::debug!(
             component = "index",
@@ -3916,7 +3915,7 @@ impl RiftMcp {
                 observed_epoch,
                 "request reading publication"
             );
-            let state = self.published.read().await;
+            let state = read_published(&self.published).await;
             let (current, failure) = state.snapshot();
             drop(state);
             if self.validation.watch_failed.load(Ordering::Acquire) {
@@ -3998,7 +3997,7 @@ impl RiftMcp {
     /// table, or the default table while `rift.toml` is invalid.
     async fn read_logs(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_records = {
-            let state = self.published.read().await;
+            let state = read_published(&self.published).await;
             let (current, _failure) = state.snapshot();
             current.configuration.logs_configuration().page_records
         };
@@ -4032,7 +4031,7 @@ impl RiftMcp {
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_index = resource::workspace_page_index(uri)?;
         self.ensure_workspace_root().await?;
-        let current = Arc::clone(&self.published.read().await.current);
+        let current = Arc::clone(&read_published(&self.published).await.current);
         let configuration = current
             .configuration
             .accepted
@@ -4096,7 +4095,7 @@ impl RiftMcp {
     /// recomputation - the map is rebuilt once per publication.
     async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         self.ensure_workspace_root().await?;
-        let current = Arc::clone(&self.published.read().await.current);
+        let current = Arc::clone(&read_published(&self.published).await.current);
         resource::rendered_map(uri, &current.map)
     }
 
@@ -4444,7 +4443,7 @@ impl RiftMcp {
     /// unchanged reuses the running sessions, and one whose tables differ
     /// replaces the pool and shuts the old engines down.
     pub async fn engine_pool(&self) -> Arc<EnginePool> {
-        let published = Arc::clone(&self.published.read().await.current);
+        let published = Arc::clone(&read_published(&self.published).await.current);
         self.engine_pool_for(&published).await
     }
 

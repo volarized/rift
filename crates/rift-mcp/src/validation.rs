@@ -531,6 +531,22 @@ fn write_published(
     state
 }
 
+/// Takes the published snapshot's read lock, recorded as the lock
+/// [`PUBLISHED_SNAPSHOT_LOCK`] in shared mode: a read that waits behind a held or queued
+/// write records that wait and the time the read stays held.
+///
+/// # Cancel safety
+///
+/// As cancel-safe as `RwLock::read`: dropping the future gives up its place in the queue.
+pub(crate) async fn read_published(
+    published: &RwLock<IndexState>,
+) -> rift_tracing::Held<tokio::sync::RwLockReadGuard<'_, IndexState>> {
+    rift_tracing::lock(PUBLISHED_SNAPSHOT_LOCK)
+        .shared()
+        .acquire(published.read())
+        .await
+}
+
 /// Published workspace plus failure for latest observed epoch.
 #[derive(Debug)]
 pub(crate) struct IndexState {
@@ -3543,9 +3559,7 @@ pub(crate) async fn discover_initial_workspace(
     let root = context.root.clone();
     let limits = context.limits;
     let cancellation = validation.cancellation.clone();
-    let configuration = context
-        .published
-        .read()
+    let configuration = read_published(&context.published)
         .await
         .snapshot()
         .0
@@ -3760,7 +3774,7 @@ async fn prepare_initial_workspace_steps(
             "index preparation progressed"
         );
     }
-    let current = Arc::clone(&context.published.read().await.current);
+    let current = Arc::clone(&read_published(&context.published).await.current);
     if current.preparation.is_none()
         && let Some(population) = &context.population
     {
@@ -4094,7 +4108,7 @@ pub(crate) async fn run_index_supervisor_with(
             !pending.covers_whole_workspace() && pending.paths.is_empty()
         };
         if pending_is_empty
-            && validation.observed_epoch() <= published.read().await.snapshot().0.epoch
+            && validation.observed_epoch() <= read_published(&published).await.snapshot().0.epoch
         {
             continue;
         }
@@ -4118,7 +4132,7 @@ pub(crate) async fn run_index_supervisor_with(
         superseded = matches!(result, Ok(RebuildOutcome::Superseded));
         match result {
             Ok(RebuildOutcome::Published) => {
-                let (current, _) = published.read().await.snapshot();
+                let (current, _) = read_published(&published).await.snapshot();
                 if let Some(lane) = population.as_ref() {
                     lane.request(current);
                 }
@@ -5693,6 +5707,51 @@ pub(crate) mod tests {
             "{table}"
         );
         assert_eq!(held[0]["parent"], "index.build", "{table}");
+        Ok(())
+    }
+
+    /// A read of the published snapshot behind a held write records its wait as the
+    /// snapshot lock in shared mode, naming the read that waited and the operation that
+    /// holds the write, and acquires once that write drops.
+    #[tokio::test]
+    async fn a_snapshot_read_behind_a_held_write_records_its_wait() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let fixture = publication_fixture()?;
+        let state = Arc::clone(&fixture.state);
+        let write = rift_tracing::traced!(component = "index", operation = "index.build", async {
+            rift_tracing::lock(super::PUBLISHED_SNAPSHOT_LOCK)
+                .acquire(state.write())
+                .await
+        })
+        .await;
+        let reading = Arc::clone(&fixture.state);
+        let reader = tokio::spawn(rift_tracing::traced!(
+            component = "search",
+            operation = "search.request",
+            async move { super::read_published(&reading).await.current.epoch }
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "the held write keeps the read waiting"
+        );
+        drop(write);
+        reader.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let waits = records
+            .iter()
+            .filter(|record| record.message() == "lock.wait")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(waits.len(), 1, "one wait, one record: {records:?}");
+        let wait = &waits[0];
+        assert_eq!(wait["lock.name"], super::PUBLISHED_SNAPSHOT_LOCK, "{wait}");
+        assert_eq!(wait["lock.mode"], "shared", "{wait}");
+        assert_eq!(wait["waiter"], "search.request", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "acquired", "{wait}");
         Ok(())
     }
 
