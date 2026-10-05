@@ -753,6 +753,15 @@
             "max": "1h",
             "min": "200ms"
           }
+        },
+        "stall_delay": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "Age past which an operation, lock wait, or held lock still open is reported\nonce, on the sample tick, as a record of the operations in flight, 1s to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1s"
+          }
         }
       },
       "type": "object"
@@ -1523,7 +1532,8 @@
         "capture": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
         "page_records": 500,
         "retention_records": 50000,
-        "sample_interval": "1s"
+        "sample_interval": "1s",
+        "stall_delay": "10s"
       },
       "description": "The server's own log records: how many the metrics database keeps,\nhow many one read returns, and which targets are captured."
     },

@@ -1218,12 +1218,13 @@ pub fn declare_dependencies_ranges(schema: &mut Schema) {
 }
 
 /// A [`LogsConfiguration`](crate::configuration::LogsConfiguration) states its
-/// `Duration` floor and ceiling as `rift:range` on `sample_interval`: schema validation
-/// alone cannot compare `"1s"` against a bound, so the server enforces it at load and the
-/// schema carries it for readers.
+/// `Duration` floors and ceilings as `rift:range` on `sample_interval` and `stall_delay`:
+/// schema validation alone cannot compare `"1s"` against a bound, so the server enforces
+/// them at load and the schema carries them for readers.
 pub fn declare_logs_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        Duration, LOGS_SAMPLE_INTERVAL_MS_MAX, LOGS_SAMPLE_INTERVAL_MS_MIN, LogsConfiguration,
+        Duration, LOGS_SAMPLE_INTERVAL_MS_MAX, LOGS_SAMPLE_INTERVAL_MS_MIN,
+        LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN, LogsConfiguration,
     };
     annotate_property(
         schema,
@@ -1232,6 +1233,15 @@ pub fn declare_logs_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MIN),
             &Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(LogsConfiguration, stall_delay),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(LOGS_STALL_DELAY_MS_MIN),
+            &Duration::from_millis(LOGS_STALL_DELAY_MS_MAX),
         ),
     );
 }
@@ -2322,6 +2332,30 @@ mod tests {
             interval[keyword::DEFAULT],
             json!(Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT)),
             "sample_interval must advertise the model's default"
+        );
+    }
+
+    #[test]
+    fn logs_configuration_schema_states_range_and_default_on_stall_delay() {
+        use crate::configuration::{
+            Duration, LOGS_STALL_DELAY_MS_DEFAULT, LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN,
+        };
+        let schema = serde_json::to_value(schema_for!(crate::configuration::LogsConfiguration))
+            .expect("schema");
+        let delay = &schema["properties"]["stall_delay"];
+        assert_eq!(
+            delay[RIFT_RANGE],
+            json!({
+                "min": Duration::from_millis(LOGS_STALL_DELAY_MS_MIN),
+                "max": Duration::from_millis(LOGS_STALL_DELAY_MS_MAX),
+            }),
+            "stall_delay must state the range acceptance enforces"
+        );
+        assert_eq!(delay[RIFT_RANGE], json!({ "min": "1s", "max": "1h" }));
+        assert_eq!(
+            delay[keyword::DEFAULT],
+            json!(Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT)),
+            "stall_delay must advertise the model's default"
         );
     }
 
