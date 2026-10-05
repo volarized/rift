@@ -1201,10 +1201,12 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
             },
         )
         .await;
-        assert!(
-            !root.join(".rift/index").exists(),
-            "a refused child cannot open the held workspace database"
-        );
+        for name in ["index", "metrics", "vectors"] {
+            assert!(
+                !root.join(".rift").join(name).exists(),
+                "a refused child opens no database: {name}"
+            );
+        }
         lingering.unlock()?;
         drop(lingering);
         lost.map(|_stderr| ())
