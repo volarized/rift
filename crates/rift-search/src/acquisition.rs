@@ -777,7 +777,7 @@ async fn fetch_with_retry<T: FileTransport>(
         };
         let Some(delay) = limits.delay_after(attempt) else {
             let attempts = limits.attempts();
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 subject = url,
                 attempts,

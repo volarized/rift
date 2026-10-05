@@ -4579,7 +4579,6 @@ dependencies = [
  "serde_with",
  "tempfile",
  "tokio",
- "tracing",
  "validator",
 ]
 
@@ -4697,7 +4696,6 @@ dependencies = [
  "toasty-driver-sqlite",
  "tokio",
  "toml",
- "tracing",
 ]
 
 [[package]]
@@ -4836,7 +4834,6 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
- "tracing",
 ]
 
 [[package]]

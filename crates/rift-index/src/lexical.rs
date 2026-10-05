@@ -1651,34 +1651,38 @@ impl LexicalSearchIndex {
         documentation: DocumentationWrite,
     ) -> Result<(), RiftError> {
         let limits = self.limits;
-        rift_core::traced_async!(
+        let mode = units.mode();
+        let documents = units.inserted().len();
+        rift_tracing::traced!(
             component = "lexical",
             operation = "lexical.commit",
-            mode = units.mode(),
-            {
-                let mut access = rift_core::traced_async!(
+            mode = mode,
+            async move {
+                let mut access = rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.write_turn",
-                    { self.database.writing().await }
+                    async move { self.database.writing().await }
                 )
                 .await?;
                 let mut transaction = access.transaction().await?;
 
                 let executor = &mut transaction;
-                rift_core::traced_async!(
+                rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.documents",
-                    documents = units.inserted().len(),
-                    { units.write(executor, limits).await }
+                    documents = documents,
+                    async move { units.write(executor, limits).await }
                 )
                 .await?;
 
                 if let DocumentationWrite::Replaced(metadata) = documentation {
                     let executor = &mut transaction;
-                    rift_core::traced_async!(
+                    rift_tracing::traced!(
                         component = "lexical",
                         operation = "lexical.documentation",
-                        { crate::documentation_store::replace(executor, metadata.as_ref()).await }
+                        async move {
+                            crate::documentation_store::replace(executor, metadata.as_ref()).await
+                        }
                     )
                     .await?;
                 }
@@ -1765,15 +1769,16 @@ impl LexicalSearchIndex {
         // One row past the bound tells whether the store holds a match the bound cuts.
         let probe_limit = i64::from(bound) + 1;
 
-        rift_core::traced_async!(
+        let phase_label = phase.label();
+        rift_tracing::traced!(
             component = "lexical",
             operation = "lexical.search",
-            phase = phase.label(),
-            {
-                let mut connection = rift_core::traced_async!(
+            phase = phase_label,
+            async move {
+                let mut connection = rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.connection",
-                    { self.database.connection().await }
+                    async move { self.database.connection().await }
                 )
                 .await?;
                 let mut transaction = connection
@@ -1781,11 +1786,12 @@ impl LexicalSearchIndex {
                     .await
                     .map_err(|source| errors::index::lexical_storage().source(source).error())?;
                 let stamp_reader = &mut transaction;
-                let stored =
-                    rift_core::traced_async!(component = "lexical", operation = "lexical.stamp", {
-                        stored_stamp(stamp_reader).await
-                    })
-                    .await?;
+                let stored = rift_tracing::traced!(
+                    component = "lexical",
+                    operation = "lexical.stamp",
+                    async move { stored_stamp(stamp_reader).await }
+                )
+                .await?;
                 if let Some(scoped) = stamp_scope(stored, tree_revision) {
                     return Ok(scoped);
                 }
@@ -1796,11 +1802,12 @@ impl LexicalSearchIndex {
                     )));
                 };
                 let query_reader = &mut transaction;
-                let matches =
-                    rift_core::traced_async!(component = "lexical", operation = "lexical.query", {
-                        ranked_rows(query_reader, expression, probe_limit).await
-                    })
-                    .await?;
+                let matches = rift_tracing::traced!(
+                    component = "lexical",
+                    operation = "lexical.query",
+                    async move { ranked_rows(query_reader, expression, probe_limit).await }
+                )
+                .await?;
                 Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
                     matches, bound,
                 )))
@@ -1913,17 +1920,22 @@ impl LexicalSearchIndex {
     pub async fn index_trigrams(&self) -> Result<TrigramBatch, RiftError> {
         let rows_max = self.limits.transaction_units_max();
         let bytes_max = u64::try_from(self.limits.transaction_bytes_max()).unwrap_or(u64::MAX);
-        rift_core::traced_async!(component = "lexical", operation = "lexical.trigrams", {
-            let mut access = self.database.writing().await?;
-            let mut transaction = access.transaction().await?;
-            let batch =
-                crate::trigram_store::index_batch(&mut transaction, rows_max, bytes_max).await?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-            Ok(batch)
-        })
+        rift_tracing::traced!(
+            component = "lexical",
+            operation = "lexical.trigrams",
+            async move {
+                let mut access = self.database.writing().await?;
+                let mut transaction = access.transaction().await?;
+                let batch =
+                    crate::trigram_store::index_batch(&mut transaction, rows_max, bytes_max)
+                        .await?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+                Ok(batch)
+            }
+        )
         .await
     }
 

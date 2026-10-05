@@ -21,7 +21,6 @@ use tokio::{
     sync::{Mutex, RwLock, Semaphore},
     time::{Instant, sleep, timeout_at},
 };
-use tracing::Instrument as _;
 
 #[expect(
     missing_docs,
@@ -995,21 +994,19 @@ impl GlobalClient {
         etag: Option<&str>,
         response_body_bytes_max: usize,
     ) -> Result<RawResponse, ClientError> {
-        let started = Instant::now();
         let deadline = Instant::now() + self.inner.config.request_timeout;
         let attempts = self.inner.config.attempts;
-        let span = tracing::info_span!(
+        let span = rift_tracing::info_span!(
             "global.request",
             component = "global",
             operation = operation.operation_id(),
-            request_count = tracing::field::Empty,
-            latency_ms = tracing::field::Empty,
-            response_bytes = tracing::field::Empty,
-            status = tracing::field::Empty,
-            retry_count = tracing::field::Empty,
+            request_count = rift_tracing::empty!(),
+            response_bytes = rift_tracing::empty!(),
+            status = rift_tracing::empty!(),
+            retry_count = rift_tracing::empty!(),
         );
         let record = span.clone();
-        async move {
+        span.instrument(async move {
             let mut attempt = 0;
             loop {
                 attempt += 1;
@@ -1033,25 +1030,24 @@ impl GlobalClient {
                         {
                             continue;
                         }
-                        record_request_span(&record, started, attempt, None);
+                        record_request_span(&record, attempt, None);
                         return Err(error);
                     }
                     Err(_) => {
-                        record_request_span(&record, started, attempt, None);
+                        record_request_span(&record, attempt, None);
                         return Err(ClientError::Deadline);
                     }
                 };
-                tracing::debug!(
+                rift_tracing::debug!(
                     operation = operation.operation_id(),
                     attempt,
                     retry_count = attempt.saturating_sub(1),
                     status = response.status.as_u16(),
                     response_bytes = response.body.len(),
-                    elapsed_ms = started.elapsed().as_millis(),
                     "global response"
                 );
                 if should_retry(response.status, attempt, attempts) {
-                    tracing::debug!(
+                    rift_tracing::debug!(
                         operation = operation.operation_id(),
                         attempt,
                         status = response.status.as_u16(),
@@ -1059,21 +1055,20 @@ impl GlobalClient {
                     );
                     if let Some(delay) = retry_delay(&response.meta) {
                         if delay >= deadline.saturating_duration_since(Instant::now()) {
-                            record_request_span(&record, started, attempt, Some(&response));
+                            record_request_span(&record, attempt, Some(&response));
                             return Ok(response);
                         }
                         if timeout_at(deadline, sleep(delay)).await.is_err() {
-                            record_request_span(&record, started, attempt, None);
+                            record_request_span(&record, attempt, None);
                             return Err(ClientError::Deadline);
                         }
                     }
                     continue;
                 }
-                record_request_span(&record, started, attempt, Some(&response));
+                record_request_span(&record, attempt, Some(&response));
                 return Ok(response);
             }
-        }
-        .instrument(span)
+        })
         .await
     }
 
@@ -1191,14 +1186,12 @@ impl GlobalClient {
 }
 
 fn record_request_span(
-    span: &tracing::Span,
-    started: Instant,
+    span: &rift_tracing::Span,
     request_count: u32,
     response: Option<&RawResponse>,
 ) {
     span.record("request_count", request_count);
     span.record("retry_count", request_count.saturating_sub(1));
-    span.record("latency_ms", started.elapsed().as_millis());
     if let Some(response) = response {
         span.record("status", response.status.as_u16());
         span.record("response_bytes", response.body.len());

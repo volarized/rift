@@ -266,7 +266,7 @@ pub(crate) fn encode_within(
     match EncodedDocumentation::within(collection, bytes_max) {
         Ok(encoded) => Ok(Some(encoded)),
         Err(error) if error.slug().as_str() == "rift.index.lexical_record_limit" => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.commit",
                 %error,

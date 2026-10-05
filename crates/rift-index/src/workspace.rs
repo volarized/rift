@@ -1023,7 +1023,7 @@ impl<File> IndexRead<File> {
 
 /// Records one file left out of the index, once, at the build that left it out.
 fn log_left_out(warning: &WorkspaceIndexWarning) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         path = warning.path().as_str(),
@@ -1035,7 +1035,7 @@ fn log_left_out(warning: &WorkspaceIndexWarning) {
 /// Records one file the index holds as text its provider did not parse, once, at the
 /// build that read it, with the fields a left-out file's record carries.
 fn log_held_unparsed(warning: &WorkspaceIndexWarning) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         path = warning.path().as_str(),
@@ -2216,9 +2216,10 @@ impl WorkspaceIndex {
     ) -> Result<Self, RiftError> {
         check_cancelled(cancelled)?;
         let composition = composition()?;
-        let classified = rift_core::traced!(component = "index", operation = "index.discover", {
-            discover_cancellable(&root, limits, visibility, &language, cancelled)
-        })?;
+        let classified =
+            rift_tracing::traced!(component = "index", operation = "index.discover", {
+                discover_cancellable(&root, limits, visibility, &language, cancelled)
+            })?;
         let BuiltContents {
             files,
             text_files,
@@ -2226,7 +2227,7 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = rift_core::traced!(component = "index", operation = "index.parse", {
+        } = rift_tracing::traced!(component = "index", operation = "index.parse", {
             let mut workspace_bytes = 0_usize;
             let mut contents = IndexContents::default();
             contents.hold_parsed_sources(
@@ -2547,7 +2548,7 @@ impl WorkspaceIndex {
     pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &RiftError> {
         self.documentation_layer
             .get_or_init(|| {
-                rift_core::traced!(
+                rift_tracing::traced!(
                     component = "documentation",
                     operation = "documentation.layer",
                     corpus = "project",
@@ -2713,7 +2714,7 @@ impl WorkspaceIndex {
     /// covers source units read for one request, not the persistent lexical index.
     #[must_use]
     pub fn index_documents(&self) -> Vec<IndexDocument> {
-        rift_core::traced!(
+        rift_tracing::traced!(
             component = "index",
             operation = "index.lexical_units",
             files = self.files.len(),
@@ -4010,7 +4011,7 @@ fn capture_path_lists_with_boundary(
         .into_iter()
         .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
     let text = capture.path_class(other)?;
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "index",
         operation = "fingerprint.bytes",
         bytes = workspace_bytes,
@@ -4290,18 +4291,18 @@ fn capture_digests_attempt(
     let root = canonical_root(root)?;
     let boundary = CaptureBoundary::create(&root);
     let root_identity = root_identity(&root);
-    let language = rift_core::traced!(
+    let language = rift_tracing::traced!(
         component = "index",
         operation = "fingerprint.language_policy",
         { WorkspaceLanguagePolicy::build(&root, languages, text_inclusion) }
     )?;
     let classified =
-        rift_core::traced!(component = "index", operation = "fingerprint.discover", {
+        rift_tracing::traced!(component = "index", operation = "fingerprint.discover", {
             discover_cancellable(&root, limits, visibility, &language, cancelled)
         })?;
     let source = classified.source.len();
     let text = classified.text.len() + classified.lockfiles.len();
-    rift_core::traced!(
+    rift_tracing::traced!(
         component = "index",
         operation = "fingerprint.read",
         source = source,
@@ -5278,7 +5279,7 @@ impl LeftOut {
         let Some((path, error)) = self.first.as_ref() else {
             return;
         };
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "index.build",
             left_out = self.count,
