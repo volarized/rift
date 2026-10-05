@@ -19,13 +19,20 @@
 //! A serving process records what its filter admits: [`log_capture`] builds the
 //! [`LogSink`] layer and its [`LogDrain`], and [`RunningLogDrain`] writes the queue into
 //! the metrics database until a stop joins it.
+//!
+//! A binary starts tracing once through [`TracingRuntime::builder`], which installs stderr,
+//! the capture, and the optional OTLP export under filters of their own, and stops it with
+//! [`TracingRuntime::shutdown`].
 
 mod capture;
 mod drain;
 mod measurement;
+mod otlp;
 mod reads;
 mod record;
+mod runtime;
 mod span;
+mod stderr;
 mod store;
 mod traced;
 
@@ -39,7 +46,11 @@ pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
     LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord,
 };
+pub use runtime::{
+    LogFilterError, StderrPolicy, TracingRuntime, TracingRuntimeBuilder, validate_log_filter,
+};
 pub use span::Span;
+pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, WalCheckpoint};
 pub use tracing::{debug, error, info, trace, warn};
 

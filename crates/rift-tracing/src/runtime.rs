@@ -1,0 +1,298 @@
+//! The process's subscriber: stderr, the log capture, and the optional OTLP export, each
+//! under a filter of its own.
+//!
+//! Stderr keeps `RUST_LOG` or the default targets, because that stream belongs to whoever
+//! started the process. The capture records under the workspace's `[logs] capture` filter,
+//! so a workspace can record itself at debug without an operator exporting an environment
+//! variable into the process a proxy spawns detached. The export reads `RIFT_OTLP_FILTER`.
+
+use std::fmt;
+use std::io::IsTerminal as _;
+
+use tracing::subscriber::Interest;
+use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter, ParseError};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::{Filter, SubscriberExt as _};
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, Layer as _};
+
+use crate::capture::log_capture;
+use crate::drain::LogDrain;
+use crate::otlp;
+use crate::stderr::BoundedStderr;
+
+/// Default filter keeps dependency diagnostics out of MCP stderr.
+const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+
+/// How much the process may write to its standard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrPolicy {
+    /// Everything the filter admits: the stream belongs to whoever reads it.
+    Unbounded,
+    /// At most [`SERVER_STDERR_BYTES_MAX`](crate::SERVER_STDERR_BYTES_MAX) bytes: the stream
+    /// is the file `rift server start` handed its detached server.
+    Bounded,
+}
+
+impl StderrPolicy {
+    /// The policy for this process, given whether it serves a workspace.
+    ///
+    /// A server whose stderr is not a terminal is writing into a file or a pipe that
+    /// outlives every reader, so it is bounded; every other command, and a server an
+    /// operator watches in a terminal, writes freely.
+    #[must_use]
+    pub fn of_process(serves: bool) -> Self {
+        Self::of(serves, std::io::stderr().is_terminal())
+    }
+
+    const fn of(serves: bool, terminal: bool) -> Self {
+        if serves && !terminal {
+            Self::Bounded
+        } else {
+            Self::Unbounded
+        }
+    }
+}
+
+/// A `[logs] capture` value `tracing` cannot parse as a filter.
+#[derive(Debug)]
+pub struct LogFilterError(ParseError);
+
+impl fmt::Display for LogFilterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for LogFilterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Checks `filter` in the `RUST_LOG` spelling the capture filter takes.
+///
+/// # Errors
+///
+/// Returns [`LogFilterError`] when `filter` is not a list of `target=level` directives
+/// `tracing` accepts.
+pub fn validate_log_filter(filter: &str) -> Result<(), LogFilterError> {
+    EnvFilter::try_new(filter)
+        .map(|_| ())
+        .map_err(LogFilterError)
+}
+
+/// The installed subscriber's handle, held until the process stops tracing.
+///
+/// Its OTLP export holds nothing unless the `otlp` feature is compiled in and
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; [`TracingRuntime::shutdown`] runs either
+/// way.
+#[must_use = "the runtime flushes its export only when shut down"]
+pub struct TracingRuntime {
+    export: otlp::Export,
+}
+
+impl TracingRuntime {
+    /// A builder whose subscriber writes stderr unbounded and captures nothing.
+    pub const fn builder() -> TracingRuntimeBuilder {
+        TracingRuntimeBuilder {
+            capture: None,
+            stderr: StderrPolicy::Unbounded,
+        }
+    }
+
+    /// Flushes buffered spans and shuts the OTLP export down.
+    ///
+    /// The caller runs it before either exit path: a normal return drops every other
+    /// local first, and `process::exit` past it runs no destructor at all.
+    pub fn shutdown(self) {
+        self.export.shutdown();
+    }
+}
+
+/// The settings [`TracingRuntimeBuilder::install`] composes the subscriber from.
+#[derive(Debug)]
+#[must_use = "a builder installs nothing until `install` runs"]
+pub struct TracingRuntimeBuilder {
+    capture: Option<String>,
+    stderr: StderrPolicy,
+}
+
+impl TracingRuntimeBuilder {
+    /// Records what `filter` admits into the log drain [`Self::install`] returns.
+    ///
+    /// `filter` is the accepted `[logs] capture` value; a value `tracing` cannot parse
+    /// records under the default targets instead.
+    pub fn capture(mut self, filter: &str) -> Self {
+        self.capture = Some(filter.to_owned());
+        self
+    }
+
+    /// Bounds or frees the process's standard error.
+    pub const fn stderr(mut self, policy: StderrPolicy) -> Self {
+        self.stderr = policy;
+        self
+    }
+
+    /// Installs the subscriber as the process's global default.
+    ///
+    /// The returned drain exists only when [`Self::capture`] ran; without it the
+    /// subscriber has no recording layer and allocates no log queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a global subscriber is already installed.
+    pub fn install(self) -> (TracingRuntime, Option<LogDrain>) {
+        let (sink, drain) = match self.capture {
+            Some(capture) => {
+                let (sink, drain) = log_capture();
+                let filter = EnvFilter::try_new(capture)
+                    .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
+                (Some(sink.with_filter(reevaluated(filter))), Some(drain))
+            }
+            None => (None, None),
+        };
+        let writer = match self.stderr {
+            StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
+            StderrPolicy::Bounded => BoxMakeWriter::new(BoundedStderr::default()),
+        };
+        let mut stderr_layer = tracing_subscriber::fmt::layer()
+            .with_span_events(FmtSpan::CLOSE)
+            .with_writer(writer);
+        // Escape codes color a terminal. A pipe or a file hands them to its reader as bytes:
+        // `rift mcp` keeps a spawned server's first startup lines verbatim, and the codes
+        // nearly double each line.
+        if !std::io::stderr().is_terminal() {
+            stderr_layer.set_ansi(false);
+        }
+        let (otlp_layer, export) = otlp::layer();
+        tracing_subscriber::registry()
+            .with(
+                stderr_layer.with_filter(stderr_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
+                )),
+            )
+            .with(sink)
+            .with(otlp_layer)
+            .init();
+        (TracingRuntime { export }, drain)
+    }
+}
+
+/// The stderr filter: `operator` plus the OTLP export's own reports.
+///
+/// `operator` is `RUST_LOG` or the default targets, and rarely names the OpenTelemetry SDK's
+/// target, through which the export reports what it drops; `otlp::sdk_reports` rides beside
+/// it so those reports reach stderr either way.
+pub(crate) fn stderr_filter<S>(operator: EnvFilter) -> impl Filter<S> {
+    reevaluated(operator.or(otlp::sdk_reports()))
+}
+
+/// Wraps a per-layer filter so the subscriber asks it at every span and event.
+///
+/// `tracing-subscriber` hands each per-layer filter's answer to the registry through one
+/// thread-local state that only an `enabled` pass writes, and a callsite whose interest is
+/// cached as `always` opens its span without such a pass. `tracing::event_enabled!` runs a
+/// pass and dispatches nothing - `toasty` asks it about a `toasty::query` warning before
+/// every statement - so without this wrapper the next such span on that thread inherits the
+/// probe's answers, and each layer whose filter refused the probe loses the span: the log
+/// store does not record it, and the OTLP export does not export it.
+///
+/// The `DynFilterFn` beside `filter` enables everything and answers `sometimes` for every
+/// callsite `filter` does not refuse, so no callsite's interest is cached as `always`. Its
+/// `TRACE` hint leaves `filter`'s own level hint in force.
+pub(crate) fn reevaluated<S>(filter: impl Filter<S>) -> impl Filter<S> {
+    let every_time = DynFilterFn::new(|_, _| true)
+        .with_callsite_filter(|_| Interest::sometimes())
+        .with_max_level_hint(LevelFilter::TRACE);
+    filter.and(every_time)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+    use tracing_subscriber::{EnvFilter, Layer};
+
+    use super::{StderrPolicy, validate_log_filter};
+
+    #[test]
+    fn only_a_server_off_a_terminal_bounds_its_stderr() {
+        assert_eq!(StderrPolicy::of(true, false), StderrPolicy::Bounded);
+        assert_eq!(StderrPolicy::of(true, true), StderrPolicy::Unbounded);
+        assert_eq!(StderrPolicy::of(false, false), StderrPolicy::Unbounded);
+        assert_eq!(StderrPolicy::of(false, true), StderrPolicy::Unbounded);
+    }
+
+    #[test]
+    fn a_log_filter_is_checked_in_the_rust_log_spelling() {
+        assert!(validate_log_filter("rift=info,rift_mcp=debug").is_ok());
+        let refused = validate_log_filter("rift=loud").expect_err("an unknown level is refused");
+        assert_eq!(
+            refused.to_string(),
+            EnvFilter::try_new("rift=loud")
+                .expect_err("tracing refuses the same value")
+                .to_string(),
+            "the refusal carries tracing's own words"
+        );
+    }
+
+    /// Spans the filter test opens; enough that one lost span shows as a count mismatch.
+    const OPENED_SPANS: usize = 32;
+
+    /// Every span name one layer saw open, in order.
+    #[derive(Clone, Default)]
+    struct OpenedSpans {
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl OpenedSpans {
+        fn count(&self, name: &str) -> usize {
+            self.names
+                .lock()
+                .expect("the opened span names are not poisoned")
+                .iter()
+                .filter(|opened| **opened == name)
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for OpenedSpans {
+        fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
+            self.names
+                .lock()
+                .expect("the opened span names are not poisoned")
+                .push(attributes.metadata().name());
+        }
+    }
+
+    /// `toasty` asks `tracing::event_enabled!` about a `toasty::query` warning before every
+    /// statement. A stderr filter with a bare `warn` default, such as `RUST_LOG=warn,rift=info`,
+    /// enables that probe while the log store's capture filter refuses it, and the capture
+    /// must still see every span that follows on the thread.
+    #[test]
+    fn a_reevaluated_filter_sees_every_span_after_a_probe_it_refuses() {
+        let capture = OpenedSpans::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                OpenedSpans::default()
+                    .with_filter(super::reevaluated(EnvFilter::new("warn,rift=info"))),
+            )
+            .with(
+                capture
+                    .clone()
+                    .with_filter(super::reevaluated(EnvFilter::new("rift=info"))),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..OPENED_SPANS {
+                let _ = tracing::event_enabled!(target: "toasty::query", tracing::Level::WARN);
+                crate::traced!(component = "search", operation = "search.request", {});
+            }
+        });
+        assert_eq!(capture.count("search.request"), OPENED_SPANS);
+    }
+}
