@@ -557,7 +557,7 @@ impl WorkspaceDatabase {
     /// checkpoint does not fail the close: the worker still stops, and `SQLite` recovers
     /// whatever the log holds at the next open. The worker drops every connection it holds,
     /// and the last connection's close removes the log file. The wait for the write turn is
-    /// the lock wait [`Self::writing`] records; each statement and each connection close is
+    /// the lock wait `writing` records; each statement and each connection close is
     /// one `db.client.operation.duration` point whose `db.operation.name` is the statement
     /// (`PRAGMA busy_timeout`, `PRAGMA wal_checkpoint(NOOP)`, `PRAGMA
     /// wal_checkpoint(TRUNCATE)`) or `close`.
