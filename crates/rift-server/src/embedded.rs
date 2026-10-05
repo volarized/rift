@@ -96,9 +96,14 @@ pub(crate) async fn started_session(
     let (client, server) = tokio::io::duplex(DUPLEX_BYTES);
     let root = workspace_root.to_path_buf();
     tokio::spawn(serve(server, root));
-    let mut session =
-        EngineSession::start_over_transport(launch, workspace_root, client, tokio::io::empty())
-            .await?;
+    // Boxed: the handshake future is 12,680 bytes on aarch64. One allocation per start.
+    let mut session = Box::pin(EngineSession::start_over_transport(
+        launch,
+        workspace_root,
+        client,
+        tokio::io::empty(),
+    ))
+    .await?;
     session.declare_ready();
     Ok(session)
 }

@@ -1246,9 +1246,9 @@ impl EngineSession {
             }]),
             ..InitializeParams::default()
         };
-        let answer = self
-            .request_within::<Initialize>(params, startup_timeout)
-            .await?;
+        // Boxed: the initialize exchange's future measures 11,056 bytes, and this handshake
+        // runs once per session start, so the allocation is paid once.
+        let answer = Box::pin(self.request_within::<Initialize>(params, startup_timeout)).await?;
         self.capabilities = Capabilities::negotiated(&answer)?;
         self.notify::<Initialized>(&InitializedParams {}).await
     }

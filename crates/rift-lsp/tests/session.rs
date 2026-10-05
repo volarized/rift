@@ -1594,8 +1594,9 @@ async fn walk_ready_at(read_between_attempts: bool) -> Duration {
 /// `cargo check` a walk skips has ended.
 #[tokio::test(start_paused = true)]
 async fn reading_output_between_attempts_reads_rust_analyzer_ready_at_cache_priming_end() {
-    let slept = walk_ready_at(false).await;
-    let read = walk_ready_at(true).await;
+    // Boxed: the helper's future measures 10,544 bytes, near `clippy::large_futures`.
+    let slept = Box::pin(walk_ready_at(false)).await;
+    let read = Box::pin(walk_ready_at(true)).await;
     eprintln!("walk ready from the engine's start: sleeping {slept:?}, reading output {read:?}");
     assert_eq!(slept, Duration::from_millis(11_750));
     assert_eq!(read, Duration::from_millis(8_470));
