@@ -3,6 +3,6 @@
   "private": true,
   "description": "Runner and baseline for the MCP conformance gate; driven by uv run --locked --project dev rift-dev conformance",
   "devDependencies": {
-    "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.12"
   }
 }
