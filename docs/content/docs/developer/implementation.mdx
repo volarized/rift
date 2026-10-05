@@ -8,7 +8,7 @@ This page goes into how Rift is built. It's developer-oriented - if you just wan
 check the [main documentation](/docs).
 
 <FlatDiagram
-  alt="rift mcp forwards requests over Streamable HTTP to the Axum server on Tokio. Providers build an in-memory index and persist search data and logs through Toasty over SQLite."
+  alt="rift mcp forwards requests over Streamable HTTP to the Axum server on Tokio. Providers build an in-memory index and persist search data through Toasty over SQLite into the index and vectors databases; the server writes its logs into the metrics database through rusqlite."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
@@ -18,12 +18,15 @@ check the [main documentation](/docs).
         providers["providers<br/>tree-sitter"]:::provider
         normalization["normalization<br/>SymbolRecord graph"]:::rift
         memory["in-memory index<br/>symbols + nodes"]:::store
-        db[".rift/db<br/>search index + server logs"]:::store
+        index[".rift/index<br/>lexical index"]:::store
+        vectors[".rift/vectors<br/>semantic vectors"]:::store
         providers -- "Contributions" --> normalization
         normalization -- "readable Symbols" --> memory
-        memory -- "publish units<br/>Toasty over SQLite" --> db
+        memory -- "publish units<br/>Toasty over SQLite" --> index
+        memory -- "embedded units<br/>Toasty over SQLite" --> vectors
       end
       server -- "compositions" --> providers
+      server -- "log records<br/>rusqlite" --> metrics[".rift/metrics<br/>server logs"]:::store
   `}
 />
 
@@ -50,9 +53,9 @@ shared lock can outlive the probe for a moment - the starter starts another with
 30-second window.
 
 When the window closes on a server that holds the election but has not published
-`.rift/server.json`, the proxy weighs the workspace database. A server records its diagnostics into
-`.rift/db` while it builds its first index, so when `.rift/db` or its write-ahead log changed during
-the window, the request gets a `temporarily_unavailable` refusal saying the server is still
+`.rift/server.json`, the proxy weighs the index and metrics databases. A server writes `.rift/index`
+while it builds its first index and records its diagnostics into `.rift/metrics`, so when either file
+or its write-ahead log changed during the window, the request gets a `temporarily_unavailable` refusal saying the server is still
 building, and the agent resends it. A holder that wrote nothing keeps the refusal that names an
 operator action.
 
@@ -175,6 +178,22 @@ Freeing a large index can take longer than closing the listener. After the index
 stops, the blocking pool releases its retained index while the foreground process finishes
 the log drain and releases the election.
 
+A foreground stop runs its stages under one deadline, `SERVER_STOP_DEADLINE` (4 s) from where the
+stop begins, and each stage takes only what the one before it left:
+
+1. The serving task drains, and the engines and index supervisor shut down.
+2. The index database, and the vectors database when it opened, close by the deadline minus
+   1 s: `SERVER_LOG_FLUSH_RESERVE` and `SERVER_DATABASE_STOP_RESERVE`, 500 ms each. A close
+   failure becomes a `warn` record with operation `database.close`, so the next stage writes it.
+3. The log drain's final flush ends by the deadline minus `SERVER_DATABASE_STOP_RESERVE`. A
+   drain that outlasts it is aborted, and its warning carries `unwritten`: the records the
+   drain accepted and never wrote.
+4. The metrics database closes by the deadline, so it outlives every record.
+5. The election guard drops, right before the process exits.
+
+Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
+`stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure.
+
 A stopped server leaves its process as soon as serving has ended and the log drain has stopped,
 through the process exit rather than by returning from `main`. Dropping the runtime would wait
 for every blocking task still running, and a lexical transaction or a dependency pass that
@@ -276,14 +295,15 @@ The process holds its election under `<common git directory>/.rift/<product iden
 The digest is SHA-256 of the canonical product identity, and the directory contains `server.lock`
 and `server.json`. Workspace routing remains inside the proxy and HTTP transport.
 
-Each admitted workspace holds an exclusive lease on its `.rift/server.lock` and keeps its
-existing `.rift/db`. A competing serving process is refused before opening that workspace's
-mutable store until the lease is released. `rift server logs` can still read the store under
-its existing migration lock. The repository process shares its bounded worker pool and content cache;
+Each admitted workspace holds an exclusive lease on its `.rift/server.lock` and keeps its own
+index, vectors, and metrics databases. A competing serving process is refused before opening that
+workspace's databases until the lease is released. `rift server logs` still reads the metrics
+database, whose reads take no lock. The repository process shares its bounded worker pool and content cache;
 workspace source, configuration, publications, and language processes retain their own owners.
 
-The database connection thread retains the workspace lease until it exits, including after a
-shutdown wait expires. History retains the existing common Git store and its fill and live locks.
+Each database's thread retains the workspace lease until it exits, including after a shutdown
+wait expires. A workspace's stop closes the index and vectors databases, then its metrics
+database, within `WORKSPACE_STOP_BOUND`, and releases the lease after a clean close. History retains the existing common Git store and its fill and live locks.
 
 ### Local index preparation
 
@@ -319,32 +339,66 @@ tree. A `get_symbol` history read records its start and retains a span until the
 ends. The corpus shutdown tests use these records to observe work in progress before issuing
 `rift server stop`; starting a client request alone does not prove that work has started.
 
-## rift db
+## Databases
 
 <VersionBadge
   version="v0.0.9"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-One [SQLite](https://www.sqlite.org/) database at `.rift/db` holds the lexical index, the
-vectors, and server logs. The server lock stays in a separate file under `.rift`. Access goes
-through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surface is raw SQL,
-because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
-to the FTS table and its rows.
+Three [SQLite](https://www.sqlite.org/) files under `.rift` hold what a server persists for its
+workspace:
+
+| File | Holds | Crate | Thread |
+| --- | --- | --- | --- |
+| `.rift/index` | lexical, trigram, and documentation tables | `rift-index` | `rift-db-index` |
+| `.rift/vectors` | `semantic_vectors` | `rift-index` | `rift-db-vectors` |
+| `.rift/metrics` | `log_records` | `rift-tracing` | `rift-db-metrics` |
+
+The index and vectors databases go through [Toasty](https://github.com/tokio-rs/toasty) models.
+The full-text surface is raw SQL, because Toasty 0.10 has no typed virtual-table or `MATCH` API,
+and the raw boundary stays confined to the FTS table and its rows. The metrics database goes
+through [rusqlite](https://github.com/rusqlite/rusqlite) directly, as the history store does.
+
+The server never reads, migrates, or removes a `.rift/db` file left in the state directory;
+delete it and its `-wal`, `-shm`, and `.lock` files by hand.
+
+An elected server opens the metrics database first, then the index database, so the index
+database's open lands as a record. The vectors database opens through `LazyDatabase`, a handle
+that opens the file at the first vector operation, at most once, under the same election owner;
+an open that fails leaves the handle unopened, and the next vector operation tries again.
+
+Each open stands alone. A refused index database emits a `database.open` warning and the server
+starts without it, while logs keep recording and `rift://logs` returns that warning.
 
 <VersionBadge version="v0.0.47" />
 
-One owned SQLite connection thread executes driver operations for this database file. Async
-callers send operations through a bounded queue and await their replies, so SQLite lock waits
-and statement execution occupy that thread. The queue uses the accepted
-[`[search]`](/docs/developer/configuration#search) `pool_slots` and `busy_timeout` bounds.
+Each of the index and vectors databases is one `WorkspaceDatabase`: one owned SQLite worker
+thread executes driver operations for its file. Async callers send operations through a bounded
+queue and await their replies, so SQLite lock waits and statement execution occupy that thread.
+Each queue uses the accepted [`[search]`](/docs/developer/configuration#search) `pool_slots` and
+`busy_timeout` bounds.
 
-Every process that opens `.rift/db`, a starting server and `rift server logs` alike, holds an
-exclusive lock on `.rift/db.lock` while it switches the file to WAL and applies the schema
-migrations. SQLite refuses a second process's WAL switch at once, without waiting for the first,
-and Toasty applies every migration it read as missing, so two processes preparing one new file
-side by side leave one of them without the database. A process that meets the lock waits for it
-up to [`[search]`](/docs/developer/configuration#search) `busy_timeout`.
+Every process that opens `.rift/index` or `.rift/vectors` holds an exclusive lock on
+`.rift/index.lock` or `.rift/vectors.lock` while it switches the file to WAL and applies that
+database's migration set. SQLite refuses a second process's WAL switch at once, without waiting
+for the first, and Toasty applies every migration it read as missing, so two processes preparing
+one new file side by side leave one of them without the database. A process that meets the lock
+waits for it up to [`[search]`](/docs/developer/configuration#search) `busy_timeout`.
+
+`LogStore::open` in `rift-tracing` spawns `rift-db-metrics`, which opens the one write connection
+to `.rift/metrics` and keeps it for its life. One thread owns the only write connection, so
+writers in the process never compete for the file, and the metrics database has no write turn
+and no lock file.
+
+Every log read, `rift://logs` and `rift server logs` alike, opens a `query_only` connection of
+its own through `LogReader`, which never creates the file or a table and never switches the
+journal mode. The file carries its schema version in `PRAGMA user_version`: a writer that finds another version drops
+`log_records` and creates it again, and a reader refuses.
+
+The metrics database's bounds are compiled: `METRICS_BUSY_TIMEOUT_MS`, 1 s, and a 4 MiB
+write-ahead log limit. A log read therefore never inherits a search wait, and `rift server logs`
+reads while `rift.toml` is invalid.
 
 Documentation extraction lives in `rift-analysis`. Workspace and package adapters pass selected
 bytes, exact source identities, origins, and existing chunk ranges into that shared crate. Its
@@ -356,7 +410,7 @@ Documentation adapters record source warnings when selected input is malformed o
 A selection above 100,000 content owners, including notebook cells and omitted sources, is refused
 before publication.
 
-The workspace database stores the documentation metadata beside the lexical rows, one row per
+The index database stores the documentation metadata beside the lexical rows, one row per
 source: the source's facts, blocks, links, references, and unresolved spellings, under the digest
 of those bytes. A manifest row carries what describes the whole collection, and each exact
 reference also gets a reverse row filed under its source. Blocks retain byte ranges and digests;
@@ -385,9 +439,9 @@ The write runs behind the publication: the rebuilt index becomes current first, 
 lane runs the writes it was handed in publication order, one at a time. The lane holds one write
 behind the running one, and a write handed while one waits merges into it: the union of the files
 both named, derived from the newer publication, leaves the store exactly as running both would. A
-burst of changes therefore costs one write per lane turn. One process-wide write turn serializes
-index commits, trigram batches, vector batches, and log batches, and each transaction starts with
-`BEGIN IMMEDIATE`.
+burst of changes therefore costs one write per lane turn. The index database's write turn
+serializes index commits and trigram batches, and the vectors database's turn its vector batches;
+each transaction starts with `BEGIN IMMEDIATE`. Log batches run on the metrics writer thread.
 
 A write commits in transactions of at most
 [`[search.lexical]`](/docs/developer/configuration#search) `transaction_units` units and
@@ -402,24 +456,34 @@ oldest rows the index lacks, under the same `transaction_units` and `transaction
 a write handed meanwhile runs before the next batch. A search never waits for a batch: it reads
 the rows the index lacks beside the index.
 
-The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
-snapshots. `search.busy_timeout` bounds a lock wait caused by another process, and a wait for a
-pooled connection when every one of the `search.pool_slots` is checked out.
+Each database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
+snapshots. In the index and vectors databases, `search.busy_timeout` bounds a lock wait caused by
+another process, and a wait for a pooled connection when every one of the `search.pool_slots` is
+checked out.
 
 Past that wait, a `search` ranks without the store: it answers from identifier matching and warns
 `lexical_ranking_unavailable`, with a `detail` naming the slot wait. A regex search verifies every
 file its `paths` select in place of the rows the trigram index would select, and warns nothing.
-Every other checkout refuses, a [`rift://logs`](/docs/mcp#resource-logs) read and a write among
-them.
+Every other checkout refuses, a write among them.
 
-Every checkout sets its pragmas again, `mmap_size` among them, from
-[`[search.lexical]`](/docs/developer/configuration#search) `mmap_size`, so a pooled connection
-reads the store file through the memory map that key sets.
+Every checkout sets its pragmas again. `mmap_size` comes from
+[`[search.lexical]`](/docs/developer/configuration#search) `mmap_size` on the index database and
+is zero on the vectors database, and `journal_size_limit` comes from
+[`[search]`](/docs/developer/configuration#search) `journal_size_limit` on both.
+
+At close, `WorkspaceDatabase::shutdown` takes the write turn, sets the busy timeout of its write
+connection to zero, and runs `PRAGMA wal_checkpoint(TRUNCATE)`. It records the `busy`, `log`, and
+`checkpointed` row as a `database.close` record, then the worker drops its connections, and the
+last connection's close removes the write-ahead log.
+
+A turn not free by the deadline, a busy answer, or a refused checkpoint does not fail the close:
+SQLite recovers whatever the log holds at the next open. The metrics writer thread runs the same
+checkpoint when it closes, and the stop records its row as a `database.close` record too.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.
 
-The database tables:
+The index database's tables:
 
 - `lexical_documents` - one row per indexed document: a declaration, carrying its names,
   signature, and documentation, or an indexed file's text, the one copy of it the store keeps,
@@ -465,12 +529,12 @@ The database tables:
   write files its new file rows here in the transaction that stores them, a trigram batch takes
   them off as it indexes them, and a regex search reads it beside the trigram index, so a row
   stored since the last batch still reaches the answer.
-- `semantic_vectors` - one row per embedding space and declaration digest.
-- `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
+The vectors database holds `semantic_vectors`, one row per embedding space and declaration
+digest. The metrics database holds `log_records`, the bounded server diagnostics
+`rift://logs` and `rift server logs` read.
 
-The store's migrations reach this layout from any earlier one. The migration that took each
-declaration's text out of its row drops that column and rebuilds both indexes, so the first start
-after an upgrade rewrites the whole store.
+The index and vectors databases each apply a Toasty migration set numbered from 1 and record it
+in the file's own `__toasty_migrations` table.
 
 A rebuild that named its files deletes and reinserts exactly those paths, which is why
 `lexical_documents` carries an index on `path`: the index finds a path's rows and their index
@@ -487,8 +551,8 @@ below. All three fuse by weighted reciprocal rank, under the shares
 
 <VersionBadge version="v0.0.46" />
 
-The history store is a second SQLite database, apart from `.rift/db`, so lexical and log writes
-never wait on a fill. It sits in the `.rift/` folder of the common git directory, one file per
+The history store is a SQLite database apart from the workspace's three, so lexical and log
+writes never wait on a fill. It sits in the `.rift/` folder of the common git directory, one file per
 derivation revision: the analyzer manifest, corpus revision, index-owned tables, and the
 `[providers.history]` strategy and releases. Compatible builds reuse that file, and a server
 deletes a file no live server holds.
@@ -511,8 +575,8 @@ changed-path listing and each side's index (`search.change_paths`, `search.chang
 
 ## Server logs
 
-The server records diagnostics beside the index in `.rift/db`. `rift server logs` prints them
-oldest first, with or without a running server:
+The server records diagnostics in the metrics database at `.rift/metrics`. `rift server logs`
+prints them oldest first, with or without a running server:
 
 ```sh
 rift server logs
@@ -654,7 +718,7 @@ attention memory grows with the square of the token window, and candle's kernels
 spread one pass across the thread pool, so running several at once buys nothing and costs the
 machine its memory.
 
-The vectors go in `semantic_vectors`, in the same `.rift/db`. A row is addressed by the
+The vectors go in `semantic_vectors`, in the vectors database at `.rift/vectors`. A row is addressed by the
 embedding space that produced it and the digest of the text it came from, so a declaration that
 moves or is renamed resolves to the row already stored and a refresh embeds only what changed.
 The space folds in the source kind, the endpoint origin for a remote service, the model and its
