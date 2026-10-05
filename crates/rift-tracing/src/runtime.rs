@@ -27,7 +27,7 @@ use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::otlp;
 use crate::render::LevelColor;
 use crate::sampler::{ProcessSampler, SystemProcessReader, TickEvidence};
-use crate::stderr::{BoundedStderr, StderrLines};
+use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrLines};
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 pub(crate) const DEFAULT_TRACING_FILTER: &str =
@@ -43,8 +43,9 @@ pub(crate) const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_ser
 pub enum StderrPolicy {
     /// Everything the filter admits: the stream belongs to whoever reads it.
     Unbounded,
-    /// At most [`SERVER_STDERR_BYTES_MAX`](crate::SERVER_STDERR_BYTES_MAX) bytes: the stream
-    /// is the file `rift server start` handed its detached server.
+    /// At most the bytes [`TracingRuntimeBuilder::stderr_limit`] sets,
+    /// [`SERVER_STDERR_BYTES_MAX`](crate::SERVER_STDERR_BYTES_MAX) without it: the stream is
+    /// the file `rift server start` handed its detached server.
     Bounded,
 }
 
@@ -126,6 +127,7 @@ impl TracingRuntime {
         TracingRuntimeBuilder {
             capture: None,
             stderr: StderrPolicy::Unbounded,
+            stderr_limit: SERVER_STDERR_BYTES_MAX,
             sample_interval: None,
             stall_delay: None,
         }
@@ -156,6 +158,7 @@ impl TracingRuntime {
 pub struct TracingRuntimeBuilder {
     capture: Option<String>,
     stderr: StderrPolicy,
+    stderr_limit: u64,
     sample_interval: Option<Duration>,
     stall_delay: Option<Duration>,
 }
@@ -173,6 +176,18 @@ impl TracingRuntimeBuilder {
     /// Bounds or frees the process's standard error.
     pub const fn stderr(mut self, policy: StderrPolicy) -> Self {
         self.stderr = policy;
+        self
+    }
+
+    /// Bounds a [`StderrPolicy::Bounded`] standard error at `bytes`: the writer passes that
+    /// many, prints one notice, and discards the rest, counting the discarded bytes in
+    /// `log.stderr.discarded`. The log drain's stop records the count.
+    ///
+    /// `bytes` is the accepted `[logs] stderr_limit` value. Without this call the bound is
+    /// [`SERVER_STDERR_BYTES_MAX`](crate::SERVER_STDERR_BYTES_MAX); under
+    /// [`StderrPolicy::Unbounded`] it bounds nothing.
+    pub const fn stderr_limit(mut self, bytes: u64) -> Self {
+        self.stderr_limit = bytes;
         self
     }
 
@@ -222,9 +237,19 @@ impl TracingRuntimeBuilder {
             }
             None => (None, None),
         };
-        let writer = match self.stderr {
-            StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
-            StderrPolicy::Bounded => BoxMakeWriter::new(BoundedStderr::default()),
+        let (otlp_layer, export) = otlp::layer();
+        #[cfg(feature = "otlp")]
+        let values = Arc::new(MetricValues::exporting(export.metrics()));
+        #[cfg(not(feature = "otlp"))]
+        let values = Arc::new(MetricValues::default());
+        let (writer, drain) = match self.stderr {
+            StderrPolicy::Unbounded => (BoxMakeWriter::new(std::io::stderr), drain),
+            StderrPolicy::Bounded => {
+                let bound = Arc::new(StderrBound::new(self.stderr_limit));
+                let drain = drain.map(|drain| drain.with_stderr(Arc::clone(&bound)));
+                let writer = BoundedStderr::new(bound, Arc::clone(&values));
+                (BoxMakeWriter::new(writer), drain)
+            }
         };
         // Escape codes color a terminal. A pipe or a file hands them to its reader as bytes:
         // `rift mcp` keeps a spawned server's first startup lines verbatim, and the codes
@@ -235,12 +260,19 @@ impl TracingRuntimeBuilder {
             LevelColor::Plain
         };
         let stderr_layer = StderrLines::new(writer, color);
-        let (otlp_layer, export) = otlp::layer();
-        #[cfg(feature = "otlp")]
-        let values = Arc::new(MetricValues::exporting(export.metrics()));
-        #[cfg(not(feature = "otlp"))]
-        let values = Arc::new(MetricValues::default());
         let flights = Arc::new(FlightTable::default());
+        crate::capture::registry()
+            .with(MetricLayer::new(Arc::clone(&values)))
+            .with(FlightLayer::new(Arc::clone(&flights)))
+            .with(
+                stderr_layer.with_filter(stderr_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_STDERR_FILTER)),
+                )),
+            )
+            .with(sink)
+            .with(otlp_layer)
+            .init();
         let sampler = self.sample_interval.and_then(|interval| {
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 eprintln!("rift: warning: no Tokio runtime runs the process sampler");
@@ -257,18 +289,6 @@ impl TracingRuntimeBuilder {
                 },
             ))
         });
-        crate::capture::registry()
-            .with(MetricLayer::new(Arc::clone(&values)))
-            .with(FlightLayer::new(Arc::clone(&flights)))
-            .with(
-                stderr_layer.with_filter(stderr_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_STDERR_FILTER)),
-                )),
-            )
-            .with(sink)
-            .with(otlp_layer)
-            .init();
         (
             TracingRuntime {
                 export,

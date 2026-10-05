@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
@@ -12,6 +12,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::capture::{closed_record, event_record};
+use crate::metrics::{Counter, MetricValues};
 use crate::record::LogRecord;
 use crate::render::{LevelColor, LiveLine, LogLines};
 
@@ -71,8 +72,9 @@ where
     }
 }
 
-/// Bytes of traced diagnostics a server writes to its standard error before
-/// it stops writing there, when that stream is not a terminal.
+/// Bytes of traced diagnostics a server writes to its standard error before it stops
+/// writing there, when that stream is not a terminal and `[logs] stderr_limit` set no
+/// other bound.
 ///
 /// The file `rift server start` hands its server is what a crashed server
 /// leaves behind: it holds the start, and a panic's own report reaches it
@@ -82,53 +84,117 @@ pub const SERVER_STDERR_BYTES_MAX: u64 = 1 << 20;
 /// The line the writer prints once, as the last thing, when the bound is reached.
 const SERVER_STDERR_BOUND_NOTICE: &str =
     "rift: standard error reached its byte bound; later diagnostics are under `rift server logs`\n";
+/// `log.stderr.discarded`: the bytes the bounded standard error discarded past
+/// `[logs] stderr_limit`.
+const LOG_STDERR_DISCARDED: Counter<0> = Counter::declare("log.stderr.discarded", "By", &[]);
 
-/// Standard error of a server whose stream is a file, cut at
-/// [`SERVER_STDERR_BYTES_MAX`].
+/// The byte bound of a server's standard error, and what passed and was discarded at it.
+///
+/// Every writer of one [`BoundedStderr`] shares it, and the log drain's stop reads
+/// [`Self::discarded`] from it.
+#[derive(Debug)]
+pub(crate) struct StderrBound {
+    limit: u64,
+    written: AtomicU64,
+    discarded: AtomicU64,
+}
+
+impl StderrBound {
+    /// A bound of `limit` bytes, nothing written yet.
+    pub(crate) const fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            written: AtomicU64::new(0),
+            discarded: AtomicU64::new(0),
+        }
+    }
+
+    /// The bound in bytes: the accepted `[logs] stderr_limit`.
+    pub(crate) const fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// The bytes discarded past the bound so far.
+    pub(crate) fn discarded(&self) -> u64 {
+        self.discarded.load(Ordering::Relaxed)
+    }
+}
+
+/// Standard error of a server whose stream is a file, cut at its [`StderrBound`].
 ///
 /// The file `rift server start` hands its server would otherwise grow for
 /// the server's whole life. Past the bound the writer prints one notice and
-/// drops what it is handed afterwards; the diagnostics recorded under
-/// `rift server logs` are unaffected.
-#[derive(Debug, Default)]
+/// discards what it is handed afterwards, counting the bytes in the bound and in
+/// `log.stderr.discarded`; the diagnostics recorded under `rift server logs` are
+/// unaffected.
+#[derive(Debug)]
 pub(crate) struct BoundedStderr {
-    written: AtomicU64,
+    bound: Arc<StderrBound>,
+    values: Arc<MetricValues>,
+}
+
+impl BoundedStderr {
+    /// Standard error cut at `bound`, its discarded bytes counted into `values`.
+    pub(crate) const fn new(bound: Arc<StderrBound>, values: Arc<MetricValues>) -> Self {
+        Self { bound, values }
+    }
 }
 
 impl<'a> MakeWriter<'a> for BoundedStderr {
     type Writer = BoundedWriter<'a, io::Stderr>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        BoundedWriter::new(&self.written, io::stderr())
+        BoundedWriter::new(&self.bound, Some(&self.values), io::stderr())
     }
 }
 
-/// One writer over a shared byte count: writes pass through until the count
-/// reaches [`SERVER_STDERR_BYTES_MAX`], the crossing write is followed by
-/// the notice, and later writes are counted and dropped.
+/// One writer over a shared [`StderrBound`]: writes pass through until the count
+/// reaches the bound, the crossing write is followed by the notice, and later writes
+/// are counted and discarded.
+///
+/// The discarded bytes reach `log.stderr.discarded` through `values` directly: the
+/// writer runs inside the subscriber's dispatch, where the thread's dispatcher is not
+/// reachable to record through.
 #[derive(Debug)]
 pub(crate) struct BoundedWriter<'a, Sink: Write> {
-    written: &'a AtomicU64,
+    bound: &'a StderrBound,
+    values: Option<&'a MetricValues>,
     sink: Sink,
 }
 
 impl<'a, Sink: Write> BoundedWriter<'a, Sink> {
-    /// A writer over `sink` sharing `written` with every sibling writer.
-    pub(crate) const fn new(written: &'a AtomicU64, sink: Sink) -> Self {
-        Self { written, sink }
+    /// A writer over `sink` sharing `bound` with every sibling writer, counting what it
+    /// discards into `values` when given.
+    pub(crate) const fn new(
+        bound: &'a StderrBound,
+        values: Option<&'a MetricValues>,
+        sink: Sink,
+    ) -> Self {
+        Self {
+            bound,
+            values,
+            sink,
+        }
     }
 }
 
 impl<Sink: Write> Write for BoundedWriter<'_, Sink> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let before = self
-            .written
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if before >= SERVER_STDERR_BYTES_MAX {
+        let length = bytes.len() as u64;
+        let before = self.bound.written.fetch_add(length, Ordering::Relaxed);
+        if before >= self.bound.limit {
+            self.bound.discarded.fetch_add(length, Ordering::Relaxed);
+            if let Some(values) = self.values {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a write is far below 2^53 bytes"
+                )]
+                LOG_STDERR_DISCARDED.add_into(values, [], length as f64);
+            }
             return Ok(bytes.len());
         }
         self.sink.write_all(bytes)?;
-        if before + bytes.len() as u64 >= SERVER_STDERR_BYTES_MAX {
+        if before + length >= self.bound.limit {
             self.sink.write_all(SERVER_STDERR_BOUND_NOTICE.as_bytes())?;
         }
         Ok(bytes.len())
@@ -142,12 +208,16 @@ impl<Sink: Write> Write for BoundedWriter<'_, Sink> {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    use super::{BoundedWriter, SERVER_STDERR_BOUND_NOTICE, SERVER_STDERR_BYTES_MAX, StderrLines};
+    use super::{
+        BoundedWriter, SERVER_STDERR_BOUND_NOTICE, SERVER_STDERR_BYTES_MAX, StderrBound,
+        StderrLines,
+    };
+    use crate::metrics::{MetricValues, SeriesValue};
     use crate::render::{LevelColor, LogLines};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -386,11 +456,12 @@ mod tests {
 
     #[test]
     fn a_bounded_writer_passes_the_crossing_write_then_drops() -> TestResult {
-        let written = AtomicU64::new(0);
+        let bound = StderrBound::new(SERVER_STDERR_BYTES_MAX);
+        let values = MetricValues::default();
         let mut sink = Vec::new();
         let head = vec![b'a'; usize::try_from(SERVER_STDERR_BYTES_MAX)? - 4];
         {
-            let mut writer = BoundedWriter::new(&written, &mut sink);
+            let mut writer = BoundedWriter::new(&bound, Some(&values), &mut sink);
             writer.write_all(&head)?;
             writer.write_all(b"crossing")?;
             writer.write_all(b"dropped")?;
@@ -401,19 +472,94 @@ mod tests {
         assert!(sink.ends_with(SERVER_STDERR_BOUND_NOTICE.as_bytes()));
         assert!(!sink.windows(7).any(|window| window == b"dropped"));
         assert_eq!(
-            written.load(Ordering::Relaxed),
+            bound.written.load(Ordering::Relaxed),
             (head.len() + "crossing".len() + "dropped".len()) as u64,
             "dropped bytes are still counted"
         );
+        assert_eq!(bound.discarded(), "dropped".len() as u64);
         Ok(())
     }
 
     #[test]
     fn a_bounded_writer_shares_its_count_between_writers() -> TestResult {
-        let written = AtomicU64::new(SERVER_STDERR_BYTES_MAX);
+        let bound = StderrBound::new(SERVER_STDERR_BYTES_MAX);
+        bound
+            .written
+            .store(SERVER_STDERR_BYTES_MAX, Ordering::Relaxed);
         let mut sink = Vec::new();
-        BoundedWriter::new(&written, &mut sink).write_all(b"late")?;
+        BoundedWriter::new(&bound, None, &mut sink).write_all(b"late")?;
         assert!(sink.is_empty(), "a writer past the bound writes nothing");
+        assert_eq!(bound.discarded(), 4);
+        Ok(())
+    }
+
+    /// The bound is the accepted `[logs] stderr_limit`: the writer passes that many bytes,
+    /// discards the rest, and counts the discarded bytes in `log.stderr.discarded`.
+    #[test]
+    fn a_bounded_writer_stops_at_its_limit_and_counts_what_it_discards() -> TestResult {
+        let bound = StderrBound::new(16);
+        let values = MetricValues::default();
+        let mut sink = Vec::new();
+        {
+            let mut writer = BoundedWriter::new(&bound, Some(&values), &mut sink);
+            writer.write_all(b"0123456789")?;
+            writer.write_all(b"abcdefgh")?;
+            writer.write_all(b"discarded")?;
+            writer.write_all(b"also")?;
+        }
+        assert_eq!(bound.limit(), 16);
+        assert_eq!(
+            sink,
+            [
+                b"0123456789abcdefgh".as_slice(),
+                SERVER_STDERR_BOUND_NOTICE.as_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(bound.discarded(), 13);
+        let snapshot = values.snapshot();
+        let series = snapshot
+            .find("log.stderr.discarded", &[])
+            .ok_or("the discarded bytes are counted")?;
+        assert_eq!(series.value(), &SeriesValue::Sum(13.0));
+        assert_eq!(series.instrument().unit(), "By");
+        Ok(())
+    }
+
+    /// The log drain's stop records the bytes the bounded standard error discarded, with
+    /// the bound: `WARN` past the bound, `INFO` with a count of zero below it.
+    #[tokio::test]
+    async fn a_drain_stop_records_the_bytes_its_bounded_stderr_discarded() -> TestResult {
+        for (written, level, discarded) in [
+            (&[b"crossing".as_slice(), b"discarded"][..], "warn", "9"),
+            (&[b"ok".as_slice()][..], "info", "0"),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let store =
+                Arc::new(crate::LogStore::open(&directory.path().join("metrics"), None).await?);
+            let bound = Arc::new(StderrBound::new(4));
+            for bytes in written {
+                BoundedWriter::new(&bound, None, Vec::new()).write_all(bytes)?;
+            }
+            let (_sink, drain) = crate::log_capture();
+            let running =
+                crate::RunningLogDrain::spawn(drain.with_stderr(Arc::clone(&bound)), store, 100);
+            let (recorder, mut records) = crate::ScopedRecorder::builder().install()?;
+            running
+                .stop(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await;
+            drop(recorder);
+
+            let record = records
+                .queued_records()
+                .into_iter()
+                .find(|record| record.message() == "standard error bytes discarded")
+                .ok_or("the stop records the discarded bytes")?;
+            assert_eq!(record.level(), level);
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields["stderr_limit"], "4", "{fields}");
+            assert_eq!(fields["discarded"], discarded, "{fields}");
+        }
         Ok(())
     }
 }
