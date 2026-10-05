@@ -874,3 +874,23 @@ impl StoreReads {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::ffi;
+
+    use super::error_type;
+
+    fn failure(code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(ffi::Error::new(code), None)
+    }
+
+    #[test]
+    fn error_type_names_busy_and_locked_by_result_code_and_every_other_failure_as_other() {
+        assert_eq!(error_type(&failure(ffi::SQLITE_BUSY)), "5");
+        assert_eq!(error_type(&failure(ffi::SQLITE_LOCKED)), "6");
+        assert_eq!(error_type(&failure(ffi::SQLITE_LOCKED_SHAREDCACHE)), "6");
+        assert_eq!(error_type(&failure(ffi::SQLITE_IOERR)), "_OTHER");
+        assert_eq!(error_type(&rusqlite::Error::QueryReturnedNoRows), "_OTHER");
+    }
+}

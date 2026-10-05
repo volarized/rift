@@ -973,6 +973,46 @@ fn a_failed_batch_records_a_rolled_back_transaction() -> TestResult {
 }
 
 #[test]
+fn a_batch_whose_commit_fails_rolls_back_and_names_the_commit() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    // A deferred foreign key is checked at `COMMIT`, so every statement of the batch
+    // succeeds and only the commit fails.
+    filler.connection().execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER orphan AFTER INSERT ON commits BEGIN INSERT INTO child VALUES (1); END;",
+    )?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    let error = filler
+        .write_batch(&[commit("c1", None, 10, "Add lexical search")])
+        .expect_err("the deferred foreign key refuses the commit");
+
+    let source = sqlite_refusal(&error, "commit batch");
+    assert_eq!(
+        source.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ConstraintViolation)
+    );
+    assert_eq!(
+        stored_row_counts(filler.connection())?,
+        [0, 0, 0, 0, 0],
+        "the failed commit wrote nothing"
+    );
+    let rolled_back = [
+        ("db.namespace", "history"),
+        ("sqlite.transaction.result", "rollback"),
+    ];
+    assert_eq!(
+        recorded(&recorder, "sqlite.transaction.duration", &rolled_back),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn a_batch_refused_the_write_lock_records_the_busy_code() -> TestResult {
     let folder = tempfile::tempdir()?;
     let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
