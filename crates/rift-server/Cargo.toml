@@ -55,6 +55,7 @@ serde_path_to_error.workspace = true
 [dev-dependencies]
 ignore.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
+rift-tracing = { workspace = true, features = ["fixtures"] }
 rusqlite.workspace = true
 schemars.workspace = true
 serde_json.workspace = true

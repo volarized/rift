@@ -1729,38 +1729,30 @@ mod tests {
     /// it logs again.
     #[test]
     fn a_failed_document_read_is_recorded_once_per_change() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         let guard = claim(directory.path())?;
         let mut document = valid_document();
         document.port = dead_port()?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let mut presences = Vec::new();
-        tracing::subscriber::with_default(subscriber, || -> TestResult {
-            let mut reported = None;
-            for _ in 0..3 {
-                let observation = super::observe(directory.path());
-                observation.report_change(&mut reported);
-                presences.push(observation.presence);
-            }
-            guard.publish(&document)?;
-            super::observe(directory.path()).report_change(&mut reported);
-            guard.retire();
-            super::observe(directory.path()).report_change(&mut reported);
-            Ok(())
-        })?;
+        let mut reported = None;
+        for _ in 0..3 {
+            let observation = super::observe(directory.path());
+            observation.report_change(&mut reported);
+            presences.push(observation.presence);
+        }
+        guard.publish(&document)?;
+        super::observe(directory.path()).report_change(&mut reported);
+        guard.retire();
+        super::observe(directory.path()).report_change(&mut reported);
+        drop(recorder);
         assert!(
             presences
                 .iter()
                 .all(|presence| matches!(presence, ServerPresence::Starting)),
             "{presences:?}"
         );
-        let mut records = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            records.push(record);
-        }
+        let records = drain.queued_records();
         assert_eq!(records.len(), 2, "one record per change of failed reads");
         let record = &records[0];
         assert_eq!(record.level(), "info");

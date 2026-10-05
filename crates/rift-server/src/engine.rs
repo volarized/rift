@@ -1520,60 +1520,27 @@ mod tests {
     use super::*;
     use rift_protocol::configuration::{ByteSize, CommandInput, Duration as ConfiguredDuration};
     use rift_protocol::retry::RetryPolicy;
+    use rift_tracing::LogRecord;
 
-    /// Collects the records one test's engine start emits, so a test reads what
-    /// `rift://logs` would carry without opening a store.
-    #[derive(Clone, Default)]
-    struct RecordedEvents(Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl RecordedEvents {
-        /// The records emitted so far, one rendered line each.
-        fn lines(&self) -> Vec<String> {
-            self.0.lock().expect("the recorder is not poisoned").clone()
-        }
-
-        /// The one record whose message matches, or a panic naming everything seen.
-        fn naming(&self, message: &str) -> String {
-            let lines = self.lines();
-            lines
-                .iter()
-                .find(|line| line.contains(message))
-                .unwrap_or_else(|| panic!("no record says {message:?}: {lines:#?}"))
-                .clone()
-        }
+    /// The one record whose message says `message`, or a panic naming every message seen.
+    fn naming<'records>(records: &'records [LogRecord], message: &str) -> &'records LogRecord {
+        records
+            .iter()
+            .find(|record| record.message().contains(message))
+            .unwrap_or_else(|| {
+                let messages: Vec<&str> = records.iter().map(LogRecord::message).collect();
+                panic!("no record says {message:?}: {messages:#?}")
+            })
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedEvents {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Rendered(String);
-            impl tracing::field::Visit for Rendered {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    use std::fmt::Write as _;
-                    let _ = write!(self.0, " {}={value:?}", field.name());
-                }
-            }
-            let mut rendered = Rendered(event.metadata().level().to_string());
-            event.record(&mut rendered);
-            self.0
-                .lock()
-                .expect("the recorder is not poisoned")
-                .push(rendered.0);
-        }
+    /// The fields `record` carried, as the JSON object the store holds.
+    fn fields(record: &LogRecord) -> serde_json::Value {
+        serde_json::from_str(record.fields()).expect("a record's fields are a JSON object")
     }
 
     /// Serves one slot whose configured program is `command`, and returns the refusal
     /// a request earns beside every record the attempt emitted.
-    async fn start_refusal(command: &str, attempts: u64) -> (RiftError, RecordedEvents) {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
+    async fn start_refusal(command: &str, attempts: u64) -> (RiftError, Vec<LogRecord>) {
         let directory = tempfile::tempdir().expect("workspace");
         let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
             "command": [command], "restart": { "attempts": attempts }
@@ -1586,17 +1553,16 @@ mod tests {
             BTreeMap::from([("rust".to_owned(), key.clone())]),
         );
         let slot = pool.engine_by_key(&key).expect("slot");
-        let recorded = RecordedEvents::default();
-        let failure = {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(recorded.clone()),
-            );
-            slot.request(|session| Box::pin(async move { Ok(session.document_version()) }))
-                .await
-                .expect_err("a program that cannot start answers nothing")
-        };
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let failure = slot
+            .request(|session| Box::pin(async move { Ok(session.document_version()) }))
+            .await
+            .expect_err("a program that cannot start answers nothing");
+        drop(recorder);
         pool.shutdown().await;
-        (failure, recorded)
+        (failure, drain.queued_records())
     }
 
     /// An embedded engine is named by the program it stands for. It has no command line, and
@@ -1644,13 +1610,13 @@ mod tests {
             failure.slug() == errors::lsp::engine_launch_failed::SLUG,
             "a missing program answers launch_failed: {failure:?}"
         );
-        let record = recorded.naming("language engine did not start");
-        assert!(record.starts_with("WARN"), "{record}");
+        let record = naming(&recorded, "language engine did not start");
+        assert_eq!(record.level(), "warn", "{record:?}");
+        assert_eq!(record.component(), "engine", "{record:?}");
+        assert_eq!(fields(record)["program"], MISSING_PROGRAM, "{record:?}");
         assert!(
-            record.contains("component=\"engine\"")
-                && record.contains(&format!("program=\"{MISSING_PROGRAM}\""))
-                && record.contains(&missing_program_cause()),
-            "the record names the component, the program and the cause: {record}"
+            record.fields().contains(&missing_program_cause()),
+            "the record names the cause: {record:?}"
         );
     }
 
@@ -1659,11 +1625,11 @@ mod tests {
     #[tokio::test]
     async fn the_spent_restart_budget_names_the_failure_it_surfaces() {
         let (_, recorded) = start_refusal(MISSING_PROGRAM, 1).await;
-        let record = recorded.naming("restart budget is spent");
+        let record = naming(&recorded, "restart budget is spent");
+        assert_eq!(fields(record)["program"], MISSING_PROGRAM, "{record:?}");
         assert!(
-            record.contains(&format!("program=\"{MISSING_PROGRAM}\""))
-                && record.contains(&missing_program_cause()),
-            "the budget record carries the cause: {record}"
+            record.fields().contains(&missing_program_cause()),
+            "the budget record carries the cause: {record:?}"
         );
     }
 
@@ -1676,19 +1642,15 @@ mod tests {
             !restart_may_help(&failure),
             "an absolute program is refused without spending a restart: {failure:?}"
         );
-        let record = recorded.naming("language engine did not start");
-        assert!(
-            record.contains("retrying=false")
-                && record.contains("program=\"/rift-engine-absolute\""),
-            "the record names the program and that no restart follows: {record}"
-        );
+        let record = naming(&recorded, "language engine did not start");
+        let carried = fields(record);
+        assert_eq!(carried["retrying"], "false", "{record:?}");
+        assert_eq!(carried["program"], "/rift-engine-absolute", "{record:?}");
         assert!(
             !recorded
-                .lines()
                 .iter()
-                .any(|line| line.contains("restart budget is spent")),
-            "the budget is untouched: {:#?}",
-            recorded.lines()
+                .any(|record| record.message().contains("restart budget is spent")),
+            "the budget is untouched: {recorded:#?}"
         );
     }
 

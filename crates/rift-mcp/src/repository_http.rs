@@ -721,15 +721,12 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    /// Diagnostics for PR #533: idle eviction events reach the test output.
-    fn diagnostic_log() -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_env_filter("rift_mcp::repository_http=info")
-                .with_ansi(false)
-                .with_test_writer()
-                .finish(),
-        )
+    /// Diagnostics for PR #533: a failed test prints the idle eviction records.
+    fn diagnostic_log() -> Result<rift_tracing::ScopedRecorder, rift_tracing::LogFilterError> {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp::repository_http=info")
+            .install()?;
+        Ok(recorder)
     }
 
     /// The retained workspace roots, and for PR #533 diagnostics each one's idle state,
@@ -943,7 +940,7 @@ mod tests {
     #[tokio::test]
     async fn repository_http_routes_each_workspace_root() -> Result<(), Box<dyn std::error::Error>>
     {
-        let _log = diagnostic_log();
+        let _log = diagnostic_log()?;
         let directory = tempfile::tempdir()?;
         let authority = directory.path();
         let idle_configuration = "[server]\nidle_timeout = \"10s\"\n";

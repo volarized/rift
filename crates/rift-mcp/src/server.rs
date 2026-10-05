@@ -9981,11 +9981,7 @@ done
 
     #[tokio::test]
     async fn traced_read_reconciles_under_an_active_subscriber() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let (_directory, server) = fixture().await?;
         let result = get_symbol(&server, "beacon")
             .await

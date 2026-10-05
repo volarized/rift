@@ -58,6 +58,7 @@ windows-spawn.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
+rift-tracing = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
 rusqlite.workspace = true
 strum.workspace = true
