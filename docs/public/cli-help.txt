@@ -48,7 +48,9 @@ Usage: rift server logs [OPTIONS]
 Options:
   -f, --follow            Keep printing records as the server writes them
   -n, --tail <COUNT>      Print only the newest COUNT records; `all` prints every kept record [default: all]
-      --since <DURATION>  Print only records newer than DURATION ago, such as `10m` or `2h`
+      --since <WHEN>      Print only records recorded at or after WHEN: an age such as `10m` or `2h`, or an RFC 3339 timestamp such as `2026-10-04T20:42:58Z`
+      --until <WHEN>      Print only records recorded before WHEN, in the forms `--since` takes
+      --kind <KIND>       Print records of this kind: diagnostics, metric snapshots, or both [default: log] [possible values: log, metric, all]
       --level <LEVEL>     Print only records at this severity, as the store spells it [possible values: trace, debug, info, warn, error]
       --component <NAME>  Print only records one component emitted, as its spans label it: index, search, engine, change, or logs
   -h, --help              Print help
