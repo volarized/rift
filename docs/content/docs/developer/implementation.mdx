@@ -188,23 +188,46 @@ A foreground stop runs its stages under one deadline, `SERVER_STOP_DEADLINE` (4 
 stop begins, and each stage takes only what the one before it left:
 
 1. The serving task drains, and the engines and index supervisor shut down, by the deadline
-   minus 1 s, the bound step 2 shares, so a stage that runs out its bound still leaves steps 3
-   and 4 their reserves. A dependency version probe the index preparation is running reads the
-   stop: its child is killed within one 25 ms poll, and its close records
-   `error.type=cancelled`.
+   minus 1.5 s, the bound step 2 shares, so a stage that runs out its bound still leaves steps 3
+   to 5 their reserves.
 2. The index database, and the vectors database when it opened, close by the deadline minus
-   1 s: `SERVER_LOG_FLUSH_RESERVE` and `SERVER_DATABASE_STOP_RESERVE`, 500 ms each. A close
-   failure becomes a `warn` record with operation `database.close`, so the next stage writes it.
-3. The log drain's final flush ends by the deadline minus `SERVER_DATABASE_STOP_RESERVE`. A
+   1.5 s: `SERVER_EXPORT_STOP_RESERVE`, `SERVER_LOG_FLUSH_RESERVE`, and
+   `SERVER_DATABASE_STOP_RESERVE`, 500 ms each. A close failure becomes a `warn` record with
+   operation `database.close`, so a later stage writes it.
+3. The `otlp export` stage sends the final spans and metric points and shuts the export down by
+   the deadline minus 1 s, and at most `SERVER_EXPORT_STOP_RESERVE` after it starts. A collector
+   that is down or stalled costs the stop that reserve and never fails it.
+4. The log drain's final flush ends by the deadline minus `SERVER_DATABASE_STOP_RESERVE`. A
    drain that outlasts it is aborted, and its warning carries `unwritten`: the records the
    drain accepted and never wrote.
-4. The metrics database closes by the deadline, so it outlives every record.
-5. The election guard drops, right before the process exits.
+5. The metrics database closes by the deadline, so it outlives every record.
+6. The election guard drops, right before the process exits.
+
+A foreground repository server opens no metrics database and runs no log drain of its own: each
+workspace it holds closes its databases inside the serving stage `repository workspaces
+shutdown`, every workspace at once. Its serving stages therefore end by the deadline minus
+`SERVER_EXPORT_STOP_RESERVE` alone, and its `otlp export` stage ends by the deadline.
 
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
 `stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure. The outcome is `ok`
 for a stage that ended inside the deadline, `error` for a failure, and `timeout` for a stage that
 ended without a failure once its bound had passed. Only a failure makes the stop exit with status 1.
+
+The `otlp export` stage fails nothing, even with the outcome `error`, such as a refused connection:
+it records the outcome at `warn`, because the export carries diagnostics only. A process that
+exports nothing records the stage `ok` at once.
+
+The stage runs before the log drain stops, so a drain the stop abandons counts its `unwritten`
+records in `log.queue.dropped` after the last export: the drain's `warn` record carries that
+count, and the collector never receives it.
+
+A stop that arrives while the index preparation runs a dependency version probe reaches the probe
+too. The probe reads the stop once per 25 ms poll, then kills its child and reaps it, and its close
+records `outcome=cancelled` with `error.type=cancelled`. A cancelled preparation publishes nothing.
+
+After the kill the probe waits at most 200 ms for the child's output pipes to close. On Windows the
+child runs inside a Job object of its own, so the kill ends every process the child started. On
+Unix a process the child started can keep the pipes open, and the probe stops waiting on it.
 
 A database close runs a checkpoint, and the checkpoint's file syncs can take longer than the
 close's bound. Such a close ends its stage with `timeout`: the thread running the checkpoint keeps running until
@@ -234,13 +257,28 @@ marks them `→`, `✓`, and `✗`:
 | `lexical commit settled` | `search.commit` | `tree_revision`, `outcome` |
 | `history fill started` | `history.fill` | `pending`, `phase` |
 | `history fill finished` | `history.fill` | `written`, `outcome` |
+| `vector population started` | `search.populate` | `tree_revision`, `phase` |
+| `vector population finished` | `search.populate` | `tree_revision`, `outcome` |
+| `Git index lock wait ended` | `index.lock` | `path`, `elapsed_ms`, `outcome` |
+| `index watch stopped` | `index.supervisor` | |
 | `stop stage ended` | `server.stop` | `stage`, `remaining`, `outcome` |
 | `workspace election released` | `server.stop` | `state_directory` |
 
 A lexical commit the store refused is owed instead of settled, and its `the lexical commit
 failed` record carries the error. A history fill with no commit pending records neither its
-start nor its end. The election guard drops after the metrics database closes, so
-`workspace election released` reaches stderr and not the store.
+start nor its end. A vector population that fails ends with its warning, carrying
+`outcome = "error"`, in place of `vector population finished`.
+
+A wait for the Git `index.lock` records `Git index lock wait ended` only when it found the lock
+present, with the `outcome` `ok`, `timeout`, or `cancelled`. The election guard drops after the
+metrics database closes, so `workspace election released` reaches stderr and not the store.
+
+`rift mcp` and `rift server start` record their side of a start on their own stderr. Each
+detached server they spawn records `detached server spawned` with its `pid` and where `stdin`,
+`stdout`, and `stderr` go, and a start that sees the child exit records `spawned server exited`
+with its `pid` and, when the platform reports one, its `exit_code`. The proxy's start window ends
+with `start window closed with a server that answers`, or `start window closed without a server
+that answers`, both carrying `rounds`, `elapsed_ms`, and `presence`.
 
 A stopped server leaves its process as soon as serving has ended and the log drain has stopped,
 through the process exit rather than by returning from `main`. Dropping the runtime would wait
@@ -366,7 +404,10 @@ workspace source, configuration, publications, and language processes retain the
 
 Each database's thread retains the workspace lease until it exits, including after a shutdown
 wait expires. A workspace's stop closes the index and vectors databases, then its metrics
-database, within `WORKSPACE_STOP_BOUND`, and releases the lease after a clean close. History retains the existing common Git store and its fill and live locks.
+database, within `WORKSPACE_STOP_BOUND`, and releases the lease after a clean close. When a repository
+process stops, it stops every workspace at once, each by the shared deadline, so one workspace's
+slow close spends none of another's bound; each workspace's records sit under a `server.stop` span
+carrying its `root`. History retains the existing common Git store and its fill and live locks.
 
 ### Local index preparation
 
@@ -531,7 +572,8 @@ checked out.
 Past that wait, a `search` ranks without the store: it answers from identifier matching and warns
 `lexical_ranking_unavailable`, with a `detail` naming the slot wait. A regex search verifies every
 file its `paths` select in place of the rows the trigram index would select, and warns nothing.
-Every other checkout refuses, a write among them.
+Every other checkout refuses, a write among them, with `index.database_failed`, which names the
+database and its path, as a failed open does.
 
 Every checkout sets its pragmas again. `mmap_size` comes from
 [`[search.lexical]`](/docs/developer/configuration#search) `mmap_size` on the index database and
@@ -639,7 +681,7 @@ tokenizer the lexical store uses. Deleting a commit issues FTS5's `'delete'` com
 still holds the message the entry was indexed from.
 
 The history task runs on the runtime's blocking threads, outside the `[server] num_workers` pool.
-With the `otlp` feature, its spans time each wait for an idle server (`history.idle_wait`), each
+Its spans time each wait for an idle server (`history.idle_wait`), each
 batch (`history.batch`, `history.analyze`, `history.write`), each plan (`history.plan`), and the
 rename and move pairing (`history.renames`, `history.moves`). A comparison's spans time the
 changed-path listing and each side's index (`search.change_paths`, `search.change_base`,
@@ -662,7 +704,6 @@ The flags narrow what prints:
   such as `2026-10-04T20:42:58Z`
 - `--until` <VersionBadge version="v0.0.62" inline /> prints records recorded before a bound, in the same two forms; with `--since` it
   selects one window
-- `--kind` <VersionBadge version="v0.0.62" inline /> prints `log` records, the default, `metric` snapshot records, or `all` of them
 - `--level` selects one severity
 - `--component` selects records from one component
 
@@ -671,7 +712,7 @@ The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the ser
 
 `rift-tracing` holds a record from its capture to its row. The `LogSink` layer copies each event
 and span close that `[logs]` `capture` admits into a queue of 4,096 records, and a full queue
-drops the newest record and counts it. The log drain writes the queue in batches. A batch the
+drops the newest record and counts it in `log.queue.dropped` with `error.type` `queue_full`. The log drain writes the queue in batches. A batch the
 metrics database refuses stays with the drain, which retries it every 500 ms with no attempt
 count; meanwhile the queue fills and then drops, and the next batch written carries a
 `the log queue was full and dropped records` record with the `dropped` count. The stop's
@@ -726,10 +767,11 @@ The CLI starts tracing through `TracingRuntime::builder` in `rift-tracing`, whic
 subscriber with a filter per layer:
 
 - stderr under `RUST_LOG`, or `rift=info,rift_mcp=info,rift_server=info,rift_index=warn` when
-  that variable is unset or does not parse, with metric snapshot records left out and only the
-  stall reports of `rift_tracing::flight`
+  that variable is unset or does not parse, with only the stall reports of
+  `rift_tracing::flight`
 - the `LogSink` under `[logs]` `capture`, installed for a foreground server alone
-- with the `otlp` feature, the OTLP export under `RIFT_OTLP_FILTER`
+- the OTLP span export under `RIFT_OTLP_FILTER`, installed when `OTEL_EXPORTER_OTLP_ENDPOINT` is
+  set
 
 A foreground server whose stderr is not a terminal writes at most `[logs]` `stderr_limit`
 there, 1 MiB by default. The write that crosses the bound is followed by one notice,
@@ -744,8 +786,7 @@ Stderr, `rift server logs`, and a failure window print a record through one rend
 function, three spaces, the context, two spaces, the nested operation, and the message:
 
 - The function is the `code.function.name` of the outermost span around the record; outside
-  every span, the record's own; for a metric snapshot record, its instrument group. A record
-  without one prints its target.
+  every span, the record's own. A record without one prints its target.
 - The context is the outermost span's fields: `component`, `operation`, then the rest sorted
   by key, `request_id` printed as `req`. A record outside every span prints its own
   `component`, `operation`, and fields there.
@@ -758,8 +799,8 @@ function, three spaces, the context, two spaces, the nested operation, and the m
   close record states the same `status.code`, and so does `traces.span.metrics.calls` for a
   `traced!` operation, with `error.type` `_OTHER` for a recorded value it does not list. A
   lifecycle record prints its mark before its message: `→` for `phase=start`, `✓` for
-  `outcome=ok`, `✗` for any other `outcome`. A metric snapshot record prints its
-  values. Any other record prints its message, then its own fields sorted by key.
+  `outcome=ok`, `✗` for any other `outcome`. Any other record prints its message, then its own
+  fields sorted by key.
 
 ```text
 2026-10-05 11:57:37.429Z DEBUG rift_mcp::validation::run_index_supervisor_with   component=index epoch=1 trigger=filesystem  ↳ worker.run component=worker operation=worker.run work=filesystem index rebuild → index capture started component=index operation=index.build epoch=1 phase=start
@@ -791,15 +832,17 @@ records no argument unless a field names it. The attribute lives in `rift-tracin
 `rift-tracing` re-exports; it finds the consuming crate's name for `rift-tracing` through
 `proc-macro-crate`, so a renamed dependency resolves too.
 
-Metric values stay in process, in every build. An instrument is declared once, with its name,
-unit, label keys, and bounds: `Counter`, `Gauge`, or `Histogram`, with label values that are
-`&'static str` literals. A value lands in the instruments of the thread's dispatcher, the ones
-`TracingRuntime` installs or a test's `ScopedRecorder`, and `TracingRuntime::metrics` and
-`ScopedRecorder::metrics` read every series. An instrument keeps at most its declared count of
-label sets, 256 unless the declaration names another; a label set past that records into one
-overflow series. Every `traced!` operation records `traces.span.metrics.calls` and
-`traces.span.metrics.duration`, in seconds, labeled with its `span.name` and its outcome as
-`status.code`, with `error.type` `panic` or `cancelled` when it did not finish. The metrics follow
+Every instrument is a `static` declaration over an OpenTelemetry instrument: a `Counter`,
+`Gauge`, `Histogram`, or `ObservableUpDownCounter` with its name, unit, and label keys, whose label
+values are `&'static str` literals. A recording hands the value to the OpenTelemetry SDK, which
+aggregates and exports it, so `rift-tracing` holds no value of its own. A process that installed
+no meter records nothing, at the cost of two atomic reads per recording.
+
+A view on the meter provider bounds every instrument at `CARDINALITY_LIMIT`, 2,000 label sets,
+and the SDK records a label set past that into one series carrying `otel.metric.overflow`. A test reads what the SDK exported through
+`ScopedRecorder::metrics`. Every `traced!` operation records `traces.span.metrics.calls` and
+`traces.span.metrics.duration`, in seconds, labeled with its `span.name`, its `span.kind`,
+`Internal`, and its outcome as `status.code`, with `error.type` `panic` or `cancelled` when it did not finish. The metrics follow
 the operation, not its span: a span clone held elsewhere does not lengthen the duration, and the
 span's filters do not select it.
 
@@ -826,20 +869,46 @@ records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
 
 <VersionBadge version="v0.0.62" />
 
-A foreground server samples its own process every [`[logs]`](/docs/developer/configuration#logs)
-`sample_interval`. A sample reads the process once through `sysinfo`, on the blocking pool, and
-records `process.memory.usage`, `process.memory.virtual`, `process.cpu.utilization`,
-`process.cpu.time`, `process.disk.io`, and the open file count:
-`process.unix.file_descriptor.count`, or `process.windows.handle.count` on Windows. A value the
-platform does not report stays absent and is never recorded as zero, and CPU usage is absent
-until a second sample at least 200 ms after the first. The same blocking read runs every sample
-hook registered through `rift_tracing::sample_hook`: each open `.rift/index`, `.rift/vectors`,
-and `.rift/metrics` database registers one that records `sqlite.file.size` for the database file
-and its write-ahead log and `sqlite.queue.length`, the commands waiting for its worker, so the
-values move on each tick between open and close. The blocking pool registers one that records
-`worker_pool.permit.count` by `worker_pool.permit.state`, `available` or `used`. With the `otlp` feature and
-`OTEL_EXPORTER_OTLP_ENDPOINT` set, every recorded value is also forwarded to an OpenTelemetry
-meter whose reader exports at `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default.
+Every build carries the OTLP export, and a process exports nothing until an operator sets an
+endpoint variable. With `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`
+set, the process installs a meter whose reader exports over OTLP/HTTP protobuf every
+`OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default; spans export when `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set. With neither, the process builds no exporter, so it never dials OTLP's default
+`http://localhost:4318`.
+
+One export takes at most `OTEL_METRIC_EXPORT_TIMEOUT` for metrics and `OTEL_BSP_EXPORT_TIMEOUT`
+for spans, 2 s each when unset, and the SDK reports a failed export on stderr. Every exported span
+and metric point carries the resource attributes `service.name` (`rift`), `service.instance.id`,
+a random UUID per process, `process.pid`, and `service.version`, the server's version, so a collector that receives from several servers
+tells them apart.
+
+Readings are observable instruments: the SDK runs their reads on its reader's task each time it
+collects, so no task of Rift's ticks for them, and a process that installed no meter reads
+nothing. The process readings go through `sysinfo`:
+
+- `process.memory.usage` and `process.memory.virtual`, in bytes
+- `process.cpu.time`, the CPU time consumed, in seconds, with no `cpu.mode`, because `sysinfo`
+  reports one total
+- `process.disk.io` by `disk.io.direction`, `read` or `write`
+- the open file count: `process.unix.file_descriptor.count`, or `process.windows.handle.count` on
+  Windows
+
+`process.cpu.time` and `process.disk.io` stay cumulative, and a collector derives rates from them.
+A value the platform does not report stays absent and is never recorded as zero.
+
+The Tokio readings load the counters of Tokio's stable `RuntimeMetrics` for the runtime that
+installed the subscriber: `tokio.runtime.worker.count`, `tokio.runtime.task.count`,
+`tokio.runtime.global_queue.length`, and the cumulative `tokio.runtime.worker.busy.time` and
+`tokio.runtime.worker.parks`, summed over the workers. A busy time that grows by the whole
+export interval while the global queue grows names a blocked runtime worker.
+
+The owners of a quantity read it the same way. Each open `.rift/index`, `.rift/vectors`, and
+`.rift/metrics` database reports `sqlite.file.size` for the database file and its write-ahead
+log, from file metadata, and `sqlite.queue.length`, the commands waiting for its worker. The
+blocking pool reports `worker_pool.permit.count` by `worker_pool.permit.state`, `available` or
+`used`. One instrument runs at most `OBSERVATIONS_MAX` live reads, three databases for each of
+the 64 workspaces a repository process admits; a read past that is refused, and the first refusal
+per instrument is a `WARN` record naming it.
 
 <VersionBadge version="v0.0.62" />
 
@@ -847,10 +916,17 @@ Work that has not finished is evidence too. The runtime keeps a table of operati
 every span carrying an `operation` field, every lock wait, and every held lock, from its opening
 to its close, with its name, kind (`operation`, `wait`, or `held`), component, lock name, parent
 operation, and start. The table holds at most 1,024 entries and counts each one refused past
-that bound as `untracked`. `rift_tracing::publish_in_flight(reason)` writes it as one
-`operations in flight` record, and the sample tick writes one `operations in flight past the
-stall delay` record, at `WARN`, for the entries open longer than `[logs]` `stall_delay`, each
-entry once. A hold its holder keeps for as long as it runs, such as a server's shared
+that bound as `untracked`.
+
+`rift_tracing::publish_in_flight(reason)` writes the table as one `operations in flight` record,
+and the panic hook writes it at `WARN` with the reason `panic`, right after its `the server
+panicked` record. The stall report, a task of its own, reads the table every quarter of
+[`[logs]`](/docs/developer/configuration#logs) `stall_delay`, and at least every 5 s, and writes
+one `operations in flight past the stall delay` record, at `WARN`, for the entries open longer
+than `stall_delay`, each entry once. The table also feeds `operation.active`, the entries open at
+each collection by `span.name`, and `operation.untracked`, the entries it refused.
+
+A hold its holder keeps for as long as it runs, such as a server's shared
 `history.live` lock and its `history.fill` lock, is declared with `.lifelong()`: the stall
 record leaves it out, and every other publication lists it with `"lifelong": true`. Both records
 list the open entries oldest first, with `age_ms`, as the JSON array in `operations`, keep it
@@ -886,16 +962,10 @@ and `lock.held.duration`. The write turn of `.rift/index` and `.rift/vectors` is
 as a `lock.wait` entry under `lexical.commit` while the holder's `lock.held` entry names the
 operation running its statements.
 
-<VersionBadge version="v0.0.62" />
-
-The sample tick also writes metric snapshot records, kind `metric`, one per instrument group:
-`operations`, `locks`, `database`, `runtime`, `process`, and `lifecycle`. A gauge prints its
-value, a counter its change since the previous snapshot, and a histogram the changes of its
-`.count` and `.sum`. A labeled series prints its label values in declaration order inside
-braces, leaving out a label recorded empty, so the waits on the write turn print as
-`lock.wait.duration.count{lock.name=index.write,lock.mode=exclusive}=2`. A tick at which no
-counter or histogram outside `process` and `runtime` moved writes nothing. Reads return `log` records unless
-they ask for another kind, so snapshots do not fill a page of diagnostics.
+The published index is recorded as the lock `index.snapshot`: a publication holds it
+`exclusive`, and a read holds it `shared`. Tokio's `RwLock` lets a queued write go first, so a
+read that waits behind a held or queued publication shows as a `lock.wait` entry naming that
+publication's operation.
 
 ## Shared ranking
 
