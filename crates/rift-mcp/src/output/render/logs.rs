@@ -3,16 +3,15 @@
 //! [`LogsPage`] borrows the records a read selected. The resource builds its JSON body from the
 //! same page, so the text and the JSON state the same records.
 
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use super::facts::{DETAIL_SEPARATOR, FACT_SEPARATOR, quoted_value};
 use super::{layout, warning};
 use crate::output::text::{TextError, TextWriter};
 
-/// Milliseconds in one day.
-const MILLIS_PER_DAY: i64 = 86_400_000;
-/// The last millisecond year 9999 holds. A later or earlier time is written as its count.
-const TIME_MILLIS_MAX: i64 = 253_402_300_799_999;
+/// `YYYY-MM-DD HH:MM:SS.mmm`, in jiff's `strftime` directives.
+const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 /// Written for a component or an operation a record did not carry.
 const NO_LABEL: &str = "-";
 /// Noun counted by the title of the records section.
@@ -153,35 +152,10 @@ fn value_text(value: &Value) -> String {
 
 /// `YYYY-MM-DD HH:MM:SS.mmm` in UTC.
 ///
-/// A count before the epoch or after the end of year 9999 is written as the count itself.
+/// A count outside the range of [`Timestamp`] is written as the count itself.
 pub(super) fn utc_time(recorded_at_ms: i64) -> String {
-    if !(0..=TIME_MILLIS_MAX).contains(&recorded_at_ms) {
-        return recorded_at_ms.to_string();
-    }
-    let (year, month, day) = civil_date(recorded_at_ms / MILLIS_PER_DAY);
-    let of_day = recorded_at_ms % MILLIS_PER_DAY;
-    let (hour, minute) = (of_day / 3_600_000, of_day / 60_000 % 60);
-    let (second, milli) = (of_day / 1_000 % 60, of_day % 1_000);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milli:03}")
-}
-
-/// The proleptic Gregorian date `days` after 1970-01-01, as year, month, and day.
-///
-/// Days are counted from March 1 of a 400-year era, so the leap day closes the year.
-fn civil_date(days: i64) -> (i64, i64, i64) {
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
+    Timestamp::from_millisecond(recorded_at_ms).map_or_else(
+        |_| recorded_at_ms.to_string(),
+        |timestamp| timestamp.strftime(TIME_FORMAT).to_string(),
+    )
 }

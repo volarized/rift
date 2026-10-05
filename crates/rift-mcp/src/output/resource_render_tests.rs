@@ -594,13 +594,15 @@ fn time_is_utc_with_milliseconds() {
     assert_eq!(utc_time(951_782_400_000), "2000-02-29 00:00:00.000");
     assert_eq!(utc_time(4_107_542_399_000), "2100-02-28 23:59:59.000");
     assert_eq!(utc_time(4_107_542_400_000), "2100-03-01 00:00:00.000");
-    assert_eq!(utc_time(253_402_300_799_999), "9999-12-31 23:59:59.999");
+    assert_eq!(utc_time(253_402_207_200_000), "9999-12-30 22:00:00.000");
+    assert_eq!(utc_time(-1), "1969-12-31 23:59:59.999");
 }
 
 #[test]
-fn a_time_outside_the_years_it_can_write_is_the_count() {
-    assert_eq!(utc_time(-1), "-1");
-    assert_eq!(utc_time(253_402_300_800_000), "253402300800000");
+fn a_time_outside_the_range_of_a_jiff_timestamp_is_the_count() {
+    assert_eq!(utc_time(253_402_207_200_001), "253402207200001");
+    assert_eq!(utc_time(253_402_300_799_999), "253402300799999");
+    assert_eq!(utc_time(-377_705_023_201_001), "-377705023201001");
     assert_eq!(utc_time(i64::MIN), i64::MIN.to_string());
     assert_eq!(utc_time(i64::MAX), i64::MAX.to_string());
 }
