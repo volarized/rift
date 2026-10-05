@@ -198,7 +198,7 @@ def test_a_gzip_body_is_read_and_a_bad_one_is_refused() -> None:
     assert post(app, METRICS_PATH, b"\xff\xff\xff") == 400
     assert post(app, METRICS_PATH, body, content_type="application/json") == 415
     assert post(app, METRICS_PATH, body, method="GET") == 405
-    assert post(app, "/v1/logs", body) == 404
+    assert post(app, "/v1/profiles", body) == 404
 
 
 def test_the_traces_path_still_keeps_span_durations() -> None:
@@ -276,6 +276,7 @@ def test_a_body_past_the_bound_is_refused_and_counted(
             "kinds": 0,
             "spans": 0,
             "durations": 0,
+            "logs": 0,
         }
     }
     assert BODY_BYTES_MAX == 8 * 1024 * 1024
@@ -488,4 +489,5 @@ def test_the_environment_names_the_base_url_and_the_intervals() -> None:
         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
         "OTEL_METRIC_EXPORT_INTERVAL": "1000",
         "OTEL_BSP_SCHEDULE_DELAY": "1000",
+        "OTEL_BLRP_SCHEDULE_DELAY": "1000",
     }

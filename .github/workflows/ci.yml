@@ -290,6 +290,8 @@ jobs:
           path: |
             lcov.info
             target/nextest/ci/junit.xml
+            target/nextest/ci/failure-windows/
+            target/integration/nextest/
           if-no-files-found: error
           retention-days: 7
 
@@ -375,6 +377,8 @@ jobs:
           name: live-results
           path: |
             target/nextest/live/junit.xml
+            target/nextest/live/failure-windows/
+            target/integration/nextest/
           if-no-files-found: error
           retention-days: 7
 
@@ -428,6 +432,8 @@ jobs:
           name: live-results-macos
           path: |
             target/nextest/live/junit.xml
+            target/nextest/live/failure-windows/
+            target/integration/nextest/
           if-no-files-found: error
           retention-days: 7
 
@@ -569,14 +575,18 @@ jobs:
             ${{ github.workspace }}/target/debug/rift${{ runner.os == 'Windows' && '.exe' || '' }}
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
-          cargo nextest run --locked
+          uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev
+          rift-dev test nextest run --locked
           --workspace --all-targets --all-features --profile ${{ matrix.profile || 'ci' }} --no-tests fail
           -E 'not test(/_probe$/)'
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
           name: native-tests-${{ matrix.target }}
-          path: target/nextest/${{ matrix.profile || 'ci' }}/junit.xml
+          path: |
+            target/nextest/${{ matrix.profile || 'ci' }}/junit.xml
+            target/nextest/${{ matrix.profile || 'ci' }}/failure-windows/
+            target/integration/nextest/
           if-no-files-found: error
           retention-days: 7
       # The parent launches its ignored child probe with the fixture environment.
@@ -589,7 +599,8 @@ jobs:
           RIFT_UPDATE_TEST_BINARY: ${{ github.workspace }}/target/debug/rift.exe
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
-          cargo nextest run --locked
+          uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev
+          rift-dev test nextest run --locked
           --workspace --all-targets --all-features --profile ci-windows-update --no-tests fail
           --run-ignored all
           -E 'binary_id(=rift::bin/rift) and test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)'
@@ -817,6 +828,8 @@ jobs:
             target/corpus/
             target/corpus.lcov
             target/nextest/corpus/junit.xml
+            target/nextest/corpus/failure-windows/
+            target/integration/nextest/
           if-no-files-found: warn
           retention-days: 7
 

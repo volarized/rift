@@ -286,15 +286,15 @@ def leg_profile(leg: dict[str, Any]) -> str:
     return matched.group(1)
 
 
-def leg_report(leg: dict[str, Any]) -> str:
-    """The path one native leg uploads its test report from."""
+def leg_report(leg: dict[str, Any]) -> list[str]:
+    """The paths one native leg uploads its test report and failure reports from."""
     upload = native_step(
         lambda step: (
             step.get("uses", "").startswith(UPLOAD_ACTION)
             and "native-tests" in (step.get("with") or {}).get("name", "")
         )
     )
-    return for_leg(upload["with"]["path"], leg)
+    return for_leg(upload["with"]["path"], leg).split()
 
 
 def automerge_step(step_id: str) -> dict[str, Any]:
@@ -704,7 +704,14 @@ class NativeRunBounds(unittest.TestCase):
                 profile = leg_profile(leg)
                 report = nextest_profile_setting(profile, "junit", "path")
                 self.assertTrue(report, f"the {profile!r} profile writes no report")
-                self.assertEqual(leg_report(leg), f"{store}/{profile}/{report}")
+                self.assertEqual(
+                    leg_report(leg),
+                    [
+                        f"{store}/{profile}/{report}",
+                        f"{store}/{profile}/failure-windows/",
+                        "target/integration/nextest/",
+                    ],
+                )
 
 
 class WindowsUpdateSelection(unittest.TestCase):

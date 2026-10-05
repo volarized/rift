@@ -524,6 +524,7 @@ def test_the_case_collector_reaches_every_server_and_the_report(
             "kinds": 0,
             "spans": 0,
             "durations": 0,
+            "logs": 0,
         },
     }
     corpus.telemetry = Collector(endpoint="http://127.0.0.1:4318")

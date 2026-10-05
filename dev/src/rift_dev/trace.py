@@ -45,6 +45,10 @@ from datetime import UTC, datetime, timedelta
 
 import uvicorn
 from google.protobuf.message import DecodeError
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
+    ExportLogsServiceRequest,
+    ExportLogsServiceResponse,
+)
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
     ExportMetricsServiceRequest,
     ExportMetricsServiceResponse,
@@ -54,6 +58,7 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceResponse,
 )
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+from opentelemetry.proto.logs.v1.logs_pb2 import LogRecord
 from opentelemetry.proto.metrics.v1.metrics_pb2 import (
     AGGREGATION_TEMPORALITY_CUMULATIVE,
     AGGREGATION_TEMPORALITY_DELTA,
@@ -68,6 +73,7 @@ from starlette.routing import Route
 
 TRACES_PATH = "/v1/traces"
 METRICS_PATH = "/v1/metrics"
+LOGS_PATH = "/v1/logs"
 PROTOBUF = "application/x-protobuf"
 BODY_BYTES_MAX = 8 * 1024 * 1024
 METRICS_MAX = 512
@@ -80,6 +86,8 @@ GZIP_WINDOW = 31
 POINTS_MAX = 32_768
 # Spans kept for time selection and the join with log records by request.
 SPANS_MAX = 8_192
+# Log records kept for time selection, as many as the metric points.
+LOGS_MAX = 32_768
 # Span durations kept for the per-operation summary.
 DURATIONS_MAX = 262_144
 # The interval of the server's metric reader and span batch processor, in milliseconds,
@@ -98,6 +106,17 @@ GRACEFUL_STOP_SECONDS = 2
 SPAN_REQUEST_KEY = "request_id"
 # The resource attribute that names the process a span or point came from.
 INSTANCE_KEY = "service.instance.id"
+# The resource attribute that carries the sending process's identifier.
+PID_KEY = "process.pid"
+# The resource attribute a test harness sets through `OTEL_RESOURCE_ATTRIBUTES` on every
+# process it spawns, naming the test the process serves.
+TEST_CASE_KEY = "test.case.name"
+# What `CaseStore` keeps per test: points, spans, and log records, the newest of each.
+CASE_POINTS_MAX = 20_000
+CASE_SPANS_MAX = 5_000
+CASE_LOGS_MAX = 20_000
+# Tests `CaseStore` holds at once; a test past it is counted, not kept.
+CASES_MAX = 512
 # Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
 # leaves out, as received from `rift` on 2026-10-05.
 SPAN_KEYS_OMITTED = frozenset(["target", "busy_ns", "idle_ns"])
@@ -169,6 +188,7 @@ class Dropped:
     kinds: int = 0
     spans: int = 0
     durations: int = 0
+    logs: int = 0
 
     def counts(self) -> dict[str, int]:
         """Each count by its reason."""
@@ -180,6 +200,7 @@ class Dropped:
             "kinds": self.kinds,
             "spans": self.spans,
             "durations": self.durations,
+            "logs": self.logs,
         }
 
     def any(self) -> bool:
@@ -192,13 +213,23 @@ class Dropped:
 
 
 def value_text(value: AnyValue) -> str:
-    """An attribute value as text; a value of a kind the text does not read, such as an
-    array, becomes its kind's name."""
+    """An attribute value as text: a map as `{key=value ...}`, an array as
+    `[value ...]`; a value of a kind the text does not read, such as bytes, becomes its
+    kind's name."""
     kind = value.WhichOneof("value")
     if kind == "bool_value":
         return str(value.bool_value).lower()
     if kind in ("string_value", "int_value", "double_value"):
         return str(getattr(value, kind))
+    if kind == "kvlist_value":
+        pairs = " ".join(
+            f"{item.key}={value_text(item.value)}" for item in value.kvlist_value.values
+        )
+        return "{" + pairs + "}"
+    if kind == "array_value":
+        return (
+            "[" + " ".join(value_text(item) for item in value.array_value.values) + "]"
+        )
     return str(kind)
 
 
@@ -211,6 +242,17 @@ def instance_of(resource: Attributes) -> str:
     """The `service.instance.id` resource attribute that names the sending process; empty
     when the resource carries none."""
     return dict(resource).get(INSTANCE_KEY, "")
+
+
+def test_of(resource: Attributes) -> str:
+    """The `test.case.name` resource attribute; empty when the resource carries none."""
+    return dict(resource).get(TEST_CASE_KEY, "")
+
+
+def process_text(resource: Attributes) -> str:
+    """The `pid=<process.pid>  ` prefix of a printed line; empty without one."""
+    pid = dict(resource).get(PID_KEY, "")
+    return f"pid={pid}  " if pid else ""
 
 
 def instance_text(instance: str) -> str:
@@ -336,6 +378,7 @@ class SpanRecord:
     end_time_unix_nano: int
     attributes: Attributes
     instance: str = ""
+    resource: Attributes = ()
 
     @property
     def duration_ms(self) -> float:
@@ -382,22 +425,24 @@ class SpanStore:
     """Every span received: the newest `SPANS_MAX` whole, the newest `DURATIONS_MAX`
     durations by operation."""
 
-    def __init__(self, spans_max: int = SPANS_MAX) -> None:
+    def __init__(
+        self, spans_max: int = SPANS_MAX, tests: CaseStore | None = None
+    ) -> None:
         self.durations: dict[str, deque[float]] = {}
         self.spans: deque[SpanRecord] = deque(maxlen=spans_max)
         self.dropped = Dropped()
         self.received = 0
         self.kept_durations = 0
         self.lock = threading.Lock()
+        self.tests = tests
 
     def record(self, body: bytes) -> None:
         """Decodes one export request and keeps its spans."""
         request = ExportTraceServiceRequest.FromString(body)
         with self.lock:
             for resource_spans in request.resource_spans:
-                instance = instance_of(
-                    attribute_key(resource_spans.resource.attributes)
-                )
+                resource = attribute_key(resource_spans.resource.attributes)
+                instance = instance_of(resource)
                 for scope_spans in resource_spans.scope_spans:
                     for span in scope_spans.spans:
                         self.keep(
@@ -409,12 +454,15 @@ class SpanStore:
                                 end_time_unix_nano=span.end_time_unix_nano,
                                 attributes=attribute_key(span.attributes),
                                 instance=instance,
+                                resource=resource,
                             )
                         )
 
     def keep(self, span: SpanRecord) -> None:
         """Keeps one span, dropping the oldest past a bound. The caller holds the lock."""
         self.received += 1
+        if self.tests is not None:
+            self.tests.keep(span.resource, span)
         if len(self.spans) == self.spans.maxlen:
             self.dropped.spans += 1
         self.spans.append(span)
@@ -491,12 +539,15 @@ class MetricStore:
     it. The Rust exporter's default temporality is cumulative.
     """
 
-    def __init__(self, points_max: int = POINTS_MAX) -> None:
+    def __init__(
+        self, points_max: int = POINTS_MAX, tests: CaseStore | None = None
+    ) -> None:
         self.metrics: dict[str, MetricSeries] = {}
         self.points: deque[MetricPoint] = deque(maxlen=points_max)
         self.dropped = Dropped()
         self.received = 0
         self.lock = threading.Lock()
+        self.tests = tests
 
     def record(self, body: bytes) -> None:
         """Decodes one export request and keeps its data points."""
@@ -567,6 +618,8 @@ class MetricStore:
                     value,
                 )
             self.received += 1
+            if self.tests is not None:
+                self.tests.keep(resource, kept)
             if len(self.points) == self.points.maxlen:
                 self.dropped.points += 1
             self.points.append(kept)
@@ -613,6 +666,186 @@ class MetricStore:
             ]
 
 
+SEVERITY_TEXT = {
+    1: "TRACE",
+    5: "DEBUG",
+    9: "INFO",
+    13: "WARN",
+    17: "ERROR",
+    21: "FATAL",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LogEntry:
+    """One OTLP log record as received: its time, severity, body, attributes, the
+    resource of the process that sent it, and the trace and span it was recorded in,
+    in hex, empty when it was recorded outside a span."""
+
+    time_unix_nano: int
+    severity: str
+    body: str
+    attributes: Attributes
+    resource: Attributes
+    trace_id: str = ""
+    span_id: str = ""
+
+    @property
+    def instance(self) -> str:
+        """The `service.instance.id` of the process that sent the record."""
+        return instance_of(self.resource)
+
+    def line(self) -> str:
+        """The record as one line in the layout of a printed log record."""
+        context = fields_text(self.attributes)
+        span = f"  span={self.span_id}" if self.span_id else ""
+        return (
+            f"{stamp(self.time_unix_nano)} {self.severity:<9} {self.body}   "
+            + process_text(self.resource)
+            + instance_text(self.instance)
+            + context
+            + span
+        )
+
+
+def log_entry(record: LogRecord, resource: Attributes) -> LogEntry:
+    """A received `LogRecord` as a [`LogEntry`]: its time, or its observed time when the
+    sender set none, and its severity text, or the name of its severity number."""
+    severity = record.severity_text or SEVERITY_TEXT.get(
+        record.severity_number - (record.severity_number - 1) % 4,
+        str(record.severity_number),
+    )
+    return LogEntry(
+        time_unix_nano=record.time_unix_nano or record.observed_time_unix_nano,
+        severity=severity,
+        body=value_text(record.body),
+        attributes=attribute_key(record.attributes),
+        resource=resource,
+        trace_id=record.trace_id.hex(),
+        span_id=record.span_id.hex(),
+    )
+
+
+class LogStore:
+    """Every OTLP log record received: the newest `LOGS_MAX`."""
+
+    def __init__(
+        self, logs_max: int = LOGS_MAX, tests: CaseStore | None = None
+    ) -> None:
+        self.logs: deque[LogEntry] = deque(maxlen=logs_max)
+        self.dropped = Dropped()
+        self.received = 0
+        self.lock = threading.Lock()
+        self.tests = tests
+
+    def record(self, body: bytes) -> None:
+        """Decodes one export request and keeps its log records."""
+        request = ExportLogsServiceRequest.FromString(body)
+        with self.lock:
+            for resource_logs in request.resource_logs:
+                resource = attribute_key(resource_logs.resource.attributes)
+                for scope_logs in resource_logs.scope_logs:
+                    for record in scope_logs.log_records:
+                        self.keep(log_entry(record, resource))
+
+    def keep(self, entry: LogEntry) -> None:
+        """Keeps one record, dropping the oldest past the bound. The caller holds the lock."""
+        self.received += 1
+        if self.tests is not None:
+            self.tests.keep(entry.resource, entry)
+        if len(self.logs) == self.logs.maxlen:
+            self.dropped.logs += 1
+        self.logs.append(entry)
+
+    def between(self, since: int | None, until: int | None) -> list[LogEntry]:
+        """The kept records with a time in `[since, until)`, oldest first."""
+        with self.lock:
+            found = [
+                entry
+                for entry in self.logs
+                if within(entry.time_unix_nano, since, until)
+            ]
+        return sorted(found, key=lambda entry: entry.time_unix_nano)
+
+
+@dataclass(slots=True)
+class CaseTelemetry:
+    """What the processes of one test sent: the newest `CASE_POINTS_MAX` points,
+    `CASE_SPANS_MAX` spans, and `CASE_LOGS_MAX` log records, and what each bound dropped."""
+
+    points: deque[MetricPoint] = field(
+        default_factory=lambda: deque(maxlen=CASE_POINTS_MAX)
+    )
+    spans: deque[SpanRecord] = field(
+        default_factory=lambda: deque(maxlen=CASE_SPANS_MAX)
+    )
+    logs: deque[LogEntry] = field(default_factory=lambda: deque(maxlen=CASE_LOGS_MAX))
+    dropped: Dropped = field(default_factory=Dropped)
+
+
+class CaseStore:
+    """Points, spans, and log records by the `test.case.name` of their sender's resource.
+
+    A runner that knows when each test ends takes a failed test's telemetry with `take`
+    and drops a passed test's with `forget`, so the store holds the tests still running.
+    A sender that carries no `test.case.name` is counted under `unattributed`; a test past
+    `CASES_MAX` held at once is counted under `refused`.
+    """
+
+    def __init__(self) -> None:
+        self.tests: dict[str, CaseTelemetry] = {}
+        self.unattributed = 0
+        self.refused = 0
+        self.lock = threading.Lock()
+
+    def keep(
+        self, resource: Attributes, item: MetricPoint | SpanRecord | LogEntry
+    ) -> None:
+        """Files `item` under the test its sender names."""
+        test = test_of(resource)
+        with self.lock:
+            if not test:
+                self.unattributed += 1
+                return
+            held = self.tests.get(test)
+            if held is None:
+                if len(self.tests) >= CASES_MAX:
+                    self.refused += 1
+                    return
+                held = CaseTelemetry()
+                self.tests[test] = held
+            if isinstance(item, MetricPoint):
+                if len(held.points) == held.points.maxlen:
+                    held.dropped.points += 1
+                held.points.append(item)
+            elif isinstance(item, SpanRecord):
+                if len(held.spans) == held.spans.maxlen:
+                    held.dropped.spans += 1
+                held.spans.append(item)
+            else:
+                if len(held.logs) == held.logs.maxlen:
+                    held.dropped.logs += 1
+                held.logs.append(item)
+
+    def matching(self, names: Callable[[str], bool]) -> list[str]:
+        """The held test names `names` accepts."""
+        with self.lock:
+            return [test for test in self.tests if names(test)]
+
+    def take(self, test: str) -> CaseTelemetry | None:
+        """Removes and answers what `test`'s processes sent; None when none sent anything."""
+        with self.lock:
+            return self.tests.pop(test, None)
+
+    def forget(self, names: Callable[[str], bool]) -> int:
+        """Drops every held test `names` accepts; answers how many."""
+        with self.lock:
+            gone = [test for test in self.tests if names(test)]
+            for test in gone:
+                del self.tests[test]
+            return len(gone)
+
+
 def inflate(body: bytes, encoding: str | None) -> bytes | None:
     """The request body, gunzipped when `encoding` says so; None past `BODY_BYTES_MAX`.
 
@@ -648,12 +881,16 @@ async def bounded_body(request: Request) -> bytes | None:
     return b"".join(chunks)
 
 
-def receiver(spans: SpanStore, metrics: MetricStore | None = None) -> Starlette:
-    """The application that feeds OTLP/HTTP export requests into `spans` and `metrics`.
+def receiver(
+    spans: SpanStore, metrics: MetricStore | None = None, logs: LogStore | None = None
+) -> Starlette:
+    """The application that feeds OTLP/HTTP export requests into `spans`, `metrics`, and
+    `logs`.
 
     Starlette answers any other path with 404 and any other method with 405.
     """
     held = metrics if metrics is not None else MetricStore()
+    records = logs if logs is not None else LogStore()
 
     def route(
         path: str,
@@ -704,6 +941,12 @@ def receiver(spans: SpanStore, metrics: MetricStore | None = None) -> Starlette:
                 ExportMetricsServiceResponse().SerializeToString(),
                 "ExportMetricsServiceRequest",
             ),
+            route(
+                LOGS_PATH,
+                records.record,
+                ExportLogsServiceResponse().SerializeToString(),
+                "ExportLogsServiceRequest",
+            ),
         ]
     )
 
@@ -718,8 +961,10 @@ class Collector:
     spans: SpanStore = field(default_factory=SpanStore)
     metrics: MetricStore = field(default_factory=MetricStore)
     endpoint: str = ""
+    logs: LogStore = field(default_factory=LogStore)
+    cases: CaseStore | None = None
 
-    def environment(self) -> dict[str, str]:
+    def environment(self, test_case: str | None = None) -> dict[str, str]:
         """The variables that point a server under test at this collector.
 
         `OTEL_EXPORTER_OTLP_ENDPOINT` is the base URL: Rift installs export only when it
@@ -727,28 +972,42 @@ class Collector:
         `/v1/metrics` and `/v1/traces`. `OTEL_METRIC_EXPORT_INTERVAL` is read by the
         async periodic reader and `OTEL_BSP_SCHEDULE_DELAY` by the batch span
         processor's default configuration, both in milliseconds
-        (`opentelemetry_sdk` 0.33.0).
+        (`opentelemetry_sdk` 0.33.0); `OTEL_BLRP_SCHEDULE_DELAY` is the batch log
+        processor's. With `test_case`, `OTEL_RESOURCE_ATTRIBUTES` sets `test.case.name`,
+        which the SDK's environment resource detector reads into every process's
+        resource, so `CaseStore` files what each process sends under its test.
         """
         if not self.endpoint:
             return {}
-        return {
+        environment = {
             "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
             "OTEL_METRIC_EXPORT_INTERVAL": str(EXPORT_INTERVAL_MS),
             "OTEL_BSP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
+            "OTEL_BLRP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
         }
+        if test_case:
+            environment["OTEL_RESOURCE_ATTRIBUTES"] = resource_attribute(
+                TEST_CASE_KEY, test_case
+            )
+        return environment
 
     def dropped(self) -> Dropped:
         """What the bounds of both stores refused or dropped."""
-        with self.metrics.lock, self.spans.lock:
-            metrics, spans = self.metrics.dropped, self.spans.dropped
+        with self.metrics.lock, self.spans.lock, self.logs.lock:
+            metrics, spans, logs = (
+                self.metrics.dropped,
+                self.spans.dropped,
+                self.logs.dropped,
+            )
             return Dropped(
-                bodies=metrics.bodies + spans.bodies,
+                bodies=metrics.bodies + spans.bodies + logs.bodies,
                 metric_names=metrics.metric_names,
                 series=metrics.series,
                 points=metrics.points,
                 kinds=metrics.kinds,
                 spans=spans.spans,
                 durations=spans.durations,
+                logs=logs.logs,
             )
 
     def points(
@@ -763,9 +1022,29 @@ class Collector:
         )
 
 
+def resource_attribute(key: str, value: str) -> str:
+    """`key=value` as `OTEL_RESOURCE_ATTRIBUTES` carries it.
+
+    `opentelemetry_sdk` 0.33 splits the variable at `,`, each entry at its first `=`,
+    trims both sides, and decodes nothing (`src/resource/env.rs`), the parse
+    `crates/rift/tests/test_case.rs` encodes for: `,`, `%`, whitespace, and control
+    characters become `%XX` of their UTF-8 bytes, every other character stays.
+    """
+    encoded = "".join(
+        "".join(f"%{byte:02X}" for byte in character.encode("utf-8"))
+        if character in ",%" or character.isspace() or not character.isprintable()
+        else character
+        for character in value
+    )
+    return f"{key}={encoded}"
+
+
 @contextmanager
 def collector(
-    points_max: int = POINTS_MAX, spans_max: int = SPANS_MAX
+    points_max: int = POINTS_MAX,
+    spans_max: int = SPANS_MAX,
+    logs_max: int = LOGS_MAX,
+    cases: CaseStore | None = None,
 ) -> Iterator[Collector]:
     """Serves a receiver on `127.0.0.1` from a thread until the block exits.
 
@@ -774,14 +1053,19 @@ def collector(
     The exit asks uvicorn to stop and joins the thread within
     `COLLECTOR_STOP_SECONDS`; a thread still running then raises `RuntimeError`.
     """
-    stores = Collector(SpanStore(spans_max), MetricStore(points_max))
+    stores = Collector(
+        SpanStore(spans_max, cases),
+        MetricStore(points_max, cases),
+        logs=LogStore(logs_max, cases),
+        cases=cases,
+    )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         listener.bind((LOOPBACK, 0))
         port = listener.getsockname()[1]
         server = uvicorn.Server(
             uvicorn.Config(
-                receiver(stores.spans, stores.metrics),
+                receiver(stores.spans, stores.metrics, stores.logs),
                 lifespan="off",
                 log_config=None,
                 log_level="warning",
