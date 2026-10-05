@@ -58,7 +58,8 @@ from rift_dev.trace import (
 STATUS_LINE = re.compile(
     r"^\s*(?:TRY \d+ )?(?P<status>PASS|FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGBUS|SIGKILL|"
     r"SIGTERM|ABORT|LEAK-FAIL|LEAK|FLAKY \d+/\d+)\s+\[\s*(?P<seconds>[0-9.]+)s\]\s+"
-    r"(?:(?:\([^)]*\)|\[[^\]]*\])\s+)*(?P<binary>\S+)\s+(?P<test>\S+)\s*$"
+    r"(?:\[\s*(?P<iteration>\d+)/\d+\]\s+)?(?:\([^)]*\)\s+)*"
+    r"(?P<binary>\S+)\s+(?P<test>\S+)\s*$"
 )
 # Statuses that end a test without a failure.
 PASSED = ("PASS", "LEAK", "FLAKY")
@@ -87,32 +88,41 @@ class Outcome:
 
     binary: str
     test: str
+    stress: int | None = None
     lines: list[str] = field(default_factory=list)
     failed: bool = False
 
     def names(self, case: str) -> bool:
         """Whether `case`, a nextest attempt identifier such as
-        `<run>:rift::server_cli@stress-3$name`, is an attempt of this test."""
-        return names_case(case, self.binary, self.test)
+        `<run>:rift::server_cli@stress-3$name`, is an attempt of this test in this
+        stress iteration."""
+        return names_case(case, self.binary, self.test, self.stress)
+
+    @property
+    def title(self) -> str:
+        """The binary and test, and the stress iteration when nextest ran one."""
+        iteration = "" if self.stress is None else f" (stress index {self.stress})"
+        return f"{self.binary} {self.test}{iteration}"
 
 
-def names_case(case: str, binary: str, test: str) -> bool:
-    """Whether the attempt identifier `case` names `test` of `binary`: the binary, its
-    `@stress-<n>` suffix when a stress run adds one, then `$` and the test's name."""
+def names_case(case: str, binary: str, test: str, stress: int | None = None) -> bool:
+    """Whether the attempt identifier `case` names `test` of `binary`: the binary, with
+    `@stress-<stress>` when a stress run adds the 0-indexed iteration, then `$` and the
+    test's name."""
     head, separator, name = case.rpartition("$")
-    return (
-        bool(separator)
-        and name == test
-        and (head.endswith(binary) or f"{binary}@stress-" in head)
-    )
+    expected = binary if stress is None else f"{binary}@stress-{stress}"
+    return bool(separator) and name == test and head.endswith(expected)
 
 
-def status_of(line: str) -> tuple[str, str, str] | None:
-    """The status, binary, and test of a nextest status line; None for any other."""
+def status_of(line: str) -> tuple[str, str, str, int | None] | None:
+    """The status, binary, test, and 0-indexed stress iteration of a nextest status
+    line (nextest prints the iteration 1-indexed as `[ 47/200]`); None for any other."""
     found = STATUS_LINE.match(line)
     if found is None:
         return None
-    return found["status"], found["binary"], found["test"]
+    iteration = found["iteration"]
+    stress = None if iteration is None else int(iteration) - 1
+    return found["status"], found["binary"], found["test"], stress
 
 
 def failed_status(status: str) -> bool:
@@ -363,7 +373,7 @@ def case_report(
         if name in os.environ
     )
     sections = [
-        f"==== failed test: {outcome.binary} {outcome.test} ====",
+        f"==== failed test: {outcome.title} ====",
         f"os: {platform.platform()} {platform.machine()}"
         + (f"  runner: {runner}" if runner else ""),
         f"command: {command}",
@@ -414,13 +424,15 @@ def case_report(
             else "no per-test store"
         )
     )
-    sections.append(f"==== end of failed test: {outcome.binary} {outcome.test} ====")
+    sections.append(f"==== end of failed test: {outcome.title} ====")
     return "\n".join(sections) + "\n"
 
 
 def report_name(outcome: Outcome) -> str:
     """The report's file name: the binary and test with path separators replaced."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", f"{outcome.binary}-{outcome.test}") + ".txt"
+    iteration = "" if outcome.stress is None else f"-stress-{outcome.stress}"
+    name = f"{outcome.binary}-{outcome.test}{iteration}"
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".txt"
 
 
 def run(command: Command, arguments: Sequence[str] | None = None) -> None:
@@ -443,9 +455,10 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                 found = status_of(line.rstrip("\n"))
                 if found is None:
                     continue
-                status, binary, test = found
+                status, binary, test, stress = found
                 outcome = outcomes.setdefault(
-                    f"{binary}${test}", Outcome(binary=binary, test=test)
+                    f"{binary}${test}@{stress}",
+                    Outcome(binary=binary, test=test, stress=stress),
                 )
                 if line.strip() not in outcome.lines:
                     outcome.lines.append(line.strip())
@@ -453,6 +466,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                     outcome.failed = True
                 elif not outcome.failed:
                     cases.forget(outcome.names)
+                    del outcomes[f"{binary}${test}@{stress}"]
             status = process.wait(EXIT_WAIT_SECONDS)
         sys.stdout.flush()
         failed = [outcome for outcome in outcomes.values() if outcome.failed]

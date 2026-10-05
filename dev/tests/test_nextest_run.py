@@ -172,20 +172,22 @@ def test_a_sender_without_a_case_is_counted_unattributed() -> None:
     [
         (
             "        FAIL [  15.614s] (2292/4226) rift::server_cli stop_after_x",
-            ("FAIL", "rift::server_cli", "stop_after_x"),
+            ("FAIL", "rift::server_cli", "stop_after_x", None),
         ),
         (
             "  TRY 2 PASS [   1.000s] (1/2) rift-mcp::proxy name",
-            ("PASS", "rift-mcp::proxy", "name"),
+            ("PASS", "rift-mcp::proxy", "name", None),
         ),
         (
             "        FAIL [  11.708s] [ 47/200] (1/1) rift::mcp_proxy repository_x",
-            ("FAIL", "rift::mcp_proxy", "repository_x"),
+            ("FAIL", "rift::mcp_proxy", "repository_x", 46),
         ),
         ("    Starting 4226 tests across 60 binaries", None),
     ],
 )
-def test_status_lines_parse(line: str, found: tuple[str, str, str] | None) -> None:
+def test_status_lines_parse(
+    line: str, found: tuple[str, str, str, int | None] | None
+) -> None:
     assert nextest_run.status_of(line) == found
 
 
@@ -200,7 +202,7 @@ def test_the_environment_names_the_case_percent_encoded() -> None:
     ("case", "named"),
     [
         ("run:rift::server_cli$stop_x", True),
-        ("run:rift::server_cli@stress-3$stop_x", True),
+        ("run:rift::server_cli@stress-3$stop_x", False),
         ("run:rift::server_cli$stop_x_as_the_document_goes", False),
         ("run:rift::mcp_proxy$stop_x", False),
         ("stop_x", False),
@@ -208,3 +210,9 @@ def test_the_environment_names_the_case_percent_encoded() -> None:
 )
 def test_an_attempt_names_its_test(case: str, named: bool) -> None:
     assert nextest_run.names_case(case, "rift::server_cli", "stop_x") is named
+
+
+def test_a_stress_attempt_names_its_iteration() -> None:
+    case = "run:rift::server_cli@stress-46$stop_x"
+    assert nextest_run.names_case(case, "rift::server_cli", "stop_x", 46)
+    assert not nextest_run.names_case(case, "rift::server_cli", "stop_x", 45)
