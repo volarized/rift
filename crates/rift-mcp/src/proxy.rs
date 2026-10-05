@@ -39,7 +39,10 @@ use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
 use tracing::Instrument as _;
 
-use crate::election::{ServerPresence, StaleReason, probe, probe_state_directory};
+use crate::election::{
+    ElectionObservation, ServerPresence, StaleReason, observe, presence_field, probe,
+    probe_state_directory,
+};
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
@@ -581,13 +584,21 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
     identity: &ProductIdentity,
     mut ask_repository: impl FnMut() -> Asking,
 ) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+    let started = tokio::time::Instant::now();
     let mut reported = None;
+    let mut closing = StartWindowClose::default();
     let asked = ask_repository().await;
     asked.report_change(&mut reported);
     let mut repository_transient = match asked {
         RepositoryAsk::Connected(running) => return Ok(running),
-        RepositoryAsk::Transient(_) => true,
-        RepositoryAsk::Terminal(_) => false,
+        RepositoryAsk::Transient(miss) => {
+            closing.repository_miss = Some(miss);
+            true
+        }
+        RepositoryAsk::Terminal(miss) => {
+            closing.repository_miss = Some(miss);
+            false
+        }
     };
     let mut replacement = Replacement::default();
     if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
@@ -608,9 +619,14 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
     let opened = DatabaseActivity::observed(root).await;
     let mut building = false;
     let mut still_serving = None;
+    let mut probe_reads = None;
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        let presence = probed(root).await;
+        let observation = observed(root).await;
+        observation.report_change(&mut probe_reads);
+        let presence = observation.presence;
+        closing.rounds += 1;
+        closing.presence = presence_field(&presence);
         building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
         still_serving = replacement.refusal_while_serving(&presence, identity);
@@ -636,16 +652,57 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
             asked.report_change(&mut reported);
             match asked {
                 RepositoryAsk::Connected(running) => return Ok(running),
-                RepositoryAsk::Transient(_) => {}
-                RepositoryAsk::Terminal(_) => repository_transient = false,
+                RepositoryAsk::Transient(miss) => closing.repository_miss = Some(miss),
+                RepositoryAsk::Terminal(miss) => {
+                    repository_transient = false;
+                    closing.repository_miss = Some(miss);
+                }
             }
         }
     }
+    closing.building = building;
     if let Some(refusal) = still_serving {
+        closing.record(started.elapsed(), None, &refusal);
         return refusal.fail();
     }
     let closed = DatabaseActivity::observed(root).await;
-    start_window_refusal(building && opened != closed).fail()
+    let wrote = opened != closed;
+    let refusal = start_window_refusal(building && wrote);
+    closing.record(started.elapsed(), Some(wrote), &refusal);
+    refusal.fail()
+}
+
+/// What a start window that closed without a server that answers last saw,
+/// logged once as the window closes, beside the refusal it returns.
+#[derive(Debug, Default)]
+struct StartWindowClose {
+    /// The poll rounds the window ran.
+    rounds: u32,
+    /// The workspace election's presence at the last round.
+    presence: String,
+    /// The last ask of the repository server, when it missed.
+    repository_miss: Option<RepositoryMiss>,
+    /// Whether the last round found the election held with no document.
+    building: bool,
+}
+
+impl StartWindowClose {
+    /// Logs the window's close after `elapsed`, with `wrote` naming whether
+    /// a database file changed during the window when the close read it, and
+    /// the `refusal` the request gets.
+    fn record(&self, elapsed: Duration, wrote: Option<bool>, refusal: &ErrorData) {
+        tracing::info!(
+            component = "mcp",
+            rounds = self.rounds,
+            elapsed_ms = elapsed.as_millis(),
+            presence = %self.presence,
+            repository_miss = self.repository_miss.as_ref().map(tracing::field::debug),
+            building = self.building,
+            wrote,
+            refusal = %refusal.message,
+            "start window closed without a server that answers"
+        );
+    }
 }
 
 /// What the index and metrics databases' files looked like at one instant: each
@@ -763,6 +820,21 @@ async fn adopt_serving(
 /// the blocking pool and changes nothing.
 async fn probed(root: &Path) -> ServerPresence {
     probed_with(root, probe).await
+}
+
+/// [`probed`] with the reads that decided the presence, so the start poll
+/// can log a read that failed.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the answer; the probe itself finishes on
+/// the blocking pool and changes nothing.
+async fn observed(root: &Path) -> ElectionObservation {
+    let root = root.to_path_buf();
+    let fallback = ElectionObservation::unobservable(&root);
+    tokio::task::spawn_blocking(move || observe(&root))
+        .await
+        .unwrap_or(fallback)
 }
 
 /// [`probed`] over any probe, so a test can hold one probe open.
@@ -2981,5 +3053,68 @@ mod tests {
             CallToolResponse::Task(passed) => assert_eq!(passed, task),
             other => panic!("a task answer must pass through, got {other:?}"),
         }
+    }
+
+    /// A start window that closes on a held election with no document logs one record
+    /// naming the rounds it ran, the last presence of the workspace election, the last
+    /// repository miss, the time it took, and the refusal it returns. Repeated probes
+    /// with the same failed read log that read once.
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_start_window_records_what_it_last_saw() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let refusal = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            connect_upstream_with(directory.path(), &test_identity(), || {
+                std::future::ready(RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                    pid: 4_242,
+                    settings_match: false,
+                    identity_adopted: true,
+                }))
+            })
+            .await
+            .expect_err("a holder that never publishes must exhaust the start window")
+        };
+        let mut records = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            records.push(record);
+        }
+        let messages = |message: &str| {
+            records
+                .iter()
+                .filter(|record| record.message() == message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            messages("election probe read failed").len(),
+            1,
+            "a failed read repeated every round logs once"
+        );
+        let closed = messages("start window closed without a server that answers");
+        assert_eq!(closed.len(), 1, "the window's close logs once");
+        assert_eq!(closed[0].level(), "info");
+        let fields: serde_json::Value = serde_json::from_str(closed[0].fields())?;
+        let rounds: u32 = fields["rounds"].as_str().ok_or("rounds")?.parse()?;
+        assert!(rounds > 1, "{fields}");
+        let elapsed_ms: u64 = fields["elapsed_ms"].as_str().ok_or("elapsed_ms")?.parse()?;
+        assert!(
+            elapsed_ms >= u64::try_from(crate::spawn::START_WAIT_MAX.as_millis())?,
+            "{fields}"
+        );
+        assert_eq!(fields["presence"], "Starting");
+        assert_eq!(fields["building"], "true");
+        assert_eq!(fields["wrote"], "false");
+        assert!(
+            fields["repository_miss"]
+                .as_str()
+                .is_some_and(|miss| miss.starts_with("NotAdopted {")),
+            "{fields}"
+        );
+        assert_eq!(fields["refusal"], refusal.message.as_ref());
+        Ok(())
     }
 }
