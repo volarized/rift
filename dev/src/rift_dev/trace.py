@@ -1,33 +1,45 @@
-"""Collect Rift's exported spans and metrics in memory and summarize them.
+"""Collect Rift's exported spans and metric points in memory, summarize them, and select them by time.
 
-`rift` built with `--features otlp` exports its `traced!` spans and its metric
-values over OTLP/HTTP, protobuf-encoded (`opentelemetry-otlp`'s `http-proto`
-feature), once `OTEL_EXPORTER_OTLP_ENDPOINT` names a receiver. The exporter appends
-`/v1/traces` and `/v1/metrics` to that base URL. The collector here is that
-receiver: it accepts `POST /v1/traces`, keeps each span's name and duration in
-memory, accepts `POST /v1/metrics`, keeps each metric's latest value per series,
-and prints one JSON line per operation and one per metric name when it stops.
-Rift's macros name a span after its operation, so grouping by span name groups by
-operation.
+`rift` built with `--features otlp` exports its `traced!` spans and its metrics over
+OTLP/HTTP, protobuf-encoded (`opentelemetry-otlp`'s `http-proto` feature), once
+`OTEL_EXPORTER_OTLP_ENDPOINT` names a receiver. The exporter appends `/v1/traces` and
+`/v1/metrics` to that base URL. The collector here is that receiver. It accepts
+`POST /v1/traces` and `POST /v1/metrics` and keeps, in memory:
 
-Bounds: a request body, encoded and decompressed, is at most `BODY_BYTES_MAX`
-bytes; the store keeps at most `METRICS_MAX` metric names and `SERIES_MAX` series
-per name. Whatever a bound refused is counted and printed as a last `dropped` line,
-so a summary cannot describe an incomplete capture as complete. Span durations are
-kept without a count bound.
+- every span received, with its name, trace and span identifiers, start and end, and
+  attributes, at most `SPANS_MAX`, and its duration for the per-operation summary;
+- every metric data point received, with its instrument's name, kind, and unit, its
+  attributes and resource attributes, its value (a histogram's count, sum, and buckets),
+  `start_time_unix_nano`, `time_unix_nano`, and aggregation temporality, at most
+  `POINTS_MAX`;
+- the latest value of each metric series, for the summary `rift-dev trace-collector`
+  prints when it stops.
 
-The receiver is a Starlette application that uvicorn serves on one asyncio event
-loop, so requests are handled one await at a time and the store needs no lock.
+Bounds: a request body, encoded and decompressed, is at most `BODY_BYTES_MAX` bytes; the
+summary keeps at most `METRICS_MAX` metric names and `SERIES_MAX` series per name; the
+point, span, and duration stores drop their oldest entry past their bound. Whatever a
+bound refused or dropped is counted in `Dropped`, so a report cannot describe an
+incomplete capture as complete.
+
+`collector()` serves the receiver on `127.0.0.1`, on a port the system picks, from a
+thread of the calling process, and stops it on exit. The stores take a lock, so the
+caller reads them while the thread writes.
 """
 
 from __future__ import annotations
 
 import json
 import signal
+import socket
 import sys
+import threading
+import time
 import zlib
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 import uvicorn
 from google.protobuf.message import DecodeError
@@ -39,15 +51,16 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
     ExportTraceServiceResponse,
 )
-from opentelemetry.proto.common.v1.common_pb2 import KeyValue
+from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 from opentelemetry.proto.metrics.v1.metrics_pb2 import (
+    AGGREGATION_TEMPORALITY_CUMULATIVE,
     AGGREGATION_TEMPORALITY_DELTA,
     HistogramDataPoint,
     Metric,
     NumberDataPoint,
 )
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
@@ -58,6 +71,35 @@ BODY_BYTES_MAX = 8 * 1024 * 1024
 METRICS_MAX = 512
 SERIES_MAX = 256
 GZIP_WINDOW = 31
+# Metric data points kept for time selection. Rift declared 47 instruments on 2026-10-05;
+# at a few series each and one export a second, a run sends on the order of 150 points a
+# second, so the bound holds the newest few minutes, longer than one failure window. An
+# estimate, not a measurement.
+POINTS_MAX = 32_768
+# Spans kept for time selection and the join with log records by request.
+SPANS_MAX = 8_192
+# Span durations kept for the per-operation summary.
+DURATIONS_MAX = 262_144
+# The interval of the server's metric reader and span batch processor, in milliseconds,
+# the unit both variables take. A steady corpus read takes 1.56 seconds at the median, so
+# a window of one read holds at least one export.
+EXPORT_INTERVAL_MS = 1_000
+LOOPBACK = "127.0.0.1"
+# What `collector()` waits for the receiver to accept connections, and for its thread to
+# end after the stop.
+COLLECTOR_START_SECONDS = 5.0
+COLLECTOR_STOP_SECONDS = 5.0
+START_POLL_SECONDS = 0.005
+# uvicorn's bound on open connections draining at stop, in whole seconds.
+GRACEFUL_STOP_SECONDS = 2
+# The attribute that names a span's MCP request; a printed log record names it `req`.
+SPAN_REQUEST_KEY = "request_id"
+# Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
+# leaves out, as received from `rift` on 2026-10-05.
+SPAN_KEYS_OMITTED = frozenset(["target", "busy_ns", "idle_ns"])
+SPAN_KEY_PREFIXES_OMITTED = ("code.", "thread.")
+
+Attributes = tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,15 +127,6 @@ class OperationTiming:
         )
 
 
-def span_durations(request: ExportTraceServiceRequest) -> Iterator[tuple[str, float]]:
-    """Every span in one export request, as its name and duration in milliseconds."""
-    for resource_spans in request.resource_spans:
-        for scope_spans in resource_spans.scope_spans:
-            for span in scope_spans.spans:
-                nanoseconds = span.end_time_unix_nano - span.start_time_unix_nano
-                yield span.name, nanoseconds / 1_000_000
-
-
 def percentile(values: list[float], fraction: float) -> float:
     """The `fraction`-th percentile of `values` by nearest-rank, ascending."""
     if not values:
@@ -115,26 +148,265 @@ def summarize(durations: Mapping[str, list[float]]) -> list[OperationTiming]:
             max_ms=max(values),
         )
         for name, values in durations.items()
+        if values
     ]
     summaries.sort(key=lambda summary: summary.total_ms, reverse=True)
     return summaries
 
 
-class SpanStore:
-    """The durations of every span received, by operation."""
+@dataclass(slots=True)
+class Dropped:
+    """What the bounds refused or dropped, by reason."""
 
-    def __init__(self) -> None:
-        self.durations: dict[str, list[float]] = {}
+    bodies: int = 0
+    metric_names: int = 0
+    series: int = 0
+    points: int = 0
+    kinds: int = 0
+    spans: int = 0
+    durations: int = 0
+
+    def counts(self) -> dict[str, int]:
+        """Each count by its reason."""
+        return {
+            "bodies": self.bodies,
+            "metric_names": self.metric_names,
+            "series": self.series,
+            "points": self.points,
+            "kinds": self.kinds,
+            "spans": self.spans,
+            "durations": self.durations,
+        }
+
+    def any(self) -> bool:
+        """Whether a bound refused or dropped anything."""
+        return any(self.counts().values())
+
+    def as_json_line(self) -> str:
+        """These counts as one compact JSON object under `dropped`."""
+        return json.dumps({"dropped": self.counts()})
+
+
+def value_text(value: AnyValue) -> str:
+    """An attribute value as text; a value of a kind the text does not read, such as an
+    array, becomes its kind's name."""
+    kind = value.WhichOneof("value")
+    if kind == "bool_value":
+        return str(value.bool_value).lower()
+    if kind in ("string_value", "int_value", "double_value"):
+        return str(getattr(value, kind))
+    return str(kind)
+
+
+def attribute_key(attributes: Iterable[KeyValue]) -> Attributes:
+    """Attributes as a sorted, hashable key, each value as `value_text`."""
+    return tuple(sorted((item.key, value_text(item.value)) for item in attributes))
+
+
+def number_value(point: NumberDataPoint) -> float:
+    """A number data point's value, whichever of `as_double` and `as_int` it set."""
+    if point.WhichOneof("value") == "as_int":
+        return float(point.as_int)
+    return float(point.as_double)
+
+
+def nanoseconds(instant: str) -> int:
+    """An ISO 8601 instant with an offset, as `utc_now` prints it, in Unix nanoseconds."""
+    moment = datetime.fromisoformat(instant)
+    return (moment - EPOCH) // timedelta(microseconds=1) * 1_000
+
+
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def stamp(unix_nano: int) -> str:
+    """Unix nanoseconds in the layout a printed log record starts with."""
+    moment = EPOCH + timedelta(microseconds=unix_nano // 1_000)
+    return moment.strftime("%Y-%m-%d %H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def number_text(value: float) -> str:
+    """A value without a trailing `.0` when it is whole."""
+    return str(int(value)) if value.is_integer() else f"{value:.6g}"
+
+
+def fields_text(attributes: Attributes) -> str:
+    """Attributes as `key=value` pairs, in key order."""
+    return " ".join(f"{key}={value}" for key, value in attributes)
+
+
+TEMPORALITY = {
+    AGGREGATION_TEMPORALITY_CUMULATIVE: "cumulative",
+    AGGREGATION_TEMPORALITY_DELTA: "delta",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MetricPoint:
+    """One metric data point as received.
+
+    `value` is a sum's or gauge's value, or a histogram's sum; `count`, `bounds`, and
+    `bucket_counts` are a histogram's and stay empty otherwise. `temporality` is
+    `cumulative` or `delta` for a sum or histogram and empty for a gauge.
+    """
+
+    name: str
+    kind: str
+    unit: str
+    temporality: str
+    attributes: Attributes
+    resource: Attributes
+    start_time_unix_nano: int
+    time_unix_nano: int
+    value: float
+    count: int | None = None
+    bounds: tuple[float, ...] = ()
+    bucket_counts: tuple[int, ...] = ()
+
+    def line(self) -> str:
+        """The point as one line in the layout of a printed log record: time, kind,
+        name, attributes, then the value.
+
+        A histogram prints its nonempty buckets as `<=bound:count`, the last one
+        `>bound:count`.
+        """
+        if self.count is None:
+            reading = f"value={number_text(self.value)}"
+        else:
+            buckets = ",".join(
+                (
+                    f"<={number_text(self.bounds[index])}:{count}"
+                    if index < len(self.bounds)
+                    else f">{number_text(self.bounds[-1]) if self.bounds else '-inf'}:{count}"
+                )
+                for index, count in enumerate(self.bucket_counts)
+                if count
+            )
+            reading = f"count={self.count} sum={number_text(self.value)}" + (
+                f" buckets={buckets}" if buckets else ""
+            )
+        extra = " ".join(
+            part
+            for part in (f"unit={self.unit}" if self.unit else "", self.temporality)
+            if part
+        )
+        context = fields_text(self.attributes)
+        return (
+            f"{stamp(self.time_unix_nano)} {self.kind:<9} {self.name}   "
+            + (f"{context}  " if context else "")
+            + reading
+            + (f" {extra}" if extra else "")
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SpanRecord:
+    """One span as received: its name, identifiers in hex, start and end, attributes."""
+
+    name: str
+    trace_id: str
+    span_id: str
+    start_time_unix_nano: int
+    end_time_unix_nano: int
+    attributes: Attributes
+
+    @property
+    def duration_ms(self) -> float:
+        """The span's duration in milliseconds."""
+        return (self.end_time_unix_nano - self.start_time_unix_nano) / 1_000_000
+
+    @property
+    def request_id(self) -> str | None:
+        """The span's `request_id` attribute; None when it carries none."""
+        return dict(self.attributes).get(SPAN_REQUEST_KEY)
+
+    def line(self, records: int | None = None) -> str:
+        """The span as one line in the layout of a printed log record, at its end.
+
+        `records`, when given, is the count of log records of the same request. The
+        attributes `tracing-opentelemetry` adds to every span, its source location,
+        thread, target, and busy and idle time, are left out.
+        """
+        context = fields_text(
+            tuple(
+                (key, value)
+                for key, value in self.attributes
+                if key not in SPAN_KEYS_OMITTED
+                and not key.startswith(SPAN_KEY_PREFIXES_OMITTED)
+            )
+        )
+        return (
+            f"{stamp(self.end_time_unix_nano)} span      {self.name}   "
+            + (f"{context}  " if context else "")
+            + f"elapsed={self.duration_ms:.3f}ms"
+            + (f" records={records}" if records is not None else "")
+        )
+
+
+def within(time_unix_nano: int, since: int | None, until: int | None) -> bool:
+    """Whether a time falls in `[since, until)`; a missing bound is open."""
+    return (since is None or time_unix_nano >= since) and (
+        until is None or time_unix_nano < until
+    )
+
+
+class SpanStore:
+    """Every span received: the newest `SPANS_MAX` whole, the newest `DURATIONS_MAX`
+    durations by operation."""
+
+    def __init__(self, spans_max: int = SPANS_MAX) -> None:
+        self.durations: dict[str, deque[float]] = {}
+        self.spans: deque[SpanRecord] = deque(maxlen=spans_max)
+        self.dropped = Dropped()
+        self.received = 0
+        self.kept_durations = 0
+        self.lock = threading.Lock()
 
     def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its spans' durations."""
+        """Decodes one export request and keeps its spans."""
         request = ExportTraceServiceRequest.FromString(body)
-        for name, duration in span_durations(request):
-            self.durations.setdefault(name, []).append(duration)
+        with self.lock:
+            for resource_spans in request.resource_spans:
+                for scope_spans in resource_spans.scope_spans:
+                    for span in scope_spans.spans:
+                        self.keep(
+                            SpanRecord(
+                                name=span.name,
+                                trace_id=span.trace_id.hex(),
+                                span_id=span.span_id.hex(),
+                                start_time_unix_nano=span.start_time_unix_nano,
+                                end_time_unix_nano=span.end_time_unix_nano,
+                                attributes=attribute_key(span.attributes),
+                            )
+                        )
+
+    def keep(self, span: SpanRecord) -> None:
+        """Keeps one span, dropping the oldest past a bound. The caller holds the lock."""
+        self.received += 1
+        if len(self.spans) == self.spans.maxlen:
+            self.dropped.spans += 1
+        self.spans.append(span)
+        if self.kept_durations >= DURATIONS_MAX:
+            self.dropped.durations += 1
+            return
+        self.kept_durations += 1
+        self.durations.setdefault(span.name, deque()).append(span.duration_ms)
 
     def summary(self) -> list[OperationTiming]:
-        """The per-operation summary of every span received so far."""
-        return summarize(self.durations)
+        """The per-operation summary of every span duration kept."""
+        with self.lock:
+            durations = {name: list(values) for name, values in self.durations.items()}
+        return summarize(durations)
+
+    def between(self, since: int | None, until: int | None) -> list[SpanRecord]:
+        """The kept spans that end in `[since, until)`, in Unix nanoseconds, oldest first."""
+        with self.lock:
+            found = [
+                span
+                for span in self.spans
+                if within(span.end_time_unix_nano, since, until)
+            ]
+        return sorted(found, key=lambda span: span.end_time_unix_nano)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,98 +446,51 @@ class MetricSeries:
 
     kind: str
     unit: str
-    values: dict[tuple[tuple[str, str], ...], tuple[float, int]] = field(
-        default_factory=dict
-    )
+    values: dict[Attributes, tuple[float, int]] = field(default_factory=dict)
     points: int = 0
 
 
-@dataclass(slots=True)
-class Dropped:
-    """What the bounds refused, by reason."""
-
-    bodies: int = 0
-    metric_names: int = 0
-    series: int = 0
-
-    def any(self) -> bool:
-        """Whether a bound refused anything."""
-        return bool(self.bodies or self.metric_names or self.series)
-
-    def as_json_line(self) -> str:
-        """These counts as one compact JSON object under `dropped`."""
-        return json.dumps(
-            {
-                "dropped": {
-                    "bodies": self.bodies,
-                    "metric_names": self.metric_names,
-                    "series": self.series,
-                }
-            }
-        )
-
-
-def attribute_key(attributes: Iterable[KeyValue]) -> tuple[tuple[str, str], ...]:
-    """A data point's attributes as a sorted, hashable key; each value as text.
-
-    A value of a kind the key does not read, such as an array, becomes its kind's name.
-    """
-    key = []
-    for item in attributes:
-        kind = item.value.WhichOneof("value")
-        text = (
-            str(getattr(item.value, kind)).lower()
-            if kind in ("string_value", "bool_value", "int_value", "double_value")
-            else str(kind)
-        )
-        key.append((item.key, text))
-    return tuple(sorted(key))
-
-
-def number_value(point: NumberDataPoint) -> float:
-    """A number data point's value, whichever of `as_double` and `as_int` it set."""
-    if point.WhichOneof("value") == "as_int":
-        return float(point.as_int)
-    return float(point.as_double)
-
-
 class MetricStore:
-    """The latest value of every metric series received, by metric name.
+    """Metric data points received: the newest `POINTS_MAX` whole, and the latest value
+    of every series by metric name.
 
-    A gauge and a cumulative sum or histogram replace a series' value with the
-    newest data point. A delta sum or histogram adds each data point to it. The Rust
-    exporter's default temporality is cumulative.
+    For the latest value, a gauge and a cumulative sum or histogram replace a series'
+    value with the newest data point; a delta sum or histogram adds each data point to
+    it. The Rust exporter's default temporality is cumulative.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, points_max: int = POINTS_MAX) -> None:
         self.metrics: dict[str, MetricSeries] = {}
+        self.points: deque[MetricPoint] = deque(maxlen=points_max)
         self.dropped = Dropped()
+        self.received = 0
+        self.lock = threading.Lock()
 
     def record(self, body: bytes) -> None:
         """Decodes one export request and keeps its data points."""
         request = ExportMetricsServiceRequest.FromString(body)
-        for resource_metrics in request.resource_metrics:
-            for scope_metrics in resource_metrics.scope_metrics:
-                for metric in scope_metrics.metrics:
-                    self.keep(metric)
+        with self.lock:
+            for resource_metrics in request.resource_metrics:
+                resource = attribute_key(resource_metrics.resource.attributes)
+                for scope_metrics in resource_metrics.scope_metrics:
+                    for metric in scope_metrics.metrics:
+                        self.keep(metric, resource)
 
-    def keep(self, metric: Metric) -> None:
-        """Keeps the data points of one metric of a supported kind."""
+    def keep(self, metric: Metric, resource: Attributes = ()) -> None:
+        """Keeps the data points of one metric of a supported kind; the caller holds the
+        lock. A summary or exponential histogram is counted under `kinds`."""
         which = metric.WhichOneof("data")
+        temporality = ""
         if which == "gauge":
-            points, cumulative = metric.gauge.data_points, True
+            points = metric.gauge.data_points
         elif which == "sum":
             points = metric.sum.data_points
-            cumulative = (
-                metric.sum.aggregation_temporality != AGGREGATION_TEMPORALITY_DELTA
-            )
+            temporality = TEMPORALITY.get(metric.sum.aggregation_temporality, "")
         elif which == "histogram":
             points = metric.histogram.data_points
-            cumulative = (
-                metric.histogram.aggregation_temporality
-                != AGGREGATION_TEMPORALITY_DELTA
-            )
+            temporality = TEMPORALITY.get(metric.histogram.aggregation_temporality, "")
         else:
+            self.dropped.kinds += 1
             return
         name = metric.name
         held = self.metrics.get(name)
@@ -282,34 +507,78 @@ class MetricStore:
                 continue
             if isinstance(point, HistogramDataPoint):
                 value, count = float(point.sum), int(point.count)
+                kept = MetricPoint(
+                    name,
+                    which,
+                    metric.unit,
+                    temporality,
+                    key,
+                    resource,
+                    point.start_time_unix_nano,
+                    point.time_unix_nano,
+                    value,
+                    count,
+                    tuple(point.explicit_bounds),
+                    tuple(point.bucket_counts),
+                )
             else:
                 value, count = number_value(point), 0
+                kept = MetricPoint(
+                    name,
+                    which,
+                    metric.unit,
+                    temporality,
+                    key,
+                    resource,
+                    point.start_time_unix_nano,
+                    point.time_unix_nano,
+                    value,
+                )
+            self.received += 1
+            if len(self.points) == self.points.maxlen:
+                self.dropped.points += 1
+            self.points.append(kept)
             held.points += 1
             previous = held.values.get(key, (0.0, 0))
             held.values[key] = (
-                (value, count)
-                if cumulative
-                else (previous[0] + value, previous[1] + count)
+                (previous[0] + value, previous[1] + count)
+                if temporality == "delta"
+                else (value, count)
             )
+
+    def between(
+        self, since: int | None, until: int | None, name: str | None = None
+    ) -> list[MetricPoint]:
+        """The kept points with `time_unix_nano` in `[since, until)`, oldest first; only
+        those of instrument `name` when given."""
+        with self.lock:
+            found = [
+                point
+                for point in self.points
+                if (name is None or point.name == name)
+                and within(point.time_unix_nano, since, until)
+            ]
+        return sorted(found, key=lambda point: point.time_unix_nano)
 
     def summary(self) -> list[MetricSummary]:
         """One [`MetricSummary`] per metric name, ordered by name."""
-        return [
-            MetricSummary(
-                metric=name,
-                kind=held.kind,
-                unit=held.unit,
-                series=len(held.values),
-                points=held.points,
-                value=sum(value for value, _ in held.values.values()),
-                count=(
-                    sum(count for _, count in held.values.values())
-                    if held.kind == "histogram"
-                    else None
-                ),
-            )
-            for name, held in sorted(self.metrics.items())
-        ]
+        with self.lock:
+            return [
+                MetricSummary(
+                    metric=name,
+                    kind=held.kind,
+                    unit=held.unit,
+                    series=len(held.values),
+                    points=held.points,
+                    value=sum(value for value, _ in held.values.values()),
+                    count=(
+                        sum(count for _, count in held.values.values())
+                        if held.kind == "histogram"
+                        else None
+                    ),
+                )
+                for name, held in sorted(self.metrics.items())
+            ]
 
 
 def inflate(body: bytes, encoding: str | None) -> bytes | None:
@@ -326,6 +595,25 @@ def inflate(body: bytes, encoding: str | None) -> bytes | None:
     if len(inflated) > BODY_BYTES_MAX or inflater.unconsumed_tail:
         return None
     return inflated
+
+
+async def bounded_body(request: Request) -> bytes | None:
+    """The encoded request body; None once it passes `BODY_BYTES_MAX`, read no further.
+
+    A declared `content-length` past the bound refuses the body before any of it is
+    read.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > BODY_BYTES_MAX:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > BODY_BYTES_MAX:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def receiver(spans: SpanStore, metrics: MetricStore | None = None) -> Starlette:
@@ -345,13 +633,19 @@ def receiver(spans: SpanStore, metrics: MetricStore | None = None) -> Starlette:
             if request.headers.get("content-type", "").split(";")[0] != PROTOBUF:
                 return PlainTextResponse(f"the collector reads {PROTOBUF}", 415)
             try:
-                body = inflate(
-                    await request.body(), request.headers.get("content-encoding")
+                encoded = await bounded_body(request)
+                body = (
+                    None
+                    if encoded is None
+                    else inflate(encoded, request.headers.get("content-encoding"))
                 )
             except zlib.error:
                 return PlainTextResponse("the body is not gzip", 400)
+            except ClientDisconnect:
+                return PlainTextResponse("the exporter disconnected", 400)
             if body is None:
-                held.dropped.bodies += 1
+                with held.lock:
+                    held.dropped.bodies += 1
                 return PlainTextResponse(
                     f"a body is at most {BODY_BYTES_MAX} bytes, encoded and decoded",
                     413,
@@ -380,6 +674,119 @@ def receiver(spans: SpanStore, metrics: MetricStore | None = None) -> Starlette:
             ),
         ]
     )
+
+
+@dataclass(slots=True)
+class Collector:
+    """The stores one collector fills and the base URL it receives at.
+
+    `endpoint` is empty for stores no receiver serves.
+    """
+
+    spans: SpanStore = field(default_factory=SpanStore)
+    metrics: MetricStore = field(default_factory=MetricStore)
+    endpoint: str = ""
+
+    def environment(self) -> dict[str, str]:
+        """The variables that point a server under test at this collector.
+
+        `OTEL_EXPORTER_OTLP_ENDPOINT` is the base URL: Rift installs export only when it
+        is set (`crates/rift-tracing/src/otlp.rs`), and the exporter appends
+        `/v1/metrics` and `/v1/traces`. `OTEL_METRIC_EXPORT_INTERVAL` is read by the
+        async periodic reader and `OTEL_BSP_SCHEDULE_DELAY` by the batch span
+        processor's default configuration, both in milliseconds
+        (`opentelemetry_sdk` 0.33.0).
+        """
+        if not self.endpoint:
+            return {}
+        return {
+            "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
+            "OTEL_METRIC_EXPORT_INTERVAL": str(EXPORT_INTERVAL_MS),
+            "OTEL_BSP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
+        }
+
+    def dropped(self) -> Dropped:
+        """What the bounds of both stores refused or dropped."""
+        with self.metrics.lock, self.spans.lock:
+            metrics, spans = self.metrics.dropped, self.spans.dropped
+            return Dropped(
+                bodies=metrics.bodies + spans.bodies,
+                metric_names=metrics.metric_names,
+                series=metrics.series,
+                points=metrics.points,
+                kinds=metrics.kinds,
+                spans=spans.spans,
+                durations=spans.durations,
+            )
+
+    def points(
+        self, name: str, since: str | None = None, until: str | None = None
+    ) -> list[MetricPoint]:
+        """The points of instrument `name` with `time_unix_nano` from `since` until
+        `until`, ISO 8601 instants as `utc_now` prints them; oldest first."""
+        return self.metrics.between(
+            None if since is None else nanoseconds(since),
+            None if until is None else nanoseconds(until),
+            name,
+        )
+
+
+@contextmanager
+def collector(
+    points_max: int = POINTS_MAX, spans_max: int = SPANS_MAX
+) -> Iterator[Collector]:
+    """Serves a receiver on `127.0.0.1` from a thread until the block exits.
+
+    The socket is bound before the thread starts, on a port the system picks, and the
+    block starts once uvicorn accepts connections, within `COLLECTOR_START_SECONDS`.
+    The exit asks uvicorn to stop and joins the thread within
+    `COLLECTOR_STOP_SECONDS`; a thread still running then raises `RuntimeError`.
+    """
+    stores = Collector(SpanStore(spans_max), MetricStore(points_max))
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind((LOOPBACK, 0))
+        port = listener.getsockname()[1]
+        server = uvicorn.Server(
+            uvicorn.Config(
+                receiver(stores.spans, stores.metrics),
+                lifespan="off",
+                log_config=None,
+                log_level="warning",
+                access_log=False,
+                timeout_graceful_shutdown=GRACEFUL_STOP_SECONDS,
+            )
+        )
+        failures: list[BaseException] = []
+
+        def serve() -> None:
+            try:
+                server.run(sockets=[listener])
+            except BaseException as failure:  # noqa: BLE001 - the start wait reports it.
+                failures.append(failure)
+
+        thread = threading.Thread(target=serve, name="rift-otlp-collector", daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + COLLECTOR_START_SECONDS
+            while not server.started:
+                if not thread.is_alive() or time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "the OTLP collector did not start within "
+                        f"{COLLECTOR_START_SECONDS}s: {failures or 'no error'}"
+                    )
+                time.sleep(START_POLL_SECONDS)
+            stores.endpoint = f"http://{LOOPBACK}:{port}"
+            yield stores
+        finally:
+            server.should_exit = True
+            thread.join(COLLECTOR_STOP_SECONDS)
+        if thread.is_alive():
+            raise RuntimeError(
+                f"the OTLP collector thread outlived its {COLLECTOR_STOP_SECONDS}s stop"
+            )
+    finally:
+        listener.close()
 
 
 def interrupt(*_: object) -> None:
@@ -420,5 +827,6 @@ def collect(host: str, port: int) -> None:
         print(timing.as_json_line())
     for metric in metrics.summary():
         print(metric.as_json_line())
-    if metrics.dropped.any():
-        print(metrics.dropped.as_json_line())
+    dropped = Collector(store, metrics).dropped()
+    if dropped.any():
+        print(dropped.as_json_line())
