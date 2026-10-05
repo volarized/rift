@@ -1677,6 +1677,46 @@ mod tests {
         Ok(())
     }
 
+    /// An unpublished server whose stop fails is recorded as a `warn`, and the caller
+    /// still receives the publish failure. A repository idle watch that never ends holds
+    /// the stop past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unpublished_server_whose_stop_fails_records_it_and_returns_the_publish_failure()
+    -> TestResult {
+        let serving_stop = CancellationToken::new();
+        let server = crate::http::HttpServer {
+            port: SERVER_PORT_MIN,
+            token: "a".repeat(SERVER_TOKEN_LENGTH),
+            identity: valid_document().identity,
+            server_configuration: rift_protocol::configuration::ServerConfiguration::default(),
+            stop: serving_stop.clone(),
+            serving: tokio::spawn(std::future::ready(Ok::<(), std::io::Error>(()))),
+            idle_watch: tokio::spawn(std::future::ready(())),
+            repository_idle_watch: Some(tokio::spawn(std::future::pending::<()>())),
+            supervisor: None,
+            engines: None,
+            search_index: None,
+            logs: None,
+            repository_workspaces: None,
+        };
+        let failure = errors::mcp::election_already_serving().error();
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let returned = shut_down_unpublished(server, &serving_stop, failure).await;
+        drop(recorder);
+
+        assert_eq!(returned.slug(), errors::mcp::election_already_serving::SLUG);
+        let records = drain.queued_records();
+        let failed = records
+            .iter()
+            .find(|record| record.message() == "unpublished server reported a shutdown failure")
+            .ok_or("the failed stop is recorded")?;
+        assert_eq!(failed.level(), "warn");
+        let fields = failed.fields();
+        assert!(fields.contains("workspace idle watch task"), "{fields}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn supplied_storage_requires_its_own_election_before_serving() -> TestResult {
         let requested = tempfile::tempdir()?;
