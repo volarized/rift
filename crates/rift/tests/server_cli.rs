@@ -202,7 +202,23 @@ impl Drop for StopOnDrop {
 /// A foreground server's standard error, drained while the server starts.
 struct StderrWatch {
     bytes: Arc<Mutex<Vec<u8>>>,
+    marks: Arc<Mutex<StderrMarks>>,
     reader: std::thread::JoinHandle<()>,
+}
+
+/// The message the server's stop opens with, the instant its stage deadline starts.
+const STOPPING_MESSAGE: &[u8] = b"MCP server stopping";
+
+/// When the reader saw the server reach points of its stop, on the test's monotonic clock.
+#[derive(Clone, Copy, Debug, Default)]
+struct StderrMarks {
+    /// The first read that carried [`STOPPING_MESSAGE`].
+    stopping: Option<std::time::Instant>,
+    /// The last read that carried bytes.
+    last_write: Option<std::time::Instant>,
+    /// The read that found the stream closed: the server and every process holding its
+    /// stderr had exited.
+    closed: Option<std::time::Instant>,
 }
 
 impl StderrWatch {
@@ -211,21 +227,58 @@ impl StderrWatch {
     fn spawn(mut stream: ChildStderr) -> Self {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&bytes);
+        let marks = Arc::new(Mutex::new(StderrMarks::default()));
+        let marked = Arc::clone(&marks);
         let reader = std::thread::spawn(move || {
             let mut buffer = [0_u8; 8 << 10];
+            // The bytes before this read that the stopping message could start in.
+            let mut carried: Vec<u8> = Vec::new();
             loop {
                 let count = match stream.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => count,
                 };
+                let now = std::time::Instant::now();
+                carried.extend_from_slice(&buffer[..count]);
+                {
+                    let mut marks = marked
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    marks.last_write = Some(now);
+                    if marks.stopping.is_none()
+                        && carried
+                            .windows(STOPPING_MESSAGE.len())
+                            .any(|window| window == STOPPING_MESSAGE)
+                    {
+                        marks.stopping = Some(now);
+                    }
+                }
+                let keep = carried.len().min(STOPPING_MESSAGE.len());
+                carried.drain(..carried.len() - keep);
                 let mut retained = captured
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let room = STARTUP_STDERR_BYTES_MAX.saturating_sub(retained.len());
                 retained.extend_from_slice(&buffer[..count.min(room)]);
             }
+            marked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed = Some(std::time::Instant::now());
         });
-        Self { bytes, reader }
+        Self {
+            bytes,
+            marks,
+            reader,
+        }
+    }
+
+    /// When the reader saw the server reach each point of its stop so far.
+    fn marks(&self) -> StderrMarks {
+        *self
+            .marks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Standard error retained so far, for a start refusal before the child ends.
@@ -251,7 +304,7 @@ impl StderrWatch {
 
     /// Waits for the reader once the foreground child ended.
     fn finished(self) -> TestResult<String> {
-        let Self { bytes, reader } = self;
+        let Self { bytes, reader, .. } = self;
         reader
             .join()
             .map_err(|_panic| "the foreground server stderr reader panicked")?;
@@ -609,40 +662,105 @@ fn stop_foreground_server(root: &Path, child: &mut Child, stderr: &StderrWatch) 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let mut exits = StopExits::default();
     loop {
         let stop_status = stop.try_wait()?;
         let server_status = child.try_wait()?;
+        exits.observe(stop_status.is_some(), server_status.is_some());
         if let (Some(stop_status), Some(server_status)) = (stop_status, server_status) {
             let stop_output = stop.wait_with_output()?;
             require_success(&stop_output, "stop the foreground server")?;
+            let elapsed = exits.render(started, &stderr.marks());
             assert!(
                 stop_status.success(),
-                "stop command must exit cleanly: {stop_status:?}"
+                "stop command must exit cleanly: {stop_status:?}; {elapsed}"
             );
             assert!(
                 server_status.success(),
-                "foreground server must exit cleanly: {server_status:?}; stderr: {}",
+                "foreground server must exit cleanly: {server_status:?} (the server's own exit \
+                 status); {elapsed}; stderr: {}",
                 stderr.after_exit()
             );
             assert!(
                 started.elapsed() <= DATABASE_REOPEN_STOP_BOUND,
-                "stop and observed process exit must fit {DATABASE_REOPEN_STOP_BOUND:?}"
+                "stop and observed process exit must fit {DATABASE_REOPEN_STOP_BOUND:?}; \
+                 {elapsed}"
             );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
+            let still_running = match (stop_status.is_some(), server_status) {
+                (false, None) => "the stop command and the server",
+                (false, Some(_)) => "the stop command",
+                (true, None) => "the server",
+                (true, Some(_)) => "neither",
+            };
             let _ = stop.kill();
             let _ = stop.wait();
-            let _ = child.kill();
-            let server_status = child.wait()?;
+            // A status the server reported before the kill is its own; one after it is
+            // the kill's, which Windows reports as exit status 1.
+            let server_status = if let Some(status) = server_status {
+                format!("{status:?} (the server's own exit status)")
+            } else {
+                let _ = child.kill();
+                format!("{:?} (the harness killed the server)", child.wait()?)
+            };
             return Err(format!(
-                "stop and process exit exceeded {DATABASE_REOPEN_STOP_BOUND:?}; server status: \
-                 {server_status:?}; stderr: {}",
+                "stop and process exit exceeded {DATABASE_REOPEN_STOP_BOUND:?}; still running \
+                 at the bound: {still_running}; server status: {server_status}; {}; stderr: {}",
+                exits.render(started, &stderr.marks()),
                 stderr.after_exit()
             )
             .into());
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// When the stop helper first observed each process exited, on the test's monotonic clock.
+#[derive(Debug, Default)]
+struct StopExits {
+    stop: Option<std::time::Instant>,
+    server: Option<std::time::Instant>,
+}
+
+impl StopExits {
+    /// Records the first poll that found the stop command or the server exited.
+    fn observe(&mut self, stop_exited: bool, server_exited: bool) {
+        let now = std::time::Instant::now();
+        if stop_exited {
+            self.stop.get_or_insert(now);
+        }
+        if server_exited {
+            self.server.get_or_insert(now);
+        }
+    }
+
+    /// The milliseconds from the stop request at `started` to each point of the stop:
+    /// `elapsed since the stop request: MCP server stopping 412 ms, last stderr write
+    /// 4420 ms, stderr closed 4431 ms, server exit observed 4501 ms, stop command exit
+    /// observed 4602 ms`; a point not reached reads `not reached`.
+    fn render(&self, started: std::time::Instant, marks: &StderrMarks) -> String {
+        let since = |instant: Option<std::time::Instant>| {
+            instant.map_or_else(
+                || "not reached".to_owned(),
+                |instant| {
+                    format!(
+                        "{} ms",
+                        instant.saturating_duration_since(started).as_millis()
+                    )
+                },
+            )
+        };
+        format!(
+            "elapsed since the stop request: MCP server stopping {}, last stderr write {}, \
+             stderr closed {}, server exit observed {}, stop command exit observed {}",
+            since(marks.stopping),
+            since(marks.last_write),
+            since(marks.closed),
+            since(self.server),
+            since(self.stop),
+        )
     }
 }
 

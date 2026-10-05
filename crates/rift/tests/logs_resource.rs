@@ -334,14 +334,24 @@ fn an_inherited_warn_filter_leaves_the_lifecycle_records_in_the_store() -> TestR
     let root = directory.path();
     let _stop = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
+    // How long each command ran, so a store missing its stop records shows whether the
+    // stop ran to its deadline.
+    let mut commands = Vec::new();
     for arguments in [["server", "start"], ["server", "stop"]] {
         let mut command = std::process::Command::new(harness::rift_binary());
+        let started = std::time::Instant::now();
         let output = harness::with_child_log_variables(&mut command)
             .env("RUST_LOG", "warn")
             .args(arguments)
             .current_dir(root)
             .stdin(std::process::Stdio::null())
             .output()?;
+        commands.push(format!(
+            "rift {} exited {:?} after {} ms",
+            arguments.join(" "),
+            output.status,
+            started.elapsed().as_millis()
+        ));
         require_success(&output, &format!("rift {}", arguments.join(" ")))?;
     }
 
@@ -357,7 +367,8 @@ fn an_inherited_warn_filter_leaves_the_lifecycle_records_in_the_store() -> TestR
     for lifecycle in LIFECYCLE_RECORDS {
         assert!(
             lines.iter().any(|line| line.contains(lifecycle)),
-            "the store keeps {lifecycle:?}: {lines:?}"
+            "the store keeps {lifecycle:?}: {lines:?}; {}",
+            commands.join("; ")
         );
     }
     let stderr = std::fs::read_to_string(rift_mcp::stderr_file_path(root))?;
