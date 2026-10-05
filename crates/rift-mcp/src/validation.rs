@@ -5026,7 +5026,6 @@ pub(crate) mod tests {
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, VectorReadiness};
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, LANE_WAIT_MAX, StoreDouble};
     use super::{
@@ -6774,9 +6773,7 @@ pub(crate) mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
         validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
         let request = validation.take_pending();
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let outcome = super::capture_rebuild_with(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -6785,9 +6782,9 @@ pub(crate) mod tests {
             request,
             super::workspace_capture(),
         )?;
-        drop(guard);
+        drop(recorder);
         assert!(matches!(outcome, super::CapturedRebuild::Candidate { .. }));
-        let records = queued_records(&mut drain);
+        let records = drain.queued_records();
         for stage in [
             "index.semantics",
             "documentation.declarations",
@@ -7535,9 +7532,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn supervisor_records_a_superseded_rebuild_with_both_epochs() -> TestResult {
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
         let (validation, invalidations) =
@@ -7593,7 +7588,7 @@ pub(crate) mod tests {
         assert_eq!(declarations_named(&current, "first")?, 1);
         assert_eq!(declarations_named(&current, "other")?, 1);
         assert_eq!(captures.load(Ordering::SeqCst), 2);
-        let records = queued_records(&mut drain);
+        let records = drain.queued_records();
         let superseded: Vec<_> = records
             .iter()
             .filter(|record| record.message() == "index rebuild superseded")
@@ -7672,11 +7667,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn supervisor_records_rebuild_failure_and_notifies_waiters() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
@@ -7739,9 +7730,7 @@ pub(crate) mod tests {
         let (context, _invalidations) = initial_preparation_context(root)?;
         let partial = Arc::clone(&context.published.blocking_read().current);
         let complete = stable_candidate(root, 0)?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let publish = |candidate| {
             super::publish_preparation_after(
                 root,
@@ -7753,12 +7742,12 @@ pub(crate) mod tests {
         };
 
         assert_eq!(publish(&partial), RebuildOutcome::Published);
-        assert!(queued_records(&mut drain).is_empty());
+        assert!(drain.queued_records().is_empty());
         let epoch = context
             .validation
             .observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
         assert_eq!(publish(&complete), RebuildOutcome::Published);
-        let records = queued_records(&mut drain);
+        let records = drain.queued_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].component(), "index");
         assert_eq!(records[0].operation(), "index.publish");
@@ -7771,7 +7760,7 @@ pub(crate) mod tests {
         assert_eq!(published.current.epoch, epoch);
         drop(published);
         assert_eq!(publish(&complete), RebuildOutcome::Superseded);
-        assert!(queued_records(&mut drain).is_empty());
+        assert!(drain.queued_records().is_empty());
         Ok(())
     }
 
@@ -7783,9 +7772,7 @@ pub(crate) mod tests {
         let (context, _invalidations) = initial_preparation_context(root)?;
         let complete = stable_candidate(root, 0)?;
         context.validation.observe_whole_workspace()?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         assert_eq!(
             super::publish_preparation_after(
@@ -7805,7 +7792,7 @@ pub(crate) mod tests {
                 .preparation
                 .is_some()
         );
-        assert!(queued_records(&mut drain).is_empty());
+        assert!(drain.queued_records().is_empty());
         Ok(())
     }
 
@@ -7827,15 +7814,17 @@ pub(crate) mod tests {
                 cancellation.cancel();
             }
             let batch = complete_initial_batch(&context, initial);
-            let (sink, mut drain) = rift_tracing::log_capture();
-            let subscriber = tracing_subscriber::registry().with(sink);
-            let outcome = tokio::task::spawn_blocking(move || {
-                tracing::subscriber::with_default(subscriber, || {
-                    super::prepare_initial_batch(&cancellation, batch)
-                })
+            // The blocking thread does not inherit this thread's default subscriber:
+            // the closure installs its own recorder and hands its drain back.
+            let (outcome, mut drain) = tokio::task::spawn_blocking(move || {
+                let (recorder, drain) = rift_tracing::ScopedRecorder::builder().install()?;
+                let outcome = super::prepare_initial_batch(&cancellation, batch);
+                drop(recorder);
+                Ok::<_, rift_tracing::LogFilterError>((outcome, drain))
             })
-            .await?;
-            let publications = queued_records(&mut drain)
+            .await??;
+            let publications = drain
+                .queued_records()
                 .into_iter()
                 .filter(|record| record.operation() == "index.publish")
                 .collect::<Vec<_>>();
@@ -7992,11 +7981,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_commit_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // The enforced minimum `max_chunk` against a several-kilobyte guide forces the file
@@ -8347,9 +8332,7 @@ pub(crate) mod tests {
     async fn a_refused_trigram_batch_is_recorded_and_the_next_write_owes_another() -> TestResult {
         let directory = tempfile::tempdir()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let double = StoreDouble::new();
         double.refuse_trigrams();
         let cancellation = CancellationToken::new();
@@ -8375,7 +8358,8 @@ pub(crate) mod tests {
             "the write ran between the batches"
         );
         assert_eq!(double.trigram_batches(), 0, "the store took no batch");
-        let refused = queued_records(&mut drain)
+        let refused = drain
+            .queued_records()
             .into_iter()
             .find(|record| {
                 record
@@ -8594,9 +8578,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         committed_through(
             &lane,
@@ -8624,7 +8606,7 @@ pub(crate) mod tests {
             ["rift://symbol/rust/blob.rs/BLOB"],
             "the oversized file row is absent and its declaration's row stays"
         );
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         let left_out = recorded
             .iter()
             .find(|record| record.message().contains("lexical unit left out"))
@@ -8639,15 +8621,6 @@ pub(crate) mod tests {
         );
         cancellation.cancel();
         Ok(())
-    }
-
-    /// Drains what the queue currently holds, without a store.
-    fn queued_records(drain: &mut rift_tracing::LogDrain) -> Vec<rift_tracing::LogRecord> {
-        let mut records = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            records.push(record);
-        }
-        records
     }
 
     #[tokio::test]
@@ -9112,9 +9085,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         double.release_one();
         lane.request(
@@ -9141,7 +9112,7 @@ pub(crate) mod tests {
             lane.owes_whole(),
             "a failed change leaves a whole comparison owed"
         );
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         let failure = recorded
             .iter()
             .find(|record| record.message().contains("the lexical commit failed"))
@@ -9196,9 +9167,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         let write = change_naming_lib()?;
         let deadline = commit_deadline(1);
@@ -9210,7 +9179,7 @@ pub(crate) mod tests {
         double.calls_within_bound(1).await?;
 
         tokio::time::sleep(deadline + Duration::from_millis(1)).await;
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         let delay = recorded
             .iter()
             .find(|record| record.message().contains("ran past its deadline"))
@@ -9657,9 +9626,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         // The first write runs and holds the lane at the store's gate.
         lane.request(change_naming_lib()?, Arc::clone(&publications[0]));
@@ -9674,7 +9641,7 @@ pub(crate) mod tests {
                 LexicalCommitState::Committing
             );
         }
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         assert!(
             recorded
                 .iter()
@@ -10251,14 +10218,12 @@ pub(crate) mod tests {
             !before.is_empty(),
             "the lexical lane must publish the declaration"
         );
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         super::populate_search(&index, &published, rift_search::Embedding::Every).await;
         assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
         assert_eq!(index.tree_revision().await?.as_deref(), Some(revision));
         assert_eq!(ranked_at(&index, revision, "beacon", 8).await?, before);
-        let records = queued_records(&mut drain);
+        let records = drain.queued_records();
         let warning = records
             .iter()
             .find(|record| {
@@ -10907,8 +10872,6 @@ pub(crate) mod tests {
     /// A settled revision logs nothing.
     #[test]
     fn an_unranked_search_records_the_commit_it_waits_on() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         let publications = declaring_publications(directory.path(), 2)?;
         let first = publications[0].reads.tree_revision().to_owned();
@@ -10929,19 +10892,17 @@ pub(crate) mod tests {
         backlog.owe_whole("the store refused".to_owned());
         backlog.end_running();
         let owed = backlog.report_of(&first);
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        tracing::subscriber::with_default(subscriber, || {
-            for report in [
-                &held,
-                &running,
-                &owed,
-                &super::LexicalCommitReport::settled(),
-            ] {
-                report.record_unranked(&first);
-            }
-        });
-        let records = queued_records(&mut drain);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        for report in [
+            &held,
+            &running,
+            &owed,
+            &super::LexicalCommitReport::settled(),
+        ] {
+            report.record_unranked(&first);
+        }
+        drop(recorder);
+        let records = drain.queued_records();
         assert_eq!(
             records.len(),
             3,
