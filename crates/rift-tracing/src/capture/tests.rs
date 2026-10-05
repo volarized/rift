@@ -3,10 +3,10 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use super::{
-    LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields, SPAN_FIELDS_BYTES_MAX,
-    install_panic_hook, log_capture, panic_payload, quoted,
+    EVENT_SPAN_MEMBERS_BYTES_MAX, LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields,
+    SPAN_FIELDS_BYTES_MAX, install_panic_hook, log_capture, panic_payload, quoted,
 };
-use crate::{LogDrain, LogRecord};
+use crate::{LOG_LABEL_BYTES_MAX, LogDrain, LogRecord};
 
 /// Drains what the queue currently holds, without a store.
 fn queued(drain: &mut LogDrain) -> Vec<LogRecord> {
@@ -175,10 +175,10 @@ fn a_span_without_fields_records_how_long_it_ran_alone() {
     );
 }
 
-/// A span whose fields run past [`SPAN_FIELDS_BYTES_MAX`] records the cut form and
-/// nothing longer, with the cut on a character boundary.
+/// A span whose fields run past [`SPAN_FIELDS_BYTES_MAX`] keeps the members that fit whole
+/// and counts the ones left out, so its close record stays a JSON object.
 #[test]
-fn a_span_past_the_field_bound_records_the_cut_fields() {
+fn a_span_past_the_field_bound_records_the_members_that_fit() {
     let (sink, mut drain) = log_capture();
     let subscriber = tracing_subscriber::registry().with(sink);
     let long = "é".repeat(SPAN_FIELDS_BYTES_MAX);
@@ -188,23 +188,276 @@ fn a_span_past_the_field_bound_records_the_cut_fields() {
             "index.build",
             component = "index",
             operation = "index.rebuild",
-            detail = long.as_str()
+            epoch = 7,
+            detail = long.as_str(),
+            trigger = "filesystem"
         );
         span.in_scope(|| {});
     });
 
     let closed = closed(queued(&mut drain));
     let fields = closed.fields();
-    let closing = fields
-        .find(",\"span\":\"closed\"")
-        .unwrap_or_else(|| panic!("the close members follow the span's own: {fields}"));
-    assert_eq!(closing, 1 + SPAN_FIELDS_BYTES_MAX);
-    assert!(fields.starts_with("{\"detail\":\"é"), "{fields}");
     assert!(
-        fields[11..closing]
-            .chars()
-            .all(|character| character == 'é'),
+        fields.starts_with(
+            "{\"epoch\":\"7\",\"trigger\":\"filesystem\",\"fields_left_out\":\"1\",\
+             \"span\":\"closed\","
+        ),
         "{fields}"
+    );
+    let object: serde_json::Value =
+        serde_json::from_str(fields).expect("the close record's fields are a JSON object");
+    assert!(object.get("detail").is_none(), "{fields}");
+}
+
+/// The records a case wrote inside `subscriber`, as JSON objects of their fields keyed by
+/// message, the span close records left out.
+fn event_fields(records: Vec<LogRecord>) -> Vec<(String, serde_json::Value)> {
+    events(records)
+        .into_iter()
+        .map(|record| {
+            let fields = serde_json::from_str(record.fields())
+                .unwrap_or_else(|error| panic!("{error}: {}", record.fields()));
+            (record.message().to_owned(), fields)
+        })
+        .collect()
+}
+
+/// An event inside one span carries the span's name and fields under `root_span`, after its
+/// own fields, and no `nearest_span`: the root span is the nearest one.
+#[test]
+fn an_event_inside_a_span_carries_the_span_fields() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(
+            "mcp.request",
+            component = "mcp",
+            operation = "tools/call",
+            request_id = 7,
+            tool = "search"
+        );
+        span.in_scope(|| tracing::info!(is_error = false, "tool request completed"));
+    });
+
+    let records = events(queued(&mut drain));
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].fields(),
+        "{\"is_error\":\"false\",\"root_span\":{\"name\":\"mcp.request\",\"fields\":\
+         {\"component\":\"mcp\",\"operation\":\"tools/call\",\"request_id\":\"7\",\"tool\":\"search\"}}}"
+    );
+    assert_eq!(records[0].component(), "mcp");
+    assert_eq!(records[0].operation(), "tools/call");
+}
+
+/// Inside nested spans an event carries the outermost span as `root_span` and the span it
+/// was emitted in as `nearest_span`; a span between the two is in neither.
+#[test]
+fn an_event_inside_nested_spans_carries_the_root_and_the_nearest_span() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let root = tracing::info_span!("mcp.request", component = "mcp", request_id = 7);
+        let _root = root.enter();
+        let middle = tracing::info_span!("index.reconcile", attempts = 2);
+        let _middle = middle.enter();
+        tracing::info!("between");
+        let nearest = tracing::debug_span!("worker.queue", component = "worker", work = "search");
+        nearest.in_scope(|| tracing::info!("inside"));
+    });
+
+    let records = event_fields(queued(&mut drain));
+    let between = &records[0].1;
+    assert_eq!(records[0].0, "between");
+    assert_eq!(between["root_span"]["name"], "mcp.request");
+    assert_eq!(between["nearest_span"]["name"], "index.reconcile");
+    assert_eq!(
+        between["nearest_span"]["fields"],
+        serde_json::json!({"attempts": "2"})
+    );
+    let inside = &records[1].1;
+    assert_eq!(records[1].0, "inside");
+    assert_eq!(
+        inside,
+        &serde_json::json!({
+            "root_span": {
+                "name": "mcp.request",
+                "fields": {"component": "mcp", "request_id": "7"},
+            },
+            "nearest_span": {
+                "name": "worker.queue",
+                "fields": {"component": "worker", "work": "search"},
+            },
+        })
+    );
+}
+
+/// A field the span records after it opened is on the events that follow the record and
+/// not on the ones before it.
+#[test]
+fn a_field_recorded_after_open_reaches_later_events() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = crate::info_span!(
+            "mcp.forward",
+            component = "mcp",
+            upstream_request_id = crate::empty!(),
+        );
+        span.in_scope(|| tracing::info!("before"));
+        span.record("upstream_request_id", 12);
+        span.in_scope(|| tracing::info!("after"));
+    });
+
+    let records = event_fields(queued(&mut drain));
+    assert_eq!(records[0].0, "before");
+    assert_eq!(
+        records[0].1["root_span"]["fields"],
+        serde_json::json!({"component": "mcp"})
+    );
+    assert_eq!(records[1].0, "after");
+    assert_eq!(
+        records[1].1["root_span"]["fields"],
+        serde_json::json!({"component": "mcp", "upstream_request_id": "12"})
+    );
+}
+
+/// A span past [`SPAN_FIELDS_BYTES_MAX`] reaches its events with the members that fit and
+/// the count left out, and the event's fields stay a JSON object within
+/// [`EVENT_SPAN_MEMBERS_BYTES_MAX`] of span members.
+#[test]
+fn an_event_inside_a_span_past_the_field_bound_carries_the_members_that_fit() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+    let long = "é".repeat(SPAN_FIELDS_BYTES_MAX);
+    let wide = "é".repeat(400);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let root = tracing::info_span!(
+            "mcp.request",
+            component = long.as_str(),
+            operation = "tools/call",
+            detail = long.as_str(),
+            request_id = 7
+        );
+        let _root = root.enter();
+        let nearest =
+            tracing::info_span!("index.build", first = wide.as_str(), second = wide.as_str());
+        nearest.in_scope(|| tracing::info!(own = 1, "inside"));
+    });
+
+    let records = events(queued(&mut drain));
+    let fields = records[0].fields();
+    assert!(
+        fields.len() <= EVENT_SPAN_MEMBERS_BYTES_MAX + "{\"own\":\"1\",}".len(),
+        "{}",
+        fields.len()
+    );
+    let object: serde_json::Value = serde_json::from_str(fields).expect("a JSON object");
+    let root = &object["root_span"]["fields"];
+    assert_eq!(root["request_id"], "7", "{fields}");
+    assert!(root.get("detail").is_none(), "{fields}");
+    assert!(
+        root["component"]
+            .as_str()
+            .is_some_and(|component| component.len() == LOG_LABEL_BYTES_MAX),
+        "the label is cut where its record column is: {fields}"
+    );
+    assert_eq!(root["fields_left_out"], "1", "{fields}");
+    let nearest = &object["nearest_span"]["fields"];
+    assert!(nearest.get("first").is_some(), "{fields}");
+    assert!(nearest.get("second").is_none(), "{fields}");
+    assert_eq!(nearest["fields_left_out"], "1", "{fields}");
+    assert_eq!(object["own"], "1");
+}
+
+/// The span members of an event are written by the layer alone: a field the code names
+/// `root_span`, `nearest_span`, or `fields_left_out` is not recorded, inside a span or
+/// outside one.
+#[test]
+fn a_field_under_a_reserved_name_is_not_recorded() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(root_span = "forged", epoch = 1, "outside");
+        let span = tracing::info_span!("mcp.request", request_id = 7, fields_left_out = 9);
+        span.in_scope(|| tracing::info!(root_span = "forged", nearest_span = "forged", "inside"));
+    });
+
+    let records = events(queued(&mut drain));
+    assert_eq!(records[0].fields(), "{\"epoch\":\"1\"}");
+    assert_eq!(
+        records[1].fields(),
+        "{\"root_span\":{\"name\":\"mcp.request\",\"fields\":{\"request_id\":\"7\"}}}"
+    );
+}
+
+/// An event outside every span carries its own fields alone.
+#[test]
+fn an_event_outside_every_span_carries_its_own_fields_alone() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("mcp.request", request_id = 7);
+        drop(span.enter());
+        tracing::info!(epoch = 7, "outside");
+        tracing::info!("bare");
+    });
+
+    let records = events(queued(&mut drain));
+    assert_eq!(records[0].fields(), "{\"epoch\":\"7\"}");
+    assert_eq!(records[1].fields(), "{}");
+}
+
+/// A task spawned from inside an instrumented future runs outside its span, so its events
+/// carry no span member; a task under `.instrument(span)` carries that span alone, here a
+/// span opened with no parent. The current-thread runtime polls a spawned task only once
+/// the instrumented future has returned `Pending` and left its span.
+#[test]
+fn a_spawned_task_carries_only_the_span_it_was_instrumented_with() {
+    use tracing::Instrument as _;
+
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a current-thread runtime builds");
+
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(
+            async {
+                tracing::info!("request");
+                tokio::spawn(async { tracing::info!("detached") })
+                    .await
+                    .expect("the detached task completes");
+                let lane =
+                    tracing::info_span!(parent: None, "validation.lane", component = "validation");
+                tokio::spawn(async { tracing::info!("instrumented") }.instrument(lane))
+                    .await
+                    .expect("the instrumented task completes");
+            }
+            .instrument(tracing::info_span!("mcp.request", request_id = 7)),
+        );
+    });
+
+    let records = event_fields(queued(&mut drain));
+    let messages: Vec<&str> = records
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(messages, ["request", "detached", "instrumented"]);
+    assert_eq!(records[0].1["root_span"]["fields"]["request_id"], "7");
+    assert_eq!(records[1].1, serde_json::json!({}));
+    assert_eq!(records[2].1["root_span"]["name"], "validation.lane");
+    assert!(
+        records[2].1["root_span"]["fields"]
+            .get("request_id")
+            .is_none()
     );
 }
 

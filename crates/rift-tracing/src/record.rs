@@ -96,6 +96,13 @@ impl LogRecord {
     }
 
     /// The record's remaining fields, rendered as a JSON object.
+    ///
+    /// An event emitted inside a span carries, after its own fields, the member `root_span`
+    /// for the outermost span around it and `nearest_span` for the span it was emitted in,
+    /// when that span is not the outermost. Each is an object holding the span's `name` and
+    /// its `fields`: `component`, `operation`, then the span's other fields as it recorded
+    /// them, cut at 1 KiB with the count of the members left out as `fields_left_out`. A
+    /// span close record carries the span's own fields, `span`, and `elapsed_ms`.
     #[must_use]
     pub fn fields(&self) -> &str {
         &self.fields
