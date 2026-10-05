@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -102,6 +104,9 @@ def window(tmp_path: Path) -> None:
     (directory / "run-1_suite_failing_case.4242.stderr").write_text(
         "stop stage ended stage=log drain outcome=ok\n", encoding="utf-8"
     )
+    # The harness writes the window while the run goes on, after the runner started.
+    later = time.time() + 60
+    os.utime(directory / "run-1_suite_failing_case.window", (later, later))
 
 
 def report(tmp_path: Path) -> str:
@@ -218,3 +223,12 @@ def test_a_stress_attempt_names_its_iteration() -> None:
     case = "run:rift::server_cli@stress-46$stop_x"
     assert nextest_run.names_case(case, "rift::server_cli", "stop_x", 46)
     assert not nextest_run.names_case(case, "rift::server_cli", "stop_x", 45)
+
+
+def test_a_window_of_an_earlier_run_is_left_out(tmp_path: Path) -> None:
+    window(tmp_path)
+    directory = tmp_path / "target/nextest/ci/failure-windows"
+    outcome = nextest_run.Outcome(binary="suite", test="failing_case")
+    path = directory / "run-1_suite_failing_case.window"
+    assert nextest_run.windows_of(directory, outcome, path.stat().st_mtime - 1)
+    assert not nextest_run.windows_of(directory, outcome, path.stat().st_mtime + 1)

@@ -31,6 +31,7 @@ import os
 import platform
 import re
 import sys
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -286,13 +287,17 @@ class Window:
         return (self.keys.get(key) or [""])[0]
 
 
-def windows_of(directory: Path, outcome: Outcome) -> list[Window]:
-    """The window files whose `attempt=` line names an attempt of `outcome`'s test."""
+def windows_of(directory: Path, outcome: Outcome, since: float = 0.0) -> list[Window]:
+    """The window files written since `since`, in seconds of the epoch, whose `attempt=`
+    line names an attempt of `outcome`'s test. A failed window stays in the directory
+    after its run, so a file older than this run belongs to an earlier one."""
     if not directory.is_dir():
         return []
     found = []
     for path in sorted(directory.glob("*.window")):
         try:
+            if path.stat().st_mtime < since:
+                continue
             window = Window.read(path)
         except OSError:
             continue
@@ -454,6 +459,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     shown = " ".join([command.program, *command.arguments])
     arguments_seen = list(arguments if arguments is not None else command.arguments)
     profile = profile_of(arguments_seen)
+    started = time.time()
     cases = CaseStore()
     outcomes: dict[str, Outcome] = {}
     with collector(cases=cases) as served:
@@ -499,7 +505,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                 command=shown,
                 profile=profile,
                 config_file=config_file_of(arguments_seen),
-                windows=windows_of(directory, outcome),
+                windows=windows_of(directory, outcome, started),
                 served=served,
             )
             path = REPORT_DIRECTORY / report_name(outcome)
