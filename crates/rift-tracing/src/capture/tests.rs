@@ -262,8 +262,15 @@ fn a_panic_under_the_hook_is_recorded_with_its_payload_and_location() {
         "{}",
         recorded.fields()
     );
+    // The fields are JSON text, which escapes each `\` of a Windows path; the decoded
+    // location carries the compiler's spelling of this file, the one `file!()` names.
+    let fields: serde_json::Value =
+        serde_json::from_str(recorded.fields()).expect("the fields are a JSON object");
+    let location = fields["location"]
+        .as_str()
+        .expect("the record carries the panic location");
     assert!(
-        recorded.fields().contains(file!()),
+        location.starts_with(&format!("{}:", file!())),
         "the location names this file: {}",
         recorded.fields()
     );
