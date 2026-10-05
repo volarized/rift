@@ -465,7 +465,7 @@ pub struct WorkspaceConfiguration {
     /// one probe may take, and which packages the context carries beside the ones the
     /// workspace's manifests and lockfiles state.
     pub dependencies: DependenciesConfiguration,
-    /// The server's own log records: how many the workspace database keeps,
+    /// The server's own log records: how many the metrics database keeps,
     /// how many one read returns, and which targets are captured.
     pub logs: LogsConfiguration,
 
@@ -858,10 +858,10 @@ impl PortRange {
     }
 }
 
-/// The `[logs]` table. The server records its own diagnostics in the workspace
-/// database, where `rift://logs` reads them back, and this table bounds how
-/// many records the store keeps, how many one read returns, and which targets
-/// are captured at all. The server reads the table at startup, so a change
+/// The `[logs]` table. The server records its own diagnostics in the metrics
+/// database at `.rift/metrics`, where `rift://logs` reads them back, and this
+/// table bounds how many records the store keeps, how many one read returns,
+/// and which targets are captured at all. The server reads the table at startup, so a change
 /// applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1490,7 +1490,7 @@ pub struct LexicalSearchConfiguration {
     /// Most content one lexical transaction writes, 1mb to 1gb, counted and
     /// applied the way `transaction_units` is.
     pub transaction_size: ByteSize,
-    /// How much of the workspace database each connection reads through a
+    /// How much of the index database each connection reads through a
     /// memory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page
     /// cache alone. Every connection maps the file on its own, so resident
     /// memory counts the mapped pages once per open connection.

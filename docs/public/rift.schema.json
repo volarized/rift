@@ -685,7 +685,7 @@
         "mmap_size": {
           "$ref": "#/$defs/ByteSize",
           "default": "1gb",
-          "description": "How much of the workspace database each connection reads through a\nmemory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page\ncache alone. Every connection maps the file on its own, so resident\nmemory counts the mapped pages once per open connection.",
+          "description": "How much of the index database each connection reads through a\nmemory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page\ncache alone. Every connection maps the file on its own, so resident\nmemory counts the mapped pages once per open connection.",
           "rift:range": {
             "max": "2097088kb",
             "min": "0b"
@@ -721,7 +721,7 @@
     },
     "LogsConfiguration": {
       "additionalProperties": false,
-      "description": "The `[logs]` table. The server records its own diagnostics in the workspace\ndatabase, where `rift://logs` reads them back, and this table bounds how\nmany records the store keeps, how many one read returns, and which targets\nare captured at all. The server reads the table at startup, so a change\napplies on the next start.",
+      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nand which targets are captured at all. The server reads the table at startup, so a change\napplies on the next start.",
       "properties": {
         "capture": {
           "default": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
@@ -1515,7 +1515,7 @@
         "page_records": 500,
         "retention_records": 50000
       },
-      "description": "The server's own log records: how many the workspace database keeps,\nhow many one read returns, and which targets are captured."
+      "description": "The server's own log records: how many the metrics database keeps,\nhow many one read returns, and which targets are captured."
     },
     "lsp": {
       "additionalProperties": {
