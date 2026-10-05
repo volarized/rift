@@ -57,7 +57,8 @@ const SERVER_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
 /// close recorded.
 const SERVER_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
 // The two reserves leave the serving stages and the index and vectors close a share of
-// the stop's deadline.
+// the stop's deadline: the deadline less both reserves still lands after the instant the
+// stop began, so no subtraction of a reserve from the deadline underflows.
 const _: () = assert!(
     SERVER_DATABASE_STOP_RESERVE.as_millis() + SERVER_LOG_FLUSH_RESERVE.as_millis()
         < SERVER_STOP_DEADLINE.as_millis()
@@ -931,10 +932,11 @@ fn process_absent(error: &io::Error) -> bool {
 /// same token stops it.
 ///
 /// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
-/// task drains and the engines and index supervisor shut down; the index and
-/// vectors databases close, by [`SERVER_LOG_FLUSH_RESERVE`] and
-/// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline; the log drain's final
-/// flush runs, writing what the stages before it recorded, by
+/// task drains and the engines and index supervisor shut down, by
+/// [`SERVER_LOG_FLUSH_RESERVE`] and [`SERVER_DATABASE_STOP_RESERVE`] before the
+/// deadline, so a stage that runs out its bound leaves the later stages their
+/// reserves; the index and vectors databases close, by the same instant; the log
+/// drain's final flush runs, writing what the stages before it recorded, by
 /// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline; the metrics database
 /// closes by the deadline; and only then is the election released, by
 /// dropping the guard right before the process exits - so a stop the CLI
@@ -949,7 +951,10 @@ fn process_absent(error: &io::Error) -> bool {
 /// the next open recovers every committed transaction from the write-ahead log.
 /// An index or vectors close that started past its bound still fails the stop on
 /// a worker that outlasts it, and so does a metrics close whose writer thread
-/// had not reached its checkpoint by the bound.
+/// had not reached its checkpoint by the bound. An index supervisor still running
+/// at its bound is aborted the same way a checkpoint is left behind: its stage
+/// ends `timeout` with the table of operations in flight and fails nothing, and
+/// blocking work it started ends with the process.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
@@ -1041,8 +1046,13 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    let (guard, deadline, stopped, mut database) =
-        server.stopped_before_database(SERVER_STOP_DEADLINE).await;
+    // The serving stages end by both reserves before the deadline, the bound the index and
+    // vectors close shares, so a serving stage that runs out its bound still leaves the
+    // final flush and the metrics close their reserves.
+    let reserve = SERVER_DATABASE_STOP_RESERVE + SERVER_LOG_FLUSH_RESERVE;
+    let (guard, deadline, stopped, mut database) = server
+        .stopped_before_database(SERVER_STOP_DEADLINE, reserve)
+        .await;
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;

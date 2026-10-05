@@ -465,17 +465,21 @@ impl HttpServer {
     /// to stop; the runtime owns that release while the caller completes its
     /// later stop stages.
     ///
+    /// A supervisor still running at the deadline is aborted and its stage ends
+    /// with the outcome `timeout`, which fails nothing.
+    ///
     /// # Errors
     ///
-    /// The second tuple element carries [`RiftError`] when the supervisor
-    /// or the drain outlasted the deadline, or a serving task failed.
+    /// The second tuple element carries [`RiftError`] when the drain outlasted
+    /// the deadline, or a serving task or the supervisor failed.
     ///
     /// # Cancel safety
     ///
     /// Dropping this future detaches the serving tasks; a shutdown already
     /// triggered still completes in the background.
     pub async fn stopped(self, budget: Duration) -> (Instant, Result<(), RiftError>) {
-        let (deadline, stopped, database) = self.stopped_before_database(budget).await;
+        let (deadline, stopped, database) =
+            self.stopped_before_database(budget, Duration::ZERO).await;
         let database = database.shutdown(deadline).await;
         (deadline, stopped.and(database))
     }
@@ -484,10 +488,19 @@ impl HttpServer {
     ///
     /// As the stop begins it publishes the table of operations in flight with the reason
     /// `stop`, so the store holds what was still running when the stop arrived.
+    ///
+    /// Every stage here ends by `reserve` before the returned deadline: the caller's
+    /// database close and final log flush keep that share of `budget` however long a stage
+    /// here runs. The stages' bound is `budget - reserve` from where the stop began,
+    /// saturating at zero, so a `reserve` at or past `budget` leaves these stages nothing
+    /// and never moves the bound before the stop began. A supervisor still running at
+    /// that bound is aborted, and its stage ends with the outcome `timeout` and the table
+    /// of operations in flight, the form a close checkpoint that outlasts its bound uses.
     #[doc(hidden)]
     pub async fn stopped_before_database(
         self,
         budget: Duration,
+        reserve: Duration,
     ) -> (Instant, Result<(), RiftError>, DeferredDatabaseShutdown) {
         let mut serving = self.serving;
         let ended_before_the_stop = tokio::select! {
@@ -496,7 +509,9 @@ impl HttpServer {
         };
         // The stop's deadline starts where the stop began: one derived where
         // the server began listening is already spent when the stop arrives.
-        let deadline = Instant::now() + budget;
+        let stop_began = Instant::now();
+        let deadline = stop_began + budget;
+        let stages_deadline = stop_began + budget.saturating_sub(reserve);
         rift_tracing::info!(
             component = "mcp",
             operation = "server.stop",
@@ -508,8 +523,9 @@ impl HttpServer {
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
         self.stop.cancel();
-        let serve_result = stopped_serving(ended_before_the_stop, &mut serving, deadline).await;
-        let idle_outcome = stop_stage("idle watch task", deadline, async {
+        let serve_result =
+            stopped_serving(ended_before_the_stop, &mut serving, stages_deadline).await;
+        let idle_outcome = stop_stage("idle watch task", stages_deadline, async {
             self.idle_watch.await.map_err(|error| {
                 errors::mcp::http_serve_failed()
                     .operation("idle watch task")
@@ -519,12 +535,12 @@ impl HttpServer {
         })
         .await;
         let repository_idle_outcome = match self.repository_idle_watch {
-            Some(watch) => stopped_repository_idle_watch(watch, deadline).await,
+            Some(watch) => stopped_repository_idle_watch(watch, stages_deadline).await,
             None => Ok(()),
         };
         let engines_stopped = match self.engines {
-            Some(engines) => stop_stage("engines shutdown", deadline, async {
-                tokio::time::timeout_at(deadline, engines.shutdown())
+            Some(engines) => stop_stage("engines shutdown", stages_deadline, async {
+                tokio::time::timeout_at(stages_deadline, engines.shutdown())
                     .await
                     .map_err(|error| {
                         errors::mcp::http_serve_failed()
@@ -538,11 +554,12 @@ impl HttpServer {
             None => true,
         };
         let supervisor_outcome = if let Some(supervisor) = self.supervisor.as_ref() {
-            stop_stage(
-                "index supervisor shutdown",
-                deadline,
-                supervisor.shutdown(deadline),
-            )
+            // An aborted supervisor fails nothing: its stage ends `timeout` with nothing of
+            // `stages_deadline` left, and the stop goes on to the caller's database close
+            // and log flush.
+            stop_stage("index supervisor shutdown", stages_deadline, async {
+                supervisor.joined_by(stages_deadline).await.map(|_join| ())
+            })
             .await
         } else {
             Ok(())
@@ -551,8 +568,8 @@ impl HttpServer {
             Some(registry) => {
                 stop_stage(
                     "repository workspaces shutdown",
-                    deadline,
-                    registry.shutdown(deadline),
+                    stages_deadline,
+                    registry.shutdown(stages_deadline),
                 )
                 .await
             }
@@ -1554,15 +1571,96 @@ mod tests {
             deadline,
             "the later stages must be given the whole budget"
         );
-        let error = stopped.expect_err("a supervisor that never joins must miss the deadline");
-        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        stopped.expect("a supervisor aborted at the deadline ends its stage `timeout`, no error");
+    }
+
+    /// A supervisor that never joins is aborted `reserve` before the stop's deadline: its
+    /// stage ends `timeout` at `warn` with nothing of the stages' bound left, publishes the
+    /// operations in flight, and fails nothing, while the returned deadline keeps the
+    /// whole budget for the caller's database close and log flush.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_never_joins_ends_its_stage_by_the_reserve()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const STOP_BUDGET: Duration = Duration::from_secs(4);
+        const RESERVE: Duration = Duration::from_secs(1);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        *validation.task.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
+        let stop = CancellationToken::new();
+        let server = HttpServer {
+            port: SERVER_PORT_MIN,
+            token: mint_token()?,
+            identity: ProductIdentity {
+                version: "0.0.9".to_owned(),
+                schema_digest: "b".repeat(64),
+            },
+            server_configuration: ServerConfiguration::default(),
+            stop: stop.clone(),
+            serving: tokio::spawn(std::future::ready(Ok::<(), std::io::Error>(()))),
+            idle_watch: tokio::spawn(std::future::ready(())),
+            repository_idle_watch: None,
+            supervisor: Some(IndexSupervisor { validation }),
+            engines: Some(Arc::new(EngineHold::new(
+                directory.path().to_path_buf(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ))),
+            search_index: None,
+            logs: None,
+            repository_workspaces: None,
+        };
+
+        let started = Instant::now();
+        stop.cancel();
+        let (deadline, stopped, _database) =
+            server.stopped_before_database(STOP_BUDGET, RESERVE).await;
+        drop(recorder);
+
+        stopped?;
         assert_eq!(
-            error
-                .mcp()
-                .wire_error(rift_protocol::error::ErrorPhase::Read)
-                .code,
-            rift_protocol::error::ErrorCode::TemporarilyUnavailable
+            deadline,
+            started + STOP_BUDGET,
+            "the deadline keeps the budget"
         );
+        assert_eq!(
+            Instant::now(),
+            deadline - RESERVE,
+            "the stages end by the reserve before the deadline"
+        );
+        let records = drain.queued_records();
+        let ended = records
+            .iter()
+            .filter(|record| record.message() == "stop stage ended")
+            .map(|record| Ok((record.level(), serde_json::from_str(record.fields())?)))
+            .collect::<Result<Vec<(_, serde_json::Value)>, serde_json::Error>>()?;
+        let (level, supervisor) = ended
+            .iter()
+            .find(|(_, fields)| fields["stage"] == "index supervisor shutdown")
+            .ok_or("the supervisor stage ended with a record")?;
+        assert_eq!(*level, "warn", "{supervisor}");
+        assert_eq!(supervisor["outcome"], "timeout", "{supervisor}");
+        let tables = records
+            .iter()
+            .filter(|record| record.message() == "operations in flight")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            tables.iter().any(|table| table["reason"] == "stop deadline"
+                && table["root_span"]["fields"]["stage"] == "index supervisor shutdown"),
+            "{tables:?}"
+        );
+        let stopped_line = records
+            .iter()
+            .find(|record| record.message() == "MCP server stopped")
+            .ok_or("the stop records its end")?;
+        assert!(
+            stopped_line.fields().contains("\"outcome\":\"ok\""),
+            "{}",
+            stopped_line.fields()
+        );
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

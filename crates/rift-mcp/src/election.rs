@@ -942,23 +942,28 @@ impl ElectedServer {
         self,
         budget: Duration,
     ) -> (Arc<ElectionGuard>, Instant, Result<(), RiftError>) {
-        let (guard, deadline, stopped, database) = self.stopped_before_database(budget).await;
+        let (guard, deadline, stopped, database) =
+            self.stopped_before_database(budget, Duration::ZERO).await;
         let database = database.shutdown(deadline).await;
         (guard, deadline, stopped.and(database))
     }
 
-    /// Stops serving before SQLite close, for a caller with final store writes.
+    /// Stops serving before SQLite close, for a caller with final store writes; the
+    /// stages here end by `reserve` before the returned deadline, which the caller keeps
+    /// for its database close and log flush.
     #[doc(hidden)]
     pub async fn stopped_before_database(
         self,
         budget: Duration,
+        reserve: Duration,
     ) -> (
         Arc<ElectionGuard>,
         Instant,
         Result<(), RiftError>,
         DeferredDatabaseShutdown,
     ) {
-        let (deadline, outcome, database) = self.server.stopped_before_database(budget).await;
+        let (deadline, outcome, database) =
+            self.server.stopped_before_database(budget, reserve).await;
         (self.guard, deadline, outcome, database)
     }
 }

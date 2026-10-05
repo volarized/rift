@@ -1205,6 +1205,17 @@ impl Drop for IndexValidation {
     }
 }
 
+/// How one supervisor shutdown ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupervisorJoin {
+    /// The supervisor ended inside the deadline, or had ended before the shutdown.
+    Joined,
+    /// The supervisor was still running at the deadline and was aborted. Blocking work it
+    /// started keeps running on the blocking pool until it reads its cancellation or the
+    /// process exits.
+    Aborted,
+}
+
 impl IndexSupervisor {
     /// Cancels the supervisor and joins it, bounded by `deadline`.
     ///
@@ -1221,12 +1232,33 @@ impl IndexSupervisor {
     /// Cancellation is requested before the join begins. Dropping this future
     /// after it takes task ownership detaches that terminating task.
     pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), RiftError> {
+        match self.joined_by(deadline).await? {
+            SupervisorJoin::Joined => Ok(()),
+            SupervisorJoin::Aborted => errors::server::read_unavailable()
+                .operation("index supervisor shutdown")
+                .detail("shutdown deadline elapsed")
+                .fail(),
+        }
+    }
+
+    /// Cancels the supervisor and joins it by `deadline`, answering whether it joined or
+    /// was aborted at `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the task panics.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation is requested before the join begins. Dropping this future
+    /// after it takes task ownership detaches that terminating task.
+    pub(crate) async fn joined_by(&self, deadline: Instant) -> Result<SupervisorJoin, RiftError> {
         self.validation.cancellation.cancel();
         let Some(mut task) = self.validation.task.lock().await.take() else {
-            return Ok(());
+            return Ok(SupervisorJoin::Joined);
         };
         if let Ok(result) = tokio::time::timeout_at(deadline, &mut task).await {
-            result.map_err(|error| {
+            result.map(|()| SupervisorJoin::Joined).map_err(|error| {
                 errors::server::read_task()
                     .operation("index supervisor shutdown")
                     .detail(error.to_string())
@@ -1235,10 +1267,7 @@ impl IndexSupervisor {
         } else {
             task.abort();
             let _ = task.await;
-            errors::server::read_unavailable()
-                .operation("index supervisor shutdown")
-                .detail("shutdown deadline elapsed")
-                .fail()
+            Ok(SupervisorJoin::Aborted)
         }
     }
 }
