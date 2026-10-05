@@ -1029,4 +1029,193 @@ mod tests {
         drop(lease);
         Ok(())
     }
+
+    /// Failure bound on one step; never a way to order two events.
+    const STEP_MAX: Duration = Duration::from_secs(10);
+
+    /// A workspace at `root` holding one committed source file, and its canonical root.
+    fn committed_workspace(root: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let root = std::fs::canonicalize(root)?;
+        crate::server::hermetic_workspace(&root, "")?;
+        std::fs::write(root.join("lib.rs"), "pub fn amber() {}\n")?;
+        rift_history::fixture::init(&root);
+        rift_history::fixture::commit_all(&root, "add workspace source");
+        Ok(root)
+    }
+
+    /// The registry a repository server on `root` builds, with no server around it, so no
+    /// idle watch evicts a workspace on its own.
+    fn unserved_registry(
+        root: &Path,
+    ) -> Result<super::RepositoryWorkspaceRegistry, Box<dyn std::error::Error>> {
+        let server_configuration =
+            crate::validation::ConfigurationState::accept(root).server_configuration();
+        Ok(super::RepositoryWorkspaceRegistry {
+            authority_root: root.to_path_buf(),
+            common_directory: root.to_path_buf(),
+            blocking: crate::server::BlockingExecutor::for_configuration(&server_configuration)?,
+            idle_timeout: Duration::from_millis(server_configuration.idle_timeout.milliseconds()),
+            admissions: Arc::new(tokio::sync::Semaphore::new(1)),
+            workspaces_max: 1,
+            server_configuration,
+            limits: WorkspaceIndexLimits::default(),
+            checkout: BuildCheckout::Unversioned,
+            stop: CancellationToken::new(),
+            build_gate: tokio::sync::Mutex::new(()),
+            workspaces: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+        })
+    }
+
+    /// A workspace whose index database was refused has no database to stop, and its stop
+    /// still succeeds and releases the store lease.
+    #[tokio::test]
+    async fn a_workspace_without_an_index_database_stops_and_releases_its_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let state_directory = root.join(".rift");
+        std::fs::create_dir_all(rift_index::DatabaseName::Index.path(&state_directory))?;
+        let registry = unserved_registry(&root)?;
+        let workspace = registry
+            .build_workspace(root.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(
+            workspace.database.is_none(),
+            "a directory is not a database"
+        );
+
+        let deadline = tokio::time::Instant::now() + STEP_MAX;
+        super::stop_repository_workspace(&workspace, deadline).await?;
+
+        assert!(
+            workspace.lease.lock().await.is_none(),
+            "a stop that succeeded releases the store lease"
+        );
+        Ok(())
+    }
+
+    /// A stop whose vectors database is still in its first open when the deadline passes
+    /// fails as a SQLite worker shutdown, and keeps the store lease. The open is polled once
+    /// and never again, and the test holds the migration lock it waits on, so the open stays
+    /// in flight past the deadline on every run.
+    #[tokio::test]
+    async fn a_workspace_stop_that_outlasts_the_vectors_first_open_keeps_the_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::task::{Context, Waker};
+
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let registry = unserved_registry(&root)?;
+        let workspace = registry
+            .build_workspace(root.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let supervisor_deadline = tokio::time::Instant::now() + STEP_MAX;
+        workspace.supervisor.shutdown(supervisor_deadline).await?;
+        let lock_path = rift_index::DatabaseName::Vectors.migration_lock_path(&root.join(".rift"));
+        let migration_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        migration_lock.try_lock()?;
+        let vectors = workspace
+            .vectors
+            .as_ref()
+            .ok_or("the vectors handle exists")?;
+        let mut opening = Box::pin(vectors.resolve(rift_index::DatabasePool::new(4, 60_000)));
+        let first_poll =
+            std::future::Future::poll(opening.as_mut(), &mut Context::from_waker(Waker::noop()));
+        assert!(
+            first_poll.is_pending(),
+            "the held migration lock keeps the open waiting"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let refusal = super::stop_repository_workspace(&workspace, deadline)
+            .await
+            .expect_err("an open in flight outlasts the stop deadline");
+
+        assert_eq!(
+            refusal.slug(),
+            rift_error::errors::mcp::http_serve_failed::SLUG
+        );
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("SQLite worker shutdown"), "{rendered}");
+        assert!(
+            workspace.lease.lock().await.is_some(),
+            "a failed stop keeps the store lease"
+        );
+        drop(opening);
+        drop(migration_lock);
+        Ok(())
+    }
+
+    /// An idle workspace whose stop fails stays retained, keeps its store lease, and
+    /// records the failure. A task that never finishes is parked where the supervisor's
+    /// own task runs, so the supervisor misses the stop deadline on every run; the paused
+    /// clock carries the workspace past its idle deadline and the stop past its own.
+    #[tokio::test]
+    async fn an_idle_workspace_whose_stop_fails_stays_retained_and_records_the_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let registry = unserved_registry(&root)?;
+        let cell = registry
+            .workspace_cell(&root)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let workspace = cell
+            .get_or_try_init(|| registry.build_workspace(root.clone()))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let validation = &workspace.supervisor.validation;
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        let supervisor_task = validation.task.lock().await.replace(stuck);
+        validation.cancellation.cancel();
+        if let Some(task) = supervisor_task {
+            tokio::time::timeout(STEP_MAX, task).await??;
+        }
+        let idle_deadline = workspace
+            .activity
+            .idle_deadline(registry.idle_timeout)
+            .ok_or("no request is active")?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+
+        tokio::time::pause();
+        tokio::time::advance(idle_deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
+        registry.evict_idle().await;
+
+        assert!(
+            registry.workspaces.lock().await.contains_key(&root),
+            "a workspace whose stop failed stays retained"
+        );
+        assert!(
+            workspace.lease.lock().await.is_some(),
+            "a workspace whose stop failed keeps its store lease"
+        );
+        let mut failures = Vec::new();
+        let mut released = false;
+        while let Ok(record) = drain.try_recv_record() {
+            match record.message() {
+                "idle workspace shutdown failed" => failures.push(record),
+                "idle workspace released" => released = true,
+                _ => {}
+            }
+        }
+        assert!(!released, "a workspace whose stop failed is not released");
+        assert_eq!(failures.len(), 1, "one failed stop records one failure");
+        assert_eq!(failures[0].level(), "warn");
+        assert!(
+            failures[0].fields().contains("index supervisor shutdown"),
+            "the record names the stage that failed: {}",
+            failures[0].fields()
+        );
+        Ok(())
+    }
 }

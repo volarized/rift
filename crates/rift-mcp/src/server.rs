@@ -6673,6 +6673,36 @@ done
         Ok(())
     }
 
+    /// A metrics file of a schema version the reader does not read answers a `rift://logs`
+    /// read with an internal error that names the refusal.
+    #[tokio::test]
+    async fn a_log_read_the_store_refuses_answers_an_internal_error() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server =
+            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(
+            server.logs.is_some(),
+            "the metrics database opens on its own"
+        );
+        let metrics = directory.path().join(".rift").join("metrics");
+        rusqlite::Connection::open(metrics)?.pragma_update(None, "user_version", 7)?;
+
+        let refusal = server
+            .read_logs("rift://logs")
+            .await
+            .expect_err("a reader refuses a schema it does not read");
+
+        assert_eq!(refusal.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            refusal.message.contains("the log store refused the read"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
     /// Logs record and answer while the index database is refused: `rift://logs`
     /// returns the `database.open` warning the refusal produced.
     #[tokio::test]
