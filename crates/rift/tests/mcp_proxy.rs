@@ -196,8 +196,9 @@ async fn repository_foreground(
     root: &Path,
     state_directory: &Path,
 ) -> TestResult<(RepositoryForeground, ServerLock)> {
+    let mut command = Command::new(harness::rift_binary());
     let mut child = RepositoryForeground(
-        Command::new(harness::rift_binary())
+        harness::with_child_log_variables(&mut command)
             .args(["server", "start", "--foreground", "--repository"])
             .current_dir(root)
             .stdin(Stdio::null())
@@ -542,6 +543,12 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         .ok_or("fixture repository has a common Git directory")?;
     let state_directory =
         rift_mcp::repository::repository_election_directory(&common, &rift_binary_identity()?)?;
+    // Each workspace keeps its own store, so the window reads all four. The expected
+    // failure of #530 returns without `passed`, so its window prints too: the proxy's
+    // `start window closed without a server that answers` record, relayed above it, names
+    // the last repository miss, and the stores show what the repository server reached.
+    let failure_window =
+        FailureWindow::begin_over(&roots.iter().map(PathBuf::as_path).collect::<Vec<_>>());
     // The linked workspace starts first; authority still comes from the main worktree.
     let (mut child, before) = repository_foreground(&roots[3], &state_directory).await?;
     let mut clients: Vec<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> = Vec::new();
@@ -600,6 +607,7 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         2
     );
     stop_repository_foreground(&roots[1], &mut reopened).await?;
+    failure_window.passed();
     Ok(())
 }
 

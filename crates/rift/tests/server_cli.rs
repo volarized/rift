@@ -1405,6 +1405,25 @@ fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
     Ok(())
 }
 
+/// Prints the failure window of every compiled-binary test whose process ended before its
+/// own window printed - a nextest timeout or another kill - and fails when it printed one.
+///
+/// Run it after the nextest run, alone, so it prints no window of a test still running:
+/// `cargo nextest run -p rift --test server_cli --run-ignored only --no-tests fail -E
+/// 'test(=failure_windows_of_ended_tests)'`.
+#[test]
+#[ignore = "run after a nextest run, to print the windows of the tests it ended"]
+fn failure_windows_of_ended_tests() -> TestResult {
+    let printed = harness::print_ended_windows()?;
+    if printed > 0 {
+        return Err(format!(
+            "{printed} tests ended before their failure window printed; the windows are above"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[test]
 fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
     let directory = workspace()?;
