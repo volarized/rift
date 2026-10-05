@@ -101,6 +101,16 @@ impl PendingWork {
         self.whole_workspace
     }
 
+    /// The `index.rebuild.trigger` of the rebuild this observation starts: `rescan` when
+    /// it reads every visible file again, `filesystem` when it reads the paths it names.
+    const fn rebuild_trigger(&self) -> &'static str {
+        if self.whole_workspace {
+            REBUILD_TRIGGER_RESCAN
+        } else {
+            REBUILD_TRIGGER_FILESYSTEM
+        }
+    }
+
     /// The paths this observation retains, in project-path order.
     #[cfg(test)]
     pub(crate) fn paths(&self) -> impl Iterator<Item = &ProjectPath> {
@@ -515,6 +525,59 @@ const INDEX_EPOCH_PUBLISHED: &str = "published";
 /// The `index.epoch.kind` of the epoch an observation reaches.
 const INDEX_EPOCH_OBSERVED: &str = "observed";
 
+/// `index.invalidation.dropped`: observations whose signal the supervisor's invalidation
+/// channel refused because it was full, by the `event` route the observation took. The
+/// channel holds [`INDEX_INVALIDATIONS_MAX`] signals and the supervisor takes all pending
+/// work on the turn one signal starts, so a refused signal loses no work: the count is the
+/// observations that joined a turn already announced. No record is written per refusal.
+static INDEX_INVALIDATION_DROPPED: rift_tracing::Counter<1> =
+    rift_tracing::Counter::declare("index.invalidation.dropped", "{event}", &["event"]);
+
+/// `watch.events`: native watch events, by `watch.event.kind`, notify's spelling of the
+/// event's kind, and `watch.event.route`, the [`WatchImpact`] it took.
+static WATCH_EVENTS: rift_tracing::Counter<2> = rift_tracing::Counter::declare(
+    "watch.events",
+    "{event}",
+    &["watch.event.kind", "watch.event.route"],
+);
+/// The `watch.event.route` of an event that cannot change the index.
+const WATCH_ROUTE_NONE: &str = "none";
+/// The `watch.event.route` of an event naming the visible files it moved.
+const WATCH_ROUTE_PATHS: &str = "paths";
+/// The `watch.event.route` of an event that asks for every visible file to be read again.
+const WATCH_ROUTE_WHOLE_WORKSPACE: &str = "whole_workspace";
+
+/// `index.rebuilds`: rebuilds by `index.rebuild.trigger`, and by `error.type` for one that
+/// ended without an outcome: the failure's registered identity, or `cancelled`.
+static INDEX_REBUILDS: rift_tracing::Counter<2> = rift_tracing::Counter::declare(
+    "index.rebuilds",
+    "{rebuild}",
+    &["index.rebuild.trigger", "error.type"],
+);
+/// The `index.rebuild.trigger` of the preparation a server runs once as it starts.
+const REBUILD_TRIGGER_STARTUP: &str = "startup";
+/// The `index.rebuild.trigger` of a rebuild that reads the paths its observation names.
+const REBUILD_TRIGGER_FILESYSTEM: &str = "filesystem";
+/// The `index.rebuild.trigger` of a rebuild that reads every visible file again.
+const REBUILD_TRIGGER_RESCAN: &str = "rescan";
+/// The `error.type` of a rebuild the supervisor's cancellation ended.
+const REBUILD_CANCELLED: &str = "cancelled";
+
+/// Counts one rebuild `trigger` started into `index.rebuilds`, under `error_type`: empty
+/// for a rebuild that reached an outcome.
+fn count_rebuild(trigger: &'static str, error_type: &'static str) {
+    INDEX_REBUILDS.labeled([trigger, error_type]).add(1);
+}
+
+/// The `error.type` of a rebuild that ended with `result`.
+fn rebuild_error_type(result: &Result<RebuildOutcome, RiftError>) -> &'static str {
+    match result {
+        Ok(RebuildOutcome::Cancelled) => REBUILD_CANCELLED,
+        Ok(_) => "",
+        Err(error) => error.slug().as_str(),
+    }
+}
+
 /// The lock a write of the published snapshot, [`IndexState`], is recorded under.
 pub(crate) const PUBLISHED_SNAPSHOT_LOCK: &str = "index.snapshot";
 
@@ -621,13 +684,15 @@ pub(crate) struct IndexValidation {
     /// The supervisor is the only writer of published snapshots. If it ends -
     /// cancelled, or unwound by a panic in a rebuild - the observed epoch keeps
     /// advancing with every filesystem event and nothing ever publishes again,
-    /// so every read waits its whole readiness budget and refuses. That was
-    /// silent: the flag makes it a named refusal on the first request instead
-    /// of a timeout on every one.
+    /// so every read waits its whole readiness budget and refuses. The flag
+    /// makes that a named refusal on the first request rather than a timeout on
+    /// every one.
     pub(crate) supervisor_running: Arc<AtomicBool>,
     /// The engine hold each publication hands its changed files to, set once the server
     /// holds one. Absent in a test that builds no server.
     engines: std::sync::OnceLock<Arc<EngineHold>>,
+    /// The watch failures recorded since the last report of their repeats.
+    watch_failures: SyncMutex<WatchFailures>,
 }
 
 /// Owned shutdown handle for the workspace index supervisor.
@@ -924,6 +989,7 @@ impl IndexValidation {
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
                 engines: std::sync::OnceLock::new(),
+                watch_failures: SyncMutex::new(WatchFailures::default()),
             }),
             receiver,
         )
@@ -958,7 +1024,7 @@ impl IndexValidation {
     pub(crate) fn observe_whole_workspace(&self) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         publication.escalate();
-        let result = self.observe_locked(&mut publication);
+        let result = self.observe_locked(&mut publication, WATCH_ROUTE_WHOLE_WORKSPACE);
         drop(publication);
         result
     }
@@ -970,7 +1036,7 @@ impl IndexValidation {
     ) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         publication.retain(paths, self.paths_max);
-        let result = self.observe_locked(&mut publication);
+        let result = self.observe_locked(&mut publication, WATCH_ROUTE_PATHS);
         drop(publication);
         result
     }
@@ -980,9 +1046,27 @@ impl IndexValidation {
         let mut publication = self.locked_pending();
         self.watch_failed.store(true, Ordering::Release);
         publication.escalate();
-        let result = self.observe_locked(&mut publication);
+        let result = self.observe_locked(&mut publication, WATCH_ROUTE_WHOLE_WORKSPACE);
         drop(publication);
         result
+    }
+
+    /// Records `error` from the watch callback's `step`: see [`WatchFailures::record`].
+    fn record_watch_failure(&self, step: WatchStep, error: RiftError) {
+        self.locked_watch_failures().record(step, error);
+    }
+
+    /// Records the repeats of each watch failure since it was recorded, once, and forgets
+    /// the failures: see [`WatchFailures::report`]. The supervisor calls it on each turn
+    /// and when the watch stops.
+    fn report_watch_failures(&self) {
+        self.locked_watch_failures().report();
+    }
+
+    fn locked_watch_failures(&self) -> std::sync::MutexGuard<'_, WatchFailures> {
+        self.watch_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Takes the work the next rebuild owes, with the epoch it answers for, under the one
@@ -1016,8 +1100,13 @@ impl IndexValidation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records one invalidation while caller owns publication lane.
-    fn observe_locked(&self, pending: &mut PendingWork) -> Result<u64, RiftError> {
+    /// Records one invalidation while caller owns publication lane; `event` is the
+    /// `watch.event.route` the observation took, the label a refused signal counts under.
+    fn observe_locked(
+        &self,
+        pending: &mut PendingWork,
+        event: &'static str,
+    ) -> Result<u64, RiftError> {
         let previous = self
             .observed_epoch
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
@@ -1036,7 +1125,10 @@ impl IndexValidation {
             .labeled_value([INDEX_EPOCH_OBSERVED], epoch)
             .record();
         match self.invalidations.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(())) => {
+                INDEX_INVALIDATION_DROPPED.labeled([event]).add(1);
+            }
             Err(mpsc::error::TrySendError::Closed(())) => {
                 self.watch_failed.store(true, Ordering::Release);
                 pending.escalate();
@@ -1095,17 +1187,24 @@ impl IndexValidation {
     /// Classifies and observes one event within the publication critical section, so the
     /// paths it names cannot be lost between the classification and the epoch that
     /// promises to cover them.
+    ///
+    /// The event counts into `watch.events` under its kind and the route it took.
     fn observe_event(&self, roots: &WatchRoots, event: &Event) -> Result<Option<u64>, RiftError> {
         let mut publication = self.locked_pending();
-        let result = match watch_event_impact(roots, self, event) {
+        let impact = watch_event_impact(roots, self, event);
+        let route = impact.route();
+        WATCH_EVENTS
+            .labeled([watch_event_kind(event.kind), route])
+            .add(1);
+        let result = match impact {
             WatchImpact::None => Ok(None),
             WatchImpact::WholeWorkspace => {
                 publication.escalate();
-                self.observe_locked(&mut publication).map(Some)
+                self.observe_locked(&mut publication, route).map(Some)
             }
             WatchImpact::Paths(paths) => {
                 publication.retain(paths, self.paths_max);
-                self.observe_locked(&mut publication).map(Some)
+                self.observe_locked(&mut publication, route).map(Some)
             }
         };
         drop(publication);
@@ -1446,44 +1545,166 @@ pub(crate) fn unwatched(
 
 /// Observes one watcher callback: a delivered event enters the inclusion filter, and a
 /// backend failure marks the watch unhealthy.
+///
+/// A failure of either step is held in [`WatchFailures`], which records it once and
+/// counts its repeats until the supervisor's next turn reports them.
 pub(crate) fn report_watch_outcome(
     roots: &WatchRoots,
     validation: &IndexValidation,
     outcome: notify::Result<Event>,
 ) {
-    let Ok(event) = outcome else {
-        let _ = validation.observe_watch_failure();
-        rift_tracing::warn!(
-            component = "index",
-            operation = "watch.receive",
-            "index watch backend reported failure"
-        );
-        return;
+    let event = match outcome {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = validation.observe_watch_failure();
+            let error = errors::server::read_unavailable()
+                .operation("workspace watch")
+                .detail(error.to_string())
+                .error();
+            validation.record_watch_failure(WatchStep::Receive, error);
+            return;
+        }
     };
     // Git control changes live outside linked worktrees. Route HEAD and index.lock
     // before the source floor; access events keep the existing rescan classification.
-    if !matches!(event.kind, EventKind::Access(_))
-        && roots.git_directory.as_ref().is_some_and(|directory| {
-            event.paths.iter().any(|path| {
-                path.parent() == Some(directory.as_path())
-                    && matches!(
-                        path.file_name().and_then(|name| name.to_str()),
-                        Some("HEAD" | "index.lock")
-                    )
-            })
-        })
-    {
-        if let Err(error) = validation.observe_whole_workspace() {
-            rift_tracing::error!(component = "index", operation = "watch.observe", error = %error, "index watch failed");
-        }
-        return;
+    let observed = if names_git_control(roots, &event) {
+        WATCH_EVENTS
+            .labeled([watch_event_kind(event.kind), WATCH_ROUTE_WHOLE_WORKSPACE])
+            .add(1);
+        validation.observe_whole_workspace().map(Some)
+    } else {
+        validation.observe_event(roots, &event)
+    };
+    if let Err(error) = observed {
+        validation.record_watch_failure(WatchStep::Observe, error);
     }
-    if validation.observe_event(roots, &event).is_err() {
-        rift_tracing::error!(
-            component = "index",
-            operation = "watch.observe",
-            "index watch failed"
-        );
+}
+
+/// Whether `event`, other than an access, names `HEAD` or `index.lock` directly inside the
+/// Git directory.
+fn names_git_control(roots: &WatchRoots, event: &Event) -> bool {
+    let Some(directory) = roots.git_directory.as_ref() else {
+        return false;
+    };
+    !matches!(event.kind, EventKind::Access(_))
+        && event.paths.iter().any(|path| {
+            path.parent() == Some(directory.as_path())
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("HEAD" | "index.lock")
+                )
+        })
+}
+
+/// The `watch.event.kind` of `kind`: notify's own serde spelling of its top-level kind.
+const fn watch_event_kind(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Any => "any",
+        EventKind::Access(_) => "access",
+        EventKind::Create(_) => "create",
+        EventKind::Modify(_) => "modify",
+        EventKind::Remove(_) => "remove",
+        EventKind::Other => "other",
+    }
+}
+
+/// The step of a watcher callback that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchStep {
+    /// The watch backend delivered an error in place of an event: `watch.receive`.
+    Receive,
+    /// An event could not be observed: `watch.observe`.
+    Observe,
+}
+
+impl WatchStep {
+    /// Records `error` as this step's failure; `count` is the number of repeats a report
+    /// carries, absent on the failure's first record.
+    fn record(self, error: &RiftError, count: Option<u64>) {
+        let error_type = error.slug().as_str();
+        match self {
+            Self::Receive => rift_tracing::warn!(
+                component = "index",
+                operation = "watch.receive",
+                error = %error,
+                error.type = error_type,
+                count,
+                "index watch backend reported failure"
+            ),
+            Self::Observe => rift_tracing::error!(
+                component = "index",
+                operation = "watch.observe",
+                error = %error,
+                error.type = error_type,
+                count,
+                "index watch failed"
+            ),
+        }
+    }
+}
+
+/// The failure one watch step last recorded, and how often it repeated since.
+#[derive(Debug)]
+struct RepeatedFailure {
+    error: RiftError,
+    repeats: u64,
+}
+
+/// Watch failures between two reports: one slot per [`WatchStep`], so the held state is
+/// bounded by construction whatever the backend delivers.
+///
+/// A failure records once, with its error and `error.type`, its registered identity. A
+/// repeat of the same identity in the same step records nothing and counts. A report
+/// records each held failure's repeats once, with `count`, and empties the slots, so the
+/// next failure records at once again. A different identity in a step reports the held
+/// one's repeats before it takes the slot. A step whose every event fails, as a stopped
+/// supervisor makes them, writes one record per identity and one per report rather than
+/// one per event.
+#[derive(Debug, Default)]
+struct WatchFailures {
+    receive: Option<RepeatedFailure>,
+    observe: Option<RepeatedFailure>,
+}
+
+impl WatchFailures {
+    const fn slot(&mut self, step: WatchStep) -> &mut Option<RepeatedFailure> {
+        match step {
+            WatchStep::Receive => &mut self.receive,
+            WatchStep::Observe => &mut self.observe,
+        }
+    }
+
+    /// Records `error` from `step` at its first sighting, and counts a repeat of the
+    /// identity the step holds.
+    fn record(&mut self, step: WatchStep, error: RiftError) {
+        let slot = self.slot(step);
+        if let Some(held) = slot.as_mut()
+            && held.error.slug() == error.slug()
+        {
+            held.repeats = held.repeats.saturating_add(1);
+            return;
+        }
+        if let Some(previous) = slot.take() {
+            report_repeats(step, &previous);
+        }
+        step.record(&error, None);
+        *slot = Some(RepeatedFailure { error, repeats: 0 });
+    }
+
+    /// Records each held failure's repeats once and empties every slot.
+    fn report(&mut self) {
+        for step in [WatchStep::Receive, WatchStep::Observe] {
+            if let Some(held) = self.slot(step).take() {
+                report_repeats(step, &held);
+            }
+        }
+    }
+}
+
+/// Records `held`'s repeats as one `step` record with their count; no repeat, no record.
+fn report_repeats(step: WatchStep, held: &RepeatedFailure) {
+    if held.repeats > 0 {
+        step.record(&held.error, Some(held.repeats));
     }
 }
 
@@ -1519,15 +1740,28 @@ impl Drop for SupervisorRunning {
 /// Holds the filesystem watcher for as long as the index supervisor runs.
 ///
 /// Dropping it with the supervisor - on return, on cancellation, or while a panic unwinds
-/// the task - drops the watcher, which ends its event delivery, and records that the watch
-/// stopped.
+/// the task - drops the watcher, which ends its event delivery, reports the repeats of the
+/// watch failures held since the supervisor's last turn, and records that the watch
+/// stopped. A callback the backend delivers after that drop records a first failure, and
+/// its repeats stay uncounted in any record.
 struct WatchRunning {
     watcher: Option<notify::RecommendedWatcher>,
+    validation: Arc<IndexValidation>,
+}
+
+impl WatchRunning {
+    fn new(watcher: notify::RecommendedWatcher, validation: &Arc<IndexValidation>) -> Self {
+        Self {
+            watcher: Some(watcher),
+            validation: Arc::clone(validation),
+        }
+    }
 }
 
 impl Drop for WatchRunning {
     fn drop(&mut self) {
         drop(self.watcher.take());
+        self.validation.report_watch_failures();
         rift_tracing::info!(
             component = "index",
             operation = "index.supervisor",
@@ -1550,6 +1784,15 @@ pub(crate) enum WatchImpact {
 }
 
 impl WatchImpact {
+    /// The `watch.event.route` of this impact.
+    const fn route(&self) -> &'static str {
+        match self {
+            Self::None => WATCH_ROUTE_NONE,
+            Self::Paths(_) => WATCH_ROUTE_PATHS,
+            Self::WholeWorkspace => WATCH_ROUTE_WHOLE_WORKSPACE,
+        }
+    }
+
     /// Folds one path's impact into the event's, keeping the widest one seen.
     fn absorb(self, other: Self) -> Self {
         match (self, other) {
@@ -3561,17 +3804,28 @@ struct InitialPreparationFailure {
     queued_epoch: Option<u64>,
 }
 
+/// Runs the startup preparation and counts it once into `index.rebuilds` under the trigger
+/// `startup`: a failure under its registered identity, and a preparation that ended with
+/// the supervisor's cancellation under `cancelled`. A discovery that leaves nothing to
+/// prepare - the validation held no preparation, or the cancellation ended the first
+/// publication - counts nothing.
 async fn prepare_initial_workspace_with_epoch(
     context: &IndexSupervisorContext,
 ) -> Result<(), Box<InitialPreparationFailure>> {
-    let preparation = match discover_initial_workspace(context).await {
-        Ok(preparation) => preparation,
-        Err(error) => return Err(Box::new(initial_preparation_failure(context, error))),
+    let result = match discover_initial_workspace(context).await {
+        Ok(Some(preparation)) => {
+            prepare_initial_workspace_from_with_epoch(context, preparation).await
+        }
+        Ok(None) => return Ok(()),
+        Err(error) => Err(Box::new(initial_preparation_failure(context, error))),
     };
-    let Some(preparation) = preparation else {
-        return Ok(());
+    let error_type = match &result {
+        Ok(()) if context.validation.cancellation.is_cancelled() => REBUILD_CANCELLED,
+        Ok(()) => "",
+        Err(failure) => failure.error.slug().as_str(),
     };
-    prepare_initial_workspace_from_with_epoch(context, preparation).await
+    count_rebuild(REBUILD_TRIGGER_STARTUP, error_type);
+    result
 }
 
 /// Retained owner and immutable discovery result for one startup preparation.
@@ -4059,7 +4313,7 @@ fn publish_preparation_after(
         rift_tracing::info!(
             component = "index",
             operation = "index.publish",
-            trigger = "startup",
+            trigger = REBUILD_TRIGGER_STARTUP,
             epoch = published_epoch,
             "index snapshot published"
         );
@@ -4080,9 +4334,7 @@ pub(crate) async fn run_index_supervisor_with(
 ) {
     // Declared ahead of the running guard, so it drops after it: the supervisor's end is
     // recorded, then the watcher's.
-    let _watch = WatchRunning {
-        watcher: Some(watcher),
-    };
+    let _watch = WatchRunning::new(watcher, &context.validation);
     let validation = Arc::clone(&context.validation);
     let published = Arc::clone(&context.published);
     let population = context.population.clone();
@@ -4121,6 +4373,7 @@ pub(crate) async fn run_index_supervisor_with(
             () = validation.cancellation.cancelled() => return,
             () = tokio::time::sleep(INDEX_DEBOUNCE) => {}
         }
+        validation.report_watch_failures();
         match version_control.wait(&context).await {
             Ok(true) => {}
             Ok(false) => return,
@@ -4166,7 +4419,7 @@ pub(crate) async fn run_index_supervisor_with(
         let result = rift_tracing::info_span!(
             "index.build",
             component = "index",
-            trigger = "filesystem",
+            trigger = request.work.rebuild_trigger(),
             epoch
         )
         .instrument(rebuild_workspace(&context, request, capture.clone()))
@@ -4264,10 +4517,27 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// spawns nothing. The capture meets the token at its next phase boundary and returns
 /// its work to the observation; a publication that took its locks before the token was
 /// cancelled still lands, and nobody hands it to the lanes.
+///
+/// Each rebuild counts once into `index.rebuilds` under the trigger its observation names,
+/// [`PendingWork::rebuild_trigger`].
 pub(crate) async fn rebuild_workspace(
     context: &IndexSupervisorContext,
     request: RebuildRequest,
     capture: impl CaptureWorkspace + Send + 'static,
+) -> Result<RebuildOutcome, RiftError> {
+    let trigger = request.work.rebuild_trigger();
+    let result = rebuild_captured(context, request, capture, trigger).await;
+    count_rebuild(trigger, rebuild_error_type(&result));
+    result
+}
+
+/// Captures and publishes one rebuild, as [`rebuild_workspace`] documents; a publication
+/// records `trigger`.
+async fn rebuild_captured(
+    context: &IndexSupervisorContext,
+    request: RebuildRequest,
+    capture: impl CaptureWorkspace + Send + 'static,
+    trigger: &'static str,
 ) -> Result<RebuildOutcome, RiftError> {
     let epoch = request.epoch;
     let root = context.root.clone();
@@ -4300,7 +4570,7 @@ pub(crate) async fn rebuild_workspace(
                 .map(|lane| LexicalHandoff::new(lane, write));
             let outcome = publish_captured(context, published, change_set, work, lexical).await?;
             if outcome == RebuildOutcome::Published {
-                trace_publication(epoch);
+                trace_publication(epoch, trigger);
             }
             Ok(outcome)
         }
@@ -4715,12 +4985,12 @@ fn trace_superseded(epoch: u64, observed_epoch: u64) {
     );
 }
 
-/// Emits one path-free filesystem publication event.
-pub(crate) fn trace_publication(epoch: u64) {
+/// Emits one path-free publication event for a rebuild `trigger` started.
+pub(crate) fn trace_publication(epoch: u64, trigger: &'static str) {
     rift_tracing::info!(
         component = "index",
         operation = "index.publish",
-        trigger = "filesystem",
+        trigger,
         epoch,
         "index snapshot published"
     );
@@ -6044,6 +6314,214 @@ pub(crate) mod tests {
             Err(notify::Error::generic("test backend failure")),
         );
         assert!(validation.watch_failed.load(Ordering::Acquire));
+    }
+
+    /// The value the series of `name` under exactly `labels` holds, if any.
+    fn series(
+        snapshot: &rift_tracing::MetricSnapshot,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<rift_tracing::SeriesValue> {
+        snapshot
+            .find(name, labels)
+            .map(|series| series.value().clone())
+    }
+
+    /// The fields of every record named `message`.
+    fn records_named(
+        records: &[rift_tracing::LogRecord],
+        message: &str,
+    ) -> TestResult<Vec<serde_json::Value>> {
+        records
+            .iter()
+            .filter(|record| record.message() == message)
+            .map(|record| Ok(serde_json::from_str(record.fields())?))
+            .collect()
+    }
+
+    /// The channel holds `INDEX_INVALIDATIONS_MAX` (one) signal: each observation past it
+    /// counts under the route it took, and none writes a record.
+    #[test]
+    fn a_full_invalidation_channel_counts_each_refused_signal_by_its_route() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, mut receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.observe_paths([ProjectPath::new("lib.rs")?])?;
+        validation.observe_paths([ProjectPath::new("main.rs")?])?;
+        validation.observe_whole_workspace()?;
+        validation.observe_watch_failure()?;
+        receiver.try_recv()?;
+        validation.observe_paths([ProjectPath::new("lib.rs")?])?;
+        let snapshot = recorder.metrics();
+        drop(recorder);
+
+        let dropped = "index.invalidation.dropped";
+        assert_eq!(
+            series(&snapshot, dropped, &[("event", "paths")]),
+            Some(rift_tracing::SeriesValue::Sum(1.0)),
+            "the first signal and the one after the receive were taken: {snapshot:?}"
+        );
+        assert_eq!(
+            series(&snapshot, dropped, &[("event", "whole_workspace")]),
+            Some(rift_tracing::SeriesValue::Sum(2.0)),
+            "{snapshot:?}"
+        );
+        let records = drain.queued_records();
+        assert!(
+            records.is_empty(),
+            "a refused signal writes no record: {records:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn each_watch_event_counts_under_its_kind_and_route() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let root = std::path::Path::new("/rift-workspace");
+        let roots = super::WatchRoots::at(root);
+        let configuration =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
+        let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(root.join("lib.rs"));
+        let rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        for event in [configuration.clone(), configuration, access, rescan] {
+            super::report_watch_outcome(&roots, &validation, Ok(event));
+        }
+        let snapshot = recorder.metrics();
+        drop(recorder);
+
+        let expected = [
+            ("modify", "paths", 2.0),
+            ("access", "none", 1.0),
+            ("other", "whole_workspace", 1.0),
+        ];
+        for (kind, route, count) in expected {
+            assert_eq!(
+                series(
+                    &snapshot,
+                    "watch.events",
+                    &[("watch.event.kind", kind), ("watch.event.route", route)],
+                ),
+                Some(rift_tracing::SeriesValue::Sum(count)),
+                "{kind} {route}: {snapshot:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With the supervisor gone every observation fails: each step records its failure
+    /// once with its registered identity, and a report records the repeats with a count.
+    #[test]
+    fn repeated_watch_failures_record_once_and_report_one_count_of_the_repeats() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        drop(receiver);
+        let root = std::path::Path::new("/rift-workspace");
+        let roots = super::WatchRoots::at(root);
+        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
+        for _ in 0..3 {
+            super::report_watch_outcome(&roots, &validation, Ok(event.clone()));
+        }
+        for _ in 0..2 {
+            let failure = notify::Error::generic("test backend failure");
+            super::report_watch_outcome(&roots, &validation, Err(failure));
+        }
+        let first = drain.queued_records();
+        validation.report_watch_failures();
+        let reported = drain.queued_records();
+        validation.report_watch_failures();
+        super::report_watch_outcome(&roots, &validation, Ok(event));
+        let again = drain.queued_records();
+        drop(recorder);
+
+        let unavailable = errors::server::read_unavailable::SLUG.as_str();
+        let observed = records_named(&first, "index watch failed")?;
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0]["error.type"], unavailable);
+        assert!(
+            observed[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("index supervisor is not running")),
+            "{observed:?}"
+        );
+        assert!(observed[0].get("count").is_none(), "{observed:?}");
+        let backend = records_named(&first, "index watch backend reported failure")?;
+        assert_eq!(backend.len(), 1, "{backend:?}");
+        assert_eq!(backend[0]["error.type"], unavailable);
+        assert!(
+            backend[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("test backend failure")),
+            "{backend:?}"
+        );
+
+        let observed = records_named(&reported, "index watch failed")?;
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0]["count"], "2");
+        let backend = records_named(&reported, "index watch backend reported failure")?;
+        assert_eq!(backend.len(), 1, "{backend:?}");
+        assert_eq!(backend[0]["count"], "1");
+
+        let observed = records_named(&again, "index watch failed")?;
+        assert_eq!(observed.len(), 1, "a report empties the slot: {again:?}");
+        assert!(observed[0].get("count").is_none(), "{observed:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_rebuild_counts_under_its_trigger_and_a_failure_under_its_identity() -> TestResult
+    {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        super::prepare_initial_workspace(&context).await?;
+        context
+            .validation
+            .observe_paths([ProjectPath::new("lib.rs")?])?;
+        let paths = context.validation.take_pending();
+        super::rebuild_workspace(&context, paths, super::workspace_capture()).await?;
+        context.validation.observe_whole_workspace()?;
+        let whole = context.validation.take_pending();
+        super::rebuild_workspace(&context, whole, super::workspace_capture()).await?;
+        context.validation.observe_whole_workspace()?;
+        let failing = context.validation.take_pending();
+        let refuse = |_: &std::path::Path,
+                      _: WorkspaceIndexLimits,
+                      _: &RebuildRequest|
+         -> Result<WorkspaceCandidate, rift_error::RiftError> {
+            errors::server::read_unavailable()
+                .operation("index capture")
+                .detail("the test capture refuses")
+                .fail()
+        };
+        super::rebuild_workspace(&context, failing, refuse)
+            .await
+            .expect_err("the refusing capture fails the rebuild");
+        let snapshot = recorder.metrics();
+        drop(recorder);
+
+        let unavailable = errors::server::read_unavailable::SLUG.as_str();
+        let expected = [
+            ("startup", None),
+            ("filesystem", None),
+            ("rescan", None),
+            ("rescan", Some(unavailable)),
+        ];
+        for (trigger, error_type) in expected {
+            let mut labels = vec![("index.rebuild.trigger", trigger)];
+            labels.extend(error_type.map(|error_type| ("error.type", error_type)));
+            assert_eq!(
+                series(&snapshot, "index.rebuilds", &labels),
+                Some(rift_tracing::SeriesValue::Sum(1.0)),
+                "{trigger} {error_type:?}: {snapshot:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
