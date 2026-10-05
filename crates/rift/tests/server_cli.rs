@@ -1405,6 +1405,45 @@ fn concurrent_starts_agree_on_one_elected_server() -> TestResult {
     Ok(())
 }
 
+/// A refused election names its outcome and the holder's process once `server.json`
+/// publishes it: a foreground start beside a published server leaves with
+/// `server_already_serving`, and its refusal names the holder's pid and address.
+/// Replays the refused election of the tracing plan's failure list.
+#[test]
+fn a_refused_foreground_start_names_the_published_holder() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = harness::FailureWindow::begin(root);
+    let started = rift(root, &["server", "start"])?;
+    require_success(&started, "the published server's start")?;
+    let (port, pid) = listening_facts(&stdout_of(&started))?;
+
+    let refused = rift(root, &["server", "start", "--foreground"])?;
+
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "the published server holds the election: {}",
+        harness::bounded_tail(&stderr)
+    );
+    for named in [
+        "server_already_serving".to_owned(),
+        format!("listening 127.0.0.1:{port}"),
+        format!("pid {pid}"),
+    ] {
+        assert!(
+            stderr.contains(&named),
+            "the refusal names {named:?}: {}",
+            harness::bounded_tail(&stderr)
+        );
+    }
+    let serving = serving_document(root).ok_or("the published server keeps serving")?;
+    assert_eq!(serving.pid, pid);
+    failure_window.passed();
+    Ok(())
+}
+
 /// Prints the failure window of every compiled-binary test whose process ended before its
 /// own window printed - a nextest timeout or another kill - and fails when it printed one.
 ///
