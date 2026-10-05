@@ -4572,6 +4572,7 @@ dependencies = [
  "rift-core",
  "rift-protocol",
  "rift-ranking",
+ "rift-tracing",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -4659,6 +4660,7 @@ dependencies = [
  "rift-error",
  "rift-protocol",
  "rift-ranking",
+ "rift-tracing",
  "rusqlite",
  "same-file",
  "serde_json",
@@ -4826,6 +4828,7 @@ dependencies = [
  "rift-error",
  "rift-index",
  "rift-ranking",
+ "rift-tracing",
  "rig-core",
  "serde",
  "serde_json",
@@ -4857,6 +4860,7 @@ dependencies = [
  "rift-ranking",
  "rift-search",
  "rift-syntax",
+ "rift-tracing",
  "ruff_db",
  "ruff_notebook",
  "ruff_text_size",
@@ -4886,6 +4890,7 @@ dependencies = [
  "rift-error",
  "rift-protocol",
  "rift-provider",
+ "rift-tracing",
  "serde",
  "strum",
  "tree-sitter",
@@ -4903,10 +4908,13 @@ dependencies = [
 name = "rift-tracing"
 version = "0.0.47"
 dependencies = [
+ "pin-project-lite",
  "rift-error",
  "rusqlite",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

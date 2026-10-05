@@ -76,6 +76,9 @@ opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = 
     "trace",
 ] }
 percent-encoding = "2.3.1"
+# `traced!` opens the span of an awaited operation on its first poll through a
+# pinned state machine; tokio already locks this version.
+pin-project-lite = "0.2.17"
 rayon = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
 regex = "1.12.3"

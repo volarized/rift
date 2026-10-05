@@ -21,6 +21,7 @@ rift-core.workspace = true
 rift-error.workspace = true
 rift-index.workspace = true
 rift-ranking.workspace = true
+rift-tracing.workspace = true
 rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

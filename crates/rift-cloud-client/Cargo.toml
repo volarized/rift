@@ -22,6 +22,7 @@ rift-core.workspace = true
 rift-analysis.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
+rift-tracing.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
