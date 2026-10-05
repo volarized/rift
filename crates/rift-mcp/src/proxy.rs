@@ -695,7 +695,7 @@ impl StartWindowClose {
             rounds = self.rounds,
             elapsed_ms = elapsed.as_millis(),
             presence = %self.presence,
-            repository_miss = self.repository_miss.as_ref().map(tracing::field::debug),
+            repository_miss = self.repository_miss.as_ref().map(|miss| format!("{miss:?}")),
             building = self.building,
             wrote,
             refusal = %refusal.message,
