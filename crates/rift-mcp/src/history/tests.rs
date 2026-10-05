@@ -333,8 +333,8 @@ async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> Tes
     assert_eq!(first.operation(), "history.batch");
     assert_eq!(
         first.fields(),
-        r#"{"phase":"start","pending":"2"}"#,
-        "the first batch starts with both commits of the fixture pending"
+        r#"{"phase":"start","pending":"2","root_span":{"name":"history.batch","fields":{"component":"history","operation":"history.batch"}}}"#,
+        "the first batch starts inside its span with both commits of the fixture pending"
     );
     Ok(())
 }

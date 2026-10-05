@@ -20,10 +20,10 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::registry::{LookupSpan, SpanRef};
 
 use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
-use crate::record::{LogRecord, bounded};
+use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
 
 /// Records the queue holds before a send drops one. The queue exists to absorb a burst
 /// while the drain writes; a workspace that emits more than this between two flushes is
@@ -31,12 +31,45 @@ use crate::record::{LogRecord, bounded};
 pub const LOG_QUEUE_RECORDS: usize = 4_096;
 /// Bytes of a panic payload the recorded event keeps, at most.
 pub const PANIC_PAYLOAD_BYTES_MAX: usize = 4 << 10;
-/// Bytes of one span's own fields the close record keeps, at most. A longer set is cut
-/// at a character boundary, the way a message past
-/// [`LOG_MESSAGE_BYTES_MAX`](crate::LOG_MESSAGE_BYTES_MAX) is, and the bound leaves the
-/// close record's `span` and `elapsed_ms` members room under
-/// [`LOG_FIELDS_BYTES_MAX`](crate::LOG_FIELDS_BYTES_MAX).
+/// Bytes of one span's field members a record keeps, at most: the members of the close
+/// record's own fields, and the members of the `fields` object an event record carries for
+/// the span. A member is kept whole or left out, so the fields stay a JSON object; the
+/// count of members left out follows as [`FIELDS_LEFT_OUT_MEMBER`].
 const SPAN_FIELDS_BYTES_MAX: usize = 1 << 10;
+/// The member of an event record's fields that carries the root span: the outermost span
+/// around the event.
+const ROOT_SPAN_MEMBER: &str = "root_span";
+/// The member of an event record's fields that carries the nearest span: the span the
+/// event was emitted in, when it is not the root span.
+const NEAREST_SPAN_MEMBER: &str = "nearest_span";
+/// The member that counts the field members a span's set left out at
+/// [`SPAN_FIELDS_BYTES_MAX`].
+const FIELDS_LEFT_OUT_MEMBER: &str = "fields_left_out";
+/// Field names the layer writes itself. A span or event field under one of them is not
+/// recorded, so a member the layer writes never meets a field of the same name.
+const RESERVED_FIELD_NAMES: [&str; 3] = [
+    ROOT_SPAN_MEMBER,
+    NEAREST_SPAN_MEMBER,
+    FIELDS_LEFT_OUT_MEMBER,
+];
+/// Most bytes of [`FIELDS_LEFT_OUT_MEMBER`] with its leading comma: a `u64` count prints
+/// in at most 20 digits.
+const FIELDS_LEFT_OUT_BYTES_MAX: usize = ",\"fields_left_out\":\"\"".len() + 20;
+/// Most bytes of a JSON string holding a label bounded at [`LOG_LABEL_BYTES_MAX`]: JSON
+/// writes a control character as six bytes, `\u0000`, and adds two quotes.
+const QUOTED_LABEL_BYTES_MAX: usize = 6 * LOG_LABEL_BYTES_MAX + 2;
+/// Most bytes of the object an event record carries for one span:
+/// `{"name":…,"fields":{…}}`.
+const SPAN_CONTEXT_BYTES_MAX: usize = "{\"name\":,\"fields\":{}}".len()
+    + QUOTED_LABEL_BYTES_MAX
+    + SPAN_FIELDS_BYTES_MAX
+    + FIELDS_LEFT_OUT_BYTES_MAX;
+/// Most bytes the span members add to an event record's fields: both objects, their names,
+/// and the commas before them.
+const EVENT_SPAN_MEMBERS_BYTES_MAX: usize =
+    2 * SPAN_CONTEXT_BYTES_MAX + ",\"root_span\":".len() + ",\"nearest_span\":".len();
+// Both span objects fit the record's fields bound with room left for the event's own.
+const _: () = assert!(EVENT_SPAN_MEMBERS_BYTES_MAX < LOG_FIELDS_BYTES_MAX / 4 * 3);
 
 /// The `tracing` layer that copies admitted events into the queue.
 ///
@@ -124,13 +157,8 @@ where
         };
         let mut fields = RecordedFields::default();
         attributes.record(&mut fields);
-        let members = bounded(&fields.members(), SPAN_FIELDS_BYTES_MAX);
-        span.extensions_mut().insert(SpanLabels {
-            component: fields.component,
-            operation: fields.operation,
-            fields: members,
-            opened_at: Instant::now(),
-        });
+        let labels = SpanLabels::opened(span.name(), &fields);
+        span.extensions_mut().insert(labels);
     }
 
     fn on_record(
@@ -144,10 +172,9 @@ where
         };
         let mut fields = RecordedFields::default();
         values.record(&mut fields);
-        let members = fields.members();
         let mut extensions = span.extensions_mut();
         if let Some(labels) = extensions.get_mut::<SpanLabels>() {
-            labels.extend(&members);
+            labels.extend(&fields.rest);
         }
     }
 
@@ -161,8 +188,7 @@ where
         };
         let elapsed_ms = labels.opened_at.elapsed().as_millis();
         let mut fields = String::from("{");
-        if !labels.fields.is_empty() {
-            fields.push_str(&labels.fields);
+        if labels.fields.write_into(&mut fields) {
             fields.push(',');
         }
         let _ = write!(
@@ -183,59 +209,78 @@ where
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
         let mut fields = RecordedFields::default();
         event.record(&mut fields);
-        let (component, operation) = labels(&fields, &context, event);
+        let mut members = fields.members();
+        let RecordedFields {
+            message,
+            mut component,
+            mut operation,
+            rest: _,
+        } = fields;
+        let mut nearest = None;
+        let mut root = None;
+        for span in context.event_scope(event).into_iter().flatten() {
+            let extensions = span.extensions();
+            let Some(labels) = extensions.get::<SpanLabels>() else {
+                continue;
+            };
+            if component.is_empty() {
+                component.clone_from(&labels.component);
+            }
+            if operation.is_empty() {
+                operation.clone_from(&labels.operation);
+            }
+            drop(extensions);
+            if nearest.is_none() {
+                nearest = Some(span);
+            } else {
+                root = Some(span);
+            }
+        }
+        if root.is_none() {
+            root = nearest.take();
+        }
+        push_span_member(&mut members, ROOT_SPAN_MEMBER, root.as_ref());
+        push_span_member(&mut members, NEAREST_SPAN_MEMBER, nearest.as_ref());
         self.send(LogRecord::new(
             now_ms(),
             event.metadata().level().as_str(),
             event.metadata().target(),
             &component,
             &operation,
-            &fields.message,
-            &fields.rendered(),
+            &message,
+            &format!("{{{members}}}"),
         ));
     }
 }
 
-/// The `component` and `operation` an event carries, falling back to the nearest
-/// enclosing span that names them. A span sets them once and every event inside it is
-/// filed under them, which is what makes a component read return a lane's whole story
-/// rather than the lines that repeated the label.
-fn labels<S>(
-    fields: &RecordedFields,
-    context: &Context<'_, S>,
-    event: &Event<'_>,
-) -> (String, String)
+/// Appends the object `span` keeps for the events inside it to `members`, under `member`.
+///
+/// The object was written when the span opened and when it recorded a field, so an event
+/// pays one copy of at most [`SPAN_CONTEXT_BYTES_MAX`] bytes per span member.
+fn push_span_member<'a, R>(members: &mut String, member: &str, span: Option<&SpanRef<'a, R>>)
 where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    R: LookupSpan<'a>,
 {
-    let mut component = fields.component.clone();
-    let mut operation = fields.operation.clone();
-    if !component.is_empty() && !operation.is_empty() {
-        return (component, operation);
-    }
-    let Some(scope) = context.event_scope(event) else {
-        return (component, operation);
+    let Some(span) = span else {
+        return;
     };
-    for span in scope {
-        let extensions = span.extensions();
-        let Some(labels) = extensions.get::<SpanLabels>() else {
-            continue;
-        };
-        if component.is_empty() {
-            component.clone_from(&labels.component);
-        }
-        if operation.is_empty() {
-            operation.clone_from(&labels.operation);
-        }
-        if !component.is_empty() && !operation.is_empty() {
-            break;
-        }
+    let extensions = span.extensions();
+    let Some(labels) = extensions.get::<SpanLabels>() else {
+        return;
+    };
+    if !members.is_empty() {
+        members.push(',');
     }
-    (component, operation)
+    let _ = write!(members, "\"{member}\":{}", labels.context);
 }
 
-/// The labels one span carries, kept in its extensions for the events inside it, with
-/// its remaining fields and the moment the span opened.
+/// What one span keeps in its extensions for the records written while it is open: its
+/// labels, its fields, the object the events inside it carry, and the moment it opened.
+///
+/// An event takes `component` and `operation` from the nearest span that names them when
+/// it names none itself. A span sets them once and every event inside it is filed under
+/// them, which is what makes a component read return a lane's whole story rather than the
+/// lines that repeated the label.
 ///
 /// The moment is what lets a closing span record how long it took. Stderr gets that from
 /// the fmt layer's own close line, which no other layer ever sees, so a store fed by
@@ -243,28 +288,102 @@ where
 /// question a wedged workspace raises.
 ///
 /// `fields` carries every other field the span recorded, as JSON object members, so the
-/// close record says what the span did and not only that it ended. It is cut at
-/// [`SPAN_FIELDS_BYTES_MAX`] on a character boundary.
+/// close record says what the span did and not only that it ended. `context` is the
+/// object an event record carries for the span, `{"name":…,"fields":{…}}`, its `fields`
+/// holding `component`, `operation`, and the span's other fields. Both member sets keep
+/// [`SPAN_FIELDS_BYTES_MAX`]. `context` is written when the span opens and again when it
+/// records a field, never per event.
 #[derive(Debug)]
 struct SpanLabels {
     component: String,
     operation: String,
-    fields: String,
+    fields: SpanFields,
+    context_fields: SpanFields,
+    quoted_name: String,
+    context: String,
     opened_at: Instant,
 }
 
 impl SpanLabels {
-    /// Appends `members` to the fields the close record carries, cut back to
-    /// [`SPAN_FIELDS_BYTES_MAX`] at a character boundary.
-    fn extend(&mut self, members: &str) {
-        if members.is_empty() {
+    /// The labels of the span `name` that opened with `fields`, each label cut at
+    /// [`LOG_LABEL_BYTES_MAX`] as its record column is.
+    fn opened(name: &str, fields: &RecordedFields) -> Self {
+        let component = bounded(&fields.component, LOG_LABEL_BYTES_MAX);
+        let operation = bounded(&fields.operation, LOG_LABEL_BYTES_MAX);
+        let mut context_fields = SpanFields::default();
+        for (label, value) in [("component", &component), ("operation", &operation)] {
+            if !value.is_empty() {
+                context_fields.push(label, value);
+            }
+        }
+        let mut labels = Self {
+            component,
+            operation,
+            fields: SpanFields::default(),
+            context_fields,
+            quoted_name: quoted(&bounded(name, LOG_LABEL_BYTES_MAX)),
+            context: String::new(),
+            opened_at: Instant::now(),
+        };
+        labels.extend(&fields.rest);
+        labels
+    }
+
+    /// Appends `rest` to both member sets and writes `context` again.
+    fn extend(&mut self, rest: &[(String, String)]) {
+        if rest.is_empty() && !self.context.is_empty() {
             return;
         }
-        if !self.fields.is_empty() {
-            self.fields.push(',');
+        for (name, value) in rest {
+            self.fields.push(name, value);
+            self.context_fields.push(name, value);
         }
-        self.fields.push_str(members);
-        self.fields = bounded(&self.fields, SPAN_FIELDS_BYTES_MAX);
+        self.context.clear();
+        let _ = write!(
+            self.context,
+            "{{\"name\":{},\"fields\":{{",
+            self.quoted_name
+        );
+        self.context_fields.write_into(&mut self.context);
+        self.context.push_str("}}");
+    }
+}
+
+/// One span's field members as JSON object text, without the enclosing braces, at most
+/// [`SPAN_FIELDS_BYTES_MAX`] bytes, with the count of the members left out at that bound.
+#[derive(Debug, Default)]
+struct SpanFields {
+    members: String,
+    left_out: u64,
+}
+
+impl SpanFields {
+    /// Appends the member `name`: `value` when it fits whole, and counts it left out when
+    /// it does not.
+    fn push(&mut self, name: &str, value: &str) {
+        let member = format!("{}:{}", quoted(name), quoted(value));
+        let separator = usize::from(!self.members.is_empty());
+        if self.members.len() + separator + member.len() > SPAN_FIELDS_BYTES_MAX {
+            self.left_out = self.left_out.saturating_add(1);
+            return;
+        }
+        if separator == 1 {
+            self.members.push(',');
+        }
+        self.members.push_str(&member);
+    }
+
+    /// Writes the members into `out`, then [`FIELDS_LEFT_OUT_MEMBER`] when a member was
+    /// left out. Returns whether it wrote anything.
+    fn write_into(&self, out: &mut String) -> bool {
+        out.push_str(&self.members);
+        if self.left_out > 0 {
+            if !self.members.is_empty() {
+                out.push(',');
+            }
+            let _ = write!(out, "\"{FIELDS_LEFT_OUT_MEMBER}\":\"{}\"", self.left_out);
+        }
+        !self.members.is_empty() || self.left_out > 0
     }
 }
 
@@ -293,6 +412,7 @@ impl RecordedFields {
     }
 
     /// The remaining fields as a JSON object, always well formed.
+    #[cfg(test)]
     fn rendered(&self) -> String {
         format!("{{{}}}", self.members())
     }
@@ -303,6 +423,7 @@ impl RecordedFields {
             "message" => self.message = value,
             "component" => self.component = value,
             "operation" => self.operation = value,
+            name if RESERVED_FIELD_NAMES.contains(&name) => {}
             name => self.rest.push((name.to_owned(), value)),
         }
     }
