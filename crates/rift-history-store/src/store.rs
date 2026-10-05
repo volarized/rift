@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_error::{RiftError, errors};
+use rift_tracing::Held;
 
 use crate::database::{StoreFiller, StoreReader, create_schema};
-use crate::lock::{lock_live, open_lock};
+use crate::lock::{FILL_LOCK_NAME, LIVE_LOCK_NAME, lock_live, open_lock};
 
 /// The folder inside the common git directory that holds every store file:
 /// `.rift`, the spelling of every Rift state directory.
@@ -149,7 +150,7 @@ impl SweptRevisions {
 pub struct HistoryStore {
     location: StoreLocation,
     fallback: Option<WorktreeFallback>,
-    _live: File,
+    _live: Held<File>,
 }
 
 impl HistoryStore {
@@ -220,6 +221,9 @@ impl HistoryStore {
     /// Takes the fill lock and a write connection, or `None` while another
     /// server's history task fills this store.
     ///
+    /// The attempt is recorded as `history.fill`: its outcome, and the time the
+    /// filler keeps the lock.
+    ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when the fill lock cannot be opened or tried, or
@@ -235,8 +239,8 @@ impl HistoryStore {
                 .detail(source)
                 .error()
         })?;
-        match lock.try_lock() {
-            Ok(()) => StoreFiller::open(&self.location.database(), lock).map(Some),
+        match rift_tracing::lock(FILL_LOCK_NAME).try_acquire(|| lock.try_lock().map(|()| lock)) {
+            Ok(fill) => StoreFiller::open(&self.location.database(), fill).map(Some),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(source)) => errors::history_store::folder()
                 .operation("lock fill")
@@ -324,13 +328,14 @@ impl HistoryStore {
 }
 
 /// Takes a revision's live lock at `live` exclusively; `None` while a server
-/// holds it shared.
+/// holds it shared. The attempt is recorded as `history.live` in exclusive
+/// mode, so a skip and a failure each end its wait with the outcome `refused`.
 ///
 /// std's `try_lock` separates the two outcomes: `TryLockError::WouldBlock`
 /// when the lock "is held by another handle/process", and
 /// `TryLockError::Error` for "an I/O error on the file", which never carries
 /// `ErrorKind::WouldBlock`.
-fn lock_released(live: &Path) -> Result<Option<File>, RiftError> {
+fn lock_released(live: &Path) -> Result<Option<Held<File>>, RiftError> {
     let lock = open_lock(live).map_err(|source| {
         errors::history_store::folder()
             .operation("open swept live lock")
@@ -338,8 +343,11 @@ fn lock_released(live: &Path) -> Result<Option<File>, RiftError> {
             .detail(source)
             .error()
     })?;
-    match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
+    match rift_tracing::lock(LIVE_LOCK_NAME)
+        .exclusive()
+        .try_acquire(|| lock.try_lock().map(|()| lock))
+    {
+        Ok(held) => Ok(Some(held)),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(source)) => errors::history_store::folder()
             .operation("lock swept live lock")

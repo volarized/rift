@@ -12,10 +12,16 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use rift_error::{RiftError, errors};
+use rift_tracing::Held;
 use same_file::Handle;
 
 /// Attempts one opener makes to lock a live lock a sweeper keeps replacing.
 pub(crate) const LIVE_LOCK_ATTEMPTS_MAX: usize = 3;
+/// The name the live lock's waits and holds are recorded under: shared by every
+/// server of the revision, exclusive for a sweep.
+pub(crate) const LIVE_LOCK_NAME: &str = "history.live";
+/// The name the fill lock's attempts and holds are recorded under.
+pub(crate) const FILL_LOCK_NAME: &str = "history.fill";
 
 /// Opens a lock file, creating it when absent. The file's bytes are never
 /// read: on Windows an exclusive lock blocks other processes' reads of the
@@ -32,12 +38,14 @@ pub(crate) fn open_lock(path: &Path) -> std::io::Result<File> {
 /// Takes the live lock at `path` shared, opening the path again when a sweep
 /// replaced the file between the open and the lock.
 ///
+/// The lock is recorded as `history.live` in shared mode: each attempt's wait,
+/// and the time the returned lock stays held.
 /// # Errors
 ///
 /// Returns [`RiftError`] when the lock file cannot be opened or locked, or
 /// when [`LIVE_LOCK_ATTEMPTS_MAX`] attempts each locked a file the path no
 /// longer named.
-pub(crate) fn lock_live(path: &Path) -> Result<File, RiftError> {
+pub(crate) fn lock_live(path: &Path) -> Result<Held<File>, RiftError> {
     lock_live_checked(path, &mut |_| {})
 }
 
@@ -47,7 +55,7 @@ pub(crate) fn lock_live(path: &Path) -> Result<File, RiftError> {
 pub(crate) fn lock_live_checked(
     path: &Path,
     after_lock: &mut dyn FnMut(usize),
-) -> Result<File, RiftError> {
+) -> Result<Held<File>, RiftError> {
     for attempt in 0..LIVE_LOCK_ATTEMPTS_MAX {
         let file = open_lock(path).map_err(|source| {
             errors::history_store::folder()
@@ -56,16 +64,19 @@ pub(crate) fn lock_live_checked(
                 .detail(source)
                 .error()
         })?;
-        file.lock_shared().map_err(|source| {
-            errors::history_store::folder()
-                .operation("lock live store")
-                .path(path)
-                .detail(source)
-                .error()
-        })?;
+        let held = rift_tracing::lock(LIVE_LOCK_NAME)
+            .shared()
+            .try_acquire(|| file.lock_shared().map(|()| file))
+            .map_err(|source| {
+                errors::history_store::folder()
+                    .operation("lock live store")
+                    .path(path)
+                    .detail(source)
+                    .error()
+            })?;
         after_lock(attempt);
-        if names_file(path, &file) {
-            return Ok(file);
+        if names_file(path, &held) {
+            return Ok(held);
         }
     }
     errors::history_store::lock_unstable()

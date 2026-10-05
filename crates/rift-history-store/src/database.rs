@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rift_tracing::{Held, Histogram};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 
 use crate::record::CommitRecord;
 
@@ -142,12 +143,12 @@ pub struct HeldCommit {
 #[derive(Debug)]
 pub struct StoreFiller {
     connection: Connection,
-    _fill: File,
+    _fill: Held<File>,
 }
 
 impl StoreFiller {
     /// Opens the write connection while `fill` holds the fill lock.
-    pub(crate) fn open(database: &Path, fill: File) -> Result<Self, RiftError> {
+    pub(crate) fn open(database: &Path, fill: Held<File>) -> Result<Self, RiftError> {
         Ok(Self {
             connection: connect(database)?,
             _fill: fill,
@@ -177,40 +178,32 @@ impl StoreFiller {
     /// Returns [`RiftError`] when `SQLite` refuses a statement; the batch then
     /// writes nothing.
     pub fn write_batch(&mut self, batch: &[CommitRecord]) -> Result<(), RiftError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("begin batch")
-                    .detail(source)
-                    .error()
-            })?;
-        for commit in batch {
-            let held: Option<i64> = transaction
-                .prepare_cached("SELECT row FROM commits WHERE id = ?1")
-                .and_then(|mut statement| {
-                    statement
-                        .query_row([&commit.id], |row| row.get(0))
-                        .optional()
-                })
-                .map_err(|source| {
-                    errors::history_store::database()
-                        .operation("read held commit")
-                        .detail(source)
-                        .error()
-                })?;
-            if let Some(row) = held {
-                delete_commit(&transaction, row)?;
-            }
-            write_commit(&transaction, commit)?;
-        }
-        transaction.commit().map_err(|source| {
-            errors::history_store::database()
-                .operation("commit batch")
-                .detail(source)
-                .error()
-        })
+        in_write_transaction(
+            &mut self.connection,
+            ["begin batch", "commit batch"],
+            |transaction| {
+                for commit in batch {
+                    let held: Option<i64> = transaction
+                        .prepare_cached("SELECT row FROM commits WHERE id = ?1")
+                        .and_then(|mut statement| {
+                            statement
+                                .query_row([&commit.id], |row| row.get(0))
+                                .optional()
+                        })
+                        .map_err(|source| {
+                            errors::history_store::database()
+                                .operation("read held commit")
+                                .detail(source)
+                                .error()
+                        })?;
+                    if let Some(row) = held {
+                        delete_commit(transaction, row)?;
+                    }
+                    write_commit(transaction, commit)?;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Deletes every commit outside `keep`, index entries first. Returns how
@@ -221,40 +214,31 @@ impl StoreFiller {
     /// Returns [`RiftError`] when `SQLite` refuses a statement; the trim then
     /// deletes nothing.
     pub fn trim(&mut self, keep: &BTreeSet<String>) -> Result<usize, RiftError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("begin trim")
-                    .detail(source)
-                    .error()
-            })?;
-        let held: Vec<(i64, String)> = transaction
-            .prepare_cached("SELECT row, id FROM commits")
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read held commits")
-                    .detail(source)
-                    .error()
-            })?;
-        let mut deleted = 0_usize;
-        for (row, _) in held.iter().filter(|(_, id)| !keep.contains(id)) {
-            delete_commit(&transaction, *row)?;
-            deleted += 1;
-        }
-        transaction.commit().map_err(|source| {
-            errors::history_store::database()
-                .operation("commit trim")
-                .detail(source)
-                .error()
-        })?;
-        Ok(deleted)
+        in_write_transaction(
+            &mut self.connection,
+            ["begin trim", "commit trim"],
+            |transaction| {
+                let held: Vec<(i64, String)> = transaction
+                    .prepare_cached("SELECT row, id FROM commits")
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                            .collect()
+                    })
+                    .map_err(|source| {
+                        errors::history_store::database()
+                            .operation("read held commits")
+                            .detail(source)
+                            .error()
+                    })?;
+                let mut deleted = 0_usize;
+                for (row, _) in held.iter().filter(|(_, id)| !keep.contains(id)) {
+                    delete_commit(transaction, *row)?;
+                    deleted += 1;
+                }
+                Ok(deleted)
+            },
+        )
     }
 
     /// Checks the message index against the commit rows it names: `SQLite`'s
@@ -276,6 +260,115 @@ impl StoreFiller {
                     .detail(source)
                     .error()
             })
+    }
+}
+
+/// The store's name as every signal of its database carries it, `db.namespace`.
+const DB_NAMESPACE: &str = "history";
+/// `sqlite.write_lock.wait.duration`: how long `BEGIN IMMEDIATE` waited for the write
+/// lock, with the result code as `error.type` when it failed.
+const WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+    "sqlite.write_lock.wait.duration",
+    &["db.namespace", "error.type"],
+);
+/// `sqlite.transaction.duration`: one write transaction from its begin to its commit or
+/// rollback, by `sqlite.transaction.result`.
+const TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+    "sqlite.transaction.duration",
+    &["db.namespace", "sqlite.transaction.result"],
+);
+/// `sqlite.commit.duration`: one `COMMIT`, a checkpoint it runs included.
+const COMMIT_DURATION: Histogram<1> =
+    Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+
+/// The `error.type` of a failed statement: `SQLite`'s result code for busy, `5`, and for
+/// locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
+fn error_type(failure: &rusqlite::Error) -> &'static str {
+    match failure.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy) => "5",
+        Some(rusqlite::ErrorCode::DatabaseLocked) => "6",
+        _ => "_OTHER",
+    }
+}
+
+/// Runs `body` inside one `BEGIN IMMEDIATE` transaction on `connection` and commits
+/// what it wrote; a failed `body` rolls back. `operations` name the begin and the commit
+/// in a refusal.
+///
+/// It records the wait for the write lock, the commit, and the transaction from its
+/// begin to its commit or rollback, all under `db.namespace` = `history`.
+fn in_write_transaction<Answer>(
+    connection: &mut Connection,
+    operations: [&'static str; 2],
+    body: impl FnOnce(&Transaction<'_>) -> Result<Answer, RiftError>,
+) -> Result<Answer, RiftError> {
+    let [begin_operation, commit_operation] = operations;
+    let begun;
+    let waited = rift_tracing::measure_elapsed!("sqlite.write_lock.wait", {
+        begun = connection.transaction_with_behavior(TransactionBehavior::Immediate);
+    })
+    .ok()
+    .map(|((), waited)| waited);
+    if let Some(waited) = waited {
+        let failed = begun.as_ref().err().map_or("", error_type);
+        WRITE_LOCK_WAIT
+            .labeled([DB_NAMESPACE, failed])
+            .record(waited.elapsed());
+    }
+    let transaction = begun.map_err(|source| {
+        errors::history_store::database()
+            .operation(begin_operation)
+            .detail(source)
+            .error()
+    })?;
+    let ended;
+    let lasted = rift_tracing::measure_elapsed!("sqlite.transaction", {
+        ended = finish_transaction(transaction, body, commit_operation);
+    })
+    .ok()
+    .map(|((), lasted)| lasted);
+    let (answer, result) = ended;
+    if let Some(lasted) = lasted {
+        TRANSACTION_DURATION
+            .labeled([DB_NAMESPACE, result])
+            .record(lasted.elapsed());
+    }
+    answer
+}
+
+/// Runs `body` in `transaction`, then commits it, or rolls it back when `body` fails;
+/// answers `body`'s answer, or the failure, with the `sqlite.transaction.result` it ended
+/// with. `commit` names the commit in a refusal.
+fn finish_transaction<Answer>(
+    transaction: Transaction<'_>,
+    body: impl FnOnce(&Transaction<'_>) -> Result<Answer, RiftError>,
+    commit: &'static str,
+) -> (Result<Answer, RiftError>, &'static str) {
+    let answer = match body(&transaction) {
+        Ok(answer) => answer,
+        Err(failure) => {
+            drop(transaction);
+            return (Err(failure), "rollback");
+        }
+    };
+    let committed;
+    let measured = rift_tracing::measure_elapsed!("sqlite.commit", {
+        committed = transaction.commit();
+    });
+    if let Ok(((), measured)) = measured {
+        COMMIT_DURATION
+            .labeled([DB_NAMESPACE])
+            .record(measured.elapsed());
+    }
+    match committed {
+        Ok(()) => (Ok(answer), "commit"),
+        Err(source) => (
+            errors::history_store::database()
+                .operation(commit)
+                .detail(source)
+                .fail(),
+            "rollback",
+        ),
     }
 }
 
