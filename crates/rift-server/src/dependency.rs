@@ -193,41 +193,42 @@ pub(crate) fn read_workspace_context(
     policy: ResolutionPolicy,
     libraries: &[StandardLibrary],
 ) -> DependencyContext {
-    let span = tracing::info_span!(
+    let span = rift_tracing::info_span!(
         "dependency.context",
         component = "dependency",
-        entries = tracing::field::Empty,
-        degraded = tracing::field::Empty,
+        entries = rift_tracing::empty!(),
+        degraded = rift_tracing::empty!(),
     );
-    let _entered = span.enter();
-    let mut inputs = FilesystemInputs::new(policy);
-    let mut context = rift_dependency::resolve_context(
-        root,
-        visible,
-        rift_dependency::resolvers(),
-        &mut inputs,
-        configured,
-    );
-    let request = StandardLibraryRequest {
-        root,
-        libraries,
-        execution: policy.execution,
-    };
-    context.add_standard_libraries(rift_dependency::standard_library_answer(
-        &request,
-        &mut inputs,
-    ));
-    span.record("entries", context.entries().len());
-    span.record("degraded", context.is_degraded());
-    for degradation in context.degradations() {
-        tracing::warn!(
-            component = "dependency",
-            resolver = %degradation.resolver,
-            reason = %degradation.reason,
-            "dependency context degraded"
+    span.in_scope(|| -> DependencyContext {
+        let mut inputs = FilesystemInputs::new(policy);
+        let mut context = rift_dependency::resolve_context(
+            root,
+            visible,
+            rift_dependency::resolvers(),
+            &mut inputs,
+            configured,
         );
-    }
-    context
+        let request = StandardLibraryRequest {
+            root,
+            libraries,
+            execution: policy.execution,
+        };
+        context.add_standard_libraries(rift_dependency::standard_library_answer(
+            &request,
+            &mut inputs,
+        ));
+        span.record("entries", context.entries().len());
+        span.record("degraded", context.is_degraded());
+        for degradation in context.degradations() {
+            rift_tracing::warn!(
+                component = "dependency",
+                resolver = %degradation.resolver,
+                reason = %degradation.reason,
+                "dependency context degraded"
+            );
+        }
+        context
+    })
 }
 
 #[cfg(all(test, unix))]

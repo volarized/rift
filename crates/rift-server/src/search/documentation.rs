@@ -155,7 +155,7 @@ impl<'a> JoinedLayers<'a> {
                 self.projection = projection.with_layer(layer);
             }
             Err(error) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "search",
                     operation = "search.documentation",
                     documentation,
@@ -194,56 +194,53 @@ pub(super) fn populate_sources(
     index: &WorkspaceIndex,
     resolution: Resolution<'_>,
 ) -> Vec<ReadWarning> {
-    let _span = tracing::info_span!(
-        "search.sources",
-        component = "search",
-        operation = "search.sources"
-    )
-    .entered();
-    let mut remaining = rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
-    let mut warnings = Vec::new();
-    for hit in results {
-        let SearchHitTarget::Documentation { documentation } = &hit.hit else {
-            continue;
-        };
-        let Some(content) = captured_content(index, resolution, &documentation.block.source) else {
-            warn(
-                &mut warnings,
-                &documentation.block.source,
-                DocumentationWarningKind::SourceUnavailable,
-            );
-            continue;
-        };
-        let range = &documentation.block.range;
-        let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end))
-        else {
-            continue;
-        };
-        let Some(exact) = content.get(start..end) else {
-            warn(
-                &mut warnings,
-                &documentation.block.source,
-                DocumentationWarningKind::SourceTruncated,
-            );
-            continue;
-        };
-        let mut end = exact.len().min(remaining);
-        while !exact.is_char_boundary(end) {
-            end -= 1;
+    rift_tracing::traced!(component = "search", operation = "search.sources", {
+        let mut remaining = rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
+        let mut warnings = Vec::new();
+        for hit in results {
+            let SearchHitTarget::Documentation { documentation } = &hit.hit else {
+                continue;
+            };
+            let Some(content) = captured_content(index, resolution, &documentation.block.source)
+            else {
+                warn(
+                    &mut warnings,
+                    &documentation.block.source,
+                    DocumentationWarningKind::SourceUnavailable,
+                );
+                continue;
+            };
+            let range = &documentation.block.range;
+            let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end))
+            else {
+                continue;
+            };
+            let Some(exact) = content.get(start..end) else {
+                warn(
+                    &mut warnings,
+                    &documentation.block.source,
+                    DocumentationWarningKind::SourceTruncated,
+                );
+                continue;
+            };
+            let mut end = exact.len().min(remaining);
+            while !exact.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end != 0 {
+                hit.source = Some(exact[..end].to_owned());
+            }
+            if end < exact.len() {
+                warn(
+                    &mut warnings,
+                    &documentation.block.source,
+                    DocumentationWarningKind::LimitExceeded,
+                );
+            }
+            remaining -= end;
         }
-        if end != 0 {
-            hit.source = Some(exact[..end].to_owned());
-        }
-        if end < exact.len() {
-            warn(
-                &mut warnings,
-                &documentation.block.source,
-                DocumentationWarningKind::LimitExceeded,
-            );
-        }
-        remaining -= end;
-    }
-    warnings
+        warnings
+    })
 }
 
 fn warn(
