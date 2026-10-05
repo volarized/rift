@@ -383,8 +383,9 @@ fn elapsed_ms(elapsed: Duration) -> u64 {
 }
 
 impl WalCheckpoint {
-    /// Reads the one row of three integers the pragma answers.
-    fn from_row(rows: &[Value]) -> Result<Self, RiftError> {
+    /// Reads the one row of three integers the pragma answers; a row of another shape is
+    /// the cause the caller's database failure carries.
+    fn from_row(rows: &[Value]) -> Result<Self, std::io::Error> {
         if let [Value::Record(record)] = rows
             && let [Value::I64(busy), Value::I64(log), Value::I64(checkpointed)] = record.as_slice()
         {
@@ -394,12 +395,10 @@ impl WalCheckpoint {
                 checkpointed: *checkpointed,
             });
         }
-        errors::index::lexical_storage()
-            .with(rift_error::ErrorContext::new(
-                "pragma",
-                format!("unexpected wal_checkpoint row: rows={rows:?}"),
-            ))
-            .fail()
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected wal_checkpoint row: rows={rows:?}"),
+        ))
     }
 }
 
@@ -475,8 +474,15 @@ impl WorkspaceDatabase {
             .connection()
             .await
             .map_err(|source| name.failed(database_path, source))?;
-        configure_journal(&mut connection).await?;
-        configure_connection(&mut connection, pool, ConnectionAccess::Write).await?;
+        configure_journal(&mut connection, name, database_path).await?;
+        configure_connection(
+            &mut connection,
+            name,
+            database_path,
+            pool,
+            ConnectionAccess::Write,
+        )
+        .await?;
         drop(connection);
         let _migration_report = name
             .migrations()
@@ -546,6 +552,12 @@ impl WorkspaceDatabase {
         self.pool
     }
 
+    /// A failure of this database's checkout, write turn, checkpoint, or worker stop,
+    /// naming the database and its file.
+    fn failed(&self, source: impl std::error::Error + Send + Sync + 'static) -> RiftError {
+        self.name.failed(&self.path, source)
+    }
+
     /// Checkpoints the write-ahead log, then stops the SQLite worker, both by `deadline`.
     ///
     /// The checkpoint waits for the file's write turn, sets the busy timeout of its write
@@ -597,9 +609,7 @@ impl WorkspaceDatabase {
                 );
                 Ok(())
             }
-            Err(failure) => Err(errors::index::lexical_storage()
-                .source(failure.into_error())
-                .error()),
+            Err(failure) => Err(self.failed(failure.into_error())),
         }
     }
 
@@ -652,7 +662,7 @@ impl WorkspaceDatabase {
         toasty::sql::query("PRAGMA busy_timeout = 0")
             .exec(&mut access.connection)
             .await
-            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+            .map_err(|source| self.failed(source))?;
         let started = tokio::time::Instant::now();
         let mut rows = Vec::with_capacity(2);
         for mode in ["NOOP", "TRUNCATE"] {
@@ -660,16 +670,14 @@ impl WorkspaceDatabase {
                 .column_types([Type::I64, Type::I64, Type::I64])
                 .exec(&mut access.connection)
                 .await
-                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-            rows.push(WalCheckpoint::from_row(&row)?);
+                .map_err(|source| self.failed(source))?;
+            rows.push(WalCheckpoint::from_row(&row).map_err(|source| self.failed(source))?);
         }
         let [before, truncate] = rows[..] else {
-            return errors::index::lexical_storage()
-                .with(rift_error::ErrorContext::new(
-                    "pragma",
-                    format!("unexpected wal_checkpoint rows: rows={rows:?}"),
-                ))
-                .fail();
+            return Err(self.failed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected wal_checkpoint rows: rows={rows:?}"),
+            )));
         };
         Ok(CloseCheckpoint::after(before, truncate, started.elapsed()))
     }
@@ -699,6 +707,7 @@ impl WorkspaceDatabase {
         Ok(WriteAccess {
             _turn: turn,
             connection,
+            database: self,
         })
     }
 
@@ -723,7 +732,7 @@ impl WorkspaceDatabase {
                 .database
                 .connection()
                 .await
-                .map_err(|source| errors::index::lexical_storage().source(source).error())?,
+                .map_err(|source| self.failed(source))?,
         })
     }
 
@@ -762,9 +771,8 @@ impl WorkspaceDatabase {
             CONNECTION_TIMEOUTS.labeled([pool]).add(1);
         }
         self.record_pool();
-        let mut connection = checked_out
-            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-        configure_connection(&mut connection, self.pool, access).await?;
+        let mut connection = checked_out.map_err(|source| self.failed(source))?;
+        configure_connection(&mut connection, self.name, &self.path, self.pool, access).await?;
         Ok(connection)
     }
 }
@@ -782,6 +790,8 @@ pub struct HeldConnection {
 pub(crate) struct WriteAccess<'database> {
     _turn: rift_tracing::Held<MutexGuard<'database, ()>>,
     connection: Connection,
+    /// The database whose turn this is, which a refused transaction start names.
+    database: &'database WorkspaceDatabase,
 }
 
 impl WriteAccess<'_> {
@@ -790,12 +800,13 @@ impl WriteAccess<'_> {
     /// The write lock is acquired before any read prerequisite, so a transaction never
     /// asks `SQLite` to upgrade a shared lock while another process writes.
     pub(crate) async fn transaction(&mut self) -> Result<Transaction<'_>, RiftError> {
+        let database = self.database;
         self.connection
             .transaction_builder()
             .mode(TransactionMode::Immediate)
             .begin()
             .await
-            .map_err(|source| errors::index::lexical_storage().source(source).error())
+            .map_err(|source| database.failed(source))
     }
 }
 
@@ -949,40 +960,48 @@ fn migration_lock_held(busy_timeout_ms: u32) -> std::io::Error {
     )
 }
 
-/// Selects WAL once for the database file.
-async fn configure_journal(connection: &mut Connection) -> Result<(), RiftError> {
+/// Selects WAL once for the database file `name` at `path`.
+async fn configure_journal(
+    connection: &mut Connection,
+    name: DatabaseName,
+    path: &Path,
+) -> Result<(), RiftError> {
     let journal_mode = toasty::sql::query("PRAGMA journal_mode = WAL")
         .column_types([Type::String])
         .exec(connection)
         .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        .map_err(|source| name.failed(path, source))?;
     require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])
+        .map_err(|source| name.failed(path, source))
 }
 
 /// Applies connection-local durability, lock wait, memory map, write-ahead log limit, and
 /// access policy.
 ///
 /// Every checkout sets each pragma again, one statement each, so a pooled connection
-/// answers under this pool's policy whichever checkout opened it.
+/// answers under this pool's policy whichever checkout opened it. A refused pragma names
+/// the database `name` at `path`.
 async fn configure_connection(
     connection: &mut Connection,
+    name: DatabaseName,
+    path: &Path,
     pool: DatabasePool,
     access: ConnectionAccess,
 ) -> Result<(), RiftError> {
     toasty::sql::query("PRAGMA synchronous = NORMAL")
         .exec(&mut *connection)
         .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        .map_err(|source| name.failed(path, source))?;
     let busy_timeout_ms = pool.busy_timeout_ms();
     toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
         .exec(&mut *connection)
         .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        .map_err(|source| name.failed(path, source))?;
     let mmap_bytes = pool.mmap_bytes();
     toasty::sql::query(format!("PRAGMA mmap_size = {mmap_bytes}"))
         .exec(&mut *connection)
         .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        .map_err(|source| name.failed(path, source))?;
     // `-1` is `SQLite`'s own default, no limit; a value past `i64::MAX` cannot be stored, and
     // no configuration accepts one.
     let journal_size_limit = pool
@@ -991,7 +1010,7 @@ async fn configure_connection(
     toasty::sql::query(format!("PRAGMA journal_size_limit = {journal_size_limit}"))
         .exec(&mut *connection)
         .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        .map_err(|source| name.failed(path, source))?;
     let query_only = match access {
         ConnectionAccess::Read => "ON",
         ConnectionAccess::Write => "OFF",
@@ -999,7 +1018,7 @@ async fn configure_connection(
     toasty::sql::query(format!("PRAGMA query_only = {query_only}"))
         .exec(connection)
         .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        .map_err(|source| name.failed(path, source))?;
     Ok(())
 }
 
@@ -1028,6 +1047,14 @@ mod tests {
     use crate::vector::VectorRecord;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The `database` field a storage failure carries, absent when it names none.
+    fn failed_database(error: &rift_error::RiftError) -> Option<String> {
+        error
+            .context()
+            .find(|(key, _)| *key == "database")
+            .map(|(_, value)| value)
+    }
 
     fn pool() -> DatabasePool {
         DatabasePool::new(4, 1_000)
@@ -1683,7 +1710,8 @@ mod tests {
         let waited = started.elapsed();
         let error = refused.expect_err("a read that meets a held pool refuses");
 
-        assert_eq!(error.slug().as_str(), "rift.index.lexical_storage");
+        assert_eq!(error.slug().as_str(), "rift.index.database_failed");
+        assert_eq!(failed_database(&error).as_deref(), Some("vectors"));
         let causes = rift_error::causes(&error).join(": ");
         assert!(causes.contains("waiting for a slot"), "{causes}");
         assert!(
@@ -1711,7 +1739,8 @@ mod tests {
             .hold_connection()
             .await
             .expect_err("a second hold meets no free slot");
-        assert_eq!(refused.slug().as_str(), "rift.index.lexical_storage");
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
+        assert_eq!(failed_database(&refused).as_deref(), Some("index"));
         drop(held);
         let _again = database.hold_connection().await?;
 
@@ -1787,6 +1816,23 @@ mod tests {
         crate::lexical::require_pragma_row(&tables, &[Value::I64(3)])?;
         let released = std::fs::File::open(super::migration_lock_path(&path))?;
         released.try_lock()?;
+        Ok(())
+    }
+
+    /// An open whose WAL switch meets another connection's write lock on a new file, with
+    /// no migration lock to wait on, is refused at once and names the database it opened.
+    #[tokio::test]
+    async fn a_refused_wal_switch_names_its_database() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = DatabaseName::Vectors.path(directory.path());
+        let (_writer, _writing) = hold_write_lock(&path).await?;
+
+        let refused = WorkspaceDatabase::open(&path, DatabaseName::Vectors, pool())
+            .await
+            .expect_err("a WAL switch under another connection's write lock is refused");
+
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
+        assert_eq!(failed_database(&refused).as_deref(), Some("vectors"));
         Ok(())
     }
 
@@ -2359,10 +2405,9 @@ mod tests {
         )
         .await
         .map_err(|_elapsed| "the index write kept waiting past its own busy timeout")?;
-        assert!(
-            refused.is_err(),
-            "the index write meets the held lock and refuses"
-        );
+        let refused = refused.expect_err("the index write meets the held lock and refuses");
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
+        assert_eq!(failed_database(&refused).as_deref(), Some("index"));
         Ok(())
     }
 
@@ -2559,6 +2604,10 @@ mod tests {
             fields.contains("waiting for a slot"),
             "the record names the refusal: {fields}"
         );
+        assert!(
+            fields.contains("on the index database at"),
+            "the refusal names its database: {fields}"
+        );
         Ok(())
     }
 
@@ -2735,6 +2784,8 @@ mod tests {
         let refused = database.shutdown(tokio::time::Instant::now()).await;
 
         let refused = refused.expect_err("a held worker fails a close past its deadline");
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
+        assert_eq!(failed_database(&refused).as_deref(), Some("index"));
         let causes = rift_error::causes(&refused).join(": ");
         assert!(causes.contains("exceeded deadline"), "{causes}");
         release.send(()).map_err(|()| "the held worker resumes")?;

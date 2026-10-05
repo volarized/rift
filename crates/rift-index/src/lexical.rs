@@ -56,13 +56,14 @@ use crate::change_set::{FileDigest, WorkspaceDigests};
 use crate::database::{DatabaseName, WorkspaceDatabase};
 use crate::trigram_store::{PatternCandidates, TrigramBatch};
 
-/// Returns whether one lexical storage error failed to obtain a pooled connection.
+/// Returns whether one storage error failed to obtain a pooled connection: a checkout
+/// refusal names its database through `index.database_failed`.
 ///
 /// Other storage errors remain refusals. Callers may skip this read only when the
 /// connection pool itself could not serve it.
 #[must_use]
 pub fn is_connection_unavailable(error: &RiftError) -> bool {
-    if error.slug() != errors::index::lexical_storage::SLUG {
+    if error.slug() != errors::index::database_failed::SLUG {
         return false;
     }
     std::error::Error::source(error)
@@ -2396,17 +2397,26 @@ mod tests {
 
     #[test]
     fn connection_unavailable_requires_toasty_pool_error() {
-        let pooled = errors::index::lexical_storage()
+        let path = std::path::Path::new(".rift/index");
+        let pooled = crate::DatabaseName::Index.failed(
+            path,
+            toasty::Error::connection_pool(std::io::Error::other("pool exhausted")),
+        );
+        assert!(is_connection_unavailable(&pooled));
+
+        let storage =
+            crate::DatabaseName::Index.failed(path, std::io::Error::other("disk unavailable"));
+        assert!(!is_connection_unavailable(&storage));
+
+        let lexical = errors::index::lexical_storage()
             .source(toasty::Error::connection_pool(std::io::Error::other(
                 "pool exhausted",
             )))
             .error();
-        assert!(is_connection_unavailable(&pooled));
-
-        let storage = errors::index::lexical_storage()
-            .source(std::io::Error::other("disk unavailable"))
-            .error();
-        assert!(!is_connection_unavailable(&storage));
+        assert!(
+            !is_connection_unavailable(&lexical),
+            "a pool checkout names its database; lexical code raises no pool refusal"
+        );
     }
 
     #[test]
