@@ -1321,10 +1321,9 @@ mod tests {
         let validation = &workspace.supervisor.validation;
         let stuck = tokio::spawn(std::future::pending::<()>());
         let supervisor_task = validation.task.lock().await.replace(stuck);
+        let supervisor_task = supervisor_task.ok_or("the built workspace runs its supervisor")?;
         validation.cancellation.cancel();
-        if let Some(task) = supervisor_task {
-            tokio::time::timeout(STEP_MAX, task).await??;
-        }
+        tokio::time::timeout(STEP_MAX, supervisor_task).await??;
         let idle_deadline = workspace
             .activity
             .idle_deadline(registry.idle_timeout)
@@ -1356,11 +1355,95 @@ mod tests {
         assert!(!released, "a workspace whose stop failed is not released");
         assert_eq!(failures.len(), 1, "one failed stop records one failure");
         assert_eq!(failures[0].level(), "warn");
+        let fields = failures[0].fields();
         assert!(
-            failures[0].fields().contains("index supervisor shutdown"),
-            "the record names the stage that failed: {}",
-            failures[0].fields()
+            fields.contains("index supervisor shutdown"),
+            "the record names the stage that failed: {fields}"
         );
+        Ok(())
+    }
+
+    /// A request that waits for the repository's only admission past `[server]
+    /// worker_queue_timeout` ends its wait `timeout` and is refused as a timed-out
+    /// admission.
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_wait_past_the_worker_queue_timeout_ends_timed_out_and_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        let holder = registry
+            .admit()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let refusal = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            registry.admit().await.map(drop)
+        })
+        .await
+        .expect_err("the holder keeps the only admission past the queue timeout");
+        drop(holder);
+        drop(recorder);
+
+        assert_eq!(
+            refusal,
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "repository admission timed out"
+            )
+        );
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_ADMISSION_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["outcome"], "timeout", "{wait}");
+        Ok(())
+    }
+
+    /// A workspace whose build is refused, here because another process holds its
+    /// election, answers the refusal, records it as a `warn`, and leaves no workspace
+    /// registered for the root.
+    #[tokio::test]
+    async fn a_refused_workspace_build_is_recorded_and_leaves_no_workspace_registered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let mut registry = unserved_registry(&root)?;
+        registry.common_directory = std::fs::canonicalize(root.join(".git"))?;
+        let held = crate::election::claim(&root)?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let refusal = registry
+            .service_for(&root)
+            .await
+            .map(drop)
+            .expect_err("a held election refuses the build");
+        drop(recorder);
+
+        assert_eq!(
+            refusal,
+            (
+                axum::http::StatusCode::CONFLICT,
+                "workspace already has a serving process"
+            )
+        );
+        assert!(
+            !registry.workspaces.lock().await.contains_key(&root),
+            "a refused build leaves no workspace registered"
+        );
+        let records = drain.queued_records();
+        let refused = records
+            .iter()
+            .find(|record| record.message() == "repository workspace build refused")
+            .ok_or("the refused build is recorded")?;
+        assert_eq!(refused.level(), "warn");
+        let fields: serde_json::Value = serde_json::from_str(refused.fields())?;
+        assert_eq!(
+            fields["refusal"], "workspace already has a serving process",
+            "{fields}"
+        );
+        drop(held);
         Ok(())
     }
 }

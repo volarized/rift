@@ -448,6 +448,33 @@ fn a_store_folder_the_filesystem_cannot_create_leaves_the_lane_off_and_warns() -
     Ok(())
 }
 
+/// A workspace removed after its configuration was accepted and before its store opens
+/// cannot be read as a repository: that refusal is not the unversioned case, so the
+/// lane stays off and warns.
+#[test]
+fn a_workspace_removed_before_its_store_opens_leaves_the_lane_off_and_warns() -> TestResult {
+    let directory = committed_workspace("")?;
+    let root = directory.path().to_path_buf();
+    let configuration = ConfigurationState::accept(&root);
+    let history = configuration.history_configuration();
+    let opening = OpenedStore::open(&root, &configuration, &history, ANALYZER_A);
+    fs::remove_dir_all(&root)?;
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    let opened = opening();
+    drop(recorder);
+
+    assert!(opened.is_none());
+    let records = records_at(&mut drain, "history.open");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, STORE_NOT_OPENED);
+    assert!(
+        records[0].1.contains("canonicalize workspace root"),
+        "{records:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_release_pattern_that_does_not_compile_refuses_the_configuration() -> TestResult {
     let directory = committed_workspace(
