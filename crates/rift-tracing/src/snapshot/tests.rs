@@ -89,12 +89,12 @@ fn a_histogram_prints_its_count_and_sum_changes_under_its_labels() -> TestResult
     let mut series = SnapshotSeries::default();
     values.observe(
         WAITS.instrument(),
-        ["index.write", "exclusive", "", ""],
+        ["index.write", "exclusive", "", "", "", ""],
         0.5,
     );
     values.observe(
         WAITS.instrument(),
-        ["index.write", "exclusive", "", ""],
+        ["index.write", "exclusive", "", "", "", ""],
         0.25,
     );
     let records = series.records(&values.snapshot(), false);

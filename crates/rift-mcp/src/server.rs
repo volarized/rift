@@ -62,8 +62,8 @@ use crate::history::{AnalysisGate, HistoryLane};
 use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
 use crate::metrics::{
-    Ending, MCP_SERVER_OPERATION_DURATION, McpRequest, RESOURCE_TEMPLATES_LIST, RESOURCES_LIST,
-    RESOURCES_READ, TOOLS_LIST,
+    Ending, INITIALIZE, MCP_SERVER_OPERATION_DURATION, McpRequest, PING, RESOURCE_TEMPLATES_LIST,
+    RESOURCES_LIST, RESOURCES_READ, TOOLS_LIST,
 };
 use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
@@ -4111,7 +4111,8 @@ impl ServerHandler for RiftMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let measured = McpRequest::tool_call(&request.name);
+        let measured =
+            McpRequest::tool_call(&request.name).served(context.protocol_version().as_ref());
         let span = rift_tracing::info_span!(
             "mcp.request",
             component = "mcp",
@@ -4158,11 +4159,9 @@ impl ServerHandler for RiftMcp {
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
-        McpRequest::method(TOOLS_LIST).record(
-            &MCP_SERVER_OPERATION_DURATION,
-            elapsed,
-            Ending::Answered,
-        );
+        McpRequest::method(TOOLS_LIST)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
         std::future::ready(Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -4176,7 +4175,7 @@ impl ServerHandler for RiftMcp {
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> {
         let resources;
         let elapsed = rift_tracing::measure_elapsed!("resources/list", {
@@ -4184,18 +4183,16 @@ impl ServerHandler for RiftMcp {
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
-        McpRequest::method(RESOURCES_LIST).record(
-            &MCP_SERVER_OPERATION_DURATION,
-            elapsed,
-            Ending::Answered,
-        );
+        McpRequest::method(RESOURCES_LIST)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
         std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
     }
 
     fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> {
         let templates;
         let elapsed = rift_tracing::measure_elapsed!("resources/templates/list", {
@@ -4203,18 +4200,16 @@ impl ServerHandler for RiftMcp {
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
-        McpRequest::method(RESOURCE_TEMPLATES_LIST).record(
-            &MCP_SERVER_OPERATION_DURATION,
-            elapsed,
-            Ending::Answered,
-        );
+        McpRequest::method(RESOURCE_TEMPLATES_LIST)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("resources/read", {
@@ -4230,12 +4225,52 @@ impl ServerHandler for RiftMcp {
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
-        McpRequest::method(RESOURCES_READ).record(
-            &MCP_SERVER_OPERATION_DURATION,
-            elapsed,
-            Ending::of(&answered),
-        );
+        McpRequest::method(RESOURCES_READ)
+            .served(context.protocol_version().as_ref())
+            .record(
+                &MCP_SERVER_OPERATION_DURATION,
+                elapsed,
+                Ending::of(&answered),
+            );
         answered
+    }
+
+    /// Answers as rmcp's default does: keeps the client's parameters as the peer's and
+    /// negotiates the protocol version; records the request's duration.
+    fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::InitializeResult, ErrorData>> {
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("initialize", {
+            context.peer.set_peer_info(request.clone());
+            answered = self.negotiate_initialize(&request);
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(INITIALIZE)
+            .served(context.protocol_version().as_ref())
+            .record(
+                &MCP_SERVER_OPERATION_DURATION,
+                elapsed,
+                Ending::of(&answered),
+            );
+        std::future::ready(answered)
+    }
+
+    /// Answers as rmcp's default does; records the request's duration.
+    fn ping(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> {
+        let elapsed = rift_tracing::measure_elapsed!("ping", {})
+            .ok()
+            .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(PING)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
+        std::future::ready(Ok(()))
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -6633,8 +6668,13 @@ done
 
     /// Every request the server answers lands in `mcp.server.operation.duration` under its
     /// method, its tool, and how it ended: a tool answered with `isError` as `tool_error`,
-    /// a refused read under its JSON-RPC code.
+    /// a refused read under its JSON-RPC code. Each names the session's protocol version and
+    /// the TCP transport.
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one session drives every recorded method before the snapshot is read"
+    )]
     async fn each_answered_request_records_its_server_operation_duration() -> TestResult {
         use crate::metrics::tests::recorded;
 
@@ -6671,14 +6711,37 @@ done
             ))
             .await;
         assert!(unpublished.is_err(), "an unpublished URI is refused");
+        client
+            .send_request(rmcp::model::ClientRequest::PingRequest(
+                rmcp::model::PingRequest {
+                    method: rmcp::model::PingRequestMethod,
+                    extensions: rmcp::model::Extensions::default(),
+                },
+            ))
+            .await?;
         client.cancel().await?;
         server_task.await?;
 
         let snapshot = recorder.metrics();
         let name = "mcp.server.operation.duration";
-        for method in ["tools/list", "resources/list", "resources/templates/list"] {
+        let version = (
+            "mcp.protocol.version",
+            rmcp::model::ProtocolVersion::LATEST.as_str(),
+        );
+        let transport = ("network.transport", "tcp");
+        for method in [
+            "initialize",
+            "ping",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+        ] {
             assert_eq!(
-                recorded(&snapshot, name, &[("mcp.method.name", method)]),
+                recorded(
+                    &snapshot,
+                    name,
+                    &[("mcp.method.name", method), version, transport]
+                ),
                 1,
                 "{method}: {snapshot:?}"
             );
@@ -6690,6 +6753,8 @@ done
                 &[
                     ("mcp.method.name", "tools/call"),
                     ("gen_ai.tool.name", "get_symbol"),
+                    version,
+                    transport,
                 ],
             ),
             1
@@ -6702,6 +6767,8 @@ done
                     ("mcp.method.name", "tools/call"),
                     ("gen_ai.tool.name", "search"),
                     ("error.type", "tool_error"),
+                    version,
+                    transport,
                 ],
             ),
             1
@@ -6713,6 +6780,7 @@ done
                 series.name() == name
                     && series.labels().first() == Some(&("mcp.method.name", "resources/read"))
                     && series.labels().iter().any(|(key, _)| *key == "error.type")
+                    && series.labels().ends_with(&[version, transport])
             })
             .map(|series| match series.value() {
                 rift_tracing::SeriesValue::Buckets { count, .. } => *count,

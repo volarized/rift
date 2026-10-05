@@ -26,8 +26,10 @@ use crate::sampler::ProcessSample;
 pub(crate) use values::{Labels, MetricValues};
 pub use values::{MetricSeries, MetricSnapshot, SeriesValue};
 
-/// Label keys one instrument may declare, at most.
-pub const METRIC_LABELS_MAX: usize = 4;
+/// Label keys one instrument may declare, at most: the six `mcp.server.operation.duration`
+/// names. Each recording carries this many label slots, and a thread's cached point is
+/// keyed by their addresses, so the bound sets the size of both.
+pub const METRIC_LABELS_MAX: usize = 6;
 /// Label sets one instrument keeps when its declaration names no other bound. A label set
 /// past it records into the instrument's overflow series.
 pub const METRIC_SERIES_MAX_DEFAULT: usize = 256;
