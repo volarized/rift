@@ -23,13 +23,19 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::capture::{LogSink, log_capture};
 use crate::drain::LogDrain;
+use crate::flight::{FlightLayer, FlightTable};
 use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::otlp;
-use crate::sampler::{ProcessSampler, SystemProcessReader};
+use crate::sampler::{ProcessSampler, SystemProcessReader, TickEvidence};
 use crate::stderr::BoundedStderr;
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+/// Default stderr filter: the default targets, without metric snapshot records and with
+/// only the stall reports of the table of operations in flight. Both reach the capture
+/// under its own filter.
+const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
+                                     rift_tracing::metric=off,rift_tracing::flight=warn";
 
 /// How much the process may write to its standard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +126,7 @@ impl TracingRuntime {
             capture: None,
             stderr: StderrPolicy::Unbounded,
             sample_interval: None,
+            stall_delay: None,
         }
     }
 
@@ -149,6 +156,7 @@ pub struct TracingRuntimeBuilder {
     capture: Option<String>,
     stderr: StderrPolicy,
     sample_interval: Option<Duration>,
+    stall_delay: Option<Duration>,
 }
 
 impl TracingRuntimeBuilder {
@@ -176,6 +184,17 @@ impl TracingRuntimeBuilder {
     /// runtime reads no process.
     pub const fn sample_interval(mut self, interval: Duration) -> Self {
         self.sample_interval = Some(interval);
+        self
+    }
+
+    /// Reports, on the process sampler's tick, each operation, lock wait, or held lock
+    /// that has stayed open for `delay`: once per entry, as one `WARN` record of the table
+    /// of operations in flight with the reason `stall_delay`.
+    ///
+    /// `delay` is the accepted `[logs] stall_delay` value. Without this call, or without
+    /// [`Self::sample_interval`], the runtime reports no stall.
+    pub const fn stall_delay(mut self, delay: Duration) -> Self {
+        self.stall_delay = Some(delay);
         self
     }
 
@@ -218,6 +237,7 @@ impl TracingRuntimeBuilder {
         let values = Arc::new(MetricValues::exporting(export.metrics()));
         #[cfg(not(feature = "otlp"))]
         let values = Arc::new(MetricValues::default());
+        let flights = Arc::new(FlightTable::default());
         let sampler = self.sample_interval.and_then(|interval| {
             if tokio::runtime::Handle::try_current().is_err() {
                 eprintln!("rift: warning: no Tokio runtime runs the process sampler");
@@ -227,14 +247,19 @@ impl TracingRuntimeBuilder {
                 SystemProcessReader::current(),
                 interval,
                 Arc::clone(&values),
+                TickEvidence {
+                    flights: Some(Arc::clone(&flights)),
+                    stall_delay: self.stall_delay,
+                },
             ))
         });
         tracing_subscriber::registry()
             .with(MetricLayer::new(Arc::clone(&values)))
+            .with(FlightLayer::new(Arc::clone(&flights)))
             .with(
                 stderr_layer.with_filter(stderr_filter(
                     EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
+                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_STDERR_FILTER)),
                 )),
             )
             .with(sink)

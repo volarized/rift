@@ -15,7 +15,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::now_ms;
+use crate::flight::{FlightTable, publish_stalled};
+use crate::measurement::monotonic_now;
 use crate::metrics::{Counter, Gauge, MetricValues, metrics};
+use crate::snapshot::{self, SnapshotSeries};
 
 /// The shortest interval the sampler refreshes the process at. CPU usage is the change of
 /// CPU time over the wall time between two refreshes, and `sysinfo` reads it reliably only
@@ -243,6 +246,30 @@ impl ProcessReader for SystemProcessReader {
     }
 }
 
+/// What the sampler publishes into the log stream beside each sample: the entries of the
+/// table of operations in flight open past `stall_delay`, and metric snapshot records.
+#[derive(Debug, Default)]
+pub(crate) struct TickEvidence {
+    /// The table the stall report reads; no table reports no stall.
+    pub(crate) flights: Option<Arc<FlightTable>>,
+    /// Age past which an entry is reported once; none reports no stall.
+    pub(crate) stall_delay: Option<Duration>,
+}
+
+impl TickEvidence {
+    /// Reports the stalled entries, then the metric snapshot of `values`: a snapshot
+    /// publishes when a counter moved, or when this tick reported a stall.
+    fn publish(&self, values: &MetricValues, snapshots: &mut SnapshotSeries) {
+        let stalled = match (&self.flights, self.stall_delay) {
+            (Some(flights), Some(stall_delay)) => {
+                publish_stalled(flights, monotonic_now(), stall_delay)
+            }
+            _ => false,
+        };
+        snapshot::publish(&snapshots.records(&values.snapshot(), stalled));
+    }
+}
+
 /// The running sampler: the task that ticks, and the token that stops it.
 #[derive(Debug)]
 pub(crate) struct ProcessSampler {
@@ -258,12 +285,14 @@ impl ProcessSampler {
         reader: impl ProcessReader,
         interval: Duration,
         values: Arc<MetricValues>,
+        evidence: TickEvidence,
     ) -> Self {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(sample(
             reader,
             interval.max(PROCESS_SAMPLE_INTERVAL_MIN),
             values,
+            evidence,
             cancel.clone(),
         ));
         Self { cancel, task }
@@ -285,16 +314,18 @@ impl ProcessSampler {
 }
 
 /// Ticks every `interval` until `cancel` fires: one read on the blocking pool, one
-/// published sample. A read that panics ends the sampling; the samples published before
-/// it stay.
+/// published sample, then the tick's evidence. A read that panics ends the sampling; the
+/// samples published before it stay.
 async fn sample(
     mut reader: impl ProcessReader,
     interval: Duration,
     values: Arc<MetricValues>,
+    evidence: TickEvidence,
     cancel: CancellationToken,
 ) {
     let started = Instant::now();
     let mut series = SampleSeries::default();
+    let mut snapshots = SnapshotSeries::default();
     let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -319,6 +350,7 @@ async fn sample(
         let sample = series.observe(reading, started.elapsed(), now_ms());
         sample.record_into(&values);
         values.publish_sample(sample);
+        evidence.publish(&values, &mut snapshots);
     }
 }
 

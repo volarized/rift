@@ -494,6 +494,28 @@ impl<const LABELS: usize> Histogram<LABELS> {
     }
 }
 
+impl<const LABELS: usize> Histogram<LABELS> {
+    /// Records one duration into the metric values `dispatch` holds, when it holds any;
+    /// answers whether it did. A guard dropped on another thread records through the
+    /// dispatcher its span was opened under.
+    pub(crate) fn record_in(
+        &self,
+        dispatch: &tracing::Dispatch,
+        labels: [&'static str; LABELS],
+        elapsed: Duration,
+    ) -> bool {
+        let Some(layer) = dispatch.downcast_ref::<MetricLayer>() else {
+            return false;
+        };
+        layer.values.observe(
+            &self.instrument,
+            self::labels(labels),
+            elapsed.as_secs_f64(),
+        );
+        true
+    }
+}
+
 impl Histogram<0> {
     /// Records one duration.
     pub fn record(&self, elapsed: Duration) {

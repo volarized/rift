@@ -20,6 +20,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::log_capture;
 use crate::drain::LogDrain;
+use crate::flight::{FlightLayer, FlightTable};
 use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::record::LogRecord;
 use crate::runtime::{LogFilterError, capture_layer, parsed_filter};
@@ -156,6 +157,7 @@ impl ScopedRecorderBuilder {
         let values = Arc::new(MetricValues::default());
         let subscriber = tracing_subscriber::registry()
             .with(MetricLayer::new(Arc::clone(&values)))
+            .with(FlightLayer::new(Arc::new(FlightTable::default())))
             .with(capture_layer(sink, filter));
         let recorder = ScopedRecorder {
             retained,

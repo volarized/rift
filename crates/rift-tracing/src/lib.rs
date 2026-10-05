@@ -31,6 +31,13 @@
 //! process's memory, CPU, open files, and disk bytes. [`TracingRuntime::metrics`] reads
 //! every value in process, in every build.
 //!
+//! Work still running is evidence too. Every operation, and every wait for and hold of a
+//! lock recorded through [`lock`], stays in the table of operations in flight until it
+//! closes; [`publish_in_flight`] writes the table as one record, and the process sampler
+//! reports each entry open past `[logs] stall_delay` and writes metric snapshot records,
+//! [`RecordKind::Metric`], into the same stream. [`LogQuery`] selects a window of either
+//! kind.
+//!
 //! A test captures what the code under test records through a `ScopedRecorder`, which the
 //! `fixtures` feature compiles in; dependent crates enable it from their
 //! dev-dependencies only, so a release build carries no recorder.
@@ -41,6 +48,8 @@ extern crate self as rift_tracing;
 
 mod capture;
 mod drain;
+mod flight;
+mod lock;
 mod measurement;
 mod metrics;
 mod otlp;
@@ -51,6 +60,7 @@ mod recorder;
 mod render;
 mod runtime;
 mod sampler;
+mod snapshot;
 mod span;
 mod stderr;
 mod store;
@@ -60,6 +70,8 @@ pub use capture::{
     LOG_QUEUE_RECORDS, LogSink, PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture,
 };
 pub use drain::{LOG_SETTLE_TIMEOUT, LogDrain, LogLane, RunningLogDrain, settle_for_read};
+pub use flight::{OPERATIONS_IN_FLIGHT_MAX, publish_in_flight};
+pub use lock::{Acquire, Held, Lock, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use metrics::{
     Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue,
@@ -70,7 +82,7 @@ pub use metrics::{
 pub use reads::{LogReader, LogReads};
 pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
-    LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord,
+    LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, RecordKind, StoredLogRecord,
 };
 #[cfg(any(test, feature = "fixtures"))]
 pub use recorder::{

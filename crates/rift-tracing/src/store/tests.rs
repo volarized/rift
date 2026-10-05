@@ -6,7 +6,8 @@ use tokio::time::Instant;
 
 use super::{LogStore, METRICS_SCHEMA_VERSION};
 use crate::{
-    LOG_BATCH_RECORDS_MAX, LOG_MESSAGE_BYTES_MAX, LogQuery, LogReader, LogReads, LogRecord,
+    LOG_BATCH_RECORDS_MAX, LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogReader,
+    LogReads, LogRecord, RecordKind,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -266,6 +267,118 @@ async fn a_since_read_drops_records_recorded_earlier() -> TestResult {
     assert_eq!(followed[0].record().message(), "new");
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].record().message(), "new");
+    Ok(())
+}
+
+/// A record recorded at `recorded_at_ms`, of `kind`.
+fn recorded(recorded_at_ms: i64, kind: RecordKind, message: &str) -> LogRecord {
+    let record = LogRecord::new(
+        recorded_at_ms,
+        "info",
+        "rift_tracing::metric",
+        "",
+        "process",
+        message,
+        "{}",
+    );
+    match kind {
+        RecordKind::Log => record,
+        RecordKind::Metric => record.into_metric(),
+    }
+}
+
+/// The messages and kinds of `records`, in order.
+fn kinds(records: &[crate::StoredLogRecord]) -> Vec<(&str, RecordKind)> {
+    records
+        .iter()
+        .map(|stored| (stored.record().message(), stored.record().kind()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_window_holds_records_and_snapshots_in_time_order_and_only_its_kind() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store
+        .append(
+            &[
+                recorded(99, RecordKind::Log, "before"),
+                recorded(100, RecordKind::Log, "opened"),
+                recorded(150, RecordKind::Metric, "snapshot"),
+                recorded(199, RecordKind::Log, "closed"),
+                recorded(200, RecordKind::Metric, "after"),
+            ],
+            KEEP_EVERY,
+        )
+        .await?;
+    let reads = reads(&store)?;
+    let window = LogQuery::newest(10).since_ms(100).until_ms(200);
+
+    assert_eq!(
+        kinds(&reads.following(&window.clone().of_every_kind())?),
+        [
+            ("opened", RecordKind::Log),
+            ("snapshot", RecordKind::Metric),
+            ("closed", RecordKind::Log),
+        ]
+    );
+    assert_eq!(
+        kinds(&reads.following(&window.clone())?),
+        [("opened", RecordKind::Log), ("closed", RecordKind::Log)],
+        "a read asks for log records unless it names a kind"
+    );
+    assert_eq!(
+        kinds(&reads.following(&window.of_kind(RecordKind::Metric))?),
+        [("snapshot", RecordKind::Metric)]
+    );
+    assert_eq!(
+        kinds(&reads.recent(&LogQuery::newest(1).of_kind(RecordKind::Metric))?),
+        [("after", RecordKind::Metric)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_window_pages_past_the_page_bound_and_starts_at_what_retention_kept() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    let batch_records = i64::try_from(LOG_BATCH_RECORDS_MAX)?;
+    let batch = |offset: i64| -> Vec<LogRecord> {
+        (0..batch_records)
+            .map(|index| recorded(offset + index, RecordKind::Log, "paged"))
+            .collect()
+    };
+    let retention = (2 * LOG_BATCH_RECORDS_MAX - 100) as u64;
+    store.append(&batch(0), retention).await?;
+    store.append(&batch(batch_records), retention).await?;
+    let reads = reads(&store)?;
+    let window = LogQuery::newest(LOG_PAGE_RECORDS_MAX)
+        .since_ms(0)
+        .until_ms(i64::MAX);
+
+    let mut read = Vec::new();
+    let mut after = 0;
+    for _ in 0..4 {
+        let page = reads.following(&window.clone().after(after))?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        after = last.identity();
+        read.extend(page.iter().map(|stored| stored.record().recorded_at_ms()));
+    }
+
+    assert_eq!(
+        read.len() as u64,
+        retention,
+        "the window reads every kept record"
+    );
+    assert!(read.len() > LOG_PAGE_RECORDS_MAX);
+    assert_eq!(
+        read.first(),
+        Some(&100),
+        "a window reaching before retention starts at what was kept"
+    );
+    assert!(read.windows(2).all(|pair| pair[0] < pair[1]));
     Ok(())
 }
 

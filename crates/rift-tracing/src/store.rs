@@ -39,8 +39,6 @@ const METRICS_JOURNAL_SIZE_LIMIT_BYTES: i64 = 4 << 20;
 const WRITER_THREAD_NAME: &str = "rift-db-metrics";
 /// Commands the writer's queue holds while the thread runs one.
 const WRITER_QUEUE_COMMANDS: usize = 1;
-/// The `kind` every row this store writes carries.
-const LOG_RECORD_KIND: &str = "log";
 
 /// The metrics database's tables, created when the file holds no schema version.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS log_records(
@@ -374,7 +372,7 @@ impl MetricsWriter {
                 insert
                     .execute(params![
                         last,
-                        LOG_RECORD_KIND,
+                        record.kind.label(),
                         record.recorded_at_ms,
                         record.level,
                         record.target,
