@@ -515,7 +515,9 @@ journal mode. The file carries its schema version in `PRAGMA user_version`: a wr
 
 The metrics database's bounds are compiled: `METRICS_BUSY_TIMEOUT_MS`, 1 s, and a 4 MiB
 write-ahead log limit. A log read therefore never inherits a search wait, and `rift server logs`
-reads while `rift.toml` is invalid.
+reads while `rift.toml` is invalid. The writer connection waits through a busy handler of its own
+that sleeps SQLite's own busy timeout steps, 1 s in all, and counts each call in
+`sqlite.busy.retries`.
 
 Documentation extraction lives in `rift-analysis`. Workspace and package adapters pass selected
 bytes, exact source identities, origins, and existing chunk ranges into that shared crate. Its

@@ -17,7 +17,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-use crate::metrics::{Histogram, ObservableUpDownCounter, Observation, ObservationGuard};
+use crate::metrics::{Counter, Histogram, ObservableUpDownCounter, Observation, ObservationGuard};
 use crate::reads::LogReader;
 use crate::record::{LOG_BATCH_RECORDS_MAX, LOG_KIND, LogRecord};
 
@@ -102,6 +102,61 @@ static OPERATION_DURATION: Histogram<5> = Histogram::declare(
         "error.type",
     ],
 );
+/// `sqlite.busy.retries`: calls of the writer connection's busy handler, each one a lock
+/// another connection held when the writer asked for it.
+static BUSY_RETRIES: Counter<1> =
+    Counter::declare("sqlite.busy.retries", "{retry}", &["db.namespace"]);
+/// The sleep before each retry of one busy wait, in milliseconds, by the count of earlier
+/// calls for the same lock: `sqliteDefaultBusyCallback`'s `delays` table in the bundled
+/// `SQLite` 3.53.2, the handler `sqlite3_busy_timeout` installs. A call past the table
+/// sleeps its last entry.
+const BUSY_DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+/// The sleep before each entry of [`BUSY_DELAYS_MS`], summed: the same function's `totals`.
+const BUSY_TOTALS_MS: [u64; 12] = [0, 1, 3, 8, 18, 33, 53, 78, 103, 128, 178, 228];
+
+/// How long the busy handler sleeps before retrying on its `count`-th call for one lock,
+/// with `timeout_ms` the whole wait; `None` once the wait is spent, and the statement then
+/// reports busy.
+///
+/// It is `sqliteDefaultBusyCallback`'s schedule: a registered busy handler replaces the
+/// one `sqlite3_busy_timeout` installs, so the writer keeps the same total wait only by
+/// sleeping the same steps, the last one cut so the sum equals `timeout_ms`.
+fn busy_delay(count: i32, timeout_ms: u64) -> Option<Duration> {
+    let count = usize::try_from(count).ok()?;
+    let last = BUSY_DELAYS_MS.len() - 1;
+    let (delay, prior) = if let (Some(delay), Some(prior)) =
+        (BUSY_DELAYS_MS.get(count), BUSY_TOTALS_MS.get(count))
+    {
+        (*delay, *prior)
+    } else {
+        let past = u64::try_from(count - last).unwrap_or(u64::MAX);
+        let prior = BUSY_DELAYS_MS[last]
+            .saturating_mul(past)
+            .saturating_add(BUSY_TOTALS_MS[last]);
+        (BUSY_DELAYS_MS[last], prior)
+    };
+    let delay = if prior.saturating_add(delay) > timeout_ms {
+        timeout_ms.checked_sub(prior).filter(|left| *left > 0)?
+    } else {
+        delay
+    };
+    Some(Duration::from_millis(delay))
+}
+
+/// The writer connection's busy handler: counts each call in `sqlite.busy.retries`, then
+/// sleeps the step [`busy_delay`] gives within [`METRICS_BUSY_TIMEOUT_MS`] and asks
+/// `SQLite` to retry, or, once the wait is spent, to report the database busy.
+fn retry_busy(count: i32) -> bool {
+    BUSY_RETRIES.labeled([DB_NAMESPACE]).add(1);
+    match busy_delay(count, METRICS_BUSY_TIMEOUT_MS) {
+        Some(delay) => {
+            thread::sleep(delay);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The `db.system.name` of the metrics database.
 const DB_SYSTEM: &str = "sqlite";
 /// The close statement that clears the busy handler, so the checkpoint never waits on
@@ -672,7 +727,7 @@ impl MetricsWriter {
             |operation: &str, source: rusqlite::Error| store_failure(operation, path, source);
         let mut connection = Connection::open(path).map_err(|source| failure("open", source))?;
         connection
-            .busy_timeout(METRICS_BUSY_TIMEOUT)
+            .busy_handler(Some(retry_busy))
             .map_err(|source| failure("set the busy timeout", source))?;
         connection
             .pragma_update(None, "journal_mode", "WAL")

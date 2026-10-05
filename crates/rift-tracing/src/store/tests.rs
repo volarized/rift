@@ -985,3 +985,66 @@ async fn the_close_records_each_statement_it_runs() -> TestResult {
     }
     Ok(())
 }
+
+/// The busy handler sleeps `SQLite`'s own steps, so its whole wait is the busy timeout,
+/// and gives up on the call past it.
+#[test]
+fn the_busy_handler_waits_the_busy_timeout_in_sqlites_steps() {
+    let steps: Vec<u64> = (0..)
+        .map_while(|count| super::busy_delay(count, super::METRICS_BUSY_TIMEOUT_MS))
+        .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
+        .collect();
+    assert_eq!(
+        steps[..12],
+        [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100],
+        "the first steps are SQLite's delays table"
+    );
+    assert_eq!(steps.iter().sum::<u64>(), super::METRICS_BUSY_TIMEOUT_MS);
+    assert_eq!(
+        steps.last(),
+        Some(&72),
+        "the last step is cut to the timeout"
+    );
+    assert_eq!(super::busy_delay(-1, super::METRICS_BUSY_TIMEOUT_MS), None);
+    assert_eq!(super::busy_delay(0, 0), None);
+}
+
+/// An append that meets another connection's write lock counts each busy handler call
+/// in `sqlite.busy.retries` and commits once the lock is released.
+#[tokio::test]
+async fn an_append_behind_another_writer_counts_its_busy_retries() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    let other = rusqlite::Connection::open(store.path())?;
+    other.execute_batch("BEGIN IMMEDIATE")?;
+    let retries = || {
+        let metrics = recorder.metrics();
+        match metrics
+            .find("sqlite.busy.retries", &[("db.namespace", "metrics")])
+            .map(crate::MetricSeries::value)
+        {
+            Some(SeriesValue::Sum(count)) => *count,
+            _ => 0.0,
+        }
+    };
+    let before = retries();
+
+    let behind = [record("behind")];
+    let append = store.append(&behind, KEEP_EVERY);
+    let mut append = std::pin::pin!(append);
+    let waited = Instant::now() + THREAD_WAIT_MAX;
+    while retries() <= before {
+        assert!(Instant::now() < waited, "the append never met the lock");
+        tokio::select! {
+            appended = &mut append => return Err(format!("the append passed the lock: {appended:?}").into()),
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+    other.execute_batch("COMMIT")?;
+    append.await?;
+
+    assert!(retries() > before);
+    assert_eq!(reads(&store)?.count()?, 1);
+    Ok(())
+}
