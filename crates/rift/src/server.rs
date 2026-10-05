@@ -60,8 +60,9 @@ const SERVER_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
 /// accepts and never answers costs the stop this much and no more, whatever the
 /// `OTEL_METRIC_EXPORT_TIMEOUT` and `OTEL_BSP_EXPORT_TIMEOUT` variables are set to.
 const SERVER_EXPORT_STOP_RESERVE: Duration = Duration::from_millis(500);
-/// Time the stop keeps for the stages after serving and the index and vectors close: the
-/// OTLP export, the log drain's final flush, and the metrics database's close.
+/// Time a workspace server's stop keeps for the stages after serving and the index and
+/// vectors close: the OTLP export, the log drain's final flush, and the metrics database's
+/// close.
 const SERVER_LATER_STAGES_RESERVE: Duration = SERVER_DATABASE_STOP_RESERVE
     .saturating_add(SERVER_LOG_FLUSH_RESERVE)
     .saturating_add(SERVER_EXPORT_STOP_RESERVE);
@@ -73,6 +74,13 @@ const _: () = assert!(
         + SERVER_LOG_FLUSH_RESERVE.as_millis()
         + SERVER_EXPORT_STOP_RESERVE.as_millis()
         < SERVER_STOP_DEADLINE.as_millis()
+);
+// Each mode's reserve is a share of the stop's deadline, and a repository server, which runs
+// fewer later stages, never keeps more than a workspace server.
+const _: () = assert!(
+    later_stages_reserve(false).as_millis() == SERVER_LATER_STAGES_RESERVE.as_millis()
+        && later_stages_reserve(true).as_millis() < later_stages_reserve(false).as_millis()
+        && later_stages_reserve(false).as_millis() < SERVER_STOP_DEADLINE.as_millis()
 );
 // The final log drain, aborted by the stop's deadline at the latest, leaves a five-second
 // stop request time to observe the process exit.
@@ -961,6 +969,12 @@ fn process_absent(error: &io::Error) -> bool {
 /// it. Each stage records its name, what it left of the deadline, and its
 /// error, and a failed stop leaves with the rendered error on stderr.
 ///
+/// A repository server runs only the OTLP export after serving: its workspaces' databases
+/// close inside the serving stage `repository workspaces shutdown`, and it has no log
+/// drain or metrics database of its own, so its serving stages end by
+/// [`SERVER_EXPORT_STOP_RESERVE`] before the deadline and the export ends by the deadline
+/// ([`later_stages_reserve`]).
+///
 /// A database close whose checkpoint started before its bound and outlasted it
 /// ends its stage with the outcome `timeout` and fails nothing: the thread that
 /// runs the checkpoint keeps running until it finishes or the process exits, and
@@ -1063,15 +1077,15 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    // Serving ends by every reserve before the deadline, so the later stages keep theirs.
+    // Serving ends by the reserves of the later stages this mode runs, so they keep theirs.
     let (guard, deadline, stopped, mut database) = server
-        .stopped_before_database(SERVER_STOP_DEADLINE, SERVER_LATER_STAGES_RESERVE)
+        .stopped_before_database(SERVER_STOP_DEADLINE, later_stages_reserve(repository))
         .await;
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;
     let flush_deadline = deadline - SERVER_DATABASE_STOP_RESERVE;
-    let export_deadline = flush_deadline - SERVER_LOG_FLUSH_RESERVE;
+    let export_deadline = deadline - export_stage_end_reserve(repository);
     let search = database
         .close_search(export_deadline - SERVER_EXPORT_STOP_RESERVE)
         .await;
@@ -1110,6 +1124,29 @@ fn foreground_selection(
             .fail();
     }
     Ok(Some(selected))
+}
+
+/// Time the stop keeps after serving for the later stages a server in this mode runs.
+///
+/// A workspace server (`repository` false) runs the OTLP export, the log drain's final
+/// flush, and the metrics database's close, and keeps [`SERVER_LATER_STAGES_RESERVE`]. A
+/// repository server opens no workspace storage and no log drain of its own: its index,
+/// vectors, and metrics databases belong to its workspaces and close inside the serving
+/// stage `repository workspaces shutdown`, so its only later stage is the OTLP export, and
+/// it keeps [`SERVER_EXPORT_STOP_RESERVE`].
+const fn later_stages_reserve(repository: bool) -> Duration {
+    if repository {
+        SERVER_EXPORT_STOP_RESERVE
+    } else {
+        SERVER_LATER_STAGES_RESERVE
+    }
+}
+
+/// How long before the stop's deadline the `otlp export` stage ends in this mode: the
+/// reserves of the stages after the export, which are the log drain's final flush and the
+/// metrics database's close on a workspace server and none on a repository server.
+const fn export_stage_end_reserve(repository: bool) -> Duration {
+    later_stages_reserve(repository).saturating_sub(SERVER_EXPORT_STOP_RESERVE)
 }
 
 /// Sends the OTLP export's final spans and metric points and shuts it down by `deadline`,
@@ -1579,13 +1616,15 @@ mod tests {
 
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsBound, LogsMode, LogsWindow, PRESENCE_POLL_INTERVAL,
-        ProcessExit, RunningLogDrain, SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT,
-        START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason,
-        StartMode, StartSpawns, StartedServer, TailCount, TokenCheck, await_election_released,
+        ProcessExit, RunningLogDrain, SERVER_DATABASE_STOP_RESERVE, SERVER_EXPORT_STOP_RESERVE,
+        SERVER_LOG_FLUSH_RESERVE, SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
+        STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns,
+        StartedServer, TailCount, TokenCheck, await_election_released,
         await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
-        await_stopped_with_probe, discard_stale_document, foreground_refused, logs_mode,
-        logs_query, now_ms, print_logs, request_stop, stale_reason_phrase, start_detached,
-        start_mode, status, stop, stop_log_drain, token_check,
+        await_stopped_with_probe, discard_stale_document, export_stage_end_reserve,
+        foreground_refused, later_stages_reserve, logs_mode, logs_query, now_ms, print_logs,
+        request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
+        stop_log_drain, token_check,
     };
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
@@ -1594,6 +1633,7 @@ mod tests {
         LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
     };
     use std::path::Path;
+    use std::time::Duration;
 
     /// Milliseconds in one hour, for fixture instants only.
     const MILLISECONDS_PER_HOUR: i64 = 3_600_000;
@@ -1757,6 +1797,34 @@ mod tests {
         assert_eq!(
             PRESENCE_POLL_INTERVAL * STOP_POLL_ATTEMPT_COUNT,
             STOP_WAIT_MAX
+        );
+    }
+
+    #[test]
+    fn each_mode_reserves_only_the_later_stop_stages_it_runs() {
+        // A workspace server keeps time for the export, the log flush, and the metrics close.
+        let workspace = later_stages_reserve(false);
+        assert_eq!(
+            workspace,
+            SERVER_EXPORT_STOP_RESERVE + SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE
+        );
+        assert_eq!(
+            export_stage_end_reserve(false),
+            SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE
+        );
+        // A repository server runs the export only, and the export ends at the deadline.
+        let repository = later_stages_reserve(true);
+        assert_eq!(repository, SERVER_EXPORT_STOP_RESERVE);
+        assert_eq!(export_stage_end_reserve(true), Duration::ZERO);
+        assert_eq!(
+            workspace.checked_sub(repository),
+            Some(SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE),
+            "a repository server's serving stages gain the flush and close reserves"
+        );
+        assert_eq!(
+            SERVER_STOP_DEADLINE.checked_sub(repository),
+            Some(Duration::from_millis(3_500)),
+            "a repository server's serving stages keep 3.5 s of the stop's 4 s"
         );
     }
 
