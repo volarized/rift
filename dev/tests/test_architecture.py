@@ -1,4 +1,4 @@
-"""The ownership check lists every backend import outside `rift-tracing`.
+"""The ownership check refuses every backend import and declaration outside `rift-tracing`.
 
 Each fixture is a workspace package written to disk with the Cargo metadata
 shape `cargo metadata --no-deps` returns, so the check resolves a library the
@@ -18,8 +18,10 @@ def package(
     name: str,
     dependencies: list[dict[str, Any]],
     files: dict[str, str],
+    features: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     directory = root / name
+    files = {"Cargo.toml": f'[package]\nname = "{name}"\n', **files}
     for relative, text in files.items():
         path = directory / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,11 +30,20 @@ def package(
         "name": name,
         "manifest_path": str(directory / "Cargo.toml"),
         "dependencies": dependencies,
+        "features": features or {},
     }
 
 
 def dependency(name: str, **fields: Any) -> dict[str, Any]:
-    return {"name": name, "rename": None, "kind": None, "optional": False, **fields}
+    return {
+        "name": name,
+        "rename": None,
+        "kind": None,
+        "optional": False,
+        "features": [],
+        "target": None,
+        **fields,
+    }
 
 
 def found(packages: list[dict[str, Any]]) -> set[tuple[str, str, int]]:
@@ -179,27 +190,197 @@ def test_internal_attribute_package_is_covered(tmp_path: Path) -> None:
     assert found([attributes]) == {("rift-tracing-macros", "tracing", 1)}
 
 
-def test_report_mode_summarizes_and_lists_each_package(tmp_path: Path) -> None:
+def complaints(packages: list[dict[str, Any]], resolved: str = "") -> list[str]:
+    return architecture.ownership_complaints(packages, resolved)
+
+
+def test_workspace_with_one_backend_import_fails(tmp_path: Path) -> None:
     consumer = package(
         tmp_path,
         "consumer",
-        [dependency("tracing"), dependency("log")],
-        {"src/lib.rs": "use tracing::info;\nuse log::warn;\nuse tracing::debug;\n"},
+        [dependency("tracing")],
+        {
+            "Cargo.toml": (
+                '[package]\nname = "consumer"\n\n[dependencies]\n'
+                "tracing.workspace = true\n"
+            ),
+            "src/lib.rs": "pub fn run() {}\nuse tracing::info;\n",
+        },
     )
-    lines = architecture.ownership_report(
-        [consumer], architecture.ownership_findings([consumer])
-    )
-    assert lines == [
-        "  consumer: 3 (log 1, tracing 2)",
+    source = tmp_path / "consumer" / "src" / "lib.rs"
+    manifest = tmp_path / "consumer" / "Cargo.toml"
+    assert complaints([consumer]) == [
         (
-            "ownership (report only): 3 backend imports outside rift-tracing in 1 "
-            "packages, 2 backend dependencies declared there"
+            f"consumer: {source}:2: use tracing::info;: imports tracing; use the "
+            "rift_tracing facade: traced!, measure_elapsed!, info_span!, debug_span!, "
+            "Span, and trace! through error!"
+        ),
+        (
+            f"consumer: {manifest}:5: tracing.workspace = true: declares tracing; "
+            "remove the line and use the rift_tracing facade: traced!, "
+            "measure_elapsed!, info_span!, debug_span!, Span, and trace! through error!"
         ),
     ]
 
 
-def test_report_mode_never_fails_on_findings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_clean_workspace_passes(tmp_path: Path) -> None:
+    owner = package(
+        tmp_path,
+        "rift-tracing",
+        [dependency("tracing"), dependency("tracing-subscriber")],
+        {"src/lib.rs": "pub use tracing::info;\n"},
+        {"fixtures": []},
+    )
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [
+            dependency("rift-tracing"),
+            dependency("rift-tracing", kind="dev", features=["fixtures"]),
+        ],
+        {"src/lib.rs": 'fn run() {\n    rift_tracing::info!("x");\n}\n'},
+    )
+    assert complaints([owner, consumer]) == []
+
+
+def test_dev_dependency_declaration_alone_fails(tmp_path: Path) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [dependency("tracing-subscriber", kind="dev")],
+        {
+            "Cargo.toml": (
+                '[package]\nname = "consumer"\n\n[dependencies]\n'
+                'tracing-subscriber = "0.3"\n\n[dev-dependencies]\n'
+                "tracing-subscriber.workspace = true\n"
+            ),
+            "src/lib.rs": "pub fn run() {}\n",
+        },
+    )
+    manifest = tmp_path / "consumer" / "Cargo.toml"
+    assert complaints([consumer]) == [
+        (
+            f"consumer: {manifest}:8: tracing-subscriber.workspace = true: declares "
+            "tracing-subscriber; remove the line and install through "
+            "rift_tracing::TracingRuntime, and capture in tests through "
+            "rift_tracing::ScopedRecorder"
+        )
+    ]
+
+
+def test_target_table_declaration_names_its_line(tmp_path: Path) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [dependency("opentelemetry_sdk", target="cfg(windows)")],
+        {
+            "Cargo.toml": (
+                '[package]\nname = "consumer"\n\n'
+                "[target.'cfg(windows)'.dependencies.opentelemetry_sdk]\n"
+                "workspace = true\n"
+            ),
+        },
+    )
+    manifest = tmp_path / "consumer" / "Cargo.toml"
+    assert complaints([consumer]) == [
+        (
+            f"consumer: {manifest}:4: [target.'cfg(windows)'.dependencies."
+            "opentelemetry_sdk]: declares opentelemetry_sdk; remove the line and "
+            "build with the otlp feature, which rift-tracing owns"
+        )
+    ]
+
+
+def test_hidden_expansion_machinery_is_refused(tmp_path: Path) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [dependency("rift-tracing")],
+        {
+            "src/lib.rs": (
+                "use rift_tracing::__private::tracing;\n"
+                "use rift_tracing::{\n"
+                "    info,\n"
+                "    __rift_traced_span,\n"
+                "};\n"
+                "use rift_tracing::traced;\n"
+            )
+        },
+    )
+    assert found([consumer]) == {
+        ("consumer", "rift_tracing::__private", 1),
+        ("consumer", "rift_tracing::__rift_traced_span", 4),
+    }
+    assert "which only the rift-tracing macros expand to" in complaints([consumer])[0]
+
+
+def test_fixtures_from_a_normal_dependency_is_refused(tmp_path: Path) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [
+            dependency("rift-tracing", features=["fixtures"]),
+            dependency("rift-tracing", kind="dev", features=["fixtures"]),
+        ],
+        {
+            "Cargo.toml": (
+                '[package]\nname = "consumer"\n\n[dependencies]\n'
+                'rift-tracing = { workspace = true, features = ["fixtures"] }\n\n'
+                "[dev-dependencies]\n"
+                'rift-tracing = { workspace = true, features = ["fixtures"] }\n'
+            ),
+        },
+    )
+    manifest = tmp_path / "consumer" / "Cargo.toml"
+    assert complaints([consumer]) == [
+        (
+            f"consumer: {manifest}:5: rift-tracing = {{ workspace = true, features = "
+            '["fixtures"] }: enables the rift-tracing fixtures feature outside '
+            "[dev-dependencies]; enable it from [dev-dependencies] only"
+        )
+    ]
+
+
+def test_feature_forwarding_to_fixtures_is_refused(tmp_path: Path) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [dependency("rift-tracing")],
+        {
+            "Cargo.toml": (
+                '[package]\nname = "consumer"\n\n[features]\n'
+                'testing = ["rift-tracing/fixtures"]\n'
+            ),
+        },
+        {"testing": ["rift-tracing/fixtures"]},
+    )
+    manifest = tmp_path / "consumer" / "Cargo.toml"
+    assert complaints([consumer]) == [
+        (
+            f'consumer: {manifest}:5: testing = ["rift-tracing/fixtures"]: enables '
+            "the rift-tracing fixtures feature outside [dev-dependencies]; enable it "
+            "from [dev-dependencies] only"
+        )
+    ]
+
+
+def test_fixtures_resolved_in_the_normal_graph_is_refused(tmp_path: Path) -> None:
+    resolved = (
+        "rift-tracing v0.0.47\n"
+        '└── rift-tracing feature "fixtures"\n'
+        '    └── rift-index feature "testing"\n'
+    )
+    assert complaints([], resolved) == [
+        (
+            'the normal or build graph resolves rift-tracing feature "fixtures", so a '
+            "release build carries the test recorder; enable it from "
+            "[dev-dependencies] only:\n" + resolved
+        )
+    ]
+
+
+def test_enforce_mode_fails_on_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     consumer = package(
         tmp_path,
@@ -218,6 +399,9 @@ def test_report_mode_never_fails_on_findings(
     )
     monkeypatch.setattr(architecture, "fail_test_targets", lambda _: None)
     monkeypatch.setattr(architecture, "fail_storage_independence", lambda: None)
+    monkeypatch.setattr(architecture, "resolved_fixtures", lambda: "")
 
-    assert architecture.main() == 0
-    assert "ownership (report only): 1 backend imports" in capsys.readouterr().out
+    with pytest.raises(
+        RuntimeError, match="Backend libraries are owned by rift-tracing"
+    ):
+        architecture.main()
