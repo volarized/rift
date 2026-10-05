@@ -1,15 +1,17 @@
 """Collect Rift's exported spans and metric points in memory, summarize them, and select them by time.
 
-`rift` built with `--features otlp` exports its `traced!` spans and its metrics over
-OTLP/HTTP, protobuf-encoded (`opentelemetry-otlp`'s `http-proto` feature), once
-`OTEL_EXPORTER_OTLP_ENDPOINT` names a receiver. The exporter appends `/v1/traces` and
+`rift` exports its `traced!` spans and its metrics over OTLP/HTTP, protobuf-encoded
+(`opentelemetry-otlp`'s `http-proto` feature), once `OTEL_EXPORTER_OTLP_ENDPOINT` names a
+receiver. The exporter appends `/v1/traces` and
 `/v1/metrics` to that base URL. The collector here is that receiver. It accepts
 `POST /v1/traces` and `POST /v1/metrics` and keeps, in memory:
 
-- every span received, with its name, trace and span identifiers, start and end, and
-  attributes, at most `SPANS_MAX`, and its duration for the per-operation summary;
+- every span received, with its name, trace and span identifiers, start and end,
+  attributes, and the `service.instance.id` of the process that sent it, at most
+  `SPANS_MAX`, and its duration for the per-operation summary;
 - every metric data point received, with its instrument's name, kind, and unit, its
-  attributes and resource attributes, its value (a histogram's count, sum, and buckets),
+  attributes and resource attributes, the `service.instance.id` of the process that sent
+  it, its value (a histogram's count, sum, and buckets),
   `start_time_unix_nano`, `time_unix_nano`, and aggregation temporality, at most
   `POINTS_MAX`;
 - the latest value of each metric series, for the summary `rift-dev trace-collector`
@@ -94,6 +96,8 @@ START_POLL_SECONDS = 0.005
 GRACEFUL_STOP_SECONDS = 2
 # The attribute that names a span's MCP request; a printed log record names it `req`.
 SPAN_REQUEST_KEY = "request_id"
+# The resource attribute that names the process a span or point came from.
+INSTANCE_KEY = "service.instance.id"
 # Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
 # leaves out, as received from `rift` on 2026-10-05.
 SPAN_KEYS_OMITTED = frozenset(["target", "busy_ns", "idle_ns"])
@@ -203,6 +207,17 @@ def attribute_key(attributes: Iterable[KeyValue]) -> Attributes:
     return tuple(sorted((item.key, value_text(item.value)) for item in attributes))
 
 
+def instance_of(resource: Attributes) -> str:
+    """The `service.instance.id` resource attribute that names the sending process; empty
+    when the resource carries none."""
+    return dict(resource).get(INSTANCE_KEY, "")
+
+
+def instance_text(instance: str) -> str:
+    """The `service.instance.id=<id>  ` prefix of a printed line; empty without an id."""
+    return f"{INSTANCE_KEY}={instance}  " if instance else ""
+
+
 def number_value(point: NumberDataPoint) -> float:
     """A number data point's value, whichever of `as_double` and `as_int` it set."""
     if point.WhichOneof("value") == "as_int":
@@ -247,7 +262,9 @@ class MetricPoint:
 
     `value` is a sum's or gauge's value, or a histogram's sum; `count`, `bounds`, and
     `bucket_counts` are a histogram's and stay empty otherwise. `temporality` is
-    `cumulative` or `delta` for a sum or histogram and empty for a gauge.
+    `cumulative` or `delta` for a sum or histogram and empty for a gauge. The printed line
+    names the sending process by its `service.instance.id`, so the points of two servers
+    stay apart.
     """
 
     name: str
@@ -262,6 +279,12 @@ class MetricPoint:
     count: int | None = None
     bounds: tuple[float, ...] = ()
     bucket_counts: tuple[int, ...] = ()
+
+    @property
+    def instance(self) -> str:
+        """The `service.instance.id` of the process that sent the point; empty when its
+        resource carries none."""
+        return instance_of(self.resource)
 
     def line(self) -> str:
         """The point as one line in the layout of a printed log record: time, kind,
@@ -293,6 +316,7 @@ class MetricPoint:
         context = fields_text(self.attributes)
         return (
             f"{stamp(self.time_unix_nano)} {self.kind:<9} {self.name}   "
+            + instance_text(self.instance)
             + (f"{context}  " if context else "")
             + reading
             + (f" {extra}" if extra else "")
@@ -301,7 +325,9 @@ class MetricPoint:
 
 @dataclass(frozen=True, slots=True)
 class SpanRecord:
-    """One span as received: its name, identifiers in hex, start and end, attributes."""
+    """One span as received: its name, identifiers in hex, start and end, attributes, and
+    the `service.instance.id` of the process that sent it, empty when its resource carries
+    none."""
 
     name: str
     trace_id: str
@@ -309,6 +335,7 @@ class SpanRecord:
     start_time_unix_nano: int
     end_time_unix_nano: int
     attributes: Attributes
+    instance: str = ""
 
     @property
     def duration_ms(self) -> float:
@@ -337,6 +364,7 @@ class SpanRecord:
         )
         return (
             f"{stamp(self.end_time_unix_nano)} span      {self.name}   "
+            + instance_text(self.instance)
             + (f"{context}  " if context else "")
             + f"elapsed={self.duration_ms:.3f}ms"
             + (f" records={records}" if records is not None else "")
@@ -367,6 +395,9 @@ class SpanStore:
         request = ExportTraceServiceRequest.FromString(body)
         with self.lock:
             for resource_spans in request.resource_spans:
+                instance = instance_of(
+                    attribute_key(resource_spans.resource.attributes)
+                )
                 for scope_spans in resource_spans.scope_spans:
                     for span in scope_spans.spans:
                         self.keep(
@@ -377,6 +408,7 @@ class SpanStore:
                                 start_time_unix_nano=span.start_time_unix_nano,
                                 end_time_unix_nano=span.end_time_unix_nano,
                                 attributes=attribute_key(span.attributes),
+                                instance=instance,
                             )
                         )
 

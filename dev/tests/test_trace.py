@@ -215,6 +215,47 @@ def test_the_traces_path_still_keeps_span_durations() -> None:
     }
 
 
+def test_points_and_spans_carry_the_instance_that_sent_them() -> None:
+    spans = SpanStore()
+    metrics = MetricStore()
+    app = receiver(spans, metrics)
+    instance = KeyValue(
+        key="service.instance.id",
+        value=AnyValue(string_value="627cc493-f310-47de-96bd-71410b7dec09"),
+    )
+    span_request = ExportTraceServiceRequest()
+    resource_spans = span_request.resource_spans.add()
+    resource_spans.resource.attributes.append(instance)
+    span = resource_spans.scope_spans.add().spans.add()
+    span.name = "index.build"
+    span.start_time_unix_nano = 1_000_000
+    span.end_time_unix_nano = 4_000_000
+    assert post(app, TRACES_PATH, span_request.SerializeToString()) == 200
+    metric_request = ExportMetricsServiceRequest()
+    resource_metrics = metric_request.resource_metrics.add()
+    resource_metrics.resource.attributes.append(instance)
+    metric = resource_metrics.scope_metrics.add().metrics.add()
+    metric.name = "process.memory.usage"
+    metric.sum.aggregation_temporality = AGGREGATION_TEMPORALITY_CUMULATIVE
+    point = metric.sum.data_points.add()
+    point.as_int = 4096
+    point.time_unix_nano = 2_000_000
+    assert post(app, METRICS_PATH, metric_request.SerializeToString()) == 200
+
+    (kept_span,) = spans.between(None, None)
+    (kept_point,) = metrics.between(None, None)
+    expected = "627cc493-f310-47de-96bd-71410b7dec09"
+    assert kept_span.instance == expected
+    assert kept_point.instance == expected
+    assert f"service.instance.id={expected}" in kept_span.line()
+    assert f"service.instance.id={expected}" in kept_point.line()
+    unlabeled = SpanStore()
+    request = ExportTraceServiceRequest()
+    request.resource_spans.add().scope_spans.add().spans.add().name = "index.build"
+    unlabeled.record(request.SerializeToString())
+    assert "service.instance.id" not in unlabeled.between(None, None)[0].line()
+
+
 def test_a_body_past_the_bound_is_refused_and_counted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
