@@ -4516,7 +4516,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tracing",
  "unicode-width",
  "waitpid-any",
  "windows-sys 0.59.0",
@@ -4744,8 +4743,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-service",
- "tracing",
- "tracing-subscriber",
  "windows-spawn",
 ]
 
@@ -4861,8 +4858,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
  "ty_ide",
  "ty_project",
  "ty_python_core",
