@@ -114,7 +114,7 @@ pub(crate) async fn serve_repository_http(
     ));
     let repository_idle_watch =
         tokio::spawn(watch_repository_idle(Arc::clone(&registry), stop.clone()));
-    tracing::info!(
+    rift_tracing::info!(
         component = "mcp",
         transport = "http",
         port,
@@ -297,7 +297,7 @@ impl RepositoryWorkspaceRegistry {
         let elapsed_ms = started.elapsed().as_millis();
         match workspace {
             Ok(_) => {
-                tracing::info!(
+                rift_tracing::info!(
                     component = "mcp",
                     root = %root.display(),
                     elapsed_ms,
@@ -306,7 +306,7 @@ impl RepositoryWorkspaceRegistry {
                 self.active_service(&root, &cell).await
             }
             Err(error) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     root = %root.display(),
                     elapsed_ms,
@@ -479,7 +479,7 @@ impl RepositoryWorkspaceRegistry {
             if let Err(error) =
                 stop_repository_workspace(&workspace, Instant::now() + WORKSPACE_STOP_BOUND).await
             {
-                tracing::warn!(component = "mcp", %error, "changed workspace settings shutdown failed");
+                rift_tracing::warn!(component = "mcp", %error, "changed workspace settings shutdown failed");
             }
         }
         Ok(workspace)
@@ -580,13 +580,13 @@ impl RepositoryWorkspaceRegistry {
             drop(workspaces);
             let started = Instant::now();
             let deadline = started + WORKSPACE_STOP_BOUND;
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 root = %root.display(),
                 "idle workspace shutdown started"
             );
             if let Err(error) = stop_repository_workspace(workspace, deadline).await {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     %error,
                     root = %root.display(),
@@ -596,7 +596,7 @@ impl RepositoryWorkspaceRegistry {
                 continue;
             }
             self.workspaces.lock().await.remove(&root);
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 root = %root.display(),
                 elapsed_ms = started.elapsed().as_millis(),
@@ -784,7 +784,7 @@ mod tests {
             + registry.idle_timeout
             + super::IDLE_EVICTION_TICK
             + super::WORKSPACE_STOP_BOUND * expired_roots;
-        tracing::info!("keep-alive requests started");
+        rift_tracing::info!("keep-alive requests started");
         loop {
             let _ = repository_symbol(server, kept, symbol).await?;
             let (retained_roots, states) = retained_workspaces(registry).await;

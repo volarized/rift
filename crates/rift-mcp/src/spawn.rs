@@ -116,7 +116,7 @@ fn stderr_destination(root: &Path) -> Option<File> {
     match stderr_file(root) {
         Ok(file) => Some(file),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "mcp",
                 path = %stderr_file_path(root).display(),
                 %error,
@@ -480,7 +480,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) if self.is_spent() => {
                 let spawn_count = self.spawn_count;
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     spawn_count,
                     "the spawn count is spent; the start window passes as a wait"
@@ -488,7 +488,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                 SpawnPollOutcome::Waiting
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) => {
-                tracing::info!(
+                rift_tracing::info!(
                     component = "mcp",
                     "no process holds the election the spawned server lost; spawning again"
                 );
@@ -505,7 +505,7 @@ impl<Spawned: StartedServer> SpawnWatch<Spawned> {
     /// printed.
     fn observed(exit: StartExit<Spawned::Failure>) -> Self {
         if let StartExit::LostElection { stderr } = &exit {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 stderr = %stderr,
                 "the spawned server lost the start election"
@@ -521,7 +521,7 @@ impl StartSpawns<StartupCapture> {
     /// server its chance.
     pub(crate) fn spawn_captured(&mut self, root: &Path) {
         if let Err(error) = self.spawn(|| spawn_detached_server_with_captured_stderr(root)) {
-            tracing::warn!(component = "mcp", %error, "detached server spawn failed");
+            rift_tracing::warn!(component = "mcp", %error, "detached server spawn failed");
         }
     }
 }

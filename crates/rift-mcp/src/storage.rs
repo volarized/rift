@@ -145,7 +145,7 @@ async fn state_directory(root: &Path) -> Option<std::path::PathBuf> {
         Ok(()) => Some(state_directory),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Some(state_directory),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "storage",
                 operation = "database.open",
                 path = %state_directory.display(),
@@ -168,7 +168,7 @@ async fn open_log_store(
         Ok(logs) => Some(Arc::new(logs)),
         Err(error) => {
             let causes = causes(&error).join(": ");
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "storage",
                 operation = "database.open",
                 path = %metrics_path.display(),
@@ -199,7 +199,7 @@ async fn open_index_database(
         Ok(database) => Some(database),
         Err(error) => {
             let causes = causes(&error).join(": ");
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "storage",
                 operation = "database.open",
                 path = %database_path.display(),

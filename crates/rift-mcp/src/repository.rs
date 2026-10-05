@@ -106,7 +106,7 @@ pub fn select_server_configuration(
     let authority_server = authority.server;
     if authority_server != workspace_server {
         let keys = differing_server_keys(&authority_server, &workspace_server);
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             operation = "server.selection",
             authority = %authority_root.display(),
@@ -119,7 +119,7 @@ pub fn select_server_configuration(
     if process_settings
         .is_some_and(|recorded| recorded != &authority_server || recorded != &workspace_server)
     {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             operation = "server.selection",
             authority = %authority_root.display(),

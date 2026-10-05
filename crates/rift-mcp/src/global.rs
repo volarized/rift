@@ -1323,19 +1323,19 @@ impl RouteState {
 
 fn log_service_transition(state: RouteState) {
     match state {
-        RouteState::Disabled => tracing::info!(
+        RouteState::Disabled => rift_tracing::info!(
             component = "global",
             operation = "global.state",
             state = "not_configured",
             "global service state changed"
         ),
-        RouteState::Available => tracing::info!(
+        RouteState::Available => rift_tracing::info!(
             component = "global",
             operation = "global.state",
             state = "available",
             "global service state changed"
         ),
-        RouteState::Unavailable { class, .. } => tracing::warn!(
+        RouteState::Unavailable { class, .. } => rift_tracing::warn!(
             component = "global",
             operation = "global.state",
             state = "unavailable",

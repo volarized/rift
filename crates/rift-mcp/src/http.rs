@@ -141,7 +141,7 @@ pub(crate) async fn serve_http_with_storage(
     check: TokenCheck,
     checkout: BuildCheckout,
 ) -> Result<HttpServer, RiftError> {
-    tracing::info!(component = "mcp", transport = "http", "MCP server starting");
+    rift_tracing::info!(component = "mcp", transport = "http", "MCP server starting");
     let logs = storage.logs();
     let server = RiftMcp::build_with_storage(root, limits, storage, checkout).await?;
     let identity = server.product_identity().clone();
@@ -155,7 +155,7 @@ pub(crate) async fn serve_http_with_storage(
     let stop = shutdown.child_token();
     let idle = server.request_activity();
     if matches!(check, TokenCheck::Skipped) {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             transport = "http",
             "the bearer token check is off for this run: every loopback request is answered"
@@ -168,7 +168,7 @@ pub(crate) async fn serve_http_with_storage(
             .into_future(),
     );
     let idle_watch = tokio::spawn(watch_idle(idle, idle_timeout, stop.clone()));
-    tracing::info!(
+    rift_tracing::info!(
         component = "mcp",
         transport = "http",
         port,
@@ -255,7 +255,7 @@ impl DeferredDatabaseShutdown {
         };
         stop_stage("SQLite worker shutdown", deadline, async {
             search_index.shutdown(deadline).await.map_err(|error| {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "storage",
                     operation = "database.close",
                     %error,
@@ -304,15 +304,15 @@ pub async fn stop_stage<Value>(
     deadline: Instant,
     work: impl std::future::Future<Output = Result<Value, RiftError>>,
 ) -> Result<Value, RiftError> {
-    rift_core::traced_async!(
+    rift_tracing::traced!(
         component = "mcp",
         operation = "server.stop",
         stage = stage,
-        {
+        async move {
             let outcome = work.await;
             let remaining = deadline.saturating_duration_since(Instant::now());
             match &outcome {
-                Ok(_) => tracing::info!(
+                Ok(_) => rift_tracing::info!(
                     component = "mcp",
                     operation = "server.stop",
                     stage,
@@ -322,7 +322,7 @@ pub async fn stop_stage<Value>(
                 ),
                 Err(error) => {
                     let causes = rift_error::causes(error).join(": ");
-                    tracing::warn!(
+                    rift_tracing::warn!(
                         component = "mcp",
                         operation = "server.stop",
                         stage,
@@ -351,7 +351,7 @@ pub(crate) async fn close_logs(
                 logs.close(deadline)
                     .await
                     .map(|checkpoint| {
-                        tracing::info!(
+                        rift_tracing::info!(
                             component = "storage",
                             operation = "database.close",
                             database = "metrics",
@@ -451,7 +451,7 @@ impl HttpServer {
         // The stop's deadline starts where the stop began: one derived where
         // the server began listening is already spent when the stop arrives.
         let deadline = Instant::now() + budget;
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             operation = "server.stop",
             ?budget,
@@ -524,7 +524,7 @@ impl HttpServer {
                 && serve_result.is_ok()
                 && engines_stopped,
         );
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             transport = "http",
             outcome,
