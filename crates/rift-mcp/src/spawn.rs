@@ -95,12 +95,39 @@ fn detached_command(root: &Path) -> Result<Command, io::Error> {
 /// child's stderr is discarded, so a full or read-only `.rift` never stops
 /// a start.
 pub fn spawn_detached_server(root: &Path) -> Result<SpawnedServer, io::Error> {
-    let mut command = detached_command(root)?;
+    spawn_with_stderr_file(detached_command(root)?, root)
+}
+
+/// Spawns `command` detached, with its stderr on the workspace's
+/// [`SERVER_STDERR_FILE_NAME`] below `root`, or discarded when that file
+/// cannot be created.
+fn spawn_with_stderr_file(mut command: Command, root: &Path) -> Result<SpawnedServer, io::Error> {
     let destination = stderr_destination(root);
     let stderr = destination.is_some().then(|| stderr_file_path(root));
     command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
     let child = spawn_detached(&mut command)?;
+    record_spawn(child.id(), if stderr.is_some() { "file" } else { "null" });
     Ok(SpawnedServer { child, stderr })
+}
+
+/// Records one detached server this process spawned: its process identifier and where
+/// each standard stream goes. The child inherits none of this process's streams: stdin
+/// and stdout are null, and stderr is `file`, `piped`, or `null`.
+fn record_spawn(pid: u32, stderr: &'static str) {
+    rift_tracing::info!(
+        component = "mcp",
+        pid,
+        stdin = "null",
+        stdout = "null",
+        stderr,
+        "detached server spawned"
+    );
+}
+
+/// Records that the detached server `pid` exited, with its exit code when this process
+/// waited for it and the platform reported one.
+fn record_exit(pid: Option<u32>, exit_code: Option<i32>) {
+    rift_tracing::info!(component = "mcp", pid, exit_code, "spawned server exited");
 }
 
 /// The path of the detached server's standard error file below `root`.
@@ -180,12 +207,15 @@ pub(crate) fn spawn_detached_server_with_captured_stderr(
     let mut command = detached_command(root)?;
     command.stderr(Stdio::piped());
     let mut child = spawn_detached(&mut command)?;
+    record_spawn(child.id(), "piped");
     let Some(stderr) = child.stderr.take() else {
         return Err(io::Error::other(
             "the spawned server's stderr pipe was not handed over",
         ));
     };
-    Ok(StartupCapture::spawn(stderr))
+    let mut capture = StartupCapture::spawn(stderr);
+    capture.pid = Some(child.id());
+    Ok(capture)
 }
 
 /// A spawned server's captured standard error, read on a background
@@ -210,6 +240,8 @@ pub(crate) fn spawn_detached_server_with_captured_stderr(
 #[derive(Debug)]
 pub(crate) struct StartupCapture {
     drain: Option<std::thread::JoinHandle<CapturedStream>>,
+    /// The spawned server's process identifier, when a spawn started the capture.
+    pid: Option<u32>,
 }
 
 impl StartupCapture {
@@ -219,6 +251,7 @@ impl StartupCapture {
             drain: Some(std::thread::spawn(move || {
                 drain_until_closed(stream, STARTUP_STDERR_CAPTURE_BYTES)
             })),
+            pid: None,
         }
     }
 
@@ -322,6 +355,7 @@ impl StartedServer for StartupCapture {
     /// The capture's end-of-file is the exit: the server closed its stderr.
     fn observed_exit(&mut self) -> Option<StartExit<CapturedStream>> {
         let capture = self.exited()?;
+        record_exit(self.pid, None);
         Some(StartExit::classified(capture.text.clone(), capture))
     }
 }
@@ -333,9 +367,12 @@ impl StartedServer for SpawnedServer {
     /// The child's exit status is the exit, and the tail of the stderr file
     /// this start truncated for it names the cause.
     fn observed_exit(&mut self) -> Option<StartExit<u32>> {
-        if self.is_running() {
-            return None;
-        }
+        let exit_code = match self.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status.code(),
+            Err(_) => None,
+        };
+        record_exit(Some(self.pid()), exit_code);
         let stderr = self.stderr.as_deref().map(stderr_tail).unwrap_or_default();
         Some(StartExit::classified(stderr, self.pid()))
     }
@@ -528,8 +565,6 @@ impl StartSpawns<StartupCapture> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::process::Stdio;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -552,14 +587,8 @@ mod tests {
     /// workspace's stderr file.
     #[cfg(unix)]
     fn spawn_detached_script(root: &std::path::Path, script: &str) -> TestResult<SpawnedServer> {
-        let mut command = super::detached_command_for("sh", ["-c", script], root);
-        let destination = super::stderr_destination(root);
-        let stderr = destination.is_some().then(|| stderr_file_path(root));
-        command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
-        Ok(SpawnedServer {
-            child: super::spawn_detached(&mut command)?,
-            stderr,
-        })
+        let command = super::detached_command_for("sh", ["-c", script], root);
+        Ok(super::spawn_with_stderr_file(command, root)?)
     }
 
     /// Runs `script` as [`spawn_detached_script`] does and waits for it to exit.
@@ -592,6 +621,37 @@ mod tests {
             "second start\n",
             "each start truncates the file"
         );
+        Ok(())
+    }
+
+    /// A spawn records the child's process identifier and where each of its standard
+    /// streams goes, and its observed exit records the same identifier and its exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_child_records_its_spawn_and_its_exit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let mut spawned = run_detached_script(directory.path(), "exit 3")?;
+        assert!(spawned.observed_exit().is_some(), "the script exited");
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let fields_of = |message: &str| -> TestResult<serde_json::Value> {
+            let mut found = records.iter().filter(|record| record.message() == message);
+            let record = found.next().ok_or(format!("{message}: {records:?}"))?;
+            assert!(found.next().is_none(), "one {message} record");
+            assert_eq!(record.level(), "info");
+            Ok(serde_json::from_str(record.fields())?)
+        };
+        let pid = spawned.pid().to_string();
+        let spawn = fields_of("detached server spawned")?;
+        assert_eq!(spawn["pid"], pid, "{spawn}");
+        assert_eq!(spawn["stdin"], "null", "{spawn}");
+        assert_eq!(spawn["stdout"], "null", "{spawn}");
+        assert_eq!(spawn["stderr"], "file", "{spawn}");
+        let exit = fields_of("spawned server exited")?;
+        assert_eq!(exit["pid"], pid, "{exit}");
+        assert_eq!(exit["exit_code"], "3", "{exit}");
         Ok(())
     }
 
