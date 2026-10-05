@@ -22,31 +22,60 @@ pub(crate) type Labels = [&'static str; METRIC_LABELS_MAX];
 pub(crate) struct MetricValues {
     instruments: Mutex<HashMap<&'static str, InstrumentValues>>,
     sample: Mutex<Option<ProcessSample>>,
+    #[cfg(feature = "otlp")]
+    export: Option<crate::otlp::MetricExport>,
 }
 
 impl MetricValues {
+    /// Values that also forward every recording to `export`, when it exists.
+    #[cfg(feature = "otlp")]
+    pub(crate) fn exporting(export: Option<crate::otlp::MetricExport>) -> Self {
+        Self {
+            export,
+            ..Self::default()
+        }
+    }
+
+    /// Forwards one recording to the OTLP export, outside the series lock.
+    #[cfg(feature = "otlp")]
+    fn forward(&self, instrument: &Instrument, labels: &Labels, overflow: bool, value: f64) {
+        if let Some(export) = &self.export {
+            export.record(instrument, labels, overflow, value);
+        }
+    }
+
+    /// Without the `otlp` feature a recording stays in process.
+    #[cfg(not(feature = "otlp"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "a build without the otlp feature forwards nowhere"
+    )]
+    const fn forward(&self, _: &Instrument, _: &Labels, _: bool, _: f64) {}
+
     /// Adds `value` to the counter series `labels` names.
     pub(crate) fn add(&self, instrument: &Instrument, labels: Labels, value: f64) {
-        self.update(instrument, labels, |point| {
+        let overflow = self.update(instrument, labels, |point| {
             if let Point::Sum(sum) = point {
                 *sum += value;
             }
         });
+        self.forward(instrument, &labels, overflow, value);
     }
 
     /// Sets the gauge series `labels` names to `value`.
     pub(crate) fn set(&self, instrument: &Instrument, labels: Labels, value: f64) {
-        self.update(instrument, labels, |point| {
+        let overflow = self.update(instrument, labels, |point| {
             if let Point::Last(last) = point {
                 *last = value;
             }
         });
+        self.forward(instrument, &labels, overflow, value);
     }
 
     /// Counts `value` into the histogram series `labels` names.
     pub(crate) fn observe(&self, instrument: &Instrument, labels: Labels, value: f64) {
         let boundaries = instrument.boundaries();
-        self.update(instrument, labels, |point| {
+        let overflow = self.update(instrument, labels, |point| {
             if let Point::Buckets(buckets) = point {
                 buckets.count += 1;
                 buckets.sum += value;
@@ -54,6 +83,7 @@ impl MetricValues {
                 buckets.counts[bucket] += 1;
             }
         });
+        self.forward(instrument, &labels, overflow, value);
     }
 
     /// Runs `update` on the point of the series `labels` names, creating it, or on the
