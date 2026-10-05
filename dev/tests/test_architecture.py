@@ -405,3 +405,65 @@ def test_enforce_mode_fails_on_findings(
         RuntimeError, match="Backend libraries are owned by rift-tracing"
     ):
         architecture.main()
+
+
+def clock_found(packages: list[dict[str, Any]]) -> set[tuple[str, str, int]]:
+    return {
+        (finding.package, Path(finding.path).name, finding.line)
+        for finding in architecture.clock_findings(packages)
+    }
+
+
+def test_a_clock_read_in_an_unlisted_file_is_refused(tmp_path: Path) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [],
+        {
+            "src/lib.rs": (
+                "fn run() {\n"
+                "    let started = std::time::Instant::now();\n"
+                "    let wall = SystemTime::now().duration_since(UNIX_EPOCH);\n"
+                "    let took = started.elapsed();\n"
+                "}\n"
+            )
+        },
+    )
+    assert clock_found([consumer]) == {
+        ("consumer", "lib.rs", 2),
+        ("consumer", "lib.rs", 3),
+        ("consumer", "lib.rs", 4),
+    }
+    with pytest.raises(RuntimeError, match=r"lib\.rs:2: .*Instant::now"):
+        architecture.fail_clocks([consumer])
+
+
+def test_a_listed_file_a_test_suite_and_rift_tracing_may_read_clocks(
+    tmp_path: Path,
+) -> None:
+    read = "fn run() {\n    let started = Instant::now();\n}\n"
+    listed = package(tmp_path, "rift-lsp", [], {"src/session.rs": read})
+    suite = package(tmp_path, "consumer", [], {"tests/wait.rs": read})
+    owner = package(tmp_path, "rift-tracing", [], {"src/clock.rs": read})
+    assert clock_found([listed, suite, owner]) == set()
+    architecture.fail_clocks([listed, suite, owner])
+
+
+def test_a_clock_name_in_a_comment_or_another_identifier_is_not_a_read(
+    tmp_path: Path,
+) -> None:
+    consumer = package(
+        tmp_path,
+        "consumer",
+        [],
+        {
+            "src/lib.rs": (
+                "// Instant::now() in prose\\n"
+                "fn run(instant: u8) -> u8 {\n"
+                "    let _ = instant;\n"
+                "    MyInstant::new()\n"
+                "}\n"
+            ).replace("\\n", "\n")
+        },
+    )
+    assert clock_found([consumer]) == set()

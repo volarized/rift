@@ -619,6 +619,87 @@ def fail_ownership(packages: list[dict[str, Any]]) -> None:
         )
 
 
+# A clock read outside `rift-tracing`: a monotonic or wall-clock `now`, the Unix epoch,
+# and an elapsed read. Telemetry reads them only through `rift-tracing`; a domain
+# deadline, retry, expiry, or pacing decision keeps its own read, and it is listed here.
+CLOCK_READ = re.compile(
+    r"\b(?:Instant|SystemTime|Timestamp|Zoned)\s*::\s*now\b"
+    r"|\bUNIX_EPOCH\b"
+    r"|\.elapsed\s*\(\)"
+)
+# The reviewed inventory: path under `crates/` -> the domain decision that owns the reads.
+# Files under a `tests` directory and `tests.rs` files prove deadline and pacing
+# behavior and are allowed by path (`clock_allowed`).
+CLOCK_INVENTORY = {
+    "rift-mcp/src/server.rs": "reconciliation capture time; request admission subtracts it",
+    "rift-mcp/src/history.rs": "analysis time that enforces the configured CPU share",
+    "rift-mcp/src/election.rs": "election deadlines",
+    "rift-mcp/src/proxy.rs": "proxy startup deadlines",
+    "rift-lsp/src/session.rs": "language server readiness and idle expiry",
+    "rift-server/src/process.rs": "child-process wait deadlines",
+    "rift-cloud-client/src/lib.rs": "cache expiry and the request deadline",
+    "rift/src/update.rs": "updater cleanup deadlines",
+    "rift-index/src/database_thread.rs": (
+        "startup, queue, shutdown, and connection-reaping timers"
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ClockFinding:
+    """One clock read in a file the inventory does not list."""
+
+    package: str
+    path: str
+    line: int
+    text: str
+
+
+def clock_allowed(package: str, relative: pathlib.PurePath) -> bool:
+    """Whether the inventory lists a file, or the file is a test suite."""
+    return (
+        f"{package}/{relative.as_posix()}" in CLOCK_INVENTORY
+        or "tests" in relative.parts[:-1]
+        or relative.name == "tests.rs"
+    )
+
+
+def clock_findings(packages: list[dict[str, Any]]) -> list[ClockFinding]:
+    """List each clock read outside `rift-tracing` in a file the inventory omits."""
+    findings: list[ClockFinding] = []
+    for package in packages:
+        if package["name"] == TRACING_OWNER:
+            continue
+        root = pathlib.Path(package["manifest_path"]).parent
+        for path in rust_sources(package):
+            if clock_allowed(package["name"], path.relative_to(root)):
+                continue
+            code = rust_code_lines(path.read_text(encoding="utf-8"))
+            findings.extend(
+                ClockFinding(package["name"], str(path), number, line.strip())
+                for number, line in code
+                if CLOCK_READ.search(line)
+            )
+    return findings
+
+
+def fail_clocks(packages: list[dict[str, Any]]) -> None:
+    """Refuse a clock read in a file the reviewed inventory does not list."""
+    findings = clock_findings(packages)
+    if findings:
+        raise RuntimeError(
+            f"Clock reads belong to {TRACING_OWNER} or to a file listed in "
+            "CLOCK_INVENTORY:\n"
+            + "\n".join(f"{f.path}:{f.line}: {f.text}" for f in findings)
+        )
+
+
+def clock_main() -> int:
+    """Check the clock inventory over the workspace's Rust files."""
+    fail_clocks(rift_packages(cargo_metadata()))
+    return 0
+
+
 def main() -> int:
     """Check exact internal edges, binary targets, and backend ownership."""
     packages = rift_packages(cargo_metadata())
