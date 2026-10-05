@@ -11,8 +11,9 @@
 //! in this module's own vocabulary, not building a second harness.
 
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write as _};
+use std::io::{Read, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -232,53 +233,114 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// Most persisted log records one failure window reads.
+/// Most log records a failure window prints for one workspace: the newest of the window.
 const WINDOW_RECORDS_MAX: usize = 200;
+/// Most metric snapshot records a failure window prints for one workspace: the newest of
+/// the window, a sampler tick or two of every snapshot group.
+const WINDOW_SNAPSHOT_RECORDS_MAX: usize = 12;
 /// Bytes of one source a failure window prints: its last bytes, the earlier ones cut.
 const WINDOW_SOURCE_BYTES_MAX: u64 = 64 << 10;
-/// How far before the test's start the record read reaches.
+/// Launch time one `rift server logs` read of a failure window is allowed beside its
+/// store waits.
 ///
-/// `rift server logs --since` takes an age measured from the command's own clock
-/// reading, which comes later than the window's; the margin keeps the records of
-/// the test's first moments inside the read.
-const WINDOW_SINCE_MARGIN: Duration = Duration::from_secs(2);
-/// Longest a failure window waits for `rift server logs`.
+/// Measured: while the linker wrote test binaries beside it, the debug `rift` took 5.36 s
+/// for a read of a store no process held, and `rift --version`, which opens no store, 3.46
+/// s; unloaded, the same read takes 0.03 s to 0.3 s.
+const WINDOW_LAUNCH_ALLOWANCE: Duration = Duration::from_secs(8);
+/// Longest one `rift server logs` read of a failure window waits: its launch, and one
+/// [`rift_tracing::METRICS_BUSY_TIMEOUT_MS`] for each statement of the read that can meet
+/// another connection's lock on `.rift/metrics` (the schema version read and the page
+/// query). The command installs no log sink, so it waits for no settlement of a server.
+const WINDOW_READ_SHARE: Duration = WINDOW_LAUNCH_ALLOWANCE.saturating_add(Duration::from_millis(
+    2 * rift_tracing::METRICS_BUSY_TIMEOUT_MS,
+));
+/// Longest every `rift server logs` read of one failure window waits, together.
 ///
-/// It counts toward the failing case's nextest deadline, so it stays short: the
-/// command reads `.rift/metrics` directly, apart from the server's request path.
-pub(crate) const WINDOW_READ_MAX: Duration = Duration::from_secs(5);
-/// Pause between polls of the record read; [`WINDOW_READ_MAX`] over it bounds the polls.
+/// It counts toward the failing case's nextest deadline. The log records of every
+/// workspace are read first, each with up to [`WINDOW_READ_SHARE`]; the snapshot reads and
+/// the operations in flight scan get what is left, so a slow read can cut only the
+/// optional parts. A read the budget cuts says how long it ran and what it printed.
+pub(crate) const WINDOW_READ_MAX: Duration = Duration::from_secs(12);
+/// Pause between polls of one record read; [`WINDOW_READ_SHARE`] over it bounds the polls.
 const WINDOW_READ_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// What the message of every record of the table of operations in flight opens with:
+/// the published table, and the stall report past `[logs] stall_delay`.
+const IN_FLIGHT_MESSAGE: &str = "operations in flight";
+/// The nextest report directory below the workspace root: `[store] dir` of
+/// `.config/nextest.toml`, which holds one directory per profile.
+const REPORT_DIRECTORY: &str = "target/nextest";
+/// The directory, in the report directory of a profile, holding the start of every
+/// failure window still open.
+const OPEN_WINDOWS_DIRECTORY: &str = "failure-windows";
+/// Extension of the file one open failure window's start is written to.
+const START_FILE_EXTENSION: &str = "window";
+/// Most windows [`print_ended_windows`] prints in one run; each spends up to
+/// [`WINDOW_READ_MAX`], and the rest are named and left for the next run.
+#[allow(
+    dead_code,
+    reason = "`server_cli` alone prints ended windows; each suite compiles this file"
+)]
+const ENDED_WINDOWS_MAX: usize = 8;
 
 /// What the tested processes recorded from the start of one test to its failure,
 /// printed on the test's stderr when the test fails and never when it passes.
 ///
-/// The window holds the test's identity, the server's persisted log records since
-/// the test began (read through `rift server logs`), and the detached server's
-/// `.rift/server.stderr`. The stderr of a `rift mcp` child is relayed onto the
-/// test's own as it arrives ([`RelayedStderr`]), so it already sits above the
-/// window. Each source prints at most [`WINDOW_SOURCE_BYTES_MAX`] bytes and says
-/// once what its bound cut; a source that could not be read says why, beside the
-/// failure and never in its place.
+/// The window holds the test's identity and, for each workspace it covers, the
+/// server's persisted records from the test's start to the failure, read through the
+/// window query of `rift server logs` (`--since`, `--until`, `--kind`): the newest
+/// [`WINDOW_RECORDS_MAX`] log records, the newest record of the table of operations in
+/// flight, and the newest [`WINDOW_SNAPSHOT_RECORDS_MAX`] metric snapshot records; then
+/// the detached server's `.rift/server.stderr`. The stderr of a `rift mcp` child is
+/// relayed onto the test's own as it arrives ([`RelayedStderr`]), so it already sits
+/// above the window. Each source prints at most [`WINDOW_SOURCE_BYTES_MAX`] bytes and
+/// says once what its bound cut, and all reads together wait at most
+/// [`WINDOW_READ_MAX`], so one workspace prints at most three sources of that size
+/// and one record; a source that could not be read says why, beside the failure and
+/// never in its place. Each read prints how long it ran.
 ///
 /// A case begins the window right after its [`StopOnDrop`], so the window drops
 /// first and prints before the teardown stop, which can itself outlast nextest's
 /// deadline. The case calls [`FailureWindow::passed`] as its last step; an early
 /// return through `?` or a panic leaves the window open, and its drop prints it.
+///
+/// Under nextest the window writes its start, identity, and workspaces into the
+/// report directory when it begins, and removes the file when it closes. A test that
+/// nextest ends at its deadline, or any other kill, runs no destructor and leaves the
+/// file; [`print_ended_windows`] prints those windows after the run.
 pub(crate) struct FailureWindow {
-    root: PathBuf,
-    began: std::time::Instant,
+    /// The test's name and its nextest identity.
+    test: String,
+    /// The workspaces whose stores and stderr files the window reads.
+    roots: Vec<PathBuf>,
+    /// When the test began, on the clock the server stamps its records with.
+    started_at: jiff::Timestamp,
+    /// When the test began, for the age the heading prints; absent once the test's
+    /// process is gone.
+    began: Option<std::time::Instant>,
+    /// The file the start was written to, nothing outside nextest, or why the write failed.
+    start_file: Result<Option<PathBuf>, String>,
     open: bool,
 }
 
 impl FailureWindow {
     /// Opens the window of one test serving `root`, before the test starts a process.
     pub(crate) fn begin(root: &Path) -> Self {
-        Self {
-            root: root.to_owned(),
-            began: std::time::Instant::now(),
+        Self::begin_over(&[root])
+    }
+
+    /// Opens the window of one test serving every workspace of `roots`, before the
+    /// test starts a process.
+    pub(crate) fn begin_over(roots: &[&Path]) -> Self {
+        let mut window = Self {
+            test: test_identity(),
+            roots: roots.iter().map(|root| root.to_path_buf()).collect(),
+            started_at: jiff::Timestamp::now(),
+            began: Some(std::time::Instant::now()),
+            start_file: Ok(None),
             open: true,
-        }
+        };
+        window.start_file = window.write_start();
+        window
     }
 
     /// Closes the window of a test that passed: it prints nothing.
@@ -286,56 +348,101 @@ impl FailureWindow {
         self.open = false;
     }
 
-    /// The window's text, every source read now.
-    fn text(&self) -> String {
-        let test = std::thread::current()
-            .name()
-            .unwrap_or("unnamed test")
-            .to_owned();
-        let identity: Vec<String> = ["NEXTEST_BINARY_ID", "NEXTEST_ATTEMPT_ID"]
-            .into_iter()
-            .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| format!("{name}={value}"))
-            })
-            .collect();
-        let stderr_file = rift_mcp::stderr_file_path(&self.root);
-        format!(
-            "\n==== failure window: {test} {identity}, {elapsed:?} after the test began ====\n\
-             {records}\
-             ---- {stderr_path} ----\n{stderr}\n\
-             ---- rift mcp stderr: relayed above as it arrived ----\n\
-             ==== end of failure window ====\n",
-            identity = identity.join(" "),
-            elapsed = self.began.elapsed(),
-            records = self.records(),
-            stderr_path = stderr_file.display(),
-            stderr = file_tail(&stderr_file),
-        )
+    /// Writes this window's start into the report directory of the running nextest
+    /// profile, and names the file; outside nextest it writes nothing.
+    fn write_start(&self) -> Result<Option<PathBuf>, String> {
+        let (Ok(workspace), Ok(profile), Ok(attempt)) = (
+            std::env::var("NEXTEST_WORKSPACE_ROOT"),
+            std::env::var("NEXTEST_PROFILE"),
+            std::env::var("NEXTEST_ATTEMPT_ID"),
+        ) else {
+            return Ok(None);
+        };
+        let directory = Path::new(&workspace)
+            .join(REPORT_DIRECTORY)
+            .join(profile)
+            .join(OPEN_WINDOWS_DIRECTORY);
+        let path = directory.join(format!("{}.{START_FILE_EXTENSION}", file_name_of(&attempt)));
+        let mut text = format!("test={}\nstarted_at={}\n", self.test, self.started_at);
+        for root in &self.roots {
+            text.push_str("root=");
+            text.push_str(&root.display().to_string());
+            text.push('\n');
+        }
+        fs::create_dir_all(&directory)
+            .and_then(|()| fs::write(&path, text))
+            .map(|()| Some(path.clone()))
+            .map_err(|error| format!("{}: {error}", path.display()))
     }
 
-    /// The server's persisted log records since the test began, as `rift server logs`
-    /// prints them, with the command line that read them as the heading.
-    fn records(&self) -> String {
-        let reach = self.began.elapsed().saturating_add(WINDOW_SINCE_MARGIN);
-        let since = format!("{}ms", reach.as_millis());
-        let tail = WINDOW_RECORDS_MAX.to_string();
-        let heading = format!("---- rift server logs --since {since} --tail {tail} ----\n");
-        let printed = match read_records(&self.root, &since, &tail) {
-            Ok(printed) => printed,
-            Err(error) => format!("the record read did not finish: {error}\n"),
-        };
-        let at_bound = printed.lines().count() >= WINDOW_RECORDS_MAX;
-        let bound_notice = if at_bound {
-            format!(
-                "[the read reached its {WINDOW_RECORDS_MAX}-record bound; older records since \
-                 the test began are cut]\n"
-            )
-        } else {
-            String::new()
-        };
-        format!("{heading}{printed}{bound_notice}")
+    /// The window a start file names, for a test whose process is gone.
+    #[allow(
+        dead_code,
+        reason = "`server_cli` alone prints ended windows; each suite compiles this file"
+    )]
+    fn restored(path: &Path) -> TestResult<Self> {
+        let text = fs::read_to_string(path)?;
+        let mut identity = None;
+        let mut started_at = None;
+        let mut roots = Vec::new();
+        for line in text.lines() {
+            match line.split_once('=') {
+                Some(("test", value)) => identity = Some(value.to_owned()),
+                Some(("started_at", value)) => started_at = Some(value.parse()?),
+                Some(("root", value)) => roots.push(PathBuf::from(value)),
+                _ => return Err(format!("{}: unexpected line {line:?}", path.display()).into()),
+            }
+        }
+        Ok(Self {
+            test: identity.ok_or_else(|| format!("{}: no test line", path.display()))?,
+            roots,
+            started_at: started_at
+                .ok_or_else(|| format!("{}: no started_at line", path.display()))?,
+            began: None,
+            start_file: Ok(Some(path.to_owned())),
+            open: true,
+        })
+    }
+
+    /// The window's text, every source read now: the window ends at this call.
+    fn text(&self) -> String {
+        let budget = ReadBudget::new();
+        let since = millisecond_text(self.started_at.as_millisecond());
+        // The query's upper bound excludes its own millisecond; the next one keeps it.
+        let until = millisecond_text(jiff::Timestamp::now().as_millisecond().saturating_add(1));
+        let age = self.began.map_or_else(
+            || "the test's process ended before its window printed".to_owned(),
+            |began| format!("{:?} after the test began", began.elapsed()),
+        );
+        let mut text = format!(
+            "\n==== failure window: {test}, {age} ====\nfrom {since} to {until}\n",
+            test = self.test,
+        );
+        if let Err(error) = &self.start_file {
+            let _ = writeln!(
+                text,
+                "[the start was not written ({error}): a kill of this test leaves no window]"
+            );
+        }
+        let mut workspaces: Vec<WorkspaceReads> = self
+            .roots
+            .iter()
+            .map(|root| WorkspaceReads::records(root, &since, &until, &budget))
+            .collect();
+        for workspace in &mut workspaces {
+            workspace.read_snapshots(&since, &until, &budget);
+        }
+        for workspace in &mut workspaces {
+            workspace.scan_in_flight(&since, &until, &budget);
+        }
+        for workspace in &workspaces {
+            text.push_str(&workspace.text());
+        }
+        text.push_str(
+            "---- rift mcp stderr: relayed above as it arrived ----\n\
+             ==== end of failure window ====\n",
+        );
+        text
     }
 }
 
@@ -344,36 +451,355 @@ impl Drop for FailureWindow {
         if self.open {
             let _ = std::io::stderr().write_all(self.text().as_bytes());
         }
+        if let Ok(Some(path)) = &self.start_file {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
-/// What one `rift server logs --since <since> --tail <tail>` run printed in `root`,
-/// stdout then stderr, bounded by [`WINDOW_READ_MAX`] and [`WINDOW_SOURCE_BYTES_MAX`].
+/// The test's name and the nextest variables that identify its run and attempt.
+fn test_identity() -> String {
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("unnamed test")
+        .to_owned();
+    let identity: Vec<String> = ["NEXTEST_BINARY_ID", "NEXTEST_ATTEMPT_ID"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| format!("{name}={value}"))
+        })
+        .collect();
+    format!("{test} {}", identity.join(" "))
+}
+
+/// `attempt` with every character a file name may not carry on some platform replaced.
+fn file_name_of(attempt: &str) -> String {
+    attempt
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `milliseconds` since the Unix epoch in RFC 3339, the form `--since` and `--until` take.
+fn millisecond_text(milliseconds: i64) -> String {
+    jiff::Timestamp::from_millisecond(milliseconds).map_or_else(
+        |error| format!("invalid instant: {error}"),
+        |at| at.to_string(),
+    )
+}
+
+/// Prints the failure window of every test of the compiled binary whose process
+/// ended before its own window printed - a nextest timeout or another kill - from the
+/// start files left in the report directory of every profile, and removes each file it
+/// printed. Answers how many it printed. At most [`ENDED_WINDOWS_MAX`] print; the rest
+/// are named, and kept for the next run.
+///
+/// A window printed here ends when this run reads it: the test's own end is unknown.
+/// Run it after nextest returns, never beside a running test, whose open window it
+/// would print and remove.
+#[allow(
+    dead_code,
+    reason = "`server_cli` alone prints ended windows; each suite compiles this file"
+)]
+pub(crate) fn print_ended_windows() -> TestResult<usize> {
+    let workspace = std::env::var("NEXTEST_WORKSPACE_ROOT")
+        .map_err(|_| "run under nextest, which names the workspace root")?;
+    let reports = Path::new(&workspace).join(REPORT_DIRECTORY);
+    let mut starts = Vec::new();
+    if let Ok(profiles) = fs::read_dir(&reports) {
+        for profile in profiles {
+            let directory = profile?.path().join(OPEN_WINDOWS_DIRECTORY);
+            let Ok(files) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for file in files {
+                let path = file?.path();
+                if path.extension() == Some(START_FILE_EXTENSION.as_ref()) {
+                    starts.push(path);
+                }
+            }
+        }
+    }
+    starts.sort();
+    let printed = starts.len().min(ENDED_WINDOWS_MAX);
+    for start in &starts[..printed] {
+        // The restored window is open: dropping it prints it and removes its start.
+        drop(FailureWindow::restored(start)?);
+    }
+    for kept in &starts[printed..] {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[not printed, past the {ENDED_WINDOWS_MAX}-window bound of one run: {}]",
+            kept.display()
+        );
+    }
+    Ok(printed)
+}
+
+/// The [`WINDOW_READ_MAX`] budget every read of one failure window shares.
+struct ReadBudget {
+    deadline: std::time::Instant,
+}
+
+impl ReadBudget {
+    fn new() -> Self {
+        Self {
+            deadline: std::time::Instant::now() + WINDOW_READ_MAX,
+        }
+    }
+
+    /// The bound of the next read: [`WINDOW_READ_SHARE`], or what is left of the budget.
+    fn next_bound(&self) -> Result<Duration, String> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "not run: the window's {WINDOW_READ_MAX:?} read budget was spent by the reads \
+                 above"
+            ));
+        }
+        Ok(left.min(WINDOW_READ_SHARE))
+    }
+}
+
+/// The newest record of the table of operations in flight of one workspace's window.
+enum InFlight {
+    /// The record, as printed.
+    Found(String),
+    /// No such record in the window.
+    Absent,
+    /// The bounded log read cut older records; a scan of every record decides.
+    Cut,
+    /// Why it could not be read.
+    NotRead(String),
+}
+
+/// What the reads of a failure window found for one workspace.
+struct WorkspaceReads {
+    root: PathBuf,
+    /// The log records of the window, under the command line that read them.
+    records: String,
+    in_flight: InFlight,
+    /// The metric snapshot records of the window, under the command line that read them.
+    snapshots: String,
+}
+
+impl WorkspaceReads {
+    /// Reads the newest [`WINDOW_RECORDS_MAX`] log records of the window in `root`.
+    fn records(root: &Path, since: &str, until: &str, budget: &ReadBudget) -> Self {
+        let tail = WINDOW_RECORDS_MAX.to_string();
+        let arguments = window_arguments(since, until, "log", &tail);
+        let mut records = read_heading(&arguments);
+        let in_flight = match read_window(root, &arguments, budget) {
+            Ok(read) => {
+                let count = read.printed.lines().count();
+                let newest = newest_in_flight(read.printed.lines());
+                records.push_str(&bounded_tail(&read.printed));
+                records.push_str(&read.took);
+                if count >= WINDOW_RECORDS_MAX {
+                    let _ = writeln!(
+                        records,
+                        "[the read reached its {WINDOW_RECORDS_MAX}-record bound; older records \
+                         of the window are cut]"
+                    );
+                }
+                match newest {
+                    Some(line) => InFlight::Found(line),
+                    None if count >= WINDOW_RECORDS_MAX => InFlight::Cut,
+                    None => InFlight::Absent,
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(records, "the record read did not finish: {error}");
+                InFlight::NotRead(format!("the record read did not finish: {error}"))
+            }
+        };
+        Self {
+            root: root.to_owned(),
+            records,
+            in_flight,
+            snapshots: String::new(),
+        }
+    }
+
+    /// Reads the newest [`WINDOW_SNAPSHOT_RECORDS_MAX`] metric snapshot records of the window.
+    fn read_snapshots(&mut self, since: &str, until: &str, budget: &ReadBudget) {
+        let tail = WINDOW_SNAPSHOT_RECORDS_MAX.to_string();
+        let arguments = window_arguments(since, until, "metric", &tail);
+        self.snapshots = read_heading(&arguments);
+        match read_window(&self.root, &arguments, budget) {
+            Ok(read) => {
+                let count = read.printed.lines().count();
+                self.snapshots.push_str(&bounded_tail(&read.printed));
+                self.snapshots.push_str(&read.took);
+                if count >= WINDOW_SNAPSHOT_RECORDS_MAX {
+                    let _ = writeln!(
+                        self.snapshots,
+                        "[the newest {WINDOW_SNAPSHOT_RECORDS_MAX} snapshot records of the \
+                         window; older ones are not read]"
+                    );
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(self.snapshots, "the snapshot read did not finish: {error}");
+            }
+        }
+    }
+
+    /// Scans every log record of the window for the newest record of the table of
+    /// operations in flight, when the bounded read cut older records.
+    fn scan_in_flight(&mut self, since: &str, until: &str, budget: &ReadBudget) {
+        use std::io::BufRead as _;
+
+        if !matches!(self.in_flight, InFlight::Cut) {
+            return;
+        }
+        let arguments = window_arguments(since, until, "log", "all");
+        let scanned = run_window_read(&self.root, &arguments, budget).and_then(|(file, _)| {
+            let mut newest = None;
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line.map_err(|error| format!("could not read the read: {error}"))?;
+                if line.contains(IN_FLIGHT_MESSAGE) {
+                    newest = Some(line);
+                }
+            }
+            Ok(newest)
+        });
+        self.in_flight = match scanned {
+            Ok(Some(line)) => InFlight::Found(line),
+            Ok(None) => InFlight::Absent,
+            Err(error) => InFlight::NotRead(error),
+        };
+    }
+
+    /// The part of a failure window this workspace holds: its records of the window, then
+    /// its server's stderr file.
+    fn text(&self) -> String {
+        let mut text = format!("---- workspace {} ----\n", self.root.display());
+        text.push_str(&self.records);
+        text.push_str("---- newest record of the operations in flight in the window ----\n");
+        match &self.in_flight {
+            InFlight::Found(line) => {
+                text.push_str(&bounded_tail(line));
+                text.push('\n');
+            }
+            InFlight::Absent => text.push_str("none recorded in the window\n"),
+            InFlight::Cut => text.push_str("not scanned\n"),
+            InFlight::NotRead(error) => {
+                let _ = writeln!(text, "not read: {error}");
+            }
+        }
+        text.push_str(&self.snapshots);
+        let stderr_file = rift_mcp::stderr_file_path(&self.root);
+        let _ = writeln!(
+            text,
+            "---- {} ----\n{}",
+            stderr_file.display(),
+            file_tail(&stderr_file)
+        );
+        text
+    }
+}
+
+/// The window query arguments of one read: `--since`, `--until`, `--kind`, `--tail`.
+fn window_arguments<'a>(
+    since: &'a str,
+    until: &'a str,
+    kind: &'a str,
+    tail: &'a str,
+) -> [&'a str; 8] {
+    [
+        "--since", since, "--until", until, "--kind", kind, "--tail", tail,
+    ]
+}
+
+/// The heading of one record read: the command line a person runs to read it again.
+fn read_heading(arguments: &[&str]) -> String {
+    format!("---- rift server logs {} ----\n", arguments.join(" "))
+}
+
+/// The last line of `lines` that a record of the table of operations in flight printed.
+fn newest_in_flight<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    lines
+        .filter(|line| line.contains(IN_FLIGHT_MESSAGE))
+        .last()
+        .map(str::to_owned)
+}
+
+/// What one finished read printed, and the line stating how long it ran.
+struct WindowRead {
+    printed: String,
+    took: String,
+}
+
+/// What one `rift server logs <arguments>` run printed in `root`, stdout then stderr.
+fn read_window(root: &Path, arguments: &[&str], budget: &ReadBudget) -> Result<WindowRead, String> {
+    let (mut file, took) = run_window_read(root, arguments, budget)?;
+    let mut printed = String::new();
+    file.read_to_string(&mut printed)
+        .map_err(|error| format!("could not read what it printed: {error}"))?;
+    Ok(WindowRead { printed, took })
+}
+
+/// Runs `rift server logs <arguments>` in `root` until it exits or the bound the budget
+/// gives it passes, and answers the file holding what it printed, rewound, and the line
+/// stating how long it ran and, when it failed, its exit status.
 ///
 /// Both streams land in one anonymous file rather than a pipe, so a long print never
-/// blocks the command while the window polls it.
-fn read_records(root: &Path, since: &str, tail: &str) -> TestResult<String> {
-    let mut printed = tempfile::tempfile()?;
+/// blocks the command while the window polls it. A read the bound ends is killed, and
+/// its refusal names how long it ran and how many bytes it printed: none means it was
+/// still launching or opening the store.
+fn run_window_read(
+    root: &Path,
+    arguments: &[&str],
+    budget: &ReadBudget,
+) -> Result<(fs::File, String), String> {
+    let bound = budget.next_bound()?;
+    let failed = |error: std::io::Error| format!("could not run the read: {error}");
+    let mut printed = tempfile::tempfile().map_err(failed)?;
     let mut command = std::process::Command::new(rift_binary());
+    let started = std::time::Instant::now();
     let mut child = with_child_log_variables(&mut command)
-        .args(["server", "logs", "--since", since, "--tail", tail])
+        .args(["server", "logs"])
+        .args(arguments)
         .current_dir(root)
         .stdin(Stdio::null())
-        .stdout(printed.try_clone()?)
-        .stderr(printed.try_clone()?)
-        .spawn()?;
-    let deadline = std::time::Instant::now() + WINDOW_READ_MAX;
-    while child.try_wait()?.is_none() {
-        if std::time::Instant::now() >= deadline {
+        .stdout(printed.try_clone().map_err(failed)?)
+        .stderr(printed.try_clone().map_err(failed)?)
+        .spawn()
+        .map_err(failed)?;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(failed)? {
+            break status;
+        }
+        if started.elapsed() >= bound {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(
-                format!("rift server logs printed nothing within {WINDOW_READ_MAX:?}").into(),
-            );
+            let bytes = printed.metadata().map_or(0, |metadata| metadata.len());
+            return Err(format!(
+                "rift server logs ran {:?} and was ended at its {bound:?} bound, having printed \
+                 {bytes} bytes",
+                started.elapsed()
+            ));
         }
         std::thread::sleep(WINDOW_READ_POLL_INTERVAL);
+    };
+    let mut took = format!("[read in {:?}", started.elapsed());
+    if !status.success() {
+        let _ = write!(took, ", exited with {status}");
     }
-    Ok(tail_of(&mut printed)?)
+    took.push_str("]\n");
+    printed.rewind().map_err(failed)?;
+    Ok((printed, took))
 }
 
 /// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of the file at `path`, or why it could
@@ -391,8 +817,6 @@ fn file_tail(path: &Path) -> String {
 /// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of `file`, preceded by a notice of the
 /// bytes before them that the bound cut.
 fn tail_of(file: &mut fs::File) -> std::io::Result<String> {
-    use std::io::Seek as _;
-
     let length = file.metadata()?.len();
     let cut = length.saturating_sub(WINDOW_SOURCE_BYTES_MAX);
     file.seek(std::io::SeekFrom::Start(cut))?;
