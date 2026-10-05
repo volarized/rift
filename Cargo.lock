@@ -4590,10 +4590,7 @@ dependencies = [
  "serde_path_to_error",
  "sha2",
  "strum",
- "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
  "unicode-normalization",
 ]
 
