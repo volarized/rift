@@ -1732,4 +1732,43 @@ mod tests {
             .await
             .expect("an externally cancelled watch must end promptly");
     }
+
+    /// A metrics close that misses its deadline is a serve failure naming the close. A test
+    /// connection holds the write lock while an append is queued ahead of the close, so the
+    /// writer thread cannot answer the close before the lock is released, and the paused
+    /// clock carries the deadline past while the writer waits. The writer's busy timeout
+    /// only bounds that wait; the append that commits after the release proves the lock
+    /// outlasted the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_metrics_close_that_misses_its_deadline_is_a_serve_failure_naming_the_close()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::task::{Context, Waker};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("metrics");
+        let store = rift_tracing::LogStore::open(&path, None).await?;
+        let holder = rusqlite::Connection::open(&path)?;
+        holder.execute_batch("BEGIN IMMEDIATE")?;
+        let held = rift_tracing::LogRecord::new(0, "info", "rift", "storage", "test", "held", "{}");
+        let records = [held];
+        let mut append = Box::pin(store.append(&records, 1_000));
+        let first_poll =
+            std::future::Future::poll(append.as_mut(), &mut Context::from_waker(Waker::noop()));
+        assert!(
+            first_poll.is_pending(),
+            "the held lock keeps the append waiting"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let refusal = super::close_logs(Some(&store), deadline)
+            .await
+            .expect_err("a writer held behind the lock misses the deadline");
+
+        assert_eq!(refusal.slug(), errors::mcp::http_serve_failed::SLUG);
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("metrics database close"), "{rendered}");
+        holder.execute_batch("ROLLBACK")?;
+        append.await?;
+        Ok(())
+    }
 }

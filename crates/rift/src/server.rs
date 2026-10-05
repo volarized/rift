@@ -3220,6 +3220,153 @@ mod tests {
         Ok(())
     }
 
+    /// A metrics file that is not a database fails each read with the read's operation, and
+    /// the store failure stays on the source chain.
+    #[tokio::test]
+    async fn a_logs_read_the_reader_refuses_names_the_read_and_keeps_its_source() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir(&state_directory)?;
+        std::fs::write(state_directory.join("metrics"), b"not a sqlite database")?;
+        let query = logs_query(TailCount::All, None, None, None);
+
+        for tail in [TailCount::All, TailCount::Newest(5)] {
+            let refused = print_logs(
+                directory.path(),
+                &query,
+                tail,
+                &LogsMode::Once,
+                &TimeZone::UTC,
+            )
+            .await
+            .expect_err("a file that is not a database cannot be read");
+
+            assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
+            let rendered = refused.to_string();
+            assert!(rendered.contains("read recorded logs"), "{rendered}");
+            assert!(
+                std::error::Error::source(&refused).is_some(),
+                "the store failure must stay on the source chain"
+            );
+        }
+        Ok(())
+    }
+
+    /// A read that panics on its blocking thread is reported as an unavailable read.
+    #[tokio::test]
+    async fn a_read_that_panics_is_reported_as_an_unavailable_read() -> TestResult {
+        use super::{LogQuery, LogReads, StoredLogRecord, read_records};
+
+        fn panicking(
+            _reads: &LogReads,
+            _query: &LogQuery,
+        ) -> Result<Vec<StoredLogRecord>, rift_error::RiftError> {
+            panic!("injected read failure")
+        }
+
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let query = logs_query(TailCount::All, None, None, None);
+
+        let refused = read_records(&store.reader(), query, panicking)
+            .await
+            .expect_err("a panicking read cannot answer");
+
+        assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
+        let rendered = refused.to_string();
+        assert!(rendered.contains("read recorded logs"), "{rendered}");
+        Ok(())
+    }
+
+    /// A follow whose read is refused fails at once rather than waiting to poll again.
+    #[tokio::test]
+    async fn a_follow_whose_read_is_refused_fails_before_it_waits() -> TestResult {
+        use super::{LogReader, follow_until_interrupt};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("metrics");
+        std::fs::write(&path, b"not a sqlite database")?;
+        let query = logs_query(TailCount::All, None, None, None);
+        let interrupted = tokio_util::sync::CancellationToken::new();
+
+        let refused = follow_until_interrupt(
+            &LogReader::new(&path),
+            &query,
+            0,
+            &interrupted,
+            &TimeZone::UTC,
+        )
+        .await
+        .expect_err("a file that is not a database cannot be followed");
+
+        assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
+        Ok(())
+    }
+
+    /// An interrupt that arrives inside the follow loop ends the follow once the read in
+    /// flight answers. The first poll enters the loop and returns pending, on the read or on
+    /// the poll interval, so the interrupt always lands inside the loop.
+    #[tokio::test]
+    async fn a_follow_ends_after_the_read_in_flight_when_interrupted() -> TestResult {
+        use super::follow_until_interrupt;
+        use std::task::{Context, Waker};
+
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let followed = LogRecord::new(0, "info", "rift", "index", "index.build", "followed", "{}");
+        store.append(&[followed], 1_000).await?;
+        let reader = store.reader();
+        let query = logs_query(TailCount::All, None, None, None);
+        let interrupted = tokio_util::sync::CancellationToken::new();
+        let time_zone = TimeZone::UTC;
+        let mut follow = Box::pin(follow_until_interrupt(
+            &reader,
+            &query,
+            0,
+            &interrupted,
+            &time_zone,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        let first_poll = std::future::Future::poll(follow.as_mut(), &mut context);
+        assert!(
+            first_poll.is_pending(),
+            "the loop waits on a read or on its interval"
+        );
+
+        interrupted.cancel();
+
+        follow.await?;
+        Ok(())
+    }
+
+    /// `--follow` prints until the operator interrupts, so a followed read has not ended
+    /// when a bound on it elapses. The clock is paused: it advances only while no read is
+    /// on a blocking thread, so the bound elapses inside the poll interval of the follow
+    /// loop, after the first page printed, on every run.
+    #[tokio::test(start_paused = true)]
+    async fn a_followed_read_ends_only_on_the_interrupt() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir(&state_directory)?;
+        let store = LogStore::open(&state_directory.join("metrics"), None).await?;
+        let kept = LogRecord::new(0, "info", "rift", "index", "index.build", "kept", "{}");
+        store.append(&[kept], 1_000).await?;
+        let query = logs_query(TailCount::All, None, None, None);
+        let time_zone = TimeZone::UTC;
+        let following = print_logs(
+            directory.path(),
+            &query,
+            TailCount::Newest(5),
+            &LogsMode::Following,
+            &time_zone,
+        );
+
+        let followed = tokio::time::timeout(std::time::Duration::from_secs(2), following).await;
+
+        assert!(followed.is_err(), "a follow ends only on the interrupt");
+        Ok(())
+    }
+
     #[test]
     fn a_rendered_line_carries_every_column() {
         let record = LogRecord::new(

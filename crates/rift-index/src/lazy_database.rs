@@ -343,4 +343,54 @@ mod tests {
         drop(handle);
         Ok(())
     }
+
+    /// The debug text names the database and says whether it opened and whether it closed.
+    #[tokio::test]
+    async fn a_handles_debug_text_reports_whether_it_opened_and_closed() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = DatabaseName::Vectors.path(directory.path());
+        let handle = LazyDatabase::new(&path, DatabaseName::Vectors, None);
+
+        let unopened = format!("{handle:?}");
+        assert!(unopened.starts_with("LazyDatabase {"), "{unopened}");
+        assert!(unopened.contains("name: Vectors"), "{unopened}");
+        assert!(unopened.contains("opened: false"), "{unopened}");
+        assert!(unopened.contains("closed: false"), "{unopened}");
+
+        handle.shutdown(Instant::now() + STEP_MAX).await?;
+        let closed = format!("{handle:?}");
+        assert!(closed.contains("closed: true"), "{closed}");
+        Ok(())
+    }
+
+    /// A shutdown whose deadline passes while the first open is held refuses, and the open
+    /// it did not wait for still finishes and stops under a later shutdown. The probe holds
+    /// the open until the test releases it, so the deadline passes first on every run.
+    #[tokio::test]
+    async fn a_shutdown_past_its_deadline_refuses_while_the_first_open_is_held() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = DatabaseName::Vectors.path(directory.path());
+        let handle = Arc::new(LazyDatabase::new(&path, DatabaseName::Vectors, None));
+        let (started, release) = handle.probe.hold_next();
+        let first_handle = Arc::clone(&handle);
+        let first = tokio::spawn(async move { first_handle.resolve(pool()).await });
+        tokio::time::timeout(STEP_MAX, started).await??;
+
+        let refused = handle
+            .shutdown(Instant::now())
+            .await
+            .expect_err("a held open outlasts a deadline that is already here");
+
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
+        let rendered = format!("{refused}: {}", rift_error::causes(&refused).join(": "));
+        assert!(
+            rendered.contains("outlasted the shutdown deadline"),
+            "{rendered}"
+        );
+        release.send(()).map_err(|()| "the open dropped its hold")?;
+        let opened = tokio::time::timeout(STEP_MAX, first).await???;
+        drop(opened);
+        handle.shutdown(Instant::now() + STEP_MAX).await?;
+        Ok(())
+    }
 }

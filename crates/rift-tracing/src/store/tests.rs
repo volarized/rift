@@ -615,3 +615,83 @@ async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestRes
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_reader_names_the_file_its_store_writes() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+
+    assert_eq!(store.reader().path(), store.path());
+    Ok(())
+}
+
+#[test]
+fn a_command_debugs_with_its_record_count_and_no_reply() {
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    let append = super::Command::Append {
+        records: vec![record("first"), record("second")],
+        retention_records: 5,
+        reply,
+    };
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    let close = super::Command::Close { reply };
+
+    assert_eq!(format!("{append:?}"), "Append { records: 2, .. }");
+    assert_eq!(format!("{close:?}"), "Close { .. }");
+}
+
+/// An open whose caller is gone before the thread answers still finishes its open, then
+/// ends without running a command and releases its owner. A lock held on the file keeps
+/// the thread from answering until the caller has dropped the open; the busy timeout only
+/// bounds how long the thread waits for that lock.
+#[tokio::test]
+async fn an_open_dropped_before_its_answer_still_releases_its_owner() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = metrics_path(&directory);
+    let holder = rusqlite::Connection::open(&path)?;
+    holder.execute_batch("BEGIN IMMEDIATE")?;
+    let (owner, released) = release_probe();
+    let mut open = Box::pin(LogStore::open(&path, Some(owner)));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let first_poll = std::future::Future::poll(open.as_mut(), &mut context);
+    assert!(
+        first_poll.is_pending(),
+        "the held lock keeps the answer back"
+    );
+
+    drop(open);
+    holder.execute_batch("ROLLBACK")?;
+
+    assert_eq!(
+        released.recv_timeout(THREAD_WAIT_MAX)?.as_deref(),
+        Some("rift-db-metrics"),
+        "the thread ends without an answer to give and releases the owner"
+    );
+    assert_eq!(
+        user_version(&path)?,
+        METRICS_SCHEMA_VERSION,
+        "the open finished before the thread found its caller gone"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_append_the_database_refuses_names_the_step_that_failed() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store.append(&[record("first")], KEEP_EVERY).await?;
+    rusqlite::Connection::open(store.path())?.execute_batch("DROP TABLE log_records")?;
+
+    let refusal = store
+        .append(&[record("second")], KEEP_EVERY)
+        .await
+        .expect_err("an append needs the table it writes");
+
+    assert_eq!(
+        refusal.slug(),
+        rift_error::errors::tracing::log_store_failed::SLUG
+    );
+    let rendered = refusal.to_string();
+    assert!(rendered.contains("read the newest identity"), "{rendered}");
+    Ok(())
+}

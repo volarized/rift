@@ -1866,3 +1866,21 @@ async fn the_full_text_ranking_reports_the_bound_it_stopped_at() -> TestResult {
     );
     Ok(())
 }
+
+/// The vector tier attaches to the vectors database alone; a handle on another database
+/// is a programming error, and the panic names the database the handle opens.
+#[tokio::test]
+#[should_panic(expected = "the vector tier attaches to the vectors database: name=Index")]
+async fn a_vector_tier_attached_to_another_database_panics_naming_it() {
+    let root = workspace().expect("a workspace");
+    let path = database(root.path(), DatabaseName::Index);
+    let opened = WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await;
+    let database = opened.expect("the index database opens");
+    let wrong = LazyDatabase::new(&path, DatabaseName::Index, None);
+
+    drop(SearchIndex::attached(
+        database,
+        std::sync::Arc::new(wrong),
+        lexical_only_limits(),
+    ));
+}
