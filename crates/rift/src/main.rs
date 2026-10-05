@@ -206,10 +206,10 @@ fn stderr_policy(serves: bool, terminal: bool) -> StderrPolicy {
 fn initialize_tracing(
     capture: Option<&str>,
     stderr: StderrPolicy,
-) -> (Option<rift_mcp::LogDrain>, otlp::Export) {
+) -> (Option<rift_tracing::LogDrain>, otlp::Export) {
     let (sink, drain) = match capture {
         Some(capture) => {
-            let (sink, drain) = rift_mcp::log_capture();
+            let (sink, drain) = rift_tracing::log_capture();
             let filter = EnvFilter::try_new(capture)
                 .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
             (Some(sink.with_filter(reevaluated(filter))), Some(drain))
@@ -399,7 +399,7 @@ impl fmt::Display for CliOutcome {
 
 async fn run(
     cli: Cli,
-    drain: Option<rift_mcp::LogDrain>,
+    drain: Option<rift_tracing::LogDrain>,
     retention_records: u64,
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {

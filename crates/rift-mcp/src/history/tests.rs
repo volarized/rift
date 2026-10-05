@@ -16,9 +16,9 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{AnalysisGate, FillBounds, HistoryLane, HistoryTask, OpenedStore, store_revision};
 use crate::http::IdleTracker;
-use crate::logs::{LogDrain, log_capture};
 use crate::validation::ConfigurationState;
 use crate::validation::tests::{ANALYZER_A, ANALYZER_B};
+use rift_tracing::{LogDrain, log_capture};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -312,7 +312,7 @@ async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> Tes
     let directory = committed_workspace("")?;
     let root = directory.path();
     let head = head_of(root)?;
-    let (sink, mut drain) = crate::logs::log_capture();
+    let (sink, mut drain) = rift_tracing::log_capture();
     let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
     let cancellation = CancellationToken::new();
     let activity = Arc::new(IdleTracker::new());
@@ -370,7 +370,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree_and_warns_on
     let configuration = ConfigurationState::accept(root);
     let history = configuration.history_configuration();
     fs::set_permissions(root.join(".git"), fs::Permissions::from_mode(0o555))?;
-    let (sink, mut drain) = crate::logs::log_capture();
+    let (sink, mut drain) = rift_tracing::log_capture();
     let subscriber = tracing_subscriber::registry().with(sink);
     let opened = tracing::subscriber::with_default(subscriber, || {
         OpenedStore::open(root, &configuration, &history, ANALYZER_A)()

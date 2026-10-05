@@ -1183,7 +1183,7 @@ mod tests {
             .activity
             .idle_deadline(registry.idle_timeout)
             .ok_or("no request is active")?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
 
         tokio::time::pause();

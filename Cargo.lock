@@ -4911,8 +4911,10 @@ dependencies = [
  "pin-project-lite",
  "rift-error",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -3892,7 +3892,7 @@ impl RiftMcp {
         let query = resource::log_query(uri, page_records)?;
         // The drain writes on a timer, so a read taken right after the request that produced a
         // record would answer without it. This waits for the lane to reach what it has taken.
-        crate::logs::settle_for_read().await;
+        rift_tracing::settle_for_read().await;
         let Some(store) = self.logs.as_ref() else {
             return resource::logs_unavailable(
                 uri,
@@ -6714,7 +6714,7 @@ done
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
         fs::create_dir_all(directory.path().join(".rift/index"))?;
-        let (sink, drain) = crate::logs::log_capture();
+        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
         let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
         let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
@@ -9359,7 +9359,7 @@ done
         fs::write(directory.path().join("src/deep.rs"), deep_source())?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = crate::logs::log_capture();
+        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
         let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
         let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
@@ -9433,7 +9433,7 @@ done
             "[providers.syntax]\nmax_file = \"128b\"\n",
         )?;
 
-        let (sink, drain) = crate::logs::log_capture();
+        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
         let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
         let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
@@ -9519,7 +9519,7 @@ done
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = crate::logs::log_capture();
+        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
         let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
         let _guard = tracing::subscriber::set_default(
@@ -9536,7 +9536,7 @@ done
             crate::identity::BuildCheckout::Unversioned,
         )
         .await?;
-        let (_other_sink, _other_drain) = crate::logs::log_capture();
+        let (_other_sink, _other_drain) = rift_tracing::log_capture();
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
@@ -9570,7 +9570,7 @@ done
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = crate::logs::log_capture();
+        let (sink, drain) = rift_tracing::log_capture();
         let filter = tracing_subscriber::EnvFilter::try_new("rift_mcp=debug")?;
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::registry().with(sink.with_filter(filter)),
@@ -9629,7 +9629,7 @@ done
         );
         fs::write(directory.path().join("src/blob.rs"), blob)?;
         super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"2mb\"\n")?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
 
         let server =

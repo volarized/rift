@@ -1223,7 +1223,7 @@ mod tests {
     fn a_stop_stage_records_its_name_outcome_and_error() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

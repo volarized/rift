@@ -3065,7 +3065,7 @@ mod tests {
 
         let directory = tempfile::tempdir()?;
         let _guard = claim(directory.path())?;
-        let (sink, mut drain) = crate::logs::log_capture();
+        let (sink, mut drain) = rift_tracing::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let refusal = {
             let _default = tracing::subscriber::set_default(subscriber);
