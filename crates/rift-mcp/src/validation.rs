@@ -2342,6 +2342,14 @@ struct LexicalBacklog {
     whole_owed: Option<String>,
     /// Whether the lane's task has ended, so a later write has no one to run it.
     ended: bool,
+    /// When the held write was first handed, while one is held: a merge keeps the
+    /// instant of the write it merges into.
+    held_since: Option<Instant>,
+    /// When the lane took the running write, while one runs.
+    running_since: Option<Instant>,
+    /// The part the running write commits, counted from one, and how many parts it
+    /// has, once its parts are derived.
+    running_part: Option<(usize, usize)>,
 }
 
 impl LexicalBacklog {
@@ -2350,6 +2358,7 @@ impl LexicalBacklog {
     fn hand(&mut self, commit: LexicalCommit) -> Option<Arc<PublishedWorkspace>> {
         let Some(held) = self.held.take() else {
             self.held = Some(commit);
+            self.held_since = Some(Instant::now());
             return None;
         };
         let (merged, released) = held.merged_with(commit);
@@ -2364,7 +2373,17 @@ impl LexicalBacklog {
         let commit = self.held.take()?;
         let whole_owed = self.whole_owed.take().is_some();
         self.running = commit.answers.iter().cloned().collect();
+        self.held_since = None;
+        self.running_since = Some(Instant::now());
+        self.running_part = None;
         Some((commit, whole_owed))
+    }
+
+    /// Records that the running write ended, success or failure.
+    fn end_running(&mut self) {
+        self.running.clear();
+        self.running_since = None;
+        self.running_part = None;
     }
 
     /// Records that the store missed a commit for the reason `cause` renders, so the next
@@ -2392,6 +2411,94 @@ impl LexicalBacklog {
             },
             None => LexicalCommitState::Settled,
         }
+    }
+
+    /// Where `tree_revision` stands, with what the lane was doing when that was read.
+    fn report_of(&self, tree_revision: &str) -> LexicalCommitReport {
+        let now = Instant::now();
+        let running = !self.running.is_empty();
+        let write = if self
+            .running
+            .iter()
+            .any(|answered| answered == tree_revision)
+        {
+            Some("running")
+        } else if self
+            .held
+            .as_ref()
+            .is_some_and(|commit| commit.answers_for(tree_revision))
+        {
+            Some("held")
+        } else {
+            None
+        };
+        LexicalCommitReport {
+            state: self.state_of(tree_revision),
+            write,
+            held_for: self
+                .held
+                .as_ref()
+                .and(self.held_since)
+                .map(|since| now.saturating_duration_since(since)),
+            running_for: self
+                .running_since
+                .filter(|_| running)
+                .map(|since| now.saturating_duration_since(since)),
+            running_part: self.running_part.filter(|_| running),
+        }
+    }
+}
+
+/// Where one tree revision stands with the lexical lane, and what the lane was doing when
+/// that was read, from one read of its backlog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LexicalCommitReport {
+    pub(crate) state: LexicalCommitState,
+    /// Which write answers for the revision, `running` or `held`, while one does.
+    write: Option<&'static str>,
+    /// How long the held write has waited for the lane, while one is held.
+    held_for: Option<Duration>,
+    /// How long the running write has run, while one runs.
+    running_for: Option<Duration>,
+    /// The part the running write commits, counted from one, and how many parts it has.
+    running_part: Option<(usize, usize)>,
+}
+
+impl LexicalCommitReport {
+    /// The report for a server with no lexical lane: nothing could commit the revision.
+    pub(crate) const fn settled() -> Self {
+        Self {
+            state: LexicalCommitState::Settled,
+            write: None,
+            held_for: None,
+            running_for: None,
+            running_part: None,
+        }
+    }
+
+    /// Logs why a search for `tree_revision` answered without the lexical ranking, when
+    /// this report's state is the reason: a commit held or running, or one the store
+    /// missed. A settled state logs nothing.
+    pub(crate) fn record_unranked(&self, tree_revision: &str) {
+        let (commit_state, cause) = match &self.state {
+            LexicalCommitState::Committing => ("committing", None),
+            LexicalCommitState::Owed { cause } => ("owed", Some(cause.as_str())),
+            LexicalCommitState::Settled => return,
+        };
+        tracing::info!(
+            component = "search",
+            operation = "search.commit",
+            tree_revision,
+            commit_state,
+            cause,
+            write = self.write,
+            held_ms = self.held_for.map(|held| held.as_millis()),
+            running_ms = self.running_for.map(|running| running.as_millis()),
+            part = self.running_part.map(|(part, _)| part),
+            parts = self.running_part.map(|(_, parts)| parts),
+            "search answered without the lexical ranking for a tree revision the lexical lane \
+             has not committed"
+        );
     }
 }
 
@@ -2531,8 +2638,16 @@ impl LexicalLane {
 
     /// Where `tree_revision` stands with the lane, for a search that found the store
     /// holding another tree.
+    #[cfg(test)]
     pub(crate) fn commit_state(&self, tree_revision: &str) -> LexicalCommitState {
         self.queue.locked().state_of(tree_revision)
+    }
+
+    /// Where `tree_revision` stands with the lane, for a search that found the store
+    /// holding another tree, with what the lane was doing when that was read, from one
+    /// read of the backlog.
+    pub(crate) fn commit_report(&self, tree_revision: &str) -> LexicalCommitReport {
+        self.queue.locked().report_of(tree_revision)
     }
 
     /// A wake-up for the lane's next landing: a write's end, success or failure, or a
@@ -2625,7 +2740,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     async fn write(&self, commit: LexicalCommit, whole_owed: bool) {
         let outcome = self.transaction(commit, whole_owed).await;
         let mut backlog = self.queue.locked();
-        backlog.running.clear();
+        backlog.end_running();
         if let Err(error) = outcome {
             backlog.owe_whole(error.to_string());
         }
@@ -2749,8 +2864,10 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         record_units_left_out(&left_out, self.bounds.unit_bytes_max);
         // A source selection or resolved reference can change metadata without changing
         // lexical documents, so the last part stamps and writes metadata even when empty.
-        let last = parts.len().saturating_sub(1);
+        let count = parts.len();
+        let last = count.saturating_sub(1);
         for (index, part) in parts.into_iter().enumerate() {
+            self.queue.locked().running_part = Some((index.saturating_add(1), count));
             let closing = index == last;
             let stamp = if closing {
                 LexicalStamp::published(&tree_revision, &derivation)
@@ -10142,5 +10259,83 @@ pub(crate) mod tests {
         validation.cancellation.cancel();
         tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
         observed
+    }
+
+    /// A search that ranks nothing while a write for its tree is held, running, or owed
+    /// logs one record per answer naming the revision, the commit state, which write
+    /// answers for it, how long that write has waited or run, and the part it commits.
+    /// A settled revision logs nothing.
+    #[test]
+    fn an_unranked_search_records_the_commit_it_waits_on() -> TestResult {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let publications = declaring_publications(directory.path(), 2)?;
+        let first = publications[0].reads.tree_revision().to_owned();
+        let commit = |epoch: usize| -> TestResult<super::LexicalCommit> {
+            Ok(super::LexicalCommit::new(
+                change_naming_lib()?,
+                Arc::clone(&publications[epoch]),
+            ))
+        };
+        let mut backlog = super::LexicalBacklog::default();
+        assert!(backlog.hand(commit(0)?).is_none());
+        let held = backlog.report_of(&first);
+        assert_eq!(held.state, LexicalCommitState::Committing);
+        backlog.take_next().ok_or("the write is held")?;
+        backlog.running_part = Some((2, 3));
+        assert!(backlog.hand(commit(1)?).is_none());
+        let running = backlog.report_of(&first);
+        backlog.owe_whole("the store refused".to_owned());
+        backlog.end_running();
+        let owed = backlog.report_of(&first);
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        tracing::subscriber::with_default(subscriber, || {
+            for report in [
+                &held,
+                &running,
+                &owed,
+                &super::LexicalCommitReport::settled(),
+            ] {
+                report.record_unranked(&first);
+            }
+        });
+        let records = queued_records(&mut drain);
+        assert_eq!(
+            records.len(),
+            3,
+            "one record per unranked answer, none when settled"
+        );
+        let fields = records
+            .iter()
+            .map(|record| {
+                assert_eq!(record.level(), "info");
+                assert_eq!(record.component(), "search");
+                assert_eq!(record.operation(), "search.commit");
+                serde_json::from_str::<serde_json::Value>(record.fields())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for field in &fields {
+            assert_eq!(field["tree_revision"], first.as_str());
+        }
+        assert_eq!(fields[0]["commit_state"], "committing");
+        assert_eq!(fields[0]["write"], "held");
+        assert!(fields[0]["held_ms"].is_string(), "{}", fields[0]);
+        assert!(fields[0].get("running_ms").is_none(), "{}", fields[0]);
+        assert_eq!(fields[1]["commit_state"], "committing");
+        assert_eq!(fields[1]["write"], "running");
+        assert!(fields[1]["running_ms"].is_string(), "{}", fields[1]);
+        assert!(
+            fields[1]["held_ms"].is_string(),
+            "the write held behind it: {}",
+            fields[1]
+        );
+        assert_eq!(fields[1]["part"], "2");
+        assert_eq!(fields[1]["parts"], "3");
+        assert_eq!(fields[2]["commit_state"], "owed");
+        assert_eq!(fields[2]["cause"], "the store refused");
+        assert!(fields[2].get("running_ms").is_none(), "{}", fields[2]);
+        Ok(())
     }
 }

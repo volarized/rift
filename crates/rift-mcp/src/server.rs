@@ -68,10 +68,10 @@ use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationFingerprint, ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState,
-    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalLane,
-    LexicalWrite, PopulationLane, PublishedWorkspace, WatchWorkspace, capture_prepared_workspace,
-    configuration_fingerprint, empty_workspace_preparation, run_index_supervisor,
-    workspace_watcher,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitReport,
+    LexicalCommitState, LexicalLane, LexicalWrite, PopulationLane, PublishedWorkspace,
+    WatchWorkspace, capture_prepared_workspace, configuration_fingerprint,
+    empty_workspace_preparation, run_index_supervisor, workspace_watcher,
 };
 
 /// Vector candidates one file may contribute to a fused ranking.
@@ -2850,7 +2850,7 @@ impl RiftMcp {
             self.store_answer(index, tree_revision, &parsed).await
         })
         .await;
-        let (searched, commit_state) = match stored {
+        let (searched, commit) = match stored {
             Ok(stored) => stored,
             Err(StoreReadFailure::ConnectionUnavailable) => {
                 return Ok(Some(SearchRanking::unavailable(
@@ -2860,11 +2860,16 @@ impl RiftMcp {
             }
             Err(StoreReadFailure::Refused(refusal)) => return refusal.fail(),
         };
+        // A matched store ranks whatever the lane holds; any other answer ranks nothing
+        // while a commit is held, running, or owed, and the record says which.
+        if !matches!(searched, RevisionScoped::Matched(_)) {
+            commit.record_unranked(tree_revision);
+        }
         Ok(ranking_of(
             searched,
             published.reads.file_count(),
             tree_revision,
-            commit_state,
+            commit.state,
             self.ranking_weights,
         ))
     }
@@ -3040,7 +3045,7 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure> {
         let searched = rift_core::traced_async!(
             component = "search",
             operation = "search.read_store",
@@ -3049,10 +3054,10 @@ impl RiftMcp {
         )
         .await?;
         let Some(lane) = self.lexical.as_ref() else {
-            return Ok((searched, LexicalCommitState::Settled));
+            return Ok((searched, LexicalCommitReport::settled()));
         };
-        let commit_state = lane.commit_state(tree_revision);
-        Ok((searched, commit_state))
+        let commit = lane.commit_report(tree_revision);
+        Ok((searched, commit))
     }
 
     /// How deep the search index is read for one request: the same `results_max` bound
