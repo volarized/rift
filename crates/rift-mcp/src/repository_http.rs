@@ -1156,8 +1156,6 @@ mod tests {
     #[tokio::test]
     async fn an_idle_workspace_whose_stop_fails_stays_retained_and_records_the_failure()
     -> Result<(), Box<dyn std::error::Error>> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         let root = committed_workspace(directory.path())?;
         let registry = unserved_registry(&root)?;
@@ -1180,8 +1178,7 @@ mod tests {
             .activity
             .idle_deadline(registry.idle_timeout)
             .ok_or("no request is active")?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         tokio::time::pause();
         tokio::time::advance(idle_deadline.saturating_duration_since(tokio::time::Instant::now()))
@@ -1198,7 +1195,7 @@ mod tests {
         );
         let mut failures = Vec::new();
         let mut released = false;
-        while let Ok(record) = drain.try_recv_record() {
+        for record in drain.queued_records() {
             match record.message() {
                 "idle workspace shutdown failed" => failures.push(record),
                 "idle workspace released" => released = true,

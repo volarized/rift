@@ -2600,13 +2600,9 @@ mod tests {
         use rmcp::ServiceExt as _;
 
         // Issue #483 needs the request still awaiting an answer to retain its IDs.
-        let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter("rift=info,rift_mcp=debug,rift_server=debug,rift_index=info")
-            .with_ansi(false)
-            .with_writer(log.reopen()?)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift=info,rift_mcp=debug,rift_server=debug,rift_index=info")
+            .install()?;
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         crate::server::hermetic_workspace(directory.path(), "")?;
@@ -2663,27 +2659,50 @@ mod tests {
                 .is_some_and(|block| block.text.contains("invalid_request")),
             "invalid paths retain the refusal code: {invalid:?}"
         );
-        let records = std::fs::read_to_string(log.path())?;
-        assert_tool_diagnostics(&records, &request_id)?;
+        assert_tool_diagnostics(&drain.queued_records(), &request_id)?;
         client.cancel().await?;
         forwarding.cancel().await?;
         serving.cancel().await?;
         Ok(())
     }
 
-    fn assert_tool_diagnostics(records: &str, request_id: &str) -> TestResult {
+    /// Whether `record` was emitted inside the `span` that served `request_id` for the
+    /// `search` tool: its `root_span` member names that span and carries both fields.
+    ///
+    /// The member is the span the record was emitted in, read from the subscriber's span
+    /// stack when the event fired. A record a background lane's task emits while the
+    /// request waits carries the lane's root span or none, never this one.
+    fn emitted_in(record: &rift_tracing::LogRecord, span: &str, request_id: &str) -> bool {
+        let Ok(fields) = serde_json::from_str::<serde_json::Value>(record.fields()) else {
+            return false;
+        };
+        let root = &fields["root_span"];
+        root["name"] == span
+            && root["fields"]["request_id"] == request_id
+            && root["fields"]["tool"] == "search"
+    }
+
+    /// Text spelling of each assertion before the records carried their spans: a rendered
+    /// line `mcp.forward{request_id=R tool=search}: forwarded request awaiting response
+    /// upstream_request_id=U` maps to the `forwarded request awaiting response` record whose
+    /// `root_span` is `mcp.forward` with `request_id` R and `tool` `search`;
+    /// `mcp.request{request_id=U}: <event>` maps to the `<event>` record whose `root_span` is
+    /// `mcp.request` with `request_id` U; `is_error=false` maps to the `is_error` field
+    /// `"false"`.
+    fn assert_tool_diagnostics(
+        records: &[rift_tracing::LogRecord],
+        request_id: &str,
+    ) -> TestResult {
         let forwarded = records
-            .lines()
-            .find(|line| {
-                line.contains("forwarded request awaiting response")
-                    && line.contains(&format!("request_id={request_id}"))
-                    && line.contains("tool=search")
+            .iter()
+            .find(|record| {
+                record.message() == "forwarded request awaiting response"
+                    && emitted_in(record, "mcp.forward", request_id)
             })
             .ok_or("the proxy records the active forward and downstream request ID")?;
-        let upstream_id = forwarded
-            .split("upstream_request_id=")
-            .nth(1)
-            .and_then(|value| value.split_whitespace().next())
+        let forwarded_fields: serde_json::Value = serde_json::from_str(forwarded.fields())?;
+        let upstream_id = forwarded_fields["upstream_request_id"]
+            .as_str()
             .ok_or("the forward records its upstream request ID")?;
         assert_ne!(upstream_id, request_id);
         for event in [
@@ -2694,29 +2713,37 @@ mod tests {
             "tool request completed",
         ] {
             assert!(
-                records.lines().any(|line| {
-                    line.contains("mcp.request{")
-                        && line.contains(&format!("request_id={upstream_id}"))
-                        && line.contains(event)
+                records.iter().any(|record| {
+                    record.message() == event && emitted_in(record, "mcp.request", upstream_id)
                 }),
-                "the server event retains the upstream request ID: {event}\n{records}"
+                "the server event retains the upstream request ID: {event}\n{records:#?}"
             );
         }
+        let completed = |record: &rift_tracing::LogRecord, is_error: &str| {
+            record.message() == "tool request completed"
+                && serde_json::from_str::<serde_json::Value>(record.fields())
+                    .is_ok_and(|fields| fields["is_error"] == is_error)
+        };
         assert!(
-            records
-                .lines()
-                .any(|line| line.contains("tool request completed")
-                    && line.contains("is_error=false"))
+            records.iter().any(|record| {
+                completed(record, "false") && emitted_in(record, "mcp.request", upstream_id)
+            }),
+            "the forwarded search completes without an error: {records:#?}"
         );
+        assert!(records.iter().any(|record| completed(record, "true")));
         assert!(
-            records
-                .lines()
-                .any(|line| line.contains("tool request completed")
-                    && line.contains("is_error=true"))
-        );
-        assert!(
-            !records.contains("zzdiagnosticsecret"),
-            "request arguments stay out of diagnostics: {records}"
+            !records.iter().any(|record| {
+                [
+                    record.target(),
+                    record.component(),
+                    record.operation(),
+                    record.message(),
+                    record.fields(),
+                ]
+                .iter()
+                .any(|text| text.contains("zzdiagnosticsecret"))
+            }),
+            "request arguments stay out of diagnostics: {records:#?}"
         );
         Ok(())
     }
@@ -3062,28 +3089,20 @@ mod tests {
     /// with the same failed read log that read once.
     #[tokio::test(start_paused = true)]
     async fn an_exhausted_start_window_records_what_it_last_saw() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         let _guard = claim(directory.path())?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let refusal = {
-            let _default = tracing::subscriber::set_default(subscriber);
-            connect_upstream_with(directory.path(), &test_identity(), || {
-                std::future::ready(RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
-                    pid: 4_242,
-                    settings_match: false,
-                    identity_adopted: true,
-                }))
-            })
-            .await
-            .expect_err("a holder that never publishes must exhaust the start window")
-        };
-        let mut records = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            records.push(record);
-        }
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let refusal = connect_upstream_with(directory.path(), &test_identity(), || {
+            std::future::ready(RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            }))
+        })
+        .await
+        .expect_err("a holder that never publishes must exhaust the start window");
+        drop(recorder);
+        let records = drain.queued_records();
         let messages = |message: &str| {
             records
                 .iter()
