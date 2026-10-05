@@ -19,7 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -131,7 +131,7 @@ impl MetricValues {
         labels: Labels,
         update: impl FnOnce(&Point, usize),
     ) -> bool {
-        let key = PointKey::of(instrument.name(), &labels);
+        let key = PointKey::of(instrument.name(), &labels, instrument.label_keys().len());
         let mut update = Some(update);
         let cached = CACHED_POINTS.try_with(|cache| {
             let Ok(mut cache) = cache.try_borrow_mut() else {
@@ -298,20 +298,34 @@ struct CachedPoint {
     overflow: bool,
 }
 
-/// A series by the addresses and lengths of its instrument name and label values. Two
-/// spellings of one name at two addresses are two keys for one point: the shared map,
-/// keyed by the text, answers both with it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct PointKey([usize; 2 * (1 + METRIC_LABELS_MAX)]);
+/// A series by the addresses and lengths of its instrument name and its declared label
+/// values. Two spellings of one name at two addresses are two keys for one point: the
+/// shared map, keyed by the text, answers both with it. Slots past the declared labels
+/// stay zero, and a filled slot never has a zero address.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PointKey([[usize; 2]; 1 + METRIC_LABELS_MAX]);
 
 impl PointKey {
-    fn of(name: &'static str, labels: &Labels) -> Self {
-        let mut key = [0; 2 * (1 + METRIC_LABELS_MAX)];
-        let (slots, _) = key.as_chunks_mut::<2>();
-        for (slot, text) in slots.iter_mut().zip(std::iter::once(&name).chain(labels)) {
+    fn of(name: &'static str, labels: &Labels, declared: usize) -> Self {
+        let mut key = [[0; 2]; 1 + METRIC_LABELS_MAX];
+        let texts = std::iter::once(&name).chain(labels.iter().take(declared));
+        for (slot, text) in key.iter_mut().zip(texts) {
             *slot = [text.as_ptr() as usize, text.len()];
         }
         Self(key)
+    }
+}
+
+/// Hashes the address of each filled slot and stops at the first empty one: the lengths
+/// only separate two texts at one address, which equality still compares.
+impl Hash for PointKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for [address, _] in self.0 {
+            if address == 0 {
+                break;
+            }
+            state.write_usize(address);
+        }
     }
 }
 
