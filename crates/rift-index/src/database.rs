@@ -1433,21 +1433,14 @@ mod tests {
         drop(recorder);
 
         let vectors = ("db.namespace", "vectors");
-        let operation = series(
-            &metrics,
-            "db.client.operation.duration",
-            &[vectors, ("db.operation.name", "transaction")],
-        )?;
+        let per_transaction = [vectors, ("db.operation.name", "transaction")];
+        let operation = series(&metrics, "db.client.operation.duration", &per_transaction)?;
         assert_eq!(operation.instrument().unit(), "s");
         assert!(
             observations(operation) >= 2,
             "begin and commit are operations"
         );
-        let queued = series(
-            &metrics,
-            "sqlite.queue.wait.duration",
-            &[vectors, ("db.operation.name", "transaction")],
-        )?;
+        let queued = series(&metrics, "sqlite.queue.wait.duration", &per_transaction)?;
         assert_eq!(observations(queued), observations(operation));
         let begun = series(&metrics, "sqlite.write_lock.wait.duration", &[vectors])?;
         assert_eq!(observations(begun), 1, "one BEGIN IMMEDIATE");
@@ -1471,26 +1464,14 @@ mod tests {
             (last(bound) - 4.0).abs() < f64::EPSILON,
             "the pool opens four slots"
         );
-        series(
-            &metrics,
-            "db.client.connection.count",
-            &[pool_name, ("db.client.connection.state", "used")],
-        )?;
-        series(
-            &metrics,
-            "db.client.connection.count",
-            &[pool_name, ("db.client.connection.state", "idle")],
-        )?;
-        series(
-            &metrics,
-            "db.client.connection.pending_requests",
-            &[pool_name],
-        )?;
-        let size = series(
-            &metrics,
-            "sqlite.file.size",
-            &[vectors, ("sqlite.file.type", "database")],
-        )?;
+        let used = [pool_name, ("db.client.connection.state", "used")];
+        series(&metrics, "db.client.connection.count", &used)?;
+        let idle = [pool_name, ("db.client.connection.state", "idle")];
+        series(&metrics, "db.client.connection.count", &idle)?;
+        let pending = "db.client.connection.pending_requests";
+        series(&metrics, pending, &[pool_name])?;
+        let database_file = [vectors, ("sqlite.file.type", "database")];
+        let size = series(&metrics, "sqlite.file.size", &database_file)?;
         assert_eq!(size.instrument().unit(), "By");
         assert!(last(size) > 0.0, "the open database file has pages");
         assert!(
@@ -1555,11 +1536,8 @@ mod tests {
         let metrics = recorder.metrics();
         drop(recorder);
 
-        let timeouts = series(
-            &metrics,
-            "db.client.connection.timeouts",
-            &[("db.client.connection.pool.name", "index")],
-        )?;
+        let index_pool = [("db.client.connection.pool.name", "index")];
+        let timeouts = series(&metrics, "db.client.connection.timeouts", &index_pool)?;
         assert_eq!(timeouts.instrument().unit(), "{timeout}");
         assert_eq!(timeouts.value(), &rift_tracing::SeriesValue::Sum(1.0));
         Ok(())
@@ -2306,9 +2284,8 @@ mod tests {
             path,
             rift_core::constants::WRITE_AHEAD_LOG_SUFFIX,
         )) {
-            Ok(metadata) => Ok(Some(metadata.len())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+            metadata => metadata.map(|metadata| Some(metadata.len())),
         }
     }
 
@@ -2423,6 +2400,46 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         database.shutdown(deadline).await?;
         database.shutdown(deadline).await?;
+        Ok(())
+    }
+
+    /// A checkpoint whose write connection the held pool refuses records the failure and
+    /// still stops the worker: the close answers without an error.
+    #[tokio::test]
+    async fn a_checkpoint_the_held_pool_refuses_records_the_failure_and_still_closes() -> TestResult
+    {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
+        let path = DatabaseName::Index.path(directory.path());
+        let database = WorkspaceDatabase::open(&path, DatabaseName::Index, one_slot).await?;
+        let held = database.hold_connection().await?;
+
+        let deadline = tokio::time::Instant::now() + HELD_POOL_READ_MAX;
+        database.shutdown(deadline).await?;
+        drop(held);
+        drop(recorder);
+
+        let closes: Vec<rift_tracing::LogRecord> = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.message().starts_with("database checkpoint"))
+            .collect();
+        let messages: Vec<&str> = closes
+            .iter()
+            .map(rift_tracing::LogRecord::message)
+            .collect();
+        assert_eq!(
+            messages,
+            ["database checkpoint failed; the write-ahead log stays for the next open"],
+            "the refused checkpoint records one failure and no checkpointed row"
+        );
+        assert_eq!(closes[0].level(), "warn");
+        let fields = closes[0].fields();
+        assert!(
+            fields.contains("waiting for a slot"),
+            "the record names the refusal: {fields}"
+        );
         Ok(())
     }
 
