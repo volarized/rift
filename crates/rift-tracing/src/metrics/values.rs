@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::{Instrument, InstrumentKind, METRIC_LABELS_MAX};
-use crate::sampler::ProcessSample;
+use crate::sampler::{ProcessSample, SampleHooks};
 
 /// The label values of one series, in declaration order; keys past the declared ones hold
 /// the empty string.
@@ -46,13 +46,14 @@ pub(super) const CACHED_POINTS_MAX: usize = 4_096;
 /// another dispatcher's values.
 static NEXT_VALUES: AtomicU64 = AtomicU64::new(0);
 
-/// The metric values one dispatcher holds: every instrument's series, and the latest
-/// process sample the sampler published.
+/// The metric values one dispatcher holds: every instrument's series, the latest process
+/// sample the sampler published, and the hooks its sampler runs.
 #[derive(Debug)]
 pub(crate) struct MetricValues {
     identity: u64,
     instruments: Mutex<HashMap<&'static str, InstrumentValues>>,
     sample: Mutex<Option<ProcessSample>>,
+    hooks: SampleHooks,
     #[cfg(feature = "otlp")]
     export: Option<crate::otlp::MetricExport>,
 }
@@ -63,6 +64,7 @@ impl Default for MetricValues {
             identity: NEXT_VALUES.fetch_add(1, Ordering::Relaxed),
             instruments: Mutex::default(),
             sample: Mutex::default(),
+            hooks: SampleHooks::default(),
             #[cfg(feature = "otlp")]
             export: None,
         }
@@ -195,6 +197,11 @@ impl MetricValues {
             point: Arc::clone(point),
             overflow: true,
         }
+    }
+
+    /// The callbacks the sampler runs on each tick.
+    pub(crate) const fn hooks(&self) -> &SampleHooks {
+        &self.hooks
     }
 
     /// Publishes `sample` as the process's latest.

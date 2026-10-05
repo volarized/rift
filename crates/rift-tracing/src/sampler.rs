@@ -7,7 +7,9 @@
 //! [`ProcessGauge::current`](crate::ProcessGauge::current) reads the latest one without an
 //! OS read of its own.
 
-use std::sync::Arc;
+use std::fmt;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 mod tokio_runtime;
@@ -21,7 +23,7 @@ use self::tokio_runtime::{RuntimeReading, RuntimeSeries};
 use crate::capture::now_ms;
 use crate::flight::{FlightTable, publish_stalled};
 use crate::measurement::monotonic_now;
-use crate::metrics::{Counter, Gauge, MetricValues, metrics};
+use crate::metrics::{Counter, Gauge, MetricLayer, MetricValues, metrics};
 use crate::snapshot::{self, SnapshotSeries};
 
 /// The shortest interval the sampler refreshes the process at. CPU usage is the change of
@@ -32,6 +34,9 @@ pub const PROCESS_SAMPLE_INTERVAL_MIN: Duration = Duration::from_millis(200);
 const _: () = assert!(
     sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.as_millis() <= PROCESS_SAMPLE_INTERVAL_MIN.as_millis()
 );
+
+/// Sample hooks one dispatcher's sampler runs, at most. A registration past it is refused.
+pub const SAMPLE_HOOKS_MAX: usize = 64;
 
 /// `process.memory.virtual`: the virtual memory size in bytes.
 const PROCESS_MEMORY_VIRTUAL: Gauge<u64, 0> = Gauge::declare("process.memory.virtual", "By", &[]);
@@ -250,6 +255,127 @@ impl ProcessReader for SystemProcessReader {
     }
 }
 
+/// The callback a [`SampleHook`] hands the sampler.
+type SampleRead = dyn Fn() + Send + Sync;
+
+/// A callback the process sampler runs on each tick for as long as this value lives:
+/// dropping it removes the callback.
+///
+/// The callback runs on the blocking pool beside the process read, under the dispatcher
+/// that was current when it was registered, so the gauges it records land in that
+/// dispatcher's metric values before the tick's snapshot reads them. It may block on a
+/// file metadata read; it holds up its own tick and no runtime worker. A callback that
+/// panics loses that tick's reads and stays registered.
+#[must_use = "dropping the hook removes it from the sampler"]
+pub struct SampleHook {
+    _read: Arc<SampleRead>,
+}
+
+impl fmt::Debug for SampleHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("SampleHook").finish_non_exhaustive()
+    }
+}
+
+/// Registers `read` with the sampler of the thread's current dispatcher, to run on each
+/// tick until the returned [`SampleHook`] drops.
+///
+/// Answers `None`, and registers nothing, when the dispatcher holds no metric values, or
+/// when [`SAMPLE_HOOKS_MAX`] hooks are already registered with it. A dispatcher whose
+/// runtime runs no sampler holds the hook and never runs it.
+///
+/// ```
+/// const QUEUED: rift_tracing::Gauge<u64, 0> =
+///     rift_tracing::Gauge::declare("test.queue.length", "{task}", &[]);
+/// let hook = rift_tracing::sample_hook(|| QUEUED.value(3).record());
+/// assert!(hook.is_none(), "no dispatcher holds metric values here");
+/// ```
+pub fn sample_hook(read: impl Fn() + Send + Sync + 'static) -> Option<SampleHook> {
+    let mut read = Some(read);
+    tracing::dispatcher::get_default(|dispatch| {
+        let layer = dispatch.downcast_ref::<MetricLayer>()?;
+        let read: Arc<SampleRead> = Arc::new(read.take()?);
+        layer
+            .values()
+            .hooks()
+            .register(&read, dispatch.downgrade())
+            .then_some(SampleHook { _read: read })
+    })
+}
+
+/// The hooks one dispatcher's metric values hold: each callback and its dispatcher, both
+/// weak, so neither a dropped owner's callback nor the dispatcher stays alive through them.
+#[derive(Default)]
+pub(crate) struct SampleHooks {
+    registered: Mutex<Vec<(Weak<SampleRead>, tracing::dispatcher::WeakDispatch)>>,
+}
+
+impl fmt::Debug for SampleHooks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SampleHooks")
+            .field("registered", &self.lock().len())
+            .finish()
+    }
+}
+
+impl SampleHooks {
+    fn lock(&self) -> MutexGuard<'_, Vec<(Weak<SampleRead>, tracing::dispatcher::WeakDispatch)>> {
+        self.registered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds `read`, recording through `dispatch`, unless [`SAMPLE_HOOKS_MAX`] live hooks
+    /// are registered; answers whether it did. Hooks whose owner or dispatcher dropped
+    /// leave first.
+    fn register(
+        &self,
+        read: &Arc<SampleRead>,
+        dispatch: tracing::dispatcher::WeakDispatch,
+    ) -> bool {
+        let mut registered = self.lock();
+        registered
+            .retain(|(read, dispatch)| read.strong_count() > 0 && dispatch.upgrade().is_some());
+        if registered.len() >= SAMPLE_HOOKS_MAX {
+            return false;
+        }
+        registered.push((Arc::downgrade(read), dispatch));
+        true
+    }
+
+    /// The hooks whose owner and dispatcher are still alive; the rest leave.
+    pub(crate) fn live(&self) -> Vec<(Arc<SampleRead>, tracing::Dispatch)> {
+        let mut live = Vec::new();
+        self.lock().retain(|(read, dispatch)| {
+            let Some(hook) = read.upgrade().zip(dispatch.upgrade()) else {
+                return false;
+            };
+            live.push(hook);
+            true
+        });
+        live
+    }
+
+    /// The count of hooks registered, those of dropped owners included until they leave.
+    #[cfg(test)]
+    pub(crate) fn registered(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// Runs each of `hooks` under its dispatcher, and answers how many it ran. A panic ends
+/// that hook's run alone.
+pub(crate) fn run_hooks(hooks: Vec<(Arc<SampleRead>, tracing::Dispatch)>) -> usize {
+    let count = hooks.len();
+    for (read, dispatch) in hooks {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            tracing::dispatcher::with_default(&dispatch, || read());
+        }));
+    }
+    count
+}
+
 /// What the sampler publishes into the log stream beside each sample: the runtime sample,
 /// the entries of the table of operations in flight open past `stall_delay`, and metric
 /// snapshot records.
@@ -320,9 +446,9 @@ impl ProcessSampler {
     }
 }
 
-/// Ticks every `interval` until `cancel` fires: one read on the blocking pool, one
-/// published sample, then the tick's evidence. A read that panics ends the sampling; the
-/// samples published before it stay.
+/// Ticks every `interval` until `cancel` fires: one read on the blocking pool, followed
+/// there by every live [`SampleHook`], one published sample, then the tick's evidence. A
+/// read that panics ends the sampling; the samples published before it stay.
 async fn sample(
     mut reader: impl ProcessReader,
     interval: Duration,
@@ -342,8 +468,10 @@ async fn sample(
             () = cancel.cancelled() => return,
             _ = ticks.tick() => {}
         }
+        let hooks = values.hooks().live();
         let read = tokio::task::spawn_blocking(move || {
             let reading = reader.read();
+            let _ran = run_hooks(hooks);
             (reader, reading)
         });
         let joined = tokio::select! {

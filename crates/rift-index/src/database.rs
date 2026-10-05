@@ -324,6 +324,9 @@ pub struct WorkspaceDatabase {
     writes: Mutex<()>,
     /// Whether a shutdown has already run the close checkpoint.
     checkpointed: AtomicBool,
+    /// Records the file sizes on each tick of the process sampler while the database
+    /// lives; absent where no dispatcher holds metric values.
+    _file_size_sampling: Option<rift_tracing::SampleHook>,
 }
 
 /// The row `PRAGMA wal_checkpoint(TRUNCATE)` answers: whether it met another connection's
@@ -445,6 +448,10 @@ impl WorkspaceDatabase {
             thread,
             writes: Mutex::new(()),
             checkpointed: AtomicBool::new(false),
+            _file_size_sampling: rift_tracing::sample_hook({
+                let path = database_path.to_owned();
+                move || record_file_sizes(name, &path)
+            }),
         };
         opened.record_pool();
         opened.record_file_sizes();
@@ -472,21 +479,10 @@ impl WorkspaceDatabase {
             .record();
     }
 
-    /// Records the size of the database file and of its write-ahead log. A file that cannot
-    /// be read, such as a log the close removed, records nothing: absent, not zero.
+    /// Records the size of the database file and of its write-ahead log, at open and close;
+    /// the process sampler records them on each tick between.
     fn record_file_sizes(&self) {
-        let database = self.name.label();
-        let files = [
-            ("database", self.path.clone()),
-            ("wal", appended(&self.path, WRITE_AHEAD_LOG_SUFFIX)),
-        ];
-        for (kind, path) in files {
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                FILE_SIZE
-                    .labeled_value([database, kind], metadata.len())
-                    .record();
-            }
-        }
+        record_file_sizes(self.name, &self.path);
     }
 
     /// Which database this is.
@@ -817,6 +813,24 @@ fn is_pool_wait_timeout(failure: &toasty::Error) -> bool {
 /// the whole file name, beside the database.
 fn migration_lock_path(database_path: &Path) -> PathBuf {
     appended(database_path, MIGRATION_LOCK_SUFFIX)
+}
+
+/// Records the size of the database file `path` of `name` and of its write-ahead log. A
+/// file that cannot be read, such as a log the close removed, records nothing: absent, not
+/// zero. The reads block on the file system.
+fn record_file_sizes(name: DatabaseName, path: &Path) {
+    let database = name.label();
+    let files = [
+        ("database", path.to_owned()),
+        ("wal", appended(path, WRITE_AHEAD_LOG_SUFFIX)),
+    ];
+    for (kind, path) in files {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            FILE_SIZE
+                .labeled_value([database, kind], metadata.len())
+                .record();
+        }
+    }
 }
 
 /// `path` with `suffix` appended to its whole file name, as `SQLite` names its
@@ -1484,6 +1498,41 @@ mod tests {
                 .find("db.client.connection.timeouts", &[pool_name])
                 .is_none(),
             "no checkout timed out"
+        );
+        Ok(())
+    }
+
+    /// An open database registers its file sizes with the process sampler: a tick records
+    /// the write-ahead log the writes grew, and once the database drops no tick runs its
+    /// hook.
+    #[tokio::test]
+    async fn an_open_database_records_its_file_sizes_on_each_sampler_tick() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let database = WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await?;
+        let wal = super::appended(&path, super::WRITE_AHEAD_LOG_SUFFIX);
+        std::fs::write(&wal, [0_u8; 4_096])?;
+
+        assert_eq!(recorder.run_sample_hooks(), 1, "the database's hook runs");
+        let wal_size = |metrics: &rift_tracing::MetricSnapshot| {
+            metrics
+                .find(
+                    "sqlite.file.size",
+                    &[("db.namespace", "index"), ("sqlite.file.type", "wal")],
+                )
+                .map(|series| series.value().clone())
+        };
+        assert_eq!(
+            wal_size(&recorder.metrics()),
+            Some(rift_tracing::SeriesValue::Last(4_096.0)),
+            "the tick read the size the file has now"
+        );
+        drop(database);
+        assert_eq!(
+            recorder.run_sample_hooks(),
+            0,
+            "the dropped database's hook left"
         );
         Ok(())
     }

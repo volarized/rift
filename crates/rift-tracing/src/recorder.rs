@@ -94,6 +94,14 @@ impl ScopedRecorder {
         self.values.snapshot()
     }
 
+    /// Runs every live [`SampleHook`](crate::SampleHook) registered under this recorder once,
+    /// on the calling thread, as a tick of the process sampler would; answers how many ran.
+    /// A recorder runs no sampler of its own.
+    #[must_use = "the count tells whether the hooks expected ran"]
+    pub fn run_sample_hooks(&self) -> usize {
+        crate::sampler::run_hooks(self.values.hooks().live())
+    }
+
     /// The metric values the recorder holds, for a test that publishes a process sample.
     #[cfg(test)]
     pub(crate) fn values(&self) -> &MetricValues {
