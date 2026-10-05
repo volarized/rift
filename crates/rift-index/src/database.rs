@@ -2823,6 +2823,113 @@ mod tests {
         Ok(())
     }
 
+    /// Opens the index, vectors, and metrics databases below `directory`, each thread
+    /// holding the one owner that stands for the election, closes two, and holds the
+    /// thread of `held` past its close. The owner is an exclusive lock on a file, as the
+    /// election is: a contender's lock attempt fails until the last of the three threads
+    /// exits, and succeeds once the held thread is released.
+    async fn election_outlasts_every_database_thread(held: &str) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let election_path = directory.path().join("server.lock");
+        let election = Arc::new(std::fs::File::create(&election_path)?);
+        election.try_lock()?;
+        let owner: Arc<dyn Send + Sync> = Arc::<std::fs::File>::clone(&election);
+        let index = WorkspaceDatabase::open_with_owner(
+            &DatabaseName::Index.path(directory.path()),
+            DatabaseName::Index,
+            pool(),
+            Some(Arc::clone(&owner)),
+        )
+        .await?;
+        let vectors = WorkspaceDatabase::open_with_owner(
+            &DatabaseName::Vectors.path(directory.path()),
+            DatabaseName::Vectors,
+            pool(),
+            Some(Arc::clone(&owner)),
+        )
+        .await?;
+        let metrics =
+            rift_tracing::LogStore::open(&directory.path().join("metrics"), Some(owner)).await?;
+        drop(election);
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&election_path)?;
+        let closed = tokio::time::Instant::now() + HELD_POOL_READ_MAX;
+
+        let release: Box<dyn FnOnce() -> TestResult> = match held {
+            "metrics" => {
+                index.shutdown(closed).await?;
+                vectors.shutdown(closed).await?;
+                let (holding, release) = metrics.hold_next_checkpoint();
+                let short = tokio::time::Instant::now() + Duration::from_millis(50);
+                let (close, holding) = tokio::join!(metrics.close(short), holding);
+                holding?;
+                let close = close?;
+                assert!(
+                    matches!(close, rift_tracing::StoreClose::Timeout { .. }),
+                    "the held writer outlasts its close: {close:?}"
+                );
+                Box::new(move || Ok(release.send(())?))
+            }
+            "index" | "vectors" => {
+                let (kept, closing) = if held == "index" {
+                    (&index, &vectors)
+                } else {
+                    (&vectors, &index)
+                };
+                closing.shutdown(closed).await?;
+                metrics.close(closed).await?;
+                let (holding, release) = kept.thread.hold_for_test().await?;
+                holding.await?;
+                kept.shutdown(tokio::time::Instant::now())
+                    .await
+                    .expect_err("the held worker outlasts a close past its deadline");
+                Box::new(move || {
+                    release
+                        .send(())
+                        .map_err(|()| "the held worker resumes".into())
+                })
+            }
+            other => return Err(format!("no database is named {other}").into()),
+        };
+        assert!(
+            contender.try_lock().is_err(),
+            "the election stays held while the {held} thread runs"
+        );
+
+        release()?;
+        tokio::time::timeout(HELD_POOL_READ_MAX, async {
+            while contender.try_lock().is_err() {
+                tokio::time::sleep(MIGRATION_LOCK_POLL).await;
+            }
+        })
+        .await
+        .map_err(|_elapsed| format!("the {held} thread kept the election once released"))?;
+        Ok(())
+    }
+
+    /// The election outlasts every database thread: with the vectors and metrics databases
+    /// closed, the index worker held past its close keeps it.
+    #[tokio::test]
+    async fn the_election_outlasts_a_held_index_worker() -> TestResult {
+        election_outlasts_every_database_thread("index").await
+    }
+
+    /// With the index and metrics databases closed, the vectors worker held past its close
+    /// keeps the election.
+    #[tokio::test]
+    async fn the_election_outlasts_a_held_vectors_worker() -> TestResult {
+        election_outlasts_every_database_thread("vectors").await
+    }
+
+    /// With the index and vectors databases closed, the metrics writer thread held in its
+    /// close checkpoint keeps the election.
+    #[tokio::test]
+    async fn the_election_outlasts_a_held_metrics_writer() -> TestResult {
+        election_outlasts_every_database_thread("metrics").await
+    }
+
     /// A checkpoint row of another shape is a storage failure, not a guess.
     #[test]
     fn a_checkpoint_row_of_another_shape_is_refused() {

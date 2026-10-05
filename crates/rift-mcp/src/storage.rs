@@ -332,6 +332,53 @@ mod tests {
             .expect("an unopened handle closes");
     }
 
+    /// The election outlasts every database thread of elected storage: with the index and
+    /// vectors databases closed and every guard handle dropped, the metrics writer held in
+    /// its close checkpoint keeps the election, and a claim succeeds once it is released.
+    #[tokio::test]
+    async fn the_election_outlasts_a_held_metrics_writer() {
+        const STEP_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let guard = Arc::new(crate::claim(directory.path()).expect("the election"));
+        let storage = WorkspaceStorage::open_elected(directory.path(), Arc::clone(&guard))
+            .await
+            .expect("elected storage opens");
+        let index = storage.database().expect("the index database opens");
+        let vectors = storage.vectors().expect("the vectors handle");
+        vectors
+            .resolve(index.pool())
+            .await
+            .expect("the vectors database opens");
+        let logs = storage.logs().expect("the metrics database opens");
+        drop(storage);
+        drop(guard);
+
+        let closed = tokio::time::Instant::now() + STEP_MAX;
+        index.shutdown(closed).await.expect("the index closes");
+        vectors.shutdown(closed).await.expect("the vectors close");
+        let (holding, release) = logs.hold_next_checkpoint();
+        let short = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        let (close, holding) = tokio::join!(logs.close(short), holding);
+        holding.expect("the writer holds its checkpoint");
+        let close = close.expect("a held checkpoint ends the close at its deadline");
+        assert!(
+            matches!(close, rift_tracing::StoreClose::Timeout { .. }),
+            "the held writer outlasts its close: {close:?}"
+        );
+        let refused =
+            crate::claim(directory.path()).expect_err("the held metrics writer keeps the election");
+        assert_eq!(refused.slug(), errors::mcp::election_already_serving::SLUG);
+
+        release.send(()).expect("the held writer resumes");
+        tokio::time::timeout(STEP_MAX, async {
+            while crate::claim(directory.path()).is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the released writer frees the election");
+    }
+
     /// A refused vectors database leaves the index and metrics databases serving: each
     /// database opens on its own.
     #[tokio::test]
