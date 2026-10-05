@@ -34,6 +34,9 @@ rift-tracing = { path = "crates/rift-tracing" }
 anyhow = "1.0"
 proc-macro2 = "1.0.107"
 prettyplease = "0.2.37"
+# `#[rift_tracing::timed]` finds the consuming crate's name for `rift-tracing`, renamed or
+# not, through this crate; `borsh-derive` already locks it.
+proc-macro-crate = "=3.5.0"
 quote = "1.0.47"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 candle-core = { version = "0.11.0", default-features = false }
@@ -62,16 +65,21 @@ oas3 = "=0.22.0"
 # pinned exactly rather than left to drift independently. `internal-logs` turns the SDK's own
 # reports - the first span a full batch queue drops, the dropped total at shutdown, a failed
 # export - into `tracing` events on the `opentelemetry_sdk` target; without it they compile to
-# nothing and a full queue drops spans silently.
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
+# nothing and a full queue drops spans silently. `metrics` exports the values rift-tracing's
+# instruments hold in process; the async-runtime periodic reader exports them over the same
+# Tokio-driven `reqwest` client the span batches use.
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = [
     "http-proto",
+    "metrics",
     "reqwest-client",
     "trace",
 ] }
 opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = [
+    "experimental_metrics_periodicreader_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
     "internal-logs",
+    "metrics",
     "rt-tokio",
     "trace",
 ] }
@@ -122,6 +130,10 @@ toasty-driver-sqlite = "=0.10.0"
 tokenizers = { version = "0.22.2", default-features = false }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 syn = { version = "2.0.119", features = ["full"] }
+# The process sampler reads one process: its resident and virtual memory, CPU time and usage,
+# open files, and disk bytes. `system` alone; 0.39 builds against the `windows` 0.62 the
+# lock already holds.
+sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 thiserror = "2.0.20"
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
