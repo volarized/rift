@@ -2322,7 +2322,13 @@ impl WorkspaceIndex {
         self.rebuilt_cancellable(changes, &|| false)
     }
 
-    /// Builds the named-path index, checking `cancelled` between paths.
+    /// Builds the named-path index, checking `cancelled` between paths and at each phase
+    /// boundary after them: before the semantics graph, before the declarations, before
+    /// the documentation collection, and before the symbol documents.
+    ///
+    /// The phases after the named paths cover every held file, so they are where a
+    /// one-path rebuild spends its time, and a caller that no longer wants the result
+    /// stops it between two of them.
     ///
     /// # Errors
     ///
@@ -2353,7 +2359,9 @@ impl WorkspaceIndex {
             self.limits.declarations_max(),
             Some(self.semantics.graph()),
         )?;
+        check_cancelled(cancelled)?;
         let declarations = crate::documentation::declarations(&files, &semantics);
+        check_cancelled(cancelled)?;
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -2362,6 +2370,7 @@ impl WorkspaceIndex {
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
             Some((&self.documentation, &self.notebooks)),
         )?;
+        check_cancelled(cancelled)?;
         let symbol_documents = carried_symbol_documents(Some(self), &files, self.limits.syntax());
         Ok(Self {
             root: self.root.clone(),
@@ -11119,6 +11128,49 @@ mod tests {
             checks.load(Ordering::SeqCst),
             2,
             "second path observes cancellation"
+        );
+    }
+
+    #[test]
+    fn test_workspace_rebuild_stops_when_cancelled_at_each_phase_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("a.rs"), "pub fn first() {}\n").expect("source");
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        fs::write(directory.path().join("a.rs"), "pub fn changed_first() {}\n")
+            .expect("changed source");
+        let changes = resolved(&index, directory.path(), &["a.rs"]);
+        assert_eq!(changes.len(), 1, "the named path needs replacement");
+        // One changed path is checked before its read and once after the loop. The three
+        // checks after those stand before the declarations, the documentation collection,
+        // and the symbol documents.
+        for passed in 2..=4_usize {
+            let checks = AtomicUsize::new(0);
+            let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= passed;
+            let error = index
+                .rebuilt_cancellable(&changes, &cancelled)
+                .expect_err("cancelled rebuild must stop at the phase boundary");
+            assert_eq!(error.slug(), errors::index::workspace_cancelled::SLUG);
+            assert_eq!(
+                checks.load(Ordering::SeqCst),
+                passed + 1,
+                "the boundary after {passed} passed checks observes cancellation"
+            );
+        }
+        let checks = AtomicUsize::new(0);
+        let counted = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let rebuilt = index
+            .rebuilt_cancellable(&changes, &counted)
+            .expect("an uncancelled rebuild completes");
+        assert_eq!(rebuilt.file_count(), 1);
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            5,
+            "one changed path meets five checks"
         );
     }
 
