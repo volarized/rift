@@ -601,7 +601,11 @@ The flags narrow what prints:
 
 - `-f`, `--follow` keeps printing records as the server writes them
 - `-n`, `--tail` prints only the newest records
-- `--since` takes a duration such as `10m`
+- `--since` prints records recorded at or after an age such as `10m`, or an RFC 3339 timestamp
+  such as `2026-10-04T20:42:58Z`
+- `--until` prints records recorded before a bound, in the same two forms; with `--since` it
+  selects one window
+- `--kind` prints `log` records, the default, `metric` snapshot records, or `all` of them
 - `--level` selects one severity
 - `--component` selects records from one component
 
@@ -649,7 +653,8 @@ The CLI starts tracing through `TracingRuntime::builder` in `rift-tracing`, whic
 subscriber with a filter per layer:
 
 - stderr under `RUST_LOG`, or `rift=info,rift_mcp=info,rift_server=info,rift_index=warn` when
-  that variable is unset or does not parse
+  that variable is unset or does not parse, with metric snapshot records left out and only the
+  stall reports of `rift_tracing::flight`
 - the `LogSink` under `[logs]` `capture`, installed for a foreground server alone
 - with the `otlp` feature, the OTLP export under `RIFT_OTLP_FILTER`
 
@@ -693,6 +698,50 @@ platform does not report stays absent and is never recorded as zero, and CPU usa
 until a second sample at least 200 ms after the first. With the `otlp` feature and
 `OTEL_EXPORTER_OTLP_ENDPOINT` set, every recorded value is also forwarded to an OpenTelemetry
 meter whose reader exports at `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default.
+
+Work that has not finished is evidence too. The runtime keeps a table of operations in flight:
+every span carrying an `operation` field, every lock wait, and every held lock, from its opening
+to its close, with its name, kind (`operation`, `wait`, or `held`), component, lock name, parent
+operation, and start. The table holds at most 1,024 entries and counts each one refused past
+that bound as `untracked`. `rift_tracing::publish_in_flight(reason)` writes it as one
+`operations in flight` record, and the sample tick writes one `operations in flight past the
+stall delay` record, at `WARN`, for the entries open longer than `[logs]` `stall_delay`, each
+entry once. Both records list the open entries oldest first, with `age_ms`, as the JSON array
+in `operations`, keep it within 4 KiB, and count what did not fit in `left_out`:
+
+```json
+[
+  {"operation": "lexical.commit", "kind": "operation", "age_ms": 12043, "component": "lexical"},
+  {"operation": "lock.wait", "kind": "wait", "age_ms": 11980, "lock.name": "index.write",
+   "parent": "lexical.write_turn"},
+  {"operation": "lock.held", "kind": "held", "age_ms": 30211, "lock.name": "index.write",
+   "parent": "documentation.store"}
+]
+```
+
+`traced!(component = .., operation = .., open = true, ..)` also records its opening: one
+`operation opened` event inside the operation's span, so the store holds the operation while it
+runs and a killed server leaves it behind. `lexical.commit` opens this way.
+
+`rift_tracing::lock(name).acquire(future)` wraps the caller's own acquisition future, such as
+`mutex.lock()`, and polls it as the caller would, so the lock's queue order and cancellation
+stay its own. A wait that does not acquire at its first poll opens a `lock.wait` span naming
+`lock.name`, `lock.mode`, the `waiter` operation, and the `holder` operation, and closes it with
+`outcome` `acquired`, `refused`, `timeout`, or `cancelled`. The returned guard dereferences to the
+wrapped guard and keeps a `lock.held` span open until it drops. Both feed `lock.wait.duration`
+and `lock.held.duration`. The write turn of `.rift/index` and `.rift/vectors` is recorded as
+`index.write` and `vectors.write`, so a lexical commit that waits for a documentation write shows
+as a `lock.wait` entry under `lexical.commit` while the holder's `lock.held` entry names the
+operation running its statements.
+
+The sample tick also writes metric snapshot records, kind `metric`, one per instrument group:
+`operations`, `locks`, `database`, `runtime`, `process`, and `lifecycle`. A gauge prints its
+value, a counter its change since the previous snapshot, and a histogram the changes of its
+`.count` and `.sum`. A labeled series prints its label values in declaration order inside
+braces, leaving out a label recorded empty, so the waits on the write turn print as
+`lock.wait.duration.count{lock.name=index.write,lock.mode=exclusive}=2`. A tick at which no
+counter or histogram outside `process` moved writes nothing. Reads return `log` records unless
+they ask for another kind, so snapshots do not fill a page of diagnostics.
 
 ## Shared ranking
 
