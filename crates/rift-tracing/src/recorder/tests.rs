@@ -35,7 +35,11 @@ fn a_recorder_captures_every_level_on_its_thread_by_default() -> TestResult {
     assert_eq!(records[0].level(), "trace");
     assert_eq!(records[0].component(), "index");
     assert_eq!(records[0].operation(), "index.publish");
-    assert_eq!(records[0].fields(), "{\"epoch\":\"3\"}");
+    assert_eq!(
+        records[0].fields(),
+        "{\"code.function.name\":\"rift_tracing::recorder::tests::\
+         a_recorder_captures_every_level_on_its_thread_by_default\",\"epoch\":\"3\"}"
+    );
     Ok(())
 }
 

@@ -328,7 +328,12 @@ async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> Tes
     assert_eq!(first.operation(), "history.batch");
     assert_eq!(
         first.fields(),
-        r#"{"phase":"start","pending":"2","root_span":{"name":"history.batch","fields":{"component":"history","operation":"history.batch"}}}"#,
+        concat!(
+            r#"{"code.function.name":"rift_mcp::history::HistoryTask::fill_planned","#,
+            r#""phase":"start","pending":"2","root_span":{"name":"history.batch","#,
+            r#""fields":{"component":"history","operation":"history.batch","#,
+            r#""code.function.name":"rift_mcp::history::HistoryTask::fill_planned"}}}"#,
+        ),
         "the first batch starts inside its span with both commits of the fixture pending"
     );
     Ok(())

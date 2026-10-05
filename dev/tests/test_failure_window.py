@@ -19,13 +19,14 @@ from rift_dev.rift_test_client import (
 SINCE = "2026-10-05T09:00:00.000+00:00"
 UNTIL = "2026-10-05T09:00:30.000+00:00"
 IN_FLIGHT = (
-    "2026-10-05T08:59:00.000+00:00 INFO  -        -            "
-    "operations in flight in_flight=2 reason=stall_delay"
+    "2026-10-05 08:59:00.000Z INFO  rift_tracing::flight   in_flight=2 reason=stop  "
+    "operations in flight"
 )
-SNAPSHOT = (
-    "2026-10-05T08:59:30.000+00:00 INFO  -        locks        metric snapshot a=1"
+SNAPSHOT = "2026-10-05 08:59:30.000Z INFO  locks   a=1"
+INSIDE = (
+    "2026-10-05 09:00:10.000Z ERROR rift_mcp::validation::prepare   component=index "
+    "operation=index.build  build failed"
 )
-INSIDE = "2026-10-05T09:00:10.000+00:00 ERROR index    index.build  build failed"
 
 
 def test_window_arguments_name_kind_bounds_and_tail() -> None:
@@ -142,7 +143,7 @@ WINDOW_BINARY = """
 import os, sys
 with open(os.environ["RECORD_ARGUMENTS"], "a") as seen:
     seen.write(" ".join(sys.argv[1:]) + "\\n")
-print("2026-10-05T09:00:10.000+00:00 \\U0001f534 ERROR index    index.build  build failed")
+print("2026-10-05 09:00:10.000Z ERROR rift_mcp::validation::prepare   component=index  build failed")
 """
 
 

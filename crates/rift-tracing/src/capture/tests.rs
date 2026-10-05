@@ -45,7 +45,7 @@ fn closed(records: Vec<LogRecord>) -> LogRecord {
 #[test]
 fn an_event_reaches_the_queue_with_its_labels() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!(
@@ -68,7 +68,7 @@ fn an_event_reaches_the_queue_with_its_labels() {
 #[test]
 fn an_event_inherits_its_span_labels() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = tracing::info_span!(
@@ -89,7 +89,7 @@ fn an_event_inherits_its_span_labels() {
 #[test]
 fn a_closing_span_records_how_long_it_ran() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = tracing::info_span!(
@@ -118,7 +118,7 @@ fn a_closing_span_records_how_long_it_ran() {
 #[test]
 fn a_closing_span_records_the_fields_it_carried() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = crate::info_span!(
@@ -137,7 +137,9 @@ fn a_closing_span_records_the_fields_it_carried() {
     let closed = closed(queued(&mut drain));
     assert!(
         closed.fields().starts_with(
-            "{\"trigger\":\"filesystem\",\"epoch\":\"7\",\"changed_count\":\"3\",\
+            "{\"code.function.name\":\"rift_tracing::capture::tests::\
+             a_closing_span_records_the_fields_it_carried\",\"trigger\":\"filesystem\",\
+             \"epoch\":\"7\",\"changed_count\":\"3\",\
              \"span\":\"closed\","
         ),
         "{}",
@@ -154,7 +156,7 @@ fn a_closing_span_records_the_fields_it_carried() {
 #[test]
 fn a_span_without_fields_records_how_long_it_ran_alone() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = tracing::info_span!(
@@ -181,7 +183,7 @@ fn a_span_without_fields_records_how_long_it_ran_alone() {
 #[test]
 fn a_span_closing_inside_another_carries_the_root_span() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let request = tracing::info_span!("mcp.request", component = "mcp", request_id = 7);
@@ -227,7 +229,7 @@ fn a_span_closing_inside_another_carries_the_root_span() {
 #[test]
 fn a_span_past_the_field_bound_records_the_members_that_fit() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
     let long = "é".repeat(SPAN_FIELDS_BYTES_MAX);
 
     tracing::subscriber::with_default(subscriber, || {
@@ -274,7 +276,7 @@ fn event_fields(records: Vec<LogRecord>) -> Vec<(String, serde_json::Value)> {
 #[test]
 fn an_event_inside_a_span_carries_the_span_fields() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = tracing::info_span!(
@@ -303,7 +305,7 @@ fn an_event_inside_a_span_carries_the_span_fields() {
 #[test]
 fn an_event_inside_nested_spans_carries_the_root_and_the_nearest_span() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let root = tracing::info_span!("mcp.request", component = "mcp", request_id = 7);
@@ -341,12 +343,16 @@ fn an_event_inside_nested_spans_carries_the_root_and_the_nearest_span() {
     );
 }
 
+/// The function that opens the span of [`a_field_recorded_after_open_reaches_later_events`].
+const RECORDED_AFTER_OPEN: &str =
+    "rift_tracing::capture::tests::a_field_recorded_after_open_reaches_later_events";
+
 /// A field the span records after it opened is on the events that follow the record and
 /// not on the ones before it.
 #[test]
 fn a_field_recorded_after_open_reaches_later_events() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = crate::info_span!(
@@ -363,12 +369,16 @@ fn a_field_recorded_after_open_reaches_later_events() {
     assert_eq!(records[0].0, "before");
     assert_eq!(
         records[0].1["root_span"]["fields"],
-        serde_json::json!({"component": "mcp"})
+        serde_json::json!({"component": "mcp", "code.function.name": RECORDED_AFTER_OPEN})
     );
     assert_eq!(records[1].0, "after");
     assert_eq!(
         records[1].1["root_span"]["fields"],
-        serde_json::json!({"component": "mcp", "upstream_request_id": "12"})
+        serde_json::json!({
+            "component": "mcp",
+            "code.function.name": RECORDED_AFTER_OPEN,
+            "upstream_request_id": "12",
+        })
     );
 }
 
@@ -378,7 +388,7 @@ fn a_field_recorded_after_open_reaches_later_events() {
 #[test]
 fn an_event_inside_a_span_past_the_field_bound_carries_the_members_that_fit() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
     let long = "é".repeat(SPAN_FIELDS_BYTES_MAX);
     let wide = "é".repeat(400);
 
@@ -427,7 +437,7 @@ fn an_event_inside_a_span_past_the_field_bound_carries_the_members_that_fit() {
 #[test]
 fn a_field_under_a_reserved_name_is_not_recorded() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!(root_span = "forged", epoch = 1, "outside");
@@ -447,7 +457,7 @@ fn a_field_under_a_reserved_name_is_not_recorded() {
 #[test]
 fn an_event_outside_every_span_carries_its_own_fields_alone() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     tracing::subscriber::with_default(subscriber, || {
         let span = tracing::info_span!("mcp.request", request_id = 7);
@@ -470,7 +480,7 @@ fn a_spawned_task_carries_only_the_span_it_was_instrumented_with() {
     use tracing::Instrument as _;
 
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a current-thread runtime builds");
@@ -511,7 +521,7 @@ fn a_spawned_task_carries_only_the_span_it_was_instrumented_with() {
 #[test]
 fn a_full_queue_drops_and_counts() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink.clone());
+    let subscriber = crate::capture::registry().with(sink.clone());
 
     tracing::subscriber::with_default(subscriber, || {
         for index in 0..(LOG_QUEUE_RECORDS + 8) {
@@ -539,7 +549,7 @@ fn a_closed_drain_does_not_report_queue_pressure() {
 fn a_panic_under_the_hook_is_recorded_with_its_payload_and_location() {
     install_panic_hook();
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let subscriber = crate::capture::registry().with(sink);
 
     let joined = std::thread::spawn(move || {
         tracing::subscriber::with_default(subscriber, || {
@@ -658,7 +668,7 @@ fn field(name: &'static str) -> tracing::field::Field {
 #[test]
 fn the_initialized_layer_records_through_the_global_subscriber() {
     let (sink, mut drain) = log_capture();
-    let guard = tracing_subscriber::registry().with(sink).set_default();
+    let guard = crate::capture::registry().with(sink).set_default();
 
     tracing::error!(component = "logs", "a global record");
     drop(guard);
@@ -666,4 +676,347 @@ fn the_initialized_layer_records_through_the_global_subscriber() {
     let records = queued(&mut drain);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].level(), "error");
+}
+
+/// The fields of the one record whose message is `message`, as JSON.
+fn fields_of(records: &[LogRecord], message: &str) -> serde_json::Value {
+    let record = records
+        .iter()
+        .find(|record| record.message() == message)
+        .unwrap_or_else(|| panic!("a record says {message}: {records:?}"));
+    serde_json::from_str(record.fields()).expect("a record's fields are a JSON object")
+}
+
+/// A type whose methods open operations, for the function name a record carries.
+struct Workspace {
+    component: &'static str,
+}
+
+/// A trait whose method opens an operation.
+trait Rebuild {
+    fn rebuild(&self);
+}
+
+impl Workspace {
+    fn search(&self) {
+        crate::traced!(component = self.component, operation = "index.search", {});
+    }
+
+    async fn nodes(&self) {
+        crate::traced!("index.nodes", async {}).await;
+    }
+
+    fn walk(&self) {
+        let visit = || crate::info!(component = self.component, "walked");
+        visit();
+    }
+}
+
+impl Rebuild for Workspace {
+    fn rebuild(&self) {
+        crate::traced!("index.rebuild", {});
+    }
+}
+
+/// A free function that opens an operation through `#[timed]`.
+#[crate::timed("index.watch")]
+fn watch() {}
+
+/// Every operation and event records the function that opened or emitted it as
+/// `code.function.name`, without the `::{{closure}}` segments of an async body or a
+/// closure.
+#[test]
+fn an_operation_and_an_event_record_the_function_that_made_them() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let workspace = Workspace { component: "index" };
+        workspace.search();
+        workspace.rebuild();
+        workspace.walk();
+        watch();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime builds");
+        runtime.block_on(workspace.nodes());
+    });
+
+    let records = queued(&mut drain);
+    let module = "rift_tracing::capture::tests";
+    for (message, function) in [
+        ("index.search", format!("{module}::Workspace::search")),
+        (
+            "index.rebuild",
+            format!("<{module}::Workspace as {module}::Rebuild>::rebuild"),
+        ),
+        ("walked", format!("{module}::Workspace::walk")),
+        ("index.watch", format!("{module}::watch")),
+        ("index.nodes", format!("{module}::Workspace::nodes")),
+    ] {
+        assert_eq!(
+            fields_of(&records, message)["code.function.name"],
+            function.as_str(),
+            "{message}"
+        );
+    }
+}
+
+/// A close record states how long its operation was entered and how long it waited,
+/// in nanoseconds: an awaited operation suspended on a timer is idle for the wait.
+#[tokio::test(start_paused = false)]
+async fn a_close_record_carries_busy_and_idle_time_across_a_suspension() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+    let _default = tracing::subscriber::set_default(subscriber);
+
+    crate::traced!("index.wait", async {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    })
+    .await;
+
+    let fields = fields_of(&queued(&mut drain), "index.wait");
+    let nanoseconds = |member: &str| {
+        fields[member]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{member} is a count: {fields}"))
+    };
+    let (busy, idle) = (nanoseconds("busy_ns"), nanoseconds("idle_ns"));
+    assert!(idle >= 20_000_000, "the timer wait is idle: {fields}");
+    assert!(busy < idle, "polling is shorter than the wait: {fields}");
+    assert_eq!(fields["status.code"], "Ok", "{fields}");
+    assert!(fields.get("error.type").is_none(), "{fields}");
+}
+
+/// A close record states that its operation did not complete: `panic` for a block left
+/// by a panic, `cancelled` for an awaited operation dropped after its first poll.
+#[test]
+fn a_close_record_states_a_panic_and_a_cancellation() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let panicked = std::panic::catch_unwind(|| {
+            crate::traced!("index.panics", {
+                std::panic::panic_any("refused");
+            });
+        });
+        assert!(panicked.is_err());
+        let mut pending = Box::pin(crate::traced!("index.cancelled", async {
+            std::future::pending::<()>().await;
+        }));
+        let waker = std::task::Waker::noop();
+        let polled = pending
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker));
+        assert!(polled.is_pending());
+        drop(pending);
+        crate::traced!("index.completes", {});
+    });
+
+    let records = queued(&mut drain);
+    for (message, status, error) in [
+        ("index.panics", "Error", Some("panic")),
+        ("index.cancelled", "Error", Some("cancelled")),
+        ("index.completes", "Ok", None),
+    ] {
+        let fields = fields_of(&records, message);
+        assert_eq!(fields["status.code"], status, "{fields}");
+        assert_eq!(
+            fields.get("error.type").and_then(|v| v.as_str()),
+            error,
+            "{fields}"
+        );
+    }
+}
+
+/// A span the capture filter leaves out still names the records inside it: the event
+/// carries it as its root or nearest span, as the stderr line prints it.
+#[test]
+fn an_event_inside_a_span_the_capture_leaves_out_carries_that_span() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(crate::runtime::capture_layer(
+        sink,
+        tracing_subscriber::EnvFilter::new("rift_tracing=info,hidden=off"),
+    ));
+
+    tracing::subscriber::with_default(subscriber, || {
+        let request = tracing::info_span!(
+            "mcp.request",
+            component = "mcp",
+            operation = "tools/call",
+            request_id = 4
+        );
+        let _request = request.enter();
+        let hidden = tracing::info_span!(
+            target: "hidden",
+            "dependency.context",
+            component = "dependency",
+            operation = "dependency.context"
+        );
+        hidden.in_scope(|| crate::info!(entries = 1, "context read"));
+    });
+
+    let records = queued(&mut drain);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.message() != "dependency.context"),
+        "the left-out span writes no close record: {records:?}"
+    );
+    let event = records
+        .iter()
+        .find(|record| record.message() == "context read")
+        .expect("the event is captured");
+    assert_eq!(event.component(), "dependency");
+    assert_eq!(event.operation(), "dependency.context");
+    let fields: serde_json::Value = serde_json::from_str(event.fields()).expect("JSON");
+    assert_eq!(fields["root_span"]["name"], "mcp.request", "{fields}");
+    assert_eq!(fields["root_span"]["fields"]["request_id"], "4", "{fields}");
+    assert_eq!(
+        fields["nearest_span"]["name"], "dependency.context",
+        "{fields}"
+    );
+}
+
+/// A dependency's span without labels around a Rift request span is no root: the request
+/// span is, as the line groups records by request.
+#[test]
+fn a_dependency_span_without_labels_is_not_the_root() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let serve = tracing::info_span!(target: "rmcp::service", "serve_inner");
+        let _serve = serve.enter();
+        let request = crate::info_span!("mcp.request", component = "mcp", request_id = 1);
+        request.in_scope(|| crate::info!("tool request started"));
+    });
+
+    let records = queued(&mut drain);
+    let event = fields_of(&records, "tool request started");
+    assert_eq!(event["root_span"]["name"], "mcp.request", "{event}");
+    assert!(event.get("nearest_span").is_none(), "{event}");
+    let close = fields_of(&records, "mcp.request");
+    assert!(
+        close.get("root_span").is_none(),
+        "the request span is a root: {close}"
+    );
+    let serve = fields_of(&records, "serve_inner");
+    assert_eq!(
+        serve["status.code"], "Ok",
+        "its own close is still recorded: {serve}"
+    );
+}
+
+/// The cost of one operation's span and of one event inside it, through the layers a
+/// serving process installs: the metric values, the table of operations in flight, the
+/// stderr lines under the default stderr filter into `io::sink`, and the capture under the
+/// default capture filter into a queue a drain thread empties. 1,000,000 `traced!` block
+/// operations per run, split across 1 and 8 threads, then as many events inside one span.
+/// Prints the median nanoseconds per operation and per event over five runs of every
+/// thread. Run it alone in a release build:
+///
+/// ```text
+/// cargo test -p rift-tracing --release --lib -- --ignored --nocapture operation_record_cost
+/// ```
+#[test]
+#[ignore = "a measurement, not a check; run it alone in a release build"]
+fn operation_record_cost() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Instant;
+
+    use tracing_subscriber::Layer as _;
+
+    use crate::flight::{FlightLayer, FlightTable};
+    use crate::metrics::{MetricLayer, MetricValues};
+    use crate::render::LevelColor;
+    use crate::runtime::{DEFAULT_STDERR_FILTER, DEFAULT_TRACING_FILTER, stderr_filter};
+    use crate::stderr::StderrLines;
+
+    const OPERATIONS: u32 = 1_000_000;
+    const RUNS: u32 = 5;
+
+    let (sink, mut drain) = log_capture();
+    let draining = Arc::new(AtomicBool::new(true));
+    let drainer = {
+        let draining = Arc::clone(&draining);
+        std::thread::spawn(move || {
+            while draining.load(Ordering::Relaxed) {
+                if drain.try_recv_record().is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        })
+    };
+    let dispatch = tracing::Dispatch::new(
+        crate::capture::registry()
+            .with(MetricLayer::new(Arc::new(MetricValues::default())))
+            .with(FlightLayer::new(Arc::new(FlightTable::default())))
+            .with(
+                StderrLines::new(std::io::sink, LevelColor::Plain).with_filter(stderr_filter(
+                    tracing_subscriber::EnvFilter::new(DEFAULT_STDERR_FILTER),
+                )),
+            )
+            .with(crate::runtime::capture_layer(
+                sink,
+                tracing_subscriber::EnvFilter::new(DEFAULT_TRACING_FILTER),
+            )),
+    );
+    let median = |mut samples: Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    };
+    for threads in [1_u32, 8] {
+        let per_thread = OPERATIONS / threads;
+        let mut operations = Vec::new();
+        let mut events = Vec::new();
+        for _ in 0..RUNS {
+            let start = Arc::new(Barrier::new(threads as usize));
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let dispatch = dispatch.clone();
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            start.wait();
+                            let opened = Instant::now();
+                            for index in 0..per_thread {
+                                crate::traced!(
+                                    component = "index",
+                                    operation = "index.cost",
+                                    unit = index,
+                                    {}
+                                );
+                            }
+                            let opened = opened.elapsed();
+                            let span = tracing::info_span!(
+                                "mcp.request",
+                                component = "mcp",
+                                operation = "tools/call",
+                                request_id = 7
+                            );
+                            let _entered = span.enter();
+                            let emitted = Instant::now();
+                            for index in 0..per_thread {
+                                crate::info!(unit = index, "cost event");
+                            }
+                            (opened, emitted.elapsed())
+                        })
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let (opened, emitted) = worker.join().expect("a worker finishes");
+                operations.push(opened.as_secs_f64() * 1e9 / f64::from(per_thread));
+                events.push(emitted.as_secs_f64() * 1e9 / f64::from(per_thread));
+            }
+        }
+        let (operation, event) = (median(operations), median(events));
+        println!("threads={threads} operation_ns={operation:.1} event_ns={event:.1}");
+    }
+    draining.store(false, Ordering::Relaxed);
+    drainer.join().expect("the drain thread finishes");
 }

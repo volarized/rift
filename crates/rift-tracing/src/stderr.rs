@@ -3,35 +3,39 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
-use jiff::tz::TimeZone;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::capture::{closed_record, event_record, span_opened, span_recorded};
+use crate::capture::{closed_record, event_record};
 use crate::record::LogRecord;
-use crate::render::LevelColor;
+use crate::render::{LevelColor, LiveLine, LogLines};
 
-/// The `tracing` layer that prints each admitted event and span close as one line on its
-/// writer, in the form [`LogRecord::rendered`] gives `rift server logs`, with the time in
-/// UTC.
+/// The `tracing` layer that prints each admitted event and span close as one line of a
+/// live stream on its writer: the line [`LogLines::live_stream`] prints for the record the
+/// log capture stores, a blank line before it when its group differs from the line before.
 ///
-/// It builds the record the log capture builds, from labels it keeps per span itself, and
-/// writes the rendered line in one `write_all` call. No module path and no list of every
-/// enclosing span precede the line; a span close prints its record, the span's name with
-/// `elapsed_ms`.
+/// It builds the record the log capture builds, from the span context
+/// [`SpanContextLayer`](crate::capture::SpanContextLayer) keeps, and writes the line in one
+/// `write_all` call.
 pub(crate) struct StderrLines<W> {
     writer: W,
     color: LevelColor,
+    lines: Mutex<LogLines>,
 }
 
 impl<W> StderrLines<W> {
     /// Lines on `writer`, the level in `color`.
     pub(crate) const fn new(writer: W, color: LevelColor) -> Self {
-        Self { writer, color }
+        Self {
+            writer,
+            color,
+            lines: Mutex::new(LogLines::live_stream()),
+        }
     }
 }
 
@@ -39,12 +43,15 @@ impl<W> StderrLines<W>
 where
     W: for<'writer> MakeWriter<'writer> + 'static,
 {
-    /// Writes `record` as one line. A failed write is dropped: stderr has no reader to
-    /// report it to.
+    /// Writes `record` as one line. The line renders before the lock; placing it after
+    /// the group of the last line and the write happen under the lock, so two threads
+    /// never print a blank line for each other's group. A failed write is dropped: stderr
+    /// has no reader to report it to.
     fn print(&self, record: &LogRecord) {
-        let mut line = record.rendered_line(&TimeZone::UTC, self.color);
-        line.push('\n');
-        let _ = self.writer.make_writer().write_all(line.as_bytes());
+        let line = LiveLine::of(record, self.color);
+        let mut lines = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
+        let text = lines.placed(line);
+        let _ = self.writer.make_writer().write_all(text.as_bytes());
     }
 }
 
@@ -53,32 +60,14 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     W: for<'writer> MakeWriter<'writer> + 'static,
 {
-    fn on_new_span(
-        &self,
-        attributes: &tracing::span::Attributes<'_>,
-        id: &tracing::span::Id,
-        context: Context<'_, S>,
-    ) {
-        span_opened::<Self, S>(attributes, id, &context);
-    }
-
-    fn on_record(
-        &self,
-        id: &tracing::span::Id,
-        values: &tracing::span::Record<'_>,
-        context: Context<'_, S>,
-    ) {
-        span_recorded::<Self, S>(id, values, &context);
-    }
-
     fn on_close(&self, id: tracing::span::Id, context: Context<'_, S>) {
-        if let Some(record) = closed_record::<Self, S>(&id, &context) {
+        if let Some(record) = closed_record(&id, &context) {
             self.print(&record);
         }
     }
 
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
-        self.print(&event_record::<Self, S>(event, &context));
+        self.print(&event_record(event, &context));
     }
 }
 
@@ -156,11 +145,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use jiff::tz::TimeZone;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{BoundedWriter, SERVER_STDERR_BOUND_NOTICE, SERVER_STDERR_BYTES_MAX, StderrLines};
-    use crate::render::LevelColor;
+    use crate::render::{LevelColor, LogLines};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -183,30 +171,41 @@ mod tests {
     }
 
     impl Written {
-        /// Every printed line without its timestamp, `elapsed_ms` read as `_`.
-        fn lines(&self) -> Vec<String> {
+        /// Everything printed, with the times that vary between runs read as `_`.
+        fn text(&self) -> String {
             let bytes = self.0.lock().expect("the written bytes are not poisoned");
-            String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(without_timestamp)
-                .collect()
+            without_times(&String::from_utf8_lossy(&bytes))
         }
     }
 
-    /// `line` past its timestamp, which must be UTC, with the `elapsed_ms` value as `_`: the
-    /// two vary between runs, and every other column is exact.
-    fn without_timestamp(line: &str) -> String {
-        let (timestamp, rest) = line
-            .split_once(' ')
-            .expect("a line starts with its timestamp");
-        assert!(timestamp.ends_with("+00:00"), "{line}");
-        let mut parts = rest.split(' ').map(str::to_owned).collect::<Vec<_>>();
-        for part in &mut parts {
-            if part.starts_with("elapsed_ms=") {
-                *part = "elapsed_ms=_".to_owned();
+    /// `text` with each line's timestamp, which must be UTC, and each `busy` and `idle`
+    /// value read as `_`: they vary between runs, and every other column is exact.
+    fn without_times(text: &str) -> String {
+        let mut lines = Vec::new();
+        for line in text.split('\n') {
+            if line.is_empty() {
+                lines.push(String::new());
+                continue;
             }
+            let mut parts = line.splitn(3, ' ');
+            let (date, time, rest) = (parts.next(), parts.next(), parts.next());
+            assert!(
+                date.is_some_and(|date| date.len() == 10)
+                    && time.is_some_and(|time| time.ends_with('Z')),
+                "{line}"
+            );
+            let rest = rest
+                .unwrap_or_default()
+                .split(' ')
+                .map(|part| match part.split_once('=') {
+                    Some((key @ ("busy" | "idle"), _)) => format!("{key}=_"),
+                    _ => part.to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!("_ {rest}"));
         }
-        parts.join(" ")
+        lines.join("\n")
     }
 
     /// Runs `emit` under a subscriber whose stderr lines go to the returned buffer.
@@ -214,122 +213,138 @@ mod tests {
         let written = Written::default();
         let writer = written.clone();
         let layer = StderrLines::new(move || writer.clone(), LevelColor::Plain);
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+        tracing::subscriber::with_default(crate::capture::registry().with(layer), emit);
         written
     }
 
     /// The owner's case: an index operation inside a `tools/call` request.
     fn request_with_index_operation() {
-        let request = tracing::info_span!(
+        let request = crate::info_span!(
             "mcp.request",
             component = "mcp",
             operation = "tools/call",
             request_id = 18,
             tool = "get_symbol"
         );
-        let _request = request.enter();
-        let discover = tracing::info_span!(
-            "fingerprint.discover",
-            component = "index",
-            operation = "fingerprint.discover"
-        );
-        discover.in_scope(|| tracing::info!(files = 12, "walked the workspace"));
+        request.in_scope(|| {
+            crate::traced!(component = "index", operation = "fingerprint.discover", {
+                crate::info!(files = 12, "walked the workspace");
+            });
+        });
     }
 
-    /// None of the default format: no enclosing span in braces, no module path, no span timing.
-    fn assert_no_default_format(lines: &[String]) {
-        for line in lines {
-            assert!(!line.contains('{'), "{line}");
-            assert!(!line.contains("time.busy"), "{line}");
-            assert!(!line.contains("rift_"), "{line}");
-        }
-    }
+    /// The function that opens the request of [`request_with_index_operation`].
+    const REQUEST_FUNCTION: &str = "rift_tracing::stderr::tests::request_with_index_operation";
 
     #[test]
-    fn an_event_outside_every_span_prints_its_labels_message_and_fields() {
-        let lines = printed(|| {
-            tracing::info!(component = "mcp", transport = "http", "MCP server starting");
+    fn an_event_outside_every_span_prints_its_function_context_and_message() {
+        let text = printed(|| {
+            crate::info!(component = "mcp", transport = "http", "MCP server starting");
         })
-        .lines();
+        .text();
 
         assert_eq!(
-            lines,
-            ["INFO  mcp      -            MCP server starting transport=http"]
+            text,
+            format!(
+                "_ INFO  {:<36}   {:<48}  MCP server starting\n",
+                "rift_tracing::stderr::tests::\
+                 an_event_outside_every_span_prints_its_function_context_and_message",
+                "component=mcp transport=http",
+            )
         );
-        assert_no_default_format(&lines);
     }
 
+    /// The event and both closes of one request: the request's context on every line, the
+    /// nested operation after `↳`, and the request's own close under `close ✓`.
     #[test]
-    fn an_event_inside_two_spans_prints_the_request_and_the_nested_operation() {
-        let lines = printed(request_with_index_operation).lines();
+    fn a_request_prints_its_context_on_every_line_and_its_closes() {
+        let text = printed(request_with_index_operation).text();
 
+        let context = "component=mcp operation=tools/call req=18 tool=get_symbol";
+        let nested = format!(
+            "↳ {:<24} {:<40} ",
+            "fingerprint.discover", "component=index operation=fingerprint.discover"
+        );
         assert_eq!(
-            lines[0],
-            "INFO  index    fingerprint.discover component=mcp operation=tools/call req=18 \
-             tool=get_symbol ↳ fingerprint.discover  walked the workspace files=12"
+            text,
+            format!(
+                "_ INFO  {REQUEST_FUNCTION:<36}   {context:<48}  {nested}walked the workspace \
+                 files=12\n\
+                 _ INFO  {REQUEST_FUNCTION:<36}   {context:<48}  {nested}close ✓ busy=_ idle=_\n\
+                 _ INFO  {REQUEST_FUNCTION:<36}   {context:<48}  close ✓ busy=_ idle=_\n"
+            )
         );
-        assert_no_default_format(&lines);
     }
 
+    /// A live stream prints a blank line where the group changes: from one request to the
+    /// next, and from a request to a record outside every span.
     #[test]
-    fn a_span_close_prints_its_name_and_elapsed_time_under_the_request() {
-        let lines = printed(request_with_index_operation).lines();
-
-        assert_eq!(
-            lines[1..],
-            [
-                "INFO  index    fingerprint.discover component=mcp operation=tools/call req=18 \
-                 tool=get_symbol  fingerprint.discover elapsed_ms=_ span=closed",
-                "INFO  mcp      tools/call   mcp.request elapsed_ms=_ request_id=18 \
-                 span=closed tool=get_symbol",
-            ]
-        );
-        assert_no_default_format(&lines);
-    }
-
-    #[test]
-    fn a_warning_prints_its_level_and_fields() {
-        let lines = printed(|| {
-            tracing::warn!(
-                component = "index",
-                operation = "index.supervisor",
-                published = 3,
-                reason = "shutdown",
-                "the index supervisor stopped"
-            );
+    fn a_live_stream_breaks_where_the_group_changes() {
+        let text = printed(|| {
+            request_with_index_operation();
+            request_with_index_operation();
+            crate::warn!(component = "index", reason = "shutdown", "stopped");
         })
-        .lines();
+        .text();
 
+        let blank = text.split('\n').filter(|line| line.is_empty()).count();
         assert_eq!(
-            lines,
-            [
-                "WARN  index    index.supervisor the index supervisor stopped published=3 \
-                 reason=shutdown"
-            ]
+            blank, 2,
+            "one break before the warning, one at the end: {text}"
         );
-        assert_no_default_format(&lines);
+        assert!(text.contains("\n\n_ WARN"), "{text}");
     }
 
-    /// Stderr and `rift server logs` print one form: the stderr line of each record is the
-    /// line the captured record renders to.
+    /// Stderr and `rift server logs --follow` print one form: the stderr line of each
+    /// record is the line the captured record renders to on a live stream, also for an
+    /// event inside a span the capture filter leaves out, which the stored record still
+    /// names. That span's own close reaches stderr alone.
     #[test]
-    fn a_stderr_line_is_the_rendered_line_of_the_captured_record() {
+    fn a_stderr_line_is_the_live_line_of_the_captured_record() {
         let written = Written::default();
         let writer = written.clone();
         let (sink, mut drain) = crate::log_capture();
-        let subscriber = tracing_subscriber::registry()
+        let subscriber = crate::capture::registry()
             .with(StderrLines::new(move || writer.clone(), LevelColor::Plain))
-            .with(sink);
+            .with(crate::runtime::capture_layer(
+                sink,
+                tracing_subscriber::EnvFilter::new("rift_tracing=trace,hidden=off"),
+            ));
         tracing::subscriber::with_default(subscriber, || {
             request_with_index_operation();
-            tracing::warn!(component = "index", reason = "shutdown", "stopped");
+            let hidden = tracing::info_span!(
+                target: "hidden",
+                "dependency.context",
+                component = "dependency",
+                operation = "dependency.context",
+            );
+            hidden.in_scope(|| crate::info!("operation opened"));
+            drop(hidden);
+            crate::warn!(component = "index", reason = "shutdown", "stopped");
         });
 
-        let rendered = std::iter::from_fn(|| drain.try_recv_record().ok())
-            .map(|record| without_timestamp(&record.rendered(&TimeZone::UTC)))
-            .collect::<Vec<_>>();
-        assert_eq!(rendered.len(), 4);
-        assert_eq!(written.lines(), rendered);
+        let stored = std::iter::from_fn(|| drain.try_recv_record().ok()).collect::<Vec<_>>();
+        let rendered = without_times(&LogLines::live_stream().lines(&stored));
+        let printed = written.text();
+        let records = |text: &str| {
+            text.split('\n')
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let mut expected = records(&printed);
+        let hidden_close = expected
+            .iter()
+            .position(|line| {
+                line.contains("operation=dependency.context") && line.contains("close ✓")
+            })
+            .expect("stderr prints the left-out span's close");
+        expected.remove(hidden_close);
+        assert_eq!(records(&rendered), expected);
+        assert!(
+            rendered.contains("component=dependency operation=dependency.context"),
+            "the stored event names its span: {rendered}"
+        );
     }
 
     /// Text from outside the process reaches stderr escaped: one record, one line, and no

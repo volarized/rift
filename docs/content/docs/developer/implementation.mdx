@@ -203,14 +203,15 @@ Each stage runs inside a `server.stop` span and ends with a `stop stage ended` r
 <VersionBadge version="v0.0.62" />
 
 A server records each step of its life at `INFO`, so the store keeps them under the default
-`[logs]` `capture`. A record that opens a step carries `phase = "start"`, and one that ends it
-carries `outcome = "ok"`:
+`[logs]` `capture`. A record that opens a step carries `phase = "start"`, one that ends it
+carries `outcome = "ok"`, and one that fails it carries `outcome = "error"`; a printed line
+marks them `→`, `✓`, and `✗`:
 
 | Record | Operation | Fields |
 | --- | --- | --- |
 | `workspace election claimed` | `server.start` | `state_directory` |
 | `another rift server already serves this workspace; this process exits` | `server.start` | |
-| `MCP server ready` | | `transport`, `port` |
+| `MCP server ready` | | `transport`, `port`, `outcome` |
 | `index preparation started` | `index.build` | `total`, `phase` |
 | `index preparation progressed` | `index.build` | `prepared`, `total` |
 | `index snapshot published` | `index.publish` | `trigger`, `epoch` |
@@ -660,21 +661,34 @@ deadline bounds the retry: a drain aborted there reports what it held as `unwrit
 <VersionBadge version="v0.0.62" />
 
 An event record names the spans it was emitted in, so the records of one request group by its
-`request_id` even while a background task logs between them. When a span opens, the `LogSink`
-writes its name and fields as one JSON object into the span's extensions, and writes it again
-when the span records a field later. An event inside the span copies that object into its
-`fields` as `root_span` for the outermost span, and as `nearest_span` for the span it was
-emitted in when that span is not the outermost. A span that closes inside another carries the
-outermost one as `root_span` on its close record. The `worker admission started` record of a
-search request carries:
+`request_id` even while a background task logs between them. When a span opens, an unfiltered
+layer ahead of stderr and the `LogSink` writes its name and fields as one JSON object into the
+span's extensions, and writes it again when the span records a field later. An event inside
+the span copies that object into its `fields` as `root_span` for the outermost span, and as
+`nearest_span` for the span it was emitted in when that span is not the outermost. A span that
+closes inside another carries the outermost one as `root_span` on its close record. The layer
+keeps every span, so a record names a span its own filter left out, and stderr and the store
+write the same record. A dependency's span with neither `component` nor `operation`, such as
+`rmcp`'s `serve_inner`, takes no part: the Rift span inside it is the root.
+
+`traced!`, `#[rift_tracing::timed]`, `info_span!`, `debug_span!`, and the event macros record
+`code.function.name`, the function that opened the span or emitted the event, read from the
+`type_name` of an item declared in its body; the format of that text is unspecified, so no
+filter or query selects by it. A close record carries `busy_ns` and `idle_ns` beside
+`elapsed_ms`, the nanoseconds the span was entered and was not, and `status.code`: `Ok`, or
+`Error` with `error.type` `panic` for a span closed while its thread unwinds a panic and
+`cancelled` for an awaited `traced!` operation dropped after its first poll. The
+`worker admission started` record of a search request carries:
 
 ```json
 {
+  "code.function.name": "rift_mcp::server::BlockingExecutor::admitted",
   "work": "workspace fingerprint",
   "queue_timeout_ms": "30000",
   "root_span": {
     "name": "mcp.request",
-    "fields": {"component": "mcp", "operation": "tools/call", "request_id": "2", "tool": "search"}
+    "fields": {"component": "mcp", "operation": "tools/call", "request_id": "2", "tool": "search",
+               "code.function.name": "<rift_mcp::server::RiftMcp as rmcp::handler::server::ServerHandler>::call_tool"}
   },
   "nearest_span": {
     "name": "worker.queue",
@@ -702,21 +716,37 @@ A foreground server whose stderr is not a terminal writes at most 1 MiB there. T
 crosses the bound is followed by one notice, `standard error reached its byte bound`, and every
 later write is discarded; the records the `LogSink` captured are unaffected.
 
-Stderr and `rift server logs` print a record through one renderer, `LogRecord::rendered`: the
-time, the level, `component`, `operation`, and, for a record inside a span, the fields of the
-outermost span, then `↳` with the name and fields of the span it was emitted in, then two
-spaces; the message and the record's own fields sorted by key follow. A span field the
-`component` or `operation` column already shows is left out, and `request_id` prints as `req`.
-A span close prints the span's name with `elapsed_ms` and `span=closed`, after the fields of the
-request it ran for:
+Stderr, `rift server logs`, and a failure window print a record through one renderer,
+`LogLines` in `rift-tracing`. A line holds the time in UTC with milliseconds, the level, the
+function, three spaces, the context, two spaces, the nested operation, and the message:
+
+- The function is the `code.function.name` of the outermost span around the record; outside
+  every span, the record's own; for a metric snapshot record, its instrument group. A record
+  without one prints its target.
+- The context is the outermost span's fields: `component`, `operation`, then the rest sorted
+  by key, `request_id` printed as `req`. A record outside every span prints its own
+  `component`, `operation`, and fields there.
+- The nested operation is `↳` with the name and fields of the span the record belongs to,
+  when that span is not the outermost.
+- A span close prints `close`, `✓` or `✗`, the reason it did not complete (`error.type=…`,
+  `panicked`, or `cancelled`), then `busy` and `idle` with three significant digits. A
+  lifecycle record prints its mark before its message. A metric snapshot record prints its
+  values. Any other record prints its message, then its own fields sorted by key.
 
 ```text
-2026-10-05T10:25:23.802+00:00 INFO  index    fingerprint.discover component=mcp operation=tools/call req=20 tool=get_symbol  fingerprint.discover elapsed_ms=0 span=closed
-2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=1 trigger=filesystem ↳ worker.run component=worker operation=worker.run work=filesystem index rebuild  index capture started epoch=1 phase=start
+2026-10-05 11:57:37.429Z DEBUG rift_mcp::validation::run_index_supervisor_with   component=index epoch=1 trigger=filesystem  ↳ worker.run component=worker operation=worker.run work=filesystem index rebuild → index capture started component=index operation=index.build epoch=1 phase=start
+2026-10-05 11:57:37.444Z INFO  rift_mcp::validation::run_index_supervisor_with   component=index epoch=1 trigger=filesystem  ↳ index.build component=index changed_count=1 files_count=3 outcome=ok tree_revision=8f107d85 close ✓ busy=7.95ms idle=19.3µs
 ```
 
-Stderr prints the time in UTC and colors the level on a terminal alone; `rift server logs`
-prints the system time zone's offset.
+A group is a run of records of one request; without a request, of one root span; without a
+span, of one function. A blank line separates two groups. `rift server logs` pads each column
+to the widest value of its group; stderr and `rift server logs --follow`, which cannot know a
+group ahead, pad to fixed widths. Every surface prints UTC; stderr colors the level on a
+terminal alone. Every character a terminal or a line reader acts on prints escaped as Rust's
+`char::escape_debug` writes it (`\u{1b}`, `\n`, `\u{202e}`): C0 and C1 controls, DEL, the
+line and paragraph separators, and the bidirectional overrides and isolates, so a value read
+from a workspace or a request cannot move the cursor, end its line, or reorder what a reader
+sees.
 
 Every workspace crate other than `rift-tracing` emits through it: spans through `traced!`,
 `info_span!`, and `Span`, events through its `trace!` to `error!`, elapsed time a caller acts on

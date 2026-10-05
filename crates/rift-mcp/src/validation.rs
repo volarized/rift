@@ -3309,6 +3309,7 @@ fn record_commit_failure(tree_revision: &str, form: &'static str, error: &RiftEr
         operation = "search.commit",
         tree_revision,
         form,
+        outcome = "error",
         error = %error,
         causes,
         "the lexical commit failed; the next publication compares every file with the \

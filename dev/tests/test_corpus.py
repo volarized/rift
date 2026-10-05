@@ -404,19 +404,22 @@ class Decisions(unittest.TestCase):
         self,
     ) -> None:
         start = (
-            "2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=7 "
-            "trigger=filesystem ↳ worker.run component=worker operation=worker.run "
-            "work=filesystem index rebuild  index capture started epoch=7 phase=start\n"
+            "2026-10-05 10:27:17.470Z DEBUG rift_mcp::validation::supervise   "
+            "component=index epoch=7 trigger=filesystem  ↳ worker.run component=worker "
+            "operation=worker.run work=filesystem index rebuild → index capture started "
+            "component=index operation=index.build epoch=7 phase=start\n"
         )
         self.assertEqual(active_stdout(start, "rebuild", "7"), start.strip())
         self.assertEqual(active_stdout(start, "rebuild", None), start.strip())
         wrong_close = (
-            "2026-10-05T10:27:17.487+00:00 INFO  index    -            index.build "
-            "elapsed_ms=18 epoch=6 span=closed trigger=filesystem\n"
+            "2026-10-05 10:27:17.487Z INFO  rift_mcp::validation::supervise   "
+            "component=index epoch=6 trigger=filesystem  ↳ index.build component=index "
+            "outcome=ok close ✓ busy=18.0ms idle=19.3µs\n"
         )
         nested_close = (
-            "2026-10-05T10:27:17.486+00:00 INFO  worker   worker.run   epoch=7 "
-            "trigger=filesystem  worker.run elapsed_ms=1 span=closed\n"
+            "2026-10-05 10:27:17.486Z INFO  rift_mcp::validation::supervise   "
+            "component=index epoch=7 trigger=filesystem  ↳ worker.run component=worker "
+            "operation=worker.run close ✓ busy=1.02ms idle=4.10µs\n"
         )
         self.assertEqual(
             active_stdout(start + wrong_close + nested_close, "rebuild", "7"),
@@ -427,15 +430,17 @@ class Decisions(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", epoch)
         for output in (
-            start.replace("DEBUG index    index.build", "DEBUG dependency index.build"),
-            start.replace("index.build  epoch", "index.publish epoch"),
+            start.replace(
+                "component=index operation", "component=dependency operation"
+            ),
+            start.replace("operation=index.build", "operation=index.publish"),
             start.replace("phase=start", "phase=complete"),
             start.replace("epoch=7", "epoch=0"),
             start.replace("epoch=7", ""),
             start + matching_close,
-            start
-            + "2026-10-05T10:27:17.487+00:00 INFO  index    index.publish epoch=7 "
-            "trigger=filesystem  index snapshot published epoch=7 trigger=filesystem\n",
+            start + "2026-10-05 10:27:17.487Z INFO  rift_mcp::validation::supervise   "
+            "component=index epoch=7 trigger=filesystem  index snapshot published "
+            "operation=index.publish epoch=7 trigger=filesystem\n",
         ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", None)
@@ -444,20 +449,23 @@ class Decisions(unittest.TestCase):
         self,
     ) -> None:
         start = (
-            "2026-10-05T10:27:14.892+00:00 DEBUG history  history.batch history batch "
-            "started pending=4 phase=start\n"
+            "2026-10-05 10:27:14.892Z DEBUG rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  → history batch started "
+            "pending=4 phase=start\n"
         )
         close = (
-            "2026-10-05T10:27:14.913+00:00 INFO  history  history.batch history.batch "
-            "elapsed_ms=17 span=closed\n"
+            "2026-10-05 10:27:14.913Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  close ✓ busy=17.0ms idle=7.08µs\n"
         )
         analyzed = (
-            "2026-10-05T10:27:14.898+00:00 INFO  history  history.analyze "
-            "operation=history.batch  history.analyze elapsed_ms=2 span=closed\n"
+            "2026-10-05 10:27:14.898Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  ↳ history.analyze "
+            "component=history operation=history.analyze close ✓ busy=2.01ms idle=4.10µs\n"
         )
         written = (
-            "2026-10-05T10:27:14.913+00:00 INFO  history  history.write "
-            "operation=history.batch  history.write elapsed_ms=3 span=closed\n"
+            "2026-10-05 10:27:14.913Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  ↳ history.write "
+            "component=history operation=history.write close ✓ busy=3.02ms idle=4.10µs\n"
         )
         self.assertEqual(active_stdout(start, "history", None), start.strip())
         self.assertEqual(
@@ -474,7 +482,7 @@ class Decisions(unittest.TestCase):
             start.replace("pending=4", "pending=0"),
             start.replace(" pending=4", ""),
             start.replace("history batch started", "history batch opened"),
-            start.replace("DEBUG history ", "DEBUG mcp     "),
+            start.replace("component=history", "component=mcp"),
             start + close + start.replace("pending=4", "pending=0"),
         ):
             with self.assertRaises(AssertionError):

@@ -110,7 +110,7 @@ async fn a_read_past_the_settle_bound_still_answers() {
 #[tokio::test]
 async fn a_log_write_emits_no_record() {
     let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry()
+    let subscriber = crate::capture::registry()
         .with(sink.with_filter(tracing_subscriber::EnvFilter::new("trace")));
     tracing::subscriber::set_global_default(subscriber)
         .expect("this case owns the process's subscriber");
@@ -236,7 +236,7 @@ async fn a_read_waits_for_the_lane_its_dispatcher_records_into() {
 
     let started = tokio::time::Instant::now();
     {
-        let _without_sink = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let _without_sink = tracing::subscriber::set_default(crate::capture::registry());
         super::settle_for_read().await;
     }
     assert_eq!(
@@ -245,7 +245,7 @@ async fn a_read_waits_for_the_lane_its_dispatcher_records_into() {
         "a thread whose dispatcher holds no sink waits for nothing"
     );
 
-    let subscriber = tracing_subscriber::registry()
+    let subscriber = crate::capture::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(std::io::sink)
@@ -273,7 +273,7 @@ async fn a_lane_counts_its_unwritten_records() {
         0,
         "an empty lane leaves nothing unwritten"
     );
-    let subscriber = tracing_subscriber::registry().with(sink.clone());
+    let subscriber = crate::capture::registry().with(sink.clone());
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!(component = "logs", "first");
         tracing::info!(component = "logs", "second");
@@ -354,7 +354,7 @@ async fn an_aborted_drain_behind_a_held_metrics_lock_leaves_its_records_unwritte
         .expect("the holding connection takes the write lock");
     let (sink, drain) = log_capture();
     let lane = drain.lane();
-    tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
+    tracing::subscriber::with_default(crate::capture::registry().with(sink), || {
         for record in 0..ACCEPTED {
             tracing::info!(component = "logs", record, "behind the held lock");
         }
@@ -453,7 +453,7 @@ async fn an_aborted_log_drain_counts_the_records_it_never_wrote() {
     const ACCEPTED: u64 = 3;
     let (sink, drain) = log_capture();
     let lane = drain.lane();
-    tracing::subscriber::with_default(tracing_subscriber::registry().with(sink), || {
+    tracing::subscriber::with_default(crate::capture::registry().with(sink), || {
         for record in 0..ACCEPTED {
             tracing::info!(component = "test", record, "accepted and never written");
         }

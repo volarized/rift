@@ -91,7 +91,12 @@ pub async fn serve_proxy(
     checkout: BuildCheckout,
     output: OutputPolicy,
 ) -> Result<(), RiftError> {
-    rift_tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
+    rift_tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        phase = "start",
+        "MCP proxy starting"
+    );
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
@@ -120,7 +125,12 @@ where
             .source(error)
             .error()
     })?;
-    rift_tracing::info!(component = "mcp", transport = "stdio", "MCP proxy ready");
+    rift_tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        outcome = "ok",
+        "MCP proxy ready"
+    );
     let reason = service.waiting().await;
     let outcome = reason
         .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())

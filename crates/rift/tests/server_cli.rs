@@ -415,14 +415,14 @@ fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
-/// The fields the server's own stop line carries, as its stderr rendered them:
-/// `key=value` pairs after the message, string values without quotes.
+/// The server's own stop line, as its stderr rendered it: the record lies outside every
+/// span, so its `key=value` fields, string values without quotes, print before the
+/// message.
 fn stop_line_of(stderr: &str) -> TestResult<&str> {
-    let after_message = stderr
-        .split_once("MCP server stopped")
-        .ok_or_else(|| format!("serving must end before the process leaves: {stderr:?}"))?
-        .1;
-    Ok(after_message.lines().next().unwrap_or_default())
+    stderr
+        .lines()
+        .find(|line| line.ends_with("MCP server stopped"))
+        .ok_or_else(|| format!("serving must end before the process leaves: {stderr:?}").into())
 }
 
 fn serving_document(root: &Path) -> Option<ServerLock> {

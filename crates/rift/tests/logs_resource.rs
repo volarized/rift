@@ -132,25 +132,30 @@ async fn read_resource(client: &RunningService<RoleClient, ()>, uri: &str) -> Te
     harness::resource_json(&answer, uri)
 }
 
-/// The lines one run printed on stdout.
+/// The record lines one run printed on stdout, without the blank lines between groups.
 fn printed_lines(output: &std::process::Output) -> Vec<String> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
+        .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect()
 }
 
-/// The timestamp column one printed line opens with.
+/// The timestamp one printed line opens with: its date and its time, `2026-10-04
+/// 20:42:58.787Z`.
 fn printed_timestamp(line: &str) -> &str {
-    line.split_whitespace().next().unwrap_or_default()
+    line.get(..24).unwrap_or_default()
 }
 
-/// Whether `stamp` ends with a signed `HH:MM` offset, as every rendered
-/// timestamp does now that the renderer always resolves a time zone.
-fn ends_with_a_numeric_offset(stamp: &str) -> bool {
-    stamp.len() >= 6
-        && matches!(stamp.as_bytes()[stamp.len() - 6], b'+' | b'-')
-        && stamp.as_bytes()[stamp.len() - 3] == b':'
+/// Whether `stamp` is a UTC time with milliseconds, `YYYY-MM-DD HH:MM:SS.mmmZ`, the form
+/// every surface prints.
+fn is_utc_with_milliseconds(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() == 24
+        && bytes[10] == b' '
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && stamp.chars().filter(char::is_ascii_digit).count() == 17
 }
 
 /// Polls `transcript` for `needle`, bounded by [`RECORD_ATTEMPTS`] reads.
@@ -272,8 +277,8 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
     for line in &lines {
         let stamp = printed_timestamp(line).to_owned();
         assert!(
-            ends_with_a_numeric_offset(&stamp),
-            "every line opens with a timestamp carrying a numeric offset: {line:?}"
+            is_utc_with_milliseconds(&stamp),
+            "every line opens with a UTC timestamp: {line:?}"
         );
         assert!(stamp >= previous, "records print oldest first: {lines:?}");
         previous = stamp;
@@ -308,7 +313,7 @@ async fn the_logs_command_honors_its_tail_and_level() -> TestResult {
     require_success(&failures, "rift server logs --level error")?;
     assert_eq!(printed_lines(&tailed).len(), 1);
     for line in printed_lines(&failures) {
-        assert_eq!(line.split_whitespace().nth(1), Some("ERROR"), "{line:?}");
+        assert_eq!(line.split_whitespace().nth(2), Some("ERROR"), "{line:?}");
     }
     client.cancel().await?;
     failure_window.passed();

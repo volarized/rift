@@ -14,24 +14,27 @@ from rift_dev.rift_test_client import Server, object_value
 
 # Lines in the shape a foreground server prints on stderr.
 STARTUP = (
-    "2026-10-05T10:27:15.020+00:00 INFO  index    index.publish component=worker "
-    "operation=worker.run work=initial index preparation  "
-    "index snapshot published epoch=0 trigger=startup\n"
+    "2026-10-05 10:27:15.020Z INFO  rift_mcp::server::BlockingExecutor::run   "
+    "component=worker operation=worker.run work=initial index preparation  "
+    "index snapshot published component=index operation=index.publish epoch=0 "
+    "trigger=startup\n"
 )
 BATCH_CLOSE = (
-    "2026-10-05T10:27:14.913+00:00 INFO  history  history.batch history.batch "
-    "elapsed_ms=17 span=closed\n"
+    "2026-10-05 10:27:14.913Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+    "component=history operation=history.batch  close ✓ busy=17.0ms idle=7.08µs\n"
 )
 ANALYZE_CLOSE = (
-    "2026-10-05T10:27:14.898+00:00 INFO  history  history.analyze "
-    "operation=history.batch  history.analyze elapsed_ms=2 span=closed\n"
+    "2026-10-05 10:27:14.898Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+    "component=history operation=history.batch  ↳ history.analyze component=history "
+    "operation=history.analyze close ✓ busy=2.01ms idle=4.10µs\n"
 )
 
 
 def batch_start(pending: int) -> str:
     return (
-        "2026-10-05T10:27:14.892+00:00 DEBUG history  history.batch history batch "
-        f"started pending={pending} phase=start\n"
+        "2026-10-05 10:27:14.892Z DEBUG rift_mcp::history::HistoryTask::fill_planned   "
+        "component=history operation=history.batch  → history batch started "
+        f"pending={pending} phase=start\n"
     )
 
 
@@ -43,9 +46,10 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
 
     async def exercise() -> None:
         started = (
-            "2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=1 "
-            "trigger=filesystem ↳ worker.run component=worker operation=worker.run "
-            "work=filesystem index rebuild  index capture started epoch=1 phase=start\n"
+            "2026-10-05 10:27:17.470Z DEBUG rift_mcp::validation::run_index_supervisor_with"
+            "   component=index epoch=1 trigger=filesystem  ↳ worker.run component=worker "
+            "operation=worker.run work=filesystem index rebuild → index capture started "
+            "component=index operation=index.build epoch=1 phase=start\n"
         )
         observed = False
 
@@ -58,8 +62,10 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
             output = STARTUP + started
             if completed:
                 output += (
-                    "2026-10-05T10:27:17.487+00:00 INFO  index    -            "
-                    "index.build elapsed_ms=18 epoch=1 span=closed trigger=filesystem\n"
+                    "2026-10-05 10:27:17.487Z INFO  "
+                    "rift_mcp::validation::run_index_supervisor_with   component=index "
+                    "epoch=1 trigger=filesystem  ↳ index.build component=index "
+                    "outcome=ok close ✓ busy=18.0ms idle=19.3µs\n"
                 )
             return output
 
