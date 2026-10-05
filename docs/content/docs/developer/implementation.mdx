@@ -918,7 +918,11 @@ span.
 
 One export takes at most `OTEL_METRIC_EXPORT_TIMEOUT` for metrics, `OTEL_BSP_EXPORT_TIMEOUT` for
 spans, and `OTEL_BLRP_EXPORT_TIMEOUT` for log records, 2 s each when unset, and the SDK reports a
-failed export on stderr. Every exported span, metric point, and log record carries the resource
+failed export on stderr. A refused or slow collector never grows the span or log record queue past
+`OTEL_BSP_MAX_QUEUE_SIZE` or `OTEL_BLRP_MAX_QUEUE_SIZE`: a span or record the full queue refuses is
+dropped. The SDK reports the first drop on stderr, and at shutdown the total, as `dropped_spans` of
+`BatchSpanProcessor.Shutdown` and `dropped_logs_count` of `BatchLogProcessor.LogsDropped`; no
+metric carries it. Every exported span, metric point, and log record carries the resource
 attributes `service.name` (`rift`), `service.instance.id`,
 a random UUID per process, `process.pid`, and `service.version`, the server's version, so a collector that receives from several servers
 tells them apart.

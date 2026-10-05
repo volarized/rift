@@ -816,13 +816,14 @@ mod tests {
         }
     }
 
-    /// Reads the `dropped_spans` field of one event.
+    /// Reads the dropped total of one event: `dropped_spans` of the span batch processor,
+    /// `dropped_logs_count` of the log record one.
     #[derive(Default)]
     struct DroppedSpans(Option<u64>);
 
     impl Visit for DroppedSpans {
         fn record_u64(&mut self, field: &Field, value: u64) {
-            if field.name() == "dropped_spans" {
+            if matches!(field.name(), "dropped_spans" | "dropped_logs_count") {
                 self.0 = Some(value);
             }
         }
@@ -1045,6 +1046,186 @@ mod tests {
             "the shutdown ends at its deadline: elapsed={elapsed:?}, bound={bound:?}"
         );
         assert!(bound + SHUTDOWN_SLACK < super::OTLP_EXPORT_TIMEOUT);
+    }
+
+    /// Records and spans the batch queue of a refused-collector case holds.
+    const REFUSED_QUEUE: usize = 4;
+    /// Records and spans one export of a refused-collector case carries, at most.
+    const REFUSED_BATCH: usize = 2;
+    /// How often a refused-collector case's batch processor exports.
+    const REFUSED_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+    /// How long the refusing collector takes to answer: far longer than one burst of
+    /// emits, so a burst meets an export in progress and a full queue.
+    const REFUSAL_TIME: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Bursts, one per wait, a refused-collector case emits.
+    const REFUSED_BURSTS: usize = 5;
+    /// Records or spans one burst emits: four times what the queue, the batch being
+    /// gathered, and the export in progress hold together.
+    const REFUSED_BURST: usize = 4 * (REFUSED_QUEUE + 2 * REFUSED_BATCH);
+    /// The wait after each burst: two refusals.
+    const REFUSED_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// A collector that answers every export with a refusal, as one answering 503 does,
+    /// after [`REFUSAL_TIME`]; it counts what it was handed and the largest batch.
+    #[derive(Clone, Debug, Default)]
+    struct RefusingExporter {
+        handed: Arc<std::sync::atomic::AtomicUsize>,
+        largest: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RefusingExporter {
+        fn refuse(
+            &self,
+            batch: usize,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send + use<> {
+            use std::sync::atomic::Ordering;
+            self.handed.fetch_add(batch, Ordering::SeqCst);
+            self.largest.fetch_max(batch, Ordering::SeqCst);
+            async {
+                tokio::time::sleep(REFUSAL_TIME).await;
+                Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                    "503 Service Unavailable".to_owned(),
+                ))
+            }
+        }
+
+        fn handed(&self) -> usize {
+            self.handed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn largest(&self) -> usize {
+            self.largest.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Waits, [`REFUSED_WAIT`] at a time, until two waits in a row hand it nothing:
+        /// the queue is drained, so the shutdown request finds room in it.
+        fn settle(&self) {
+            let mut seen = self.handed();
+            for _ in 0..REFUSED_BURSTS * REFUSED_BURST {
+                std::thread::sleep(2 * REFUSED_WAIT);
+                let now = self.handed();
+                if now == seen {
+                    return;
+                }
+                seen = now;
+            }
+        }
+    }
+
+    impl SpanExporter for RefusingExporter {
+        fn export(
+            &self,
+            batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            self.refuse(batch.len())
+        }
+    }
+
+    impl opentelemetry_sdk::logs::LogExporter for RefusingExporter {
+        fn export(
+            &self,
+            batch: opentelemetry_sdk::logs::LogBatch<'_>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            self.refuse(batch.iter().count())
+        }
+    }
+
+    /// What a refused-collector case asserts once its processor shut down: every export
+    /// carried at most a batch; each burst got at most what the queue, the batch being
+    /// gathered, and the export in progress hold past the full queue; and every emitted
+    /// item was either handed to the collector or counted in the dropped total the SDK
+    /// reports at its shutdown.
+    fn assert_bounded_and_counted(exporter: &RefusingExporter, reports: &Reports) {
+        let emitted = REFUSED_BURSTS * REFUSED_BURST;
+        let handed = exporter.handed();
+        let dropped = reports
+            .dropped_spans()
+            .and_then(|dropped| usize::try_from(dropped).ok())
+            .expect("the shutdown reports its dropped total");
+        assert!(
+            exporter.largest() <= REFUSED_BATCH,
+            "{}",
+            exporter.largest()
+        );
+        assert!(
+            handed <= REFUSED_BURSTS * (REFUSED_QUEUE + 2 * REFUSED_BATCH),
+            "the queue bounds what each burst gets past it: handed={handed}"
+        );
+        assert_eq!(
+            handed + dropped,
+            emitted,
+            "every item is handed or counted dropped: handed={handed}, dropped={dropped}"
+        );
+    }
+
+    /// A collector refusing every span batch over several export intervals keeps the span
+    /// queue at its bound, and the SDK counts each span the full queue refused.
+    #[test]
+    fn a_refusing_collector_keeps_the_span_queue_bounded_and_counts_the_drops() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let exporter = RefusingExporter::default();
+        let batch = BatchConfigBuilder::default()
+            .with_max_queue_size(REFUSED_QUEUE)
+            .with_max_export_batch_size(REFUSED_BATCH)
+            .with_scheduled_delay(REFUSED_DELAY)
+            .build();
+        let provider = tracer_provider(exporter.clone(), batch, resource());
+        let reports = Reports::default();
+        let filter = crate::runtime::stderr_filter(EnvFilter::new("rift=info"));
+        let subscriber = tracing_subscriber::registry().with(reports.clone().with_filter(filter));
+        tracing::subscriber::with_default(subscriber, || {
+            let tracer = provider.tracer("refused");
+            for _ in 0..REFUSED_BURSTS {
+                for _ in 0..REFUSED_BURST {
+                    tracer.start("refused").end();
+                }
+                std::thread::sleep(REFUSED_WAIT);
+            }
+            exporter.settle();
+            provider
+                .shutdown()
+                .expect("the drained queue takes the shutdown");
+        });
+        assert_eq!(reports.count("BatchSpanProcessor.SpanDroppingStarted"), 1);
+        assert_bounded_and_counted(&exporter, &reports);
+    }
+
+    /// A collector refusing every log record batch over several export intervals keeps
+    /// the log record queue at its bound, and the SDK counts each record the full queue
+    /// refused.
+    #[test]
+    fn a_refusing_collector_keeps_the_log_queue_bounded_and_counts_the_drops() {
+        use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let exporter = RefusingExporter::default();
+        let batch = opentelemetry_sdk::logs::BatchConfigBuilder::default()
+            .with_max_queue_size(REFUSED_QUEUE)
+            .with_max_export_batch_size(REFUSED_BATCH)
+            .with_scheduled_delay(REFUSED_DELAY)
+            .build();
+        let logs = logger_export(exporter.clone(), batch, resource());
+        let reports = Reports::default();
+        let filter = crate::runtime::stderr_filter(EnvFilter::new("rift=info"));
+        let subscriber = tracing_subscriber::registry().with(reports.clone().with_filter(filter));
+        tracing::subscriber::with_default(subscriber, || {
+            let logger = logs.provider.logger("refused");
+            for _ in 0..REFUSED_BURSTS {
+                for _ in 0..REFUSED_BURST {
+                    let mut record = logger.create_log_record();
+                    record.set_body(AnyValue::from("refused".to_owned()));
+                    logger.emit(record);
+                }
+                std::thread::sleep(REFUSED_WAIT);
+            }
+            exporter.settle();
+            logs.provider
+                .shutdown()
+                .expect("the drained queue takes the shutdown");
+        });
+        assert_eq!(reports.count("BatchLogProcessor.LogDroppingStarted"), 1);
+        assert_bounded_and_counted(&exporter, &reports);
     }
 
     /// The attribute `key` of `record`, when it carries one.
