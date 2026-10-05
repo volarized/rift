@@ -3,12 +3,13 @@
 use rift_protocol::documentation::{
     DocumentationContext, DocumentationHit, DocumentationReferenceHit,
 };
-use rift_protocol::read::{GetSymbolHit, ProjectPath, SymbolHistory, SymbolVersion};
+use rift_protocol::read::{GetSymbolHit, ProjectPath, ReadWarning, SymbolHistory, SymbolVersion};
 
 use super::facts::{
     Facts, author_of, block_of, cut_hash, date_of, describe, location, spaced_name,
 };
 use super::layout::Lines;
+use super::warning;
 use crate::output::text::TextError;
 
 /// Levels that indent an entry under its section label.
@@ -64,13 +65,14 @@ fn text_section(lines: &mut Lines<'_>, text: &str) -> Result<(), TextError> {
     lines.verbatim(0, text)
 }
 
-/// Writes the documentation context: one entry per reference, with its excerpt.
+/// Writes the documentation context: one entry per reference, with its excerpt, then one warning
+/// line per warning of the context, written as the `documentation` read warning.
 fn context_section(lines: &mut Lines<'_>, context: &DocumentationContext) -> Result<(), TextError> {
     let DocumentationContext {
         documentation_revision: _,
         references,
         truncated,
-        warnings: _,
+        warnings,
     } = context;
     lines.blank()?;
     lines.line(
@@ -83,6 +85,12 @@ fn context_section(lines: &mut Lines<'_>, context: &DocumentationContext) -> Res
     )?;
     for reference in references {
         reference_entry(lines, reference)?;
+    }
+    for context_warning in warnings {
+        let read_warning = ReadWarning::Documentation {
+            warning: context_warning.clone(),
+        };
+        lines.line(ENTRY_INDENT, &warning::line(&read_warning)?)?;
     }
     Ok(())
 }

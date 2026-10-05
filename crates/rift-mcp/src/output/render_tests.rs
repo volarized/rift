@@ -3155,6 +3155,71 @@ fn a_truncated_or_empty_documentation_context_keeps_its_label() {
     );
 }
 
+#[test]
+fn documentation_context_warnings_follow_the_references_as_documentation_warning_lines() {
+    let guide = documentation_hit_at("docs/guide.md", 2, &["Guide"], None);
+    let mut context = context(&json!([reference(&guide, None)]), false);
+    let warning = json!({
+        "source": {"source": {"kind": "project", "path": "docs/a.md"}},
+        "stage": "extract", "kind": "malformed_source", "count": 3});
+    let truncated = json!({
+        "source": {"source": {"kind": "project", "path": "docs/b.md"}},
+        "stage": "source", "kind": "source_truncated", "count": 1});
+    context.warnings = vec![
+        serde_json::from_value(warning.clone()).expect("documentation warning deserializes"),
+        serde_json::from_value(truncated).expect("documentation warning deserializes"),
+    ];
+    let mut hit = symbol_hit_with_source(None);
+    hit.documentation = Some(context);
+    golden(
+        &symbol_result(vec![hit], pagination(0, 1)),
+        &[
+            "1 result",
+            "\tstruct A",
+            "\ta.rs:1",
+            "\trift://symbol/rust/a.rs/A",
+            "",
+            "\tdocumentation:",
+            "\t\tdocs/guide.md:2 · Guide",
+            "\t\tdocumentation · warning (source docs/a.md, stage extract, kind malformed_source, count 3)",
+            "\t\tdocumentation · warning (source docs/b.md, stage source, kind source_truncated, count 1)",
+        ],
+    );
+    let read_warning = json!({"code": "documentation", "warning": warning});
+    let shared_line = warning_line(&read_warning);
+    let context_line =
+        "documentation · warning (source docs/a.md, stage extract, kind malformed_source, count 3)";
+    assert_eq!(
+        shared_line, context_line,
+        "one line for one warning wherever it is read"
+    );
+}
+
+#[test]
+fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warning() {
+    let mut context = context(&json!([]), true);
+    context.warnings = vec![
+        serde_json::from_value(json!({
+            "source": {"source": {"kind": "project", "path": "docs/a.md"}},
+            "stage": "source", "kind": "source_unavailable", "count": 2}))
+        .expect("documentation warning deserializes"),
+    ];
+    let mut hit = symbol_hit_with_source(None);
+    hit.documentation = Some(context);
+    golden(
+        &symbol_result(vec![hit], pagination(0, 1)),
+        &[
+            "1 result",
+            "\tstruct A",
+            "\ta.rs:1",
+            "\trift://symbol/rust/a.rs/A",
+            "",
+            "\tdocumentation (truncated):",
+            "\t\tdocumentation · warning (source docs/a.md, stage source, kind source_unavailable, count 2)",
+        ],
+    );
+}
+
 fn version(
     revision: &str,
     path: &str,
