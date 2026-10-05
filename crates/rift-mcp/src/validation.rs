@@ -1833,10 +1833,10 @@ pub(crate) fn watch_event_impact(
 ///
 /// The path is placed under the canonical root first, because the watcher reports
 /// whatever spelling the platform hands it, and the floor's names say nothing about a
-/// path it cannot place. A path under neither spelling is dropped. This arm used to admit
-/// such a path instead, and what it admitted was the server's own `.rift` state: the
-/// workspace database moves continuously while SQLite runs, so every one of those writes
-/// moved the filesystem epoch that reads and the initial build both wait on.
+/// path it cannot place. A path under neither spelling is dropped. Admitting such a path
+/// would admit the server's own `.rift` state: the workspace database moves continuously
+/// while SQLite runs, so every one of those writes would move the filesystem epoch that
+/// reads and the initial build both wait on.
 ///
 /// Dropping an unplaceable path is safe only beside that placement. On a platform whose
 /// root reaches the watcher through a symlink every event carries the other spelling, so
@@ -3645,12 +3645,12 @@ fn record_commit_failure(tree_revision: &str, form: &'static str, error: &RiftEr
 /// The population lane: one long-lived task owning every search index population, and the
 /// handle a caller hands one publication to.
 ///
-/// Population used to run wherever it was wanted, and the wait was the caller's. Startup
-/// awaited its own pass before the server answered anything, which held the first answer
-/// for around fifteen seconds on a real workspace, and every change awaited a whole lexical
+/// A pass run wherever it is wanted makes its caller wait for it. A startup that awaits its
+/// own pass before the server answers anything holds the first answer for around fifteen
+/// seconds on a real workspace, and a change that awaits its pass waits for a whole lexical
 /// replacement plus the embedding of each new declaration inside the request path. The lane
-/// runs one pass per publication on its own task instead, so no request and no startup step
-/// awaits a pass.
+/// runs one pass per publication on its own task, so no request and no startup step awaits
+/// a pass.
 ///
 /// Requests coalesce. The channel holds exactly one publication, so a request landing while
 /// an earlier one still waits overwrites it, and the lane always runs the newest tree it
