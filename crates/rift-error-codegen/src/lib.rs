@@ -275,6 +275,54 @@ __rift_error_definition!(
     }
 
     #[test]
+    fn module_declares_an_error_directly_under_the_registry_in_the_parent() {
+        let source = r#"
+[registry]
+namespace = "rift"
+schema = 1
+
+[error.stopped]
+message = "stopped"
+action = "restart"
+
+[error.alpha.first]
+message = "first"
+action = "retry"
+"#;
+        let module = generate_module(source).expect("generate module");
+        assert_eq!(
+            module
+                .namespaces
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
+        let expected_parent = r#"use rift_error::__rift_error_definition;
+
+#[doc(hidden)]
+pub const REGISTRY_NAMESPACE: &str = "rift";
+#[doc(hidden)]
+pub const REGISTERED_SLUGS: &[&str] = &[
+    "rift.alpha.first",
+    "rift.stopped",
+];
+
+/// Registered errors under `rift.alpha`.
+pub mod alpha;
+
+__rift_error_definition!(
+    stopped,
+    slug = "rift.stopped",
+    message = "stopped",
+    action = "restart",
+    fields = {},
+);
+"#;
+        assert_eq!(module.parent, expected_parent);
+    }
+
+    #[test]
     fn module_files_are_rustfmt_stable() {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
