@@ -52,7 +52,6 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::global::{
@@ -198,8 +197,14 @@ impl BlockingExecutor {
         // would print two closing lines per request and per build.
         let acquire = Arc::clone(&self.operations).acquire_owned();
         let queue_timeout_ms = self.queue_timeout_ms;
-        let permit_result = async {
-            tracing::debug!(work = operation, queue_timeout_ms, "worker admission started");
+        let permit_result = rift_tracing::debug_span!(
+            "worker.queue",
+            component = "worker",
+            operation = "worker.queue",
+            work = operation
+        )
+        .instrument(async {
+            rift_tracing::debug!(work = operation, queue_timeout_ms, "worker admission started");
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => errors::server::read_cancelled().fail(),
@@ -209,16 +214,10 @@ impl BlockingExecutor {
                         .map_err(|error| errors::server::read_task().operation(operation).detail(error.to_string()).error())
                 }
             }
-        }
-        .instrument(tracing::debug_span!(
-            "worker.queue",
-            component = "worker",
-            operation = "worker.queue",
-            work = operation
-        ))
+        })
         .await;
         let permit = permit_result?;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "worker",
             operation = "worker.queue",
             work = operation,
@@ -229,28 +228,29 @@ impl BlockingExecutor {
             return errors::server::read_cancelled().fail();
         }
         let rayon_pool = Arc::clone(&self.rayon_pool);
-        async move {
+        rift_tracing::debug_span!(
+            "worker.run",
+            component = "worker",
+            operation = "worker.run",
+            work = operation
+        )
+        .instrument(async move {
             // The blocking thread has no ambient span, so the work's own spans attach to
             // the current one explicitly rather than opening a disconnected trace.
-            let parent = tracing::Span::current();
+            let parent = rift_tracing::Span::current();
             tokio::task::spawn_blocking(move || {
                 let result = rayon_pool.install(move || {
-                    let _entered = parent.enter();
-                    tracing::debug!(work = operation, "worker execution started");
-                    work(&cancellation)
+                    parent.in_scope(|| {
+                        rift_tracing::debug!(work = operation, "worker execution started");
+                        work(&cancellation)
+                    })
                 });
                 // Explicit success-path release; unwinding also drops the owned permit.
                 drop(permit);
                 result
             })
             .await
-        }
-        .instrument(tracing::debug_span!(
-            "worker.run",
-            component = "worker",
-            operation = "worker.run",
-            work = operation
-        ))
+        })
         .await
         .map_err(|error| {
             errors::server::read_task()
@@ -427,7 +427,7 @@ fn model_acquisition(
     match resolved {
         Ok(selection) => Some(selection),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.prepare",
                 model = embedding_model(&vector.embedding),
@@ -464,7 +464,7 @@ fn remote_selection(
     api_key: Option<&str>,
 ) -> Option<EmbeddingSelection> {
     let Some(api_key) = api_key else {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "search",
             operation = "search.prepare",
             api_key_env = embedding.api_key_env,
@@ -603,7 +603,7 @@ fn open_search_index(
     match SearchIndex::attached(database, vectors, limits) {
         Ok(index) => Some(Arc::new(index)),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.open",
                 error = %error,
@@ -638,7 +638,7 @@ fn spawn_vector_preparation(
         };
         match prepared {
             Ok(()) => embed_prepared(&published, &population).await,
-            Err(error) => tracing::warn!(
+            Err(error) => rift_tracing::warn!(
                 component = "search",
                 operation = "search.prepare",
                 error = %error,
@@ -712,7 +712,7 @@ async fn held_model(index: &SearchIndex, selection: &EmbeddingSelection) -> Resu
 /// ranking. The lane runs that pass rather than this task, so a pass a change or the
 /// supervisor already asked for is never run twice over.
 async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationLane) {
-    tracing::info!(
+    rift_tracing::info!(
         component = "search",
         operation = "search.prepare",
         "the vector ranking is prepared"
@@ -1505,7 +1505,7 @@ enum StoreReadFailure {
 impl From<RiftError> for StoreReadFailure {
     fn from(error: RiftError) -> Self {
         if is_connection_unavailable(&error) {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.store",
                 %error,
@@ -2059,16 +2059,15 @@ impl RiftMcp {
     ) -> Result<notify::RecommendedWatcher, RiftError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
-        blocking
-            .run("workspace watch setup", move || {
-                watch(&watch_root, &watch_validation)
-            })
-            .instrument(tracing::info_span!(
-                "index.watch",
-                component = "index",
-                operation = "watch.setup"
-            ))
-            .await
+        rift_tracing::info_span!(
+            "index.watch",
+            component = "index",
+            operation = "watch.setup"
+        )
+        .instrument(blocking.run("workspace watch setup", move || {
+            watch(&watch_root, &watch_validation)
+        }))
+        .await
     }
 
     /// Opens the search tier over `storage` and hands the lexical lane the initial write.
@@ -2269,9 +2268,11 @@ impl RiftMcp {
             return self.change_search(params, change).await;
         }
         let Some(rev) = params.rev.clone() else {
-            return rift_core::traced_async!(component = "search", operation = "search.request", {
-                self.current_tree_search(params).await
-            })
+            return rift_tracing::traced!(
+                component = "search",
+                operation = "search.request",
+                async move { self.current_tree_search(params).await }
+            )
             .await;
         };
         // The search index only ever holds the current tree, so a revision-addressed
@@ -2401,11 +2402,11 @@ impl RiftMcp {
         let requested = &params;
         let (resolved, ranking, mut references) = tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(rift_core::traced_async!(
+            Box::pin(rift_tracing::traced!(
                 component = "search",
                 operation = "search.references",
-                {
-                    tracing::debug!("search references started");
+                async move {
+                    rift_tracing::debug!("search references started");
                     self.current_tree_references(resolved, ranking, requested, deadline)
                         .await
                 }
@@ -2617,13 +2618,17 @@ impl RiftMcp {
         references: Arc<EngineReferences>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let include_local_preparation = params.scope != SearchScope::Global;
-        rift_core::traced_async!(component = "search", operation = "search.read", {
-            tracing::debug!("search read started");
-            self.current_tree_read(resolved, include_local_preparation, move |reads| {
-                reads.search_with_references(&params, &answer, &references)
-            })
-            .await
-        })
+        rift_tracing::traced!(
+            component = "search",
+            operation = "search.read",
+            async move {
+                rift_tracing::debug!("search read started");
+                self.current_tree_read(resolved, include_local_preparation, move |reads| {
+                    reads.search_with_references(&params, &answer, &references)
+                })
+                .await
+            }
+        )
         .await
     }
 
@@ -2845,10 +2850,14 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
-            tracing::debug!("search store read started");
-            self.store_answer(index, tree_revision, &parsed).await
-        })
+        let stored = rift_tracing::traced!(
+            component = "search",
+            operation = "search.store",
+            async move {
+                rift_tracing::debug!("search store read started");
+                self.store_answer(index, tree_revision, &parsed).await
+            }
+        )
         .await;
         let (searched, commit) = match stored {
             Ok(stored) => stored,
@@ -2912,13 +2921,16 @@ impl RiftMcp {
         let line_bound = pattern.is_line_bound();
         let tree_revision = published.reads.tree_revision();
         let rows_max = self.pattern_bounds.candidate_rows_max();
-        let scoped =
-            rift_core::traced_async!(component = "search", operation = "search.pattern", {
+        let scoped = rift_tracing::traced!(
+            component = "search",
+            operation = "search.pattern",
+            async move {
                 index
                     .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
                     .await
-            })
-            .await;
+            }
+        )
+        .await;
         let selected = match scoped.map_err(StoreReadFailure::from) {
             Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
             Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
@@ -3016,7 +3028,7 @@ impl RiftMcp {
         query: &ParsedQuery,
         phase: QueryPhase,
     ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "search",
             operation = "search.rank",
             phase = phase.label(),
@@ -3046,11 +3058,11 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
     ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure> {
-        let searched = rift_core::traced_async!(
+        let searched = rift_tracing::traced!(
             component = "search",
             operation = "search.read_store",
             attempt = 1_u8,
-            { self.read_store(index, tree_revision, query).await }
+            async move { self.read_store(index, tree_revision, query).await }
         )
         .await?;
         let Some(lane) = self.lexical.as_ref() else {
@@ -3302,7 +3314,7 @@ impl RiftMcp {
             tokio::time::timeout_at(deadline.at(), self.reconcile_workspace(phase)).await
         else {
             let detail = self.readiness_stall(deadline.budget()).await;
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "index",
                 operation = "index.readiness",
                 detail = detail.as_str(),
@@ -3357,14 +3369,14 @@ impl RiftMcp {
     /// not, since a deadline this call needs before validation can even
     /// begin cannot itself wait on that validation.
     async fn readiness_timeout(&self) -> Duration {
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.readiness",
             "reading request readiness budget"
         );
         let state = self.published.read().await;
         let (current, _failure) = state.snapshot();
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.readiness",
             timeout_ms = current
@@ -3468,7 +3480,7 @@ impl RiftMcp {
                 previous.awaits_publication(&current, &capture.tree, capture.configuration)
             });
             if configuration_matches && owed_publication {
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "index",
                     operation = "index.reconcile",
                     attempts,
@@ -3544,7 +3556,7 @@ impl RiftMcp {
         let reads = Arc::clone(&current.reads);
         self.blocking
             .run("project environment", move || {
-                Ok(rift_core::traced!(
+                Ok(rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.environment",
                     { reads.project_environment_moved() }
@@ -3583,10 +3595,10 @@ impl RiftMcp {
         let capture_started = tokio::time::Instant::now();
         let (digests, configuration) = self.capture_read(current, phase).await?;
         let capture_elapsed = capture_started.elapsed();
-        let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+        let tree = rift_tracing::traced!(component = "index", operation = "fingerprint.fold", {
             digests.fingerprint()
         });
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.reconcile",
             attempts,
@@ -3629,7 +3641,7 @@ impl RiftMcp {
             self.validation.observe_whole_workspace()
         };
         let requested_epoch = observed.map_err(|error| error.mcp().tool_error(phase))?;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.reconcile",
             attempts,
@@ -3704,8 +3716,16 @@ impl RiftMcp {
         let languages = current.configuration.language_file_selections();
         let last_capture = Arc::clone(&self.last_capture);
         let cancellation = self.validation.cancellation.clone();
-        self.blocking
-            .run_with_cancellation("workspace fingerprint", cancellation, move |cancellation| {
+        rift_tracing::debug_span!(
+            "index.reconcile",
+            component = "index",
+            operation = "fingerprint.capture",
+            epoch = current.epoch
+        )
+        .instrument(self.blocking.run_with_cancellation(
+            "workspace fingerprint",
+            cancellation,
+            move |cancellation| {
                 let last = Arc::clone(
                     &last_capture
                         .lock()
@@ -3723,20 +3743,15 @@ impl RiftMcp {
                 *last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-                let configuration = rift_core::traced!(
+                let configuration = rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.configuration",
                     { configuration_fingerprint(&root) }
                 );
                 Ok((digests, configuration))
-            })
-            .instrument(tracing::debug_span!(
-                "index.reconcile",
-                component = "index",
-                operation = "fingerprint.capture",
-                epoch = current.epoch
-            ))
-            .await
+            },
+        ))
+        .await
     }
 
     /// Validates only the selected paths represented by this immutable partial publication.
@@ -3797,7 +3812,7 @@ impl RiftMcp {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let observed_epoch = self.validation.observed_epoch();
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.readiness",
                 ?wait,
@@ -3857,7 +3872,7 @@ impl RiftMcp {
             if capture {
                 return Ok((current, None));
             }
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.readiness",
                 ?wait,
@@ -3867,7 +3882,7 @@ impl RiftMcp {
                 "request waiting for publication"
             );
             changed.as_mut().await;
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.readiness",
                 "publication wait notified"
@@ -4035,24 +4050,23 @@ impl ServerHandler for RiftMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let span = tracing::info_span!(
+        let span = rift_tracing::info_span!(
             "mcp.request",
             component = "mcp",
             operation = "tools/call",
             request_id = %context.id,
             tool = %request.name
         );
-        async {
-            tracing::debug!("tool request started");
+        span.instrument(async {
+            rift_tracing::debug!("tool request started");
             let routed = ToolCallContext::new(self, request, context);
             let result = self.tool_router.call(routed).await;
-            tracing::debug!(is_error = result.is_err(), "tool request completed");
+            rift_tracing::debug!(is_error = result.is_err(), "tool request completed");
             match result {
                 Err(error) => ToolFailure::from(error).into_call_tool_result(),
                 Ok(response) => Ok(response),
             }
-        }
-        .instrument(span)
+        })
         .await
     }
 
@@ -9690,7 +9704,7 @@ done
         .await?;
         let (_other_sink, _other_drain) = rift_tracing::log_capture();
 
-        tracing::warn!(component = "engine", "the beacon engine did not start");
+        rift_tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
         let text = resource_json_text(&logs, "rift://logs/component/engine")?;
         let answered = text.clone();
