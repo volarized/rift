@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::{
-    PROCESS_SAMPLE_INTERVAL_MIN, ProcessReader, ProcessReading, ProcessSampler, SampleSeries,
-    SystemProcessReader, TickEvidence,
+    PROCESS_SAMPLE_INTERVAL_MIN, ProcessReader, ProcessReading, ProcessSampler, RuntimeReading,
+    RuntimeSeries, SampleSeries, SystemProcessReader, TickEvidence,
 };
 use crate::RecordKind;
 use crate::flight::{FlightEntry, FlightKind, FlightTable};
@@ -274,6 +274,7 @@ async fn a_tick_reports_an_entry_past_the_stall_delay_once_with_a_snapshot() -> 
     let values = Arc::new(MetricValues::default());
     let reader = CountingReader { reads: 0, sent };
     let evidence = TickEvidence {
+        runtime: None,
         flights: Some(Arc::clone(&flights)),
         stall_delay: Some(Duration::ZERO),
     };
@@ -305,4 +306,147 @@ async fn a_tick_reports_an_entry_past_the_stall_delay_once_with_a_snapshot() -> 
     );
     assert_eq!(snapshots[0].operation(), "process");
     Ok(())
+}
+
+/// The value of the series `name` without labels in `values`.
+fn unlabeled(values: &MetricValues, name: &str) -> Option<SeriesValue> {
+    values
+        .snapshot()
+        .find(name, &[])
+        .map(|series| series.value().clone())
+}
+
+/// A runtime reading of two workers.
+fn runtime_reading(
+    busy_ms: [u64; 2],
+    parks: [u64; 2],
+    global_queue_depth: usize,
+) -> RuntimeReading {
+    RuntimeReading {
+        workers: 2,
+        alive_tasks: 7,
+        global_queue_depth,
+        busy: busy_ms.map(Duration::from_millis).to_vec(),
+        parks: parks.to_vec(),
+    }
+}
+
+#[test]
+fn the_first_runtime_reading_records_its_counts_and_no_change() {
+    let values = MetricValues::default();
+    let mut series = RuntimeSeries::default();
+    series.observe(runtime_reading([500, 900], [3, 4], 0), &values);
+
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.count"),
+        Some(SeriesValue::Last(2.0))
+    );
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.task.count"),
+        Some(SeriesValue::Last(7.0))
+    );
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.global_queue.length"),
+        Some(SeriesValue::Last(0.0))
+    );
+    for name in [
+        "tokio.runtime.worker.busy.time",
+        "tokio.runtime.worker.busy.time.max",
+        "tokio.runtime.worker.parks",
+    ] {
+        assert_eq!(unlabeled(&values, name), None, "{name} needs a base first");
+    }
+}
+
+#[test]
+fn a_runtime_reading_records_busy_time_and_parks_since_the_previous_one() {
+    let values = MetricValues::default();
+    let mut series = RuntimeSeries::default();
+    series.observe(runtime_reading([500, 900], [3, 4], 0), &values);
+    series.observe(runtime_reading([1_500, 1_150], [3, 9], 12), &values);
+
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.busy.time"),
+        Some(SeriesValue::Sum(1.25)),
+        "1 s on one worker and 0.25 s on the other"
+    );
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.busy.time.max"),
+        Some(SeriesValue::Last(1.0)),
+        "the busiest worker filled the interval alone"
+    );
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.parks"),
+        Some(SeriesValue::Sum(5.0))
+    );
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.global_queue.length"),
+        Some(SeriesValue::Last(12.0))
+    );
+}
+
+#[test]
+fn a_runtime_total_that_went_backwards_adds_nothing() {
+    let values = MetricValues::default();
+    let mut series = RuntimeSeries::default();
+    series.observe(runtime_reading([500, 900], [3, 4], 0), &values);
+    series.observe(runtime_reading([400, 900], [2, 4], 0), &values);
+
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.busy.time"),
+        Some(SeriesValue::Sum(0.0))
+    );
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.parks"),
+        Some(SeriesValue::Sum(0.0))
+    );
+}
+
+#[tokio::test]
+async fn a_runtime_reading_reads_the_runtime_it_runs_on() {
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let waiting = tokio::spawn(released);
+    let reading = RuntimeReading::of(&tokio::runtime::Handle::current().metrics());
+    let _ = release.send(());
+    let _ = waiting.await;
+
+    assert_eq!(
+        reading.workers, 1,
+        "a current-thread runtime has one worker"
+    );
+    assert_eq!(
+        reading.alive_tasks, 1,
+        "the spawned task is alive: {reading:?}"
+    );
+    if cfg!(target_has_atomic = "64") {
+        assert_eq!(reading.busy.len(), 1);
+        assert_eq!(reading.parks.len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tick_reads_the_runtime_into_the_runtime_group() {
+    let (sent, mut reads) = mpsc::unbounded_channel();
+    let values = Arc::new(MetricValues::default());
+    let reader = CountingReader { reads: 0, sent };
+    let evidence = TickEvidence {
+        runtime: Some(tokio::runtime::Handle::current().metrics()),
+        ..TickEvidence::default()
+    };
+    let sampler = ProcessSampler::spawn(
+        reader,
+        Duration::from_secs(1),
+        Arc::clone(&values),
+        evidence,
+    );
+    for expected in 1..=2 {
+        assert_eq!(reads.recv().await, Some(expected));
+    }
+    sampler.stopped().await;
+
+    assert_eq!(
+        unlabeled(&values, "tokio.runtime.worker.count"),
+        Some(SeriesValue::Last(1.0)),
+        "the first tick read the runtime before the second read began"
+    );
 }

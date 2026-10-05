@@ -10,10 +10,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+mod tokio_runtime;
+
+use tokio::runtime::RuntimeMetrics;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+use self::tokio_runtime::{RuntimeReading, RuntimeSeries};
 use crate::capture::now_ms;
 use crate::flight::{FlightTable, publish_stalled};
 use crate::measurement::monotonic_now;
@@ -246,10 +250,13 @@ impl ProcessReader for SystemProcessReader {
     }
 }
 
-/// What the sampler publishes into the log stream beside each sample: the entries of the
-/// table of operations in flight open past `stall_delay`, and metric snapshot records.
+/// What the sampler publishes into the log stream beside each sample: the runtime sample,
+/// the entries of the table of operations in flight open past `stall_delay`, and metric
+/// snapshot records.
 #[derive(Debug, Default)]
 pub(crate) struct TickEvidence {
+    /// The Tokio runtime each tick reads into the `runtime` group; none reads no runtime.
+    pub(crate) runtime: Option<RuntimeMetrics>,
     /// The table the stall report reads; no table reports no stall.
     pub(crate) flights: Option<Arc<FlightTable>>,
     /// Age past which an entry is reported once; none reports no stall.
@@ -325,6 +332,7 @@ async fn sample(
 ) {
     let started = Instant::now();
     let mut series = SampleSeries::default();
+    let mut runtime = RuntimeSeries::default();
     let mut snapshots = SnapshotSeries::default();
     let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -350,6 +358,9 @@ async fn sample(
         let sample = series.observe(reading, started.elapsed(), now_ms());
         sample.record_into(&values);
         values.publish_sample(sample);
+        if let Some(metrics) = &evidence.runtime {
+            runtime.observe(RuntimeReading::of(metrics), &values);
+        }
         evidence.publish(&values, &mut snapshots);
     }
 }

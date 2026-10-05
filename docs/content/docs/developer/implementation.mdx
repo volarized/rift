@@ -740,7 +740,7 @@ value, a counter its change since the previous snapshot, and a histogram the cha
 `.count` and `.sum`. A labeled series prints its label values in declaration order inside
 braces, leaving out a label recorded empty, so the waits on the write turn print as
 `lock.wait.duration.count{lock.name=index.write,lock.mode=exclusive}=2`. A tick at which no
-counter or histogram outside `process` moved writes nothing. Reads return `log` records unless
+counter or histogram outside `process` and `runtime` moved writes nothing. Reads return `log` records unless
 they ask for another kind, so snapshots do not fill a page of diagnostics.
 
 ## Shared ranking

@@ -10,7 +10,9 @@
 //! `runtime`, `process`, and `lifecycle` for every other instrument. A gauge carries its
 //! value; a counter carries its change since the previous snapshot; a histogram carries the
 //! change of its count and of its sum. A tick at which no counter or histogram outside the
-//! `process` group moved publishes nothing, so an idle server writes no snapshots.
+//! `process` and `runtime` groups moved publishes nothing, so an idle server writes no
+//! snapshots: the sampler's own tick moves the process's CPU time and the runtime's busy
+//! time and parks.
 //!
 //! A series prints under its instrument name and, when it has labels, the label values in
 //! declaration order inside braces, a label recorded empty left out:
@@ -34,8 +36,12 @@ pub(crate) const SNAPSHOT_VALUES_FIELD: &str = "values";
 /// Bytes of one snapshot record's values, at most: the members that fit are kept whole, and
 /// the count of the rest follows as `series_left_out`.
 const SNAPSHOT_VALUES_BYTES_MAX: usize = LOG_FIELDS_BYTES_MAX - 64;
-/// The group of the process sampler's instruments, whose movement alone publishes nothing.
+/// The group of the process sampler's instruments.
 const PROCESS_GROUP: &str = "process";
+/// The group of the Tokio runtime's instruments.
+const RUNTIME_GROUP: &str = "runtime";
+/// The groups whose movement alone publishes nothing: every tick moves them.
+const SAMPLED_GROUPS: [&str; 2] = [PROCESS_GROUP, RUNTIME_GROUP];
 
 /// The instrument group a series belongs to, by its instrument name.
 fn group(name: &str) -> &'static str {
@@ -47,7 +53,7 @@ fn group(name: &str) -> &'static str {
     } else if prefixed("sqlite.") || prefixed("db.") {
         "database"
     } else if prefixed("tokio.") {
-        "runtime"
+        RUNTIME_GROUP
     } else if prefixed("process.") {
         PROCESS_GROUP
     } else {
@@ -119,7 +125,7 @@ impl SnapshotSeries {
                     members.extend(self.change(series_key(series, ".sum"), *sum));
                 }
             }
-            if group != PROCESS_GROUP
+            if !SAMPLED_GROUPS.contains(&group)
                 && !matches!(series.value(), SeriesValue::Last(_))
                 && !members.is_empty()
             {

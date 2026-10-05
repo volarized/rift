@@ -41,6 +41,25 @@ fn a_tick_where_only_gauges_and_process_counters_moved_publishes_nothing() {
 }
 
 #[test]
+fn a_tick_where_only_runtime_counters_moved_publishes_nothing() {
+    const BUSY: Counter<0> = Counter::declare("tokio.runtime.worker.busy.time", "s", &[]);
+    const PARKS: Counter<0> = Counter::declare("tokio.runtime.worker.parks", "{park}", &[]);
+    let values = MetricValues::default();
+    BUSY.add_into(&values, [], 0.01);
+    PARKS.add_into(&values, [], 2.0);
+    let mut series = SnapshotSeries::default();
+
+    assert!(
+        series.records(&values.snapshot(), false).is_empty(),
+        "the sampler's own tick moves the runtime counters"
+    );
+    BUSY.add_into(&values, [], 0.02);
+    let forced = series.records(&values.snapshot(), true);
+    let runtime = group(&forced, "runtime").expect("a forced tick publishes the runtime group");
+    assert!(runtime.values.contains("tokio.runtime.worker.busy.time"));
+}
+
+#[test]
 fn a_counter_prints_its_change_since_the_previous_snapshot() -> TestResult {
     let values = MetricValues::default();
     let mut series = SnapshotSeries::default();
