@@ -4901,6 +4901,7 @@ dependencies = [
 name = "rift-tracing"
 version = "0.0.47"
 dependencies = [
+ "jiff",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

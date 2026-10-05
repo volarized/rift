@@ -22,7 +22,8 @@
 //!
 //! A binary starts tracing once through [`TracingRuntime::builder`], which installs stderr,
 //! the capture, and the optional OTLP export under filters of their own, and stops it with
-//! [`TracingRuntime::shutdown`].
+//! [`TracingRuntime::shutdown`]. [`LogRecord::rendered`] prints a record the way
+//! `rift server logs` shows it.
 
 mod capture;
 mod drain;
@@ -30,6 +31,7 @@ mod measurement;
 mod otlp;
 mod reads;
 mod record;
+mod render;
 mod runtime;
 mod span;
 mod stderr;
