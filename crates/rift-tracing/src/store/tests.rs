@@ -477,6 +477,56 @@ async fn a_new_file_carries_the_schema_version() -> TestResult {
     Ok(())
 }
 
+/// The `sqlite_schema` rows a new metrics database holds, one block per row in name order,
+/// spelled as the index database's schema fixture.
+const METRICS_SCHEMA: &str = include_str!("../../tests/fixtures/metrics_schema.txt");
+
+/// `fixture` with every line ending `\n`, as `SQLite` stores the schema text: a Windows
+/// checkout may rewrite the fixture's endings to `\r\n`.
+fn fixture_text(fixture: &str) -> String {
+    fixture.replace("\r\n", "\n")
+}
+
+/// The schema rows of the file at `path`, rendered as [`METRICS_SCHEMA`] spells them.
+fn rendered_schema(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let connection = rusqlite::Connection::open(path)?;
+    let mut statement =
+        connection.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name")?;
+    let rows = statement.query_map([], |row| {
+        let sql = row
+            .get::<_, Option<String>>(3)?
+            .map_or_else(String::new, |sql| format!(" {sql}"));
+        Ok(format!(
+            "type: {}\nname: {}\ntbl_name: {}\nsql:{sql}\n",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let blocks = rows.collect::<Result<Vec<String>, _>>()?;
+    Ok(blocks.join("\n"))
+}
+
+/// A new metrics database holds exactly its recorded table and indexes: `log_records`
+/// with its `kind` column, and the `level` and `component` indexes.
+#[tokio::test]
+async fn a_new_file_holds_its_recorded_schema() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    closed(&store).await?;
+
+    assert_eq!(rendered_schema(store.path())?, fixture_text(METRICS_SCHEMA));
+    Ok(())
+}
+
+/// A fixture a Windows checkout rewrote to `\r\n` reads as the one with `\n` endings.
+#[test]
+fn a_crlf_checkout_of_the_schema_fixture_reads_as_written() {
+    let crlf = METRICS_SCHEMA.replace("\r\n", "\n").replace('\n', "\r\n");
+    assert_eq!(fixture_text(&crlf), fixture_text(METRICS_SCHEMA));
+    assert!(!fixture_text(&crlf).contains('\r'));
+}
+
 #[tokio::test]
 async fn a_file_of_another_version_is_refused_by_a_reader_and_recreated_by_the_writer() -> TestResult
 {
