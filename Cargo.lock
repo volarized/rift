@@ -4495,9 +4495,6 @@ dependencies = [
  "jsonschema",
  "mimalloc",
  "nix",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
  "regex-syntax",
  "reqwest",
  "rift-core",
@@ -4520,7 +4517,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
  "unicode-width",
  "waitpid-any",
@@ -4904,6 +4900,9 @@ dependencies = [
 name = "rift-tracing"
 version = "0.0.47"
 dependencies = [
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "pin-project-lite",
  "rift-error",
  "rusqlite",
@@ -4912,6 +4911,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

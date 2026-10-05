@@ -1,6 +1,7 @@
 //! Optional OTLP export of Rift's `tracing` spans, behind the `otlp` cargo feature.
 //!
-//! Off by default, so a release binary built without `--features otlp` carries no
+//! The `rift` binary's `otlp` feature turns this crate's on. Off by default, so a release
+//! binary built without `--features otlp` carries no
 //! OpenTelemetry export stack. Compiled in, the process still exports nothing until an
 //! operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` - the in-memory collector `just
 //! trace-collector` runs, or any other OTLP/HTTP receiver.
@@ -29,8 +30,8 @@ const SERVICE_NAME: &str = "rift";
 /// Overrides the export layer's own filter; unset, [`DEFAULT_OTLP_FILTER`] applies.
 #[cfg(feature = "otlp")]
 const RIFT_OTLP_FILTER_VAR: &str = "RIFT_OTLP_FILTER";
-/// Keeps Rift's own crates - the ones `traced!` and `traced_async!` instrument - at
-/// info; a dependency's own spans stay out unless the operator names it.
+/// Keeps Rift's own crates - the ones `traced!` instruments - at info; a dependency's own
+/// spans stay out unless the operator names it.
 #[cfg(feature = "otlp")]
 const DEFAULT_OTLP_FILTER: &str =
     "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info";
@@ -66,6 +67,13 @@ impl Export {
     /// A collector that is unreachable at shutdown is not this process's failure: the
     /// server has already finished serving, and losing the last batch of spans must not
     /// turn a clean run into a nonzero exit status.
+    #[cfg_attr(
+        not(feature = "otlp"),
+        expect(
+            clippy::unused_self,
+            reason = "a build without the otlp feature holds no provider to shut down"
+        )
+    )]
     pub(crate) fn shutdown(self) {
         #[cfg(feature = "otlp")]
         if let Some(provider) = self.provider
@@ -82,7 +90,10 @@ impl Export {
 /// Generic in the subscriber `S` because `tracing_subscriber::registry().with(a).with(b)`
 /// changes the concrete subscriber type at every `.with()` call; a layer boxed as
 /// `dyn Layer<Registry>` only satisfies the first one in the chain. Returning `impl
-/// Layer<S>` lets this layer adapt to wherever `initialize_tracing` appends it instead.
+/// Layer<S>` lets this layer adapt to wherever [`TracingRuntimeBuilder::install`] appends it
+/// instead.
+///
+/// [`TracingRuntimeBuilder::install`]: crate::TracingRuntimeBuilder::install
 ///
 /// The exporter posts protobuf-encoded OTLP over the async `reqwest` client Rift already
 /// depends on, batched by a Tokio-driven [`BatchSpanProcessor`]: `opentelemetry_sdk`'s
@@ -156,7 +167,7 @@ where
 {
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(SERVICE_NAME))
-        .with_filter(crate::reevaluated(filter))
+        .with_filter(crate::runtime::reevaluated(filter))
 }
 
 /// Always `None`: no exporter exists to install without the `otlp` feature.
@@ -313,7 +324,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..SPANS {
                 let _ = tracing::event_enabled!(target: "toasty::query", tracing::Level::WARN);
-                rift_core::traced!(component = "search", operation = "search.request", {});
+                crate::traced!(component = "search", operation = "search.request", {});
             }
         });
         provider
@@ -334,7 +345,7 @@ mod tests {
         let batch = BatchConfigBuilder::default().with_max_queue_size(1).build();
         let provider = tracer_provider(StalledExporter, batch);
         let stderr = Reports::default();
-        let filter = crate::stderr_filter(EnvFilter::new("rift=info"));
+        let filter = crate::runtime::stderr_filter(EnvFilter::new("rift=info"));
         let subscriber = tracing_subscriber::registry().with(stderr.clone().with_filter(filter));
         tracing::subscriber::with_default(subscriber, || {
             let tracer = provider.tracer("queue");

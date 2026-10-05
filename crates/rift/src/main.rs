@@ -7,13 +7,11 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod install;
 mod mcp;
-mod otlp;
 mod progress;
 mod server;
 mod steer;
 mod update;
 use std::fmt;
-use std::io::IsTerminal as _;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::OnceLock;
@@ -22,15 +20,7 @@ use std::sync::OnceLock;
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
 use rift_mcp::McpErrorExt as _;
-use tracing::subscriber::Interest;
-use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter};
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
-use tracing_subscriber::layer::{Filter, SubscriberExt as _};
-use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{EnvFilter, Layer as _};
-
-/// Default filter keeps dependency diagnostics out of MCP stderr.
-const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+use rift_tracing::{StderrPolicy, TracingRuntime};
 
 /// The checkout this binary was built from, as `build.rs` recorded it. Every server and
 /// proxy this binary runs names its build through it.
@@ -130,9 +120,11 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let serves = cli.records_logs();
     let logs = serves.then(|| rift_mcp::logs_configuration(Path::new(".")));
-    let stderr = stderr_policy(serves, std::io::stderr().is_terminal());
-    let (drain, otlp_export) =
-        initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()), stderr);
+    let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
+    if let Some(logs) = &logs {
+        tracing_builder = tracing_builder.capture(&logs.capture);
+    }
+    let (tracing_runtime, drain) = tracing_builder.install();
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
     let succeeded = match run(cli, drain, retention_records).await {
         Ok(Some(outcome)) => {
@@ -147,7 +139,7 @@ async fn main() -> ExitCode {
     };
     // Flushes buffered spans before either exit path: the normal return below drops
     // every other local first, and `process::exit` past it runs no destructor at all.
-    otlp_export.shutdown();
+    tracing_runtime.shutdown();
     if serves {
         // A foreground server's index build, a lane's pass, or a lexical transaction can
         // still be running when serving ends. Returning would drop the runtime, and that
@@ -165,111 +157,6 @@ async fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
-}
-
-/// How much the process may write to its standard error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StderrPolicy {
-    /// Everything the filter admits: the stream belongs to whoever reads it.
-    Unbounded,
-    /// At most [`rift_mcp::SERVER_STDERR_BYTES_MAX`] bytes: the stream is
-    /// the file `rift server start` handed its detached server.
-    Bounded,
-}
-
-/// The policy for this invocation: a server whose stderr is not a terminal
-/// is writing into a file or a pipe that outlives every reader, so it is
-/// bounded; every other command, and a server an operator watches in a
-/// terminal, writes freely.
-fn stderr_policy(serves: bool, terminal: bool) -> StderrPolicy {
-    if serves && !terminal {
-        StderrPolicy::Bounded
-    } else {
-        StderrPolicy::Unbounded
-    }
-}
-
-/// Installs stderr tracing and optional foreground-server recording.
-///
-/// The two carry their own filters. Stderr keeps `RUST_LOG` or the default
-/// targets, because that stream belongs to whoever started the process. The
-/// store captures under the workspace's `[logs] capture` filter, so a workspace
-/// can record itself at debug without an operator exporting an environment
-/// variable into the process a proxy spawns detached.
-///
-/// The returned drain exists only for a foreground server. Other commands install no
-/// recording layer and allocate no log queue.
-///
-/// The returned [`otlp::Export`] is a no-op handle unless the `otlp` feature is compiled
-/// in and `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; the caller shuts it down
-/// before the process exits either way.
-fn initialize_tracing(
-    capture: Option<&str>,
-    stderr: StderrPolicy,
-) -> (Option<rift_tracing::LogDrain>, otlp::Export) {
-    let (sink, drain) = match capture {
-        Some(capture) => {
-            let (sink, drain) = rift_tracing::log_capture();
-            let filter = EnvFilter::try_new(capture)
-                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
-            (Some(sink.with_filter(reevaluated(filter))), Some(drain))
-        }
-        None => (None, None),
-    };
-    let writer = match stderr {
-        StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
-        StderrPolicy::Bounded => BoxMakeWriter::new(rift_mcp::BoundedStderr::default()),
-    };
-    let mut stderr_layer = tracing_subscriber::fmt::layer()
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_writer(writer);
-    // Escape codes color a terminal. A pipe or a file hands them to its reader as bytes:
-    // `rift mcp` keeps a spawned server's first startup lines verbatim, and the codes
-    // nearly double each line.
-    if !std::io::stderr().is_terminal() {
-        stderr_layer.set_ansi(false);
-    }
-    let (otlp_layer, otlp_export) = otlp::layer();
-    tracing_subscriber::registry()
-        .with(
-            stderr_layer.with_filter(stderr_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
-            )),
-        )
-        .with(sink)
-        .with(otlp_layer)
-        .init();
-    (drain, otlp_export)
-}
-
-/// The stderr filter: `operator` plus the OTLP export's own reports.
-///
-/// `operator` is `RUST_LOG` or the default targets, and rarely names the OpenTelemetry SDK's
-/// target, through which the export reports what it drops; `otlp::sdk_reports` rides beside
-/// it so those reports reach stderr either way.
-fn stderr_filter<S>(operator: EnvFilter) -> impl Filter<S> {
-    reevaluated(operator.or(otlp::sdk_reports()))
-}
-
-/// Wraps a per-layer filter so the subscriber asks it at every span and event.
-///
-/// `tracing-subscriber` hands each per-layer filter's answer to the registry through one
-/// thread-local state that only an `enabled` pass writes, and a callsite whose interest is
-/// cached as `always` opens its span without such a pass. `tracing::event_enabled!` runs a
-/// pass and dispatches nothing - `toasty` asks it about a `toasty::query` warning before
-/// every statement - so without this wrapper the next such span on that thread inherits the
-/// probe's answers, and each layer whose filter refused the probe loses the span: the log
-/// store does not record it, and the OTLP export does not export it.
-///
-/// The `DynFilterFn` beside `filter` enables everything and answers `sometimes` for every
-/// callsite `filter` does not refuse, so no callsite's interest is cached as `always`. Its
-/// `TRACE` hint leaves `filter`'s own level hint in force.
-fn reevaluated<S>(filter: impl Filter<S>) -> impl Filter<S> {
-    let every_time = DynFilterFn::new(|_, _| true)
-        .with_callsite_filter(|_| Interest::sometimes())
-        .with_max_level_hint(LevelFilter::TRACE);
-    filter.and(every_time)
 }
 
 #[derive(Debug)]
@@ -440,13 +327,9 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::sync::{Arc, Mutex};
 
     use super::{Cli, CliCommand, CliError, cli_code, cli_command, mcp};
     use clap::Parser;
-    use tracing::span::{Attributes, Id};
-    use tracing_subscriber::layer::{Context, SubscriberExt as _};
-    use tracing_subscriber::{EnvFilter, Layer};
 
     #[test]
     fn version_prints_the_product_version() {
@@ -877,26 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_server_off_a_terminal_bounds_its_stderr() {
-        assert_eq!(
-            super::stderr_policy(true, false),
-            super::StderrPolicy::Bounded
-        );
-        assert_eq!(
-            super::stderr_policy(true, true),
-            super::StderrPolicy::Unbounded
-        );
-        assert_eq!(
-            super::stderr_policy(false, false),
-            super::StderrPolicy::Unbounded
-        );
-        assert_eq!(
-            super::stderr_policy(false, true),
-            super::StderrPolicy::Unbounded
-        );
-    }
-
-    #[test]
     fn unknown_commands_are_rejected() {
         let error = Cli::try_parse_from(["rift", "serve"])
             .expect_err("unknown operational command must fail");
@@ -947,60 +810,5 @@ mod tests {
             Cli::try_parse_from(["rift", "steer", "--session-id", "abc"]).is_err(),
             "steer reads the hook call from stdin, not flags"
         );
-    }
-
-    /// Spans the filter test opens; enough that one lost span shows as a count mismatch.
-    const OPENED_SPANS: usize = 32;
-
-    /// Every span name one layer saw open, in order.
-    #[derive(Clone, Default)]
-    struct OpenedSpans {
-        names: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    impl OpenedSpans {
-        fn count(&self, name: &str) -> usize {
-            self.names
-                .lock()
-                .expect("the opened span names are not poisoned")
-                .iter()
-                .filter(|opened| **opened == name)
-                .count()
-        }
-    }
-
-    impl<S: tracing::Subscriber> Layer<S> for OpenedSpans {
-        fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
-            self.names
-                .lock()
-                .expect("the opened span names are not poisoned")
-                .push(attributes.metadata().name());
-        }
-    }
-
-    /// `toasty` asks `tracing::event_enabled!` about a `toasty::query` warning before every
-    /// statement. A stderr filter with a bare `warn` default, such as `RUST_LOG=warn,rift=info`,
-    /// enables that probe while the log store's capture filter refuses it, and the capture
-    /// must still see every span that follows on the thread.
-    #[test]
-    fn a_reevaluated_filter_sees_every_span_after_a_probe_it_refuses() {
-        let capture = OpenedSpans::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                OpenedSpans::default()
-                    .with_filter(super::reevaluated(EnvFilter::new("warn,rift=info"))),
-            )
-            .with(
-                capture
-                    .clone()
-                    .with_filter(super::reevaluated(EnvFilter::new("rift=info"))),
-            );
-        tracing::subscriber::with_default(subscriber, || {
-            for _ in 0..OPENED_SPANS {
-                let _ = tracing::event_enabled!(target: "toasty::query", tracing::Level::WARN);
-                rift_core::traced!(component = "search", operation = "search.request", {});
-            }
-        });
-        assert_eq!(capture.count("search.request"), OPENED_SPANS);
     }
 }
