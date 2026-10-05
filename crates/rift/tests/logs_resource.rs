@@ -308,7 +308,7 @@ async fn the_logs_command_honors_its_tail_and_level() -> TestResult {
     require_success(&failures, "rift server logs --level error")?;
     assert_eq!(printed_lines(&tailed).len(), 1);
     for line in printed_lines(&failures) {
-        assert!(line.contains("🔴 ERROR"), "{line:?}");
+        assert_eq!(line.split_whitespace().nth(1), Some("ERROR"), "{line:?}");
     }
     client.cancel().await?;
     failure_window.passed();

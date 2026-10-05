@@ -14,7 +14,6 @@ use std::time::Duration;
 use tracing::Subscriber;
 use tracing::subscriber::Interest;
 use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter, ParseError};
-use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::layer::{Filter, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
@@ -26,8 +25,9 @@ use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable};
 use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::otlp;
+use crate::render::LevelColor;
 use crate::sampler::{ProcessSampler, SystemProcessReader, TickEvidence};
-use crate::stderr::BoundedStderr;
+use crate::stderr::{BoundedStderr, StderrLines};
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
@@ -225,15 +225,15 @@ impl TracingRuntimeBuilder {
             StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
             StderrPolicy::Bounded => BoxMakeWriter::new(BoundedStderr::default()),
         };
-        let mut stderr_layer = tracing_subscriber::fmt::layer()
-            .with_span_events(FmtSpan::CLOSE)
-            .with_writer(writer);
         // Escape codes color a terminal. A pipe or a file hands them to its reader as bytes:
         // `rift mcp` keeps a spawned server's first startup lines verbatim, and the codes
         // nearly double each line.
-        if !std::io::stderr().is_terminal() {
-            stderr_layer.set_ansi(false);
-        }
+        let color = if std::io::stderr().is_terminal() {
+            LevelColor::Ansi
+        } else {
+            LevelColor::Plain
+        };
+        let stderr_layer = StderrLines::new(writer, color);
         let (otlp_layer, export) = otlp::layer();
         #[cfg(feature = "otlp")]
         let values = Arc::new(MetricValues::exporting(export.metrics()));
