@@ -505,6 +505,32 @@ fn publication_map(
     Arc::new(map)
 }
 
+/// `index.epoch`: the epoch the index last published and the filesystem epoch it last
+/// observed, recorded where each one moves. An observed epoch running ahead of the
+/// published one is an index behind the tree.
+const INDEX_EPOCH: rift_tracing::Gauge<u64, 1> =
+    rift_tracing::Gauge::declare("index.epoch", "{epoch}", &["index.epoch.kind"]);
+/// The `index.epoch.kind` of the epoch a publication installs.
+const INDEX_EPOCH_PUBLISHED: &str = "published";
+/// The `index.epoch.kind` of the epoch an observation reaches.
+const INDEX_EPOCH_OBSERVED: &str = "observed";
+
+/// The lock a write of the published snapshot, [`IndexState`], is recorded under.
+pub(crate) const PUBLISHED_SNAPSHOT_LOCK: &str = "index.snapshot";
+
+/// Takes the published snapshot's write lock on a blocking thread, recorded as the lock
+/// [`PUBLISHED_SNAPSHOT_LOCK`]: the wait for its readers to leave and the time the write
+/// stays held. The held write stays in the table of operations in flight until the guard
+/// drops. Tokio's `RwLock` is write-preferring, so every read that arrives meanwhile waits
+/// for that guard.
+fn write_published(
+    published: &RwLock<IndexState>,
+) -> rift_tracing::Held<tokio::sync::RwLockWriteGuard<'_, IndexState>> {
+    let Ok(state) = rift_tracing::lock(PUBLISHED_SNAPSHOT_LOCK)
+        .try_acquire(|| Ok::<_, std::convert::Infallible>(published.blocking_write()));
+    state
+}
+
 /// Published workspace plus failure for latest observed epoch.
 #[derive(Debug)]
 pub(crate) struct IndexState {
@@ -527,6 +553,9 @@ impl IndexState {
         if candidate.epoch != observed_epoch {
             return false;
         }
+        INDEX_EPOCH
+            .labeled_value([INDEX_EPOCH_PUBLISHED], candidate.epoch)
+            .record();
         self.current = candidate;
         self.failure = None;
         true
@@ -987,6 +1016,9 @@ impl IndexValidation {
                     .error()
             })?;
         let epoch = previous + 1;
+        INDEX_EPOCH
+            .labeled_value([INDEX_EPOCH_OBSERVED], epoch)
+            .record();
         match self.invalidations.try_send(()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
             Err(mpsc::error::TrySendError::Closed(())) => {
@@ -3850,7 +3882,7 @@ fn publish_preparation_after(
         drop(pending);
         return RebuildOutcome::Superseded;
     };
-    let mut state = published.blocking_write();
+    let mut state = write_published(published);
     if state.current.preparation.is_none() || answer.epoch < state.current.epoch {
         drop(state);
         drop(pending);
@@ -4378,7 +4410,7 @@ pub(crate) fn publish_rebuild_after(
     let observed_epoch = validation.observed_epoch();
     let candidate =
         answered_candidate(root, candidate, &publication, observed_epoch).into_current();
-    let mut state = published.blocking_write();
+    let mut state = write_published(published);
     after_state_lock();
     if validation.cancellation.is_cancelled() {
         drop(state);
@@ -4508,9 +4540,7 @@ pub(crate) fn record_rebuild_failure(
 ) -> bool {
     let publication = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
-    let recorded = published
-        .blocking_write()
-        .record_failure(epoch, observed_epoch, error);
+    let recorded = write_published(published).record_failure(epoch, observed_epoch, error);
     drop(publication);
     recorded
 }
@@ -5519,6 +5549,91 @@ pub(crate) mod tests {
         }
         assert_published_fixture(&fixture);
         assert_eq!(fixture.validation.observed_epoch(), 2);
+        Ok(())
+    }
+
+    /// A publication holding the published snapshot's write lock sits in the table of
+    /// operations in flight as a held lock under the operation that publishes, so every
+    /// read waiting for that write can be traced to it.
+    #[test]
+    fn a_held_snapshot_write_is_listed_under_the_operation_that_publishes() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let fixture = publication_fixture()?;
+        let outcome = rift_tracing::traced!(component = "index", operation = "index.build", {
+            publish_rebuild_after(
+                fixture.root(),
+                &fixture.state,
+                &fixture.validation,
+                &fixture.after,
+                &ChangeSet::Full,
+                None,
+                || rift_tracing::publish_in_flight("stop"),
+            )
+        });
+        assert_eq!(outcome, RebuildOutcome::Published);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the hook published the table")?;
+        let table: serde_json::Value = serde_json::from_str(table.fields())?;
+        let listed: serde_json::Value =
+            serde_json::from_str(table["operations"].as_str().ok_or("operations")?)?;
+        let held = listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["kind"] == "held")
+            .collect::<Vec<_>>();
+        assert_eq!(held.len(), 1, "{table}");
+        assert_eq!(
+            held[0]["lock.name"],
+            super::PUBLISHED_SNAPSHOT_LOCK,
+            "{table}"
+        );
+        assert_eq!(held[0]["parent"], "index.build", "{table}");
+        Ok(())
+    }
+
+    /// An observation records the filesystem epoch it reaches, and a publication the epoch
+    /// it installs, so the two read apart while the index is behind the tree.
+    #[test]
+    fn observation_and_publication_record_their_index_epochs() -> TestResult {
+        let recorder = rift_tracing::ScopedRecorder::builder().install()?.0;
+        let fixture = publication_fixture()?;
+        let epoch = |kind| {
+            recorder
+                .metrics()
+                .find("index.epoch", &[("index.epoch.kind", kind)])
+                .map(|series| series.value().clone())
+        };
+        let observed = fixture.validation.observe_whole_workspace()?;
+        assert_eq!(
+            epoch("observed"),
+            Some(rift_tracing::SeriesValue::Last(f64::from(u32::try_from(
+                observed
+            )?)))
+        );
+        assert_eq!(epoch("published"), None, "nothing published since");
+        let current = stable_candidate(fixture.root(), observed)?;
+        let outcome = publish_rebuild_after(
+            fixture.root(),
+            &fixture.state,
+            &fixture.validation,
+            &current,
+            &ChangeSet::Full,
+            None,
+            || {},
+        );
+        assert_eq!(outcome, RebuildOutcome::Published);
+        assert_eq!(
+            epoch("published"),
+            Some(rift_tracing::SeriesValue::Last(f64::from(u32::try_from(
+                observed
+            )?)))
+        );
         Ok(())
     }
 
@@ -7730,7 +7845,10 @@ pub(crate) mod tests {
         let (context, _invalidations) = initial_preparation_context(root)?;
         let partial = Arc::clone(&context.published.blocking_read().current);
         let complete = stable_candidate(root, 0)?;
-        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        // At info: the snapshot's uncontended write hold closes at debug on every publish.
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("info")
+            .install()?;
         let publish = |candidate| {
             super::publish_preparation_after(
                 root,
