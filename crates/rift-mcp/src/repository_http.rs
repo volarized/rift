@@ -43,6 +43,17 @@ const IDLE_EVICTION_TICK: Duration = Duration::from_secs(1);
 /// Wall-clock bound one workspace stop spends on its engines, supervisor, and database.
 const WORKSPACE_STOP_BOUND: Duration = Duration::from_secs(4);
 
+/// The lock a repository request's admission is recorded under, waits and holds alike.
+const REPOSITORY_ADMISSION_LOCK: &str = "repository.admission";
+
+/// The lock a workspace build's turn at the repository's build gate is recorded under.
+const REPOSITORY_BUILD_GATE_LOCK: &str = "repository.build_gate";
+
+/// One request's admission, recorded as [`REPOSITORY_ADMISSION_LOCK`]. The error arm is
+/// the semaphore's closure, which [`RepositoryWorkspaceRegistry::admit`] refuses.
+type RepositoryAdmission =
+    rift_tracing::Held<Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>>;
+
 /// Serves one repository's workspaces through a process-wide bounded executor.
 ///
 /// Each admitted workspace retains its own server and mutable stores.
@@ -332,21 +343,26 @@ impl RepositoryWorkspaceRegistry {
         }
     }
 
-    async fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, &'static str)> {
+    /// Waits for one of the repository's admissions by `[server] worker_queue_timeout`, or
+    /// until the server stops.
+    ///
+    /// The wait is recorded as the lock [`REPOSITORY_ADMISSION_LOCK`], so a contended wait
+    /// names the waiting operation and the one holding the oldest admission.
+    async fn admit(&self) -> Result<RepositoryAdmission, (StatusCode, &'static str)> {
         let timeout = Duration::from_millis(
             self.server_configuration
                 .worker_queue_timeout
                 .milliseconds(),
         );
-        tokio::select! {
-            () = self.stop.cancelled() => Err(Self::stopping()),
-            acquired = tokio::time::timeout(timeout, Arc::clone(&self.admissions).acquire_owned()) => {
-                acquired.ok().and_then(Result::ok).ok_or((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "repository admission timed out",
-                ))
-            }
-        }
+        let admission = tokio::select! {
+            () = self.stop.cancelled() => return Err(Self::stopping()),
+            acquired = rift_tracing::lock(REPOSITORY_ADMISSION_LOCK)
+                .acquire_within(timeout, Arc::clone(&self.admissions).acquire_owned()) => acquired.ok(),
+        };
+        admission.filter(|admission| admission.is_ok()).ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository admission timed out",
+        ))
     }
 
     fn stopping() -> (StatusCode, &'static str) {
@@ -415,7 +431,8 @@ impl RepositoryWorkspaceRegistry {
         );
         let _build = tokio::select! {
             () = self.stop.cancelled() => return Err(Self::stopping()),
-            acquired = tokio::time::timeout(timeout, self.build_gate.lock()) => acquired.map_err(|_| {
+            acquired = rift_tracing::lock(REPOSITORY_BUILD_GATE_LOCK)
+                .acquire_within(timeout, self.build_gate.lock()) => acquired.map_err(|_| {
                 (StatusCode::SERVICE_UNAVAILABLE, "workspace build admission timed out")
             })?,
         };
@@ -1061,6 +1078,104 @@ mod tests {
             build_gate: tokio::sync::Mutex::new(()),
             workspaces: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// The fields of the one `lock.wait` record among `records`.
+    fn lock_wait(
+        records: &[rift_tracing::LogRecord],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut waits = records
+            .iter()
+            .filter(|record| record.message() == "lock.wait");
+        let wait = waits.next().ok_or("the wait closed with a record")?;
+        assert!(waits.next().is_none(), "one wait, one record");
+        Ok(serde_json::from_str(wait.fields())?)
+    }
+
+    /// A request waiting for the repository's only admission names itself and the
+    /// operation that holds it, and acquires it once that operation releases it.
+    #[tokio::test]
+    async fn an_admission_wait_names_the_request_holding_the_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        let holder = rift_tracing::traced!("index.build", async { registry.admit().await })
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let mut waiter = std::pin::pin!(rift_tracing::traced!(
+            component = "mcp",
+            operation = "tools/call",
+            async { registry.admit().await.map(drop) }
+        ));
+        let pending = tokio::select! {
+            biased;
+            _ = waiter.as_mut() => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(pending, "the holder keeps the only admission");
+        drop(holder);
+        waiter.await.map_err(|error| format!("{error:?}"))?;
+        drop(recorder);
+
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_ADMISSION_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["waiter"], "tools/call", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "acquired", "{wait}");
+        Ok(())
+    }
+
+    /// A workspace build waiting at the build gate when the server stops names itself and
+    /// the build holding the gate, and its wait ends cancelled.
+    #[tokio::test]
+    async fn a_build_gate_wait_the_stop_ends_names_the_build_holding_the_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        let gate = rift_tracing::traced!("index.build", async {
+            rift_tracing::lock(super::REPOSITORY_BUILD_GATE_LOCK)
+                .acquire(registry.build_gate.lock())
+                .await
+        })
+        .await;
+        let mut waiter = std::pin::pin!(rift_tracing::traced!(
+            component = "mcp",
+            operation = "tools/call",
+            async {
+                registry
+                    .build_workspace(directory.path().to_path_buf())
+                    .await
+                    .map(drop)
+            }
+        ));
+        let pending = tokio::select! {
+            biased;
+            _ = waiter.as_mut() => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(pending, "the holder keeps the build gate");
+        registry.stop.cancel();
+        let refusal = waiter.await.expect_err("a stopping server builds nothing");
+        assert_eq!(refusal, super::RepositoryWorkspaceRegistry::stopping());
+        drop(gate);
+        drop(recorder);
+
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_BUILD_GATE_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["waiter"], "tools/call", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "cancelled", "{wait}");
+        Ok(())
     }
 
     /// A workspace whose index database was refused has no database to stop, and its stop

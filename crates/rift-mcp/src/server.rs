@@ -105,6 +105,15 @@ const MODEL_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// download's own `download_timeout` is the budget an operator tunes.
 const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 
+/// The lock a blocking operation's worker permit is recorded under, waits and holds alike.
+pub(crate) const WORKER_PERMIT_LOCK: &str = "worker.permit";
+
+/// One admitted blocking operation's worker permit, recorded as [`WORKER_PERMIT_LOCK`].
+/// The error arm is the semaphore's closure, which [`BlockingExecutor::admitted`] refuses,
+/// so every permit it answers holds `Ok`.
+type WorkerPermit =
+    rift_tracing::Held<Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>>;
+
 /// Bounded Tokio acceptance for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockingExecutor {
@@ -182,6 +191,56 @@ impl BlockingExecutor {
             .await
     }
 
+    /// Waits for one worker permit for `operation`, by the queue timeout, or until
+    /// `cancellation`.
+    ///
+    /// The wait is recorded as the lock [`WORKER_PERMIT_LOCK`] from the calling operation,
+    /// so a contended wait names that operation and the operation that holds the oldest
+    /// permit, and a held permit stays in the table of operations in flight until it drops.
+    /// A wait that reaches the queue timeout also publishes that table, which lists the
+    /// operations holding every permit. The `worker.queue` span covers the semaphore wait
+    /// alone; both spans of a blocking operation sit at debug, since an info filter would
+    /// print two closing lines per request and per build.
+    async fn admitted(
+        &self,
+        operation: &'static str,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkerPermit, RiftError> {
+        let queue_timeout_ms = self.queue_timeout_ms;
+        let queue = rift_tracing::debug_span!(
+            "worker.queue",
+            component = "worker",
+            operation = "worker.queue",
+            work = operation
+        );
+        queue.in_scope(|| {
+            rift_tracing::debug!(
+                work = operation,
+                queue_timeout_ms,
+                "worker admission started"
+            );
+        });
+        let waiting = rift_tracing::lock(WORKER_PERMIT_LOCK).acquire_within(
+            Duration::from_millis(queue_timeout_ms),
+            queue.instrument(Arc::clone(&self.operations).acquire_owned()),
+        );
+        let permit = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return errors::server::read_cancelled().fail(),
+            waited = waiting => waited.map_err(|_| {
+                rift_tracing::publish_in_flight("worker_queue_timeout");
+                errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error()
+            })?,
+        };
+        if let Err(error) = &*permit {
+            return errors::server::read_task()
+                .operation(operation)
+                .detail(error.to_string())
+                .fail();
+        }
+        Ok(permit)
+    }
+
     /// Runs blocking work with the same token the async caller uses to cancel queue
     /// admission and bounded phase or file work.
     pub(crate) async fn run_with_cancellation<Output>(
@@ -193,30 +252,10 @@ impl BlockingExecutor {
     where
         Output: Send + 'static,
     {
-        // Both spans wrap every blocking operation, so they sit at debug: an info filter
-        // would print two closing lines per request and per build.
-        let acquire = Arc::clone(&self.operations).acquire_owned();
-        let queue_timeout_ms = self.queue_timeout_ms;
-        let permit_result = rift_tracing::debug_span!(
-            "worker.queue",
-            component = "worker",
-            operation = "worker.queue",
-            work = operation
-        )
-        .instrument(async {
-            rift_tracing::debug!(work = operation, queue_timeout_ms, "worker admission started");
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => errors::server::read_cancelled().fail(),
-                result = tokio::time::timeout(Duration::from_millis(queue_timeout_ms), acquire) => {
-                    result
-                        .map_err(|_| errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error())?
-                        .map_err(|error| errors::server::read_task().operation(operation).detail(error.to_string()).error())
-                }
-            }
-        })
-        .await;
-        let permit = permit_result?;
+        // The admission's timer and lock records, and the held permit the run carries, live
+        // on the heap: every blocking operation awaits this body, and its callers' futures
+        // sit near `clippy::large_futures`.
+        let permit = Box::pin(self.admitted(operation, &cancellation)).await?;
         rift_tracing::debug!(
             component = "worker",
             operation = "worker.queue",
@@ -228,29 +267,31 @@ impl BlockingExecutor {
             return errors::server::read_cancelled().fail();
         }
         let rayon_pool = Arc::clone(&self.rayon_pool);
-        rift_tracing::debug_span!(
-            "worker.run",
-            component = "worker",
-            operation = "worker.run",
-            work = operation
+        Box::pin(
+            rift_tracing::debug_span!(
+                "worker.run",
+                component = "worker",
+                operation = "worker.run",
+                work = operation
+            )
+            .instrument(async move {
+                // The blocking thread has no ambient span, so the work's own spans attach to
+                // the current one explicitly rather than opening a disconnected trace.
+                let parent = rift_tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    let result = rayon_pool.install(move || {
+                        parent.in_scope(|| {
+                            rift_tracing::debug!(work = operation, "worker execution started");
+                            work(&cancellation)
+                        })
+                    });
+                    // Explicit success-path release; unwinding also drops the owned permit.
+                    drop(permit);
+                    result
+                })
+                .await
+            }),
         )
-        .instrument(async move {
-            // The blocking thread has no ambient span, so the work's own spans attach to
-            // the current one explicitly rather than opening a disconnected trace.
-            let parent = rift_tracing::Span::current();
-            tokio::task::spawn_blocking(move || {
-                let result = rayon_pool.install(move || {
-                    parent.in_scope(|| {
-                        rift_tracing::debug!(work = operation, "worker execution started");
-                        work(&cancellation)
-                    })
-                });
-                // Explicit success-path release; unwinding also drops the owned permit.
-                drop(permit);
-                result
-            })
-            .await
-        })
         .await
         .map_err(|error| {
             errors::server::read_task()
@@ -6316,6 +6357,81 @@ done
             .run("operation after timeout", || Ok(()))
             .await
             .expect("timed-out waiter must leave capacity reusable");
+    }
+
+    /// A blocking operation that waits past the queue timeout for the only worker permit
+    /// names itself and the operation holding the permit, and the timeout publishes the
+    /// table of operations in flight with that holder in it.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_timeout_names_the_operation_holding_the_worker_permit() -> TestResult {
+        const QUEUE_TIMEOUT_MS: u64 = 25;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(1, QUEUE_TIMEOUT_MS);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let held_executor = executor.clone();
+        let held = tokio::spawn(rift_tracing::traced!(
+            component = "index",
+            operation = "index.build",
+            async move {
+                held_executor
+                    .run("held operation", move || {
+                        let _ = started_sender.send(());
+                        release_receiver
+                            .recv()
+                            .map_err(|_| errors::server::read_cancelled().error())
+                    })
+                    .await
+            }
+        ));
+        started_receiver.await?;
+        let queued_executor = executor.clone();
+        let (queued_ready_sender, queued_ready_receiver) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(rift_tracing::traced!(
+            component = "search",
+            operation = "search.read",
+            async move {
+                let _ = queued_ready_sender.send(());
+                queued_executor.run("queued operation", || Ok(())).await
+            }
+        ));
+        queued_ready_receiver.await?;
+        tokio::time::advance(Duration::from_millis(QUEUE_TIMEOUT_MS + 1)).await;
+        let refusal = queued
+            .await?
+            .expect_err("the queue wait passed its timeout");
+        assert_eq!(refusal.slug(), errors::server::read_capacity_timeout::SLUG);
+        release_sender.send(())?;
+        held.await??;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| record.message() == "lock.wait")
+            .ok_or("the wait closed with a record")?;
+        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
+        assert_eq!(wait["lock.name"], super::WORKER_PERMIT_LOCK, "{wait}");
+        assert_eq!(wait["waiter"], "search.read", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "timeout", "{wait}");
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the timeout published the table")?;
+        let table: serde_json::Value = serde_json::from_str(table.fields())?;
+        assert_eq!(table["reason"], "worker_queue_timeout", "{table}");
+        let listed: serde_json::Value =
+            serde_json::from_str(table["operations"].as_str().ok_or("operations")?)?;
+        assert!(
+            listed.as_array().into_iter().flatten().any(|entry| {
+                entry["kind"] == "held"
+                    && entry["lock.name"] == super::WORKER_PERMIT_LOCK
+                    && entry["parent"] == "index.build"
+            }),
+            "{table}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
