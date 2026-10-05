@@ -148,7 +148,9 @@ A served workspace keeps three databases under `.rift`:
 - the index database, `.rift/index`, holds the lexical index `search` ranks from
 - the vectors database, `.rift/vectors`, holds the vector ranking's rows. The server creates it
   at the first vector operation, and never while vector ranking is disabled
-- the metrics database, `.rift/metrics`, holds the server's own log records
+- the metrics database, `.rift/metrics`, holds the server's own log records; under repository
+  serving, each workspace's metrics database holds the records that name that workspace, and a
+  record that names none reaches stderr alone
 
 Each database has its own connections and its own writes, so a long index write delays no log
 record and no other database's write. [`rift://logs`](/docs/mcp#resource-logs) and

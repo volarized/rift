@@ -78,8 +78,9 @@ Each `rift mcp` process owns its choice, so two proxies on one workspace can dif
 
 Before it adopts a live server, the proxy compares the product identity from the lock with its
 own: the version and the canonical MCP schema SHA-256. The version is the package version with the
-git commit the binary was built from as semantic-versioning build metadata, the version
-`rift --version` prints, such as `0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34`.
+git commit the binary was built from as semantic-versioning build metadata, such as
+`0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34`. `rift --version` prints the package version
+alone.
 
 A build script in the `rift` crate asks `git` for the commit at build time, and `rift` hands it to
 `rift-mcp` when it serves, so no start reads the executable's bytes. A build from a working tree
@@ -203,12 +204,15 @@ stop begins, and each stage takes only what the one before it left:
 5. The metrics database closes by the deadline, so it outlives every record.
 6. The election guard drops, right before the process exits.
 
-A foreground repository server opens no metrics database and runs no log drain of its own: each
-workspace it holds closes its databases inside the serving stage `repository workspaces
-shutdown`, every workspace at once. The server's serving stages therefore end by the deadline
-minus `SERVER_EXPORT_STOP_RESERVE` alone, and its `otlp export` stage ends by the deadline. Within
-a workspace, the index and vectors databases close after the index supervisor stops, and the
-metrics database closes at the same time as that whole sequence: no log drain writes to it.
+A foreground repository server opens no metrics database of its own; its log drain routes each
+record to the consumer of the workspace the record names. Each workspace stops inside the serving
+stage `repository workspaces shutdown`, every workspace at once. Within a workspace, the engines,
+the index supervisor, then the index and vectors databases stop by the workspace deadline minus
+`WORKSPACE_LOG_FLUSH_RESERVE` and `WORKSPACE_DATABASE_STOP_RESERVE`; its consumer's final flush
+ends by the deadline minus `WORKSPACE_DATABASE_STOP_RESERVE`; its metrics database closes last.
+The server's serving stages end by the deadline minus `SERVER_EXPORT_STOP_RESERVE` and
+`SERVER_LOG_FLUSH_RESERVE`, its `otlp export` stage by the deadline minus
+`SERVER_LOG_FLUSH_RESERVE`, and its `log drain` stage by the deadline.
 
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
 `stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure. The outcome is `ok`
@@ -281,6 +285,11 @@ metrics database closes, so `workspace election released` reaches stderr and not
 database thread whose close ended `timeout` still holds a clone of the election guard, so the
 stop retires `server.json` itself before the process exits, records `a database thread still
 holds the workspace election` at `warn`, and the election is released by the process exit.
+
+A watch failure records once per step: `index watch backend reported failure` under
+`watch.receive` at `WARN`, or `index watch failed` under `watch.observe` at `ERROR`, each with
+`error` and `error.type`, the registered identity. Repeats of the same identity record nothing
+until the supervisor's next turn, or the watch's stop, records one line carrying their `count`.
 
 `rift mcp` and `rift server start` record their side of a start on their own stderr. Each
 detached server they spawn records `detached server spawned` with its `pid` and where `stdin`,
@@ -750,7 +759,8 @@ write the same record. A dependency's span with neither `component` nor `operati
 `traced!`, `#[rift_tracing::timed]`, `info_span!`, `debug_span!`, and the event macros record
 `code.function.name`, the function that opened the span or emitted the event, read from the
 `type_name` of an item declared in its body; the format of that text is unspecified, so no
-filter or query selects by it. A close record carries `busy_ns` and `idle_ns` beside
+filter or query selects by it. A tool call's `mcp.request` span carries `mcp.method.name`,
+`gen_ai.tool.name`, and `workspace`, the workspace root, beside `request_id` and `tool`. A close record carries `busy_ns` and `idle_ns` beside
 `elapsed_ms`, the nanoseconds the span was entered and was not, and `status.code`: `Ok`, or
 `Error` with `error.type` `panic` for a span closed while its thread unwinds a panic and
 `cancelled` for an awaited `traced!` operation dropped after its first poll. The
@@ -764,6 +774,7 @@ filter or query selects by it. A close record carries `busy_ns` and `idle_ns` be
   "root_span": {
     "name": "mcp.request",
     "fields": {"component": "mcp", "operation": "tools/call", "request_id": "2", "tool": "search",
+               "mcp.method.name": "tools/call", "gen_ai.tool.name": "search", "workspace": "/work/project",
                "code.function.name": "<rift_mcp::server::RiftMcp as rmcp::handler::server::ServerHandler>::call_tool"}
   },
   "nearest_span": {
@@ -896,6 +907,13 @@ records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
 close records `PRAGMA busy_timeout`, both checkpoints, and `close` in
 `db.client.operation.duration`, as the index close does.
 
+The index supervisor counts `index.rebuilds` by `index.rebuild.trigger`: `startup` for the
+preparation at start, `filesystem` for a rebuild that reads the paths its observation names,
+`rescan` for one that reads every visible file again. A failed rebuild adds `error.type`. Each
+native event counts `watch.events` by `watch.event.kind` and `watch.event.route`. An observation
+whose signal the full invalidation channel refused counts `index.invalidation.dropped` under
+`event` and writes no record.
+
 <VersionBadge version="v0.0.62" />
 
 Every build carries the OTLP export, and a process exports nothing until an operator sets an
@@ -1013,6 +1031,14 @@ The published index is recorded as the lock `index.snapshot`: a publication hold
 `exclusive`, and a read holds it `shared`. Tokio's `RwLock` lets a queued write go first, so a
 read that waits behind a held or queued publication shows as a `lock.wait` entry naming that
 publication's operation.
+
+The claim of `.rift/server.lock` is recorded as the lock `server.election`, `exclusive` and
+lifelong: a refused claim ends its wait `refused` and records the holder's `pid` when
+`server.json` names one. The hold closes when the last clone of the election guard drops; a
+process that exits with a database thread still holding a clone ends it unrecorded. A probe that
+finds the election held, or whose attempt the platform fails, writes no record and counts in
+`lock.wait.duration` under `lock.name` `server.election`, `lock.mode` `shared`, and `error.type`
+`refused`. A probe that finds the election free holds it `shared` until it releases the lock.
 
 ## Shared ranking
 

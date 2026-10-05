@@ -2358,7 +2358,9 @@ The compact text of a resource follows the layout of a [tool result](#result-con
 `rift://logs` reads the server's own diagnostics back, newest first. Events admitted by the
 `[logs] capture` filter enter a bounded queue and one task writes them to the metrics database
 at `.rift/metrics`, so an agent that met a refusal can ask what the server was doing without an
-operator reading its terminal. When the queue fills, the task drops later events and records the dropped count:
+operator reading its terminal. Under repository serving, each record goes to the store of the
+workspace its `workspace` field, or the request span around it, names; `rift://logs` answers that
+workspace's records alone. When the queue fills, the task drops later events and records the dropped count:
 
 | Resource | Content |
 | --- | --- |
