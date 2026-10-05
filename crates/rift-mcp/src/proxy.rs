@@ -2900,9 +2900,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let proxy = RiftProxy::new(directory.path(), test_identity(), output);
         let (upstream_client_half, upstream_server_half) = tokio::io::duplex(64 * 1024);
+        // Each rmcp handshake future is about 4,900 bytes on aarch64; boxed, the three of
+        // them stay out of every test that awaits this fixture.
         let (running, upstream) = tokio::join!(
-            ().serve(upstream_client_half),
-            StructuredUpstream.serve(upstream_server_half)
+            Box::pin(().serve(upstream_client_half)),
+            Box::pin(StructuredUpstream.serve(upstream_server_half))
         );
         {
             let mut slot = proxy.upstream.lock().await;
@@ -2915,7 +2917,7 @@ mod tests {
         let (proxy_half, client_half) = tokio::io::duplex(64 * 1024);
         let connection = tokio::spawn(serve_connection(proxy, proxy_half));
         Ok(ProxiedClient {
-            client: ().serve(client_half).await?,
+            client: Box::pin(().serve(client_half)).await?,
             _upstream: upstream?,
             _connection: connection,
             _directory: directory,

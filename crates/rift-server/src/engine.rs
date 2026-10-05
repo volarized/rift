@@ -786,16 +786,20 @@ impl EngineSlot {
     /// down as a running session is.
     async fn end_session(self: Arc<Self>) {
         let mut held = self.hold().await;
+        // Both shutdowns are boxed: `EngineSession::shutdown` owns the session and its
+        // bounded `shutdown` exchange (9,920 bytes on aarch64), and a request that
+        // replaces a pool awaits this stop through `EnginePool::shutdown_replaced_by`.
+        // One allocation per stopped session.
         if let Some(start) = held.starting.take() {
             start.abort();
             if let Ok(Ok(started)) = start.await {
-                started.shutdown().await;
+                Box::pin(started.shutdown()).await;
             }
         }
         let Some(session) = held.session.take() else {
             return;
         };
-        let stderr = session.shutdown().await;
+        let stderr = Box::pin(session.shutdown()).await;
         self.report_state(LspState::Stopped);
         let engine = self.name();
         rift_tracing::debug!(
@@ -1512,7 +1516,9 @@ impl EngineSlot {
     /// reads every file from disk.
     async fn reap(&self, replaced: EngineSession) {
         let ended = replaced.is_ended();
-        let stderr = replaced.shutdown().await;
+        // Boxed for the reason `end_session` boxes it: the shutdown future is 9,920 bytes
+        // on aarch64. One allocation per replaced session.
+        let stderr = Box::pin(replaced.shutdown()).await;
         let engine = self.name();
         if ended {
             rift_tracing::warn!(

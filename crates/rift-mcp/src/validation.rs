@@ -3541,7 +3541,16 @@ pub(crate) async fn discover_initial_workspace(
         map_text_paths,
         last: LastCapture::default(),
     };
-    publish_initial_empty(context, initial, empty_index, configuration).await
+    // Boxed: the publication future holds the discovery result, the empty index, and the
+    // configuration by value (9,416 bytes on aarch64), and every startup caller and the
+    // supervisor would otherwise embed it in their own state. One allocation per startup.
+    Box::pin(publish_initial_empty(
+        context,
+        initial,
+        empty_index,
+        configuration,
+    ))
+    .await
 }
 
 async fn publish_initial_empty(
@@ -3636,7 +3645,10 @@ async fn prepare_initial_workspace_from_with_epoch(
     context: &IndexSupervisorContext,
     initial: InitialWorkspacePreparation,
 ) -> Result<(), Box<InitialPreparationFailure>> {
-    let result = prepare_initial_workspace_steps(context, initial).await;
+    // Boxed: the batch loop holds the discovery result across each batch's blocking read
+    // (10,656 bytes on aarch64), and every startup caller and the supervisor would otherwise
+    // embed it in their own state. One allocation per startup, outside the batch loop.
+    let result = Box::pin(prepare_initial_workspace_steps(context, initial)).await;
     result.map_err(|error| Box::new(initial_preparation_failure(context, error)))
 }
 
