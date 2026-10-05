@@ -593,6 +593,54 @@ mod tests {
         ));
     }
 
+    /// One span closes for each stage of the visible-file capture that follows the
+    /// indexed-file capture, so a validation's record says where its time went.
+    #[test]
+    fn validation_capture_closes_one_span_for_each_visible_stage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn old() {}\n")?;
+        std::fs::write(
+            directory.path().join("opaque.unknown"),
+            "unclassified bytes",
+        )?;
+        let configuration = super::super::ConfigurationState::accept(directory.path());
+        let (sink, mut drain) = rift_tracing::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let guard = tracing::subscriber::set_default(subscriber);
+        let (_indexed, visible, _next) = capture_visible_digests_with_languages_cancellable(
+            directory.path(),
+            configuration.index_limits(rift_index::WorkspaceIndexLimits::default())?,
+            &configuration.source_visibility(),
+            &configuration.text_inclusion(),
+            &configuration.language_file_selections(),
+            &LastCapture::default(),
+            &|| false,
+        )?;
+        drop(guard);
+        assert_eq!(visible.len(), 2);
+        let mut closed = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            if record.fields().contains("\"span\":\"closed\"") {
+                closed.push(record.message().to_owned());
+            }
+        }
+        for stage in [
+            "fingerprint.source_policy",
+            "fingerprint.visible_paths",
+            "fingerprint.visible_read",
+        ] {
+            let count = closed.iter().filter(|name| *name == stage).count();
+            assert_eq!(
+                count, 1,
+                "one closed span for the {stage} stage: {closed:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn background_capture_recovers_missing_events_and_leaves_unchanged_publication_alone()
     -> Result<(), Box<dyn std::error::Error>> {

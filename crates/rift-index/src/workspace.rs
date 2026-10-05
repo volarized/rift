@@ -2261,7 +2261,7 @@ impl WorkspaceIndex {
                 previous.map(|index| index.semantics.graph()),
             )
         })?;
-        let declarations = crate::documentation::declarations(&files, &semantics);
+        let declarations = accepted_declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -2360,7 +2360,7 @@ impl WorkspaceIndex {
             Some(self.semantics.graph()),
         )?;
         check_cancelled(cancelled)?;
-        let declarations = crate::documentation::declarations(&files, &semantics);
+        let declarations = accepted_declarations(&files, &semantics);
         check_cancelled(cancelled)?;
         let (documentation, notebooks) = crate::documentation::build(
             &files,
@@ -2480,7 +2480,7 @@ impl WorkspaceIndex {
             limits.declarations_max(),
             previous.map(|index| index.semantics.graph()),
         )?;
-        let declarations = crate::documentation::declarations(&files, &semantics);
+        let declarations = accepted_declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -3537,64 +3537,85 @@ fn built_contents(
 ) -> Result<BuiltContents, RiftError> {
     let passes_max = contents.files.len().saturating_add(1);
     let mut passes = 0_usize;
-    loop {
-        let fingerprint = WorkspaceFingerprint::from_files(
-            &contents.files,
-            &contents.text_files,
-            &contents.left_out,
-        );
-        let built = WorkspaceSemantics::build_project_facts(
-            contents
-                .files
-                .values()
-                .map(|file| (file.syntax(), file.path())),
-            declarations_max,
-            fingerprint.revision_number(),
-            previous,
-        );
-        match built {
-            Ok(BuiltSemantics {
-                semantics,
-                beyond_declaration_bound,
-                refused_contributions,
-            }) => {
-                if !beyond_declaration_bound.is_empty() || !refused_contributions.is_empty() {
-                    passes = passes.saturating_add(1);
-                    leave_out_refused_contributions(
-                        &mut contents,
+    rift_tracing::traced!(
+        component = "index",
+        operation = "index.semantics",
+        files = contents.files.len(),
+        {
+            loop {
+                let fingerprint = WorkspaceFingerprint::from_files(
+                    &contents.files,
+                    &contents.text_files,
+                    &contents.left_out,
+                );
+                let built = WorkspaceSemantics::build_project_facts(
+                    contents
+                        .files
+                        .values()
+                        .map(|file| (file.syntax(), file.path())),
+                    declarations_max,
+                    fingerprint.revision_number(),
+                    previous,
+                );
+                match built {
+                    Ok(BuiltSemantics {
+                        semantics,
+                        beyond_declaration_bound,
                         refused_contributions,
-                        passes < passes_max,
-                    )?;
-                    leave_out_beyond_declaration_bound(
-                        &mut contents,
-                        &beyond_declaration_bound,
-                        passes < passes_max,
-                    )?;
-                    continue;
+                    }) => {
+                        if !beyond_declaration_bound.is_empty() || !refused_contributions.is_empty()
+                        {
+                            passes = passes.saturating_add(1);
+                            leave_out_refused_contributions(
+                                &mut contents,
+                                refused_contributions,
+                                passes < passes_max,
+                            )?;
+                            leave_out_beyond_declaration_bound(
+                                &mut contents,
+                                &beyond_declaration_bound,
+                                passes < passes_max,
+                            )?;
+                            continue;
+                        }
+                        let IndexContents {
+                            files,
+                            text_files,
+                            left_out,
+                            warnings,
+                        } = contents;
+                        return Ok(BuiltContents {
+                            files,
+                            text_files,
+                            left_out,
+                            warnings,
+                            fingerprint,
+                            semantics,
+                        });
+                    }
+                    Err(error) => {
+                        return error
+                            .with(ctx::operation("index.build"))
+                            .with(ctx::workspace(root))
+                            .fail();
+                    }
                 }
-                let IndexContents {
-                    files,
-                    text_files,
-                    left_out,
-                    warnings,
-                } = contents;
-                return Ok(BuiltContents {
-                    files,
-                    text_files,
-                    left_out,
-                    warnings,
-                    fingerprint,
-                    semantics,
-                });
-            }
-            Err(error) => {
-                return error
-                    .with(ctx::operation("index.build"))
-                    .with(ctx::workspace(root))
-                    .fail();
             }
         }
-    }
+    )
+}
+
+/// Collects the declarations the semantics graph accepted, as one stage of an index build.
+fn accepted_declarations(
+    files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    semantics: &WorkspaceSemantics,
+) -> Vec<crate::documentation::DeclarationFacts> {
+    rift_tracing::traced!(
+        component = "documentation",
+        operation = "documentation.declarations",
+        files = files.len(),
+        { crate::documentation::declarations(files, semantics) }
+    )
 }
 
 /// Leaves every document whose Contribution the syntax publication refused out in one pass.
@@ -4181,43 +4202,66 @@ pub fn capture_visible_digests_with_languages_cancellable(
                 last,
                 cancelled,
             )?;
-            let policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
-                &root,
-                limits,
-                visibility,
-                text_inclusion,
-                languages,
-                cancelled,
+            let policy = rift_tracing::traced!(
+                component = "index",
+                operation = "fingerprint.source_policy",
+                {
+                    WorkspaceSourcePolicy::build_with_languages_cancellable(
+                        &root,
+                        limits,
+                        visibility,
+                        text_inclusion,
+                        languages,
+                        cancelled,
+                    )
+                }
             )?;
-            let paths = policy.visible_paths_cancellable(cancelled)?;
+            let paths = rift_tracing::traced!(
+                component = "index",
+                operation = "fingerprint.visible_paths",
+                { policy.visible_paths_cancellable(cancelled) }
+            )?;
             let boundary = next.boundary();
             let root_identity = next.root_identity();
             let mut visible = Vec::with_capacity(paths.len());
-            for batch in paths.chunks(SOURCE_BATCH_FILES) {
-                check_cancelled(cancelled)?;
-                let read: Vec<Result<(PathBuf, CapturedPath, bool), RiftError>> = batch
-                    .par_iter()
-                    .map(|path| {
+            rift_tracing::traced!(
+                component = "index",
+                operation = "fingerprint.visible_read",
+                paths = paths.len(),
+                {
+                    for batch in paths.chunks(SOURCE_BATCH_FILES) {
                         check_cancelled(cancelled)?;
-                        let absolute = root.join(path.as_str());
-                        let (capture, was_read) = match next.captured(&absolute) {
-                            Some(capture) => (capture, false),
-                            None => capture_path(&absolute, limits, last, boundary, root_identity)?,
-                        };
-                        Ok((absolute, capture, was_read))
-                    })
-                    .collect();
-                for (path, capture) in batch.iter().zip(read) {
-                    check_cancelled(cancelled)?;
-                    let (absolute, capture, was_read) = capture?;
-                    if next.captured(&absolute).is_none() {
-                        next.record(&absolute, capture, was_read);
-                    }
-                    if let Some((_, digest)) = capture.content() {
-                        visible.push((path.clone(), digest));
+                        let read: Vec<Result<(PathBuf, CapturedPath, bool), RiftError>> = batch
+                            .par_iter()
+                            .map(|path| {
+                                check_cancelled(cancelled)?;
+                                let absolute = root.join(path.as_str());
+                                let (capture, was_read) = match next.captured(&absolute) {
+                                    Some(capture) => (capture, false),
+                                    None => capture_path(
+                                        &absolute,
+                                        limits,
+                                        last,
+                                        boundary,
+                                        root_identity,
+                                    )?,
+                                };
+                                Ok((absolute, capture, was_read))
+                            })
+                            .collect();
+                        for (path, capture) in batch.iter().zip(read) {
+                            check_cancelled(cancelled)?;
+                            let (absolute, capture, was_read) = capture?;
+                            if next.captured(&absolute).is_none() {
+                                next.record(&absolute, capture, was_read);
+                            }
+                            if let Some((_, digest)) = capture.content() {
+                                visible.push((path.clone(), digest));
+                            }
+                        }
                     }
                 }
-            }
+            );
             Ok((indexed, WorkspaceDigests::new(visible), next))
         })();
         match result {
