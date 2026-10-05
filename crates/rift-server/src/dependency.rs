@@ -1,5 +1,7 @@
 //! The server's filesystem-backed context inputs, and the dependency context read through them.
 
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -122,13 +124,70 @@ impl ContextInputs for FilesystemInputs {
         for name in &command.environment_removed {
             process.env_remove(name);
         }
-        let run = run_bounded(
-            &mut process,
-            self.policy.command_timeout,
-            toolchain_capture_bytes(),
-        )
-        .map_err(|io| failure(program, format!("failed to launch: {io}")))?;
+        let run = run_recorded(program, &mut process, self.policy.command_timeout)
+            .map_err(|io| failure(program, format!("failed to launch: {io}")))?;
         output_of(program, run, self.policy.command_timeout)
+    }
+}
+
+/// Runs one probe through [`run_bounded`] inside one `dependency.probe` operation.
+///
+/// The operation opens before the spawn and closes after the wait, so its close carries
+/// the run's duration. It records the program's file name alone, never the argument
+/// vector, the environment, or a path. `run_bounded` hands the child `stdin` null and both
+/// output streams piped, so the child inherits none of the server's standard streams.
+/// After the run the operation records the child's process identifier `pid`, its
+/// `exit_code` when the platform reports one, and an `outcome`: `ok` when the child
+/// exited, `timeout` when it was killed at `timeout`, `error` when it failed to spawn or
+/// could not be observed.
+fn run_recorded(
+    program: &str,
+    process: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<BoundedRun> {
+    let name = Path::new(program)
+        .file_name()
+        .map_or(Cow::Borrowed(""), OsStr::to_string_lossy);
+    rift_tracing::traced!(
+        component = "dependency",
+        operation = "dependency.probe",
+        program = &*name,
+        stdin = "null",
+        stdout = "piped",
+        stderr = "piped",
+        pid = rift_tracing::empty!(),
+        exit_code = rift_tracing::empty!(),
+        outcome = rift_tracing::empty!(),
+        {
+            let span = rift_tracing::Span::current();
+            let run = run_bounded(process, timeout, toolchain_capture_bytes());
+            record_probe(&span, &run);
+            run
+        }
+    )
+}
+
+/// Sets the fields a probe operation declared empty from how its run ended.
+fn record_probe(span: &rift_tracing::Span, run: &std::io::Result<BoundedRun>) {
+    let Ok(run) = run else {
+        span.record("outcome", "error");
+        return;
+    };
+    span.record("pid", run.pid);
+    match &run.exit {
+        _ if run.timed_out => {
+            span.record("outcome", "timeout");
+            span.record("error.type", "timeout");
+        }
+        Ok(exit) => {
+            if let Some(code) = exit.code() {
+                span.record("exit_code", code);
+            }
+            span.record("outcome", "ok");
+        }
+        Err(_) => {
+            span.record("outcome", "error");
+        }
     }
 }
 
@@ -387,6 +446,90 @@ mod tests {
         assert!(failure.reason.starts_with("failed to launch"), "{failure}");
     }
 
+    /// The fields of every closed `dependency.probe` operation `run` leaves, in order.
+    fn probes_recorded(run: impl FnOnce()) -> Vec<serde_json::Value> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        run();
+        drop(recorder);
+        drain
+            .queued_records()
+            .iter()
+            .filter(|record| record.operation() == "dependency.probe")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .map(|fields| fields.expect("fields are JSON"))
+            .filter(|fields| fields["span"] == "closed")
+            .collect()
+    }
+
+    /// The process identifier a probe record names; the store keeps every field as text.
+    fn pid_of(probe: &serde_json::Value) -> u32 {
+        probe["pid"]
+            .as_str()
+            .and_then(|pid| pid.parse().ok())
+            .expect("the record names a pid")
+    }
+
+    #[test]
+    fn test_probe_of_an_existing_program_records_name_pid_streams_and_exit() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let probes = probes_recorded(|| {
+            let probe = command("sh", &["-c", "exit 3"], directory.path());
+            inputs().run(&probe).expect("sh runs");
+        });
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        let probe = &probes[0];
+        assert_eq!(probe["program"], "sh");
+        assert_eq!(probe["outcome"], "ok");
+        assert_eq!(probe["exit_code"], "3");
+        assert!(pid_of(probe) > 0, "{probe}");
+        assert_eq!(probe["stdin"], "null");
+        assert_eq!(probe["stdout"], "piped");
+        assert_eq!(probe["stderr"], "piped");
+        assert!(probe["elapsed_ms"].is_string(), "{probe}");
+        let text = probe.to_string();
+        assert!(!text.contains("exit 3"), "arguments stay out: {text}");
+    }
+
+    #[test]
+    fn test_probe_of_a_missing_program_records_a_spawn_error_without_a_pid() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let probes = probes_recorded(|| {
+            let probe = command(
+                "rift-test-binary-that-does-not-exist",
+                &[],
+                directory.path(),
+            );
+            inputs().run(&probe).expect_err("a missing program fails");
+        });
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert_eq!(probes[0]["program"], "rift-test-binary-that-does-not-exist");
+        assert_eq!(probes[0]["outcome"], "error");
+        assert!(probes[0].get("pid").is_none(), "{}", probes[0]);
+        assert!(probes[0].get("exit_code").is_none(), "{}", probes[0]);
+    }
+
+    #[test]
+    fn test_probe_killed_at_the_timeout_records_the_timeout_outcome() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let table = DependenciesConfiguration {
+            command_timeout: rift_protocol::configuration::Duration::from_millis(200),
+            ..DependenciesConfiguration::default()
+        };
+        let mut inputs = FilesystemInputs::new(ResolutionPolicy::from(&table));
+        let probes = probes_recorded(|| {
+            let probe = command("sleep", &["30"], directory.path());
+            let failure = inputs.run(&probe).expect_err("sleep overstays");
+            assert!(failure.reason.starts_with("overstayed"), "{failure}");
+        });
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert_eq!(probes[0]["program"], "sleep");
+        assert_eq!(probes[0]["outcome"], "timeout");
+        assert_eq!(probes[0]["error.type"], "timeout");
+        assert!(pid_of(&probes[0]) > 0, "{}", probes[0]);
+    }
+
     #[test]
     fn test_run_refuses_a_program_spelled_as_a_path_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -433,6 +576,7 @@ mod tests {
     fn test_output_of_reports_a_killed_run_as_overstayed() {
         use std::os::unix::process::ExitStatusExt as _;
         let run = BoundedRun {
+            pid: 0,
             exit: Ok(std::process::ExitStatus::from_raw(9)),
             timed_out: true,
             stdout: rift_core::CapturedStream::default(),
@@ -449,6 +593,7 @@ mod tests {
     #[test]
     fn test_output_of_reports_an_unobservable_run_with_the_io_text() {
         let run = BoundedRun {
+            pid: 0,
             exit: Err(std::io::Error::other("lost the child")),
             timed_out: false,
             stdout: rift_core::CapturedStream::default(),

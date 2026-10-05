@@ -17,6 +17,8 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// What one bounded child run produced.
 #[derive(Debug)]
 pub(crate) struct BoundedRun {
+    /// The operating system's process identifier of the child.
+    pub(crate) pid: u32,
     /// The exit status, or the error that left the child unobservable.
     pub(crate) exit: std::io::Result<ExitStatus>,
     /// Whether the child overstayed `timeout` and was killed.
@@ -48,10 +50,12 @@ pub(crate) fn run_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let pid = child.id();
     let stdout_drain = drain_thread(child.stdout.take(), capture_bytes);
     let stderr_drain = drain_thread(child.stderr.take(), capture_bytes);
     let (exit, timed_out) = wait_bounded(&mut child, timeout);
     Ok(BoundedRun {
+        pid,
         exit,
         timed_out,
         stdout: join_drain(stdout_drain),
