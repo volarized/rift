@@ -275,11 +275,15 @@ cargo build --release -p rift --features otlp
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
 ```
 
-`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans on
-port 4318 and keeps them in memory. `RIFT_OTLP_FILTER` overrides the export layer's own filter;
+`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans at
+`/v1/traces` and the exported metric values at `/v1/metrics` on port 4318 and keeps them in memory. `RIFT_OTLP_FILTER` overrides the export layer's own filter;
 unset, it keeps Rift's own crates at `info`. Stop the collector with Ctrl-C once the run is done,
 and it prints one JSON line per operation: the span count, total duration, p50, p95, and max, in
-milliseconds.
+milliseconds. It then prints one JSON line per metric name with its kind, unit, series count, data
+point count, and value; the value is the sum of the latest value of each series, and a histogram adds
+its recorded count. A request body is at most 8 MiB encoded and decoded, and the collector keeps at
+most 512 metric names and 256 series per name. A last `dropped` line counts what these bounds
+refused.
 
 The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
 errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at
