@@ -415,11 +415,8 @@ fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
-/// The fields the server's own stop line carries, as its stderr rendered them.
-///
-/// The recorded stream is styled, so a field name and its `=` are separated by
-/// escape codes; the values themselves stay plain, and the line is read for
-/// those.
+/// The fields the server's own stop line carries, as its stderr rendered them:
+/// `key=value` pairs after the message, string values without quotes.
 fn stop_line_of(stderr: &str) -> TestResult<&str> {
     let after_message = stderr
         .split_once("MCP server stopped")
@@ -937,7 +934,9 @@ fn sigterm_stops_a_foreground_server_through_its_stop() -> TestResult {
     );
     let stop_line = stop_line_of(&stderr)?;
     assert!(
-        stop_line.contains("\"ok\""),
+        stop_line
+            .split_whitespace()
+            .any(|field| field == "outcome=ok"),
         "the engines and the index supervisor join inside the budget: {stop_line}"
     );
     assert!(
@@ -1085,7 +1084,9 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     let stderr = stderr.finished()?;
     let stop_line = stop_line_of(&stderr)?;
     assert!(
-        stop_line.contains("\"ok\""),
+        stop_line
+            .split_whitespace()
+            .any(|field| field == "outcome=ok"),
         "the engines and the index supervisor must join inside the budget: {stop_line}"
     );
     assert!(

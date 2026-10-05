@@ -175,6 +175,53 @@ fn a_span_without_fields_records_how_long_it_ran_alone() {
     );
 }
 
+/// A span closing inside another carries the outermost span as `root_span` after its own
+/// members, so its close names the request it ran for; the outermost span's own close
+/// carries no span member.
+#[test]
+fn a_span_closing_inside_another_carries_the_root_span() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = tracing_subscriber::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let request = tracing::info_span!("mcp.request", component = "mcp", request_id = 7);
+        let _request = request.enter();
+        let middle = tracing::info_span!("index.reconcile", attempts = 2);
+        let _middle = middle.enter();
+        tracing::info_span!("fingerprint.fold", operation = "fingerprint.fold").in_scope(|| {});
+    });
+
+    let closes = queued(&mut drain)
+        .into_iter()
+        .map(|record| {
+            let fields: serde_json::Value =
+                serde_json::from_str(record.fields()).expect("a close record's fields are JSON");
+            (record.message().to_owned(), fields)
+        })
+        .collect::<Vec<_>>();
+    let names = closes
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        ["fingerprint.fold", "index.reconcile", "mcp.request"]
+    );
+    let root = serde_json::json!({
+        "name": "mcp.request",
+        "fields": {"component": "mcp", "request_id": "7"},
+    });
+    assert_eq!(closes[0].1["root_span"], root);
+    assert_eq!(closes[1].1["root_span"], root);
+    assert_eq!(closes[1].1["attempts"], "2");
+    assert!(closes[2].1.get("root_span").is_none(), "{:?}", closes[2].1);
+    assert!(
+        closes[0].1.get("nearest_span").is_none(),
+        "{:?}",
+        closes[0].1
+    );
+}
+
 /// A span whose fields run past [`SPAN_FIELDS_BYTES_MAX`] keeps the members that fit whole
 /// and counts the ones left out, so its close record stays a JSON object.
 #[test]

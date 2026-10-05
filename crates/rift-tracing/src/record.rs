@@ -150,7 +150,8 @@ impl LogRecord {
     /// when that span is not the outermost. Each is an object holding the span's `name` and
     /// its `fields`: `component`, `operation`, then the span's other fields as it recorded
     /// them, cut at 1 KiB with the count of the members left out as `fields_left_out`. A
-    /// span close record carries the span's own fields, `span`, and `elapsed_ms`.
+    /// span close record carries the span's own fields, `span`, and `elapsed_ms`, then
+    /// `root_span` when the span closed inside another.
     #[must_use]
     pub fn fields(&self) -> &str {
         &self.fields

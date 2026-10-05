@@ -650,7 +650,8 @@ An event record names the spans it was emitted in, so the records of one request
 writes its name and fields as one JSON object into the span's extensions, and writes it again
 when the span records a field later. An event inside the span copies that object into its
 `fields` as `root_span` for the outermost span, and as `nearest_span` for the span it was
-emitted in when that span is not the outermost. The `worker admission started` record of a
+emitted in when that span is not the outermost. A span that closes inside another carries the
+outermost one as `root_span` on its close record. The `worker admission started` record of a
 search request carries:
 
 ```json
@@ -686,6 +687,22 @@ subscriber with a filter per layer:
 A foreground server whose stderr is not a terminal writes at most 1 MiB there. The write that
 crosses the bound is followed by one notice, `standard error reached its byte bound`, and every
 later write is discarded; the records the `LogSink` captured are unaffected.
+
+Stderr and `rift server logs` print a record through one renderer, `LogRecord::rendered`: the
+time, the level, `component`, `operation`, and, for a record inside a span, the fields of the
+outermost span, then `↳` with the name and fields of the span it was emitted in, then two
+spaces; the message and the record's own fields sorted by key follow. A span field the
+`component` or `operation` column already shows is left out, and `request_id` prints as `req`.
+A span close prints the span's name with `elapsed_ms` and `span=closed`, after the fields of the
+request it ran for:
+
+```text
+2026-10-05T10:25:23.802+00:00 INFO  index    fingerprint.discover component=mcp operation=tools/call req=20 tool=get_symbol  fingerprint.discover elapsed_ms=0 span=closed
+2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=1 trigger=filesystem ↳ worker.run component=worker operation=worker.run work=filesystem index rebuild  index capture started epoch=1 phase=start
+```
+
+Stderr prints the time in UTC and colors the level on a terminal alone; `rift server logs`
+prints the system time zone's offset.
 
 Every workspace crate other than `rift-tracing` emits through it: spans through `traced!`,
 `info_span!`, and `Span`, events through its `trace!` to `error!`, elapsed time a caller acts on
