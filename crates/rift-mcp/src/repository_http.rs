@@ -540,9 +540,17 @@ impl RepositoryWorkspaceRegistry {
 
     /// Stops every retained workspace before the repository server leaves.
     ///
+    /// Every workspace stops at once, each by the shared `deadline`: one workspace's
+    /// database close never spends the bound of the workspaces after it. Each stop runs in
+    /// a `server.stop` span naming its `root`, so its records name the workspace.
+    ///
     /// # Errors
     ///
     /// Returns a workspace shutdown failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future aborts the workspace stops still running.
     pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), RiftError> {
         let workspaces = std::mem::take(&mut *self.workspaces.lock().await);
         for cell in workspaces.values() {
@@ -550,16 +558,38 @@ impl RepositoryWorkspaceRegistry {
                 workspace.stop.cancel();
             }
         }
-        let mut outcome = Ok(());
-        for (_, cell) in workspaces {
-            let Some(workspace) = cell.get() else {
+        let mut stopping = tokio::task::JoinSet::new();
+        for (root, cell) in workspaces {
+            if cell.get().is_none() {
                 continue;
-            };
-            if let Err(error) = stop_repository_workspace(workspace, deadline).await {
+            }
+            let root = root.display().to_string();
+            let stop = rift_tracing::traced!(
+                component = "mcp",
+                operation = "server.stop",
+                root = root,
+                async move {
+                    let outcome = match cell.get() {
+                        Some(workspace) => stop_repository_workspace(workspace, deadline).await,
+                        None => Ok(()),
+                    };
+                    drop(tokio::task::spawn_blocking(move || drop(cell)));
+                    outcome
+                }
+            );
+            stopping.spawn(rift_tracing::Span::current().instrument(stop));
+        }
+        let mut outcome = Ok(());
+        while let Some(joined) = stopping.join_next().await {
+            let stopped = joined.unwrap_or_else(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("repository workspace shutdown")
+                    .source(error)
+                    .fail()
+            });
+            if let Err(error) = stopped {
                 outcome = Err(error);
             }
-            let retired = cell;
-            drop(tokio::task::spawn_blocking(move || drop(retired)));
         }
         outcome
     }
@@ -1360,6 +1390,72 @@ mod tests {
         assert!(
             fields.contains("index supervisor shutdown"),
             "the record names the stage that failed: {fields}"
+        );
+        Ok(())
+    }
+
+    /// A repository shutdown stops every workspace at once: a workspace whose supervisor has
+    /// not joined yet does not hold back the stop of a workspace after it. The held
+    /// supervisor is released only once the other workspace has released its store lease,
+    /// which a shutdown that stops workspaces one after another never reaches.
+    #[tokio::test]
+    async fn a_repository_shutdown_stops_every_workspace_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let held_root = directory.path().join("a-held");
+        let ready_root = directory.path().join("b-ready");
+        std::fs::create_dir_all(&held_root)?;
+        std::fs::create_dir_all(&ready_root)?;
+        let held_root = committed_workspace(&held_root)?;
+        let ready_root = committed_workspace(&ready_root)?;
+        let mut registry = unserved_registry(&held_root)?;
+        registry.workspaces_max = 2;
+        let mut cells = Vec::new();
+        for root in [&held_root, &ready_root] {
+            let cell = registry
+                .workspace_cell(root)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            cell.get_or_try_init(|| registry.build_workspace(root.clone()))
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            cells.push(cell);
+        }
+        let held = cells[0].get().ok_or("the held workspace is built")?;
+        let ready = cells[1].get().ok_or("the ready workspace is built")?;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let holding = tokio::spawn(async move {
+            let _ = released.await;
+        });
+        let validation = &held.supervisor.validation;
+        let supervisor_task = validation.task.lock().await.replace(holding);
+        let supervisor_task = supervisor_task.ok_or("the built workspace runs its supervisor")?;
+        validation.cancellation.cancel();
+        tokio::time::timeout(STEP_MAX, supervisor_task).await??;
+
+        let deadline = tokio::time::Instant::now() + STEP_MAX;
+        let (stopped, ready_released) = tokio::join!(registry.shutdown(deadline), async {
+            let released_by = tokio::time::Instant::now() + STEP_MAX;
+            let mut ready_released = false;
+            while tokio::time::Instant::now() < released_by {
+                if ready.lease.lock().await.is_none() {
+                    ready_released = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(release);
+            ready_released
+        });
+
+        assert!(
+            ready_released,
+            "the ready workspace stops while the held one waits"
+        );
+        stopped?;
+        assert!(
+            held.lease.lock().await.is_none(),
+            "the held workspace stops once released"
         );
         Ok(())
     }
