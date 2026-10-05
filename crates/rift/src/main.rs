@@ -622,6 +622,8 @@ mod tests {
                     follow,
                     tail,
                     since,
+                    until,
+                    kind,
                     level,
                     component,
                 },
@@ -632,6 +634,8 @@ mod tests {
         assert!(!follow);
         assert_eq!(tail, super::server::TailCount::All);
         assert_eq!(since, None);
+        assert_eq!(until, None);
+        assert_eq!(kind, super::server::LogKind::Log);
         assert_eq!(level, None);
         assert_eq!(component, None);
     }
@@ -651,6 +655,10 @@ mod tests {
             "index",
             "--since",
             "10m",
+            "--until",
+            "2026-10-04T20:42:58Z",
+            "--kind",
+            "all",
         ])
         .expect("a filtered logs read must parse");
         let rendered = format!("{parsed:?}");
@@ -660,6 +668,8 @@ mod tests {
                     follow,
                     tail,
                     since,
+                    until,
+                    kind,
                     level,
                     component,
                 },
@@ -671,8 +681,19 @@ mod tests {
         assert_eq!(tail, super::server::TailCount::Newest(20));
         assert_eq!(
             since,
-            Some(rift_protocol::configuration::Duration::from_millis(600_000))
+            Some(super::server::LogsBound::Age(
+                rift_protocol::configuration::Duration::from_millis(600_000)
+            ))
         );
+        assert_eq!(
+            until,
+            Some(super::server::LogsBound::At(
+                "2026-10-04T20:42:58Z"
+                    .parse()
+                    .expect("the timestamp parses")
+            ))
+        );
+        assert_eq!(kind, super::server::LogKind::All);
         assert_eq!(level, Some(super::server::LogLevel::Warn));
         assert_eq!(component.as_deref(), Some("index"));
     }

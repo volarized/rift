@@ -26,7 +26,7 @@ use rift_mcp::{
 };
 use rift_protocol::lock::ServerLock;
 use rift_tracing::{
-    LOG_PAGE_RECORDS_MAX, LogDrain, LogQuery, LogReader, LogReads, RunningLogDrain,
+    LOG_PAGE_RECORDS_MAX, LogDrain, LogQuery, LogReader, LogReads, RecordKind, RunningLogDrain,
     StoredLogRecord, install_panic_hook,
 };
 use tokio_util::sync::CancellationToken;
@@ -139,13 +139,16 @@ pub(super) enum ServerCommand {
         /// Print only the newest COUNT records; `all` prints every kept record.
         #[arg(short = 'n', long, default_value = "all", value_name = "COUNT")]
         tail: TailCount,
-        /// Print only records newer than DURATION ago, such as `10m` or `2h`.
-        #[arg(
-            long,
-            value_name = "DURATION",
-            value_parser = rift_protocol::configuration::Duration::parse
-        )]
-        since: Option<rift_protocol::configuration::Duration>,
+        /// Print only records recorded at or after WHEN: an age such as `10m` or `2h`,
+        /// or an RFC 3339 timestamp such as `2026-10-04T20:42:58Z`.
+        #[arg(long, value_name = "WHEN", value_parser = LogsBound::parse)]
+        since: Option<LogsBound>,
+        /// Print only records recorded before WHEN, in the forms `--since` takes.
+        #[arg(long, value_name = "WHEN", value_parser = LogsBound::parse)]
+        until: Option<LogsBound>,
+        /// Print records of this kind: diagnostics, metric snapshots, or both.
+        #[arg(long, value_name = "KIND", default_value = "log")]
+        kind: LogKind,
         /// Print only records at this severity, as the store spells it.
         #[arg(long, value_name = "LEVEL")]
         level: Option<LogLevel>,
@@ -177,6 +180,55 @@ impl FromStr for TailCount {
             Ok(count) => Ok(Self::Newest(count)),
         }
     }
+}
+
+/// One bound of the window a logs read selects: an age before the read starts, or one
+/// instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LogsBound {
+    /// This long before the read starts.
+    Age(rift_protocol::configuration::Duration),
+    /// One instant, given in RFC 3339.
+    At(jiff::Timestamp),
+}
+
+impl LogsBound {
+    /// Reads an age in the configuration's duration spelling, or else an RFC 3339
+    /// timestamp; the refusal names both forms.
+    fn parse(text: &str) -> Result<Self, String> {
+        if let Ok(age) = rift_protocol::configuration::Duration::parse(text) {
+            return Ok(Self::Age(age));
+        }
+        text.parse::<jiff::Timestamp>().map(Self::At).map_err(|_| {
+            format!(
+                "expected an age such as `10m` or an RFC 3339 timestamp such as \
+                 `2026-10-04T20:42:58Z`, not {text:?}"
+            )
+        })
+    }
+
+    /// The bound in milliseconds since the Unix epoch, an age counted back from `now_ms`.
+    fn recorded_at_ms(self, now_ms: i64) -> i64 {
+        match self {
+            Self::Age(age) => {
+                now_ms.saturating_sub(i64::try_from(age.milliseconds()).unwrap_or(i64::MAX))
+            }
+            Self::At(instant) => instant.as_millisecond(),
+        }
+    }
+}
+
+/// Which kind of record a logs read prints.
+///
+/// The variants carry no documentation of their own: clap renders a value's
+/// doc comment as per-value help, which turns the whole command's help into
+/// its long form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum LogKind {
+    #[default]
+    Log,
+    Metric,
+    All,
 }
 
 /// One severity a logs read is restricted to, in the store's own spelling.
@@ -385,10 +437,13 @@ pub(super) async fn run(
             follow,
             tail,
             since,
+            until,
+            kind,
             level,
             component,
         } => {
-            let query = logs_query(tail, since, level, component.as_deref());
+            let window = LogsWindow { since, until, kind };
+            let query = logs_query(tail, window, level, component.as_deref());
             let time_zone = TimeZone::system();
             print_logs(root, &query, tail, &logs_mode(follow), &time_zone)
                 .await
@@ -1287,14 +1342,22 @@ async fn restart(root: &Path) -> Result<ServerOutcome, RiftError> {
     start_detached(root, STOP_POLL_ATTEMPT_COUNT).await
 }
 
+/// The window and kind one `rift server logs` run selects.
+#[derive(Clone, Copy, Debug, Default)]
+struct LogsWindow {
+    since: Option<LogsBound>,
+    until: Option<LogsBound>,
+    kind: LogKind,
+}
+
 /// The store read one `rift server logs` run issues.
 ///
 /// The page is the `--tail` count, bounded by [`LOG_PAGE_RECORDS_MAX`]; `all`
-/// reads a whole page at a time. `--since` becomes an absolute floor here, so
-/// every page of one run selects the same window.
+/// reads a whole page at a time. `--since` and `--until` become absolute bounds here,
+/// both counted from one clock read, so every page of one run selects the same window.
 fn logs_query(
     tail: TailCount,
-    since: Option<rift_protocol::configuration::Duration>,
+    window: LogsWindow,
     level: Option<LogLevel>,
     component: Option<&str>,
 ) -> LogQuery {
@@ -1302,16 +1365,23 @@ fn logs_query(
         TailCount::All => LOG_PAGE_RECORDS_MAX,
         TailCount::Newest(count) => usize::try_from(count).unwrap_or(LOG_PAGE_RECORDS_MAX),
     };
-    let mut query = LogQuery::newest(limit);
+    let mut query = match window.kind {
+        LogKind::Log => LogQuery::newest(limit),
+        LogKind::Metric => LogQuery::newest(limit).of_kind(RecordKind::Metric),
+        LogKind::All => LogQuery::newest(limit).of_every_kind(),
+    };
     if let Some(level) = level {
         query = query.at_level(level.label());
     }
     if let Some(component) = component {
         query = query.for_component(component);
     }
-    if let Some(since) = since {
-        let age_ms = i64::try_from(since.milliseconds()).unwrap_or(i64::MAX);
-        query = query.since_ms(now_ms().saturating_sub(age_ms));
+    let now_ms = now_ms();
+    if let Some(since) = window.since {
+        query = query.since_ms(since.recorded_at_ms(now_ms));
+    }
+    if let Some(until) = window.until {
+        query = query.until_ms(until.recorded_at_ms(now_ms));
     }
     query
 }
@@ -1464,14 +1534,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
-        RunningLogDrain, SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-        STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns,
-        StartedServer, TailCount, TokenCheck, await_election_released,
-        await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
-        await_stopped_with_probe, discard_stale_document, foreground_refused, logs_mode,
-        logs_query, now_ms, print_logs, request_stop, stale_reason_phrase, start_detached,
-        start_mode, status, stop, stop_log_drain, token_check,
+        AuthMode, ChildWatch, LogKind, LogLevel, LogsBound, LogsMode, LogsWindow,
+        PRESENCE_POLL_INTERVAL, ProcessExit, RunningLogDrain, SERVER_STOP_DEADLINE,
+        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
+        ServerOutcome, StaleReason, StartMode, StartSpawns, StartedServer, TailCount, TokenCheck,
+        await_election_released, await_election_released_with_probe, await_serving,
+        await_serving_with_probe, await_stopped, await_stopped_with_probe, discard_stale_document,
+        foreground_refused, logs_mode, logs_query, now_ms, print_logs, request_stop,
+        stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain, token_check,
     };
     use jiff::tz::TimeZone;
     use rift_error::errors;
@@ -2863,7 +2933,7 @@ mod tests {
     fn a_logs_query_carries_its_tail_level_and_component() {
         let query = logs_query(
             TailCount::Newest(20),
-            None,
+            LogsWindow::default(),
             Some(LogLevel::Warn),
             Some("index"),
         );
@@ -2872,7 +2942,7 @@ mod tests {
         assert_eq!(query.level(), Some("warn"));
         assert_eq!(query.component(), Some("index"));
         assert_eq!(
-            logs_query(TailCount::All, None, None, None).limit(),
+            logs_query(TailCount::All, LogsWindow::default(), None, None).limit(),
             LOG_PAGE_RECORDS_MAX
         );
     }
@@ -2905,12 +2975,15 @@ mod tests {
         assert_eq!(since.milliseconds(), 600_000);
         assert!(rift_protocol::configuration::Duration::parse("10").is_err());
 
-        let read = store.reader().connect()?.following(&logs_query(
-            TailCount::All,
-            Some(since),
-            None,
-            None,
-        ))?;
+        let window = LogsWindow {
+            since: Some(LogsBound::Age(since)),
+            ..LogsWindow::default()
+        };
+        let read =
+            store
+                .reader()
+                .connect()?
+                .following(&logs_query(TailCount::All, window, None, None))?;
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].record().message(), "fresh");
@@ -2918,9 +2991,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_until_read_selects_records_before_its_bound_of_the_kind_asked() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let record = |recorded_at_ms, message| {
+            LogRecord::new(
+                recorded_at_ms,
+                "info",
+                "rift_mcp::server",
+                "index",
+                "index.build",
+                message,
+                "{}",
+            )
+        };
+        let started = 1_759_600_000_000;
+        store
+            .append(
+                &[
+                    record(started - 1, "before"),
+                    record(started, "first"),
+                    record(started + 999, "last"),
+                    record(started + 1_000, "after"),
+                ],
+                1_000,
+            )
+            .await?;
+        let since = LogsBound::parse("2025-10-04T17:46:40Z")?;
+        let until = LogsBound::parse("2025-10-04T17:46:41Z")?;
+        assert_eq!(since.recorded_at_ms(0), started);
+        let reads = store.reader().connect()?;
+        let messages = |kind| -> Result<Vec<String>, rift_error::RiftError> {
+            let window = LogsWindow {
+                since: Some(since),
+                until: Some(until),
+                kind,
+            };
+            Ok(reads
+                .following(&logs_query(TailCount::All, window, None, None))?
+                .iter()
+                .map(|stored| stored.record().message().to_owned())
+                .collect())
+        };
+
+        assert_eq!(messages(LogKind::Log)?, ["first", "last"]);
+        assert_eq!(messages(LogKind::All)?, ["first", "last"]);
+        assert!(messages(LogKind::Metric)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_window_bound_reads_an_age_or_an_rfc_3339_timestamp() {
+        assert_eq!(
+            LogsBound::parse("10m"),
+            Ok(LogsBound::Age(
+                rift_protocol::configuration::Duration::from_millis(600_000)
+            ))
+        );
+        assert_eq!(
+            LogsBound::parse("10m").map(|bound| bound.recorded_at_ms(1_000_000)),
+            Ok(400_000)
+        );
+        assert_eq!(
+            LogsBound::parse("1970-01-01T00:00:01.5Z").map(|bound| bound.recorded_at_ms(0)),
+            Ok(1_500)
+        );
+        let refused = LogsBound::parse("yesterday").expect_err("a word is no bound");
+        assert!(refused.contains("RFC 3339"), "{refused}");
+    }
+
+    #[tokio::test]
     async fn a_workspace_without_a_database_prints_nothing_and_creates_nothing() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
         print_logs(
             directory.path(),
@@ -2963,7 +3106,7 @@ mod tests {
         store
             .close(tokio::time::Instant::now() + SERVER_STOP_DEADLINE)
             .await?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
         print_logs(
             directory.path(),
@@ -3028,7 +3171,7 @@ mod tests {
         let state_directory = directory.path().join(".rift");
         std::fs::create_dir(&state_directory)?;
         std::fs::write(state_directory.join("metrics"), b"not a sqlite database")?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
         for tail in [TailCount::All, TailCount::Newest(5)] {
             let refused = print_logs(
@@ -3066,7 +3209,7 @@ mod tests {
 
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
         let refused = read_records(&store.reader(), query, panicking)
             .await
@@ -3086,7 +3229,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("metrics");
         std::fs::write(&path, b"not a sqlite database")?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
         let interrupted = tokio_util::sync::CancellationToken::new();
 
         let refused = follow_until_interrupt(
@@ -3116,7 +3259,7 @@ mod tests {
         let followed = LogRecord::new(0, "info", "rift", "index", "index.build", "followed", "{}");
         store.append(&[followed], 1_000).await?;
         let reader = store.reader();
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
         let interrupted = tokio_util::sync::CancellationToken::new();
         let time_zone = TimeZone::UTC;
         let mut follow = Box::pin(follow_until_interrupt(
@@ -3151,7 +3294,7 @@ mod tests {
         let store = LogStore::open(&state_directory.join("metrics"), None).await?;
         let kept = LogRecord::new(0, "info", "rift", "index", "index.build", "kept", "{}");
         store.append(&[kept], 1_000).await?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
         let time_zone = TimeZone::UTC;
         let following = print_logs(
             directory.path(),
