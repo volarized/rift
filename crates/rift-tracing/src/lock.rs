@@ -21,12 +21,12 @@ use crate::metrics::Histogram;
 
 /// `lock.wait.duration`: one wait, by lock, mode, and `error.type` when it ended without
 /// the lock.
-const LOCK_WAIT_DURATION: Histogram<3> = Histogram::declare(
+static LOCK_WAIT_DURATION: Histogram<3> = Histogram::declare(
     "lock.wait.duration",
     &["lock.name", "lock.mode", "error.type"],
 );
 /// `lock.held.duration`: the time one acquisition kept its lock, by lock and mode.
-const LOCK_HELD_DURATION: Histogram<2> =
+static LOCK_HELD_DURATION: Histogram<2> =
     Histogram::declare("lock.held.duration", &["lock.name", "lock.mode"]);
 
 /// Starts recording waits for and holds of the lock `name`, a literal from a closed set
@@ -436,7 +436,8 @@ pub struct Held<Guard> {
 /// The record of one hold: its `lock.held` span and its start, closed and recorded when
 /// it drops.
 struct Hold {
-    span: tracing::Span,
+    /// Held open, never read: the span closes when the hold drops.
+    _span: tracing::Span,
     lock: Lock,
     acquired: Duration,
 }
@@ -481,7 +482,7 @@ impl<Guard> Held<Guard> {
         Self {
             guard,
             hold: Hold {
-                span,
+                _span: span,
                 lock,
                 acquired: monotonic_now(),
             },
@@ -527,13 +528,9 @@ impl<Guard> std::fmt::Debug for Held<Guard> {
 impl Drop for Hold {
     fn drop(&mut self) {
         let held = monotonic_now().saturating_sub(self.acquired);
-        let labels = [self.lock.name, self.lock.mode.label()];
-        let recorded = self
-            .span
-            .with_subscriber(|(_, dispatch)| LOCK_HELD_DURATION.record_in(dispatch, labels, held));
-        if recorded != Some(true) {
-            LOCK_HELD_DURATION.labeled(labels).record(held);
-        }
+        LOCK_HELD_DURATION
+            .labeled([self.lock.name, self.lock.mode.label()])
+            .record(held);
     }
 }
 

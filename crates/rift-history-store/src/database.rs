@@ -267,18 +267,18 @@ impl StoreFiller {
 const DB_NAMESPACE: &str = "history";
 /// `sqlite.write_lock.wait.duration`: how long `BEGIN IMMEDIATE` waited for the write
 /// lock, with the result code as `error.type` when it failed.
-const WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
     "sqlite.write_lock.wait.duration",
     &["db.namespace", "error.type"],
 );
 /// `sqlite.transaction.duration`: one write transaction from its begin to its commit or
 /// rollback, by `sqlite.transaction.result`.
-const TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
     "sqlite.transaction.duration",
     &["db.namespace", "sqlite.transaction.result"],
 );
 /// `sqlite.commit.duration`: one `COMMIT`, a checkpoint it runs included.
-const COMMIT_DURATION: Histogram<1> =
+static COMMIT_DURATION: Histogram<1> =
     Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
 
 /// The `error.type` of a failed statement: `SQLite`'s result code for busy, `5`, and for

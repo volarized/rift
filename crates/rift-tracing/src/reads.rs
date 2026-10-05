@@ -12,11 +12,11 @@ use rift_error::RiftError;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, Row, params_from_iter};
 
-use crate::record::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, RecordKind, StoredLogRecord};
+use crate::record::{LOG_KIND, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord};
 use crate::store::{METRICS_BUSY_TIMEOUT, METRICS_SCHEMA_VERSION, store_failure};
 
 /// The columns one page selects, in the order [`stored_record`] reads them.
-const SELECT_RECORDS: &str = "SELECT id, kind, recorded_at, level, target, component, \
+const SELECT_RECORDS: &str = "SELECT id, recorded_at, level, target, component, \
                               operation, message, fields FROM log_records";
 
 /// Opens read connections to one metrics database file.
@@ -164,12 +164,9 @@ impl LogReads {
         if !self.holds_records {
             return Ok(Vec::new());
         }
-        let mut conditions: Vec<&str> = Vec::with_capacity(6);
+        let mut conditions: Vec<&str> = vec!["kind = ?"];
         let mut values: Vec<Value> = Vec::with_capacity(7);
-        if let Some(kind) = query.kind {
-            conditions.push("kind = ?");
-            values.push(Value::Text(kind.label().to_owned()));
-        }
+        values.push(Value::Text(LOG_KIND.to_owned()));
         if let Some(level) = &query.level {
             conditions.push("level = ?");
             values.push(Value::Text(level.clone()));
@@ -193,10 +190,8 @@ impl LogReads {
         let limit = query.limit.min(LOG_PAGE_RECORDS_MAX);
         values.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
         let mut sql = String::from(SELECT_RECORDS);
-        if !conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-        }
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
         sql.push_str(order.clause());
         let failure = |source: rusqlite::Error| store_failure("read records", &self.path, source);
         let mut statement = self.connection.prepare_cached(&sql).map_err(failure)?;
@@ -212,14 +207,13 @@ fn stored_record(row: &Row<'_>) -> rusqlite::Result<StoredLogRecord> {
     Ok(StoredLogRecord {
         identity: row.get(0)?,
         record: LogRecord {
-            kind: RecordKind::from_label(&row.get::<_, String>(1)?),
-            recorded_at_ms: row.get(2)?,
-            level: row.get(3)?,
-            target: row.get(4)?,
-            component: row.get(5)?,
-            operation: row.get(6)?,
-            message: row.get(7)?,
-            fields: row.get(8)?,
+            recorded_at_ms: row.get(1)?,
+            level: row.get(2)?,
+            target: row.get(3)?,
+            component: row.get(4)?,
+            operation: row.get(5)?,
+            message: row.get(6)?,
+            fields: row.get(7)?,
         },
     })
 }

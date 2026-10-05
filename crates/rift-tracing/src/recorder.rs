@@ -9,6 +9,11 @@
 //!
 //! The recorder also keeps the newest records it captured, and prints them when its test
 //! panics, so a failed assertion carries what the code recorded before it.
+//!
+//! Metrics are the process's: the first recorder installs the process's meter, and
+//! [`ScopedRecorder::metrics`] reads what the OpenTelemetry SDK exports from it.
+
+mod metrics;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,10 +24,12 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use crate::capture::log_capture;
 use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable};
-use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
+use crate::otlp::SDK_TARGET;
 use crate::record::LogRecord;
 use crate::render::LogLines;
 use crate::runtime::{LogFilterError, capture_layer, parsed_filter};
+
+pub use self::metrics::{MetricSeries, MetricSnapshot, SeriesValue};
 
 /// Most records a panicking test's recorder prints: the newest ones it captured.
 pub const SCOPED_RECORDER_PRINT_RECORDS_MAX: usize = 256;
@@ -64,7 +71,6 @@ const RECORDER_DEFAULT_CAPTURE: &str = "trace";
 #[must_use = "the recorder captures only while it is held"]
 pub struct ScopedRecorder {
     retained: Arc<RetainedRecords>,
-    values: Arc<MetricValues>,
     output: PanicOutput,
     _default: tracing::subscriber::DefaultGuard,
 }
@@ -75,7 +81,9 @@ impl ScopedRecorder {
         ScopedRecorderBuilder { capture: None }
     }
 
-    /// Every value the code under test recorded into an instrument on this thread.
+    /// Every series the process's instruments hold now, as the OpenTelemetry SDK exports
+    /// them: every value recorded on any thread since the process's first recorder
+    /// installed its meter, whichever recorder is held.
     ///
     /// ```
     /// let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
@@ -90,21 +98,15 @@ impl ScopedRecorder {
     /// ```
     #[must_use]
     pub fn metrics(&self) -> MetricSnapshot {
-        self.values.snapshot()
+        metrics::snapshot()
     }
 
-    /// Runs every live [`SampleHook`](crate::SampleHook) registered under this recorder once,
-    /// on the calling thread, as a tick of the process sampler would; answers how many ran.
-    /// A recorder runs no sampler of its own.
+    /// Runs every live [`SampleHook`](crate::SampleHook) of the process once, on the calling
+    /// thread, as a tick of the process sampler would; answers how many ran. A recorder
+    /// runs no sampler of its own.
     #[must_use = "the count tells whether the hooks expected ran"]
     pub fn run_sample_hooks(&self) -> usize {
-        crate::sampler::run_hooks(self.values.hooks().live())
-    }
-
-    /// The metric values the recorder holds, for a test that publishes a process sample.
-    #[cfg(test)]
-    pub(crate) fn values(&self) -> &MetricValues {
-        &self.values
+        crate::sampler::run_hooks(crate::sampler::live_hooks())
     }
 
     /// Prints into `buffer` instead of standard error, so a test can read what a panic
@@ -144,31 +146,36 @@ pub struct ScopedRecorderBuilder {
 impl ScopedRecorderBuilder {
     /// Captures what `filter` admits, in the `RUST_LOG` spelling
     /// [`TracingRuntimeBuilder::capture`](crate::TracingRuntimeBuilder::capture) takes.
-    /// Without it the recorder captures every level of every target.
+    /// Without it the recorder captures every level of every target. Either way the
+    /// OpenTelemetry SDK's own reports are captured at `WARN` and above, as stderr carries
+    /// them: the SDK reports each instrument it builds at `DEBUG`.
     pub fn capture(mut self, filter: &str) -> Self {
         self.capture = Some(filter.to_owned());
         self
     }
 
-    /// Installs the recorder as the calling thread's default subscriber, and returns it
-    /// with the drain its records reach.
+    /// Installs the recorder as the calling thread's default subscriber, and the process's
+    /// meter unless one is installed, and returns the recorder with the drain its records
+    /// reach.
     ///
     /// # Errors
     ///
     /// Returns [`LogFilterError`] when the [`Self::capture`] filter does not parse.
     pub fn install(self) -> Result<(ScopedRecorder, LogDrain), LogFilterError> {
-        let filter = parsed_filter(self.capture.as_deref().unwrap_or(RECORDER_DEFAULT_CAPTURE))?;
+        let mut filter =
+            parsed_filter(self.capture.as_deref().unwrap_or(RECORDER_DEFAULT_CAPTURE))?;
+        if let Ok(reports) = format!("{SDK_TARGET}=warn").parse() {
+            filter = filter.add_directive(reports);
+        }
         let retained = Arc::new(RetainedRecords::default());
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
-        let values = Arc::new(MetricValues::default());
+        metrics::install();
         let subscriber = crate::capture::registry()
-            .with(MetricLayer::new(Arc::clone(&values)))
             .with(FlightLayer::new(Arc::new(FlightTable::default())))
             .with(capture_layer(sink, filter));
         let recorder = ScopedRecorder {
             retained,
-            values,
             output: PanicOutput::Stderr,
             _default: tracing::subscriber::set_default(subscriber),
         };

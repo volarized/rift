@@ -1,161 +1,100 @@
-//! Typed metric instruments: counters, gauges, and histograms a declaration fixes once.
+//! Typed metric instruments over the OpenTelemetry metrics API: counters, gauges, and
+//! histograms a declaration fixes once.
 //!
-//! A declaration names an instrument, its unit, its kind, the label keys it accepts, and
-//! its bounds. A caller holds the declared handle and records values into it; it never
-//! registers an instrument or builds a label map on the recording path. Label values are
-//! `&'static str`, so a value comes from a closed set the code spells out, and a path, a
-//! query, or an error message cannot become a label.
+//! A declaration is a `static` naming an instrument, its unit, and the label keys it
+//! accepts. A caller records into the declared handle; it never registers an instrument or
+//! builds a label map. Label values are `&'static str`, so a value comes from a closed set
+//! the code spells out, and a path, a query, or an error message cannot become a label.
 //!
-//! A value lands in the metric values of the thread's current `tracing` dispatcher: the
-//! ones [`TracingRuntime`](crate::TracingRuntime) installs, or a test's `ScopedRecorder`.
-//! A thread whose dispatcher holds neither records nothing, and pays one dispatcher lookup.
-
-mod values;
+//! A recording hands the value and its labels to the OpenTelemetry instrument the
+//! declaration holds, built from the process's meter on the first recording after one was
+//! installed. The OpenTelemetry SDK aggregates, bounds the series, and exports; this
+//! module holds no value. The process installs at most one meter: the `otlp` export when an
+//! endpoint is configured, or a test's `ScopedRecorder`. Before that, and in a process that
+//! installs none, a recording reads two atomics and records nothing.
+//!
+//! A meter obtained from `opentelemetry::global` before a provider is set stays a no-op for
+//! good, so the meter is never taken from there: the installer hands it over once, and
+//! each declaration builds its instrument from it lazily.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use tracing::Subscriber;
-use tracing_subscriber::Layer;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Meter;
 
 use crate::capture::span_failure;
 use crate::measurement::monotonic_now;
-use crate::sampler::ProcessSample;
 
-pub(crate) use values::{Labels, MetricValues};
-pub use values::{MetricSeries, MetricSnapshot, SeriesValue};
-
-/// Label keys one instrument may declare, at most: the six `mcp.server.operation.duration`
-/// names. Each recording carries this many label slots, and a thread's cached point is
-/// keyed by their addresses, so the bound sets the size of both.
-pub const METRIC_LABELS_MAX: usize = 6;
-/// Label sets one instrument keeps when its declaration names no other bound. A label set
-/// past it records into the instrument's overflow series.
-pub const METRIC_SERIES_MAX_DEFAULT: usize = 256;
-/// Bucket boundaries one histogram may declare, at most.
-pub const HISTOGRAM_BOUNDARIES_MAX: usize = 16;
 /// Upper bucket boundaries, in seconds, of a duration histogram whose declaration names no
 /// others: the boundaries the OpenTelemetry HTTP semantic conventions advise for durations.
 pub const DURATION_BOUNDARIES_SECONDS: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
 
-/// What an instrument holds between two reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstrumentKind {
-    /// A sum that only grows, such as dropped records.
-    Counter,
-    /// The latest value recorded, such as resident memory.
-    Gauge,
-    /// Counts of recorded values per bucket, with their count and sum.
-    Histogram,
+/// The meter every declaration builds its instrument from, installed at most once.
+static METER: OnceLock<Meter> = OnceLock::new();
+
+/// The instrumentation scope of every Rift instrument: `rift-tracing` and its version,
+/// because every instrument is declared through this crate.
+#[cfg(any(test, feature = "fixtures", feature = "otlp"))]
+pub(crate) fn scope() -> opentelemetry::InstrumentationScope {
+    opentelemetry::InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .build()
 }
 
-/// One instrument as its declaration fixes it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Instrument {
-    name: &'static str,
-    unit: &'static str,
-    kind: InstrumentKind,
-    label_keys: &'static [&'static str],
-    series_max: usize,
-    boundaries: &'static [f64],
+/// Makes `meter` the one every declaration builds its instrument from; a meter installed
+/// before stays, and `meter` is dropped.
+#[cfg(any(test, feature = "fixtures", feature = "otlp"))]
+pub(crate) fn install_meter(meter: Meter) {
+    let _ = METER.set(meter);
 }
 
-impl Instrument {
-    /// Declares an instrument, refusing at compile time, in a `const` declaration, more
-    /// than [`METRIC_LABELS_MAX`] label keys.
-    const fn declared(
-        name: &'static str,
-        unit: &'static str,
-        kind: InstrumentKind,
-        label_keys: &'static [&'static str],
-    ) -> Self {
-        assert!(
-            label_keys.len() <= METRIC_LABELS_MAX,
-            "an instrument declares at most METRIC_LABELS_MAX label keys"
-        );
-        Self {
-            name,
-            unit,
-            kind,
-            label_keys,
-            series_max: METRIC_SERIES_MAX_DEFAULT,
-            boundaries: &[],
+/// Whether a meter is installed, so a recording reaches an instrument.
+pub(crate) fn meter_installed() -> bool {
+    METER.get().is_some()
+}
+
+/// The instrument `cell` holds, built by `build` from the installed meter on first use;
+/// `None` while no meter is installed, so a later install still builds it.
+fn built<Handle>(cell: &OnceLock<Handle>, build: impl FnOnce(&Meter) -> Handle) -> Option<&Handle> {
+    if let Some(handle) = cell.get() {
+        return Some(handle);
+    }
+    let meter = METER.get()?;
+    Some(cell.get_or_init(|| build(meter)))
+}
+
+/// The attributes the label `values` name, in declaration order, and how many lead the
+/// array: a value recorded empty names no attribute, so a success carries no `error.type`.
+fn attributes<const LABELS: usize>(
+    keys: &'static [&'static str; LABELS],
+    values: [&'static str; LABELS],
+) -> ([KeyValue; LABELS], usize) {
+    let mut present = keys
+        .iter()
+        .zip(values)
+        .filter(|(_, value)| !value.is_empty());
+    let mut count = 0;
+    let attributes = std::array::from_fn(|_| match present.next() {
+        Some((key, value)) => {
+            count += 1;
+            KeyValue::new(*key, value)
         }
-    }
-
-    /// The instrument's name, such as `process.memory.usage`.
-    #[must_use]
-    pub const fn name(&self) -> &'static str {
-        self.name
-    }
-
-    /// The unit its values carry, in the OpenTelemetry spelling: `s`, `By`, `1`, or a
-    /// curly-brace annotation such as `{call}`.
-    #[must_use]
-    pub const fn unit(&self) -> &'static str {
-        self.unit
-    }
-
-    /// What the instrument holds between two reads.
-    #[must_use]
-    pub const fn kind(&self) -> InstrumentKind {
-        self.kind
-    }
-
-    /// The label keys every recorded value names a value for, in declaration order.
-    #[must_use]
-    pub const fn label_keys(&self) -> &'static [&'static str] {
-        self.label_keys
-    }
-
-    /// Label sets the instrument keeps before it records into its overflow series.
-    #[must_use]
-    pub const fn series_max(&self) -> usize {
-        self.series_max
-    }
-
-    /// The upper bucket boundaries of a histogram, ascending; empty for other kinds.
-    #[must_use]
-    pub const fn boundaries(&self) -> &'static [f64] {
-        self.boundaries
-    }
-}
-
-/// Runs `record` against the metric values of the thread's current dispatcher, when it
-/// holds any.
-fn with_installed(mut record: impl FnMut(&MetricValues)) {
-    tracing::dispatcher::get_default(|dispatch| {
-        if let Some(layer) = dispatch.downcast_ref::<MetricLayer>() {
-            record(&layer.values);
-        }
+        None => KeyValue::new("", ""),
     });
-}
-
-/// Whether the thread's current dispatcher holds metric values.
-fn installed() -> bool {
-    tracing::dispatcher::get_default(|dispatch| dispatch.downcast_ref::<MetricLayer>().is_some())
-}
-
-/// The label values a recording names, in declaration order, padded to [`Labels`].
-fn labels<const LABELS: usize>(values: [&'static str; LABELS]) -> Labels {
-    const {
-        assert!(
-            LABELS <= METRIC_LABELS_MAX,
-            "at most METRIC_LABELS_MAX label values"
-        );
-    };
-    let mut labels = [""; METRIC_LABELS_MAX];
-    labels[..LABELS].copy_from_slice(&values);
-    labels
+    (attributes, count)
 }
 
 /// A sum that only grows: the count of something that happened.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Counter<const LABELS: usize> {
-    instrument: Instrument,
+    name: &'static str,
+    unit: &'static str,
+    label_keys: &'static [&'static str; LABELS],
+    instrument: OnceLock<opentelemetry::metrics::Counter<f64>>,
 }
 
 impl<const LABELS: usize> Counter<LABELS> {
@@ -167,40 +106,29 @@ impl<const LABELS: usize> Counter<LABELS> {
         label_keys: &'static [&'static str; LABELS],
     ) -> Self {
         Self {
-            instrument: Instrument::declared(name, unit, InstrumentKind::Counter, label_keys),
+            name,
+            unit,
+            label_keys,
+            instrument: OnceLock::new(),
         }
-    }
-
-    /// Keeps at most `series_max` label sets; later ones record into the overflow series.
-    #[must_use]
-    pub const fn series_max(mut self, series_max: usize) -> Self {
-        self.instrument.series_max = series_max;
-        self
-    }
-
-    /// The declaration this handle records into.
-    #[must_use]
-    pub const fn instrument(&self) -> &Instrument {
-        &self.instrument
     }
 
     /// Selects the series the label `values` name, in declaration order.
-    pub fn labeled(&self, values: [&'static str; LABELS]) -> CounterSelection<'_> {
+    pub const fn labeled(&self, values: [&'static str; LABELS]) -> CounterSelection<'_, LABELS> {
         CounterSelection {
-            instrument: &self.instrument,
-            labels: labels(values),
+            counter: self,
+            labels: values,
         }
     }
 
-    /// Adds `value`, in the instrument's unit, straight into `values`, for the sampler that
-    /// owns them. A fractional value, such as CPU seconds, keeps its fraction.
-    pub(crate) fn add_into(
-        &self,
-        values: &MetricValues,
-        labels: [&'static str; LABELS],
-        value: f64,
-    ) {
-        values.add(&self.instrument, self::labels(labels), value);
+    fn add_labeled(&self, labels: [&'static str; LABELS], value: f64) {
+        let built = built(&self.instrument, |meter| {
+            meter.f64_counter(self.name).with_unit(self.unit).build()
+        });
+        if let Some(counter) = built {
+            let (attributes, count) = attributes(self.label_keys, labels);
+            counter.add(value, &attributes[..count]);
+        }
     }
 }
 
@@ -214,26 +142,31 @@ impl Counter<0> {
 /// One series of a counter, selected by its label values; [`Self::add`] records.
 #[derive(Clone, Copy, Debug)]
 #[must_use = "a selection records nothing until `add` runs"]
-pub struct CounterSelection<'counter> {
-    instrument: &'counter Instrument,
-    labels: Labels,
+pub struct CounterSelection<'counter, const LABELS: usize> {
+    counter: &'counter Counter<LABELS>,
+    labels: [&'static str; LABELS],
 }
 
-impl CounterSelection<'_> {
+impl<const LABELS: usize> CounterSelection<'_, LABELS> {
     /// Adds `value` to the selected series.
     #[expect(
         clippy::cast_precision_loss,
         reason = "a count past 2^53 events loses its last digits, which no reader acts on"
     )]
     pub fn add(self, value: u64) {
-        with_installed(|values| values.add(self.instrument, self.labels, value as f64));
+        self.counter.add_labeled(self.labels, value as f64);
+    }
+
+    /// Adds `value`, a fractional quantity such as CPU seconds, to the selected series.
+    pub(crate) fn add_fraction(self, value: f64) {
+        self.counter.add_labeled(self.labels, value);
     }
 }
 
 /// The value types a gauge records: a byte or item count, or a fractional quantity.
 pub trait GaugeValue: Copy + private::Sealed {
-    /// The value as the instrument stores it, or `None` for a value that measures nothing:
-    /// a negative, infinite, or NaN float.
+    /// The value as the instrument records it, or `None` for a value that measures
+    /// nothing: a negative, infinite, or NaN float.
     fn measured(self) -> Option<f64>;
 }
 
@@ -253,20 +186,89 @@ impl GaugeValue for f64 {
     }
 }
 
+/// The value types a histogram records: a duration, recorded in seconds, or a count.
+pub trait HistogramValue: Copy + private::Sealed {
+    /// What the OpenTelemetry instrument records.
+    #[doc(hidden)]
+    type Recorded: std::fmt::Debug + Send + Sync + 'static;
+
+    /// The OpenTelemetry histogram named `name`, in `unit`, bucketed at `boundaries`.
+    #[doc(hidden)]
+    fn histogram(
+        meter: &Meter,
+        name: &'static str,
+        unit: &'static str,
+        boundaries: &'static [f64],
+    ) -> opentelemetry::metrics::Histogram<Self::Recorded>;
+
+    /// The value as the instrument records it.
+    #[doc(hidden)]
+    fn recorded(self) -> Self::Recorded;
+}
+
+impl HistogramValue for Duration {
+    type Recorded = f64;
+
+    fn histogram(
+        meter: &Meter,
+        name: &'static str,
+        unit: &'static str,
+        boundaries: &'static [f64],
+    ) -> opentelemetry::metrics::Histogram<f64> {
+        meter
+            .f64_histogram(name)
+            .with_unit(unit)
+            .with_boundaries(boundaries.to_vec())
+            .build()
+    }
+
+    fn recorded(self) -> f64 {
+        self.as_secs_f64()
+    }
+}
+
+impl HistogramValue for u64 {
+    type Recorded = Self;
+
+    fn histogram(
+        meter: &Meter,
+        name: &'static str,
+        unit: &'static str,
+        boundaries: &'static [f64],
+    ) -> opentelemetry::metrics::Histogram<Self> {
+        meter
+            .u64_histogram(name)
+            .with_unit(unit)
+            .with_boundaries(boundaries.to_vec())
+            .build()
+    }
+
+    fn recorded(self) -> Self {
+        self
+    }
+}
+
 mod private {
-    /// Seals [`GaugeValue`](super::GaugeValue) to the value types its storage keeps whole.
+    use std::time::Duration;
+
+    /// Seals [`GaugeValue`](super::GaugeValue) and
+    /// [`HistogramValue`](super::HistogramValue) to the value types they record.
     pub trait Sealed {}
     impl Sealed for u64 {}
     impl Sealed for f64 {}
+    impl Sealed for Duration {}
 }
 
 /// The latest value of a quantity, such as resident memory in bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Gauge<Value: GaugeValue, const LABELS: usize> {
-    instrument: Instrument,
+    name: &'static str,
+    unit: &'static str,
+    label_keys: &'static [&'static str; LABELS],
     /// What one recorded unit is in the instrument's unit: `0.01` for a percent recorded
     /// into a utilization whose unit is `1`.
     scale: f64,
+    instrument: OnceLock<opentelemetry::metrics::Gauge<f64>>,
     _value: PhantomData<fn(Value)>,
 }
 
@@ -279,8 +281,11 @@ impl<Value: GaugeValue, const LABELS: usize> Gauge<Value, LABELS> {
         label_keys: &'static [&'static str; LABELS],
     ) -> Self {
         Self {
-            instrument: Instrument::declared(name, unit, InstrumentKind::Gauge, label_keys),
+            name,
+            unit,
+            label_keys,
             scale: 1.0,
+            instrument: OnceLock::new(),
             _value: PhantomData,
         }
     }
@@ -292,161 +297,65 @@ impl<Value: GaugeValue, const LABELS: usize> Gauge<Value, LABELS> {
         self
     }
 
-    /// Keeps at most `series_max` label sets; later ones record into the overflow series.
-    #[must_use]
-    pub const fn series_max(mut self, series_max: usize) -> Self {
-        self.instrument.series_max = series_max;
-        self
-    }
-
-    /// The declaration this handle records into.
-    #[must_use]
-    pub const fn instrument(&self) -> &Instrument {
-        &self.instrument
-    }
-
     /// Selects `value` for the series the label `values` name.
-    pub fn labeled_value(
+    pub const fn labeled_value(
         &self,
         labels: [&'static str; LABELS],
         value: Value,
-    ) -> GaugeSelection<'_, Value> {
+    ) -> GaugeSelection<'_, Value, LABELS> {
         GaugeSelection {
-            gauge: self.erased(),
-            labels: self::labels(labels),
-            value: Selected::Value(value),
-        }
-    }
-
-    /// Records `value` straight into `values`, for the sampler that owns them.
-    pub(crate) fn record_into(
-        &self,
-        values: &MetricValues,
-        labels: [&'static str; LABELS],
-        value: Value,
-    ) {
-        if let Some(measured) = value.measured() {
-            values.set(
-                &self.instrument,
-                self::labels(labels),
-                measured * self.scale,
-            );
-        }
-    }
-
-    const fn erased(&self) -> ErasedGauge<'_> {
-        ErasedGauge {
-            instrument: &self.instrument,
-            scale: self.scale,
+            gauge: self,
+            labels,
+            value,
         }
     }
 }
 
 impl<Value: GaugeValue> Gauge<Value, 0> {
     /// Selects `value`, a caller-measured quantity; [`GaugeSelection::record`] records it.
-    pub fn value(&self, value: Value) -> GaugeSelection<'_, Value> {
+    pub const fn value(&self, value: Value) -> GaugeSelection<'_, Value, 0> {
         self.labeled_value([], value)
     }
-}
-
-/// A gauge without its value type, as a selection carries it.
-#[derive(Clone, Copy, Debug)]
-struct ErasedGauge<'gauge> {
-    instrument: &'gauge Instrument,
-    scale: f64,
-}
-
-/// Where a gauge selection takes its value from.
-#[derive(Clone, Copy, Debug)]
-enum Selected<Value> {
-    /// A value the caller supplied.
-    Value(Value),
-    /// The latest published process sample, read when `record` runs.
-    Current(fn(&ProcessSample) -> Option<Value>),
 }
 
 /// One value of a gauge, selected but not yet recorded; [`Self::record`] records it.
 #[derive(Clone, Copy, Debug)]
 #[must_use = "a selection records nothing until `record` runs"]
-pub struct GaugeSelection<'gauge, Value: GaugeValue> {
-    gauge: ErasedGauge<'gauge>,
-    labels: Labels,
-    value: Selected<Value>,
+pub struct GaugeSelection<'gauge, Value: GaugeValue, const LABELS: usize> {
+    gauge: &'gauge Gauge<Value, LABELS>,
+    labels: [&'static str; LABELS],
+    value: Value,
 }
 
-impl<Value: GaugeValue> GaugeSelection<'_, Value> {
+impl<Value: GaugeValue, const LABELS: usize> GaugeSelection<'_, Value, LABELS> {
     /// Records the selected value.
     ///
-    /// A value that measures nothing records nothing: a negative, infinite, or NaN float,
-    /// or a current value the process sampler has not published. It never records zero
-    /// in their place.
+    /// A value that measures nothing records nothing: a negative, infinite, or NaN float.
+    /// It never records zero in its place.
     pub fn record(self) {
         let gauge = self.gauge;
-        let labels = self.labels;
-        let selected = self.value;
-        with_installed(|values| {
-            let value = match selected {
-                Selected::Value(value) => Some(value),
-                Selected::Current(read) => values.latest_sample().as_ref().and_then(read),
-            };
-            if let Some(measured) = value.and_then(GaugeValue::measured) {
-                values.set(gauge.instrument, labels, measured * gauge.scale);
-            }
+        let Some(measured) = self.value.measured() else {
+            return;
+        };
+        let built = built(&gauge.instrument, |meter| {
+            meter.f64_gauge(gauge.name).with_unit(gauge.unit).build()
         });
-    }
-}
-
-/// A gauge of the current process, whose current value the process sampler publishes.
-#[derive(Clone, Copy, Debug)]
-pub struct ProcessGauge<Value: GaugeValue> {
-    gauge: Gauge<Value, 0>,
-    current: fn(&ProcessSample) -> Option<Value>,
-}
-
-impl<Value: GaugeValue> ProcessGauge<Value> {
-    /// The handle over `gauge` whose current value `current` reads from a sample.
-    pub(crate) const fn reading(
-        gauge: Gauge<Value, 0>,
-        current: fn(&ProcessSample) -> Option<Value>,
-    ) -> Self {
-        Self { gauge, current }
-    }
-
-    /// Selects the value of the latest published process sample, read when `record` runs.
-    ///
-    /// The selection performs no OS read: the sampler refreshes the process on its own
-    /// tick, and a value it has not published records nothing.
-    pub fn current(&self) -> GaugeSelection<'_, Value> {
-        GaugeSelection {
-            gauge: self.gauge.erased(),
-            labels: labels([]),
-            value: Selected::Current(self.current),
-        }
-    }
-
-    /// Selects `value`, a caller-measured quantity in the same unit as [`Self::current`].
-    pub fn value(&self, value: Value) -> GaugeSelection<'_, Value> {
-        self.gauge.value(value)
-    }
-
-    /// The declaration this handle records into.
-    #[must_use]
-    pub const fn instrument(&self) -> &Instrument {
-        self.gauge.instrument()
-    }
-
-    /// Records the current value of `sample` straight into `values`, for the sampler.
-    pub(crate) fn record_sample_into(&self, values: &MetricValues, sample: &ProcessSample) {
-        if let Some(value) = (self.current)(sample) {
-            self.gauge.record_into(values, [], value);
+        if let Some(instrument) = built {
+            let (attributes, count) = attributes(gauge.label_keys, self.labels);
+            instrument.record(measured * gauge.scale, &attributes[..count]);
         }
     }
 }
 
-/// Counts of recorded durations per bucket, with their count and sum in seconds.
-#[derive(Clone, Copy, Debug)]
-pub struct Histogram<const LABELS: usize> {
-    instrument: Instrument,
+/// Counts of recorded values per bucket, with their count and sum: durations in seconds,
+/// or counts, such as the statements one transaction ran.
+#[derive(Debug)]
+pub struct Histogram<const LABELS: usize, Value: HistogramValue = Duration> {
+    name: &'static str,
+    unit: &'static str,
+    label_keys: &'static [&'static str; LABELS],
+    boundaries: &'static [f64],
+    instrument: OnceLock<opentelemetry::metrics::Histogram<Value::Recorded>>,
 }
 
 impl<const LABELS: usize> Histogram<LABELS> {
@@ -454,159 +363,82 @@ impl<const LABELS: usize> Histogram<LABELS> {
     /// `label_keys`, bucketed at [`DURATION_BOUNDARIES_SECONDS`].
     #[must_use]
     pub const fn declare(name: &'static str, label_keys: &'static [&'static str; LABELS]) -> Self {
-        let mut instrument = Instrument::declared(name, "s", InstrumentKind::Histogram, label_keys);
-        instrument.boundaries = &DURATION_BOUNDARIES_SECONDS;
-        Self { instrument }
-    }
-
-    /// Buckets at `boundaries`, ascending upper bounds in seconds.
-    ///
-    /// # Panics
-    ///
-    /// Panics on more than [`HISTOGRAM_BOUNDARIES_MAX`] boundaries; in a `const`
-    /// declaration, that fails compilation.
-    #[must_use]
-    pub const fn boundaries(mut self, boundaries: &'static [f64]) -> Self {
-        assert!(
-            boundaries.len() <= HISTOGRAM_BOUNDARIES_MAX,
-            "a histogram declares at most HISTOGRAM_BOUNDARIES_MAX boundaries"
-        );
-        self.instrument.boundaries = boundaries;
-        self
-    }
-
-    /// Keeps at most `series_max` label sets; later ones record into the overflow series.
-    #[must_use]
-    pub const fn series_max(mut self, series_max: usize) -> Self {
-        self.instrument.series_max = series_max;
-        self
-    }
-
-    /// The declaration this handle records into.
-    #[must_use]
-    pub const fn instrument(&self) -> &Instrument {
-        &self.instrument
-    }
-
-    /// Selects the series the label `values` name, in declaration order.
-    pub fn labeled(&self, values: [&'static str; LABELS]) -> HistogramSelection<'_> {
-        HistogramSelection {
-            instrument: &self.instrument,
-            labels: labels(values),
+        Self {
+            name,
+            unit: "s",
+            label_keys,
+            boundaries: &DURATION_BOUNDARIES_SECONDS,
+            instrument: OnceLock::new(),
         }
     }
 }
 
-impl<const LABELS: usize> Histogram<LABELS> {
-    /// Records one duration into the metric values `dispatch` holds, when it holds any;
-    /// answers whether it did. A guard dropped on another thread records through the
-    /// dispatcher its span was opened under.
-    pub(crate) fn record_in(
-        &self,
-        dispatch: &tracing::Dispatch,
-        labels: [&'static str; LABELS],
-        elapsed: Duration,
-    ) -> bool {
-        let Some(layer) = dispatch.downcast_ref::<MetricLayer>() else {
-            return false;
-        };
-        layer.values.observe(
-            &self.instrument,
-            self::labels(labels),
-            elapsed.as_secs_f64(),
-        );
-        true
+impl<const LABELS: usize> Histogram<LABELS, u64> {
+    /// Declares a histogram of counts named `name`, in `unit`, whose values name the
+    /// `label_keys`, bucketed at the ascending upper bounds `boundaries`.
+    #[must_use]
+    pub const fn declare_count(
+        name: &'static str,
+        unit: &'static str,
+        label_keys: &'static [&'static str; LABELS],
+        boundaries: &'static [f64],
+    ) -> Self {
+        Self {
+            name,
+            unit,
+            label_keys,
+            boundaries,
+            instrument: OnceLock::new(),
+        }
     }
 }
 
-impl Histogram<0> {
-    /// Records one duration.
-    pub fn record(&self, elapsed: Duration) {
-        self.labeled([]).record(elapsed);
+impl<const LABELS: usize, Value: HistogramValue> Histogram<LABELS, Value> {
+    /// Buckets at `boundaries`, ascending upper bounds in the instrument's unit.
+    #[must_use]
+    pub const fn boundaries(mut self, boundaries: &'static [f64]) -> Self {
+        self.boundaries = boundaries;
+        self
+    }
+
+    /// Selects the series the label `values` name, in declaration order.
+    pub const fn labeled(
+        &self,
+        values: [&'static str; LABELS],
+    ) -> HistogramSelection<'_, LABELS, Value> {
+        HistogramSelection {
+            histogram: self,
+            labels: values,
+        }
+    }
+}
+
+impl<Value: HistogramValue> Histogram<0, Value> {
+    /// Records one value.
+    pub fn record(&self, value: Value) {
+        self.labeled([]).record(value);
     }
 }
 
 /// One series of a histogram, selected by its label values; [`Self::record`] records.
 #[derive(Clone, Copy, Debug)]
 #[must_use = "a selection records nothing until `record` runs"]
-pub struct HistogramSelection<'histogram> {
-    instrument: &'histogram Instrument,
-    labels: Labels,
+pub struct HistogramSelection<'histogram, const LABELS: usize, Value: HistogramValue = Duration> {
+    histogram: &'histogram Histogram<LABELS, Value>,
+    labels: [&'static str; LABELS],
 }
 
-impl HistogramSelection<'_> {
-    /// Records one duration into the selected series, in seconds.
-    pub fn record(self, elapsed: Duration) {
-        with_installed(|values| {
-            values.observe(self.instrument, self.labels, elapsed.as_secs_f64());
+impl<const LABELS: usize, Value: HistogramValue> HistogramSelection<'_, LABELS, Value> {
+    /// Records one value into the selected series.
+    pub fn record(self, value: Value) {
+        let histogram = self.histogram;
+        let built = built(&histogram.instrument, |meter| {
+            Value::histogram(meter, histogram.name, histogram.unit, histogram.boundaries)
         });
-    }
-}
-
-/// Counts of recorded item counts per bucket, with their count and sum, such as the
-/// statements one transaction ran.
-#[derive(Clone, Copy, Debug)]
-pub struct CountHistogram<const LABELS: usize> {
-    instrument: Instrument,
-}
-
-impl<const LABELS: usize> CountHistogram<LABELS> {
-    /// Declares a histogram named `name`, in `unit`, whose values name the `label_keys`,
-    /// bucketed at the ascending upper bounds `boundaries`.
-    ///
-    /// # Panics
-    ///
-    /// Panics on more than [`HISTOGRAM_BOUNDARIES_MAX`] boundaries; in a `const`
-    /// declaration, that fails compilation.
-    #[must_use]
-    pub const fn declare(
-        name: &'static str,
-        unit: &'static str,
-        label_keys: &'static [&'static str; LABELS],
-        boundaries: &'static [f64],
-    ) -> Self {
-        assert!(
-            boundaries.len() <= HISTOGRAM_BOUNDARIES_MAX,
-            "a histogram declares at most HISTOGRAM_BOUNDARIES_MAX boundaries"
-        );
-        let mut instrument =
-            Instrument::declared(name, unit, InstrumentKind::Histogram, label_keys);
-        instrument.boundaries = boundaries;
-        Self { instrument }
-    }
-
-    /// The declaration this handle records into.
-    #[must_use]
-    pub const fn instrument(&self) -> &Instrument {
-        &self.instrument
-    }
-
-    /// Selects the series the label `values` name, in declaration order.
-    pub fn labeled(&self, values: [&'static str; LABELS]) -> CountHistogramSelection<'_> {
-        CountHistogramSelection {
-            instrument: &self.instrument,
-            labels: labels(values),
+        if let Some(instrument) = built {
+            let (attributes, count) = attributes(histogram.label_keys, self.labels);
+            instrument.record(value.recorded(), &attributes[..count]);
         }
-    }
-}
-
-/// One series of a count histogram, selected by its label values; [`Self::record`]
-/// records.
-#[derive(Clone, Copy, Debug)]
-#[must_use = "a selection records nothing until `record` runs"]
-pub struct CountHistogramSelection<'histogram> {
-    instrument: &'histogram Instrument,
-    labels: Labels,
-}
-
-impl CountHistogramSelection<'_> {
-    /// Records one count into the selected series, in the instrument's unit.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a count past 2^53 items loses its last digits, which no reader acts on"
-    )]
-    pub fn record(self, count: u64) {
-        with_installed(|values| values.observe(self.instrument, self.labels, count as f64));
     }
 }
 
@@ -616,9 +448,9 @@ impl CountHistogramSelection<'_> {
 pub struct Metrics {
     /// The process's CPU usage, in percent of one core; past 100 on several cores. The
     /// exported instrument is `process.cpu.utilization`, unit `1`.
-    pub cpu: ProcessGauge<f64>,
+    pub cpu: Gauge<f64, 0>,
     /// The process's resident set, in bytes: `process.memory.usage`.
-    pub memory: ProcessGauge<u64>,
+    pub memory: Gauge<u64, 0>,
 }
 
 /// The instruments every Rift crate records into.
@@ -626,7 +458,7 @@ pub struct Metrics {
 /// ```
 /// let metrics = rift_tracing::metrics();
 /// metrics.memory.value(4 << 20).record();
-/// metrics.cpu.current().record();
+/// metrics.cpu.value(12.5).record();
 /// ```
 #[must_use]
 pub fn metrics() -> &'static Metrics {
@@ -634,33 +466,22 @@ pub fn metrics() -> &'static Metrics {
 }
 
 static METRICS: Metrics = Metrics {
-    cpu: ProcessGauge::reading(PROCESS_CPU_UTILIZATION, ProcessSample::cpu_percent),
-    memory: ProcessGauge::reading(PROCESS_MEMORY_USAGE, ProcessSample::resident_bytes),
+    cpu: Gauge::declare("process.cpu.utilization", "1", &[]).scaled(0.01),
+    memory: Gauge::declare("process.memory.usage", "By", &[]),
 };
-
-/// `process.cpu.utilization`: recorded in percent, stored in the unit `1`.
-const PROCESS_CPU_UTILIZATION: Gauge<f64, 0> =
-    Gauge::declare("process.cpu.utilization", "1", &[]).scaled(0.01);
-/// `process.memory.usage`: the resident set in bytes.
-const PROCESS_MEMORY_USAGE: Gauge<u64, 0> = Gauge::declare("process.memory.usage", "By", &[]);
 
 /// The duration of every `traced!` operation, the name the OpenTelemetry Collector's span
 /// metrics connector derives from spans.
-pub(crate) const OPERATION_DURATION: Histogram<3> = Histogram::declare(
+pub(crate) static OPERATION_DURATION: Histogram<3> = Histogram::declare(
     "traces.span.metrics.duration",
     &["span.name", "status.code", "error.type"],
-)
-.series_max(OPERATION_SERIES_MAX);
+);
 /// The count of every `traced!` operation, beside [`OPERATION_DURATION`].
-pub(crate) const OPERATION_CALLS: Counter<3> = Counter::declare(
+pub(crate) static OPERATION_CALLS: Counter<3> = Counter::declare(
     "traces.span.metrics.calls",
     "{call}",
     &["span.name", "status.code", "error.type"],
-)
-.series_max(OPERATION_SERIES_MAX);
-/// Operation and outcome pairs each operation instrument keeps: every `traced!` literal of
-/// the workspace, three outcomes each, with room to spare.
-const OPERATION_SERIES_MAX: usize = 1_024;
+);
 
 /// The `status.code` of an operation that finished.
 const STATUS_OK: &str = "Ok";
@@ -686,10 +507,10 @@ enum Ending {
 /// The completion of one `traced!` operation: its duration and its outcome, recorded once
 /// when the guard drops.
 ///
-/// The guard reads the monotonic clock only when the thread's dispatcher holds metric
-/// values, so a thread recording no metrics pays one dispatcher lookup per operation.
-/// Retained clones of the operation's span do not lengthen the recorded duration: the
-/// guard drops when the work ends.
+/// The guard reads the monotonic clock only when a meter is installed, so a process that
+/// records no metrics pays one atomic read per operation. Retained clones of the
+/// operation's span do not lengthen the recorded duration: the guard drops when the work
+/// ends.
 #[doc(hidden)]
 #[derive(Debug)]
 #[must_use = "the completion records when it drops"]
@@ -769,32 +590,11 @@ pub(crate) fn future_completion(operation: &'static str) -> Completion {
 fn started(operation: &'static str, ending: Ending) -> Completion {
     Completion {
         operation,
-        started: installed().then(monotonic_now),
+        started: meter_installed().then(monotonic_now),
         ending,
         span: None,
     }
 }
-
-/// The `tracing` layer that carries a dispatcher's metric values, found through it by
-/// every handle that records. It observes no span or event.
-#[derive(Clone, Debug)]
-pub(crate) struct MetricLayer {
-    values: Arc<MetricValues>,
-}
-
-impl MetricLayer {
-    /// The layer over `values`.
-    pub(crate) const fn new(values: Arc<MetricValues>) -> Self {
-        Self { values }
-    }
-
-    /// The metric values the layer carries.
-    pub(crate) fn values(&self) -> &MetricValues {
-        &self.values
-    }
-}
-
-impl<S: Subscriber> Layer<S> for MetricLayer {}
 
 #[cfg(test)]
 mod tests;

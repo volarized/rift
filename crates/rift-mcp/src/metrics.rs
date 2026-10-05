@@ -68,7 +68,7 @@ const MCP_DURATION_BOUNDARIES_SECONDS: [f64; 14] = [
 
 /// `mcp.server.operation.duration`: one request `RiftMcp` answered, from the handler's
 /// start to its answer.
-pub(crate) const MCP_SERVER_OPERATION_DURATION: Histogram<6> = Histogram::declare(
+pub(crate) static MCP_SERVER_OPERATION_DURATION: Histogram<6> = Histogram::declare(
     "mcp.server.operation.duration",
     &[
         "mcp.method.name",
@@ -83,7 +83,7 @@ pub(crate) const MCP_SERVER_OPERATION_DURATION: Histogram<6> = Histogram::declar
 
 /// `mcp.client.operation.duration`: one request `rift mcp` forwarded, from the downstream
 /// handler's start to the answer it relays, a reconnect included.
-pub(crate) const MCP_CLIENT_OPERATION_DURATION: Histogram<6> = Histogram::declare(
+pub(crate) static MCP_CLIENT_OPERATION_DURATION: Histogram<6> = Histogram::declare(
     "mcp.client.operation.duration",
     &[
         "mcp.method.name",

@@ -1049,9 +1049,9 @@ fn a_dependency_span_without_labels_is_not_the_root() {
 }
 
 /// The cost of one operation's span and of one event inside it, through the layers a
-/// serving process installs: the metric values, the table of operations in flight, the
-/// stderr lines under the default stderr filter into `io::sink`, and the capture under the
-/// default capture filter into a queue a drain thread empties. 1,000,000 `traced!` block
+/// serving process installs: the table of operations in flight, the stderr lines under
+/// the default stderr filter into `io::sink`, and the capture under the default capture
+/// filter into a queue a drain thread empties. 1,000,000 `traced!` block
 /// operations per run, split across 1 and 8 threads, then as many events inside one span.
 /// Prints the median nanoseconds per operation and per event over five runs of every
 /// thread. Run it alone in a release build:
@@ -1069,7 +1069,6 @@ fn operation_record_cost() {
     use tracing_subscriber::Layer as _;
 
     use crate::flight::{FlightLayer, FlightTable};
-    use crate::metrics::{MetricLayer, MetricValues};
     use crate::render::LevelColor;
     use crate::runtime::{DEFAULT_STDERR_FILTER, DEFAULT_TRACING_FILTER, stderr_filter};
     use crate::stderr::StderrLines;
@@ -1091,7 +1090,6 @@ fn operation_record_cost() {
     };
     let dispatch = tracing::Dispatch::new(
         crate::capture::registry()
-            .with(MetricLayer::new(Arc::new(MetricValues::default())))
             .with(FlightLayer::new(Arc::new(FlightTable::default())))
             .with(
                 StderrLines::new(std::io::sink, LevelColor::Plain).with_filter(stderr_filter(

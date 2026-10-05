@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use super::{LogStore, METRICS_SCHEMA_VERSION, StoreClose, WalCheckpoint};
 use crate::{
     LOG_BATCH_RECORDS_MAX, LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogReader,
-    LogReads, LogRecord, RecordKind, SeriesValue,
+    LogReads, LogRecord, SeriesValue,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -278,43 +278,31 @@ async fn a_since_read_drops_records_recorded_earlier() -> TestResult {
     Ok(())
 }
 
-/// A record recorded at `recorded_at_ms`, of `kind`.
-fn recorded(recorded_at_ms: i64, kind: RecordKind, message: &str) -> LogRecord {
-    let record = LogRecord::new(
-        recorded_at_ms,
-        "info",
-        "rift_tracing::metric",
-        "",
-        "process",
-        message,
-        "{}",
-    );
-    match kind {
-        RecordKind::Log => record,
-        RecordKind::Metric => record.into_metric(),
-    }
+/// A record recorded at `recorded_at_ms`.
+fn recorded(recorded_at_ms: i64, message: &str) -> LogRecord {
+    LogRecord::new(recorded_at_ms, "info", "rift", "", "process", message, "{}")
 }
 
-/// The messages and kinds of `records`, in order.
-fn kinds(records: &[crate::StoredLogRecord]) -> Vec<(&str, RecordKind)> {
+/// The messages of `records`, in order.
+fn messages(records: &[crate::StoredLogRecord]) -> Vec<&str> {
     records
         .iter()
-        .map(|stored| (stored.record().message(), stored.record().kind()))
+        .map(|stored| stored.record().message())
         .collect()
 }
 
 #[tokio::test]
-async fn a_window_holds_records_and_snapshots_in_time_order_and_only_its_kind() -> TestResult {
+async fn a_window_holds_the_records_recorded_inside_it_in_time_order() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     store
         .append(
             &[
-                recorded(99, RecordKind::Log, "before"),
-                recorded(100, RecordKind::Log, "opened"),
-                recorded(150, RecordKind::Metric, "snapshot"),
-                recorded(199, RecordKind::Log, "closed"),
-                recorded(200, RecordKind::Metric, "after"),
+                recorded(99, "before"),
+                recorded(100, "opened"),
+                recorded(150, "inside"),
+                recorded(199, "closed"),
+                recorded(200, "after"),
             ],
             KEEP_EVERY,
         )
@@ -323,26 +311,10 @@ async fn a_window_holds_records_and_snapshots_in_time_order_and_only_its_kind() 
     let window = LogQuery::newest(10).since_ms(100).until_ms(200);
 
     assert_eq!(
-        kinds(&reads.following(&window.clone().of_every_kind())?),
-        [
-            ("opened", RecordKind::Log),
-            ("snapshot", RecordKind::Metric),
-            ("closed", RecordKind::Log),
-        ]
+        messages(&reads.following(&window)?),
+        ["opened", "inside", "closed"]
     );
-    assert_eq!(
-        kinds(&reads.following(&window.clone())?),
-        [("opened", RecordKind::Log), ("closed", RecordKind::Log)],
-        "a read asks for log records unless it names a kind"
-    );
-    assert_eq!(
-        kinds(&reads.following(&window.of_kind(RecordKind::Metric))?),
-        [("snapshot", RecordKind::Metric)]
-    );
-    assert_eq!(
-        kinds(&reads.recent(&LogQuery::newest(1).of_kind(RecordKind::Metric))?),
-        [("after", RecordKind::Metric)]
-    );
+    assert_eq!(messages(&reads.recent(&LogQuery::newest(1))?), ["after"]);
     Ok(())
 }
 
@@ -353,7 +325,7 @@ async fn a_window_pages_past_the_page_bound_and_starts_at_what_retention_kept() 
     let batch_records = i64::try_from(LOG_BATCH_RECORDS_MAX)?;
     let batch = |offset: i64| -> Vec<LogRecord> {
         (0..batch_records)
-            .map(|index| recorded(offset + index, RecordKind::Log, "paged"))
+            .map(|index| recorded(offset + index, "paged"))
             .collect()
     };
     let retention = (2 * LOG_BATCH_RECORDS_MAX - 100) as u64;

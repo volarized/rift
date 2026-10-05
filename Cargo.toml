@@ -66,10 +66,11 @@ oas3 = "=0.22.0"
 # pinned exactly rather than left to drift independently. `internal-logs` turns the SDK's own
 # reports - the first span a full batch queue drops, the dropped total at shutdown, a failed
 # export - into `tracing` events on the `opentelemetry_sdk` target; without it they compile to
-# nothing and a full queue drops spans silently. `metrics` exports the values rift-tracing's
-# instruments hold in process; the async-runtime periodic reader exports them over the same
-# Tokio-driven `reqwest` client the span batches use.
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["metrics", "trace"] }
+# nothing and a full queue drops spans silently. rift-tracing's instruments record through
+# the `metrics` API in every build; `trace` comes with the otlp feature. The SDK aggregates
+# and its async-runtime periodic reader exports over the same Tokio-driven `reqwest` client
+# the span batches use.
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["metrics"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = [
     "http-proto",
     "metrics",

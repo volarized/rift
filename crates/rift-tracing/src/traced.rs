@@ -245,8 +245,8 @@ pub fn parent_span(parent: &Span) -> Span {
 /// `status.code` and `error.type`, and the span records `code.function.name`, the
 /// function the macro expands in. The metric
 /// recording follows the operation, not its span: a clone of the span held elsewhere
-/// does not lengthen the duration, and the span's filters do not select it. A thread
-/// whose dispatcher holds no metric values records nothing and reads no clock for it.
+/// does not lengthen the duration, and the span's filters do not select it. A process
+/// that installed no meter records nothing and reads no clock for it.
 ///
 /// A computed operation name is refused at compile time:
 ///

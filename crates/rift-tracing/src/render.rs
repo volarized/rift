@@ -8,8 +8,8 @@
 //! ```
 //!
 //! - The function is the `code.function.name` of the root span, the outermost span around
-//!   the record; outside every span, the record's own; for a metric snapshot record, the
-//!   instrument group. A record that carries none prints its target.
+//!   the record; outside every span, the record's own. A record that carries none prints
+//!   its target.
 //! - The context is the root span's fields: `component`, `operation`, then the rest sorted
 //!   by key, `request_id` under the label `req`. A record outside every span prints its
 //!   own `component`, `operation`, and fields there instead.
@@ -17,12 +17,10 @@
 //!   record belongs to a span below the root.
 //! - The message is `close`, a mark, the reason the operation did not complete, then
 //!   `busy` and `idle` for a span close; a mark and the message for a lifecycle record;
-//!   the values for a metric snapshot record; the message and the record's own fields
-//!   otherwise.
+//!   the message and the record's own fields otherwise.
 //!
 //! A group is a run of consecutive records of one request; without a request, of one
-//! root span; without a span, of one function. Each metric snapshot record is a group of
-//! its own. A blank line separates two groups. A stored page pads each column to the
+//! root span; without a span, of one function. A blank line separates two groups. A stored page pads each column to the
 //! widest value of its group; a live stream, which does not know a group ahead, pads to
 //! fixed widths.
 
@@ -32,7 +30,7 @@ use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::capture::{OUTCOME_FIELD, completed_outcome};
-use crate::record::{LogRecord, RecordKind};
+use crate::record::LogRecord;
 
 /// The time a line prints: UTC with milliseconds, `2026-10-04 20:42:58.787Z`.
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3fZ";
@@ -223,8 +221,8 @@ enum Group {
 }
 
 impl Group {
-    /// Whether two records of these groups belong to one: a record without a group, a
-    /// metric snapshot record, belongs to none but its own.
+    /// Whether two records of these groups belong to one: a record without a group
+    /// belongs to none but its own.
     fn same(first: Option<&Self>, second: Option<&Self>) -> bool {
         matches!((first, second), (Some(first), Some(second)) if first == second)
     }
@@ -294,11 +292,6 @@ impl LineParts {
             message: String::new(),
             group: None,
         };
-        if record.kind() == RecordKind::Metric {
-            parts.function = escaped(label(record.operation()));
-            parts.message = own_pairs(&parsed_fields(record.fields()).unwrap_or_default());
-            return parts;
-        }
         let Some(mut own) = parsed_fields(record.fields()) else {
             parts.function = escaped(record.target());
             parts.context = labels_context(record, &Map::new());
@@ -661,11 +654,6 @@ fn level_color(level: &str) -> Option<u8> {
         "error" => Some(31),
         _ => None,
     }
-}
-
-/// The label a record carried, or `-` when it carried none.
-fn label(value: &str) -> &str {
-    if value.is_empty() { "-" } else { value }
 }
 
 /// Appends `text` to `line` with every character [`is_escaped`] names written as

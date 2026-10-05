@@ -9,24 +9,24 @@ use std::time::Duration;
 
 use tokio::runtime::RuntimeMetrics;
 
-use crate::metrics::{Counter, Gauge, MetricValues};
+use crate::metrics::{Counter, Gauge};
 
 /// `tokio.runtime.worker.count`: the runtime's worker threads.
-const RUNTIME_WORKERS: Gauge<u64, 0> =
+static RUNTIME_WORKERS: Gauge<u64, 0> =
     Gauge::declare("tokio.runtime.worker.count", "{thread}", &[]);
 /// `tokio.runtime.task.count`: the tasks alive in the runtime.
-const RUNTIME_TASKS: Gauge<u64, 0> = Gauge::declare("tokio.runtime.task.count", "{task}", &[]);
+static RUNTIME_TASKS: Gauge<u64, 0> = Gauge::declare("tokio.runtime.task.count", "{task}", &[]);
 /// `tokio.runtime.global_queue.length`: the tasks waiting in the runtime's global queue.
-const RUNTIME_GLOBAL_QUEUE: Gauge<u64, 0> =
+static RUNTIME_GLOBAL_QUEUE: Gauge<u64, 0> =
     Gauge::declare("tokio.runtime.global_queue.length", "{task}", &[]);
 /// `tokio.runtime.worker.busy.time`: the time every worker spent busy, in seconds.
-const RUNTIME_BUSY: Counter<0> = Counter::declare("tokio.runtime.worker.busy.time", "s", &[]);
+static RUNTIME_BUSY: Counter<0> = Counter::declare("tokio.runtime.worker.busy.time", "s", &[]);
 /// `tokio.runtime.worker.busy.time.max`: the busy time of the busiest worker over the last
 /// interval, in seconds.
-const RUNTIME_BUSY_MAX: Gauge<f64, 0> =
+static RUNTIME_BUSY_MAX: Gauge<f64, 0> =
     Gauge::declare("tokio.runtime.worker.busy.time.max", "s", &[]);
 /// `tokio.runtime.worker.parks`: the times every worker parked for lack of work.
-const RUNTIME_PARKS: Counter<0> = Counter::declare("tokio.runtime.worker.parks", "{park}", &[]);
+static RUNTIME_PARKS: Counter<0> = Counter::declare("tokio.runtime.worker.parks", "{park}", &[]);
 
 /// One read of a Tokio runtime.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -77,17 +77,18 @@ pub(crate) struct RuntimeSeries {
 }
 
 impl RuntimeSeries {
-    /// Records `reading` into the runtime instruments held in `values`: the counts as
-    /// gauges, and, from the second reading on, the busy time and parks since the previous
+    /// Records `reading` into the runtime instruments: the counts as gauges, and, from the second reading on, the busy time and parks since the previous
     /// reading, with the busiest worker's share. The first reading sets the base and
     /// records no change; a worker whose totals went backwards adds none.
-    pub(crate) fn observe(&mut self, reading: RuntimeReading, values: &MetricValues) {
+    pub(crate) fn observe(&mut self, reading: RuntimeReading) {
         for (gauge, count) in [
-            (RUNTIME_WORKERS, reading.workers),
-            (RUNTIME_TASKS, reading.alive_tasks),
-            (RUNTIME_GLOBAL_QUEUE, reading.global_queue_depth),
+            (&RUNTIME_WORKERS, reading.workers),
+            (&RUNTIME_TASKS, reading.alive_tasks),
+            (&RUNTIME_GLOBAL_QUEUE, reading.global_queue_depth),
         ] {
-            gauge.record_into(values, [], u64::try_from(count).unwrap_or(u64::MAX));
+            gauge
+                .value(u64::try_from(count).unwrap_or(u64::MAX))
+                .record();
         }
         if let Some(previous) = self.previous.as_ref() {
             let busy: Vec<Duration> = reading
@@ -98,9 +99,9 @@ impl RuntimeSeries {
                 .collect();
             if !busy.is_empty() {
                 let total: Duration = busy.iter().sum();
-                RUNTIME_BUSY.add_into(values, [], total.as_secs_f64());
+                RUNTIME_BUSY.labeled([]).add_fraction(total.as_secs_f64());
                 let busiest = busy.iter().max().copied().unwrap_or_default();
-                RUNTIME_BUSY_MAX.record_into(values, [], busiest.as_secs_f64());
+                RUNTIME_BUSY_MAX.value(busiest.as_secs_f64()).record();
             }
             let parks: u64 = reading
                 .parks
@@ -109,12 +110,7 @@ impl RuntimeSeries {
                 .map(|(now, before)| now.saturating_sub(*before))
                 .sum();
             if !reading.parks.is_empty() {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "a park count past 2^53 in one interval is not a runtime's"
-                )]
-                let parks = parks as f64;
-                RUNTIME_PARKS.add_into(values, [], parks);
+                RUNTIME_PARKS.add(parks);
             }
         }
         self.previous = Some(reading);

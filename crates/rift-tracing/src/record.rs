@@ -17,45 +17,14 @@ pub const LOG_PAGE_RECORDS_MAX: usize = 5_000;
 /// The levels a read accepts, in the spelling the store holds.
 pub const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
-/// What one stored row records: a log record, or a metric snapshot record.
-///
-/// Both kinds share one identity order and one clock, so a read of a window places a
-/// metric beside the log records around it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RecordKind {
-    /// An event, or the close of a span.
-    #[default]
-    Log,
-    /// The values of one group of metric instruments at one sampler tick.
-    Metric,
-}
-
-impl RecordKind {
-    /// The spelling the store's `kind` column holds.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Log => "log",
-            Self::Metric => "metric",
-        }
-    }
-
-    /// The kind a stored `kind` column names; a value this build does not write reads as
-    /// a log record.
-    pub(crate) fn from_label(label: &str) -> Self {
-        if label == Self::Metric.label() {
-            Self::Metric
-        } else {
-            Self::Log
-        }
-    }
-}
+/// The spelling every stored row's `kind` column holds: the store writes log records
+/// alone, and a read returns rows of this kind alone.
+pub(crate) const LOG_KIND: &str = "log";
 
 /// One record on its way into the store: when it happened, how severe it was,
 /// where it came from, and what it said.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
-    pub(crate) kind: RecordKind,
     pub(crate) recorded_at_ms: i64,
     pub(crate) level: String,
     pub(crate) target: String,
@@ -81,7 +50,6 @@ impl LogRecord {
         fields: &str,
     ) -> Self {
         Self {
-            kind: RecordKind::Log,
             recorded_at_ms,
             level: bounded(&level.to_lowercase(), LOG_LABEL_BYTES_MAX),
             target: bounded(target, LOG_LABEL_BYTES_MAX),
@@ -90,18 +58,6 @@ impl LogRecord {
             message: bounded(message, LOG_MESSAGE_BYTES_MAX),
             fields: bounded(fields, LOG_FIELDS_BYTES_MAX),
         }
-    }
-
-    /// The same record as a metric snapshot record.
-    pub(crate) fn into_metric(mut self) -> Self {
-        self.kind = RecordKind::Metric;
-        self
-    }
-
-    /// Whether the record is a log record or a metric snapshot record.
-    #[must_use]
-    pub const fn kind(&self) -> RecordKind {
-        self.kind
     }
 
     /// Milliseconds since the Unix epoch at which the record was emitted.
@@ -183,7 +139,6 @@ impl StoredLogRecord {
 /// Which records one read returns, and how many.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogQuery {
-    pub(crate) kind: Option<RecordKind>,
     pub(crate) level: Option<String>,
     pub(crate) component: Option<String>,
     pub(crate) after: Option<i64>,
@@ -194,14 +149,9 @@ pub struct LogQuery {
 
 impl LogQuery {
     /// A read of the newest `limit` log records, bounded by [`LOG_PAGE_RECORDS_MAX`].
-    ///
-    /// Metric snapshot records are left out until [`Self::of_kind`] or
-    /// [`Self::of_every_kind`] asks for them, so snapshots do not fill a page of
-    /// diagnostics.
     #[must_use]
     pub fn newest(limit: usize) -> Self {
         Self {
-            kind: Some(RecordKind::Log),
             level: None,
             component: None,
             after: None,
@@ -209,20 +159,6 @@ impl LogQuery {
             until_ms: None,
             limit: limit.min(LOG_PAGE_RECORDS_MAX),
         }
-    }
-
-    /// Restricts the read to records of one kind.
-    #[must_use]
-    pub const fn of_kind(mut self, kind: RecordKind) -> Self {
-        self.kind = Some(kind);
-        self
-    }
-
-    /// Reads log records and metric snapshot records alike.
-    #[must_use]
-    pub const fn of_every_kind(mut self) -> Self {
-        self.kind = None;
-        self
     }
 
     /// Restricts the read to one severity, matched in lower case.
@@ -261,12 +197,6 @@ impl LogQuery {
     pub const fn until_ms(mut self, recorded_at_ms: i64) -> Self {
         self.until_ms = Some(recorded_at_ms);
         self
-    }
-
-    /// The kind this read is restricted to; `None` reads every kind.
-    #[must_use]
-    pub const fn kind(&self) -> Option<RecordKind> {
-        self.kind
     }
 
     /// The severity this read is restricted to, when it is.

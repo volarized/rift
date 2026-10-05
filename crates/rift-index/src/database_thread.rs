@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rift_tracing::{CountHistogram, Counter, Gauge, Histogram, PerformanceMeasurement};
+use rift_tracing::{Counter, Gauge, Histogram, PerformanceMeasurement};
 use toasty_core::Schema;
 use toasty_core::driver::operation::{Operation, Transaction, TransactionMode};
 use toasty_core::driver::{
@@ -23,7 +23,7 @@ const CONNECTION_REAP_SPAN: Duration = Duration::from_millis(100);
 
 /// `db.client.operation.duration`: one driver operation's execution on the worker, its
 /// time in the queue left out.
-const OPERATION_DURATION: Histogram<5> = Histogram::declare(
+static OPERATION_DURATION: Histogram<5> = Histogram::declare(
     "db.client.operation.duration",
     &[
         "db.system.name",
@@ -37,17 +37,17 @@ const OPERATION_DURATION: Histogram<5> = Histogram::declare(
 const DB_SYSTEM: &str = "sqlite";
 /// `sqlite.queue.length`: commands sent to the worker and not yet received, read on the
 /// sampler tick.
-const QUEUE_LENGTH: Gauge<u64, 1> =
+static QUEUE_LENGTH: Gauge<u64, 1> =
     Gauge::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
 /// `sqlite.transaction.duration`: one transaction from its begin's answer to its commit's
 /// or rollback's answer, by `sqlite.transaction.result`.
-const TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
     "sqlite.transaction.duration",
     &["db.namespace", "sqlite.transaction.result"],
 );
 /// `sqlite.transaction.statement.count`: the statements one transaction ran, its begin,
 /// its savepoints, and its end left out.
-const TRANSACTION_STATEMENTS: CountHistogram<1> = CountHistogram::declare(
+static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
     "sqlite.transaction.statement.count",
     "{statement}",
     &["db.namespace"],
@@ -59,27 +59,27 @@ const STATEMENT_BOUNDARIES: [f64; 13] = [
 ];
 /// `sqlite.queue.wait.duration`: one driver operation's round trip to the worker less its
 /// execution there: the wait to enter the queue, the wait in it, and the reply.
-const QUEUE_WAIT: Histogram<2> = Histogram::declare(
+static QUEUE_WAIT: Histogram<2> = Histogram::declare(
     "sqlite.queue.wait.duration",
     &["db.namespace", "db.operation.name"],
 );
 /// `sqlite.queue.timeouts`: requests the full queue refused once the busy timeout passed.
-const QUEUE_TIMEOUTS: Counter<1> =
+static QUEUE_TIMEOUTS: Counter<1> =
     Counter::declare("sqlite.queue.timeouts", "{timeout}", &["db.namespace"]);
 /// `sqlite.write_lock.wait.duration`: one `BEGIN IMMEDIATE` on the worker, the wait for
 /// another connection's write lock inside `SQLite` included.
-const WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
     "sqlite.write_lock.wait.duration",
     &["db.namespace", "error.type"],
 );
 /// `sqlite.transaction.active`: transactions begun and not yet ended, per database.
-const TRANSACTION_ACTIVE: Gauge<u64, 1> = Gauge::declare(
+static TRANSACTION_ACTIVE: Gauge<u64, 1> = Gauge::declare(
     "sqlite.transaction.active",
     "{transaction}",
     &["db.namespace"],
 );
 /// `sqlite.commit.duration`: one `COMMIT` on the worker, a checkpoint it runs included.
-const COMMIT_DURATION: Histogram<1> =
+static COMMIT_DURATION: Histogram<1> =
     Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
 
 /// The `error.type` of a failed driver operation; its `SQLite` result code, when it has
@@ -1272,7 +1272,7 @@ mod tests {
         let timeouts = metrics
             .find("sqlite.queue.timeouts", &[("db.namespace", "index")])
             .expect("the refusals were counted");
-        assert_eq!(timeouts.instrument().unit(), "{timeout}");
+        assert_eq!(timeouts.unit(), "{timeout}");
         assert_eq!(
             timeouts.value(),
             &rift_tracing::SeriesValue::Sum(f64::from(refusals))

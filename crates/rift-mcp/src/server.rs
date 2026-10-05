@@ -124,7 +124,7 @@ enum WorkerAdmission {
 
 /// `worker_pool.permit.count`: the blocking pool's worker permits, by
 /// `worker_pool.permit.state` = `available` or `used`, read on the sampler tick.
-const WORKER_PERMIT_COUNT: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+static WORKER_PERMIT_COUNT: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
     "worker_pool.permit.count",
     "{permit}",
     &["worker_pool.permit.state"],
@@ -6844,10 +6844,12 @@ done
             .series()
             .iter()
             .filter(|series| {
+                let labels = series.labels();
                 series.name() == name
-                    && series.labels().first() == Some(&("mcp.method.name", "resources/read"))
-                    && series.labels().iter().any(|(key, _)| *key == "error.type")
-                    && series.labels().ends_with(&[version, transport])
+                    && labels.contains(&("mcp.method.name", "resources/read"))
+                    && labels.iter().any(|(key, _)| *key == "error.type")
+                    && labels.contains(&version)
+                    && labels.contains(&transport)
             })
             .map(|series| match series.value() {
                 rift_tracing::SeriesValue::Buckets { count, .. } => *count,

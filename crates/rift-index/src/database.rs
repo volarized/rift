@@ -48,7 +48,7 @@ use crate::lexical::{LexicalDocumentRecord, LexicalFileRecord, LexicalIndexState
 use crate::vector::{VECTORS_MIGRATIONS, VectorRecord};
 
 /// `db.client.connection.count`: the pool's connections, by `idle` or `used`.
-const CONNECTION_COUNT: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
+static CONNECTION_COUNT: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
     "db.client.connection.count",
     "{connection}",
     &[
@@ -57,31 +57,31 @@ const CONNECTION_COUNT: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::decla
     ],
 );
 /// `db.client.connection.max`: the most connections the pool opens.
-const CONNECTION_MAX: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+static CONNECTION_MAX: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
     "db.client.connection.max",
     "{connection}",
     &["db.client.connection.pool.name"],
 );
 /// `db.client.connection.pending_requests`: checkouts waiting for a free connection.
-const CONNECTION_PENDING: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+static CONNECTION_PENDING: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
     "db.client.connection.pending_requests",
     "{request}",
     &["db.client.connection.pool.name"],
 );
 /// `db.client.connection.wait_time`: one checkout, from its request to a connection or a
 /// refusal.
-const CONNECTION_WAIT: rift_tracing::Histogram<1> = rift_tracing::Histogram::declare(
+static CONNECTION_WAIT: rift_tracing::Histogram<1> = rift_tracing::Histogram::declare(
     "db.client.connection.wait_time",
     &["db.client.connection.pool.name"],
 );
 /// `db.client.connection.timeouts`: checkouts the pool refused once its wait bound passed.
-const CONNECTION_TIMEOUTS: rift_tracing::Counter<1> = rift_tracing::Counter::declare(
+static CONNECTION_TIMEOUTS: rift_tracing::Counter<1> = rift_tracing::Counter::declare(
     "db.client.connection.timeouts",
     "{timeout}",
     &["db.client.connection.pool.name"],
 );
 /// `sqlite.file.size`: the size of the database file and of its write-ahead log.
-const FILE_SIZE: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
+static FILE_SIZE: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
     "sqlite.file.size",
     "By",
     &["db.namespace", "sqlite.file.type"],
@@ -328,7 +328,7 @@ pub struct WorkspaceDatabase {
     /// the worker when the deadline passed.
     checkpoint_outlasted: AtomicBool,
     /// Records the file sizes and the worker's queue length on each tick of the process
-    /// sampler while the database lives; absent where no dispatcher holds metric values.
+    /// sampler while the database lives; absent where the process installed no meter.
     _file_size_sampling: Option<rift_tracing::SampleHook>,
 }
 
@@ -1560,7 +1560,7 @@ mod tests {
         let system = ("db.system.name", "sqlite");
         let per_operation = [system, vectors, ("db.operation.name", "transaction")];
         let operation = series(&metrics, "db.client.operation.duration", &per_operation)?;
-        assert_eq!(operation.instrument().unit(), "s");
+        assert_eq!(operation.unit(), "s");
         assert!(
             observations(operation) >= 2,
             "begin and commit are operations"
@@ -1572,7 +1572,7 @@ mod tests {
         let committed = series(&metrics, "sqlite.commit.duration", &[vectors])?;
         assert_eq!(observations(committed), 1, "one COMMIT");
         let active = series(&metrics, "sqlite.transaction.active", &[vectors])?;
-        assert_eq!(active.instrument().unit(), "{transaction}");
+        assert_eq!(active.unit(), "{transaction}");
         assert!(
             last(active).abs() < f64::EPSILON,
             "the commit ended the transaction"
@@ -1581,7 +1581,7 @@ mod tests {
         let lasted = series(&metrics, "sqlite.transaction.duration", &[vectors, result])?;
         assert_eq!(observations(lasted), 1, "one committed transaction");
         let statements = series(&metrics, "sqlite.transaction.statement.count", &[vectors])?;
-        assert_eq!(statements.instrument().unit(), "{statement}");
+        assert_eq!(statements.unit(), "{statement}");
         assert!(
             matches!(
                 statements.value(),
@@ -1609,7 +1609,7 @@ mod tests {
         series(&metrics, pending, &[pool_name])?;
         let database_file = [vectors, ("sqlite.file.type", "database")];
         let size = series(&metrics, "sqlite.file.size", &database_file)?;
-        assert_eq!(size.instrument().unit(), "By");
+        assert_eq!(size.unit(), "By");
         assert!(last(size) > 0.0, "the open database file has pages");
         assert!(
             metrics
@@ -1649,10 +1649,10 @@ mod tests {
         let queued = recorder
             .metrics()
             .find("sqlite.queue.length", &[("db.namespace", "index")])
-            .map(|series| (series.instrument().unit(), series.value().clone()));
+            .map(|series| (series.unit().to_owned(), series.value().clone()));
         assert_eq!(
             queued,
-            Some(("{command}", rift_tracing::SeriesValue::Last(0.0))),
+            Some(("{command}".to_owned(), rift_tracing::SeriesValue::Last(0.0))),
             "no command waits in the idle worker's queue"
         );
         drop(database);
@@ -1684,7 +1684,7 @@ mod tests {
 
         let index_pool = [("db.client.connection.pool.name", "index")];
         let timeouts = series(&metrics, "db.client.connection.timeouts", &index_pool)?;
-        assert_eq!(timeouts.instrument().unit(), "{timeout}");
+        assert_eq!(timeouts.unit(), "{timeout}");
         assert_eq!(timeouts.value(), &rift_tracing::SeriesValue::Sum(1.0));
         Ok(())
     }

@@ -508,7 +508,7 @@ fn publication_map(
 /// `index.epoch`: the epoch the index last published and the filesystem epoch it last
 /// observed, recorded where each one moves. An observed epoch running ahead of the
 /// published one is an index behind the tree.
-const INDEX_EPOCH: rift_tracing::Gauge<u64, 1> =
+static INDEX_EPOCH: rift_tracing::Gauge<u64, 1> =
     rift_tracing::Gauge::declare("index.epoch", "{epoch}", &["index.epoch.kind"]);
 /// The `index.epoch.kind` of the epoch a publication installs.
 const INDEX_EPOCH_PUBLISHED: &str = "published";

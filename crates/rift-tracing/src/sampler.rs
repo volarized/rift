@@ -3,9 +3,7 @@
 //! A tick reads the process once on the blocking pool, through `sysinfo`, and never walks
 //! another process. The sample it publishes carries what the platform reported and the
 //! changes since the previous one; a reading the platform does not report stays absent and
-//! never becomes zero. The sampler records each sample into the process instruments, and
-//! [`ProcessGauge::current`](crate::ProcessGauge::current) reads the latest one without an
-//! OS read of its own.
+//! never becomes zero. The sampler records each sample into the process instruments.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -20,11 +18,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use self::tokio_runtime::{RuntimeReading, RuntimeSeries};
-use crate::capture::now_ms;
 use crate::flight::{FlightTable, publish_stalled};
 use crate::measurement::monotonic_now;
-use crate::metrics::{Counter, Gauge, MetricLayer, MetricValues, metrics};
-use crate::snapshot::{self, SnapshotSeries};
+use crate::metrics::{Counter, Gauge, meter_installed, metrics};
 
 /// The shortest interval the sampler refreshes the process at. CPU usage is the change of
 /// CPU time over the wall time between two refreshes, and `sysinfo` reads it reliably only
@@ -35,26 +31,26 @@ const _: () = assert!(
     sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.as_millis() <= PROCESS_SAMPLE_INTERVAL_MIN.as_millis()
 );
 
-/// Sample hooks one dispatcher's sampler runs, at most. A registration past it is refused.
+/// Sample hooks the process's sampler runs, at most. A registration past it is refused.
 pub const SAMPLE_HOOKS_MAX: usize = 64;
 
 /// `process.memory.virtual`: the virtual memory size in bytes.
-const PROCESS_MEMORY_VIRTUAL: Gauge<u64, 0> = Gauge::declare("process.memory.virtual", "By", &[]);
+static PROCESS_MEMORY_VIRTUAL: Gauge<u64, 0> = Gauge::declare("process.memory.virtual", "By", &[]);
 /// `process.cpu.time`: CPU time the process consumed, in seconds.
-const PROCESS_CPU_TIME: Counter<0> = Counter::declare("process.cpu.time", "s", &[]);
+static PROCESS_CPU_TIME: Counter<0> = Counter::declare("process.cpu.time", "s", &[]);
 /// Open file descriptors: `process.unix.file_descriptor.count`.
 #[cfg(not(windows))]
-const PROCESS_OPEN_FILES: Gauge<u64, 0> = Gauge::declare(
+static PROCESS_OPEN_FILES: Gauge<u64, 0> = Gauge::declare(
     "process.unix.file_descriptor.count",
     "{file_descriptor}",
     &[],
 );
 /// Open handles of every kind: `process.windows.handle.count`.
 #[cfg(windows)]
-const PROCESS_OPEN_FILES: Gauge<u64, 0> =
+static PROCESS_OPEN_FILES: Gauge<u64, 0> =
     Gauge::declare("process.windows.handle.count", "{handle}", &[]);
 /// `process.disk.io`: bytes read and written, by `disk.io.direction`.
-const PROCESS_DISK_IO: Counter<1> =
+static PROCESS_DISK_IO: Counter<1> =
     Counter::declare("process.disk.io", "By", &["disk.io.direction"]);
 
 /// One read of the process, as the platform reported it.
@@ -76,12 +72,9 @@ pub(crate) struct ProcessReading {
     pub(crate) written_bytes: Option<u64>,
 }
 
-/// One published sample: the reading, when it was taken, and its changes since the
-/// previous sample.
+/// One sample: the reading and its changes since the previous sample.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ProcessSample {
-    /// Milliseconds since the Unix epoch, on the log records' clock.
-    recorded_at_ms: i64,
     reading: ProcessReading,
     cpu_percent: Option<f64>,
     resident_change: Option<i64>,
@@ -97,16 +90,6 @@ impl ProcessSample {
         self.cpu_percent
     }
 
-    /// When the sample was taken, in milliseconds since the Unix epoch.
-    pub(crate) const fn recorded_at_ms(&self) -> i64 {
-        self.recorded_at_ms
-    }
-
-    /// Resident set size in bytes.
-    pub(crate) fn resident_bytes(&self) -> Option<u64> {
-        self.reading.resident_bytes
-    }
-
     /// Signed change of the resident set since the previous sample, in bytes.
     #[cfg(test)]
     pub(crate) const fn resident_change(&self) -> Option<i64> {
@@ -119,27 +102,33 @@ impl ProcessSample {
         self.cpu_time_change_ms
     }
 
-    /// Records the sample into every process instrument held in `values`.
+    /// Records the sample into every process instrument.
     #[expect(
         clippy::cast_precision_loss,
         reason = "a CPU time change past 2^53 milliseconds is not a sampler interval"
     )]
-    pub(crate) fn record_into(&self, values: &MetricValues) {
+    pub(crate) fn record(&self) {
         let metrics = metrics();
-        metrics.memory.record_sample_into(values, self);
-        metrics.cpu.record_sample_into(values, self);
+        if let Some(bytes) = self.reading.resident_bytes {
+            metrics.memory.value(bytes).record();
+        }
+        if let Some(percent) = self.cpu_percent() {
+            metrics.cpu.value(percent).record();
+        }
         if let Some(bytes) = self.reading.virtual_bytes {
-            PROCESS_MEMORY_VIRTUAL.record_into(values, [], bytes);
+            PROCESS_MEMORY_VIRTUAL.value(bytes).record();
         }
         if let Some(count) = self.reading.open_files {
-            PROCESS_OPEN_FILES.record_into(values, [], count);
+            PROCESS_OPEN_FILES.value(count).record();
         }
         if let Some(change) = self.cpu_time_change_ms {
-            PROCESS_CPU_TIME.add_into(values, [], change as f64 / 1_000.0);
+            PROCESS_CPU_TIME
+                .labeled([])
+                .add_fraction(change as f64 / 1_000.0);
         }
         for (direction, change) in [("read", self.read_change), ("write", self.written_change)] {
             if let Some(bytes) = change {
-                PROCESS_DISK_IO.add_into(values, [direction], bytes as f64);
+                PROCESS_DISK_IO.labeled([direction]).add(bytes);
             }
         }
     }
@@ -152,25 +141,18 @@ pub(crate) struct SampleSeries {
 }
 
 impl SampleSeries {
-    /// The sample of `reading`, taken `at` on a monotonic clock and `recorded_at_ms` on
-    /// the log clock.
+    /// The sample of `reading`, taken `at` on a monotonic clock.
     ///
     /// CPU usage is kept only when a previous reading exists at least
     /// [`PROCESS_SAMPLE_INTERVAL_MIN`] earlier: the first refresh reports no usage, and
     /// two readings at one instant measure none. A total that went backwards gives no
     /// change; the next sample measures from the lower total.
-    pub(crate) fn observe(
-        &mut self,
-        reading: ProcessReading,
-        at: Duration,
-        recorded_at_ms: i64,
-    ) -> ProcessSample {
+    pub(crate) fn observe(&mut self, reading: ProcessReading, at: Duration) -> ProcessSample {
         let previous = self.previous.replace((reading, at));
         let warmed = previous
             .is_some_and(|(_, then)| at.saturating_sub(then) >= PROCESS_SAMPLE_INTERVAL_MIN);
         let before = previous.map(|(before, _)| before).unwrap_or_default();
         ProcessSample {
-            recorded_at_ms,
             reading,
             cpu_percent: reading
                 .cpu_percent
@@ -262,10 +244,9 @@ type SampleRead = dyn Fn() + Send + Sync;
 /// dropping it removes the callback.
 ///
 /// The callback runs on the blocking pool beside the process read, under the dispatcher
-/// that was current when it was registered, so the gauges it records land in that
-/// dispatcher's metric values before the tick's snapshot reads them. It may block on a
-/// file metadata read; it holds up its own tick and no runtime worker. A callback that
-/// panics loses that tick's reads and stays registered.
+/// that was current when it was registered, so a record it emits reaches that
+/// dispatcher. It may block on a file metadata read; it holds up its own tick and no
+/// runtime worker. A callback that panics loses that tick's reads and stays registered.
 #[must_use = "dropping the hook removes it from the sampler"]
 pub struct SampleHook {
     _read: Arc<SampleRead>,
@@ -277,35 +258,43 @@ impl fmt::Debug for SampleHook {
     }
 }
 
-/// Registers `read` with the sampler of the thread's current dispatcher, to run on each
-/// tick until the returned [`SampleHook`] drops.
+/// Registers `read` with the process's sampler, to run on each tick under the thread's
+/// current dispatcher until the returned [`SampleHook`] drops.
 ///
-/// Answers `None`, and registers nothing, when the dispatcher holds no metric values, or
-/// when [`SAMPLE_HOOKS_MAX`] hooks are already registered with it. A dispatcher whose
-/// runtime runs no sampler holds the hook and never runs it.
+/// Answers `None`, and registers nothing, when the process installed no meter, so a gauge
+/// the hook records would record nothing, or when [`SAMPLE_HOOKS_MAX`] hooks are already
+/// registered. A process whose runtime runs no sampler holds the hook and never runs it.
 ///
 /// ```
-/// const QUEUED: rift_tracing::Gauge<u64, 0> =
+/// static QUEUED: rift_tracing::Gauge<u64, 0> =
 ///     rift_tracing::Gauge::declare("test.queue.length", "{task}", &[]);
+/// // `None` in a process that installed no meter.
 /// let hook = rift_tracing::sample_hook(|| QUEUED.value(3).record());
-/// assert!(hook.is_none(), "no dispatcher holds metric values here");
+/// drop(hook);
 /// ```
 pub fn sample_hook(read: impl Fn() + Send + Sync + 'static) -> Option<SampleHook> {
-    let mut read = Some(read);
-    tracing::dispatcher::get_default(|dispatch| {
-        let layer = dispatch.downcast_ref::<MetricLayer>()?;
-        let read: Arc<SampleRead> = Arc::new(read.take()?);
-        layer
-            .values()
-            .hooks()
-            .register(&read, dispatch.downgrade())
-            .then_some(SampleHook { _read: read })
-    })
+    if !meter_installed() {
+        return None;
+    }
+    let read: Arc<SampleRead> = Arc::new(read);
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::downgrade);
+    HOOKS
+        .register(&read, dispatch)
+        .then_some(SampleHook { _read: read })
 }
 
-/// The hooks one dispatcher's metric values hold: each callback and its dispatcher, both
-/// weak, so neither a dropped owner's callback nor the dispatcher stays alive through them.
-#[derive(Default)]
+/// The live hooks of the process, those of dropped owners or dispatchers left out.
+pub(crate) fn live_hooks() -> Vec<(Arc<SampleRead>, tracing::Dispatch)> {
+    HOOKS.live()
+}
+
+/// The process's hooks.
+static HOOKS: SampleHooks = SampleHooks {
+    registered: Mutex::new(Vec::new()),
+};
+
+/// The hooks the process registered: each callback and its dispatcher, both weak, so
+/// neither a dropped owner's callback nor the dispatcher stays alive through them.
 pub(crate) struct SampleHooks {
     registered: Mutex<Vec<(Weak<SampleRead>, tracing::dispatcher::WeakDispatch)>>,
 }
@@ -377,8 +366,7 @@ pub(crate) fn run_hooks(hooks: Vec<(Arc<SampleRead>, tracing::Dispatch)>) -> usi
 }
 
 /// What the sampler publishes into the log stream beside each sample: the runtime sample,
-/// the entries of the table of operations in flight open past `stall_delay`, and metric
-/// snapshot records.
+/// and the entries of the table of operations in flight open past `stall_delay`.
 #[derive(Debug, Default)]
 pub(crate) struct TickEvidence {
     /// The Tokio runtime each tick reads into the `runtime` group; none reads no runtime.
@@ -390,16 +378,11 @@ pub(crate) struct TickEvidence {
 }
 
 impl TickEvidence {
-    /// Reports the stalled entries, then the metric snapshot of `values`: a snapshot
-    /// publishes when a counter moved, or when this tick reported a stall.
-    fn publish(&self, values: &MetricValues, snapshots: &mut SnapshotSeries) {
-        let stalled = match (&self.flights, self.stall_delay) {
-            (Some(flights), Some(stall_delay)) => {
-                publish_stalled(flights, monotonic_now(), stall_delay)
-            }
-            _ => false,
-        };
-        snapshot::publish(&snapshots.records(&values.snapshot(), stalled));
+    /// Reports the entries open past `stall_delay`.
+    fn publish(&self) {
+        if let (Some(flights), Some(stall_delay)) = (&self.flights, self.stall_delay) {
+            publish_stalled(flights, monotonic_now(), stall_delay);
+        }
     }
 }
 
@@ -412,19 +395,17 @@ pub(crate) struct ProcessSampler {
 
 impl ProcessSampler {
     /// Starts sampling the process `reader` reads every `interval` on the current Tokio
-    /// runtime, publishing each sample into `values`. An interval below
+    /// runtime, recording each sample into the process instruments. An interval below
     /// [`PROCESS_SAMPLE_INTERVAL_MIN`] samples at that minimum.
     pub(crate) fn spawn(
         reader: impl ProcessReader,
         interval: Duration,
-        values: Arc<MetricValues>,
         evidence: TickEvidence,
     ) -> Self {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(sample(
             reader,
             interval.max(PROCESS_SAMPLE_INTERVAL_MIN),
-            values,
             evidence,
             cancel.clone(),
         ));
@@ -452,14 +433,12 @@ impl ProcessSampler {
 async fn sample(
     mut reader: impl ProcessReader,
     interval: Duration,
-    values: Arc<MetricValues>,
     evidence: TickEvidence,
     cancel: CancellationToken,
 ) {
     let started = Instant::now();
     let mut series = SampleSeries::default();
     let mut runtime = RuntimeSeries::default();
-    let mut snapshots = SnapshotSeries::default();
     let mut ticks = tokio::time::interval(interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -468,7 +447,7 @@ async fn sample(
             () = cancel.cancelled() => return,
             _ = ticks.tick() => {}
         }
-        let hooks = values.hooks().live();
+        let hooks = live_hooks();
         let read = tokio::task::spawn_blocking(move || {
             let reading = reader.read();
             let _ran = run_hooks(hooks);
@@ -483,13 +462,12 @@ async fn sample(
             return;
         };
         reader = returned;
-        let sample = series.observe(reading, started.elapsed(), now_ms());
-        sample.record_into(&values);
-        values.publish_sample(sample);
+        let sample = series.observe(reading, started.elapsed());
+        sample.record();
         if let Some(metrics) = &evidence.runtime {
-            runtime.observe(RuntimeReading::of(metrics), &values);
+            runtime.observe(RuntimeReading::of(metrics));
         }
-        evidence.publish(&values, &mut snapshots);
+        evidence.publish();
     }
 }
 

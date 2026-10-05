@@ -25,18 +25,19 @@
 //! [`TracingRuntime::shutdown`]. [`LogLines`] prints records the way stderr and
 //! `rift server logs` show them.
 //!
-//! Code records values into typed instruments: [`metrics`] returns the ones Rift declares,
-//! and [`Counter`], [`Gauge`], and [`Histogram`] declare more. Every [`traced!`] operation
-//! records its duration and outcome, and the runtime's process sampler publishes the
-//! process's memory, CPU, open files, and disk bytes. [`TracingRuntime::metrics`] reads
-//! every value in process, in every build.
+//! Code records values into typed instruments over the OpenTelemetry metrics API:
+//! [`metrics`] returns the ones Rift declares, and [`Counter`], [`Gauge`], and
+//! [`Histogram`] declare more. Every [`traced!`] operation records its duration and
+//! outcome, and the runtime's process sampler records the process's memory, CPU, open
+//! files, and disk bytes. The OpenTelemetry SDK aggregates and exports them over OTLP when
+//! the `otlp` feature is compiled in and an endpoint is configured; otherwise a recording
+//! records nothing.
 //!
 //! Work still running is evidence too. Every operation, and every wait for and hold of a
 //! lock recorded through [`lock`], stays in the table of operations in flight until it
 //! closes; [`publish_in_flight`] writes the table as one record, and the process sampler
-//! reports each entry open past `[logs] stall_delay` and writes metric snapshot records,
-//! [`RecordKind::Metric`], into the same stream. [`LogQuery`] selects a window of either
-//! kind.
+//! reports each entry open past `[logs] stall_delay`. [`LogQuery`] selects a window of
+//! records.
 //!
 //! A test captures what the code under test records through a `ScopedRecorder`, which the
 //! `fixtures` feature compiles in; dependent crates enable it from their
@@ -60,7 +61,6 @@ mod recorder;
 mod render;
 mod runtime;
 mod sampler;
-mod snapshot;
 mod span;
 mod stderr;
 mod store;
@@ -74,21 +74,18 @@ pub use flight::{OPERATIONS_IN_FLIGHT_MAX, publish_in_flight, warn_in_flight};
 pub use lock::{Acquire, Held, Lock, Refusal, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use metrics::{
-    CountHistogram, CountHistogramSelection, Counter, CounterSelection,
-    DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue, HISTOGRAM_BOUNDARIES_MAX,
-    Histogram, HistogramSelection, Instrument, InstrumentKind, METRIC_LABELS_MAX,
-    METRIC_SERIES_MAX_DEFAULT, MetricSeries, MetricSnapshot, Metrics, ProcessGauge, SeriesValue,
-    metrics,
+    Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge, GaugeSelection, GaugeValue,
+    Histogram, HistogramSelection, HistogramValue, Metrics, metrics,
 };
 pub use reads::{LogReader, LogReads};
 pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
-    LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, RecordKind, StoredLogRecord,
+    LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord,
 };
 #[cfg(any(test, feature = "fixtures"))]
 pub use recorder::{
-    SCOPED_RECORDER_PRINT_BYTES_MAX, SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder,
-    ScopedRecorderBuilder,
+    MetricSeries, MetricSnapshot, SCOPED_RECORDER_PRINT_BYTES_MAX,
+    SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder, ScopedRecorderBuilder, SeriesValue,
 };
 pub use render::LogLines;
 pub use runtime::{

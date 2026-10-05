@@ -281,30 +281,6 @@ fn a_lifecycle_record_inside_a_span_prints_its_fields_after_the_message() {
     );
 }
 
-/// A metric snapshot record prints its instrument group in the function column and its
-/// values as the message, and is a group of its own.
-#[test]
-fn a_metric_snapshot_prints_its_group_and_values() {
-    let snapshot = LogRecord::new(
-        SAMPLE_MS,
-        "info",
-        "rift_tracing::metric",
-        "",
-        "runtime",
-        "metric snapshot",
-        "{\"tokio.runtime.task.count\":42,\"tokio.runtime.global_queue.length\":7}",
-    )
-    .into_metric();
-
-    assert_eq!(
-        page(&[snapshot.clone(), snapshot]),
-        "2026-10-04 20:42:58.787Z INFO  runtime   tokio.runtime.global_queue.length=7 \
-         tokio.runtime.task.count=42\n\n\
-         2026-10-04 20:42:58.787Z INFO  runtime   tokio.runtime.global_queue.length=7 \
-         tokio.runtime.task.count=42\n"
-    );
-}
-
 /// A blank line separates two groups: two requests, then a record outside every span.
 /// Each group pads to its own widths, and a later call breaks against the group the
 /// previous call ended in.

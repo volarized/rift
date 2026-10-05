@@ -23,7 +23,6 @@ use tracing_subscriber::{EnvFilter, Layer};
 use crate::capture::{LogSink, log_capture};
 use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable};
-use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::otlp;
 use crate::render::LevelColor;
 use crate::sampler::{ProcessSampler, SystemProcessReader, TickEvidence};
@@ -32,11 +31,10 @@ use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrL
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 pub(crate) const DEFAULT_TRACING_FILTER: &str =
     "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
-/// Default stderr filter: the default targets, without metric snapshot records and with
-/// only the stall reports of the table of operations in flight. Both reach the capture
-/// under its own filter.
+/// Default stderr filter: the default targets, with only the stall reports of the table of
+/// operations in flight. The table's other records reach the capture under its own filter.
 pub(crate) const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
-                                     rift_tracing::metric=off,rift_tracing::flight=warn";
+                                     rift_tracing::flight=warn";
 
 /// How much the process may write to its standard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,13 +132,11 @@ impl std::error::Error for InstallError {
 
 /// The installed subscriber's handle, held until the process stops tracing.
 ///
-/// Its OTLP export holds nothing unless the `otlp` feature is compiled in and
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; [`TracingRuntime::shutdown`] runs either
-/// way.
+/// Its OTLP export holds nothing unless the `otlp` feature is compiled in and an OTLP
+/// endpoint variable names a collector; [`TracingRuntime::shutdown`] runs either way.
 #[must_use = "the runtime flushes its export only when shut down"]
 pub struct TracingRuntime {
     export: otlp::Export,
-    values: Arc<MetricValues>,
     sampler: Option<ProcessSampler>,
 }
 
@@ -155,12 +151,6 @@ impl TracingRuntime {
             sample_interval: None,
             stall_delay: None,
         }
-    }
-
-    /// Every value the process's instruments hold now, read in process.
-    #[must_use]
-    pub fn metrics(&self) -> MetricSnapshot {
-        self.values.snapshot()
     }
 
     /// Stops the process sampler, then flushes buffered spans and shuts the OTLP export
@@ -264,16 +254,12 @@ impl TracingRuntimeBuilder {
             None => (None, None),
         };
         let (otlp_layer, export) = otlp::layer();
-        #[cfg(feature = "otlp")]
-        let values = Arc::new(MetricValues::exporting(export.metrics()));
-        #[cfg(not(feature = "otlp"))]
-        let values = Arc::new(MetricValues::default());
         let (writer, drain) = match self.stderr {
             StderrPolicy::Unbounded => (BoxMakeWriter::new(std::io::stderr), drain),
             StderrPolicy::Bounded => {
                 let bound = Arc::new(StderrBound::new(self.stderr_limit));
                 let drain = drain.map(|drain| drain.with_stderr(Arc::clone(&bound)));
-                let writer = BoundedStderr::new(bound, Arc::clone(&values));
+                let writer = BoundedStderr::new(bound);
                 (BoxMakeWriter::new(writer), drain)
             }
         };
@@ -288,7 +274,6 @@ impl TracingRuntimeBuilder {
         let stderr_layer = StderrLines::new(writer, color);
         let flights = Arc::new(FlightTable::default());
         let installed = crate::capture::registry()
-            .with(MetricLayer::new(Arc::clone(&values)))
             .with(FlightLayer::new(Arc::clone(&flights)))
             .with(
                 stderr_layer.with_filter(stderr_filter(
@@ -303,6 +288,7 @@ impl TracingRuntimeBuilder {
             export.shutdown();
             return Err(InstallError(error));
         }
+        export.install_meter();
         let sampler = self.sample_interval.and_then(|interval| {
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 eprintln!("rift: warning: no Tokio runtime runs the process sampler");
@@ -311,7 +297,6 @@ impl TracingRuntimeBuilder {
             Some(ProcessSampler::spawn(
                 SystemProcessReader::current(),
                 interval,
-                Arc::clone(&values),
                 TickEvidence {
                     runtime: Some(handle.metrics()),
                     flights: Some(Arc::clone(&flights)),
@@ -319,14 +304,7 @@ impl TracingRuntimeBuilder {
                 },
             ))
         });
-        Ok((
-            TracingRuntime {
-                export,
-                values,
-                sampler,
-            },
-            drain,
-        ))
+        Ok((TracingRuntime { export, sampler }, drain))
     }
 }
 

@@ -1,23 +1,18 @@
-//! Optional OTLP export of Rift's `tracing` spans and metric values, behind the `otlp` cargo
+//! Optional OTLP export of Rift's `tracing` spans and metrics, behind the `otlp` cargo
 //! feature.
 //!
 //! The `rift` binary's `otlp` feature turns this crate's on. Off by default, so a release
 //! binary built without `--features otlp` carries no
 //! OpenTelemetry export stack. Compiled in, the process still exports nothing until an
-//! operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` - the in-memory collector `just
-//! trace-collector` runs, or any other OTLP/HTTP receiver.
-
-#[cfg(feature = "otlp")]
-use std::collections::HashMap;
-#[cfg(feature = "otlp")]
-use std::sync::{Mutex, PoisonError};
+//! operator sets an OTLP endpoint variable - for the in-memory collector `just
+//! trace-collector` runs, or any other OTLP/HTTP receiver. Spans export when
+//! `OTEL_EXPORTER_OTLP_ENDPOINT` is set; metrics when it or
+//! `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is.
 
 #[cfg(feature = "otlp")]
 use opentelemetry::metrics::MeterProvider as _;
 #[cfg(feature = "otlp")]
 use opentelemetry::trace::TracerProvider as _;
-#[cfg(feature = "otlp")]
-use opentelemetry::{InstrumentationScope, KeyValue};
 #[cfg(feature = "otlp")]
 use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig as _};
 #[cfg(feature = "otlp")]
@@ -38,10 +33,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 #[cfg(feature = "otlp")]
 use tracing_subscriber::registry::LookupSpan;
 
-#[cfg(feature = "otlp")]
-use crate::metrics::{Instrument, InstrumentKind, Labels};
-
-/// The `service.name` resource attribute every exported span carries.
+/// The `service.name` resource attribute every exported span and metric carries.
 #[cfg(feature = "otlp")]
 const SERVICE_NAME: &str = "rift";
 /// Overrides the export layer's own filter; unset, [`DEFAULT_OTLP_FILTER`] applies.
@@ -54,7 +46,7 @@ const DEFAULT_OTLP_FILTER: &str =
     "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info";
 
 /// The target the OpenTelemetry SDK's own reports carry.
-const SDK_TARGET: &str = "opentelemetry_sdk";
+pub(crate) const SDK_TARGET: &str = "opentelemetry_sdk";
 
 /// The OpenTelemetry SDK's own warnings and errors, which stderr carries whatever
 /// `RUST_LOG` names.
@@ -108,15 +100,34 @@ impl Export {
         }
     }
 
-    /// The forwarding of every metric value into the meter provider, when one exports.
-    #[cfg(feature = "otlp")]
-    pub(crate) fn metrics(&self) -> Option<MetricExport> {
-        self.meters.as_ref().map(MetricExport::new)
+    /// Makes the meter provider's meter the one every instrument records into, when one
+    /// exports. The runtime calls it once its subscriber is installed.
+    #[cfg_attr(
+        not(feature = "otlp"),
+        expect(
+            clippy::unused_self,
+            reason = "a build without the otlp feature holds no meter provider"
+        )
+    )]
+    pub(crate) fn install_meter(&self) {
+        #[cfg(feature = "otlp")]
+        if let Some(meters) = &self.meters {
+            crate::metrics::install_meter(meters.meter_with_scope(crate::metrics::scope()));
+        }
     }
 }
 
+/// The variables that name where metrics export: the metrics endpoint, used as it is, or
+/// the base endpoint, which the exporter extends with `/v1/metrics`.
+#[cfg(feature = "otlp")]
+const METRIC_ENDPOINT_VARS: [&str; 2] = [
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+];
+
 /// Installs an OTLP/HTTP export layer when `OTEL_EXPORTER_OTLP_ENDPOINT` names a
-/// collector, `None` otherwise.
+/// collector, `None` otherwise, beside a meter provider when a metric endpoint variable
+/// names one.
 ///
 /// Generic in the subscriber `S` because `tracing_subscriber::registry().with(a).with(b)`
 /// changes the concrete subscriber type at every `.with()` call; a layer boxed as
@@ -130,7 +141,7 @@ impl Export {
 /// depends on, batched by a Tokio-driven [`BatchSpanProcessor`]: `opentelemetry_sdk`'s
 /// default batch processor exports on a dedicated `std::thread` through
 /// `futures_executor::block_on`, which has no Tokio reactor to poll an async HTTP client
-/// on, and Rift never uses `reqwest::blocking`. Checking the endpoint variable before
+/// on, and Rift never uses `reqwest::blocking`. Checking the endpoint variables before
 /// building anything keeps the feature from silently dialing OTLP's default
 /// `http://localhost:4318` the moment it is compiled in.
 #[cfg(feature = "otlp")]
@@ -138,12 +149,31 @@ pub(crate) fn layer<S>() -> (Option<impl Layer<S> + Send + Sync>, Export)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_none() {
+    let configured = |variable: &str| std::env::var_os(variable).is_some();
+    let meters = if METRIC_ENDPOINT_VARS
+        .iter()
+        .any(|variable| configured(variable))
+    {
+        match MetricExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .build()
+        {
+            Ok(exporter) => Some(meter_provider(exporter)),
+            Err(error) => {
+                eprintln!("rift: warning: otlp metric exporter did not build: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if !configured("OTEL_EXPORTER_OTLP_ENDPOINT") {
         return (
             None,
             Export {
                 provider: None,
-                meters: None,
+                meters,
             },
         );
     }
@@ -159,20 +189,9 @@ where
                 None,
                 Export {
                     provider: None,
-                    meters: None,
+                    meters,
                 },
             );
-        }
-    };
-    let meters = match MetricExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-    {
-        Ok(exporter) => Some(meter_provider(exporter)),
-        Err(error) => {
-            eprintln!("rift: warning: otlp metric exporter did not build: {error}");
-            None
         }
     };
     let provider = tracer_provider(exporter, BatchConfig::default());
@@ -189,7 +208,7 @@ where
     )
 }
 
-/// The meter provider that exports every forwarded metric value into `exporter`.
+/// The meter provider that exports what every instrument records into `exporter`.
 ///
 /// Its reader exports on the Tokio runtime, at `OTEL_METRIC_EXPORT_INTERVAL` or the SDK's
 /// 60 s default, so the OTLP exporter posts over the same async `reqwest` client the span
@@ -204,113 +223,6 @@ where
         .with_resource(resource)
         .with_reader(PeriodicReader::builder(exporter, runtime::Tokio).build())
         .build()
-}
-
-/// The attribute the OpenTelemetry SDK marks a stream's overflow series with.
-#[cfg(feature = "otlp")]
-const OVERFLOW_ATTRIBUTE: &str = "otel.metric.overflow";
-
-/// Forwards every value an instrument records in process into one SDK instrument of the
-/// same name, unit, and kind, created at the instrument's first recording.
-///
-/// The meter's instrumentation scope is `rift-tracing` and its version: every Rift
-/// instrument is declared through this crate. A value the in-process series sent to its
-/// overflow series carries `otel.metric.overflow = true` alone, as the SDK marks its own.
-#[cfg(feature = "otlp")]
-pub(crate) struct MetricExport {
-    meter: opentelemetry::metrics::Meter,
-    instruments: Mutex<HashMap<&'static str, Exported>>,
-}
-
-#[cfg(feature = "otlp")]
-impl std::fmt::Debug for MetricExport {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MetricExport")
-            .finish_non_exhaustive()
-    }
-}
-
-/// One SDK instrument a Rift instrument forwards into.
-#[cfg(feature = "otlp")]
-#[derive(Clone)]
-enum Exported {
-    Counter(opentelemetry::metrics::Counter<f64>),
-    Gauge(opentelemetry::metrics::Gauge<f64>),
-    Histogram(opentelemetry::metrics::Histogram<f64>),
-}
-
-#[cfg(feature = "otlp")]
-impl MetricExport {
-    /// The forwarding into a meter of `provider`.
-    pub(crate) fn new(provider: &SdkMeterProvider) -> Self {
-        let scope = InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
-            .with_version(env!("CARGO_PKG_VERSION"))
-            .build();
-        Self {
-            meter: provider.meter_with_scope(scope),
-            instruments: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Records `value` of `instrument` into its SDK instrument, under the attributes
-    /// `labels` names or the overflow attribute.
-    pub(crate) fn record(
-        &self,
-        instrument: &Instrument,
-        labels: &Labels,
-        overflow: bool,
-        value: f64,
-    ) {
-        let attributes: Vec<KeyValue> = if overflow {
-            vec![KeyValue::new(OVERFLOW_ATTRIBUTE, true)]
-        } else {
-            instrument
-                .label_keys()
-                .iter()
-                .zip(labels)
-                .filter(|(_, value)| !value.is_empty())
-                .map(|(key, value)| KeyValue::new(*key, *value))
-                .collect()
-        };
-        match self.exported(instrument) {
-            Exported::Counter(counter) => counter.add(value, &attributes),
-            Exported::Gauge(gauge) => gauge.record(value, &attributes),
-            Exported::Histogram(histogram) => histogram.record(value, &attributes),
-        }
-    }
-
-    /// The SDK instrument `instrument` forwards into, created on its first use.
-    fn exported(&self, instrument: &Instrument) -> Exported {
-        let mut instruments = self
-            .instruments
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        instruments
-            .entry(instrument.name())
-            .or_insert_with(|| match instrument.kind() {
-                InstrumentKind::Counter => Exported::Counter(
-                    self.meter
-                        .f64_counter(instrument.name())
-                        .with_unit(instrument.unit())
-                        .build(),
-                ),
-                InstrumentKind::Gauge => Exported::Gauge(
-                    self.meter
-                        .f64_gauge(instrument.name())
-                        .with_unit(instrument.unit())
-                        .build(),
-                ),
-                InstrumentKind::Histogram => Exported::Histogram(
-                    self.meter
-                        .f64_histogram(instrument.name())
-                        .with_unit(instrument.unit())
-                        .with_boundaries(instrument.boundaries().to_vec())
-                        .build(),
-                ),
-            })
-            .clone()
-    }
 }
 
 /// The tracer provider that batches every ended span into `exporter` under `batch`.
@@ -369,8 +281,7 @@ mod tests {
     use tracing_subscriber::layer::{Context, SubscriberExt as _};
     use tracing_subscriber::{EnvFilter, Layer};
 
-    use super::{MetricExport, export_layer, meter_provider, tracer_provider};
-    use crate::metrics::{MetricLayer, MetricValues};
+    use super::{Export, export_layer, meter_provider, tracer_provider};
 
     /// Spans each test ends; enough that one lost span shows as a count mismatch.
     const SPANS: usize = 32;
@@ -587,20 +498,21 @@ mod tests {
         );
     }
 
-    /// A value recorded in process reaches the meter provider under the instrument's own
-    /// name and unit.
+    /// A value an instrument records reaches the meter provider the export installed,
+    /// under the instrument's own name and unit.
     #[test]
     fn every_recorded_instrument_reaches_the_meter_provider() {
         let runtime = runtime();
         let _entered = runtime.enter();
         let exporter = RecordingMetricExporter::default();
-        let provider = meter_provider(exporter.clone());
-        let values = Arc::new(MetricValues::exporting(Some(MetricExport::new(&provider))));
-        let subscriber = tracing_subscriber::registry().with(MetricLayer::new(Arc::clone(&values)));
-        tracing::subscriber::with_default(subscriber, || {
-            crate::traced!(component = "search", operation = "search.request", {});
-            crate::metrics().memory.value(4096).record();
-        });
+        let export = Export {
+            provider: None,
+            meters: Some(meter_provider(exporter.clone())),
+        };
+        export.install_meter();
+        crate::traced!(component = "search", operation = "search.request", {});
+        crate::metrics().memory.value(4096).record();
+        let provider = export.meters.as_ref().expect("the export holds its meters");
         provider
             .force_flush()
             .expect("the reader collects and exports");
@@ -619,13 +531,6 @@ mod tests {
                 "{name} in {unit} must be exported: {received:?}"
             );
         }
-        assert!(
-            values
-                .snapshot()
-                .find("process.memory.usage", &[])
-                .is_some(),
-            "the value stays readable in process"
-        );
-        provider.shutdown().expect("the provider shuts down");
+        export.shutdown();
     }
 }

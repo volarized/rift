@@ -12,7 +12,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::capture::{closed_record, event_record};
-use crate::metrics::{Counter, MetricValues};
+use crate::metrics::Counter;
 use crate::record::LogRecord;
 use crate::render::{LevelColor, LiveLine, LogLines};
 
@@ -86,7 +86,7 @@ const SERVER_STDERR_BOUND_NOTICE: &str =
     "rift: standard error reached its byte bound; later diagnostics are under `rift server logs`\n";
 /// `log.stderr.discarded`: the bytes the bounded standard error discarded past
 /// `[logs] stderr_limit`.
-const LOG_STDERR_DISCARDED: Counter<0> = Counter::declare("log.stderr.discarded", "By", &[]);
+static LOG_STDERR_DISCARDED: Counter<0> = Counter::declare("log.stderr.discarded", "By", &[]);
 
 /// The byte bound of a server's standard error, and what passed and was discarded at it.
 ///
@@ -130,13 +130,12 @@ impl StderrBound {
 #[derive(Debug)]
 pub(crate) struct BoundedStderr {
     bound: Arc<StderrBound>,
-    values: Arc<MetricValues>,
 }
 
 impl BoundedStderr {
-    /// Standard error cut at `bound`, its discarded bytes counted into `values`.
-    pub(crate) const fn new(bound: Arc<StderrBound>, values: Arc<MetricValues>) -> Self {
-        Self { bound, values }
+    /// Standard error cut at `bound`.
+    pub(crate) const fn new(bound: Arc<StderrBound>) -> Self {
+        Self { bound }
     }
 }
 
@@ -144,37 +143,23 @@ impl<'a> MakeWriter<'a> for BoundedStderr {
     type Writer = BoundedWriter<'a, io::Stderr>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        BoundedWriter::new(&self.bound, Some(&self.values), io::stderr())
+        BoundedWriter::new(&self.bound, io::stderr())
     }
 }
 
 /// One writer over a shared [`StderrBound`]: writes pass through until the count
 /// reaches the bound, the crossing write is followed by the notice, and later writes
-/// are counted and discarded.
-///
-/// The discarded bytes reach `log.stderr.discarded` through `values` directly: the
-/// writer runs inside the subscriber's dispatch, where the thread's dispatcher is not
-/// reachable to record through.
+/// are counted, in the bound and in `log.stderr.discarded`, and discarded.
 #[derive(Debug)]
 pub(crate) struct BoundedWriter<'a, Sink: Write> {
     bound: &'a StderrBound,
-    values: Option<&'a MetricValues>,
     sink: Sink,
 }
 
 impl<'a, Sink: Write> BoundedWriter<'a, Sink> {
-    /// A writer over `sink` sharing `bound` with every sibling writer, counting what it
-    /// discards into `values` when given.
-    pub(crate) const fn new(
-        bound: &'a StderrBound,
-        values: Option<&'a MetricValues>,
-        sink: Sink,
-    ) -> Self {
-        Self {
-            bound,
-            values,
-            sink,
-        }
+    /// A writer over `sink` sharing `bound` with every sibling writer.
+    pub(crate) const fn new(bound: &'a StderrBound, sink: Sink) -> Self {
+        Self { bound, sink }
     }
 }
 
@@ -184,13 +169,7 @@ impl<Sink: Write> Write for BoundedWriter<'_, Sink> {
         let before = self.bound.written.fetch_add(length, Ordering::Relaxed);
         if before >= self.bound.limit {
             self.bound.discarded.fetch_add(length, Ordering::Relaxed);
-            if let Some(values) = self.values {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "a write is far below 2^53 bytes"
-                )]
-                LOG_STDERR_DISCARDED.add_into(values, [], length as f64);
-            }
+            LOG_STDERR_DISCARDED.add(length);
             return Ok(bytes.len());
         }
         self.sink.write_all(bytes)?;
@@ -217,7 +196,7 @@ mod tests {
         BoundedWriter, SERVER_STDERR_BOUND_NOTICE, SERVER_STDERR_BYTES_MAX, StderrBound,
         StderrLines,
     };
-    use crate::metrics::{MetricValues, SeriesValue};
+    use crate::SeriesValue;
     use crate::render::{LevelColor, LogLines};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -457,11 +436,10 @@ mod tests {
     #[test]
     fn a_bounded_writer_passes_the_crossing_write_then_drops() -> TestResult {
         let bound = StderrBound::new(SERVER_STDERR_BYTES_MAX);
-        let values = MetricValues::default();
         let mut sink = Vec::new();
         let head = vec![b'a'; usize::try_from(SERVER_STDERR_BYTES_MAX)? - 4];
         {
-            let mut writer = BoundedWriter::new(&bound, Some(&values), &mut sink);
+            let mut writer = BoundedWriter::new(&bound, &mut sink);
             writer.write_all(&head)?;
             writer.write_all(b"crossing")?;
             writer.write_all(b"dropped")?;
@@ -487,7 +465,7 @@ mod tests {
             .written
             .store(SERVER_STDERR_BYTES_MAX, Ordering::Relaxed);
         let mut sink = Vec::new();
-        BoundedWriter::new(&bound, None, &mut sink).write_all(b"late")?;
+        BoundedWriter::new(&bound, &mut sink).write_all(b"late")?;
         assert!(sink.is_empty(), "a writer past the bound writes nothing");
         assert_eq!(bound.discarded(), 4);
         Ok(())
@@ -497,11 +475,11 @@ mod tests {
     /// discards the rest, and counts the discarded bytes in `log.stderr.discarded`.
     #[test]
     fn a_bounded_writer_stops_at_its_limit_and_counts_what_it_discards() -> TestResult {
+        let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
         let bound = StderrBound::new(16);
-        let values = MetricValues::default();
         let mut sink = Vec::new();
         {
-            let mut writer = BoundedWriter::new(&bound, Some(&values), &mut sink);
+            let mut writer = BoundedWriter::new(&bound, &mut sink);
             writer.write_all(b"0123456789")?;
             writer.write_all(b"abcdefgh")?;
             writer.write_all(b"discarded")?;
@@ -517,12 +495,12 @@ mod tests {
             .concat()
         );
         assert_eq!(bound.discarded(), 13);
-        let snapshot = values.snapshot();
+        let snapshot = recorder.metrics();
         let series = snapshot
             .find("log.stderr.discarded", &[])
             .ok_or("the discarded bytes are counted")?;
         assert_eq!(series.value(), &SeriesValue::Sum(13.0));
-        assert_eq!(series.instrument().unit(), "By");
+        assert_eq!(series.unit(), "By");
         Ok(())
     }
 
@@ -539,7 +517,7 @@ mod tests {
                 Arc::new(crate::LogStore::open(&directory.path().join("metrics"), None).await?);
             let bound = Arc::new(StderrBound::new(4));
             for bytes in written {
-                BoundedWriter::new(&bound, None, Vec::new()).write_all(bytes)?;
+                BoundedWriter::new(&bound, Vec::new()).write_all(bytes)?;
             }
             let (_sink, drain) = crate::log_capture();
             let running =
