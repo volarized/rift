@@ -36,6 +36,7 @@ CHILD = textwrap.dedent(
             headers={"content-type": "application/x-protobuf"})
         urllib.request.urlopen(request, timeout=5).read()
 
+    sys.stdout.buffer.write("\\u2500\\u2500 a line no code page encodes\\n".encode())
     print("        PASS [   0.010s] (1/2) suite passing_case", flush=True)
     if mode != "nothing" and endpoint:
         logs = ExportLogsServiceRequest()

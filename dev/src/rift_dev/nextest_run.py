@@ -428,6 +428,14 @@ def case_report(
     return "\n".join(sections) + "\n"
 
 
+def echo(data: bytes) -> None:
+    """Writes `data` to stdout as bytes: nextest prints UTF-8, which a Windows console
+    code page such as cp1252 cannot encode as text."""
+    sys.stdout.flush()
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
 def report_name(outcome: Outcome) -> str:
     """The report's file name: the binary and test with path separators replaced."""
     iteration = "" if outcome.stress is None else f"-stress-{outcome.stress}"
@@ -451,7 +459,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             assert process.stdout is not None
             for raw in process.stdout:
                 line = raw.decode("utf-8", errors="replace")
-                sys.stdout.write(line)
+                echo(raw)
                 found = status_of(line.rstrip("\n"))
                 if found is None:
                     continue
@@ -490,8 +498,8 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             )
             path = REPORT_DIRECTORY / report_name(outcome)
             path.write_text(report, encoding="utf-8")
-            sys.stdout.write(report)
-            sys.stdout.write(f"[report written to {path}]\n")
+            echo(report.encode("utf-8"))
+            echo(f"[report written to {path}]\n".encode())
         sys.stdout.flush()
     if status != 0:
         raise CommandFailed(command, status, "")
