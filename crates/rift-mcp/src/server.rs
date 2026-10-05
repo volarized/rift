@@ -6722,18 +6722,14 @@ done
     /// returns the `database.open` warning the refusal produced.
     #[tokio::test]
     async fn a_refused_index_database_is_recorded_in_the_logs() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
         fs::create_dir_all(directory.path().join(".rift/index"))?;
-        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
-        tracing::subscriber::set_global_default(subscriber)?;
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .capture(&capture)
+            .install()?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage
@@ -9185,13 +9181,9 @@ done
     /// whole budget the request was given.
     #[tokio::test]
     async fn a_publication_wait_ends_at_the_deadline_the_request_carries() -> TestResult {
-        let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(log.reopen()?)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         // The tree moves past the publication, so the read waits for a rebuild that the
@@ -9224,7 +9216,7 @@ done
                 .contains(&format!("{}ms", STALLED_PUBLICATION_BUDGET.as_millis())),
             "the refusal names the whole budget the request was given: {error:?}"
         );
-        let records = fs::read_to_string(log.path())?;
+        let records = drain.queued_records();
         for event in [
             "request capture compared with publication",
             "request capture requested a rebuild",
@@ -9232,18 +9224,19 @@ done
             "a request spent its whole readiness budget",
         ] {
             assert!(
-                records.contains(event),
-                "the wait records its active stage: {event}\n{records}"
+                records.iter().any(|record| record.message() == event),
+                "the wait records its active stage: {event}\n{records:#?}"
             );
         }
         let waiting = records
-            .lines()
-            .find(|line| line.contains("request waiting for publication"))
+            .iter()
+            .find(|record| record.message() == "request waiting for publication")
             .ok_or("the request records its publication wait before the deadline")?;
-        assert!(waiting.contains("published_epoch=0"), "{waiting}");
+        let fields: serde_json::Value = serde_json::from_str(waiting.fields())?;
+        assert_eq!(fields["published_epoch"], "0", "{waiting:?}");
         assert!(
-            waiting.contains("observed_epoch=") && waiting.contains("superseded_epoch="),
-            "{waiting}"
+            fields.get("observed_epoch").is_some() && fields.get("superseded_epoch").is_some(),
+            "{waiting:?}"
         );
         Ok(())
     }
@@ -9516,20 +9509,20 @@ done
     /// filter a served workspace records under.
     #[tokio::test]
     async fn a_file_past_a_syntax_bound_is_named_in_the_logs_and_the_rest_serves() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("src/deep.rs"), deep_source())?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
-        tracing::subscriber::set_global_default(subscriber)?;
+        // The runtime falls back to its default targets on a filter it cannot parse; the
+        // test refuses one instead.
+        rift_tracing::validate_log_filter(&capture)?;
+        let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
+            .capture(&capture)
+            .install();
+        let drain = drain.ok_or("a capture filter returns a drain")?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
@@ -9585,9 +9578,6 @@ done
     /// the same bound, so only the requested source path receives the warning.
     #[tokio::test]
     async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
@@ -9599,11 +9589,14 @@ done
             "[providers.syntax]\nmax_file = \"128b\"\n",
         )?;
 
-        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
-        tracing::subscriber::set_global_default(subscriber)?;
+        // The runtime falls back to its default targets on a filter it cannot parse; the
+        // test refuses one instead.
+        rift_tracing::validate_log_filter(&capture)?;
+        let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
+            .capture(&capture)
+            .install();
+        let drain = drain.ok_or("a capture filter returns a drain")?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
@@ -9677,20 +9670,15 @@ done
     /// lane its own thread records into, never the one built last.
     #[tokio::test]
     async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = rift_tracing::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(sink.with_filter(filter)),
-        );
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .capture(&capture)
+            .install()?;
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -9724,9 +9712,6 @@ done
     /// own words stay out of the store.
     #[tokio::test]
     async fn a_ranked_phase_records_the_query_shape_and_not_its_text() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         /// A term no fixture source carries, so finding it in the store would mean
         /// the record carried the caller's text.
         const SECRET_TERM: &str = "zzquixotic";
@@ -9736,11 +9721,9 @@ done
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = rift_tracing::log_capture();
-        let filter = tracing_subscriber::EnvFilter::try_new("rift_mcp=debug")?;
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(sink.with_filter(filter)),
-        );
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=debug")
+            .install()?;
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -9784,8 +9767,6 @@ done
     #[tokio::test]
     async fn a_file_row_as_large_as_max_chunk_answers_search_and_its_declaration_serves()
     -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
@@ -9795,8 +9776,7 @@ done
         );
         fs::write(directory.path().join("src/blob.rs"), blob)?;
         super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"2mb\"\n")?;
-        let (sink, mut drain) = rift_tracing::log_capture();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
@@ -9818,7 +9798,7 @@ done
         );
         let symbol = get_symbol(&server, "BLOB").await?;
         assert_eq!(symbol.hits.len(), 1, "{symbol:?}");
-        while let Ok(record) = drain.try_recv_record() {
+        for record in drain.queued_records() {
             assert!(
                 !record.message().contains("lexical unit left out"),
                 "no unit is left out: {}",
@@ -9992,11 +9972,7 @@ done
 
     #[tokio::test]
     async fn build_disables_search_index_when_rift_state_path_is_a_file() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A regular file already occupies `.rift`, so `create_dir_all` cannot make the
@@ -10014,11 +9990,7 @@ done
 
     #[tokio::test]
     async fn build_disables_search_index_when_database_path_is_a_directory() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A directory at the database path makes SQLite reject the open without changing
@@ -10190,11 +10162,9 @@ done
 
     #[test]
     fn an_openai_compatible_embedding_without_its_credential_leaves_the_tier_off() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
         assert!(
             super::remote_selection(&remote_embedding(), None).is_none(),
             "an unset credential variable leaves the vector ranking off"
@@ -10221,11 +10191,7 @@ done
 
     #[tokio::test]
     async fn a_model_the_source_refuses_leaves_the_tier_off_and_full_text_serving() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         // Acceptance's path rule allows an empty segment; `ModelSource` refuses one, so this
         // value passes the first gate and fails the second.
         let refused = vector_with(EmbeddingConfiguration::Directory {
@@ -10273,11 +10239,7 @@ done
 
     #[tokio::test]
     async fn an_invalid_configuration_holds_the_acquisition_back() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // The table naming the model is the very part acceptance could not read.
@@ -10300,11 +10262,7 @@ done
     #[tokio::test]
     async fn a_model_directory_without_weights_ends_preparation_and_the_answer_says_so()
     -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // An empty directory holds none of the three files an encoder loads, so acquisition
@@ -10637,11 +10595,7 @@ done
 
     #[tokio::test]
     async fn a_revision_search_never_consults_the_search_index() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         rift_history::fixture::init(directory.path());
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
