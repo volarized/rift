@@ -1217,6 +1217,25 @@ pub fn declare_dependencies_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`LogsConfiguration`](crate::configuration::LogsConfiguration) states its
+/// `Duration` floor and ceiling as `rift:range` on `sample_interval`: schema validation
+/// alone cannot compare `"1s"` against a bound, so the server enforces it at load and the
+/// schema carries it for readers.
+pub fn declare_logs_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        Duration, LOGS_SAMPLE_INTERVAL_MS_MAX, LOGS_SAMPLE_INTERVAL_MS_MIN, LogsConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(LogsConfiguration, sample_interval),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MIN),
+            &Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MAX),
+        ),
+    );
+}
+
 /// An [`LspConfiguration`](crate::configuration::LspConfiguration)
 /// states its `Duration` and `ByteSize` ceilings as `rift:range` on their
 /// keys: schema validation alone cannot compare `"30s"` or `"4kb"` against
@@ -2278,6 +2297,31 @@ mod tests {
             schema["properties"]["max_chunk"][RIFT_RANGE],
             json!({ "min": "1kb", "max": "16mb" }),
             "max_chunk must state its accepted range"
+        );
+    }
+
+    #[test]
+    fn logs_configuration_schema_states_range_and_default_on_sample_interval() {
+        use crate::configuration::{
+            Duration, LOGS_SAMPLE_INTERVAL_MS_DEFAULT, LOGS_SAMPLE_INTERVAL_MS_MAX,
+            LOGS_SAMPLE_INTERVAL_MS_MIN,
+        };
+        let schema = serde_json::to_value(schema_for!(crate::configuration::LogsConfiguration))
+            .expect("schema");
+        let interval = &schema["properties"]["sample_interval"];
+        assert_eq!(
+            interval[RIFT_RANGE],
+            json!({
+                "min": Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MIN),
+                "max": Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_MAX),
+            }),
+            "sample_interval must state the range acceptance enforces"
+        );
+        assert_eq!(interval[RIFT_RANGE], json!({ "min": "200ms", "max": "1h" }));
+        assert_eq!(
+            interval[keyword::DEFAULT],
+            json!(Duration::from_millis(LOGS_SAMPLE_INTERVAL_MS_DEFAULT)),
+            "sample_interval must advertise the model's default"
         );
     }
 

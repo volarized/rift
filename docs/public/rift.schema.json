@@ -721,7 +721,7 @@
     },
     "LogsConfiguration": {
       "additionalProperties": false,
-      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nand which targets are captured at all. The server reads the table at startup, so a change\napplies on the next start.",
+      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nwhich targets are captured at all, and how often the server samples its own\nprocess. The server reads the table at startup, so a change applies on the next\nstart.",
       "properties": {
         "capture": {
           "default": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
@@ -744,6 +744,15 @@
           "maximum": 1000000,
           "minimum": 100,
           "type": "integer"
+        },
+        "sample_interval": {
+          "$ref": "#/$defs/Duration",
+          "default": "1s",
+          "description": "Wall-clock span between two samples of the server process: its resident\nand virtual memory, CPU time and usage, open files, and disk bytes, 200ms\nto 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "200ms"
+          }
         }
       },
       "type": "object"
@@ -1513,7 +1522,8 @@
       "default": {
         "capture": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
         "page_records": 500,
-        "retention_records": 50000
+        "retention_records": 50000,
+        "sample_interval": "1s"
       },
       "description": "The server's own log records: how many the metrics database keeps,\nhow many one read returns, and which targets are captured."
     },

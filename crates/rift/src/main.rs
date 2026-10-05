@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 #[cfg(test)]
 use clap::{Command, CommandFactory};
@@ -122,7 +123,10 @@ async fn main() -> ExitCode {
     let logs = serves.then(|| rift_mcp::logs_configuration(Path::new(".")));
     let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
     if let Some(logs) = &logs {
-        tracing_builder = tracing_builder.capture(&logs.capture);
+        let sample_interval = Duration::from_millis(logs.sample_interval.milliseconds());
+        tracing_builder = tracing_builder
+            .capture(&logs.capture)
+            .sample_interval(sample_interval);
     }
     let (tracing_runtime, drain) = tracing_builder.install();
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
