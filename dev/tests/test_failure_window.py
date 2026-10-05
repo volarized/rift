@@ -19,13 +19,13 @@ from rift_dev.rift_test_client import (
 SINCE = "2026-10-05T09:00:00.000+00:00"
 UNTIL = "2026-10-05T09:00:30.000+00:00"
 IN_FLIGHT = (
-    "2026-10-05T08:59:00.000+00:00 🔵 INFO  -        -            "
+    "2026-10-05T08:59:00.000+00:00 INFO  -        -            "
     "operations in flight in_flight=2 reason=stall_delay"
 )
 SNAPSHOT = (
-    "2026-10-05T08:59:30.000+00:00 🔵 INFO  -        locks        metric snapshot a=1"
+    "2026-10-05T08:59:30.000+00:00 INFO  -        locks        metric snapshot a=1"
 )
-INSIDE = "2026-10-05T09:00:10.000+00:00 🔴 ERROR index    index.build  build failed"
+INSIDE = "2026-10-05T09:00:10.000+00:00 ERROR index    index.build  build failed"
 
 
 def test_window_arguments_name_kind_bounds_and_tail() -> None:

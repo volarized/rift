@@ -1,11 +1,13 @@
-"""Read the lines `rift server logs` prints.
+"""Read the lines `rift server logs` and server stderr print.
 
-A line is `<timestamp> <glyph> <LEVEL> <component> <operation> <message>` followed by
-` key=value` pairs, sorted by key, with string values printed without quotes
-(`LogRecord::rendered` in `crates/rift-tracing/src/render.rs`). A label a record did
-not carry prints as `-`. The runners parse two kinds of record from a stopped server's
-output, `database.close` and `stop stage ended`, and pick the newest `operations in
-flight` and `metric snapshot` records for a failure window.
+A line is `<timestamp> <LEVEL> <component> <operation> <message>` followed by ` key=value`
+pairs, sorted by key, with string values printed without quotes (`LogRecord::rendered`
+in `crates/rift-tracing/src/render.rs`). A label a record did not carry prints as `-`.
+A record emitted or closed inside a span prints, before its message, the outermost span's
+`key=value` fields, then `↳`, the nearest span's name and fields, and two spaces. Stderr
+prints the same line with the time in UTC. The runners parse two kinds of record from a
+stopped server's output, `database.close` and `stop stage ended`, and pick the newest
+`operations in flight` and `metric snapshot` records for a failure window.
 """
 
 from __future__ import annotations
@@ -26,6 +28,10 @@ ENTRIES_MAX = 64
 # Characters of a free-text value the report keeps.
 VALUE_CHARS_MAX = 300
 FIELD_MARK = re.compile(r"(?:^|\s)([A-Za-z_][\w.]*)=")
+# The start of the root and nearest span fields a line prints before its message.
+SPAN_FIELDS_START = re.compile(r"^(?:[A-Za-z_][\w.]*=|↳ )")
+# What ends the root and nearest span fields: the message starts after it.
+SPAN_FIELDS_END = "  "
 
 
 Entry = dict[str, int | str | None]
@@ -41,7 +47,11 @@ class Measurements(TypedDict):
 
 
 class Line(NamedTuple):
-    """One printed record, its labels split from its message and fields."""
+    """One printed record, its labels split from its message and fields.
+
+    `spans` holds the root and nearest span fields printed before the message, empty for
+    a record outside every span; `rest` holds the message and the record's own fields.
+    """
 
     time: datetime
     level: str
@@ -49,6 +59,7 @@ class Line(NamedTuple):
     operation: str
     rest: str
     text: str
+    spans: str = ""
 
     def is_message(self, message: str) -> bool:
         """Whether the message is exactly `message`, with fields or nothing after it."""
@@ -65,8 +76,8 @@ def parse_line(line: str) -> Line | None:
     A line that does not start with an ISO 8601 timestamp is not a record, such as
     the cut notice a records file starts with.
     """
-    parts = line.split(None, 5)
-    if len(parts) < 5:
+    parts = line.split(None, 4)
+    if len(parts) < 4:
         return None
     try:
         time = datetime.fromisoformat(parts[0])
@@ -74,9 +85,27 @@ def parse_line(line: str) -> Line | None:
         return None
     if time.tzinfo is None:
         return None
-    return Line(
-        time, parts[2], parts[3], parts[4], parts[5] if len(parts) == 6 else "", line
-    )
+    spans, rest = split_spans(parts[4] if len(parts) == 5 else "")
+    return Line(time, parts[1], parts[2], parts[3], rest, line, spans)
+
+
+def split_spans(text: str) -> tuple[str, str]:
+    """The root and nearest span fields at the start of `text`, and what follows them.
+
+    Span fields print as `key=value` pairs or `↳ name`, and two spaces end them; text
+    that starts with neither is the message alone.
+    """
+    if SPAN_FIELDS_START.match(text) is None:
+        return "", text
+    spans, separator, rest = text.partition(SPAN_FIELDS_END)
+    if not separator:
+        return "", text
+    return spans, rest.lstrip(" ")
+
+
+def closes_span(record: Line, name: str) -> bool:
+    """Whether `record` is the close record of the span `name`."""
+    return record.is_message(name) and record.fields(name).get("span") == "closed"
 
 
 def instant(text: str) -> datetime | None:

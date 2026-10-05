@@ -12,21 +12,26 @@ from rift_dev.corpus_assertions import PROBE_PATH, PROBE_SOURCE
 from rift_dev.corpus_cache import git, pins
 from rift_dev.rift_test_client import Server, object_value
 
-STARTUP = 'INFO index snapshot published operation="index.publish" trigger="startup" epoch=0\n'
-BATCH_SPAN = 'history.batch{component="history" operation="history.batch"}'
+# Lines in the shape a foreground server prints on stderr.
+STARTUP = (
+    "2026-10-05T10:27:15.020+00:00 INFO  index    index.publish component=worker "
+    "operation=worker.run work=initial index preparation  "
+    "index snapshot published epoch=0 trigger=startup\n"
+)
 BATCH_CLOSE = (
-    f"INFO {BATCH_SPAN}: rift_mcp::history: close time.busy=1ms time.idle=2s\n"
+    "2026-10-05T10:27:14.913+00:00 INFO  history  history.batch history.batch "
+    "elapsed_ms=17 span=closed\n"
 )
 ANALYZE_CLOSE = (
-    f'INFO {BATCH_SPAN}:history.analyze{{component="history" operation="history.analyze"}}:'
-    " rift_mcp::history: close time.busy=1ms\n"
+    "2026-10-05T10:27:14.898+00:00 INFO  history  history.analyze "
+    "operation=history.batch  history.analyze elapsed_ms=2 span=closed\n"
 )
 
 
 def batch_start(pending: int) -> str:
     return (
-        f"DEBUG {BATCH_SPAN}: rift_mcp::history: history batch started "
-        f'component="history" operation="history.batch" phase="start" pending={pending}\n'
+        "2026-10-05T10:27:14.892+00:00 DEBUG history  history.batch history batch "
+        f"started pending={pending} phase=start\n"
     )
 
 
@@ -37,7 +42,11 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
     """The stop observer cannot start a replacement server through its proxy (#505)."""
 
     async def exercise() -> None:
-        started = 'DEBUG index capture started component="index" operation="index.build" phase="start" epoch=1\n'
+        started = (
+            "2026-10-05T10:27:17.470+00:00 DEBUG index    index.build  epoch=1 "
+            "trigger=filesystem ↳ worker.run component=worker operation=worker.run "
+            "work=filesystem index rebuild  index capture started epoch=1 phase=start\n"
+        )
         observed = False
 
         def read_log() -> str:
@@ -48,7 +57,10 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
             observed = True
             output = STARTUP + started
             if completed:
-                output += "INFO index.build{epoch=1}: rift_mcp::validation: close\n"
+                output += (
+                    "2026-10-05T10:27:17.487+00:00 INFO  index    -            "
+                    "index.build elapsed_ms=18 epoch=1 span=closed trigger=filesystem\n"
+                )
             return output
 
         def stop() -> None:
