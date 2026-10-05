@@ -369,9 +369,10 @@ pub async fn stop_stage<Value>(
 
 /// Closes the metrics database by `deadline`, when it opened.
 ///
-/// A checkpoint or connection close the deadline passed in does not fail the stage: it is
-/// recorded as a `warn` `database.close` record naming the close stage and its time, and
-/// the next open recovers the log.
+/// The close runs as a `database.close` operation with `open = true`, so its opening and
+/// its end are both recorded. A deadline that passes in any close stage does not fail
+/// the stage: it is recorded as a `warn` `database.close` record naming the close stage and
+/// its time, and the next open recovers the log.
 pub(crate) async fn close_logs(
     logs: Option<&rift_tracing::LogStore>,
     deadline: Instant,
@@ -379,37 +380,46 @@ pub(crate) async fn close_logs(
     match logs {
         Some(logs) => {
             stop_stage("metrics database close", deadline, async {
-                logs.close(deadline)
-                    .await
-                    .map(|closed| match closed {
-                        rift_tracing::StoreClose::Closed(checkpoint) => rift_tracing::info!(
+                // The close runs as a `database.close` operation: it records its opening,
+                // sits in the table of operations in flight while the writer thread runs
+                // it, and ends with its outcome.
+                rift_tracing::traced!(
+                    component = "storage",
+                    operation = "database.close",
+                    database = "metrics",
+                    open = true,
+                    async { logs.close(deadline).await }
+                )
+                .await
+                .map(|closed| match closed {
+                    rift_tracing::StoreClose::Closed(checkpoint) => rift_tracing::info!(
+                        component = "storage",
+                        operation = "database.close",
+                        database = "metrics",
+                        busy = checkpoint.is_busy(),
+                        log = checkpoint.log(),
+                        checkpointed = checkpoint.checkpointed(),
+                        elapsed_ms = elapsed_ms(checkpoint.elapsed()),
+                        "database checkpointed its write-ahead log"
+                    ),
+                    rift_tracing::StoreClose::Timeout { stage, elapsed } => {
+                        rift_tracing::warn!(
                             component = "storage",
                             operation = "database.close",
                             database = "metrics",
-                            busy = checkpoint.is_busy(),
-                            log = checkpoint.log(),
-                            checkpointed = checkpoint.checkpointed(),
-                            elapsed_ms = elapsed_ms(checkpoint.elapsed()),
-                            "database checkpointed its write-ahead log"
-                        ),
-                        rift_tracing::StoreClose::Timeout { stage, elapsed } => {
-                            rift_tracing::warn!(
-                                component = "storage",
-                                operation = "database.close",
-                                database = "metrics",
-                                stage,
-                                elapsed_ms = elapsed_ms(elapsed),
-                                "database checkpoint outlasted the shutdown deadline; the \
+                            stage,
+                            elapsed_ms = elapsed_ms(elapsed),
+                            "database checkpoint outlasted the shutdown deadline; the \
                                  write-ahead log stays for the next open"
-                            );
-                        }
-                    })
-                    .map_err(|error| {
-                        errors::mcp::http_serve_failed()
-                            .operation("metrics database close")
-                            .cause(error)
-                            .error()
-                    })
+                        );
+                    }
+                })
+                .map_err(|error| {
+                    errors::mcp::http_serve_failed()
+                        .operation("metrics database close")
+                        .cause(error)
+                        .error()
+                })
             })
             .await
         }
@@ -1373,7 +1383,10 @@ mod tests {
         assert_eq!(ended["outcome"], "timeout", "{ended}");
         let close = records
             .iter()
-            .find(|record| record.operation() == "database.close")
+            .find(|record| {
+                record.operation() == "database.close"
+                    && record.message().starts_with("database checkpoint")
+            })
             .ok_or("the close was recorded")?;
         assert_eq!(close.level(), "warn");
         assert_eq!(
@@ -2035,7 +2048,10 @@ mod tests {
         assert_eq!(ended["outcome"], "timeout", "{ended}");
         let close = records
             .iter()
-            .find(|record| record.operation() == "database.close")
+            .find(|record| {
+                record.operation() == "database.close"
+                    && record.message().starts_with("database checkpoint")
+            })
             .ok_or("the close was recorded")?;
         assert_eq!(close.level(), "warn");
         let close: serde_json::Value = serde_json::from_str(close.fields())?;

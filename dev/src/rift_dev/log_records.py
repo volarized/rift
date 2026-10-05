@@ -30,6 +30,9 @@ STAGE_ENDED = "stop stage ended"
 IN_FLIGHT = "operations in flight"
 STALL_REPORT = "operations in flight past the stall delay"
 DATABASE_CLOSE = "database.close"
+# The record an operation declared with `open = true` writes when it opens
+# (`crates/rift-tracing/src/traced.rs`).
+OPERATION_OPENED = "operation opened"
 # Entries one report keeps per record kind. A stop writes a handful; the newest win.
 ENTRIES_MAX = 64
 # Characters of a free-text value the report keeps.
@@ -237,6 +240,10 @@ def database_closes(records: Iterable[Line]) -> list[Entry]:
     found: list[Entry] = []
     for record in records:
         if record.operation != DATABASE_CLOSE:
+            continue
+        # The close runs as a `database.close` operation: its opening and its span close
+        # are not close outcomes.
+        if record.closes() or record.is_message(OPERATION_OPENED):
             continue
         if record.is_message(CHECKPOINTED):
             values = record.fields(CHECKPOINTED)

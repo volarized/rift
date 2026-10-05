@@ -200,6 +200,18 @@ def test_a_close_without_a_checkpoint_row_keeps_its_message() -> None:
     assert str(entry["unchecked"]).startswith("database checkpoint outlasted")
 
 
+def test_the_close_operation_opening_and_span_close_are_not_close_outcomes() -> None:
+    opened = (
+        "2026-10-05 09:00:04.000Z INFO  rift_mcp::http::close_logs   component=storage "
+        "operation=database.close database=metrics  operation opened"
+    )
+    closed = (
+        "2026-10-05 09:00:05.000Z INFO  rift_mcp::http::close_logs   component=storage "
+        "operation=database.close database=metrics  close \u2713 busy=1ms idle=2ms"
+    )
+    assert stop_measurements(f"{opened}\n{closed}\n")["database_close"] == []
+
+
 def test_records_of_an_earlier_server_are_left_out() -> None:
     since = datetime(2026, 10, 5, 11, 57, 50, 506000, tzinfo=UTC)
     found = stop_measurements(f"{STAGE}\n{CHECKPOINT}", since)
