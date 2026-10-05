@@ -4925,6 +4925,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pin-project-lite",
  "rift-error",
+ "rift-tracing-macros",
  "rusqlite",
  "serde_json",
  "sysinfo",
@@ -4934,6 +4935,18 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rift-tracing-macros"
+version = "0.0.47"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "rift-tracing",
+ "syn 2.0.119",
+ "tokio",
 ]
 
 [[package]]

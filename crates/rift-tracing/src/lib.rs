@@ -35,6 +35,10 @@
 //! `fixtures` feature compiles in; dependent crates enable it from their
 //! dev-dependencies only, so a release build carries no recorder.
 
+// `#[timed]` names this crate `::rift_tracing` in every expansion, including the ones inside
+// it, its unit tests, and its doctests.
+extern crate self as rift_tracing;
+
 mod capture;
 mod drain;
 mod measurement;
@@ -81,6 +85,77 @@ pub use span::Span;
 pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, WalCheckpoint};
 pub use tracing::{debug, error, info, trace, warn};
+
+/// Times a whole function as one [`traced!`] operation.
+///
+/// The arguments are those of `traced!`: the operation literal first, then optionally
+/// `component = <expr>` and extra `name = value` fields after it. An `async fn` runs its
+/// body through the async form, so its operation starts on the first poll and records a
+/// cancellation when the future is dropped before it returns; any other function runs its
+/// body through the block form.
+///
+/// ```
+/// #[rift_tracing::timed("package.analyze", component = "dependency", sources = sources.len())]
+/// fn analyze(sources: &[&str]) -> Result<usize, String> {
+///     if sources.is_empty() {
+///         return Err("no source".to_owned());
+///     }
+///     Ok(sources.len())
+/// }
+/// assert_eq!(analyze(&["lib.rs"]), Ok(1));
+///
+/// struct Store {
+///     name: String,
+/// }
+///
+/// impl Store {
+///     #[rift_tracing::timed("lexical.commit")]
+///     async fn commit(&self, documents: usize) -> (&str, usize) {
+///         (&self.name, documents)
+///     }
+/// }
+/// # let store = Store { name: "index".to_owned() };
+/// # let _ = store.commit(2);
+/// ```
+///
+/// # Evaluation and control flow
+///
+/// - The signature, generics, visibility, attributes, and return value stay as written.
+/// - The function's arguments are not recorded. A field names what the span carries, and
+///   evaluates once when the operation starts, as in `traced!`.
+/// - `return` and `?` leave the function, and the operation finishes on every path out.
+/// - A function that returns a future without being `async` is timed until it returns
+///   the future.
+///
+/// A `const fn` is refused at compile time, because the clock and the span run when the
+/// function is called:
+///
+/// ```compile_fail
+/// #[rift_tracing::timed("index.parse")]
+/// const fn parse() -> u8 {
+///     1
+/// }
+/// ```
+///
+/// A computed operation name is refused at compile time:
+///
+/// ```compile_fail
+/// const OPERATION: &str = "index.parse";
+/// #[rift_tracing::timed(OPERATION)]
+/// fn parse() -> u8 {
+///     1
+/// }
+/// ```
+///
+/// A field needs `component` before it, as `traced!`'s detailed form does:
+///
+/// ```compile_fail
+/// #[rift_tracing::timed("index.parse", units = 1)]
+/// fn parse() -> u8 {
+///     1
+/// }
+/// ```
+pub use rift_tracing_macros::timed;
 
 /// Items the exported macros expand to. Application code never names them.
 #[doc(hidden)]

@@ -30,6 +30,7 @@ rift-provider = { path = "crates/rift-provider" }
 rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
 rift-tracing = { path = "crates/rift-tracing" }
+rift-tracing-macros = { path = "crates/rift-tracing-macros" }
 
 anyhow = "1.0"
 proc-macro2 = "1.0.107"
