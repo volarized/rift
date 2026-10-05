@@ -659,10 +659,40 @@ later write is discarded; the records the `LogSink` captured are unaffected.
 
 Every workspace crate other than `rift-tracing` emits through it: spans through `traced!`,
 `info_span!`, and `Span`, events through its `trace!` to `error!`, elapsed time a caller acts on
-through `measure_elapsed!`, and test capture through `ScopedRecorder`.
-The architecture check refuses a `tracing`, `tracing-subscriber`, `log`, or OpenTelemetry
-dependency or import in any other crate, and a normal dependency that enables `rift-tracing`'s
-`fixtures` feature, which compiles the test recorder into a release build.
+through `measure_elapsed!`, whole functions through the `#[rift_tracing::timed]` attribute, and
+test capture through `ScopedRecorder`.
+The architecture check refuses a `tracing`, `tracing-subscriber`, `log`, OpenTelemetry, or
+`sysinfo` dependency or import in any other crate, `rift-tracing-macros` included, and a normal
+dependency that enables `rift-tracing`'s `fixtures` feature, which compiles the test recorder
+into a release build.
+
+`#[rift_tracing::timed("package.analyze", component = "dependency")]` rewrites a function's body
+into one `traced!` call: the block form for a function, the async form for an `async fn`. It
+records no argument unless a field names it. The attribute lives in `rift-tracing-macros`, which
+`rift-tracing` re-exports; it finds the consuming crate's name for `rift-tracing` through
+`proc-macro-crate`, so a renamed dependency resolves too.
+
+Metric values stay in process, in every build. An instrument is declared once, with its name,
+unit, label keys, and bounds: `Counter`, `Gauge`, or `Histogram`, with label values that are
+`&'static str` literals. A value lands in the instruments of the thread's dispatcher, the ones
+`TracingRuntime` installs or a test's `ScopedRecorder`, and `TracingRuntime::metrics` and
+`ScopedRecorder::metrics` read every series. An instrument keeps at most its declared count of
+label sets, 256 unless the declaration names another; a label set past that records into one
+overflow series. Every `traced!` operation records `traces.span.metrics.calls` and
+`traces.span.metrics.duration`, in seconds, labeled with its `span.name` and its outcome as
+`status.code`, with `error.type` `panic` or `cancelled` when it did not finish. The metrics follow
+the operation, not its span: a span clone held elsewhere does not lengthen the duration, and the
+span's filters do not select it.
+
+A foreground server samples its own process every [`[logs]`](/docs/developer/configuration#logs)
+`sample_interval`. A sample reads the process once through `sysinfo`, on the blocking pool, and
+records `process.memory.usage`, `process.memory.virtual`, `process.cpu.utilization`,
+`process.cpu.time`, `process.disk.io`, and the open file count:
+`process.unix.file_descriptor.count`, or `process.windows.handle.count` on Windows. A value the
+platform does not report stays absent and is never recorded as zero, and CPU usage is absent
+until a second sample at least 200 ms after the first. With the `otlp` feature and
+`OTEL_EXPORTER_OTLP_ENDPOINT` set, every recorded value is also forwarded to an OpenTelemetry
+meter whose reader exports at `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default.
 
 ## Shared ranking
 
