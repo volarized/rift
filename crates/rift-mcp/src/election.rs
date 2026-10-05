@@ -485,7 +485,8 @@ impl ElectionObservation {
         if election_failure.is_none() && document_failure.is_none() {
             return;
         }
-        let kind = |failure: ReadFailure| tracing::field::debug(failure.kind);
+        // The kind's `Debug` name (`NotFound`), recorded only for a read that failed.
+        let kind = |failure: ReadFailure| format!("{:?}", failure.kind);
         rift_tracing::info!(
             component = "mcp",
             path = %self.document_path.display(),
