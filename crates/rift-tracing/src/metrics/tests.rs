@@ -289,6 +289,118 @@ fn two_threads_record_into_their_own_recorders() {
     );
 }
 
+/// One thread recording into two dispatchers' values in turn lands each value in the
+/// values it was recorded into: the thread's cache never answers a point of the other.
+#[test]
+fn one_thread_recording_into_two_values_in_turn_keeps_them_apart() {
+    use super::{MetricValues, labels};
+
+    let first = MetricValues::default();
+    let second = MetricValues::default();
+    for (values, value) in [(&first, 1.0), (&second, 2.0), (&first, 4.0)] {
+        values.add(PLAIN.instrument(), labels([]), value);
+        values.set(QUEUE.instrument(), labels([]), value);
+        values.observe(SHORT.instrument(), labels([]), value);
+    }
+    drop(first);
+    let third = MetricValues::default();
+    third.add(PLAIN.instrument(), labels([]), 8.0);
+
+    let unlabeled = |values: &MetricValues, name: &str| value(&values.snapshot(), name, &[]);
+    assert_eq!(
+        unlabeled(&second, "test.plain"),
+        Some(SeriesValue::Sum(2.0))
+    );
+    assert_eq!(
+        unlabeled(&second, "test.queue.length"),
+        Some(SeriesValue::Last(2.0))
+    );
+    assert!(matches!(
+        unlabeled(&second, "test.short.duration"),
+        Some(SeriesValue::Buckets { count: 1, .. })
+    ));
+    assert_eq!(unlabeled(&third, "test.plain"), Some(SeriesValue::Sum(8.0)));
+    assert_eq!(unlabeled(&third, "test.queue.length"), None);
+}
+
+/// A thread that records into more series than its cache keeps starts its cache over, and
+/// every value still lands in its own series.
+#[test]
+fn a_thread_past_its_cache_bound_still_records_every_value() {
+    use super::values::{CACHED_POINTS_MAX, cached_points};
+    use super::{MetricValues, labels};
+
+    const WIDE: Counter<1> =
+        Counter::declare("test.wide", "{event}", &["test.key"]).series_max(CACHED_POINTS_MAX + 2);
+    let keys: Vec<&'static str> = (0..=CACHED_POINTS_MAX)
+        .map(|index| &*Box::leak(index.to_string().into_boxed_str()))
+        .collect();
+    let values = MetricValues::default();
+    for round in 0..2 {
+        for key in &keys {
+            values.add(WIDE.instrument(), labels([*key]), 1.0);
+            assert!(cached_points() <= CACHED_POINTS_MAX, "round {round}");
+        }
+    }
+
+    let snapshot = values.snapshot();
+    let wide: Vec<_> = snapshot
+        .series()
+        .iter()
+        .filter(|series| series.name() == "test.wide")
+        .collect();
+    assert_eq!(wide.len(), keys.len(), "one series per key, no overflow");
+    assert!(
+        wide.iter()
+            .all(|series| series.value() == &SeriesValue::Sum(2.0)),
+        "every series holds both rounds"
+    );
+}
+
+/// Threads recording into one series together leave the exact totals: every shard is
+/// added up, and a histogram's count, sum, and buckets agree.
+#[test]
+fn threads_recording_into_one_series_leave_its_exact_totals() {
+    use std::sync::Arc;
+
+    use super::{MetricValues, labels};
+
+    const THREADS: u32 = 16;
+    const RECORDS: u32 = 1_000;
+    let values = Arc::new(MetricValues::default());
+    let workers: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let values = Arc::clone(&values);
+            std::thread::spawn(move || {
+                for _ in 0..RECORDS {
+                    values.add(PLAIN.instrument(), labels([]), 1.0);
+                    values.observe(SHORT.instrument(), labels([]), 0.5);
+                    values.observe(SHORT.instrument(), labels([]), 2.0);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("a worker finishes");
+    }
+
+    let snapshot = values.snapshot();
+    let total = f64::from(THREADS * RECORDS);
+    assert_eq!(
+        value(&snapshot, "test.plain", &[]),
+        Some(SeriesValue::Sum(total))
+    );
+    let per_bucket = u64::from(THREADS * RECORDS);
+    assert_eq!(
+        value(&snapshot, "test.short.duration", &[]),
+        Some(SeriesValue::Buckets {
+            count: 2 * per_bucket,
+            sum: total * 2.5,
+            counts: vec![(Some(0.1), 0), (Some(1.0), per_bucket), (None, per_bucket)],
+        })
+    );
+}
+
 fn traced_question_mark(fail: bool) -> Result<u8, &'static str> {
     let parsed = crate::traced!("test.parse", {
         if fail {
@@ -407,4 +519,98 @@ fn every_operation_instrument_names_the_span_metrics_connector_spelling() {
     );
     assert_eq!(calls.label_keys(), duration.label_keys());
     assert_eq!(duration.series_max(), calls.series_max());
+}
+
+/// The cost of one record on the handle path, from 1, 4, and 8 threads sharing one
+/// dispatcher's values: 1,000,000 counter adds and 1,000,000 histogram records per run,
+/// split across the threads, each thread under the same dispatcher a runtime installs.
+/// Prints the median nanoseconds per record over five runs of every thread. Run it alone
+/// in a release build:
+///
+/// ```text
+/// cargo test -p rift-tracing --release --lib -- --ignored --nocapture record_path_cost
+/// ```
+#[test]
+#[ignore = "a measurement, not a check; run it alone in a release build"]
+fn record_path_cost() {
+    use std::sync::{Arc, Barrier};
+    use std::time::Instant;
+
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::{MetricLayer, MetricValues};
+
+    const RECORDS: u32 = 1_000_000;
+    const RUNS: u32 = 5;
+    const CALLS: Counter<3> = Counter::declare(
+        "test.cost.calls",
+        "{call}",
+        &["span.name", "status.code", "error.type"],
+    );
+    const DURATION: Histogram<3> = Histogram::declare(
+        "test.cost.duration",
+        &["db.namespace", "db.operation.name", "error.type"],
+    );
+
+    let values = Arc::new(MetricValues::default());
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(MetricLayer::new(Arc::clone(&values))),
+    );
+    let median = |mut samples: Vec<f64>| {
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    };
+    for threads in [1_u32, 4, 8] {
+        let per_thread = RECORDS / threads;
+        let mut counter = Vec::new();
+        let mut histogram = Vec::new();
+        for _ in 0..RUNS {
+            let start = Arc::new(Barrier::new(threads as usize));
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let dispatch = dispatch.clone();
+                    let start = Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            start.wait();
+                            let added = Instant::now();
+                            for _ in 0..per_thread {
+                                CALLS.labeled(["lexical.commit", "Ok", ""]).add(1);
+                            }
+                            let added = added.elapsed();
+                            let recorded = Instant::now();
+                            for _ in 0..per_thread {
+                                DURATION
+                                    .labeled(["index", "exec", ""])
+                                    .record(Duration::from_micros(40));
+                            }
+                            (added, recorded.elapsed())
+                        })
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let (added, recorded) = worker.join().expect("a worker finishes");
+                counter.push(added.as_secs_f64() * 1e9 / f64::from(per_thread));
+                histogram.push(recorded.as_secs_f64() * 1e9 / f64::from(per_thread));
+            }
+        }
+        let (counter, histogram) = (median(counter), median(histogram));
+        println!(
+            "threads={threads} counter_ns_per_record={counter:.1} \
+             histogram_ns_per_record={histogram:.1}"
+        );
+    }
+    let snapshot = values.snapshot();
+    let calls = snapshot
+        .find(
+            "test.cost.calls",
+            &[("span.name", "lexical.commit"), ("status.code", "Ok")],
+        )
+        .map(crate::MetricSeries::value);
+    let expected = f64::from(RECORDS) * f64::from(RUNS) * 3.0;
+    assert!(
+        matches!(calls, Some(SeriesValue::Sum(sum)) if (*sum - expected).abs() < 1.0),
+        "every add landed: {calls:?}"
+    );
 }
