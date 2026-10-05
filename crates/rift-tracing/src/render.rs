@@ -53,9 +53,9 @@ impl LogRecord {
     /// [`Self::rendered`], with the level in `color`.
     pub(crate) fn rendered_line(&self, time_zone: &TimeZone, color: LevelColor) -> String {
         let timestamp = rendered_timestamp(self.recorded_at_ms(), time_zone);
-        let level = self.level().to_uppercase();
-        let component = label(self.component());
-        let operation = label(self.operation());
+        let level = escaped(&self.level().to_uppercase());
+        let component = escaped(label(self.component()));
+        let operation = escaped(label(self.operation()));
         let mut line = format!("{timestamp} ");
         match level_color(self.level()).filter(|_| color == LevelColor::Ansi) {
             Some(code) => {
@@ -68,7 +68,7 @@ impl LogRecord {
         let _ = write!(line, " {component:<8} {operation:<12} ");
         let fields = RecordFields::parsed(self.fields());
         fields.write_context(&mut line, self.component(), self.operation());
-        line.push_str(self.message());
+        push_escaped(&mut line, self.message());
         fields.write_own(&mut line);
         line
     }
@@ -139,7 +139,7 @@ impl RecordFields {
             line.push_str(NESTED_MARK);
             if let Some(Value::String(name)) = nearest.get("name") {
                 line.push(' ');
-                line.push_str(name);
+                push_escaped(line, name);
             }
             let length = line.len();
             line.push(' ');
@@ -167,7 +167,7 @@ impl RecordFields {
             }
             Self::Text(text) => {
                 line.push(' ');
-                line.push_str(text);
+                push_escaped(line, text);
             }
         }
     }
@@ -229,15 +229,70 @@ fn write_span_fields(
 }
 
 /// Writes `key=value`, a string value without the quotes JSON puts around it.
+///
+/// An array or object value prints as the JSON `serde_json` writes, which escapes C0
+/// controls alone, so its text goes through [`push_escaped`] as well.
 fn write_pair(line: &mut String, key: &str, value: &Value) {
-    line.push_str(key);
+    push_escaped(line, key);
     line.push('=');
     match value {
-        Value::String(text) => line.push_str(text),
-        other => {
-            let _ = write!(line, "{other}");
+        Value::String(text) => push_escaped(line, text),
+        other => push_escaped(line, &other.to_string()),
+    }
+}
+
+/// Appends `text` to `line` with every character [`is_escaped`] names written as
+/// [`char::escape_debug`] writes it (`\u{1b}`, `\n`, `\u{202e}`), every other character
+/// as it is.
+///
+/// Every piece of record text a line carries passes through here: the message, the
+/// level, `component`, `operation`, span names, field keys and values, and the JSON of an
+/// array or object value. A record's text comes partly from outside the process (file
+/// paths, tool arguments, text of an indexed repository), and a line reaches a terminal on
+/// stderr and through `rift server logs`, so no record can move the cursor, recolor the
+/// terminal, end its line early, or reorder the text a reader sees. The only escape
+/// sequences a line carries are the level colors [`LevelColor::Ansi`] writes.
+///
+/// A backslash prints as it is: a Windows path stays readable, and the text `\u{1b}` a
+/// record carried reads the same as an escaped ESC without acting as one.
+fn push_escaped(line: &mut String, text: &str) {
+    if !text.chars().any(is_escaped) {
+        line.push_str(text);
+        return;
+    }
+    for character in text.chars() {
+        if is_escaped(character) {
+            let _ = write!(line, "{}", character.escape_debug());
+        } else {
+            line.push(character);
         }
     }
+}
+
+/// `text` with every character [`is_escaped`] names in its escaped form.
+fn escaped(text: &str) -> String {
+    let mut line = String::with_capacity(text.len());
+    push_escaped(&mut line, text);
+    line
+}
+
+/// Whether a line prints `character` escaped:
+///
+/// - a control code, `char::is_control`: C0 (`\0` to `\x1f`, with ESC, CR, LF, and TAB),
+///   DEL (`\x7f`), and C1 (`\u{80}` to `\u{9f}`). ESC and the C1 CSI start terminal
+///   control sequences; CR and LF end the line; the line layout uses no TAB.
+/// - U+2028 and U+2029, the line and paragraph separators: Python's `str.splitlines`, with
+///   which the `rift-dev` log readers split a page into lines, ends a line at them.
+/// - The bidirectional embeddings, overrides, and isolates U+202A to U+202E and U+2066 to
+///   U+2069: a terminal that applies the Unicode bidirectional algorithm displays the text
+///   after one in an order other than the order of its bytes, so a value can show a reader
+///   text it does not hold.
+pub(crate) const fn is_escaped(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// One recorded instant as an RFC 3339 timestamp in `time_zone`'s local offset.
@@ -259,8 +314,129 @@ fn rendered_timestamp(recorded_at_ms: i64, time_zone: &TimeZone) -> String {
 mod tests {
     use jiff::tz::{Offset, TimeZone};
 
-    use super::{LevelColor, label, level_color, rendered_timestamp};
+    use serde_json::json;
+
+    use super::{LevelColor, is_escaped, label, level_color, rendered_timestamp};
     use crate::record::LogRecord;
+
+    /// Text a record can carry from outside the process, each holding characters a terminal
+    /// or a line reader acts on, and the escaped form a line prints for one of them.
+    const HOSTILE: [(&str, &str); 11] = [
+        ("\u{1b}[31mred\u{1b}[0m", "\\u{1b}[31mred"),
+        ("\u{1b}]0;title\u{7}", "\\u{1b}]0;title\\u{7}"),
+        ("\u{1b}[2J\u{1b}[H", "\\u{1b}[2J"),
+        ("left\rright", "left\\rright"),
+        ("first\nsecond", "first\\nsecond"),
+        ("nul\0byte", "nul\\0byte"),
+        ("del\u{7f}byte", "del\\u{7f}byte"),
+        ("csi\u{9b}31m", "csi\\u{9b}31m"),
+        ("next\u{85}line", "next\\u{85}line"),
+        ("override\u{202e}txt.exe", "override\\u{202e}txt.exe"),
+        (
+            "isolate\u{2066}x\u{2069} sep\u{2028}end",
+            "isolate\\u{2066}x\\u{2069}",
+        ),
+    ];
+
+    /// One record carrying `text` in the message, a field key, a field value, an array
+    /// value, the component, the root span's name and field, and the nearest span's name
+    /// and field.
+    fn records_carrying(text: &str) -> Vec<LogRecord> {
+        let span = |name: &str, key: &str, value: &str| {
+            let fields = json!({ "component": "mcp", key: value });
+            json!({ "name": name, "fields": fields })
+        };
+        let with_fields = |fields: serde_json::Value| {
+            LogRecord::new(
+                0,
+                "info",
+                "rift",
+                "mcp",
+                "tools/call",
+                "plain",
+                &fields.to_string(),
+            )
+        };
+        vec![
+            LogRecord::new(0, "info", "rift", "mcp", "tools/call", text, "{}"),
+            LogRecord::new(0, "info", "rift", text, text, "plain", "{}"),
+            with_fields(json!({ "path": text })),
+            with_fields(json!({ text: "value" })),
+            with_fields(json!({ "arguments": [text, { "nested": text }] })),
+            with_fields(json!({ "root_span": span(text, "tool", "search") })),
+            with_fields(json!({ "root_span": span("mcp.request", "tool", text) })),
+            with_fields(json!({ "root_span": span("mcp.request", text, "search") })),
+            with_fields(json!({
+                "root_span": span("mcp.request", "tool", "search"),
+                "nearest_span": span(text, "path", "lib.rs"),
+            })),
+            with_fields(json!({
+                "root_span": span("mcp.request", "tool", "search"),
+                "nearest_span": span("index.read", "path", text),
+            })),
+            LogRecord::new(0, "info", "rift", "mcp", "", "plain", text),
+        ]
+    }
+
+    /// `line` without the level colors [`LevelColor::Ansi`] writes.
+    fn without_level_colors(line: &str) -> String {
+        let mut plain = line.to_owned();
+        for code in [31, 32, 33, 34, 35, 0] {
+            plain = plain.replace(&format!("\u{1b}[{code}m"), "");
+        }
+        plain
+    }
+
+    /// No record text reaches a line as a control character, a line separator, or a
+    /// bidirectional control: each prints escaped, and the record stays one line, colored
+    /// or not.
+    #[test]
+    fn record_text_never_reaches_a_line_as_a_control_character() {
+        for (text, escaped_form) in HOSTILE {
+            for record in records_carrying(text) {
+                for color in [LevelColor::Plain, LevelColor::Ansi] {
+                    let line = record.rendered_line(&TimeZone::UTC, color);
+                    let plain = without_level_colors(&line);
+                    let raw = plain.chars().filter(|character| is_escaped(*character));
+                    assert_eq!(raw.count(), 0, "{text:?} reached {line:?}");
+                    assert_eq!(line.lines().count(), 1, "{line:?}");
+                    assert!(!line.contains(['\n', '\r']), "{line:?}");
+                }
+                let line = record.rendered(&TimeZone::UTC);
+                // `serde_json` writes a C0 control inside an array as `\u001b` itself, and a
+                // line names the nearest span alone.
+                let fields = record.fields();
+                if !fields.contains("arguments")
+                    && !fields.starts_with(
+                        "{\"root_span\":{\"fields\":{\"component\":\"mcp\",\"tool\":\"search\"}",
+                    )
+                {
+                    assert!(
+                        line.contains(escaped_form),
+                        "{line:?} shows {escaped_form:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The only escape sequences a line carries are its level colors, written on a
+    /// terminal alone.
+    #[test]
+    fn a_plain_line_carries_no_escape_sequence_and_a_terminal_line_only_its_color() {
+        let record = LogRecord::new(0, "warn", "rift", "mcp", "", "\u{1b}[31mred", "{}");
+
+        let plain = record.rendered_line(&TimeZone::UTC, LevelColor::Plain);
+        let terminal = record.rendered_line(&TimeZone::UTC, LevelColor::Ansi);
+
+        assert!(!plain.contains('\u{1b}'), "{plain:?}");
+        assert_eq!(terminal.matches('\u{1b}').count(), 2, "{terminal:?}");
+        assert!(
+            terminal.contains("\u{1b}[33mWARN \u{1b}[0m"),
+            "{terminal:?}"
+        );
+        assert!(terminal.ends_with("\\u{1b}[31mred"), "{terminal:?}");
+    }
 
     #[test]
     fn a_rendered_line_carries_every_column() {
