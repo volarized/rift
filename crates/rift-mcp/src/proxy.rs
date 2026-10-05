@@ -45,6 +45,10 @@ use crate::election::{
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
+use crate::metrics::{
+    Ending, MCP_CLIENT_OPERATION_DURATION, McpRequest, RESOURCE_TEMPLATES_LIST, RESOURCES_LIST,
+    RESOURCES_READ, TOOLS_LIST,
+};
 use crate::output::OutputPolicy;
 use crate::repository::{
     ServerConfigurationSelection, repository_election_directory, select_server_configuration,
@@ -1382,13 +1386,23 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let listing = self
-            .forward(list_tools_request(request), |result| match result {
-                ServerResult::ListToolsResult(result) => Some(result),
-                _ => None,
-            })
-            .await?;
-        Ok(self.output.select_listing(listing))
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("tools/list", {
+            answered = self
+                .forward(list_tools_request(request), |result| match result {
+                    ServerResult::ListToolsResult(result) => Some(result),
+                    _ => None,
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(TOOLS_LIST).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        Ok(self.output.select_listing(answered?))
     }
 
     async fn call_tool(
@@ -1396,6 +1410,7 @@ impl ServerHandler for RiftProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let measured = McpRequest::tool_call(&request.name);
         let span = rift_tracing::info_span!(
             "mcp.forward",
             component = "mcp",
@@ -1403,29 +1418,39 @@ impl ServerHandler for RiftProxy {
             request_id = %context.id,
             tool = %request.name
         );
-        let response = span
-            .instrument(async {
-                rift_tracing::debug!("tool forward started");
-                let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-                let result = self
-                    .forward(request, |result| match result {
-                        ServerResult::CallToolResult(result) => {
-                            Some(CallToolResponse::Complete(result))
-                        }
-                        ServerResult::InputRequiredResult(result) => {
-                            Some(CallToolResponse::InputRequired(result))
-                        }
-                        ServerResult::CreateTaskResult(result) => {
-                            Some(CallToolResponse::Task(result))
-                        }
-                        _ => None,
-                    })
-                    .await;
-                rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
-                result
-            })
-            .await?;
-        Ok(self.selected_response(response))
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("tools/call", {
+            answered = span
+                .instrument(async {
+                    rift_tracing::debug!("tool forward started");
+                    let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+                    let result = self
+                        .forward(request, |result| match result {
+                            ServerResult::CallToolResult(result) => {
+                                Some(CallToolResponse::Complete(result))
+                            }
+                            ServerResult::InputRequiredResult(result) => {
+                                Some(CallToolResponse::InputRequired(result))
+                            }
+                            ServerResult::CreateTaskResult(result) => {
+                                Some(CallToolResponse::Task(result))
+                            }
+                            _ => None,
+                        })
+                        .await;
+                    rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
+                    result
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        measured.record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of_tool_call(&answered),
+        );
+        Ok(self.selected_response(answered?))
     }
 
     async fn list_resources(
@@ -1438,11 +1463,23 @@ impl ServerHandler for RiftProxy {
             params: request,
             extensions: Extensions::default(),
         });
-        self.forward(request, |result| match result {
-            ServerResult::ListResourcesResult(result) => Some(result),
-            _ => None,
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/list", {
+            answered = self
+                .forward(request, |result| match result {
+                    ServerResult::ListResourcesResult(result) => Some(result),
+                    _ => None,
+                })
+                .await;
         })
-        .await
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_LIST).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        answered
     }
 
     async fn list_resource_templates(
@@ -1455,11 +1492,23 @@ impl ServerHandler for RiftProxy {
             params: request,
             extensions: Extensions::default(),
         });
-        self.forward(request, |result| match result {
-            ServerResult::ListResourceTemplatesResult(result) => Some(result),
-            _ => None,
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/templates/list", {
+            answered = self
+                .forward(request, |result| match result {
+                    ServerResult::ListResourceTemplatesResult(result) => Some(result),
+                    _ => None,
+                })
+                .await;
         })
-        .await
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCE_TEMPLATES_LIST).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        answered
     }
 
     async fn read_resource(
@@ -1468,18 +1517,28 @@ impl ServerHandler for RiftProxy {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(request));
-        let response = self
-            .forward(request, |result| match result {
-                ServerResult::ReadResourceResult(result) => {
-                    Some(ReadResourceResponse::Complete(result))
-                }
-                ServerResult::InputRequiredResult(result) => {
-                    Some(ReadResourceResponse::InputRequired(result))
-                }
-                _ => None,
-            })
-            .await?;
-        Ok(self.selected_resource(response))
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/read", {
+            answered = self
+                .forward(request, |result| match result {
+                    ServerResult::ReadResourceResult(result) => {
+                        Some(ReadResourceResponse::Complete(result))
+                    }
+                    ServerResult::InputRequiredResult(result) => {
+                        Some(ReadResourceResponse::InputRequired(result))
+                    }
+                    _ => None,
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_READ).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        Ok(self.selected_resource(answered?))
     }
 }
 
@@ -2943,6 +3002,83 @@ mod tests {
         assert_eq!(result.structured_content, None);
         assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
         assert_eq!(result.is_error, Some(false));
+        Ok(())
+    }
+
+    /// Every request the proxy forwards lands in `mcp.client.operation.duration`: a tool
+    /// answered with `isError` as `tool_error`, an upstream JSON-RPC refusal under its code.
+    #[tokio::test]
+    async fn each_forwarded_request_records_its_client_operation_duration() -> TestResult {
+        use crate::metrics::tests::recorded;
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        proxied.client.list_all_tools().await?;
+        proxied
+            .client
+            .call_tool(CallToolRequestParams::new("search"))
+            .await?;
+        let failing = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("failing"))
+            .await?;
+        assert_eq!(failing.is_error, Some(true));
+        let refused = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("unknown"))
+            .await;
+        assert!(refused.is_err(), "the upstream refuses an unknown tool");
+        proxied
+            .client
+            .read_resource(ReadResourceRequestParams::new(JSON_ONLY_URI))
+            .await?;
+
+        let snapshot = recorder.metrics();
+        let name = "mcp.client.operation.duration";
+        assert_eq!(
+            recorded(&snapshot, name, &[("mcp.method.name", "tools/list")]),
+            2,
+            "one per listed page: {snapshot:?}"
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("gen_ai.tool.name", "search")
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("error.type", "tool_error")
+                ],
+            ),
+            1,
+            "a tool outside the served tools names none"
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("error.type", "-32602"),
+                    ("rpc.response.status_code", "-32602"),
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            recorded(&snapshot, name, &[("mcp.method.name", "resources/read")]),
+            1
+        );
         Ok(())
     }
 

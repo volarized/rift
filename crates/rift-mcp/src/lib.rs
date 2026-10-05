@@ -8,6 +8,7 @@ mod history;
 mod http;
 mod identity;
 pub mod logs;
+mod metrics;
 mod output;
 mod parameters;
 mod proxy;
