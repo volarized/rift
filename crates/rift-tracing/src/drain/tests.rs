@@ -376,6 +376,47 @@ async fn an_aborted_drain_behind_a_held_metrics_lock_leaves_its_records_unwritte
     drop(holder);
 }
 
+/// A stop whose drain meets another connection's write lock on the metrics database past
+/// its deadline warns "log drain outlasted the stop deadline", and the warning's
+/// `unwritten` field counts every record the lane accepted and never wrote.
+#[tokio::test(start_paused = true)]
+async fn a_stop_behind_a_held_metrics_lock_warns_with_the_unwritten_count() {
+    const ACCEPTED: u64 = 4;
+    let (directory, store) = store().await;
+    let holder = rusqlite::Connection::open(directory.path().join("metrics"))
+        .expect("the holding connection opens");
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the holding connection takes the write lock");
+    let (sink, drain) = log_capture();
+    tracing::subscriber::with_default(crate::capture::registry().with(sink), || {
+        for record in 0..ACCEPTED {
+            tracing::info!(component = "logs", record, "behind the held lock");
+        }
+    });
+    let running = RunningLogDrain::spawn(drain, Arc::clone(&store), 100);
+    let (recorder, mut records) = crate::ScopedRecorder::builder()
+        .install()
+        .expect("the default filter parses");
+
+    let unwritten = running
+        .stop(tokio::time::Instant::now() + Duration::from_millis(500))
+        .await;
+    drop(recorder);
+
+    assert_eq!(unwritten, Some(ACCEPTED));
+    let warning = records
+        .queued_records()
+        .into_iter()
+        .find(|record| record.message() == "log drain outlasted the stop deadline")
+        .expect("the stop warns that the drain outlasted its deadline");
+    assert_eq!(warning.level(), "warn");
+    let fields: serde_json::Value =
+        serde_json::from_str(warning.fields()).expect("the warning's fields are JSON");
+    assert_eq!(fields["unwritten"], ACCEPTED.to_string(), "{fields}");
+    drop(holder);
+}
+
 #[tokio::test]
 async fn cancellation_drains_every_buffered_record() {
     let (_directory, store) = store().await;
