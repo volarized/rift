@@ -187,7 +187,7 @@ fn path_violation(value: &str, bytes_max: usize) -> Option<PathViolation> {
     }
 }
 
-// Explicit match per review request; equivalent `matches!` trips clippy needlessly.
+// Explicit match: the equivalent `matches!` trips `clippy::match_like_matches_macro` needlessly.
 #[allow(clippy::match_like_matches_macro)]
 fn is_dot_segment(segment: &str) -> bool {
     match segment {

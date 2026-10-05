@@ -1833,8 +1833,8 @@ mod tests {
         );
     }
 
-    /// Regression for #362: a candidate set past the collection block bound projects,
-    /// where the projection used to refuse the whole search.
+    /// #362: a candidate set past the collection block bound projects; the search is not
+    /// refused.
     #[test]
     fn candidates_past_the_block_bound_still_project() {
         let source = source(
