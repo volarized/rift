@@ -235,9 +235,6 @@ impl Drop for StopOnDrop {
 
 /// Most log records a failure window prints for one workspace: the newest of the window.
 const WINDOW_RECORDS_MAX: usize = 200;
-/// Most metric snapshot records a failure window prints for one workspace: the newest of
-/// the window, a sampler tick or two of every snapshot group.
-const WINDOW_SNAPSHOT_RECORDS_MAX: usize = 12;
 /// Bytes of one source a failure window prints: its last bytes, the earlier ones cut.
 const WINDOW_SOURCE_BYTES_MAX: u64 = 64 << 10;
 /// Launch time one `rift server logs` read of a failure window is allowed beside its
@@ -257,9 +254,8 @@ const WINDOW_READ_SHARE: Duration = WINDOW_LAUNCH_ALLOWANCE.saturating_add(Durat
 /// Longest every `rift server logs` read of one failure window waits, together.
 ///
 /// It counts toward the failing case's nextest deadline. The log records of every
-/// workspace are read first, each with up to [`WINDOW_READ_SHARE`]; the snapshot reads and
-/// the operations in flight scan get what is left, so a slow read can cut only the
-/// optional parts. A read the budget cuts says how long it ran and what it printed.
+/// workspace are read first, each with up to [`WINDOW_READ_SHARE`]; the operations in
+/// flight scan gets what is left, so a slow read can cut only the optional part. A read the budget cuts says how long it ran and what it printed.
 pub(crate) const WINDOW_READ_MAX: Duration = Duration::from_secs(12);
 /// Pause between polls of one record read; [`WINDOW_READ_SHARE`] over it bounds the polls.
 const WINDOW_READ_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -287,14 +283,13 @@ const ENDED_WINDOWS_MAX: usize = 8;
 ///
 /// The window holds the test's identity and, for each workspace it covers, the
 /// server's persisted records from the test's start to the failure, read through the
-/// window query of `rift server logs` (`--since`, `--until`, `--kind`): the newest
-/// [`WINDOW_RECORDS_MAX`] log records, the newest record of the table of operations in
-/// flight, and the newest [`WINDOW_SNAPSHOT_RECORDS_MAX`] metric snapshot records; then
-/// the detached server's `.rift/server.stderr`. The stderr of a `rift mcp` child is
+/// window query of `rift server logs` (`--since`, `--until`): the newest
+/// [`WINDOW_RECORDS_MAX`] log records and the newest record of the table of operations in
+/// flight; then the detached server's `.rift/server.stderr`. The stderr of a `rift mcp` child is
 /// relayed onto the test's own as it arrives ([`RelayedStderr`]), so it already sits
 /// above the window. Each source prints at most [`WINDOW_SOURCE_BYTES_MAX`] bytes and
 /// says once what its bound cut, and all reads together wait at most
-/// [`WINDOW_READ_MAX`], so one workspace prints at most three sources of that size
+/// [`WINDOW_READ_MAX`], so one workspace prints at most two sources of that size
 /// and one record; a source that could not be read says why, beside the failure and
 /// never in its place. Each read prints how long it ran.
 ///
@@ -429,9 +424,6 @@ impl FailureWindow {
             .iter()
             .map(|root| WorkspaceReads::records(root, &since, &until, &budget))
             .collect();
-        for workspace in &mut workspaces {
-            workspace.read_snapshots(&since, &until, &budget);
-        }
         for workspace in &mut workspaces {
             workspace.scan_in_flight(&since, &until, &budget);
         }
@@ -589,15 +581,13 @@ struct WorkspaceReads {
     /// The log records of the window, under the command line that read them.
     records: String,
     in_flight: InFlight,
-    /// The metric snapshot records of the window, under the command line that read them.
-    snapshots: String,
 }
 
 impl WorkspaceReads {
     /// Reads the newest [`WINDOW_RECORDS_MAX`] log records of the window in `root`.
     fn records(root: &Path, since: &str, until: &str, budget: &ReadBudget) -> Self {
         let tail = WINDOW_RECORDS_MAX.to_string();
-        let arguments = window_arguments(since, until, "log", &tail);
+        let arguments = window_arguments(since, until, &tail);
         let mut records = read_heading(&arguments);
         let in_flight = match read_window(root, &arguments, budget) {
             Ok(read) => {
@@ -627,31 +617,6 @@ impl WorkspaceReads {
             root: root.to_owned(),
             records,
             in_flight,
-            snapshots: String::new(),
-        }
-    }
-
-    /// Reads the newest [`WINDOW_SNAPSHOT_RECORDS_MAX`] metric snapshot records of the window.
-    fn read_snapshots(&mut self, since: &str, until: &str, budget: &ReadBudget) {
-        let tail = WINDOW_SNAPSHOT_RECORDS_MAX.to_string();
-        let arguments = window_arguments(since, until, "metric", &tail);
-        self.snapshots = read_heading(&arguments);
-        match read_window(&self.root, &arguments, budget) {
-            Ok(read) => {
-                let count = read.printed.lines().filter(|line| !line.is_empty()).count();
-                self.snapshots.push_str(&bounded_tail(&read.printed));
-                self.snapshots.push_str(&read.took);
-                if count >= WINDOW_SNAPSHOT_RECORDS_MAX {
-                    let _ = writeln!(
-                        self.snapshots,
-                        "[the newest {WINDOW_SNAPSHOT_RECORDS_MAX} snapshot records of the \
-                         window; older ones are not read]"
-                    );
-                }
-            }
-            Err(error) => {
-                let _ = writeln!(self.snapshots, "the snapshot read did not finish: {error}");
-            }
         }
     }
 
@@ -663,7 +628,7 @@ impl WorkspaceReads {
         if !matches!(self.in_flight, InFlight::Cut) {
             return;
         }
-        let arguments = window_arguments(since, until, "log", "all");
+        let arguments = window_arguments(since, until, "all");
         let scanned = run_window_read(&self.root, &arguments, budget).and_then(|(file, _)| {
             let mut newest = None;
             for line in std::io::BufReader::new(file).lines() {
@@ -698,7 +663,6 @@ impl WorkspaceReads {
                 let _ = writeln!(text, "not read: {error}");
             }
         }
-        text.push_str(&self.snapshots);
         let stderr_file = rift_mcp::stderr_file_path(&self.root);
         let _ = writeln!(
             text,
@@ -710,16 +674,9 @@ impl WorkspaceReads {
     }
 }
 
-/// The window query arguments of one read: `--since`, `--until`, `--kind`, `--tail`.
-fn window_arguments<'a>(
-    since: &'a str,
-    until: &'a str,
-    kind: &'a str,
-    tail: &'a str,
-) -> [&'a str; 8] {
-    [
-        "--since", since, "--until", until, "--kind", kind, "--tail", tail,
-    ]
+/// The window query arguments of one read: `--since`, `--until`, `--tail`.
+fn window_arguments<'a>(since: &'a str, until: &'a str, tail: &'a str) -> [&'a str; 6] {
+    ["--since", since, "--until", until, "--tail", tail]
 }
 
 /// The heading of one record read: the command line a person runs to read it again.

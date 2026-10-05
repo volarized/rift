@@ -24,8 +24,8 @@ use rift_mcp::{
 };
 use rift_protocol::lock::ServerLock;
 use rift_tracing::{
-    LOG_PAGE_RECORDS_MAX, LogDrain, LogLines, LogQuery, LogReader, LogReads, RecordKind,
-    RunningLogDrain, StoredLogRecord, install_panic_hook,
+    LOG_PAGE_RECORDS_MAX, LogDrain, LogLines, LogQuery, LogReader, LogReads, RunningLogDrain,
+    StoredLogRecord, install_panic_hook,
 };
 use tokio_util::sync::CancellationToken;
 use waitpid_any::WaitHandle;
@@ -144,9 +144,6 @@ pub(super) enum ServerCommand {
         /// Print only records recorded before WHEN, in the forms `--since` takes.
         #[arg(long, value_name = "WHEN", value_parser = LogsBound::parse)]
         until: Option<LogsBound>,
-        /// Print records of this kind: diagnostics, metric snapshots, or both.
-        #[arg(long, value_name = "KIND", default_value = "log")]
-        kind: LogKind,
         /// Print only records at this severity, as the store spells it.
         #[arg(long, value_name = "LEVEL")]
         level: Option<LogLevel>,
@@ -214,19 +211,6 @@ impl LogsBound {
             Self::At(instant) => instant.as_millisecond(),
         }
     }
-}
-
-/// Which kind of record a logs read prints.
-///
-/// The variants carry no documentation of their own: clap renders a value's
-/// doc comment as per-value help, which turns the whole command's help into
-/// its long form.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub(super) enum LogKind {
-    #[default]
-    Log,
-    Metric,
-    All,
 }
 
 /// One severity a logs read is restricted to, in the store's own spelling.
@@ -436,11 +420,10 @@ pub(super) async fn run(
             tail,
             since,
             until,
-            kind,
             level,
             component,
         } => {
-            let window = LogsWindow { since, until, kind };
+            let window = LogsWindow { since, until };
             let query = logs_query(tail, window, level, component.as_deref());
             print_logs(root, &query, tail, &logs_mode(follow))
                 .await
@@ -1347,12 +1330,11 @@ async fn restart(root: &Path) -> Result<ServerOutcome, RiftError> {
     start_detached(root, STOP_POLL_ATTEMPT_COUNT).await
 }
 
-/// The window and kind one `rift server logs` run selects.
+/// The window one `rift server logs` run selects.
 #[derive(Clone, Copy, Debug, Default)]
 struct LogsWindow {
     since: Option<LogsBound>,
     until: Option<LogsBound>,
-    kind: LogKind,
 }
 
 /// The store read one `rift server logs` run issues.
@@ -1370,11 +1352,7 @@ fn logs_query(
         TailCount::All => LOG_PAGE_RECORDS_MAX,
         TailCount::Newest(count) => usize::try_from(count).unwrap_or(LOG_PAGE_RECORDS_MAX),
     };
-    let mut query = match window.kind {
-        LogKind::Log => LogQuery::newest(limit),
-        LogKind::Metric => LogQuery::newest(limit).of_kind(RecordKind::Metric),
-        LogKind::All => LogQuery::newest(limit).of_every_kind(),
-    };
+    let mut query = LogQuery::newest(limit);
     if let Some(level) = level {
         query = query.at_level(level.label());
     }
@@ -1548,14 +1526,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AuthMode, ChildWatch, LogKind, LogLevel, LogsBound, LogsMode, LogsWindow,
-        PRESENCE_POLL_INTERVAL, ProcessExit, RunningLogDrain, SERVER_STOP_DEADLINE,
-        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
-        ServerOutcome, StaleReason, StartMode, StartSpawns, StartedServer, TailCount, TokenCheck,
-        await_election_released, await_election_released_with_probe, await_serving,
-        await_serving_with_probe, await_stopped, await_stopped_with_probe, discard_stale_document,
-        foreground_refused, logs_mode, logs_query, now_ms, print_logs, request_stop,
-        stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain, token_check,
+        AuthMode, ChildWatch, LogLevel, LogsBound, LogsMode, LogsWindow, PRESENCE_POLL_INTERVAL,
+        ProcessExit, RunningLogDrain, SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT,
+        START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason,
+        StartMode, StartSpawns, StartedServer, TailCount, TokenCheck, await_election_released,
+        await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
+        await_stopped_with_probe, discard_stale_document, foreground_refused, logs_mode,
+        logs_query, now_ms, print_logs, request_stop, stale_reason_phrase, start_detached,
+        start_mode, status, stop, stop_log_drain, token_check,
     };
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
@@ -3004,7 +2982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_until_read_selects_records_before_its_bound_of_the_kind_asked() -> TestResult {
+    async fn an_until_read_selects_records_before_its_bound() -> TestResult {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
         let record = |recorded_at_ms, message| {
@@ -3034,22 +3012,17 @@ mod tests {
         let until = LogsBound::parse("2025-10-04T17:46:41Z")?;
         assert_eq!(since.recorded_at_ms(0), started);
         let reads = store.reader().connect()?;
-        let messages = |kind| -> Result<Vec<String>, rift_error::RiftError> {
-            let window = LogsWindow {
-                since: Some(since),
-                until: Some(until),
-                kind,
-            };
-            Ok(reads
-                .following(&logs_query(TailCount::All, window, None, None))?
-                .iter()
-                .map(|stored| stored.record().message().to_owned())
-                .collect())
+        let window = LogsWindow {
+            since: Some(since),
+            until: Some(until),
         };
+        let messages: Vec<String> = reads
+            .following(&logs_query(TailCount::All, window, None, None))?
+            .iter()
+            .map(|stored| stored.record().message().to_owned())
+            .collect();
 
-        assert_eq!(messages(LogKind::Log)?, ["first", "last"]);
-        assert_eq!(messages(LogKind::All)?, ["first", "last"]);
-        assert!(messages(LogKind::Metric)?.is_empty());
+        assert_eq!(messages, ["first", "last"]);
         Ok(())
     }
 
