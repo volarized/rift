@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import collections
 import difflib
 import json
 import pathlib
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from rift_dev.commands import CargoCommand
@@ -241,6 +243,158 @@ def fail_storage_independence() -> None:
         )
 
 
+# The ownership check names who may import a tracing, logging, metrics, or
+# resource-sampling backend. Only `rift-tracing` may; every other workspace
+# package reaches those libraries through it. A library is identified by the
+# package name Cargo resolves, so a renamed dependency (`rename` in the
+# metadata) and a domain module that happens to be called `log` are told apart
+# from the backend. It runs in report mode: it lists what it finds and never
+# fails, because a later batch switches it to enforce once the consumers move.
+TRACING_OWNER = "rift-tracing"
+BACKEND_PACKAGES = frozenset(
+    {
+        "tracing",
+        "log",
+        "tracing-subscriber",
+        "tracing-opentelemetry",
+        "tracing-appender",
+        "tracing-log",
+        "env_logger",
+        "metrics",
+        "prometheus",
+        "sysinfo",
+        "tokio-metrics",
+    }
+)
+BACKEND_PREFIXES = ("opentelemetry",)
+FACADE_ALIAS = re.compile(r"\brift_tracing\b[^;{}]*?\bas\s+(tracing|log)\b")
+CODE_FENCE = re.compile(r"^\s*//[/!]\s*```")
+
+
+@dataclass(frozen=True, slots=True)
+class OwnershipFinding:
+    """One line outside `rift-tracing` that reaches a backend library."""
+
+    package: str
+    library: str
+    path: str
+    line: int
+    text: str
+
+
+def is_backend(package_name: str) -> bool:
+    """Whether Cargo package `package_name` is a backend library the facade owns."""
+    return package_name in BACKEND_PACKAGES or package_name.startswith(BACKEND_PREFIXES)
+
+
+def backend_names(package: dict[str, Any]) -> dict[str, str]:
+    """Map each local identifier a package imports a backend by to the library behind it.
+
+    A dependency of any kind (normal, development, build, optional, target
+    conditional) counts, and `rename` is the identifier the source uses, so
+    `tracing_crate = { package = "tracing" }` is found under `tracing_crate`.
+    """
+    names: dict[str, str] = {}
+    for dependency in package["dependencies"]:
+        if is_backend(dependency["name"]):
+            local = (dependency.get("rename") or dependency["name"]).replace("-", "_")
+            names[local] = dependency["name"]
+    return names
+
+
+def rust_code_lines(text: str) -> list[tuple[int, str]]:
+    """Return the lines that are code, with doctest bodies and without prose comments.
+
+    A plain comment and doc prose never import anything. A doc comment's fenced
+    block is a doctest that compiles, so its lines count.
+    """
+    lines: list[tuple[int, str]] = []
+    fenced = False
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith(("///", "//!")):
+            if CODE_FENCE.match(line):
+                fenced = not fenced
+            elif fenced:
+                lines.append((number, stripped[3:]))
+        elif stripped.startswith("//"):
+            continue
+        else:
+            fenced = False
+            lines.append((number, line))
+    return lines
+
+
+def package_findings(package: dict[str, Any]) -> list[OwnershipFinding]:
+    """List every backend import in the Rust files under one package's directory."""
+    names = backend_names(package)
+    patterns = [
+        (
+            library,
+            re.compile(
+                rf"(?<![\w:.]){re.escape(local)}\b(?=\s*::|\s*;|\s+as\b)"
+                rf"|\bextern\s+crate\s+{re.escape(local)}\b"
+            ),
+        )
+        for local, library in names.items()
+    ]
+    root = pathlib.Path(package["manifest_path"]).parent
+    findings: list[OwnershipFinding] = []
+    for path in sorted(root.rglob("*.rs")):
+        if path.relative_to(root).parts[0] == "target":
+            continue
+        text = path.read_text(encoding="utf-8")
+        for number, line in rust_code_lines(text):
+            hits = {library for library, pattern in patterns if pattern.search(line)}
+            if FACADE_ALIAS.search(line):
+                hits.add("rift-tracing alias")
+            findings.extend(
+                OwnershipFinding(
+                    package["name"], library, str(path), number, line.strip()
+                )
+                for library in sorted(hits)
+            )
+    return findings
+
+
+def ownership_findings(packages: list[dict[str, Any]]) -> list[OwnershipFinding]:
+    """List backend imports in every workspace package except `rift-tracing`."""
+    return [
+        finding
+        for package in packages
+        if package["name"] != TRACING_OWNER
+        for finding in package_findings(package)
+    ]
+
+
+def ownership_report(
+    packages: list[dict[str, Any]], findings: list[OwnershipFinding]
+) -> list[str]:
+    """Summarize ownership findings: one line per package, then the totals."""
+    per_package: dict[str, collections.Counter[str]] = collections.defaultdict(
+        collections.Counter
+    )
+    for finding in findings:
+        per_package[finding.package][finding.library] += 1
+    lines = [
+        f"  {name}: {sum(counts.values())} ("
+        + ", ".join(f"{library} {count}" for library, count in sorted(counts.items()))
+        + ")"
+        for name, counts in sorted(per_package.items())
+    ]
+    declared = sum(
+        len(backend_names(package))
+        for package in packages
+        if package["name"] != TRACING_OWNER
+    )
+    lines.append(
+        f"ownership (report only): {len(findings)} backend imports outside "
+        f"{TRACING_OWNER} in {len(per_package)} packages, "
+        f"{declared} backend dependencies declared there"
+    )
+    return lines
+
+
 def main() -> int:
     """Check exact internal edges and binary targets."""
     packages = rift_packages(cargo_metadata())
@@ -269,4 +423,6 @@ def main() -> int:
 
     fail_test_targets(packages)
     fail_storage_independence()
+    for line in ownership_report(packages, ownership_findings(packages)):
+        print(line)
     return 0
