@@ -2247,6 +2247,8 @@ fn shared_workspace_candidate(
 /// Population failure is a warning, never a request failure: the vector ranking reports its
 /// own readiness, and the next successful publication asks for another pass.
 /// A disabled vector ranking still reports chunked files, then skips declaration derivation.
+/// Any other pass records `vector population started` at its start, and at its end either
+/// `vector population finished` or the warning, which carries `outcome = "error"`.
 ///
 /// # Cancel safety
 ///
@@ -2273,18 +2275,33 @@ pub(crate) async fn populate_search(
     let units = published.reads.symbol_index_documents_by_file();
     let described = published.reads.described_symbol_units_by_file(&units);
     let tree_revision = published.reads.tree_revision();
-    if let Err(error) = index
+    rift_tracing::info!(
+        component = "search",
+        operation = "search.populate",
+        tree_revision,
+        phase = "start",
+        "vector population started"
+    );
+    match index
         .embed_described(&described, embedding, tree_revision)
         .await
     {
-        rift_tracing::warn!(
+        Ok(()) => rift_tracing::info!(
+            component = "search",
+            operation = "search.populate",
+            tree_revision,
+            outcome = "ok",
+            "vector population finished"
+        ),
+        Err(error) => rift_tracing::warn!(
             component = "search",
             operation = "search.populate",
             tree_revision = published.reads.tree_revision(),
             error = %error,
+            outcome = "error",
             "the vector ranking could not embed this publication; the full-text tier keeps \
              answering until a later pass lands"
-        );
+        ),
     }
 }
 
@@ -10652,7 +10669,47 @@ pub(crate) mod tests {
             .ok_or("a disabled vector ranking must still report the chunked guide")?;
         assert_eq!(warning.level(), "warn");
         assert_eq!(warning.component(), "search");
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.message().starts_with("vector population")),
+            "a disabled vector ranking runs no population: {records:?}"
+        );
         cancellation.cancel();
+        Ok(())
+    }
+
+    /// A pass of an enabled vector ranking records its start and its end, each naming the
+    /// tree revision it embeds.
+    #[tokio::test]
+    async fn a_population_pass_records_its_start_and_its_end() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = counting_index(&directory.path().join("search.db")).await?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        super::populate_search(&index, &published, rift_search::Embedding::Every).await;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let lifecycle = records
+            .iter()
+            .filter(|record| record.message().starts_with("vector population"))
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2, "{records:?}");
+        assert_eq!(lifecycle[0].message(), "vector population started");
+        assert_eq!(lifecycle[1].message(), "vector population finished");
+        let revision = published.reads.tree_revision();
+        for (record, field, value) in [
+            (lifecycle[0], "phase", "start"),
+            (lifecycle[1], "outcome", "ok"),
+        ] {
+            assert_eq!(record.level(), "info");
+            assert_eq!(record.operation(), "search.populate");
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields[field], value, "{fields}");
+            assert_eq!(fields["tree_revision"], revision, "{fields}");
+        }
         Ok(())
     }
 
