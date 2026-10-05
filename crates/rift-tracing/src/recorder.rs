@@ -20,6 +20,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::log_capture;
 use crate::drain::LogDrain;
+use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::record::LogRecord;
 use crate::runtime::{LogFilterError, capture_layer, parsed_filter};
 
@@ -63,6 +64,7 @@ const RECORDER_DEFAULT_CAPTURE: &str = "trace";
 #[must_use = "the recorder captures only while it is held"]
 pub struct ScopedRecorder {
     retained: Arc<RetainedRecords>,
+    values: Arc<MetricValues>,
     output: PanicOutput,
     _default: tracing::subscriber::DefaultGuard,
 }
@@ -71,6 +73,30 @@ impl ScopedRecorder {
     /// A builder whose recorder captures every level of every target.
     pub fn builder() -> ScopedRecorderBuilder {
         ScopedRecorderBuilder { capture: None }
+    }
+
+    /// Every value the code under test recorded into an instrument on this thread.
+    ///
+    /// ```
+    /// let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    /// rift_tracing::traced!("index.parse", 1 + 1);
+    /// let calls = recorder.metrics();
+    /// let parsed = calls.find(
+    ///     "traces.span.metrics.calls",
+    ///     &[("span.name", "index.parse"), ("status.code", "Ok")],
+    /// );
+    /// assert_eq!(parsed.map(|series| series.value().clone()), Some(rift_tracing::SeriesValue::Sum(1.0)));
+    /// # Ok::<(), rift_tracing::LogFilterError>(())
+    /// ```
+    #[must_use]
+    pub fn metrics(&self) -> MetricSnapshot {
+        self.values.snapshot()
+    }
+
+    /// The metric values the recorder holds, for a test that publishes a process sample.
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> &MetricValues {
+        &self.values
     }
 
     /// Prints into `buffer` instead of standard error, so a test can read what a panic
@@ -127,9 +153,13 @@ impl ScopedRecorderBuilder {
         let retained = Arc::new(RetainedRecords::default());
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
-        let subscriber = tracing_subscriber::registry().with(capture_layer(sink, filter));
+        let values = Arc::new(MetricValues::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(MetricLayer::new(Arc::clone(&values)))
+            .with(capture_layer(sink, filter));
         let recorder = ScopedRecorder {
             retained,
+            values,
             output: PanicOutput::Stderr,
             _default: tracing::subscriber::set_default(subscriber),
         };

@@ -8,6 +8,8 @@
 
 use std::fmt;
 use std::io::IsTerminal as _;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::Subscriber;
 use tracing::subscriber::Interest;
@@ -21,7 +23,9 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::capture::{LogSink, log_capture};
 use crate::drain::LogDrain;
+use crate::metrics::{MetricLayer, MetricSnapshot, MetricValues};
 use crate::otlp;
+use crate::sampler::{ProcessSampler, SystemProcessReader};
 use crate::stderr::BoundedStderr;
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
@@ -104,22 +108,36 @@ where
 #[must_use = "the runtime flushes its export only when shut down"]
 pub struct TracingRuntime {
     export: otlp::Export,
+    values: Arc<MetricValues>,
+    sampler: Option<ProcessSampler>,
 }
 
 impl TracingRuntime {
-    /// A builder whose subscriber writes stderr unbounded and captures nothing.
+    /// A builder whose subscriber writes stderr unbounded, captures nothing, and samples
+    /// no process.
     pub const fn builder() -> TracingRuntimeBuilder {
         TracingRuntimeBuilder {
             capture: None,
             stderr: StderrPolicy::Unbounded,
+            sample_interval: None,
         }
     }
 
-    /// Flushes buffered spans and shuts the OTLP export down.
+    /// Every value the process's instruments hold now, read in process.
+    #[must_use]
+    pub fn metrics(&self) -> MetricSnapshot {
+        self.values.snapshot()
+    }
+
+    /// Stops the process sampler, then flushes buffered spans and shuts the OTLP export
+    /// down.
     ///
     /// The caller runs it before either exit path: a normal return drops every other
     /// local first, and `process::exit` past it runs no destructor at all.
     pub fn shutdown(self) {
+        if let Some(sampler) = self.sampler {
+            sampler.stop();
+        }
         self.export.shutdown();
     }
 }
@@ -130,6 +148,7 @@ impl TracingRuntime {
 pub struct TracingRuntimeBuilder {
     capture: Option<String>,
     stderr: StderrPolicy,
+    sample_interval: Option<Duration>,
 }
 
 impl TracingRuntimeBuilder {
@@ -148,10 +167,25 @@ impl TracingRuntimeBuilder {
         self
     }
 
-    /// Installs the subscriber as the process's global default.
+    /// Samples the current process every `interval`: its resident and virtual memory, CPU
+    /// time and usage, open files, and disk bytes. An interval below
+    /// [`PROCESS_SAMPLE_INTERVAL_MIN`](crate::PROCESS_SAMPLE_INTERVAL_MIN) samples at that
+    /// minimum.
+    ///
+    /// `interval` is the accepted `[logs] sample_interval` value. Without this call the
+    /// runtime reads no process.
+    pub const fn sample_interval(mut self, interval: Duration) -> Self {
+        self.sample_interval = Some(interval);
+        self
+    }
+
+    /// Installs the subscriber as the process's global default, and starts the process
+    /// sampler when [`Self::sample_interval`] ran.
     ///
     /// The returned drain exists only when [`Self::capture`] ran; without it the
-    /// subscriber has no recording layer and allocates no log queue.
+    /// subscriber has no recording layer and allocates no log queue. The sampler runs on
+    /// the calling Tokio runtime; called outside one, the runtime samples nothing and says
+    /// so on stderr.
     ///
     /// # Panics
     ///
@@ -180,7 +214,20 @@ impl TracingRuntimeBuilder {
             stderr_layer.set_ansi(false);
         }
         let (otlp_layer, export) = otlp::layer();
+        let values = Arc::new(MetricValues::default());
+        let sampler = self.sample_interval.and_then(|interval| {
+            if tokio::runtime::Handle::try_current().is_err() {
+                eprintln!("rift: warning: no Tokio runtime runs the process sampler");
+                return None;
+            }
+            Some(ProcessSampler::spawn(
+                SystemProcessReader::current(),
+                interval,
+                Arc::clone(&values),
+            ))
+        });
         tracing_subscriber::registry()
+            .with(MetricLayer::new(Arc::clone(&values)))
             .with(
                 stderr_layer.with_filter(stderr_filter(
                     EnvFilter::try_from_default_env()
@@ -190,7 +237,14 @@ impl TracingRuntimeBuilder {
             .with(sink)
             .with(otlp_layer)
             .init();
-        (TracingRuntime { export }, drain)
+        (
+            TracingRuntime {
+                export,
+                values,
+                sampler,
+            },
+            drain,
+        )
     }
 }
 

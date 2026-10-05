@@ -461,8 +461,10 @@ fn future_adds_no_more_than_instrumentation_to_the_work() {
 
     assert!(work_bytes >= BODY_BYTES);
     assert_eq!(size_of::<Span>(), size_of::<tracing::Span>());
+    // Beside the instrumentation, the future holds the operation's completion guard.
+    let completion = size_of::<crate::metrics::Completion>();
     assert!(
-        size_of_val(&traced) <= size_of_val(&instrumented) + 2 * size_of::<Span>(),
+        size_of_val(&traced) <= size_of_val(&instrumented) + 2 * size_of::<Span>() + completion,
         "work {work_bytes}, instrumented {}, traced {}",
         size_of_val(&instrumented),
         size_of_val(&traced)
