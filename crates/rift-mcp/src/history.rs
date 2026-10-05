@@ -376,6 +376,18 @@ impl HistoryTask {
         self.record_releases(&plan);
         self.progress
             .record_plan(plan.keep().len(), plan.pending().len());
+        // A plan with nothing pending is the steady state of every later fill: only a fill
+        // with commits to write records its start, and `fill_planned` its end.
+        let pending = plan.pending().len();
+        if pending > 0 {
+            rift_tracing::info!(
+                component = "history",
+                operation = "history.fill",
+                pending,
+                phase = "start",
+                "history fill started"
+            );
+        }
         self.fill_planned(filler, &plan, cancellation).await
     }
 
@@ -472,8 +484,16 @@ impl HistoryTask {
             (filler, trimmed)
         })
         .await?;
-        if let Err(error) = trimmed {
-            fill_failed(&error.to_string());
+        match trimmed {
+            Err(error) => fill_failed(&error.to_string()),
+            Ok(_) if !plan.pending().is_empty() => rift_tracing::info!(
+                component = "history",
+                operation = "history.fill",
+                written = plan.pending().len(),
+                outcome = "ok",
+                "history fill finished"
+            ),
+            Ok(_) => {}
         }
         Some(filler)
     }

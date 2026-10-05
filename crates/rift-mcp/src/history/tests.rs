@@ -110,12 +110,15 @@ fn execute_on_store(task: &HistoryTask, statements: &str) -> TestResult {
     Ok(())
 }
 
-/// The message and fields of each record `drain` holds at `operation`.
+/// The message and fields of each warning or error `drain` holds at `operation`; the
+/// `INFO` records of a fill's start and end are left out.
 fn records_at(drain: &mut LogDrain, operation: &str) -> Vec<(String, String)> {
     drain
         .queued_records()
         .into_iter()
-        .filter(|record| record.operation() == operation)
+        .filter(|record| {
+            record.operation() == operation && matches!(record.level(), "warn" | "error")
+        })
         .map(|record| (record.message().to_owned(), record.fields().to_owned()))
         .collect()
 }
@@ -591,6 +594,37 @@ async fn a_commit_past_the_batch_bound_opens_the_next_batch() -> TestResult {
     assert_eq!(held(&task)?, 2, "each commit is a batch of its own");
     let counts = task.progress.counts().ok_or("the plan is recorded")?;
     assert_eq!((counts.analyzed(), counts.total()), (2, 2));
+    Ok(())
+}
+
+/// A fill with commits pending records its start with the pending count, and its end with
+/// the commits it wrote; a later fill with nothing pending records neither.
+#[tokio::test]
+async fn a_fill_with_pending_commits_records_its_start_and_its_end() -> TestResult {
+    let directory = committed_workspace("")?;
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let mut task = history_task(directory.path(), None)?;
+
+    let filler = task.fill(None, &CancellationToken::new()).await;
+    let filler = task.fill(filler, &CancellationToken::new()).await;
+
+    assert!(filler.is_some());
+    let records: Vec<_> = drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| record.message().starts_with("history fill "))
+        .collect();
+    let messages: Vec<_> = records
+        .iter()
+        .map(rift_tracing::LogRecord::message)
+        .collect();
+    assert_eq!(messages, ["history fill started", "history fill finished"]);
+    let started: serde_json::Value = serde_json::from_str(records[0].fields())?;
+    assert_eq!(started["pending"], "2", "{started}");
+    assert_eq!(started["phase"], "start", "{started}");
+    let finished: serde_json::Value = serde_json::from_str(records[1].fields())?;
+    assert_eq!(finished["written"], "2", "{finished}");
+    assert_eq!(finished["outcome"], "ok", "{finished}");
     Ok(())
 }
 

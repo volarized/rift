@@ -106,6 +106,12 @@ pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGu
             // now, before serving starts, so a concurrent probe cannot pair
             // the previous holder's document with this holder's lock.
             guard.retire();
+            rift_tracing::info!(
+                component = "mcp",
+                operation = "server.start",
+                state_directory = %guard.state_directory.display(),
+                "workspace election claimed"
+            );
             Ok(guard)
         }
         Err(TryLockError::WouldBlock) => errors::mcp::election_already_serving().fail(),
@@ -278,6 +284,12 @@ impl Drop for ElectionGuard {
     fn drop(&mut self) {
         self.retire();
         release_election_lock(&self.election_file);
+        rift_tracing::info!(
+            component = "mcp",
+            operation = "server.stop",
+            state_directory = %self.state_directory.display(),
+            "workspace election released"
+        );
     }
 }
 
@@ -1447,6 +1459,38 @@ mod tests {
         assert_eq!(only.level(), "info");
         assert_eq!(only.operation(), "server.start");
         assert_eq!(records.len(), 1, "one record, no error event");
+    }
+
+    /// A claim records the election claimed, and the guard's drop records it released,
+    /// each naming the state directory.
+    #[test]
+    fn a_claim_and_its_release_are_each_recorded() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let guard = claim(directory.path())?;
+        drop(guard);
+        drop(recorder);
+        let records = drain.queued_records();
+        let state_directory = directory
+            .path()
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY)
+            .display()
+            .to_string();
+        for (message, operation) in [
+            ("workspace election claimed", "server.start"),
+            ("workspace election released", "server.stop"),
+        ] {
+            let record = records
+                .iter()
+                .find(|record| record.message() == message)
+                .ok_or(message)?;
+            assert_eq!(record.level(), "info");
+            assert_eq!(record.component(), "mcp");
+            assert_eq!(record.operation(), operation);
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields["state_directory"], state_directory.as_str());
+        }
+        Ok(())
     }
 
     #[test]
