@@ -109,10 +109,14 @@ const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 pub(crate) const WORKER_PERMIT_LOCK: &str = "worker.permit";
 
 /// One admitted blocking operation's worker permit, recorded as [`WORKER_PERMIT_LOCK`].
-/// The error arm is the semaphore's closure, which [`BlockingExecutor::admitted`] refuses,
-/// so every permit it answers holds `Ok`.
-type WorkerPermit =
-    rift_tracing::Held<Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>>;
+type WorkerPermit = rift_tracing::Held<tokio::sync::OwnedSemaphorePermit>;
+
+/// Why a worker permit wait ended without the permit: the semaphore closed, which records
+/// the wait `refused`, or the queue timeout passed, which records it `timeout`.
+enum WorkerAdmission {
+    Closed(tokio::sync::AcquireError),
+    TimedOut,
+}
 
 /// Bounded Tokio acceptance for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
@@ -220,24 +224,35 @@ impl BlockingExecutor {
                 "worker admission started"
             );
         });
-        let waiting = rift_tracing::lock(WORKER_PERMIT_LOCK).acquire_within(
-            Duration::from_millis(queue_timeout_ms),
-            queue.instrument(Arc::clone(&self.operations).acquire_owned()),
-        );
+        let operations = Arc::clone(&self.operations);
+        let waiting = rift_tracing::lock(WORKER_PERMIT_LOCK).acquire_fallible(async move {
+            match tokio::time::timeout(
+                Duration::from_millis(queue_timeout_ms),
+                queue.instrument(operations.acquire_owned()),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(closed)) => Err(rift_tracing::Refusal::Refused(WorkerAdmission::Closed(
+                    closed,
+                ))),
+                Err(_) => Err(rift_tracing::Refusal::Timeout(WorkerAdmission::TimedOut)),
+            }
+        });
         let permit = tokio::select! {
             biased;
             () = cancellation.cancelled() => return errors::server::read_cancelled().fail(),
-            waited = waiting => waited.map_err(|_| {
-                rift_tracing::publish_in_flight("worker_queue_timeout");
-                errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error()
+            waited = waiting => waited.map_err(|admission| match admission {
+                WorkerAdmission::Closed(error) => errors::server::read_task()
+                    .operation(operation)
+                    .detail(error.to_string())
+                    .error(),
+                WorkerAdmission::TimedOut => {
+                    rift_tracing::publish_in_flight("worker_queue_timeout");
+                    errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error()
+                }
             })?,
         };
-        if let Err(error) = &*permit {
-            return errors::server::read_task()
-                .operation(operation)
-                .detail(error.to_string())
-                .fail();
-        }
         Ok(permit)
     }
 
@@ -6488,6 +6503,37 @@ done
             !names.is_empty() && names.iter().all(|name| name.starts_with("rift-index-")),
             "every parallel task must run on a named configured worker: {names:?}"
         );
+    }
+
+    /// A blocking operation that finds the worker semaphore closed ends its wait `refused`
+    /// and records no hold, and the caller gets the read task error rather than a timeout.
+    #[tokio::test]
+    async fn a_closed_worker_semaphore_ends_the_wait_refused_and_holds_nothing() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        executor.operations.close();
+        let refusal =
+            rift_tracing::traced!(component = "search", operation = "search.read", async {
+                executor.run("closed operation", || Ok(())).await
+            })
+            .await
+            .expect_err("a closed semaphore admits nothing");
+        assert_eq!(refusal.slug(), errors::server::read_task::SLUG);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| record.message() == "lock.wait")
+            .ok_or("the wait closed with a record")?;
+        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
+        assert_eq!(wait["lock.name"], super::WORKER_PERMIT_LOCK, "{wait}");
+        assert_eq!(wait["outcome"], "refused", "{wait}");
+        assert!(
+            records.iter().all(|record| record.message() != "lock.held"),
+            "a refused wait records no hold"
+        );
+        Ok(())
     }
 
     #[tokio::test]

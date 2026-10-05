@@ -49,10 +49,8 @@ const REPOSITORY_ADMISSION_LOCK: &str = "repository.admission";
 /// The lock a workspace build's turn at the repository's build gate is recorded under.
 const REPOSITORY_BUILD_GATE_LOCK: &str = "repository.build_gate";
 
-/// One request's admission, recorded as [`REPOSITORY_ADMISSION_LOCK`]. The error arm is
-/// the semaphore's closure, which [`RepositoryWorkspaceRegistry::admit`] refuses.
-type RepositoryAdmission =
-    rift_tracing::Held<Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>>;
+/// One request's admission, recorded as [`REPOSITORY_ADMISSION_LOCK`].
+type RepositoryAdmission = rift_tracing::Held<tokio::sync::OwnedSemaphorePermit>;
 
 /// Serves one repository's workspaces through a process-wide bounded executor.
 ///
@@ -354,15 +352,21 @@ impl RepositoryWorkspaceRegistry {
                 .worker_queue_timeout
                 .milliseconds(),
         );
-        let admission = tokio::select! {
-            () = self.stop.cancelled() => return Err(Self::stopping()),
-            acquired = rift_tracing::lock(REPOSITORY_ADMISSION_LOCK)
-                .acquire_within(timeout, Arc::clone(&self.admissions).acquire_owned()) => acquired.ok(),
-        };
-        admission.filter(|admission| admission.is_ok()).ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "repository admission timed out",
-        ))
+        let admissions = Arc::clone(&self.admissions);
+        let waiting = rift_tracing::lock(REPOSITORY_ADMISSION_LOCK).acquire_fallible(async move {
+            match tokio::time::timeout(timeout, admissions.acquire_owned()).await {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_closed)) => Err(rift_tracing::Refusal::Refused(())),
+                Err(_) => Err(rift_tracing::Refusal::Timeout(())),
+            }
+        });
+        tokio::select! {
+            () = self.stop.cancelled() => Err(Self::stopping()),
+            acquired = waiting => acquired.map_err(|()| (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repository admission timed out",
+            )),
+        }
     }
 
     fn stopping() -> (StatusCode, &'static str) {
@@ -1127,6 +1131,38 @@ mod tests {
         assert_eq!(wait["waiter"], "tools/call", "{wait}");
         assert_eq!(wait["holder"], "index.build", "{wait}");
         assert_eq!(wait["outcome"], "acquired", "{wait}");
+        Ok(())
+    }
+
+    /// A request that finds the repository's admissions closed ends its wait `refused`,
+    /// records no hold, and is refused as a timed-out admission is.
+    #[tokio::test]
+    async fn a_closed_admission_semaphore_ends_the_wait_refused_and_holds_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        registry.admissions.close();
+        let refusal = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            registry.admit().await.map(drop)
+        })
+        .await
+        .expect_err("a closed semaphore admits nothing");
+        assert_eq!(refusal.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = lock_wait(&records)?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_ADMISSION_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["outcome"], "refused", "{wait}");
+        assert!(
+            records.iter().all(|record| record.message() != "lock.held"),
+            "a refused wait records no hold"
+        );
         Ok(())
     }
 
