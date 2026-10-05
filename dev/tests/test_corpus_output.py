@@ -305,7 +305,13 @@ def test_a_failing_case_keeps_each_servers_evidence_in_report_and_stderr(
     corpus, report, evidence = corpus_with_server(tmp_path, monkeypatch, fails=True)
     with pytest.raises(AssertionError, match="source revision differs"):
         asyncio.run(corpus.run())
-    evidence.assert_called_once_with()
+    # The failing action began at or after the end of the last recorded action.
+    since = corpus.mark
+    bound = (
+        "the end of the last recorded action, publication; the failing action "
+        "began at or after it"
+    )
+    evidence.assert_called_once_with(since, bound)
     err = capfd.readouterr().err
     assert "server stderr (x):\nboom\n" in err
     assert "persisted log records (y):\nERROR index\n" in err
@@ -318,9 +324,13 @@ def test_a_failing_case_keeps_each_servers_evidence_in_report_and_stderr(
             "stderr_cut": False,
             "proxy_stderr": [],
             "records": str(server.records_path),
+            "window": str(server.window_path),
+            "window_since": since,
+            "window_lower_bound": bound,
         }
     ]
     assert server.records_path == tmp_path / "out" / "report.server-1.records.log"
+    assert server.window_path == tmp_path / "out" / "report.server-1.window.log"
 
 
 def test_a_failing_case_reaches_servers_through_the_served_tree(
@@ -332,7 +342,7 @@ def test_a_failing_case_reaches_servers_through_the_served_tree(
     monkeypatch.setattr(
         corpus.servers[0],
         "evidence",
-        lambda: existed.append(corpus.root.is_dir()) or [],
+        lambda *_: existed.append(corpus.root.is_dir()) or [],
     )
 
     async def cases(directory: Path) -> None:
@@ -372,6 +382,12 @@ def stopped_corpus(tmp_path: Path) -> tuple[Corpus, Mock, Path]:
     server.root = root
     server.log_path = tmp_path / "out" / "r.server-1.log"
     server.records_path = tmp_path / "out" / "r.server-1.records.log"
+    server.started_at = "2026-10-05T09:00:00.000+00:00"
+    server.read_records.return_value = (
+        "2026-10-05T08:00:00.000+00:00 🔵 INFO  storage  database.close "
+        "database checkpointed its write-ahead log busy=0 checkpointed=1 "
+        "database=earlier log=1\n"
+    )
     return corpus, server, root
 
 
@@ -394,6 +410,10 @@ def test_a_stop_keeps_records_and_sizes_with_an_absent_vectors_file(
                 "vectors-wal": "absent",
             },
             "records": str(server.records_path),
+            "records_lines": 0,
+            "database_close": [],
+            "stop_stages": [],
+            "lacks": ["database.close", "stop stage ended"],
         }
     ]
 
@@ -406,6 +426,41 @@ def test_a_failing_records_read_is_noted_and_the_case_continues(
     corpus.stop(server)
     assert corpus.stops[0]["records"] is None
     assert corpus.stops[0]["records_error"] == "rift exited 3"
+    assert corpus.stops[0]["lacks"] == ["database.close", "stop stage ended"]
+
+
+STOP_RECORDS = (
+    "2026-10-05T09:00:05.100+00:00 🔵 INFO  mcp      server.stop  stop stage ended "
+    "outcome=ok remaining=4.9s stage=SQLite worker shutdown\n"
+    "2026-10-05T09:00:05.200+00:00 🔵 INFO  storage  database.close "
+    "database checkpointed its write-ahead log "
+    "busy=0 checkpointed=12 database=index log=12\n"
+)
+
+
+def test_a_stop_reports_database_close_and_stop_stage_values(
+    tmp_path: Path,
+) -> None:
+    corpus, server, _ = stopped_corpus(tmp_path)
+    server.read_records.return_value += STOP_RECORDS
+    corpus.stop(server)
+    entry = corpus.stops[0]
+    assert entry["database_close"] == [
+        {"database": "index", "busy": 0, "log": 12, "checkpointed": 12}
+    ]
+    assert entry["stop_stages"] == [
+        {"stage": "SQLite worker shutdown", "remaining": "4.9s", "outcome": "ok"}
+    ]
+    assert entry["lacks"] == []
+    assert entry["records_lines"] == 2
+
+
+def test_a_stop_without_stage_records_names_what_it_lacks(tmp_path: Path) -> None:
+    corpus, server, _ = stopped_corpus(tmp_path)
+    server.read_records.return_value = STOP_RECORDS.splitlines(keepends=True)[1]
+    corpus.stop(server)
+    assert corpus.stops[0]["lacks"] == ["stop stage ended"]
+    assert corpus.stops[0]["stop_stages"] == []
 
 
 def test_a_failing_stop_keeps_no_stop_entry(tmp_path: Path) -> None:

@@ -55,6 +55,8 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
             assert observed, "the rebuild must be observed before stop"
 
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
         server.root = Path("workspace")
         server.log_path = Path("server.log")
         server.__enter__.return_value = server
@@ -96,6 +98,8 @@ def fill_server(tmp_path: Path, outputs: list[str]) -> MagicMock:
         return current
 
     server = MagicMock(spec=Server)
+    server.started_at = ""
+    server.read_records.return_value = ""
     server.root = Path("workspace")
     server.log_path = Path("server.log")
     server.__enter__.return_value = server
