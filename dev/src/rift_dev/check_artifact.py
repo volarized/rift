@@ -120,5 +120,6 @@ async def check_artifact(binary: Path, version: str) -> None:
                         await check_external_change(client, root)
                     server.stop()
                 except BaseException as error:
-                    error.add_note(server.read_log())
+                    for note in server.evidence():
+                        error.add_note(note)
                     raise

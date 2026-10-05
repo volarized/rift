@@ -21,6 +21,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, NamedTuple, Self, TextIO, TypeAlias, cast
@@ -50,6 +51,16 @@ Json: TypeAlias = (
 )
 JsonObject: TypeAlias = dict[str, Json]
 LOG_BYTES_MAX = 8 * 1024 * 1024
+# The filter every Rift child under test runs with. It is set, never inherited, so
+# an `RUST_LOG` in the developer's shell or the runner cannot change what a failed
+# run left on stderr.
+LOG_FILTER = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"
+# What a failure keeps of one stream: the newest bytes, inline. The whole stream is
+# in its file next to the report.
+EVIDENCE_TAIL_BYTES = 256 * 1024
+# Newest persisted records `rift server logs` prints for a failure.
+RECORD_TAIL = 5000
+EVIDENCE_SECONDS = 10.0
 MESSAGE_BYTES_MAX = 16 * 1024 * 1024
 PAGE_COUNT_MAX = 32
 POLL_SECONDS = 0.05
@@ -227,6 +238,30 @@ def write_junit(path: Path, name: str, seconds: float, failure: str | None) -> N
     ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
 
 
+def cut_notice(stream: str, limit: int) -> str:
+    """The line a file ends with when its stream wrote past `limit` bytes."""
+    return f"[rift-dev: {stream} cut at {limit} bytes; later output was dropped]\n"
+
+
+def tail_text(text: str, path: Path | None = None) -> str:
+    """The newest `EVIDENCE_TAIL_BYTES` of `text`, naming `path` when older bytes are left out.
+
+    A stream held only in memory has no file, so it states the omitted count alone.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= EVIDENCE_TAIL_BYTES:
+        return text
+    kept = encoded[-EVIDENCE_TAIL_BYTES:].decode("utf-8", errors="replace")
+    omitted = len(encoded) - EVIDENCE_TAIL_BYTES
+    where = f"are in {path}" if path is not None else "were left out"
+    return f"[{omitted} earlier bytes {where}]\n{kept}"
+
+
+def utc_now() -> str:
+    """The current UTC time, to the millisecond, as ISO 8601."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
 @contextmanager
 def stderr_log(
     path: Path | None = None, *, output: BinaryIO | None = None
@@ -251,7 +286,12 @@ def stderr_log(
             reader.join(timeout=STOP_SECONDS)
             require(not reader.is_alive(), "SDK stderr did not close within its bound")
             if path is not None:
-                path.write_bytes(drain.data[:LOG_BYTES_MAX])
+                notice = (
+                    cut_notice("SDK stderr", LOG_BYTES_MAX)
+                    if len(drain.data) > LOG_BYTES_MAX
+                    else ""
+                )
+                path.write_bytes(drain.data[:LOG_BYTES_MAX] + notice.encode("utf-8"))
         if drain.error is not None:
             raise RuntimeError("SDK stderr collection failed") from drain.error
 
@@ -526,6 +566,7 @@ class Server:
         self.log_path = log_path
         self.startup_seconds = startup_seconds
         self.env = dict(os.environ)
+        self.env["RUST_LOG"] = LOG_FILTER
         self.env.update(env or {})
         self.output = output
         self.process: Process
@@ -536,6 +577,8 @@ class Server:
         self._log_failure: BaseException | None = None
         self._descendants: list[psutil.Process] = []
         self._stopped = False
+        self._proxy_logs: list[Path] = []
+        self._output_cut = False
 
     def start(self, *, wait_for_publication: bool = True) -> Self:
         """Start once; callers may inspect output before awaiting publication."""
@@ -581,6 +624,9 @@ class Server:
                     )
                     if not chunk:
                         return
+                    if len(chunk) > remaining:
+                        self._output_cut = True
+                        log.write(cut_notice("server output", LOG_BYTES_MAX).encode())
                     require(
                         len(chunk) <= remaining,
                         f"server output exceeded {LOG_BYTES_MAX} bytes",
@@ -599,7 +645,68 @@ class Server:
         if not self.log_path.exists():
             return ""
         with self.log_path.open("rb") as log:
-            return log.read(LOG_BYTES_MAX).decode("utf-8", errors="replace")
+            text = log.read(LOG_BYTES_MAX).decode("utf-8", errors="replace")
+        if self._output_cut:
+            text += cut_notice("server output", LOG_BYTES_MAX)
+        return text
+
+    @property
+    def records_path(self) -> Path:
+        """Where `records` writes the persisted log records, beside the server log."""
+        return self.log_path.with_suffix(".records.log")
+
+    @property
+    def proxy_logs(self) -> tuple[Path, ...]:
+        """The stderr file of every `rift mcp` connection this server served."""
+        return tuple(self._proxy_logs)
+
+    @property
+    def output_cut(self) -> bool:
+        """Whether the server wrote past `LOG_BYTES_MAX` and its log stops there."""
+        return self._output_cut
+
+    def records(self) -> str:
+        """Read the persisted log records through `rift server logs`, bounded and never raising.
+
+        The records live in the workspace's `.rift/metrics`, which the CLI reads
+        without a server, so a killed server still answers. The text is also
+        written beside the server log. A failed read is reported as text so
+        collecting evidence cannot replace the failure it explains.
+        """
+        path = self.records_path
+        try:
+            text = (
+                Command(self.binary, "server", "logs", "--tail", str(RECORD_TAIL))
+                .with_cwd(self.root)
+                .with_environment(self.env)
+                .with_timeout(EVIDENCE_SECONDS)
+                .with_output_limit(LOG_BYTES_MAX)
+                .output()
+            )
+            path.write_bytes(text.encode("utf-8"))
+        except (OSError, RuntimeError, ValueError) as error:
+            return f"persisted log records unavailable: {error}"
+        return f"persisted log records ({path}):\n{tail_text(text, path)}"
+
+    def evidence(self) -> list[str]:
+        """What a failure keeps: server stderr, each proxy's stderr, and the persisted records.
+
+        Each part is one note; a stream longer than `EVIDENCE_TAIL_BYTES` keeps its
+        newest bytes and names the file holding the rest.
+        """
+        notes = [
+            f"server stderr ({self.log_path}):\n"
+            + tail_text(self.read_log(), self.log_path)
+        ]
+        for proxy in self._proxy_logs:
+            text = (
+                proxy.read_bytes().decode("utf-8", errors="replace")
+                if proxy.exists()
+                else ""
+            )
+            notes.append(f"rift mcp stderr ({proxy}):\n" + tail_text(text, proxy))
+        notes.append(self.records())
+        return notes
 
     def await_publication(self) -> int:
         """Wait at most startup_seconds, checking process ownership in server.json."""
@@ -653,6 +760,7 @@ class Server:
         """
         proxy_log = log_path or self.log_path.with_suffix(".mcp.log")
         outside_workspace(proxy_log, self.root)
+        self._proxy_logs.append(proxy_log)
         with (
             stderr_log(proxy_log, output=self.output) as log,
             owned_environment(self.env) as environment,

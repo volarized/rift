@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import sys
 from builtins import ExceptionGroup
 from collections.abc import AsyncIterator, Buffer
@@ -20,7 +21,13 @@ from rift_dev import cli, commands, rift_test_client
 from rift_dev.check_corpus import Corpus
 from rift_dev.commands import Command, CommandFailed, Process
 from rift_dev.corpus_cache import pins
-from rift_dev.rift_test_client import LOG_BYTES_MAX, Client, Server, stderr_log
+from rift_dev.rift_test_client import (
+    LOG_BYTES_MAX,
+    Client,
+    Server,
+    cut_notice,
+    stderr_log,
+)
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -57,7 +64,7 @@ def test_actions_and_complete_failure_stay_in_report(
         assert retained["failure"] == ""
 
 
-def test_corpus_foreground_stdout_and_stderr_reach_test_output(
+def test_corpus_foreground_output_is_retained_and_a_pass_prints_none(
     tmp_path: Path, capfdbinary: pytest.CaptureFixture[bytes]
 ) -> None:
     corpus = Corpus(pins()["fastapi"], tmp_path / "rift", tmp_path / "report.json")
@@ -73,7 +80,8 @@ def test_corpus_foreground_stdout_and_stderr_reach_test_output(
     retained = server.log_path.read_bytes()
     assert b"index publication complete\n" in retained
     assert b"error[readiness]: source revision differs\n" in retained
-    assert capfdbinary.readouterr().err == retained
+    # A pass copies nothing to the console; a failure prints its evidence instead.
+    assert capfdbinary.readouterr().err == b""
 
 
 def test_sdk_stderr_is_forwarded_and_retained(
@@ -108,7 +116,8 @@ def test_forwarded_sdk_stderr_stops_at_existing_byte_bound(tmp_path: Path) -> No
     with pytest.raises(RuntimeError, match="SDK stderr collection failed"):
         asyncio.run(operation())
     assert len(output.getvalue()) == LOG_BYTES_MAX
-    assert path.read_bytes() == output.getvalue()
+    notice = cut_notice("SDK stderr", LOG_BYTES_MAX).encode()
+    assert path.read_bytes() == output.getvalue() + notice
 
 
 def test_forwarded_foreground_output_stops_at_existing_byte_bound(
@@ -130,11 +139,12 @@ def test_forwarded_foreground_output_stops_at_existing_byte_bound(
         assert process.wait(5) == 0
     with pytest.raises(RuntimeError, match="server log collection failed"):
         server.check_running()
-    assert server.log_path.read_bytes() == b"x" * maximum
-    assert output.getvalue() == server.log_path.read_bytes()
+    notice = cut_notice("server output", maximum).encode()
+    assert server.log_path.read_bytes() == b"x" * maximum + notice
+    assert output.getvalue() == b"x" * maximum
 
 
-def test_corpus_connection_forwards_proxy_diagnostics(
+def test_corpus_connection_keeps_proxy_diagnostics_and_prints_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capfdbinary: pytest.CaptureFixture[bytes],
@@ -166,7 +176,7 @@ def test_corpus_connection_forwards_proxy_diagnostics(
     asyncio.run(operation())
     retained = server.log_path.with_suffix(".mcp.log").read_bytes()
     assert retained == b"proxy connected to server\n"
-    assert capfdbinary.readouterr().err == retained
+    assert capfdbinary.readouterr().err == b""
 
 
 @pytest.mark.parametrize("sdk", [False, True])
@@ -256,3 +266,95 @@ def test_corpus_profile_displays_passing_output_and_retains_capture() -> None:
     assert configuration["success-output"] == "immediate"
     assert configuration["failure-output"] == "immediate-final"
     assert configuration["junit"]["path"] == "junit.xml"
+
+
+def corpus_with_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: bool):
+    report = tmp_path / "out" / "report.json"
+    corpus = Corpus(pins()["fastapi"], tmp_path / "rift", report)
+    server = corpus.server(tmp_path / "workspace")
+    notes = ["server stderr (x):\nboom\n", "persisted log records (y):\nERROR index\n"]
+    evidence = Mock(return_value=notes)
+    monkeypatch.setattr(server, "evidence", evidence)
+
+    async def cases(_directory: Path) -> None:
+        corpus.record("publication", symbols=200)
+        if fails:
+            raise AssertionError("source revision differs")
+
+    monkeypatch.setattr(corpus, "cases", cases)
+    return corpus, report, evidence
+
+
+def test_a_passing_case_collects_and_prints_no_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    corpus, report, evidence = corpus_with_server(tmp_path, monkeypatch, fails=False)
+    asyncio.run(corpus.run())
+    evidence.assert_not_called()
+    assert capfd.readouterr().err == ""
+    assert json.loads(report.read_text())["evidence"] == []
+
+
+def test_a_failing_case_keeps_each_servers_evidence_in_report_and_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    corpus, report, evidence = corpus_with_server(tmp_path, monkeypatch, fails=True)
+    with pytest.raises(AssertionError, match="source revision differs"):
+        asyncio.run(corpus.run())
+    evidence.assert_called_once_with()
+    err = capfd.readouterr().err
+    assert "server stderr (x):\nboom\n" in err
+    assert "persisted log records (y):\nERROR index\n" in err
+    server = corpus.servers[0]
+    assert json.loads(report.read_text())["evidence"] == [
+        {
+            "server": 1,
+            "root": str(tmp_path / "workspace"),
+            "stderr": str(server.log_path),
+            "stderr_cut": False,
+            "proxy_stderr": [],
+            "records": str(server.records_path),
+        }
+    ]
+    assert server.records_path == tmp_path / "out" / "report.server-1.records.log"
+
+
+def test_a_failing_case_reaches_servers_through_the_served_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence is read inside the temporary tree, before the case removes it."""
+    corpus, _, _ = corpus_with_server(tmp_path, monkeypatch, fails=True)
+    existed: list[bool] = []
+    monkeypatch.setattr(
+        corpus.servers[0],
+        "evidence",
+        lambda: existed.append(corpus.root.is_dir()) or [],
+    )
+
+    async def cases(directory: Path) -> None:
+        corpus.root = directory / "workspace"
+        corpus.root.mkdir()
+        raise AssertionError("late")
+
+    monkeypatch.setattr(corpus, "cases", cases)
+    with pytest.raises(AssertionError, match="late"):
+        asyncio.run(corpus.run())
+    assert existed == [True]
+
+
+def test_actions_carry_utc_start_and_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus, report, _ = corpus_with_server(tmp_path, monkeypatch, fails=False)
+    asyncio.run(corpus.run())
+    first = json.loads(report.read_text())["actions"][0]
+    pattern = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+00:00"
+    assert re.fullmatch(pattern, first["started_at"])
+    assert re.fullmatch(pattern, first["ended_at"])
+    assert first["started_at"] <= first["ended_at"]
+    corpus.record("second")
+    assert corpus.actions[1]["started_at"] == first["ended_at"]  # type: ignore[index]

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from rift_dev import check_coldstart
 from rift_dev.commands import Command, DockerCommand
+from rift_dev.rift_test_client import LOG_BYTES_MAX, LOG_FILTER
 
 
 def test_failed_container_start_still_attempts_cleanup(
@@ -26,9 +27,16 @@ def test_failed_container_start_still_attempts_cleanup(
     monkeypatch.setattr(DockerCommand, "output", failed_output)
     with pytest.raises(RuntimeError, match="failed run") as captured:
         asyncio.run(check_coldstart.check_coldstart(binary, "ubuntu:24.04"))
-    assert [command[1] for command in commands] == ["run", "logs", "rm"]
-    assert len(captured.value.__notes__) == 2
+    assert [command[1] for command in commands] == ["run", "logs", "exec", "rm"]
+    notes = captured.value.__notes__
+    assert [note.split(":")[0] for note in notes[:3]] == [
+        "server stderr (last 200 lines) unavailable",
+        "persisted log records unavailable",
+        "rift mcp stderr unavailable",
+    ]
+    assert notes[3].startswith("container cleanup failed")
     command = commands[0]
+    assert command[command.index("--env") + 1] == f"RUST_LOG={LOG_FILTER}"
     assert command[command.index("--network") + 1] == "none"
     assert command[command.index("--workdir") + 1] == "/workspace"
     mount = command[command.index("--mount") + 1]
@@ -66,7 +74,7 @@ def test_expired_gate_still_removes_container(
     monkeypatch.setattr(DockerCommand, "output", output)
     with pytest.raises(RuntimeError, match="command deadline expired"):
         asyncio.run(check_coldstart.check_coldstart(binary, "ubuntu:24.04"))
-    assert cleanup == [("logs", 10), ("rm", 30)]
+    assert cleanup == [("logs", 10), ("exec", 10), ("rm", 30)]
     process.assert_not_called()
     assert rift_test_client.remaining_seconds(30.0) == 30.0
 
@@ -219,3 +227,48 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
         )
     assert len(reads) == (2 if cause_message is not None else 1)
     assert commands[0][1][-1] == '[languages.rust.lsp]\ncommand = ["rust-analyzer"]\n'
+
+
+def test_container_evidence_keeps_server_stderr_proxy_stderr_and_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxy = tmp_path / "proxy.log"
+    proxy.write_text("proxy: connection reset\n", encoding="utf-8")
+    answers = {
+        "logs": "server: panicked at index.rs\n",
+        "exec": "2026-10-05T09:00:00Z ERROR index build failed\n",
+    }
+    limits: list[tuple[str, float | None, int]] = []
+
+    def output(command: Command) -> str:
+        limits.append(
+            (command.arguments[0], command.timeout_seconds, command.output_bytes_max)
+        )
+        return answers[command.arguments[0]]
+
+    monkeypatch.setattr(DockerCommand, "output", output)
+    notes = check_coldstart.container_evidence("cold", proxy)
+    assert notes == [
+        "server stderr (last 200 lines):\nserver: panicked at index.rs\n",
+        "persisted log records:\n2026-10-05T09:00:00Z ERROR index build failed\n",
+        f"rift mcp stderr ({proxy}):\nproxy: connection reset\n",
+    ]
+    # Each read has its own bound and no gate deadline: a timed-out gate is what
+    # the evidence explains.
+    assert limits == [
+        ("logs", check_coldstart.EVIDENCE_SECONDS, LOG_BYTES_MAX),
+        ("exec", check_coldstart.EVIDENCE_SECONDS, LOG_BYTES_MAX),
+    ]
+
+
+def test_container_evidence_failure_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(command: Command) -> str:
+        raise RuntimeError("docker is gone")
+
+    monkeypatch.setattr(DockerCommand, "output", broken)
+    notes = check_coldstart.container_evidence("cold", tmp_path / "missing.log")
+    assert notes[0] == "server stderr (last 200 lines) unavailable: docker is gone"
+    assert notes[1] == "persisted log records unavailable: docker is gone"
+    assert notes[2].startswith("rift mcp stderr unavailable:")
