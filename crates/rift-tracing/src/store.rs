@@ -7,7 +7,6 @@
 //! the only write connection, so writers in this process never compete for the file.
 
 use std::error::Error;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -222,12 +221,15 @@ impl WalCheckpoint {
 pub enum StoreClose {
     /// The writer thread checkpointed and closed the connection, and released its owner.
     Closed(WalCheckpoint),
-    /// The deadline passed while the writer thread ran the checkpoint or the connection's
-    /// close, both of which sync files. The thread keeps running, and keeps its owner, until
-    /// it finishes or the process exits; a log the checkpoint did not empty stays for the
-    /// next open, which recovers every committed record from it.
+    /// The deadline passed before the writer thread finished the close: while the command
+    /// waited in the queue behind an earlier command, or while the thread ran a later stage,
+    /// such as the checkpoint or the connection's close, both of which sync files. The
+    /// thread keeps running, and keeps its owner, until it finishes or the process exits; a
+    /// log the checkpoint did not empty stays for the next open, which recovers every
+    /// committed record from it.
     Timeout {
-        /// The close stage the thread was in: `checkpoint` or `close`.
+        /// The close stage the close was in: one of `queued`, `clear the busy timeout`,
+        /// `checkpoint`, or `close`.
         stage: &'static str,
         /// How long the thread had been in that stage when the deadline passed.
         elapsed: Duration,
@@ -238,8 +240,8 @@ pub enum StoreClose {
 ///
 /// The closer starts the queued stage before it sends the command; the thread starts each
 /// later stage before running it and marks the close ended after the connection closed. A
-/// close that misses its deadline renders this, so the failure names the stage the thread
-/// was in and how long each stage before it took.
+/// close that misses its deadline reads this, so its timeout names the stage the close was
+/// in and how long that stage ran.
 #[derive(Debug, Default)]
 struct CloseProgress {
     stages: Mutex<CloseStages>,
@@ -256,17 +258,12 @@ struct CloseStages {
     started: [Option<std::time::Instant>; CLOSE_STAGES.len()],
     /// When the connection's close returned.
     ended: Option<std::time::Instant>,
-    /// Commands the writer's queue held when the close was requested.
-    queue_depth: usize,
 }
 
 impl CloseProgress {
     /// Starts a close: clears what an earlier close recorded and starts the queued stage.
-    fn request(&self, queue_depth: usize) {
-        *self.lock() = CloseStages {
-            queue_depth,
-            ..CloseStages::default()
-        };
+    fn request(&self) {
+        *self.lock() = CloseStages::default();
         self.start(CLOSE_QUEUED);
     }
 
@@ -295,55 +292,6 @@ impl CloseProgress {
             .rev()
             .find_map(|(stage, started)| started.map(|started| (stage, started)))
             .map(|(stage, started)| (stage, until.saturating_duration_since(started)))
-    }
-
-    /// The stage the close was in at `now` and the time each stage took, as text a
-    /// failure carries: `stage checkpoint running for 1834 ms; queued took 0 ms, clear
-    /// the busy timeout took 0 ms; the queue held 0 of 1 commands at the close request`.
-    fn render(&self, now: std::time::Instant) -> String {
-        let stages = self.lock();
-        let reached: Vec<(&str, std::time::Instant)> = CLOSE_STAGES
-            .iter()
-            .zip(stages.started)
-            .filter_map(|(name, started)| started.map(|started| (*name, started)))
-            .collect();
-        let mut rendered = String::new();
-        match (reached.last(), stages.ended) {
-            (Some((name, started)), None) => {
-                let _ = write!(
-                    rendered,
-                    "stage {name} running for {} ms",
-                    now.saturating_duration_since(*started).as_millis()
-                );
-            }
-            (Some(_), Some(_)) => rendered.push_str("every stage ended"),
-            (None, _) => rendered.push_str("no stage started"),
-        }
-        let took = reached
-            .windows(2)
-            .map(|pair| (pair[0].0, pair[1].1.saturating_duration_since(pair[0].1)))
-            .chain(
-                reached
-                    .last()
-                    .zip(stages.ended)
-                    .map(|((name, started), ended)| {
-                        (*name, ended.saturating_duration_since(*started))
-                    }),
-            );
-        for (index, (name, elapsed)) in took.enumerate() {
-            let separator = if index == 0 { "; " } else { ", " };
-            let _ = write!(
-                rendered,
-                "{separator}{name} took {} ms",
-                elapsed.as_millis()
-            );
-        }
-        let _ = write!(
-            rendered,
-            "; the queue held {} of {WRITER_QUEUE_COMMANDS} commands at the close request",
-            stages.queue_depth
-        );
-        rendered
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CloseStages> {
@@ -541,17 +489,16 @@ impl LogStore {
     /// owner is released. A thread that misses `deadline` keeps running and keeps its
     /// owner until it finishes. A second close answers what the first close answered.
     ///
-    /// A deadline that passes while the thread runs the checkpoint or the connection's close
-    /// answers [`StoreClose::Timeout`]: both stages sync files, a commit is durable in the
-    /// log before either starts, and the next open recovers whatever the log still holds.
+    /// A deadline that passes before the thread answers, whatever stage the close is in,
+    /// answers [`StoreClose::Timeout`] naming that stage: every committed transaction is in the
+    /// log, and the next open recovers whatever the log still holds.
+    /// A close still waiting in the queue behind an earlier command runs after it; one the
+    /// full queue never took leaves the thread to close once every handle drops.
     ///
     /// # Errors
     ///
-    /// Returns `tracing.log_store_failed` when the thread already stopped, `SQLite`
-    /// refuses the checkpoint or the close, or the deadline passes before the thread
-    /// started the checkpoint: while the command waits in the queue, or while the thread
-    /// clears the busy timeout. A missed deadline names the stage the close was in, the
-    /// time each earlier stage took, and the commands the queue held at the request.
+    /// Returns `tracing.log_store_failed` when the thread already stopped, or `SQLite`
+    /// refuses the checkpoint or the close.
     ///
     /// # Cancel safety
     ///
@@ -561,8 +508,7 @@ impl LogStore {
             return Ok(*closed);
         }
         let (reply, answer) = oneshot::channel();
-        self.progress
-            .request(self.sender.max_capacity() - self.sender.capacity());
+        self.progress.request();
         let answered = timeout_at(
             deadline,
             self.request(Command::Close { reply }, answer, "close"),
@@ -571,26 +517,15 @@ impl LogStore {
         let closed = match answered {
             Ok(checkpoint) => StoreClose::Closed(checkpoint?),
             Err(_elapsed) => {
-                let now = std::time::Instant::now();
-                match self.progress.running(now) {
-                    Some((stage, elapsed))
-                        if stage == CLOSE_CHECKPOINT || stage == CLOSE_CONNECTION =>
-                    {
-                        StoreClose::Timeout {
-                            stage: CLOSE_STAGES[stage],
-                            elapsed,
-                        }
-                    }
-                    _ => {
-                        let stages = self.progress.render(now);
-                        return Err(store_failure(
-                            "close",
-                            &self.path,
-                            std::io::Error::other(format!(
-                                "the writer thread outlasted the close deadline: {stages}"
-                            )),
-                        ));
-                    }
+                // `request` started the queued stage before the command was sent, so a
+                // close always has a stage to name.
+                let (stage, elapsed) = self
+                    .progress
+                    .running(std::time::Instant::now())
+                    .unwrap_or((CLOSE_QUEUED, Duration::ZERO));
+                StoreClose::Timeout {
+                    stage: CLOSE_STAGES[stage],
+                    elapsed,
                 }
             }
         };

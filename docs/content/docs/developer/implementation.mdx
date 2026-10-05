@@ -232,10 +232,11 @@ Unix a process the child started can keep the pipes open, and the probe stops wa
 A database close runs a checkpoint, and the checkpoint's file syncs can take longer than the
 close's bound. Such a close ends its stage with `timeout`: the thread running the checkpoint keeps running until
 it finishes or the process exits, and the next open recovers every committed transaction from the
-write-ahead log. A close that started past its bound still fails the stop, and so does a metrics
-close whose writer thread had not reached its checkpoint by the bound. An index supervisor still
-running at its bound is aborted the same way: its stage ends with `timeout` and the table of
-operations in flight, and blocking work it started ends with the process.
+write-ahead log. A metrics close ends with `timeout` whatever stage its bound passed in, a close
+still queued behind an earlier write included. An index or vectors close that started past its
+bound still fails the stop. An index supervisor still running at its bound is aborted the same
+way: its stage ends with `timeout` and the table of operations in flight, and blocking work it
+started ends with the process.
 
 <VersionBadge version="v0.0.62" />
 

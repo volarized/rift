@@ -1990,17 +1990,19 @@ mod tests {
             .expect("an externally cancelled watch must end promptly");
     }
 
-    /// A metrics close that misses its deadline is a serve failure naming the close. A test
-    /// connection holds the write lock while an append is queued ahead of the close, so the
-    /// writer thread cannot answer the close before the lock is released, and the paused
-    /// clock carries the deadline past while the writer waits. The writer's busy timeout
-    /// only bounds that wait; the append that commits after the release proves the lock
-    /// outlasted the deadline.
+    /// A metrics close queued behind a held writer at the stop's deadline ends its stage
+    /// with the outcome `timeout` and no error, so the stop's exit status stays clean. A
+    /// test connection holds the write lock while an append is queued ahead of the close,
+    /// so the writer thread cannot answer the close before the lock is released, and the
+    /// paused clock carries the deadline past while the writer waits. The writer's busy
+    /// timeout, `METRICS_BUSY_TIMEOUT_MS`, only bounds that wait; the append that commits
+    /// after the release proves the lock outlasted the deadline.
     #[tokio::test(start_paused = true)]
-    async fn a_metrics_close_that_misses_its_deadline_is_a_serve_failure_naming_the_close()
+    async fn a_metrics_close_queued_at_the_stop_deadline_ends_its_stage_without_an_error()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::task::{Context, Waker};
 
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("metrics");
         let store = rift_tracing::LogStore::open(&path, None).await?;
@@ -2017,15 +2019,28 @@ mod tests {
         );
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        let refusal = super::close_logs(Some(&store), deadline)
-            .await
-            .expect_err("a writer held behind the lock misses the deadline");
+        super::close_logs(Some(&store), deadline).await?;
 
-        assert_eq!(refusal.slug(), errors::mcp::http_serve_failed::SLUG);
-        let rendered = refusal.to_string();
-        assert!(rendered.contains("metrics database close"), "{rendered}");
         holder.execute_batch("ROLLBACK")?;
         append.await?;
+        drop(recorder);
+        let records = drain.queued_records();
+        let ended = records
+            .iter()
+            .find(|record| record.message() == "stop stage ended")
+            .ok_or("the stage ended with a record")?;
+        assert_eq!(ended.level(), "warn");
+        let ended: serde_json::Value = serde_json::from_str(ended.fields())?;
+        assert_eq!(ended["stage"], "metrics database close", "{ended}");
+        assert_eq!(ended["outcome"], "timeout", "{ended}");
+        let close = records
+            .iter()
+            .find(|record| record.operation() == "database.close")
+            .ok_or("the close was recorded")?;
+        assert_eq!(close.level(), "warn");
+        let close: serde_json::Value = serde_json::from_str(close.fields())?;
+        assert_eq!(close["database"], "metrics", "{close}");
+        assert_eq!(close["stage"], "queued", "{close}");
         Ok(())
     }
 

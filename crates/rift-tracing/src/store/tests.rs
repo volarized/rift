@@ -717,11 +717,12 @@ async fn a_restarted_write_ahead_log_is_cut_to_its_limit() -> TestResult {
     Ok(())
 }
 
-/// A writer thread held inside an append keeps its owner past a close that missed its
-/// deadline, and releases it only once the thread runs the close queued behind the append. The owner stands in
-/// for the election guard the serving process hands the thread.
+/// A close queued behind an append the writer thread is held inside answers a timeout
+/// naming the queued stage, and the thread keeps its owner past it, releasing the owner
+/// only once it runs the close queued behind the append. The owner stands in for the
+/// election guard the serving process hands the thread.
 #[tokio::test]
-async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestResult {
+async fn a_close_queued_behind_a_held_writer_times_out_in_the_queued_stage() -> TestResult {
     let directory = tempfile::tempdir()?;
     let (owner, released) = release_probe();
     let weak = Arc::downgrade(&owner);
@@ -743,18 +744,12 @@ async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestRes
 
     let missed = store
         .close(Instant::now() + Duration::from_millis(50))
-        .await;
+        .await?;
 
-    let missed = missed.expect_err("the close misses its deadline");
-    let rendered = format!("{missed}: {}", rift_error::causes(&missed).join(": "));
-    // The queue holds the append until the writer thread receives it, which races the
-    // close request, so the depth the failure names is 0 or 1.
-    assert!(
-        rendered.contains("stage queued running for")
-            && (rendered.contains("the queue held 0 of 1 commands at the close request")
-                || rendered.contains("the queue held 1 of 1 commands at the close request")),
-        "the missed close names the stage it waited in and the queue it waited behind: {rendered}"
-    );
+    let StoreClose::Timeout { stage, .. } = missed else {
+        return Err(format!("the close misses its deadline: {missed:?}").into());
+    };
+    assert_eq!(stage, "queued", "the close names the stage it waited in");
     assert!(
         weak.upgrade().is_some(),
         "the held thread keeps the owner past the missed deadline"
