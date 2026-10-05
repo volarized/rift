@@ -187,7 +187,11 @@ the log drain and releases the election.
 A foreground stop runs its stages under one deadline, `SERVER_STOP_DEADLINE` (4 s) from where the
 stop begins, and each stage takes only what the one before it left:
 
-1. The serving task drains, and the engines and index supervisor shut down.
+1. The serving task drains, and the engines and index supervisor shut down, by the deadline
+   minus 1 s, the bound step 2 shares, so a stage that runs out its bound still leaves steps 3
+   and 4 their reserves. A dependency version probe the index preparation is running reads the
+   stop: its child is killed within one 25 ms poll, and its close records
+   `error.type=cancelled`.
 2. The index database, and the vectors database when it opened, close by the deadline minus
    1 s: `SERVER_LOG_FLUSH_RESERVE` and `SERVER_DATABASE_STOP_RESERVE`, 500 ms each. A close
    failure becomes a `warn` record with operation `database.close`, so the next stage writes it.
@@ -206,7 +210,9 @@ A database close runs a checkpoint, and the checkpoint's file syncs can take lon
 close's bound. Such a close ends its stage with `timeout`: the thread running the checkpoint keeps running until
 it finishes or the process exits, and the next open recovers every committed transaction from the
 write-ahead log. A close that started past its bound still fails the stop, and so does a metrics
-close whose writer thread had not reached its checkpoint by the bound.
+close whose writer thread had not reached its checkpoint by the bound. An index supervisor still
+running at its bound is aborted the same way: its stage ends with `timeout` and the table of
+operations in flight, and blocking work it started ends with the process.
 
 <VersionBadge version="v0.0.62" />
 
