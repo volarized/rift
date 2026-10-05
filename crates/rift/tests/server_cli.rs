@@ -626,9 +626,18 @@ fn wait_for_lexical_content_hit(
 /// published its document, with the watch on its standard error that every stop of it
 /// passes to [`stop_foreground_server`].
 fn start_foreground_server(root: &Path) -> TestResult<(Child, ServerLock, StderrWatch)> {
+    start_foreground_server_with(root, &[])
+}
+
+/// [`start_foreground_server`] with `variables` laid over [`SERVER_LOG_VARIABLES`].
+fn start_foreground_server_with(
+    root: &Path,
+    variables: &[(&str, &str)],
+) -> TestResult<(Child, ServerLock, StderrWatch)> {
     let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .envs(SERVER_LOG_VARIABLES)
+        .envs(variables.iter().copied())
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1212,6 +1221,166 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         "the log drain's final flush must get its share of the budget: {stderr}"
     );
     failure_window.passed();
+    Ok(())
+}
+
+/// A `rustup` on a fixture `PATH` directory, ahead of the inherited `PATH`, whose `body`
+/// runs under `sh`; answers the `PATH` value that finds it first.
+#[cfg(unix)]
+fn fixture_rustup(tools: &Path, body: &str) -> TestResult<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let program = tools.join("rustup");
+    fs::write(&program, format!("#!/bin/sh\n{body}"))?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+    let inherited = std::env::var_os("PATH").ok_or("the test process has a PATH")?;
+    let paths = std::iter::once(tools.to_path_buf()).chain(std::env::split_paths(&inherited));
+    std::env::join_paths(paths)?
+        .into_string()
+        .map_err(|path| format!("the fixture PATH is not UTF-8: {}", path.display()).into())
+}
+
+/// The stored records `rift server logs` prints for the workspace, once the server left.
+#[cfg(unix)]
+fn stored_records(root: &Path) -> TestResult<String> {
+    let printed = rift(root, &["server", "logs"])?;
+    require_success(&printed, "read the stored records")?;
+    Ok(stdout_of(&printed))
+}
+
+/// The stored `stop stage ended` line of `stage`.
+#[cfg(unix)]
+fn stage_ended_line<'a>(records: &'a str, stage: &str) -> TestResult<&'a str> {
+    records
+        .lines()
+        .find(|line| line.contains("stop stage ended") && line.contains(stage))
+        .ok_or_else(|| format!("the store holds no end of the {stage:?} stage: {records}").into())
+}
+
+/// A stop that lands while the initial preparation waits on a dependency version probe
+/// kills the probe's child: the `index supervisor shutdown` stage ends `ok` with time
+/// left, the probe's close records the cancellation, and the store holds the stop's own
+/// last record. The fixture `rustup` `exec`s its sleep, so the probe's child is the
+/// sleeping process itself.
+#[cfg(unix)]
+#[test]
+fn a_stop_during_a_dependency_probe_kills_the_probe_and_ends_cleanly() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let tools = tempfile::tempdir()?;
+    let started = tools.path().join("probe-started");
+    let path = fixture_rustup(
+        tools.path(),
+        &format!("printf started > '{}'\nexec sleep 30\n", started.display()),
+    )?;
+    let (mut child, _serving, stderr) =
+        start_foreground_server_with(root, &[("PATH", path.as_str())])?;
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the rustup probe to start",
+        || started.exists().then_some(()),
+    )?;
+
+    stop_foreground_server(root, &mut child, &stderr)?;
+
+    let records = stored_records(root)?;
+    let supervisor = stage_ended_line(&records, "index supervisor shutdown")?;
+    assert!(supervisor.contains("outcome=ok"), "{supervisor}");
+    assert!(
+        !supervisor.contains("remaining=0ns"),
+        "the stage ends with time left: {supervisor}"
+    );
+    let probe = records
+        .lines()
+        .find(|line| line.contains("dependency.probe") && line.contains("program=rustup"))
+        .ok_or_else(|| format!("the store holds the probe's close: {records}"))?;
+    assert!(probe.contains("close ✗ cancelled"), "{probe}");
+    assert!(
+        records
+            .lines()
+            .any(|line| line.ends_with("MCP server stopped")),
+        "{records}"
+    );
+    Ok(())
+}
+
+/// A stop that lands while a probe's child left a process holding the probe's output
+/// pipes still ends cleanly. The fixture `rustup` starts a background sleep that inherits
+/// both pipes, then waits on it: the stop kills the probe's child, the probe stops waiting
+/// on the held pipes after its bound, its close records the cancellation, and the
+/// `index supervisor shutdown` stage ends `ok` with time left. On Unix the probe runner
+/// does not reach the sleep, so the test ends it by the pid the fixture recorded.
+#[cfg(unix)]
+#[test]
+fn a_stop_during_a_probe_whose_child_holds_the_pipes_ends_cleanly() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let tools = tempfile::tempdir()?;
+    let started = tools.path().join("probe-started");
+    let holder = tools.path().join("holder-pid");
+    let path = fixture_rustup(
+        tools.path(),
+        &format!(
+            "sleep 30 &\nprintf %s \"$!\" > '{}'\nprintf started > '{}'\nwait\n",
+            holder.display(),
+            started.display()
+        ),
+    )?;
+    let (mut child, _serving, stderr) =
+        start_foreground_server_with(root, &[("PATH", path.as_str())])?;
+    let held = wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the rustup probe to start",
+        || started.exists().then_some(()),
+    )
+    .and_then(|()| {
+        let stop = rift(root, &["server", "stop"])?;
+        let server = wait_for(
+            GONE_POLL_ATTEMPT_COUNT,
+            "the foreground server to exit",
+            || child.try_wait().ok().flatten(),
+        )?;
+        Ok((stop, server))
+    });
+    // The sleep the fixture left behind is the server's grandchild: end it by the pid it
+    // recorded, whatever the stop did.
+    if let Some(pid) = fs::read_to_string(&holder)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let (stop, _server) = held.map_err(|error| {
+        format!(
+            "{error}; stderr: {}",
+            harness::bounded_tail(&stderr.snapshot())
+        )
+    })?;
+    require_success(&stop, "stop the foreground server")?;
+
+    let records = stored_records(root)?;
+    let supervisor = stage_ended_line(&records, "index supervisor shutdown")?;
+    assert!(supervisor.contains("outcome=ok"), "{supervisor}");
+    assert!(
+        !supervisor.contains("remaining=0ns"),
+        "the stage ends with time left: {supervisor}"
+    );
+    let probe = records
+        .lines()
+        .find(|line| line.contains("dependency.probe") && line.contains("program=rustup"))
+        .ok_or_else(|| format!("the store holds the probe's close: {records}"))?;
+    assert!(probe.contains("close ✗ cancelled"), "{probe}");
+    assert!(
+        records
+            .lines()
+            .any(|line| line.ends_with("MCP server stopped")),
+        "{records}"
+    );
     Ok(())
 }
 
