@@ -46,6 +46,46 @@ use crate::lexical::{INDEX_MIGRATIONS, bound_as_usize, require_pragma_row};
 use crate::lexical::{LexicalDocumentRecord, LexicalFileRecord, LexicalIndexStateRecord};
 use crate::vector::{VECTORS_MIGRATIONS, VectorRecord};
 
+/// `db.client.connection.count`: the pool's connections, by `idle` or `used`.
+const CONNECTION_COUNT: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
+    "db.client.connection.count",
+    "{connection}",
+    &[
+        "db.client.connection.pool.name",
+        "db.client.connection.state",
+    ],
+);
+/// `db.client.connection.max`: the most connections the pool opens.
+const CONNECTION_MAX: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+    "db.client.connection.max",
+    "{connection}",
+    &["db.client.connection.pool.name"],
+);
+/// `db.client.connection.pending_requests`: checkouts waiting for a free connection.
+const CONNECTION_PENDING: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+    "db.client.connection.pending_requests",
+    "{request}",
+    &["db.client.connection.pool.name"],
+);
+/// `db.client.connection.wait_time`: one checkout, from its request to a connection or a
+/// refusal.
+const CONNECTION_WAIT: rift_tracing::Histogram<1> = rift_tracing::Histogram::declare(
+    "db.client.connection.wait_time",
+    &["db.client.connection.pool.name"],
+);
+/// `db.client.connection.timeouts`: checkouts the pool refused once its wait bound passed.
+const CONNECTION_TIMEOUTS: rift_tracing::Counter<1> = rift_tracing::Counter::declare(
+    "db.client.connection.timeouts",
+    "{timeout}",
+    &["db.client.connection.pool.name"],
+);
+/// `sqlite.file.size`: the size of the database file and of its write-ahead log.
+const FILE_SIZE: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
+    "sqlite.file.size",
+    "By",
+    &["db.namespace", "sqlite.file.type"],
+);
+
 /// Suffix the migration lock file appends to the database file's whole name: the
 /// database `.rift/index` is prepared under `.rift/index.lock`.
 const MIGRATION_LOCK_SUFFIX: &str = ".lock";
@@ -97,6 +137,14 @@ impl DatabaseName {
         match self {
             Self::Index => "index.write",
             Self::Vectors => "vectors.write",
+        }
+    }
+
+    /// The name the database's migration lock is recorded under, waits and holds alike.
+    const fn migration_lock_name(self) -> &'static str {
+        match self {
+            Self::Index => "index.migration",
+            Self::Vectors => "vectors.migration",
         }
     }
 
@@ -263,6 +311,8 @@ impl DatabasePool {
 #[derive(Debug)]
 pub struct WorkspaceDatabase {
     name: DatabaseName,
+    /// The database file, whose size and write-ahead log size the database records.
+    path: PathBuf,
     database: Db,
     pool: DatabasePool,
     thread: Arc<DatabaseThread>,
@@ -346,7 +396,9 @@ impl WorkspaceDatabase {
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<Self>, RiftError> {
         let pool = name.pool(pool);
-        let migration_lock = MigrationLock::acquire(database_path, name, pool).await?;
+        // Boxed: the recorded hold stays alive across every await below, and would otherwise
+        // sit inline in every future that opens a database.
+        let migration_lock = Box::new(MigrationLock::acquire(database_path, name, pool).await?);
         let mut builder = Db::builder();
         builder
             .models(name.models())
@@ -384,14 +436,56 @@ impl WorkspaceDatabase {
             .await
             .map_err(|source| name.failed(database_path, source))?;
         drop(migration_lock);
-        Ok(Arc::new(Self {
+        let opened = Self {
             name,
+            path: database_path.to_owned(),
             database,
             pool,
             thread,
             writes: Mutex::new(()),
             checkpointed: AtomicBool::new(false),
-        }))
+        };
+        opened.record_pool();
+        opened.record_file_sizes();
+        Ok(Arc::new(opened))
+    }
+
+    /// Records the pool's connections, its bound, and its waiting checkouts.
+    fn record_pool(&self) {
+        let pool = self.name.label();
+        let status = self.database.pool().status();
+        let counts = [
+            ("idle", status.available),
+            ("used", status.size.saturating_sub(status.available)),
+        ];
+        for (state, count) in counts {
+            CONNECTION_COUNT
+                .labeled_value([pool, state], as_count(count))
+                .record();
+        }
+        CONNECTION_MAX
+            .labeled_value([pool], as_count(status.max_size))
+            .record();
+        CONNECTION_PENDING
+            .labeled_value([pool], as_count(status.waiting))
+            .record();
+    }
+
+    /// Records the size of the database file and of its write-ahead log. A file that cannot
+    /// be read, such as a log the close removed, records nothing: absent, not zero.
+    fn record_file_sizes(&self) {
+        let database = self.name.label();
+        let files = [
+            ("database", self.path.clone()),
+            ("wal", appended(&self.path, WRITE_AHEAD_LOG_SUFFIX)),
+        ];
+        for (kind, path) in files {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                FILE_SIZE
+                    .labeled_value([database, kind], metadata.len())
+                    .record();
+            }
+        }
     }
 
     /// Which database this is.
@@ -428,7 +522,9 @@ impl WorkspaceDatabase {
     /// already queued still completes.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
         if !self.checkpointed.swap(true, Ordering::AcqRel) {
-            self.checkpoint_before_close(deadline).await;
+            // Boxed: the checkpoint holds a write checkout, and every stop path that awaits
+            // this future would otherwise carry it inline.
+            Box::pin(self.checkpoint_before_close(deadline)).await;
         }
         self.thread
             .shutdown(deadline)
@@ -440,15 +536,18 @@ impl WorkspaceDatabase {
     async fn checkpoint_before_close(&self, deadline: tokio::time::Instant) {
         let database = self.name.label();
         match tokio::time::timeout_at(deadline, self.truncate_write_ahead_log()).await {
-            Ok(Ok(checkpoint)) => rift_tracing::info!(
-                component = "storage",
-                operation = "database.close",
-                database,
-                busy = checkpoint.busy,
-                log = checkpoint.log,
-                checkpointed = checkpoint.checkpointed,
-                "database checkpointed its write-ahead log"
-            ),
+            Ok(Ok(checkpoint)) => {
+                rift_tracing::info!(
+                    component = "storage",
+                    operation = "database.close",
+                    database,
+                    busy = checkpoint.busy,
+                    log = checkpoint.log,
+                    checkpointed = checkpoint.checkpointed,
+                    "database checkpointed its write-ahead log"
+                );
+                self.record_file_sizes();
+            }
             Ok(Err(error)) => rift_tracing::warn!(
                 component = "storage",
                 operation = "database.close",
@@ -550,14 +649,28 @@ impl WorkspaceDatabase {
     ) -> Result<Connection, RiftError> {
         // Every store operation checks a connection out, so the span sits at debug: an info
         // filter would print one closing line per checkout.
-        let mut connection = rift_tracing::debug_span!(
-            "database.checkout",
-            component = "database",
-            operation = "database.checkout"
-        )
-        .instrument(self.database.connection())
-        .await
-        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        let checked_out;
+        let waited = rift_tracing::measure_elapsed!("database.checkout", {
+            checked_out = rift_tracing::debug_span!(
+                "database.checkout",
+                component = "database",
+                operation = "database.checkout"
+            )
+            .instrument(self.database.connection())
+            .await;
+        })
+        .ok()
+        .map(|((), waited)| waited);
+        let pool = self.name.label();
+        if let Some(waited) = waited {
+            CONNECTION_WAIT.labeled([pool]).record(waited.elapsed());
+        }
+        if checked_out.as_ref().is_err_and(is_pool_wait_timeout) {
+            CONNECTION_TIMEOUTS.labeled([pool]).add(1);
+        }
+        self.record_pool();
+        let mut connection = checked_out
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }
@@ -616,7 +729,9 @@ enum ConnectionAccess {
 /// and with the process when the process exits.
 #[derive(Debug)]
 struct MigrationLock {
+    /// Declared first: the file closes, releasing the lock, before the hold is recorded.
     _file: File,
+    _held: rift_tracing::Held<Result<(), RiftError>>,
 }
 
 impl MigrationLock {
@@ -624,7 +739,11 @@ impl MigrationLock {
     /// pool's busy-wait budget for another process to release it.
     ///
     /// The wait tries the lock once every [`MIGRATION_LOCK_POLL`], so it makes at most
-    /// the budget divided by that span, plus one, attempts.
+    /// the budget divided by that span, plus one, attempts; the last one runs at the first
+    /// poll at or past the budget. The whole wait is recorded once as the lock
+    /// [`DatabaseName::migration_lock_name`], and the hold stays in the table of operations
+    /// in flight until the value drops. The record's outcome is `acquired` whenever the
+    /// attempts end, a refusal included: the refusal reaches the caller as the error.
     ///
     /// # Errors
     ///
@@ -648,20 +767,51 @@ impl MigrationLock {
             .map_err(|source| name.failed(&lock_path, source))?;
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(u64::from(pool.busy_timeout_ms()));
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(TryLockError::Error(source)) => {
-                    return Err(name.failed(&lock_path, source));
+        let attempts = async {
+            loop {
+                match file.try_lock() {
+                    Ok(()) => return Ok(()),
+                    Err(TryLockError::Error(source)) => {
+                        return Err(name.failed(&lock_path, source));
+                    }
+                    Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
+                        let held = migration_lock_held(pool.busy_timeout_ms());
+                        return Err(name.failed(&lock_path, held));
+                    }
+                    Err(TryLockError::WouldBlock) => tokio::time::sleep(MIGRATION_LOCK_POLL).await,
                 }
-                Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
-                    let held = migration_lock_held(pool.busy_timeout_ms());
-                    return Err(name.failed(&lock_path, held));
-                }
-                Err(TryLockError::WouldBlock) => tokio::time::sleep(MIGRATION_LOCK_POLL).await,
             }
-        }
+        };
+        let mut held = rift_tracing::lock(name.migration_lock_name())
+            .acquire(attempts)
+            .await;
+        std::mem::replace(&mut *held, Ok(()))?;
+        Ok(Self {
+            _file: file,
+            _held: held,
+        })
     }
+}
+
+/// A count as a gauge records it; no pool holds more than `u64::MAX` connections.
+fn as_count(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// Whether a checkout failed because the pool's wait bound passed.
+///
+/// Toasty wraps every pool failure as a connection pool error over deadpool's
+/// `PoolError`. A failure to open a connection is `PoolError::Backend`, whose source is
+/// the driver's error; a wait past the bound is `PoolError::Timeout`, which has no source
+/// (deadpool 0.13 `managed/errors.rs`). The pool is never closed while the database is
+/// open, so a pool error without a source is the timeout.
+fn is_pool_wait_timeout(failure: &toasty::Error) -> bool {
+    use std::error::Error as _;
+    failure.is_connection_pool()
+        && failure
+            .source()
+            .and_then(std::error::Error::source)
+            .is_some_and(|pool| pool.source().is_none())
 }
 
 /// The migration lock file of the database at `database_path`: the suffix appended to
@@ -1210,6 +1360,163 @@ mod tests {
     /// waiting here has no bound of its own.
     const HELD_POOL_READ_MAX: Duration = Duration::from_secs(10);
 
+    /// The one series of `name` labeled `labels` in `snapshot`.
+    fn series<'snapshot>(
+        snapshot: &'snapshot rift_tracing::MetricSnapshot,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Result<&'snapshot rift_tracing::MetricSeries, String> {
+        snapshot.find(name, labels).ok_or_else(|| {
+            let recorded = snapshot
+                .series()
+                .iter()
+                .map(|series| format!("{} {:?}", series.name(), series.labels()))
+                .collect::<Vec<_>>();
+            format!("{name} {labels:?} was not recorded; recorded: {recorded:#?}")
+        })
+    }
+
+    /// The count of values a histogram series holds.
+    fn observations(series: &rift_tracing::MetricSeries) -> u64 {
+        match series.value() {
+            rift_tracing::SeriesValue::Buckets { count, .. } => *count,
+            other => panic!("{} holds no histogram: {other:?}", series.name()),
+        }
+    }
+
+    /// The latest value a gauge series holds.
+    fn last(series: &rift_tracing::MetricSeries) -> f64 {
+        match series.value() {
+            rift_tracing::SeriesValue::Last(value) => *value,
+            other => panic!("{} holds no gauge: {other:?}", series.name()),
+        }
+    }
+
+    /// One committed write transaction and one read record the operation, queue, write
+    /// lock, commit, transaction, pool, and file size signals of the database they ran on.
+    #[tokio::test]
+    async fn a_committed_write_records_the_database_signals() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Vectors, pool())
+                .await?;
+        let mut writing = database.writing().await?;
+        let mut transaction = writing.transaction().await?;
+        VectorRecord::create()
+            .identity("committed".to_owned())
+            .model("model".to_owned())
+            .digest("digest".to_owned())
+            .dimension(1)
+            .vector(vec![0_u8; 4])
+            .exec(&mut transaction)
+            .await?;
+        transaction.commit().await?;
+        drop(writing);
+        let mut reading = database.connection().await?;
+        assert_eq!(VectorRecord::all().count().exec(&mut reading).await?, 1);
+        drop(reading);
+        let metrics = recorder.metrics();
+        drop(recorder);
+
+        let vectors = ("db.namespace", "vectors");
+        let operation = series(
+            &metrics,
+            "db.client.operation.duration",
+            &[vectors, ("db.operation.name", "transaction")],
+        )?;
+        assert_eq!(operation.instrument().unit(), "s");
+        assert!(
+            observations(operation) >= 2,
+            "begin and commit are operations"
+        );
+        let queued = series(
+            &metrics,
+            "sqlite.queue.wait.duration",
+            &[vectors, ("db.operation.name", "transaction")],
+        )?;
+        assert_eq!(observations(queued), observations(operation));
+        let begun = series(&metrics, "sqlite.write_lock.wait.duration", &[vectors])?;
+        assert_eq!(observations(begun), 1, "one BEGIN IMMEDIATE");
+        let committed = series(&metrics, "sqlite.commit.duration", &[vectors])?;
+        assert_eq!(observations(committed), 1, "one COMMIT");
+        let active = series(&metrics, "sqlite.transaction.active", &[vectors])?;
+        assert_eq!(active.instrument().unit(), "{transaction}");
+        assert!(
+            last(active).abs() < f64::EPSILON,
+            "the commit ended the transaction"
+        );
+
+        let pool_name = ("db.client.connection.pool.name", "vectors");
+        let waited = series(&metrics, "db.client.connection.wait_time", &[pool_name])?;
+        assert!(
+            observations(waited) >= 2,
+            "the write and the read checked out"
+        );
+        let bound = series(&metrics, "db.client.connection.max", &[pool_name])?;
+        assert!(
+            (last(bound) - 4.0).abs() < f64::EPSILON,
+            "the pool opens four slots"
+        );
+        series(
+            &metrics,
+            "db.client.connection.count",
+            &[pool_name, ("db.client.connection.state", "used")],
+        )?;
+        series(
+            &metrics,
+            "db.client.connection.count",
+            &[pool_name, ("db.client.connection.state", "idle")],
+        )?;
+        series(
+            &metrics,
+            "db.client.connection.pending_requests",
+            &[pool_name],
+        )?;
+        let size = series(
+            &metrics,
+            "sqlite.file.size",
+            &[vectors, ("sqlite.file.type", "database")],
+        )?;
+        assert_eq!(size.instrument().unit(), "By");
+        assert!(last(size) > 0.0, "the open database file has pages");
+        assert!(
+            metrics
+                .find("db.client.connection.timeouts", &[pool_name])
+                .is_none(),
+            "no checkout timed out"
+        );
+        Ok(())
+    }
+
+    /// A checkout the held pool refuses counts one timeout.
+    #[tokio::test]
+    async fn a_checkout_past_the_pool_wait_counts_a_timeout() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, one_slot)
+                .await?;
+        let held = database.connection().await?;
+        tokio::time::timeout(HELD_POOL_READ_MAX, database.connection())
+            .await
+            .map_err(|_elapsed| "the read kept waiting for the held slot past its budget")?
+            .expect_err("a read that meets a held pool refuses");
+        drop(held);
+        let metrics = recorder.metrics();
+        drop(recorder);
+
+        let timeouts = series(
+            &metrics,
+            "db.client.connection.timeouts",
+            &[("db.client.connection.pool.name", "index")],
+        )?;
+        assert_eq!(timeouts.instrument().unit(), "{timeout}");
+        assert_eq!(timeouts.value(), &rift_tracing::SeriesValue::Sum(1.0));
+        Ok(())
+    }
+
     /// A read that meets a pool whose every slot is held refuses once the busy-wait budget
     /// passes, naming the wait, instead of waiting for as long as the holder keeps the slot.
     #[tokio::test]
@@ -1364,6 +1671,117 @@ mod tests {
         assert!(causes.contains("busy-wait budget"), "{causes}");
         assert!(!path.exists(), "a refused open creates no database file");
         drop(held);
+        Ok(())
+    }
+
+    /// The fields of the one `lock.wait` record among `records`.
+    fn lock_wait(
+        records: &[rift_tracing::LogRecord],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut waits = records
+            .iter()
+            .filter(|record| record.message() == "lock.wait");
+        let wait = waits.next().ok_or("the wait closed with a record")?;
+        assert!(waits.next().is_none(), "one wait writes one record");
+        Ok(serde_json::from_str(wait.fields())?)
+    }
+
+    #[tokio::test]
+    async fn an_open_waiting_for_the_migration_lock_names_the_operation_that_holds_it() -> TestResult
+    {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let holder = rift_tracing::traced!("search.open", async {
+            MigrationLock::acquire(&path, DatabaseName::Index, pool()).await
+        })
+        .await?;
+        let mut waiter = std::pin::pin!(rift_tracing::traced!(
+            component = "storage",
+            operation = "database.open",
+            async { MigrationLock::acquire(&path, DatabaseName::Index, pool()).await }
+        ));
+        let pending = tokio::select! {
+            biased;
+            _ = waiter.as_mut() => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(pending, "the holder keeps the migration lock");
+        drop(holder);
+        drop(waiter.await?);
+        drop(recorder);
+
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(wait["lock.name"], "index.migration");
+        assert_eq!(wait["lock.mode"], "exclusive");
+        assert_eq!(wait["waiter"], "database.open");
+        assert_eq!(wait["holder"], "search.open");
+        assert_eq!(wait["outcome"], "acquired");
+        Ok(())
+    }
+
+    /// A wait the budget ends still writes one `lock.wait` record naming the waiter and the
+    /// holder. The record says `acquired`, because the attempts resolved; the refusal
+    /// reaches the caller as the error.
+    #[tokio::test(start_paused = true)]
+    async fn a_migration_lock_wait_past_the_budget_records_one_wait() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let holder = rift_tracing::traced!("search.open", async {
+            MigrationLock::acquire(&path, DatabaseName::Vectors, pool()).await
+        })
+        .await?;
+
+        let refused =
+            rift_tracing::traced!(component = "storage", operation = "database.open", async {
+                MigrationLock::acquire(&path, DatabaseName::Vectors, pool()).await
+            })
+            .await
+            .expect_err("a held migration lock refuses once the budget passes");
+        drop(holder);
+        drop(recorder);
+
+        let causes = rift_error::causes(&refused).join(": ");
+        assert!(causes.contains("busy-wait budget"), "{causes}");
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(wait["lock.name"], "vectors.migration");
+        assert_eq!(wait["waiter"], "database.open");
+        assert_eq!(wait["holder"], "search.open");
+        assert_eq!(wait["outcome"], "acquired");
+        Ok(())
+    }
+
+    /// The wait makes its last attempt at the first poll at or past the budget, so a lock
+    /// released after the budget passed but before that poll is still taken. A budget of
+    /// 995 ms puts the attempts at 990 ms and 1,000 ms, and the holder releases at 996 ms.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_migration_lock_attempt_runs_after_the_budget_passes() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let budget_off_the_poll = DatabasePool::new(4, 995);
+        let holder = MigrationLock::acquire(&path, DatabaseName::Index, pool()).await?;
+        let started = tokio::time::Instant::now();
+        let waiter_path = path.clone();
+        let waiter = tokio::spawn(async move {
+            MigrationLock::acquire(&waiter_path, DatabaseName::Index, budget_off_the_poll)
+                .await
+                .map(drop)
+        });
+
+        tokio::time::sleep_until(started + Duration::from_millis(996)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter still waits past the budget"
+        );
+        drop(holder);
+
+        waiter.await??;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(1_000),
+            "the lock was taken by the attempt after the budget"
+        );
         Ok(())
     }
 
