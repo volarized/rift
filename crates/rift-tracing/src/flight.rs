@@ -13,7 +13,7 @@
 //! [`LOG_LABEL_BYTES_MAX`]; an entry that finds the table full is not tracked, and every
 //! table record carries the count of those refused since the process started.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -55,6 +55,8 @@ const LIFELONG_FIELD: &str = "lifelong";
 /// The span field that names the work an operation runs, as `worker.run` names the request
 /// operation it runs on a worker.
 const WORK_FIELD: &str = "work";
+/// The member of a listed entry that holds the fields recorded on its span after it opened.
+const RECORDED_FIELD: &str = "fields";
 
 /// What an entry of the table is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +102,10 @@ pub(crate) struct FlightEntry {
     pub(crate) parent: Option<&'static str>,
     pub(crate) started_at_ms: i64,
     pub(crate) started: Duration,
+    /// Fields recorded on the span after it opened, such as a child's `pid`, by field
+    /// name, each value cut at [`LOG_LABEL_BYTES_MAX`]; a field recorded again keeps its
+    /// latest value. The span's callsite declares the names, so their count is fixed.
+    pub(crate) recorded: BTreeMap<&'static str, String>,
     /// Kept by its holder for as long as the holder runs: listed, never reported stalled.
     pub(crate) lifelong: bool,
     stall_reported: bool,
@@ -121,6 +127,7 @@ impl FlightEntry {
             kind,
             lock: String::new(),
             work: String::new(),
+            recorded: BTreeMap::new(),
             parent,
             started_at_ms,
             started,
@@ -154,6 +161,14 @@ impl FlightEntry {
         }
         if self.lifelong {
             member.insert(LIFELONG_FIELD.to_owned(), Value::from(true));
+        }
+        if !self.recorded.is_empty() {
+            let fields = self
+                .recorded
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), Value::from(value.as_str())))
+                .collect();
+            member.insert(RECORDED_FIELD.to_owned(), Value::Object(fields));
         }
         Value::Object(member)
     }
@@ -220,6 +235,29 @@ impl FlightTable {
             *active.entry(entry.name).or_insert(0) += 1;
         }
         active
+    }
+
+    /// Applies `values`, recorded on the span of the entry under `identity` after it opened,
+    /// to that entry: `component`, the lock name, and `work` replace what it carries, and
+    /// every other field joins its recorded fields. An identity the table does not track
+    /// changes nothing.
+    fn record(&self, identity: u64, values: &tracing::span::Record<'_>) {
+        let mut entries = self.lock();
+        let Some(entry) = entries.open.get_mut(&identity) else {
+            return;
+        };
+        let mut fields = EntryFields::recorded_later();
+        values.record(&mut fields);
+        for (target, value) in [
+            (&mut entry.component, fields.component),
+            (&mut entry.lock, fields.lock),
+            (&mut entry.work, fields.work),
+        ] {
+            if !value.is_empty() {
+                *target = value;
+            }
+        }
+        entry.recorded.extend(fields.recorded);
     }
 
     /// Removes the entry under `identity`, if the table tracked it.
@@ -300,21 +338,38 @@ fn listed(mut entries: Vec<FlightEntry>, untracked: u64, now: Duration) -> Fligh
 }
 
 /// The fields an entry takes from its span: `component`, the lock name, `work`, and the
-/// lifelong mark.
+/// lifelong mark; and, from a span's later records alone, every other field.
 #[derive(Default)]
 struct EntryFields {
     component: String,
     lock: String,
     work: String,
     lifelong: bool,
+    /// Whether fields other than the four above are kept in `recorded`: on a later
+    /// record, not at the opening, whose fields every entry would otherwise copy.
+    keeps_others: bool,
+    recorded: BTreeMap<&'static str, String>,
 }
 
 impl EntryFields {
+    /// Fields of a record made after the span opened.
+    fn recorded_later() -> Self {
+        Self {
+            keeps_others: true,
+            ..Self::default()
+        }
+    }
+
     fn record(&mut self, field: &Field, value: &str) {
         match field.name() {
             "component" => self.component = bounded(value, LOG_LABEL_BYTES_MAX),
             LOCK_NAME_FIELD => self.lock = bounded(value, LOG_LABEL_BYTES_MAX),
             WORK_FIELD => self.work = bounded(value, LOG_LABEL_BYTES_MAX),
+            LIFELONG_FIELD => {}
+            other if self.keeps_others => {
+                self.recorded
+                    .insert(other, bounded(value, LOG_LABEL_BYTES_MAX));
+            }
             _ => {}
         }
     }
@@ -328,11 +383,13 @@ impl Visit for EntryFields {
     fn record_bool(&mut self, field: &Field, value: bool) {
         if field.name() == LIFELONG_FIELD {
             self.lifelong = value;
+        } else if self.keeps_others {
+            self.record(field, if value { "true" } else { "false" });
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if matches!(field.name(), "component" | LOCK_NAME_FIELD | WORK_FIELD) {
+        if self.keeps_others || matches!(field.name(), "component" | LOCK_NAME_FIELD | WORK_FIELD) {
             self.record(field, &format!("{value:?}"));
         }
     }
@@ -386,6 +443,12 @@ where
         self.table.join(id.into_u64(), entry);
     }
 
+    /// A field recorded after the span opened, such as the `pid` of a child it started,
+    /// joins the span's entry.
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, _context: Context<'_, S>) {
+        self.table.record(id.into_u64(), values);
+    }
+
     fn on_close(&self, id: Id, context: Context<'_, S>) {
         if context
             .metadata(&id)
@@ -429,7 +492,9 @@ pub(crate) fn with_table<Answer>(read: impl FnOnce(&FlightTable) -> Answer) -> O
 /// entries, oldest first. Each entry names its `operation`, its `kind` (`operation`,
 /// `wait`, or `held`), its `age_ms`, its `started_at_ms`, and its `component`,
 /// `lock.name`, and `parent` operation when it has them; a hold declared
-/// [`lifelong`](crate::Lock::lifelong) also carries `"lifelong": true`.
+/// [`lifelong`](crate::Lock::lifelong) also carries `"lifelong": true`. An entry whose span
+/// recorded fields after it opened, such as the `pid` of a child it started, lists them,
+/// latest value each, in the object `fields`.
 ///
 /// A thread whose dispatcher keeps no table publishes nothing.
 ///

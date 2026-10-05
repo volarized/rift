@@ -514,3 +514,32 @@ fn a_full_table_counts_the_refused_entry_in_operation_untracked() {
     );
     drop(open);
 }
+
+/// A field recorded on an operation's span after it opened, as a child's `pid` is once the
+/// child started, shows in the published table under the entry's `fields` with its latest
+/// value; a field declared and never recorded stays out.
+#[test]
+fn a_field_recorded_after_the_opening_shows_in_the_published_table() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let span = crate::info_span!(
+        "engine.start",
+        component = "engine",
+        operation = "engine.start",
+        pid = crate::empty!(),
+        awaited = crate::empty!()
+    );
+    span.record("pid", 41_u32);
+    span.record("pid", 4_242_u32);
+    span.in_scope(|| publish_in_flight("stop"));
+    drop(span);
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let published = with_message(&records, "operations in flight");
+    assert_eq!(published.len(), 1, "{records:?}");
+    let listed = operations(published[0])?;
+    assert_eq!(listed[0]["operation"], "engine.start");
+    assert_eq!(listed[0]["fields"]["pid"], "4242", "{listed:?}");
+    assert!(listed[0]["fields"].get("awaited").is_none(), "{listed:?}");
+    Ok(())
+}

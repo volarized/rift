@@ -956,7 +956,9 @@ per instrument is a `WARN` record naming it.
 Work that has not finished is evidence too. The runtime keeps a table of operations in flight:
 every span carrying an `operation` field, every lock wait, and every held lock, from its opening
 to its close, with its name, kind (`operation`, `wait`, or `held`), component, lock name, parent
-operation, and start. The table holds at most 1,024 entries and counts each one refused past
+operation, and start. A field recorded on the span after it opened, such as the `pid` of a
+child the operation started, joins the entry's `fields` with its latest value. The table holds at
+most 1,024 entries and counts each one refused past
 that bound as `untracked`.
 
 `rift_tracing::publish_in_flight(reason)` writes the table as one `operations in flight` record,
