@@ -215,6 +215,42 @@ def test_the_traces_path_still_keeps_span_durations() -> None:
     }
 
 
+def span_durations(*attributes: KeyValue) -> list[float]:
+    """The durations the store keeps for one 3 ms span carrying `attributes`."""
+    spans = SpanStore()
+    request = ExportTraceServiceRequest()
+    span = request.resource_spans.add().scope_spans.add().spans.add()
+    span.name = "index.build"
+    span.start_time_unix_nano = 1_000_000
+    span.end_time_unix_nano = 4_000_000
+    span.attributes.extend(attributes)
+    assert (
+        post(receiver(spans, MetricStore()), TRACES_PATH, request.SerializeToString())
+        == 200
+    )
+    return list(spans.durations["index.build"])
+
+
+def test_a_span_duration_prefers_the_elapsed_ms_attribute() -> None:
+    assert span_durations(KeyValue(key="elapsed_ms", value=AnyValue(int_value=42))) == [
+        42.0
+    ]
+    assert span_durations(
+        KeyValue(key="elapsed_ms", value=AnyValue(double_value=0.5))
+    ) == [0.5]
+
+
+def test_a_span_duration_falls_back_to_timestamps_without_a_usable_elapsed_ms() -> None:
+    assert span_durations() == [3.0]
+    for unusable in (
+        AnyValue(string_value="slow"),
+        AnyValue(int_value=-1),
+        AnyValue(double_value=float("nan")),
+        AnyValue(double_value=float("inf")),
+    ):
+        assert span_durations(KeyValue(key="elapsed_ms", value=unusable)) == [3.0]
+
+
 def test_points_and_spans_carry_the_instance_that_sent_them() -> None:
     spans = SpanStore()
     metrics = MetricStore()

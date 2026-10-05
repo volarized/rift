@@ -31,6 +31,7 @@ caller reads them while the thread writes.
 from __future__ import annotations
 
 import json
+import math
 import signal
 import socket
 import sys
@@ -104,6 +105,8 @@ START_POLL_SECONDS = 0.005
 GRACEFUL_STOP_SECONDS = 2
 # The attribute that names a span's MCP request; a printed log record names it `req`.
 SPAN_REQUEST_KEY = "request_id"
+# The attribute that holds the duration a Rift operation records on completion.
+ELAPSED_KEY = "elapsed_ms"
 # The resource attribute that names the process a span or point came from.
 INSTANCE_KEY = "service.instance.id"
 # The resource attribute that carries the sending process's identifier.
@@ -382,7 +385,20 @@ class SpanRecord:
 
     @property
     def duration_ms(self) -> float:
-        """The span's duration in milliseconds."""
+        """The span's duration in milliseconds.
+
+        A non-negative number in the span's `elapsed_ms` attribute, the duration a
+        Rift operation records on completion, wins; otherwise the end and start
+        timestamps give it.
+        """
+        recorded = dict(self.attributes).get(ELAPSED_KEY)
+        if recorded is not None:
+            try:
+                elapsed = float(recorded)
+            except ValueError:
+                elapsed = -1.0
+            if math.isfinite(elapsed) and elapsed >= 0.0:
+                return elapsed
         return (self.end_time_unix_nano - self.start_time_unix_nano) / 1_000_000
 
     @property
