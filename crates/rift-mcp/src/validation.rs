@@ -489,15 +489,17 @@ fn publication_map(
     reads: &ReadService,
     preparation: Option<&LocalIndexPreparation>,
 ) -> Arc<WorkspaceMap> {
-    let mut map = preparation.map_or_else(
-        || reads.workspace_map(),
-        |preparation| {
-            reads.workspace_preparation_map(
-                &preparation.map_source_paths,
-                &preparation.map_text_paths,
-            )
-        },
-    );
+    let mut map = rift_core::traced!(component = "index", operation = "index.map", {
+        preparation.map_or_else(
+            || reads.workspace_map(),
+            |preparation| {
+                reads.workspace_preparation_map(
+                    &preparation.map_source_paths,
+                    &preparation.map_text_paths,
+                )
+            },
+        )
+    });
     if let Some(warning) = preparation.and_then(LocalIndexPreparation::warning) {
         map.warnings.push(warning);
     }
@@ -1970,9 +1972,12 @@ pub(crate) fn lexical_write(
     }
     match change_set {
         ChangeSet::Full => LexicalWrite::Whole,
-        ChangeSet::Incremental(changes) => {
-            LexicalWrite::Change(published.reads.lexical_change(changes))
-        }
+        ChangeSet::Incremental(changes) => rift_core::traced!(
+            component = "index",
+            operation = "index.lexical_write",
+            paths = changes.len(),
+            { LexicalWrite::Change(published.reads.lexical_change(changes)) }
+        ),
     }
 }
 
@@ -2058,13 +2063,16 @@ fn whole_workspace_candidate(
     let source_policy = Some(reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     }));
-    let visible_files = complete_visible_digests(
-        root,
-        &reads,
-        source_policy.as_deref().unwrap_or_else(|| {
-            unreachable!("a current-tree read service always compiles its source policy")
-        }),
-    )?;
+    let visible_files =
+        rift_core::traced!(component = "index", operation = "index.visible_digests", {
+            complete_visible_digests(
+                root,
+                &reads,
+                source_policy.as_deref().unwrap_or_else(|| {
+                    unreachable!("a current-tree read service always compiles its source policy")
+                }),
+            )
+        })?;
     let map = publication_map(&reads, None);
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
@@ -2128,7 +2136,12 @@ fn shared_workspace_candidate(
         }
     }
     let reads = previous.reads.rebuilt_cancellable(changes, cancelled)?;
-    let visible_files = previous.update_visible_digests(root, &reads, observed_paths)?;
+    let visible_files = rift_core::traced!(
+        component = "index",
+        operation = "index.visible_digests",
+        paths = observed_paths.len(),
+        { previous.update_visible_digests(root, &reads, observed_paths) }
+    )?;
     let map = publication_map(&reads, previous.preparation.as_ref());
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
@@ -6744,6 +6757,53 @@ pub(crate) mod tests {
             vec!["lib.rs", "other.rs"],
             "the superseded attempt's paths return beside what landed while it ran"
         );
+        Ok(())
+    }
+
+    /// One span closes for each stage of a one-path rebuild that covers every held file,
+    /// so the record of a rebuild says where its time went.
+    #[test]
+    fn a_one_path_rebuild_closes_one_span_for_each_stage() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        });
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let request = validation.take_pending();
+        let (sink, mut drain) = rift_tracing::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let guard = tracing::subscriber::set_default(subscriber);
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            super::workspace_capture(),
+        )?;
+        drop(guard);
+        assert!(matches!(outcome, super::CapturedRebuild::Candidate { .. }));
+        let records = queued_records(&mut drain);
+        for stage in [
+            "index.semantics",
+            "documentation.declarations",
+            "documentation.collect",
+            "index.visible_digests",
+            "index.map",
+            "index.lexical_write",
+        ] {
+            let closed = records
+                .iter()
+                .filter(|record| record.message() == stage)
+                .filter(|record| record.fields().contains("\"span\":\"closed\""))
+                .count();
+            assert_eq!(closed, 1, "one closed span for the {stage} stage");
+        }
         Ok(())
     }
 

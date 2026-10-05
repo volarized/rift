@@ -693,13 +693,16 @@ class Corpus:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / PROBE_PATH
         sources: list[str] = []
+        written: list[float] = []
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
         overlaps = 0
+        converging = False
 
         def write(edit: int) -> None:
             source = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
             path.write_text(source, encoding="utf-8")
             sources.append(source.rstrip("\n"))
+            written.append(time.monotonic())
 
         async def writer() -> None:
             for edit in range(1, int(self.work_seconds()) // 2):
@@ -750,6 +753,11 @@ class Corpus:
                     writes=changed,
                     source_revision=revision,
                     source_revision_at_start=before - 1,
+                    # The age of the newest write when the read began, and the loop the
+                    # read ran in: a read that outlasts its deadline leaves no answer, so
+                    # these say which write the server still owed a publication for.
+                    seconds_since_write=started - written[before - 1],
+                    convergence=converging,
                     warning_codes=codes,
                 )
 
@@ -775,6 +783,7 @@ class Corpus:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             final = [sources[-1]]
+            converging = True
             convergence = time.monotonic()
             async with gate_deadline("churn final source", CONVERGENCE_SECONDS):
                 for name in CHURN_REQUESTS:
