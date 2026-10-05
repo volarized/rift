@@ -184,6 +184,22 @@ fn fixture_workspace(
     Ok(directory)
 }
 
+/// The stderr filter every `rift` child the harness starts runs under.
+///
+/// Each child gets it explicitly and never inherits `RUST_LOG`: an exported
+/// `RUST_LOG=warn` once hid the lifecycle lines a case asserts on (#479).
+pub(crate) const CHILD_LOG_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info";
+
+/// Sets [`CHILD_LOG_FILTER`] and `NO_COLOR` on one `rift` child: the traced lines
+/// end up in a test's captured output rather than on a terminal, so they stay plain.
+pub(crate) fn with_child_log_variables(
+    command: &mut std::process::Command,
+) -> &mut std::process::Command {
+    command
+        .env("RUST_LOG", CHILD_LOG_FILTER)
+        .env("NO_COLOR", "1")
+}
+
 /// Stops the fixture's server when a test unwinds, best effort.
 ///
 /// The stop's standard error reaches the test's own, so a stop that refuses or
@@ -205,7 +221,8 @@ impl StopOnDrop {
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(&self.binary)
+        let mut command = std::process::Command::new(&self.binary);
+        let _ = with_child_log_variables(&mut command)
             .args(["server", "stop"])
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -215,13 +232,208 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// Most persisted log records one failure window reads.
+const WINDOW_RECORDS_MAX: usize = 200;
+/// Bytes of one source a failure window prints: its last bytes, the earlier ones cut.
+const WINDOW_SOURCE_BYTES_MAX: u64 = 64 << 10;
+/// How far before the test's start the record read reaches.
+///
+/// `rift server logs --since` takes an age measured from the command's own clock
+/// reading, which comes later than the window's; the margin keeps the records of
+/// the test's first moments inside the read.
+const WINDOW_SINCE_MARGIN: Duration = Duration::from_secs(2);
+/// Longest a failure window waits for `rift server logs`.
+///
+/// It counts toward the failing case's nextest deadline, so it stays short: the
+/// command reads `.rift/metrics` directly, apart from the server's request path.
+pub(crate) const WINDOW_READ_MAX: Duration = Duration::from_secs(5);
+/// Pause between polls of the record read; [`WINDOW_READ_MAX`] over it bounds the polls.
+const WINDOW_READ_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// What the tested processes recorded from the start of one test to its failure,
+/// printed on the test's stderr when the test fails and never when it passes.
+///
+/// The window holds the test's identity, the server's persisted log records since
+/// the test began (read through `rift server logs`), and the detached server's
+/// `.rift/server.stderr`. The stderr of a `rift mcp` child is relayed onto the
+/// test's own as it arrives ([`RelayedStderr`]), so it already sits above the
+/// window. Each source prints at most [`WINDOW_SOURCE_BYTES_MAX`] bytes and says
+/// once what its bound cut; a source that could not be read says why, beside the
+/// failure and never in its place.
+///
+/// A case begins the window right after its [`StopOnDrop`], so the window drops
+/// first and prints before the teardown stop, which can itself outlast nextest's
+/// deadline. The case calls [`FailureWindow::passed`] as its last step; an early
+/// return through `?` or a panic leaves the window open, and its drop prints it.
+pub(crate) struct FailureWindow {
+    root: PathBuf,
+    began: std::time::Instant,
+    open: bool,
+}
+
+impl FailureWindow {
+    /// Opens the window of one test serving `root`, before the test starts a process.
+    pub(crate) fn begin(root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+            began: std::time::Instant::now(),
+            open: true,
+        }
+    }
+
+    /// Closes the window of a test that passed: it prints nothing.
+    pub(crate) fn passed(mut self) {
+        self.open = false;
+    }
+
+    /// The window's text, every source read now.
+    fn text(&self) -> String {
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("unnamed test")
+            .to_owned();
+        let identity: Vec<String> = ["NEXTEST_BINARY_ID", "NEXTEST_ATTEMPT_ID"]
+            .into_iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect();
+        let stderr_file = rift_mcp::stderr_file_path(&self.root);
+        format!(
+            "\n==== failure window: {test} {identity}, {elapsed:?} after the test began ====\n\
+             {records}\
+             ---- {stderr_path} ----\n{stderr}\n\
+             ---- rift mcp stderr: relayed above as it arrived ----\n\
+             ==== end of failure window ====\n",
+            identity = identity.join(" "),
+            elapsed = self.began.elapsed(),
+            records = self.records(),
+            stderr_path = stderr_file.display(),
+            stderr = file_tail(&stderr_file),
+        )
+    }
+
+    /// The server's persisted log records since the test began, as `rift server logs`
+    /// prints them, with the command line that read them as the heading.
+    fn records(&self) -> String {
+        let reach = self.began.elapsed().saturating_add(WINDOW_SINCE_MARGIN);
+        let since = format!("{}ms", reach.as_millis());
+        let tail = WINDOW_RECORDS_MAX.to_string();
+        let heading = format!("---- rift server logs --since {since} --tail {tail} ----\n");
+        let printed = match read_records(&self.root, &since, &tail) {
+            Ok(printed) => printed,
+            Err(error) => format!("the record read did not finish: {error}\n"),
+        };
+        let at_bound = printed.lines().count() >= WINDOW_RECORDS_MAX;
+        let bound_notice = if at_bound {
+            format!(
+                "[the read reached its {WINDOW_RECORDS_MAX}-record bound; older records since \
+                 the test began are cut]\n"
+            )
+        } else {
+            String::new()
+        };
+        format!("{heading}{printed}{bound_notice}")
+    }
+}
+
+impl Drop for FailureWindow {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = std::io::stderr().write_all(self.text().as_bytes());
+        }
+    }
+}
+
+/// What one `rift server logs --since <since> --tail <tail>` run printed in `root`,
+/// stdout then stderr, bounded by [`WINDOW_READ_MAX`] and [`WINDOW_SOURCE_BYTES_MAX`].
+///
+/// Both streams land in one anonymous file rather than a pipe, so a long print never
+/// blocks the command while the window polls it.
+fn read_records(root: &Path, since: &str, tail: &str) -> TestResult<String> {
+    let mut printed = tempfile::tempfile()?;
+    let mut command = std::process::Command::new(rift_binary());
+    let mut child = with_child_log_variables(&mut command)
+        .args(["server", "logs", "--since", since, "--tail", tail])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(printed.try_clone()?)
+        .stderr(printed.try_clone()?)
+        .spawn()?;
+    let deadline = std::time::Instant::now() + WINDOW_READ_MAX;
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(
+                format!("rift server logs printed nothing within {WINDOW_READ_MAX:?}").into(),
+            );
+        }
+        std::thread::sleep(WINDOW_READ_POLL_INTERVAL);
+    }
+    Ok(tail_of(&mut printed)?)
+}
+
+/// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of the file at `path`, or why it could
+/// not be read.
+fn file_tail(path: &Path) -> String {
+    match fs::File::open(path) {
+        Ok(mut file) => tail_of(&mut file).unwrap_or_else(|error| format!("unreadable: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "absent: only a server `rift server start` spawned writes this file".to_owned()
+        }
+        Err(error) => format!("unreadable: {error}"),
+    }
+}
+
+/// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of `file`, preceded by a notice of the
+/// bytes before them that the bound cut.
+fn tail_of(file: &mut fs::File) -> std::io::Result<String> {
+    use std::io::Seek as _;
+
+    let length = file.metadata()?.len();
+    let cut = length.saturating_sub(WINDOW_SOURCE_BYTES_MAX);
+    file.seek(std::io::SeekFrom::Start(cut))?;
+    let mut kept = Vec::new();
+    file.take(WINDOW_SOURCE_BYTES_MAX).read_to_end(&mut kept)?;
+    Ok(format!(
+        "{}{}",
+        cut_notice(cut),
+        String::from_utf8_lossy(&kept)
+    ))
+}
+
+/// The last [`WINDOW_SOURCE_BYTES_MAX`] bytes of `text`, preceded by a notice of the
+/// bytes before them that the bound cut, for retained stderr a failure message carries.
+pub(crate) fn bounded_tail(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let kept = usize::try_from(WINDOW_SOURCE_BYTES_MAX).unwrap_or(usize::MAX);
+    let cut = bytes.len().saturating_sub(kept);
+    format!(
+        "{}{}",
+        cut_notice(u64::try_from(cut).unwrap_or(u64::MAX)),
+        String::from_utf8_lossy(&bytes[cut..])
+    )
+}
+
+/// The one line saying how many leading bytes a source's bound cut, or nothing.
+fn cut_notice(cut: u64) -> String {
+    if cut == 0 {
+        return String::new();
+    }
+    format!("[the first {cut} bytes are cut by the {WINDOW_SOURCE_BYTES_MAX}-byte bound]\n")
+}
+
 /// Runs the real binary with `arguments` inside the fixture workspace,
 /// off the async runtime.
 pub(crate) async fn run_rift(root: &Path, arguments: &[&str]) -> TestResult<std::process::Output> {
     let root = root.to_owned();
     let arguments: Vec<String> = arguments.iter().map(|&argument| argument.into()).collect();
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(rift_binary())
+        let mut command = std::process::Command::new(rift_binary());
+        with_child_log_variables(&mut command)
             .args(&arguments)
             .current_dir(&root)
             .stdin(Stdio::null())
@@ -257,18 +469,15 @@ pub(crate) async fn within<Value>(
 /// The base `rift mcp` child command for one fixture workspace, before either
 /// the rmcp transport wrapper or a raw-pipe session spawns it.
 ///
-/// `NO_COLOR` keeps the traced lines plain, since they end up in a test's
-/// captured output rather than on a terminal; the server the proxy spawns
-/// inherits both variables. `arguments` follow the `mcp` subcommand.
+/// The child runs under [`with_child_log_variables`]; the server the proxy
+/// spawns inherits both variables. `arguments` follow the `mcp` subcommand.
 fn base_command(root: &Path, arguments: &[&str]) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(rift_binary());
-    command
+    let mut command = std::process::Command::new(rift_binary());
+    with_child_log_variables(&mut command)
         .arg("mcp")
         .args(arguments)
-        .current_dir(root)
-        .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info")
-        .env("NO_COLOR", "1");
-    command
+        .current_dir(root);
+    tokio::process::Command::from(command)
 }
 
 /// The `rift mcp` child command for one fixture workspace.
@@ -375,8 +584,12 @@ impl RelayedStderr {
 
 /// Copies `stream` onto this process's stderr until end-of-file, keeping
 /// what it copied, both bounded by [`RELAYED_STDERR_BYTES_MAX`].
+///
+/// The first read the bound cuts writes one notice after the relayed bytes;
+/// the notice is not retained, so a case's assertions see the child's bytes alone.
 fn relay_until_closed(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
     let mut buffer = [0_u8; rift_core::STREAM_READ_BYTES];
+    let mut cut_reported = false;
     loop {
         let read_bytes = match stream.read(&mut buffer) {
             Ok(0) | Err(_) => break,
@@ -392,6 +605,14 @@ fn relay_until_closed(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
             relayed
         };
         let _ = std::io::stderr().write_all(relayed);
+        if relayed.len() < read_bytes && !cut_reported {
+            cut_reported = true;
+            let _ = writeln!(
+                std::io::stderr(),
+                "\n[relayed stderr reached its {RELAYED_STDERR_BYTES_MAX}-byte bound; the rest \
+                 is read and dropped]"
+            );
+        }
     }
 }
 
