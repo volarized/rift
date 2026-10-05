@@ -63,7 +63,7 @@ use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
 use crate::metrics::{
     Ending, INITIALIZE, MCP_SERVER_OPERATION_DURATION, McpRequest, PING, RESOURCE_TEMPLATES_LIST,
-    RESOURCES_LIST, RESOURCES_READ, TOOLS_LIST,
+    RESOURCES_LIST, RESOURCES_READ, TOOLS_CALL, TOOLS_LIST,
 };
 use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
@@ -4155,12 +4155,17 @@ impl ServerHandler for RiftMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         let measured =
             McpRequest::tool_call(&request.name).served(context.protocol_version().as_ref());
+        // `workspace` routes every record inside the request to this workspace's log store
+        // when one process serves several workspaces.
         let span = rift_tracing::info_span!(
             "mcp.request",
             component = "mcp",
             operation = "tools/call",
             request_id = %context.id,
-            tool = %request.name
+            tool = %request.name,
+            mcp.method.name = TOOLS_CALL,
+            gen_ai.tool.name = %request.name,
+            workspace = %self.root.display()
         );
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("tools/call", {
@@ -6740,6 +6745,57 @@ done
                 )
                 .is_none(),
             "a dropped executor reports no permit"
+        );
+        Ok(())
+    }
+
+    /// A tool call's `mcp.request` span carries the MCP method, the tool, and the
+    /// workspace root, so every record inside it names, through its `root_span`, the
+    /// workspace the routing log drain files it under.
+    #[tokio::test]
+    async fn a_tool_call_request_span_names_its_method_tool_and_workspace() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (directory, server) = Box::pin(fixture()).await?;
+        let root = super::absolute_root(directory.path())?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await?;
+        client.cancel().await?;
+        server_task.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let completed = records
+            .iter()
+            .find(|record| record.message() == "tool request completed")
+            .ok_or("the event inside the request span is captured")?;
+        let fields: serde_json::Value = serde_json::from_str(completed.fields())?;
+        let request = &fields["root_span"];
+        assert_eq!(request["name"], "mcp.request", "{fields}");
+        assert_eq!(
+            request["fields"]["mcp.method.name"], "tools/call",
+            "{fields}"
+        );
+        assert_eq!(
+            request["fields"]["gen_ai.tool.name"], "get_symbol",
+            "{fields}"
+        );
+        assert_eq!(
+            request["fields"]["workspace"],
+            root.display().to_string(),
+            "{fields}"
         );
         Ok(())
     }
