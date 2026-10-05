@@ -2254,12 +2254,11 @@ mod tests {
         }
 
         let started = tokio::time::Instant::now();
+        // A silent server answers nothing, so the forward's `answer` never runs.
         let forward = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            let request = super::list_tools_request(None);
             proxy
-                .forward(super::list_tools_request(None), |result| match result {
-                    ServerResult::ListToolsResult(result) => Some(result),
-                    _ => None,
-                })
+                .forward(request, |_answer| None::<ListToolsResult>)
                 .await
         });
         let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
@@ -2756,13 +2755,12 @@ mod tests {
     /// stack when the event fired. A record a background lane's task emits while the
     /// request waits carries the lane's root span or none, never this one.
     fn emitted_in(record: &rift_tracing::LogRecord, span: &str, request_id: &str) -> bool {
-        let Ok(fields) = serde_json::from_str::<serde_json::Value>(record.fields()) else {
-            return false;
-        };
-        let root = &fields["root_span"];
-        root["name"] == span
-            && root["fields"]["request_id"] == request_id
-            && root["fields"]["tool"] == "search"
+        serde_json::from_str::<serde_json::Value>(record.fields()).is_ok_and(|fields| {
+            let root = &fields["root_span"];
+            root["name"] == span
+                && root["fields"]["request_id"] == request_id
+                && root["fields"]["tool"] == "search"
+        })
     }
 
     /// Text spelling of each assertion before the records carried their spans: a rendered
@@ -3297,6 +3295,435 @@ mod tests {
             "{fields}"
         );
         assert_eq!(fields["refusal"], refusal.message.as_ref());
+        Ok(())
+    }
+
+    /// A start window whose repository asks miss transiently, then terminally, asks
+    /// once per poll round until the terminal miss and never again, and its close names
+    /// that last miss.
+    #[tokio::test(start_paused = true)]
+    async fn a_repository_miss_turning_terminal_inside_the_start_window_ends_the_asking()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let not_serving = || RepositoryMiss::NotServing {
+            presence: "Absent".to_owned(),
+        };
+        let mut answers = vec![
+            RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            }),
+            RepositoryAsk::Transient(not_serving()),
+            RepositoryAsk::Transient(not_serving()),
+        ];
+        let mut asked = 0_u32;
+        let refusal = connect_upstream_with(directory.path(), &test_identity(), || {
+            asked += 1;
+            std::future::ready(
+                answers
+                    .pop()
+                    .unwrap_or(RepositoryAsk::Transient(not_serving())),
+            )
+        })
+        .await
+        .expect_err("a holder that never publishes must exhaust the start window");
+        drop(recorder);
+
+        assert_eq!(asked, 3, "the terminal third ask ends the asking");
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let records = drain.queued_records();
+        let closed = records
+            .iter()
+            .find(|record| record.message() == "start window closed without a server that answers")
+            .ok_or("the window's close is recorded")?;
+        let fields: serde_json::Value = serde_json::from_str(closed.fields())?;
+        let miss = fields["repository_miss"]
+            .as_str()
+            .ok_or("repository_miss")?;
+        assert!(miss.starts_with("NotAdopted {"), "{fields}");
+        Ok(())
+    }
+
+    /// Each repository miss logs one `info` record naming why the ask missed, except the
+    /// workspace that selects its own server, which is the ordinary case.
+    #[test]
+    fn each_repository_miss_but_a_workspace_server_logs_why_the_ask_missed() -> TestResult {
+        let misses = [
+            RepositoryMiss::NotRepository,
+            RepositoryMiss::SelectionRefused {
+                detail: "rift.toml failed validation".to_owned(),
+            },
+            RepositoryMiss::ElectionDirectory {
+                detail: "the identity did not serialize".to_owned(),
+            },
+            RepositoryMiss::NotServing {
+                presence: "Absent".to_owned(),
+            },
+            RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            },
+            RepositoryMiss::Unanswered {
+                pid: 4_242,
+                port: 47_000,
+                elapsed_ms: 5_000,
+                detail: "connect timed out after 5s".to_owned(),
+            },
+        ];
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        for miss in &misses {
+            miss.report();
+        }
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let messages: Vec<&str> = records
+            .iter()
+            .map(rift_tracing::LogRecord::message)
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "server configuration selection refused; polling the workspace election",
+                "repository election directory unavailable; polling the workspace election",
+                "repository server not serving; polling the workspace election",
+                "repository server not adopted; polling the workspace election",
+                "repository server did not answer; polling the workspace election",
+            ]
+        );
+        assert!(records.iter().all(|record| record.level() == "info"));
+        assert!(records[0].fields().contains("rift.toml failed validation"));
+        assert!(
+            records[1]
+                .fields()
+                .contains("the identity did not serialize")
+        );
+        Ok(())
+    }
+
+    /// A workspace whose configuration is refused misses the repository ask terminally,
+    /// carrying the refusal's message.
+    #[tokio::test]
+    async fn a_refused_workspace_configuration_misses_the_repository_ask_terminally() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("rift.toml"), "unknown = true\n")?;
+        let refused = crate::repository::select_server_configuration(directory.path(), None)
+            .expect_err("an unknown key refuses the configuration");
+
+        let asked = super::connect_repository_server(directory.path(), &test_identity()).await;
+
+        assert!(
+            matches!(
+                &asked,
+                RepositoryAsk::Terminal(RepositoryMiss::SelectionRefused { detail })
+                    if *detail == refused.message
+            ),
+            "{asked:?}"
+        );
+        Ok(())
+    }
+
+    /// Accepts each connection to `listener` and closes it at once: a port that answers a
+    /// connect and then serves nothing.
+    async fn close_each_connection(listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        loop {
+            drop(listener.accept().await?);
+        }
+    }
+
+    /// A committed repository whose election, for this test's identity, records the
+    /// serving server `lock` on a port that answers a connect and serves nothing.
+    struct RecordedRepositoryServer {
+        root: std::path::PathBuf,
+        port: u16,
+        _guard: crate::election::ElectionGuard,
+        _closing: tokio::task::JoinHandle<std::io::Result<()>>,
+        _directory: tempfile::TempDir,
+    }
+
+    async fn recorded_repository_server(
+        server: Option<rift_protocol::configuration::ServerConfiguration>,
+    ) -> TestResult<RecordedRepositoryServer> {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        rift_history::fixture::init(&root);
+        std::fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        rift_history::fixture::commit_all(&root, "add source");
+        let common =
+            crate::repository::discover_common_directory(&root).ok_or("a git directory")?;
+        let identity = test_identity();
+        let state = crate::repository::repository_election_directory(&common, &identity)?;
+        let guard = crate::election::claim_state_directory(&state)?;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        guard.publish(&ServerLock {
+            server,
+            ..recorded_lock(port)
+        })?;
+        Ok(RecordedRepositoryServer {
+            root,
+            port,
+            _guard: guard,
+            _closing: tokio::spawn(close_each_connection(listener)),
+            _directory: directory,
+        })
+    }
+
+    /// A repository server that records other settings than the workspace accepts is not
+    /// adopted, and the ask misses terminally without connecting.
+    #[tokio::test]
+    async fn a_repository_server_recording_other_settings_misses_the_ask_terminally() -> TestResult
+    {
+        let recorded = recorded_repository_server(None).await?;
+
+        let asked = super::connect_repository_server(&recorded.root, &test_identity()).await;
+
+        assert!(
+            matches!(
+                asked,
+                RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                    pid: 4_242,
+                    settings_match: false,
+                    identity_adopted: true,
+                })
+            ),
+            "{asked:?}"
+        );
+        Ok(())
+    }
+
+    /// A repository server this process adopts that does not answer the connect misses
+    /// the ask transiently, naming its port.
+    #[tokio::test]
+    async fn an_adopted_repository_server_that_does_not_answer_misses_the_ask_transiently()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let accepted = crate::validation::ConfigurationState::accept(directory.path());
+        let recorded = recorded_repository_server(Some(accepted.server_configuration())).await?;
+
+        let asked = super::connect_repository_server(&recorded.root, &test_identity()).await;
+
+        assert!(
+            matches!(
+                asked,
+                RepositoryAsk::Transient(RepositoryMiss::Unanswered { pid: 4_242, port, .. })
+                    if port == recorded.port
+            ),
+            "{asked:?}"
+        );
+        Ok(())
+    }
+
+    /// A recorded server whose port answers a connect but serves no MCP is treated as
+    /// stale, and the failed connect is recorded.
+    #[tokio::test]
+    async fn adopt_treats_a_recorded_server_that_serves_nothing_as_stale() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        guard.publish(&recorded_lock(listener.local_addr()?.port()))?;
+        let closing = tokio::spawn(close_each_connection(listener));
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let adopted = adopt_serving(
+            directory.path(),
+            &test_identity(),
+            &mut Replacement::default(),
+        )
+        .await?;
+        drop(recorder);
+
+        assert!(
+            adopted.is_none(),
+            "a server that serves nothing is not adopted"
+        );
+        let records = drain.queued_records();
+        let stale = records
+            .iter()
+            .find(|record| {
+                record.message() == "recorded server did not answer; treating the lock as stale"
+            })
+            .ok_or("the failed connect is recorded")?;
+        let fields = stale.fields();
+        assert!(fields.contains("\"detail\""), "{fields}");
+        closing.abort();
+        Ok(())
+    }
+
+    /// Answers each request read off `upstream` with `answer` of its method, as a
+    /// workspace server answering a request with a result of the kind it chose.
+    async fn answer_requests(
+        upstream: tokio::io::DuplexStream,
+        answer: fn(&str) -> serde_json::Value,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let (reading, mut writing) = tokio::io::split(upstream);
+        let mut lines = tokio::io::BufReader::new(reading).lines();
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            let request: serde_json::Value = serde_json::from_str(&line)?;
+            let result = answer(request["method"].as_str().unwrap_or_default());
+            let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+            writing
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+        }
+    }
+
+    /// A downstream client declaring `client` of a proxy whose upstream answers through
+    /// [`answer_requests`]. The fields keep the connection tasks alive.
+    struct AnsweredClient {
+        client: RunningService<RoleClient, rmcp::model::ClientConfig>,
+        _answering: tokio::task::JoinHandle<std::io::Result<()>>,
+        _connection: tokio::task::JoinHandle<Result<(), rift_error::RiftError>>,
+        _directory: tempfile::TempDir,
+    }
+
+    async fn answered_client(
+        client: rmcp::model::ClientConfig,
+        answer: fn(&str) -> serde_json::Value,
+    ) -> TestResult<AnsweredClient> {
+        use rmcp::ServiceExt as _;
+        let directory = tempfile::tempdir()?;
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::All);
+        let (running, upstream) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let answering = tokio::spawn(answer_requests(upstream, answer));
+        let (proxy_half, client_half) = tokio::io::duplex(64 * 1024);
+        let connection = tokio::spawn(serve_connection(proxy, proxy_half));
+        Ok(AnsweredClient {
+            client: Box::pin(client.serve(client_half)).await?,
+            _answering: answering,
+            _connection: connection,
+            _directory: directory,
+        })
+    }
+
+    /// A client declaring no capability, at the default protocol version.
+    fn plain_client() -> rmcp::model::ClientConfig {
+        rmcp::model::ClientConfig::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("probe", "0.0.1"),
+        )
+    }
+
+    /// The task a server answers a tool call with.
+    fn working_task() -> CreateTaskResult {
+        CreateTaskResult::new(Task::new(
+            "task-1",
+            TaskStatus::Working,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+    }
+
+    /// An upstream that answers each request with a result of another kind than the
+    /// request reads: every forwarding handler refuses it as an unexpected response.
+    #[tokio::test]
+    async fn an_answer_of_another_kind_is_refused_by_every_forwarding_handler() -> TestResult {
+        let answered = answered_client(plain_client(), |method| match method {
+            "tools/list" => json!({"content": [{"type": "text", "text": "a tool result"}]}),
+            _ => json!({"tools": []}),
+        })
+        .await?;
+        let client = &answered.client;
+        let refusals = [
+            format!("{:?}", client.list_tools(None).await.err()),
+            format!(
+                "{:?}",
+                client
+                    .call_tool(CallToolRequestParams::new("search"))
+                    .await
+                    .err()
+            ),
+            format!("{:?}", client.list_resources(None).await.err()),
+            format!("{:?}", client.list_resource_templates(None).await.err()),
+            format!(
+                "{:?}",
+                client
+                    .read_resource(ReadResourceRequestParams::new(TWO_CONTENT_URI))
+                    .await
+                    .err()
+            ),
+        ];
+        for refusal in refusals {
+            assert!(
+                refusal.contains("failed the forwarded request"),
+                "every handler refuses an answer of another kind: {refusal}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A task the upstream answers a tool call with reaches a client that declared tasks
+    /// unchanged.
+    #[tokio::test]
+    async fn a_task_answer_passes_through_the_proxy_to_a_client_that_declared_tasks() -> TestResult
+    {
+        let client = rmcp::model::ClientConfig::new(
+            rmcp::model::ClientCapabilities::builder()
+                .enable_tasks()
+                .build(),
+            rmcp::model::Implementation::new("probe", "0.0.1"),
+        );
+        let answered = answered_client(client, |_method| {
+            serde_json::to_value(working_task()).unwrap_or_default()
+        })
+        .await?;
+
+        let response = answered
+            .client
+            .call_tool_once(CallToolRequestParams::new("search"))
+            .await?;
+
+        assert!(
+            matches!(&response, CallToolResponse::Task(task) if *task == working_task()),
+            "{response:?}"
+        );
+        Ok(())
+    }
+
+    /// An input request the upstream answers a tool call or a resource read with leaves
+    /// the proxy as an input request, which rmcp then refuses to a client that did not
+    /// negotiate the 2026-07-28 protocol, not as the proxy's own unexpected-response
+    /// refusal.
+    #[tokio::test]
+    async fn an_input_required_answer_leaves_the_proxy_as_an_input_request() -> TestResult {
+        let answered = answered_client(plain_client(), |_method| {
+            serde_json::to_value(InputRequiredResult::from_request_state("opaque"))
+                .unwrap_or_default()
+        })
+        .await?;
+        let client = &answered.client;
+
+        let called = client
+            .call_tool_once(CallToolRequestParams::new("search"))
+            .await;
+        let read = client
+            .read_resource_once(ReadResourceRequestParams::new(TWO_CONTENT_URI))
+            .await;
+
+        for refusal in [format!("{:?}", called.err()), format!("{:?}", read.err())] {
+            assert!(
+                refusal.contains("InputRequiredResult requires negotiated protocol version"),
+                "{refusal}"
+            );
+        }
         Ok(())
     }
 }
