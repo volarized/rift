@@ -52,15 +52,26 @@ const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(4);
 /// Time the stop keeps for the metrics database's close, its last stage: the log drain's
 /// final flush ends this long before the stop's deadline.
 const SERVER_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
-/// Time the stop keeps for the log drain's final flush: the index and vectors databases
-/// close by this long before the flush's own bound, so the flush can write what their
-/// close recorded.
+/// Time the stop keeps for the log drain's final flush: the OTLP export shuts down by this
+/// long before the flush's own bound, so the flush can write the export's stop record.
 const SERVER_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
-// The two reserves leave the serving stages and the index and vectors close a share of
-// the stop's deadline: the deadline less both reserves still lands after the instant the
-// stop began, so no subtraction of a reserve from the deadline underflows.
+/// Time the stop keeps for the OTLP export's final flush and shutdown: the index and
+/// vectors databases close by this long before the export's own bound. A collector that
+/// accepts and never answers costs the stop this much and no more, whatever the
+/// `OTEL_METRIC_EXPORT_TIMEOUT` and `OTEL_BSP_EXPORT_TIMEOUT` variables are set to.
+const SERVER_EXPORT_STOP_RESERVE: Duration = Duration::from_millis(500);
+/// Time the stop keeps for the stages after serving and the index and vectors close: the
+/// OTLP export, the log drain's final flush, and the metrics database's close.
+const SERVER_LATER_STAGES_RESERVE: Duration = SERVER_DATABASE_STOP_RESERVE
+    .saturating_add(SERVER_LOG_FLUSH_RESERVE)
+    .saturating_add(SERVER_EXPORT_STOP_RESERVE);
+// The reserves leave the serving stages and the index and vectors close a share of the
+// stop's deadline: the deadline less every reserve still lands after the instant the stop
+// began, so no subtraction of a reserve from the deadline underflows.
 const _: () = assert!(
-    SERVER_DATABASE_STOP_RESERVE.as_millis() + SERVER_LOG_FLUSH_RESERVE.as_millis()
+    SERVER_DATABASE_STOP_RESERVE.as_millis()
+        + SERVER_LOG_FLUSH_RESERVE.as_millis()
+        + SERVER_EXPORT_STOP_RESERVE.as_millis()
         < SERVER_STOP_DEADLINE.as_millis()
 );
 // The final log drain, aborted by the stop's deadline at the latest, leaves a five-second
@@ -380,6 +391,7 @@ pub(super) async fn run(
     command: ServerCommand,
     drain: Option<LogDrain>,
     retention_records: u64,
+    export: rift_tracing::OtlpExport,
 ) -> Result<Option<ServerOutcome>, RiftError> {
     let root = Path::new(".");
     match command {
@@ -397,6 +409,7 @@ pub(super) async fn run(
                 retention_records,
                 token_check(auth),
                 repository,
+                export,
             )
             .await
             .map(|()| None),
@@ -933,10 +946,13 @@ fn process_absent(error: &io::Error) -> bool {
 ///
 /// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
 /// task drains and the engines and index supervisor shut down, by
-/// [`SERVER_LOG_FLUSH_RESERVE`] and [`SERVER_DATABASE_STOP_RESERVE`] before the
-/// deadline, so a stage that runs out its bound leaves the later stages their
-/// reserves; the index and vectors databases close, by the same instant; the log
-/// drain's final flush runs, writing what the stages before it recorded, by
+/// [`SERVER_EXPORT_STOP_RESERVE`], [`SERVER_LOG_FLUSH_RESERVE`], and
+/// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline, so a stage that runs out its
+/// bound leaves the later stages their reserves; the index and vectors databases close,
+/// by the same instant; the OTLP export sends its final spans and metric points and shuts
+/// down, by [`SERVER_LOG_FLUSH_RESERVE`] and [`SERVER_DATABASE_STOP_RESERVE`] before the
+/// deadline, recording how it ended and failing nothing; the log drain's final flush
+/// runs, writing what the stages before it recorded, by
 /// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline; the metrics database
 /// closes by the deadline; and only then is the election released, by
 /// dropping the guard right before the process exits - so a stop the CLI
@@ -961,6 +977,7 @@ async fn serve_foreground(
     retention_records: u64,
     check: TokenCheck,
     repository: bool,
+    export: rift_tracing::OtlpExport,
 ) -> Result<(), RiftError> {
     // A detached server's panic reaches its stderr file at best; the hook
     // records it through the same lane every other diagnostic takes.
@@ -1046,20 +1063,19 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    // The serving stages end by both reserves before the deadline, the bound the index and
-    // vectors close shares, so a serving stage that runs out its bound still leaves the
-    // final flush and the metrics close their reserves.
-    let reserve = SERVER_DATABASE_STOP_RESERVE + SERVER_LOG_FLUSH_RESERVE;
+    // Serving ends by every reserve before the deadline, so the later stages keep theirs.
     let (guard, deadline, stopped, mut database) = server
-        .stopped_before_database(SERVER_STOP_DEADLINE, reserve)
+        .stopped_before_database(SERVER_STOP_DEADLINE, SERVER_LATER_STAGES_RESERVE)
         .await;
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;
     let flush_deadline = deadline - SERVER_DATABASE_STOP_RESERVE;
+    let export_deadline = flush_deadline - SERVER_LOG_FLUSH_RESERVE;
     let search = database
-        .close_search(flush_deadline - SERVER_LOG_FLUSH_RESERVE)
+        .close_search(export_deadline - SERVER_EXPORT_STOP_RESERVE)
         .await;
+    stop_export(&export, export_deadline).await;
     stop_log_drain(log_drain, flush_deadline).await;
     let logs = database.close_logs(deadline).await;
     // The election releases last: dropping the guard retires the document and
@@ -1094,6 +1110,32 @@ fn foreground_selection(
             .fail();
     }
     Ok(Some(selected))
+}
+
+/// Sends the OTLP export's final spans and metric points and shuts it down by `deadline`,
+/// or [`SERVER_EXPORT_STOP_RESERVE`] after the stage starts when that comes first, as the
+/// `otlp export` stop stage: a collector that is down or stalled costs the stop that
+/// reserve at most, even when the stages before left more.
+///
+/// The stage records `outcome="ok"` when the export shut down inside `deadline`,
+/// `outcome="timeout"` at `warn` when the deadline passed first, as with a collector that
+/// accepts and never answers, and `outcome="error"` at `warn` with the SDK's words when the
+/// final export failed, as with a refused connection. None fails the stop: the export
+/// carries diagnostics only. A process that exports nothing records `ok` at once.
+async fn stop_export(export: &rift_tracing::OtlpExport, deadline: tokio::time::Instant) {
+    let deadline = deadline.min(tokio::time::Instant::now() + SERVER_EXPORT_STOP_RESERVE);
+    let _ = rift_mcp::stop_stage("otlp export", deadline, async {
+        match export.shutdown(deadline).await {
+            Ok(()) | Err(rift_tracing::ExportShutdownError::TimedOut) => Ok(()),
+            Err(failed @ rift_tracing::ExportShutdownError::Failed(_)) => {
+                errors::mcp::http_serve_failed()
+                    .operation("otlp export")
+                    .source(io::Error::other(failed))
+                    .fail()
+            }
+        }
+    })
+    .await;
 }
 
 /// Stops the diagnostics drain and joins it by `deadline`, as the `log drain` stop stage;

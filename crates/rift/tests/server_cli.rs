@@ -1074,11 +1074,14 @@ fn sigterm_stops_a_foreground_server_through_its_stop() -> TestResult {
     Ok(())
 }
 
-/// Every OTLP/HTTP export request one receiver answered, with when it arrived.
+/// Every OTLP/HTTP export request one receiver answered: when it arrived, its path, and its
+/// body's length.
 #[cfg(unix)]
-type ReceivedExports = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, usize)>>>;
+type ReceivedExports =
+    std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, &'static str, usize)>>>;
 
-/// An OTLP/HTTP receiver on a loopback port that records each export and answers success.
+/// An OTLP/HTTP receiver on a loopback port that records each span and metric export and
+/// answers success.
 #[cfg(unix)]
 struct TraceReceiver {
     _runtime: tokio::runtime::Runtime,
@@ -1096,17 +1099,19 @@ impl TraceReceiver {
         let listener = runtime.block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))?;
         let port = listener.local_addr()?.port();
         let exports = ReceivedExports::default();
-        let recorded = std::sync::Arc::clone(&exports);
-        let receiver = axum::Router::new().route(
-            "/v1/traces",
+        let route = |path: &'static str| {
+            let recorded = std::sync::Arc::clone(&exports);
             axum::routing::post(move |body: axum::body::Bytes| async move {
                 recorded
                     .lock()
                     .expect("the recorded exports are not poisoned")
-                    .push((std::time::Instant::now(), body.len()));
+                    .push((std::time::Instant::now(), path, body.len()));
                 axum::http::StatusCode::OK
-            }),
-        );
+            })
+        };
+        let receiver = axum::Router::new()
+            .route("/v1/traces", route("/v1/traces"))
+            .route("/v1/metrics", route("/v1/metrics"));
         runtime.spawn(async move { axum::serve(listener, receiver).await });
         Ok(Self {
             _runtime: runtime,
@@ -1119,22 +1124,36 @@ impl TraceReceiver {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// The byte counts of the exports that arrived at or after `moment`.
-    fn exports_since(&self, moment: std::time::Instant) -> Vec<usize> {
+    /// The byte counts of the exports to `path` that arrived at or after `moment`.
+    fn exports_since(&self, path: &str, moment: std::time::Instant) -> Vec<usize> {
         self.exports
             .lock()
             .expect("the recorded exports are not poisoned")
             .iter()
-            .filter(|(arrived, _)| *arrived >= moment)
-            .map(|(_, bytes)| *bytes)
+            .filter(|(arrived, received, _)| *arrived >= moment && *received == path)
+            .map(|(_, _, bytes)| *bytes)
             .collect()
     }
 }
 
-/// The batch processor's export interval the flush test sets: ten minutes, so no scheduled
-/// export runs while the server serves and only the shutdown flush sends its spans.
+/// The batch processor's and the metric reader's export interval the export tests set: ten
+/// minutes, so no scheduled export runs while the server serves and only the stop's final
+/// flush sends.
 #[cfg(unix)]
 const EXPORT_INTERVAL_PAST_THE_TEST_MS: &str = "600000";
+
+/// The variables that point a server at `endpoint` with no scheduled export.
+#[cfg(unix)]
+fn export_variables(endpoint: &str) -> [(&str, &str); 3] {
+    [
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
+        ("OTEL_BSP_SCHEDULE_DELAY", EXPORT_INTERVAL_PAST_THE_TEST_MS),
+        (
+            "OTEL_METRIC_EXPORT_INTERVAL",
+            EXPORT_INTERVAL_PAST_THE_TEST_MS,
+        ),
+    ]
+}
 
 #[cfg(unix)]
 #[test]
@@ -1146,13 +1165,7 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     let receiver = TraceReceiver::start()?;
     let endpoint = receiver.endpoint();
 
-    let server = ListeningForeground::start(
-        root,
-        &[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str()),
-            ("OTEL_BSP_SCHEDULE_DELAY", EXPORT_INTERVAL_PAST_THE_TEST_MS),
-        ],
-    )?;
+    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
     let signalled = std::time::Instant::now();
     let (status, elapsed, stderr) = server.terminate()?;
 
@@ -1164,11 +1177,94 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
         elapsed <= STOP_EXIT_BOUND,
         "a signalled server flushes and exits inside the stop bound: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
-    let flushed = receiver.exports_since(signalled);
+    let spans = receiver.exports_since("/v1/traces", signalled);
     assert!(
-        flushed.iter().any(|bytes| *bytes > 0),
-        "the export shutdown sends the spans the server closed while serving: {flushed:?}"
+        spans.iter().any(|bytes| *bytes > 0),
+        "the export shutdown sends the spans the server closed while serving: {spans:?}"
     );
+    let points = receiver.exports_since("/v1/metrics", signalled);
+    assert_eq!(
+        points.len(),
+        1,
+        "the export shutdown sends the final metric points once: {points:?}"
+    );
+    let records = stored_records(root)?;
+    let export = stage_ended_line(&records, "otlp export")?;
+    assert!(export.contains("outcome=ok"), "{export}");
+    failure_window.passed();
+    Ok(())
+}
+
+/// A collector that accepts the connection and never answers costs the stop the export's
+/// reserve: the `otlp export` stage ends `timeout` at `warn`, and the process exits cleanly
+/// inside the stop bound.
+#[cfg(unix)]
+#[test]
+fn a_stalled_collector_ends_the_export_stage_timeout_inside_the_stop_bound() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = harness::FailureWindow::begin(root);
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+    // Every accepted connection stays open and unread until the test ends.
+    std::thread::spawn(move || {
+        let held: Vec<_> = listener.incoming().collect();
+        drop(held);
+    });
+
+    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let (status, elapsed, stderr) = server.terminate()?;
+
+    assert!(
+        status.success(),
+        "a stalled collector fails no stop: {status:?}, stderr: {stderr}"
+    );
+    assert!(
+        elapsed <= STOP_EXIT_BOUND,
+        "the export stage holds the stop for its reserve alone: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
+    );
+    let records = stored_records(root)?;
+    let export = stage_ended_line(&records, "otlp export")?;
+    assert!(export.contains("outcome=timeout"), "{export}");
+    assert!(export.contains("WARN"), "{export}");
+    failure_window.passed();
+    Ok(())
+}
+
+/// A collector that refuses the connection costs the stop at most the export's reserve: the
+/// exporter retries a refused export three times, 100 ms apart and doubling, so the stage
+/// ends `error` when the retries end inside the reserve and `timeout` when they do not,
+/// both at `warn`, and the process exits cleanly.
+#[cfg(unix)]
+#[test]
+fn a_refused_collector_ends_the_export_stage_error_and_the_stop_cleanly() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = harness::FailureWindow::begin(root);
+    let refused = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = format!("http://127.0.0.1:{}", refused.local_addr()?.port());
+    drop(refused);
+
+    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let (status, elapsed, stderr) = server.terminate()?;
+
+    assert!(
+        status.success(),
+        "a refused collector fails no stop: {status:?}, stderr: {stderr}"
+    );
+    assert!(
+        elapsed <= STOP_EXIT_BOUND,
+        "elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
+    );
+    let records = stored_records(root)?;
+    let export = stage_ended_line(&records, "otlp export")?;
+    assert!(
+        export.contains("outcome=error") || export.contains("outcome=timeout"),
+        "{export}"
+    );
+    assert!(export.contains("WARN"), "{export}");
     failure_window.passed();
     Ok(())
 }

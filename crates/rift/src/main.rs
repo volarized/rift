@@ -172,7 +172,8 @@ async fn main() -> ExitCode {
         }
     };
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
-    let succeeded = match run(cli, drain, retention_records).await {
+    let export = tracing_runtime.export();
+    let succeeded = match run(cli, drain, retention_records, export).await {
         Ok(Some(outcome)) => {
             println!("{outcome}");
             true
@@ -336,6 +337,7 @@ async fn run(
     cli: Cli,
     drain: Option<rift_tracing::LogDrain>,
     retention_records: u64,
+    export: rift_tracing::OtlpExport,
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
@@ -345,10 +347,12 @@ async fn run(
                 .map_err(|error| CliError::Mcp(error.mcp()))?;
             Ok(None)
         }
-        Some(CliCommand::Server { command }) => server::run(command, drain, retention_records)
-            .await
-            .map(|outcome| outcome.map(CliOutcome::Server))
-            .map_err(CliError::Server),
+        Some(CliCommand::Server { command }) => {
+            server::run(command, drain, retention_records, export)
+                .await
+                .map(|outcome| outcome.map(CliOutcome::Server))
+                .map_err(CliError::Server)
+        }
         Some(CliCommand::Update) => update::update()
             .await
             .map(CliOutcome::Update)
@@ -463,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn empty_invocation_runs_no_command() {
         let cli = Cli::try_parse_from(["rift"]).expect("empty invocation must parse");
-        let outcome = super::run(cli, None, 1_000)
+        let outcome = super::run(cli, None, 1_000, rift_tracing::OtlpExport::default())
             .await
             .expect("empty invocation must succeed");
         assert!(outcome.is_none());
