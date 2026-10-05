@@ -315,6 +315,97 @@ async fn the_logs_command_honors_its_tail_and_level() -> TestResult {
     Ok(())
 }
 
+/// The lifecycle records a failure window reads, which an inherited `RUST_LOG` must not
+/// filter out of the store.
+const LIFECYCLE_RECORDS: [&str; 2] = ["MCP server ready", "MCP server stopped"];
+
+/// An inherited `RUST_LOG=warn` narrows a server's stderr and leaves its store alone: the
+/// store records under `[logs] capture`, so the lifecycle records a window reads are kept
+/// while stderr carries warnings alone (#479). Replays the inherited filter of the
+/// tracing plan's failure list.
+#[test]
+fn an_inherited_warn_filter_leaves_the_lifecycle_records_in_the_store() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _stop = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    for arguments in [["server", "start"], ["server", "stop"]] {
+        let mut command = std::process::Command::new(harness::rift_binary());
+        let output = harness::with_child_log_variables(&mut command)
+            .env("RUST_LOG", "warn")
+            .args(arguments)
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        require_success(&output, &format!("rift {}", arguments.join(" ")))?;
+    }
+
+    let mut command = std::process::Command::new(harness::rift_binary());
+    let printed = harness::with_child_log_variables(&mut command)
+        .args(["server", "logs"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+
+    require_success(&printed, "rift server logs")?;
+    let lines = printed_lines(&printed);
+    for lifecycle in LIFECYCLE_RECORDS {
+        assert!(
+            lines.iter().any(|line| line.contains(lifecycle)),
+            "the store keeps {lifecycle:?}: {lines:?}"
+        );
+    }
+    let stderr = std::fs::read_to_string(rift_mcp::stderr_file_path(root))?;
+    assert!(
+        !stderr.lines().any(|line| line.contains(" INFO ")),
+        "the inherited filter keeps information records off stderr: {}",
+        harness::bounded_tail(&stderr)
+    );
+    failure_window.passed();
+    Ok(())
+}
+
+/// A stop publishes the table of operations in flight as it begins, and the store keeps
+/// it: the stop half of the held write replay of the tracing plan's failure list. Which
+/// operations are open when the stop lands depends on the server's background work, so
+/// the case asserts the record and its fields, not its entries.
+#[test]
+fn a_stop_records_the_operations_still_in_flight() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _stop = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    for arguments in [["server", "start"], ["server", "stop"]] {
+        let mut command = std::process::Command::new(harness::rift_binary());
+        let output = harness::with_child_log_variables(&mut command)
+            .args(arguments)
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        require_success(&output, &format!("rift {}", arguments.join(" ")))?;
+    }
+
+    let mut command = std::process::Command::new(harness::rift_binary());
+    let printed = harness::with_child_log_variables(&mut command)
+        .args(["server", "logs"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+
+    require_success(&printed, "rift server logs")?;
+    let lines = printed_lines(&printed);
+    let published: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("operations in flight") && line.contains("reason=stop"))
+        .collect();
+    assert_eq!(published.len(), 1, "one table at the stop: {lines:?}");
+    for field in ["in_flight=", "left_out=", "untracked=", "operations=["] {
+        assert!(published[0].contains(field), "{field} in {}", published[0]);
+    }
+    failure_window.passed();
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_unrecorded_workspace_says_so_and_creates_no_state() -> TestResult {
     let directory = tempfile::tempdir()?;
