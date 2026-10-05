@@ -959,6 +959,14 @@ fn process_absent(error: &io::Error) -> bool {
 /// the stop begins, and each stage takes only what the one before it left of
 /// it. Each stage records its name, what it left of the deadline, and its
 /// error, and a failed stop leaves with the rendered error on stderr.
+///
+/// A database close whose checkpoint started before its bound and outlasted it
+/// ends its stage with the outcome `timeout` and fails nothing: the thread that
+/// runs the checkpoint keeps running until it finishes or the process exits, and
+/// the next open recovers every committed transaction from the write-ahead log.
+/// An index or vectors close that started past its bound still fails the stop on
+/// a worker that outlasts it, and so does a metrics close whose writer thread
+/// had not reached its checkpoint by the bound.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,

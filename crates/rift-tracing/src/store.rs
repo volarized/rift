@@ -78,16 +78,60 @@ const INSERT_RECORD: &str = "INSERT INTO log_records
 /// `retention_records` rows are exactly those above it.
 const TRIM_RECORDS: &str = "DELETE FROM log_records WHERE id <= ?1";
 
-/// The row a truncate checkpoint answers: whether it met a busy lock, the frames the
-/// write-ahead log held, and the frames it moved into the database.
+/// What the close checkpoint did: whether it met a busy lock, the frames the write-ahead
+/// log held, the frames it moved into the database, and how long it ran.
+///
+/// A truncate checkpoint that succeeds answers zero frames held and zero moved, because it
+/// reads both after it emptied the log. The close therefore reads the frames first with
+/// `PRAGMA wal_checkpoint(NOOP)`, which takes no lock and moves nothing, and derives the
+/// frames moved from the two rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalCheckpoint {
     busy: bool,
     log: i64,
     checkpointed: i64,
+    elapsed: Duration,
+}
+
+/// The three integers one `PRAGMA wal_checkpoint` row carries: `busy`, `log`, and
+/// `checkpointed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckpointRow {
+    busy: bool,
+    log: i64,
+    checkpointed: i64,
+}
+
+impl CheckpointRow {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            busy: row.get::<_, i64>(0)? != 0,
+            log: row.get(1)?,
+            checkpointed: row.get(2)?,
+        })
+    }
 }
 
 impl WalCheckpoint {
+    /// The checkpoint `truncate` answered, read against the `before` row of the NOOP
+    /// checkpoint that preceded it, after running for `elapsed`.
+    ///
+    /// A truncate that met no busy lock moved every frame the log held and had not yet
+    /// moved; a busy one moved what its own count of moved frames adds to the earlier one.
+    fn after(before: CheckpointRow, truncate: CheckpointRow, elapsed: Duration) -> Self {
+        let moved = if truncate.busy {
+            truncate.checkpointed - before.checkpointed
+        } else {
+            before.log - before.checkpointed
+        };
+        Self {
+            busy: truncate.busy,
+            log: before.log,
+            checkpointed: moved.max(0),
+            elapsed,
+        }
+    }
+
     /// Whether the checkpoint met another connection's lock and stopped short.
     #[must_use]
     pub const fn is_busy(&self) -> bool {
@@ -105,6 +149,29 @@ impl WalCheckpoint {
     pub const fn checkpointed(&self) -> i64 {
         self.checkpointed
     }
+
+    /// How long the two checkpoint statements ran on the writer thread.
+    #[must_use]
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
+
+/// How one close of the metrics database ended without a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreClose {
+    /// The writer thread checkpointed and closed the connection, and released its owner.
+    Closed(WalCheckpoint),
+    /// The deadline passed while the writer thread ran the checkpoint or the connection's
+    /// close, both of which sync files. The thread keeps running, and keeps its owner, until
+    /// it finishes or the process exits; a log the checkpoint did not empty stays for the
+    /// next open, which recovers every committed record from it.
+    Timeout {
+        /// The close stage the thread was in: `checkpoint` or `close`.
+        stage: &'static str,
+        /// How long the thread had been in that stage when the deadline passed.
+        elapsed: Duration,
+    },
 }
 
 /// Where one close stands, shared by the closer and the writer thread.
@@ -116,6 +183,10 @@ impl WalCheckpoint {
 #[derive(Debug, Default)]
 struct CloseProgress {
     stages: Mutex<CloseStages>,
+    /// Holds the writer thread at the start of its next checkpoint: the thread answers on
+    /// the sender once it holds, and resumes once the receiver fires or its sender drops.
+    #[cfg(any(test, feature = "fixtures"))]
+    checkpoint_hold: Mutex<Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// The instants one close reached, each read on the monotonic clock.
@@ -149,6 +220,21 @@ impl CloseProgress {
     /// Records that the connection's close returned.
     fn end(&self) {
         self.lock().ended = Some(std::time::Instant::now());
+    }
+
+    /// The index into [`CLOSE_STAGES`] of the last stage the close started, and how long it
+    /// ran by `now`, or until the connection's close returned when it returned before
+    /// `now`; `None` before any stage started.
+    fn running(&self, now: std::time::Instant) -> Option<(usize, Duration)> {
+        let stages = self.lock();
+        let until = stages.ended.unwrap_or(now);
+        stages
+            .started
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(stage, started)| started.map(|started| (stage, started)))
+            .map(|(stage, started)| (stage, until.saturating_duration_since(started)))
     }
 
     /// The stage the close was in at `now` and the time each stage took, as text a
@@ -203,6 +289,33 @@ impl CloseProgress {
     fn lock(&self) -> std::sync::MutexGuard<'_, CloseStages> {
         self.stages.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Arms a hold of the next checkpoint: the receiver answers once the writer thread
+    /// holds, and the thread resumes once the sender fires or drops.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn hold_next_checkpoint(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (holding, held) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self
+            .checkpoint_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((holding, released));
+        (held, release)
+    }
+
+    /// Runs an armed hold on the writer thread; returns at once when none is armed.
+    #[cfg(any(test, feature = "fixtures"))]
+    fn checkpoint_held(&self) {
+        let hold = self
+            .checkpoint_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((holding, released)) = hold {
+            let _ = holding.send(());
+            let _ = released.recv();
+        }
+    }
 }
 
 /// One command the writer thread runs.
@@ -227,7 +340,7 @@ enum Command {
 pub struct LogStore {
     path: Arc<Path>,
     sender: mpsc::Sender<Command>,
-    closed: OnceLock<WalCheckpoint>,
+    closed: OnceLock<StoreClose>,
     progress: Arc<CloseProgress>,
 }
 
@@ -347,41 +460,72 @@ impl LogStore {
     /// The checkpoint truncates the WAL file to zero bytes unless another connection, such
     /// as a `rift server logs --follow` reader, holds it busy. A received answer means the
     /// owner is released. A thread that misses `deadline` keeps running and keeps its
-    /// owner until it finishes. A second close answers the first close's checkpoint.
+    /// owner until it finishes. A second close answers what the first close answered.
+    ///
+    /// A deadline that passes while the thread runs the checkpoint or the connection's close
+    /// answers [`StoreClose::Timeout`]: both stages sync files, a commit is durable in the
+    /// log before either starts, and the next open recovers whatever the log still holds.
     ///
     /// # Errors
     ///
-    /// Returns `tracing.log_store_failed` when the deadline passes, the thread already
-    /// stopped, or `SQLite` refuses the checkpoint or the close. A missed deadline names
-    /// the stage the close was in, from the queued command to the connection's close, the
+    /// Returns `tracing.log_store_failed` when the thread already stopped, `SQLite`
+    /// refuses the checkpoint or the close, or the deadline passes before the thread
+    /// started the checkpoint: while the command waits in the queue, or while the thread
+    /// clears the busy timeout. A missed deadline names the stage the close was in, the
     /// time each earlier stage took, and the commands the queue held at the request.
     ///
     /// # Cancel safety
     ///
     /// Dropping the future after the command is queued leaves the thread to close.
-    pub async fn close(&self, deadline: Instant) -> Result<WalCheckpoint, RiftError> {
-        if let Some(checkpoint) = self.closed.get() {
-            return Ok(*checkpoint);
+    pub async fn close(&self, deadline: Instant) -> Result<StoreClose, RiftError> {
+        if let Some(closed) = self.closed.get() {
+            return Ok(*closed);
         }
         let (reply, answer) = oneshot::channel();
         self.progress
             .request(self.sender.max_capacity() - self.sender.capacity());
-        let checkpoint = timeout_at(
+        let answered = timeout_at(
             deadline,
             self.request(Command::Close { reply }, answer, "close"),
         )
-        .await
-        .map_err(|_| {
-            let stages = self.progress.render(std::time::Instant::now());
-            store_failure(
-                "close",
-                &self.path,
-                std::io::Error::other(format!(
-                    "the writer thread outlasted the close deadline: {stages}"
-                )),
-            )
-        })??;
-        Ok(*self.closed.get_or_init(|| checkpoint))
+        .await;
+        let closed = match answered {
+            Ok(checkpoint) => StoreClose::Closed(checkpoint?),
+            Err(_elapsed) => {
+                let now = std::time::Instant::now();
+                match self.progress.running(now) {
+                    Some((stage, elapsed))
+                        if stage == CLOSE_CHECKPOINT || stage == CLOSE_CONNECTION =>
+                    {
+                        StoreClose::Timeout {
+                            stage: CLOSE_STAGES[stage],
+                            elapsed,
+                        }
+                    }
+                    _ => {
+                        let stages = self.progress.render(now);
+                        return Err(store_failure(
+                            "close",
+                            &self.path,
+                            std::io::Error::other(format!(
+                                "the writer thread outlasted the close deadline: {stages}"
+                            )),
+                        ));
+                    }
+                }
+            }
+        };
+        Ok(*self.closed.get_or_init(|| closed))
+    }
+
+    /// Holds the writer thread at the start of its next close checkpoint, as a test holds a
+    /// checkpoint that outlasts its deadline: the receiver answers once the thread holds,
+    /// and the thread resumes once the sender fires or drops.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_next_checkpoint(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.progress.hold_next_checkpoint()
     }
 
     /// Queues `command` and awaits the thread's answer to it.
@@ -532,15 +676,16 @@ impl MetricsWriter {
             .busy_timeout(Duration::ZERO)
             .map_err(|source| failure(CLOSE_STAGES[CLOSE_CLEAR_BUSY_TIMEOUT], source))?;
         progress.start(CLOSE_CHECKPOINT);
-        let checkpoint = connection
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok(WalCheckpoint {
-                    busy: row.get::<_, i64>(0)? != 0,
-                    log: row.get(1)?,
-                    checkpointed: row.get(2)?,
-                })
-            })
+        #[cfg(any(test, feature = "fixtures"))]
+        progress.checkpoint_held();
+        let started = std::time::Instant::now();
+        let before = connection
+            .query_row("PRAGMA wal_checkpoint(NOOP)", [], CheckpointRow::read)
             .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))?;
+        let truncate = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], CheckpointRow::read)
+            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))?;
+        let checkpoint = WalCheckpoint::after(before, truncate, started.elapsed());
         progress.start(CLOSE_CONNECTION);
         connection
             .close()

@@ -295,9 +295,12 @@ impl DeferredDatabaseShutdown {
 /// The span's close carries the stage's elapsed time. The `stop stage ended` record
 /// carries the stage's name, what it left of the stop's shared `deadline`, its outcome,
 /// and, for a failure, the error and its causes, so a stop that leaves with a failure
-/// names the stage that returned it. The span records its opening too, so a stage the
-/// process never finishes still names itself, and the stage the deadline expired in
-/// publishes the table of operations in flight with the reason `stop deadline`.
+/// names the stage that returned it. The outcome is `ok` for a stage that succeeded inside
+/// `deadline`, `timeout` at `warn` for one that succeeded with nothing of it left, such as
+/// a database close whose checkpoint outlasted it, and `error` at `warn` for a failure;
+/// only a failure reaches the caller as an error. The span records its opening too, so a
+/// stage the process never finishes still names itself, and the stage the deadline
+/// expired in publishes the table of operations in flight with the reason `stop deadline`.
 ///
 /// # Errors
 ///
@@ -328,6 +331,14 @@ pub async fn stop_stage<Value>(
                 rift_tracing::warn_in_flight("stop deadline");
             }
             match &outcome {
+                Ok(_) if remaining.is_zero() => rift_tracing::warn!(
+                    component = "mcp",
+                    operation = "server.stop",
+                    stage,
+                    ?remaining,
+                    outcome = "timeout",
+                    "stop stage ended"
+                ),
                 Ok(_) => rift_tracing::info!(
                     component = "mcp",
                     operation = "server.stop",
@@ -357,6 +368,10 @@ pub async fn stop_stage<Value>(
 }
 
 /// Closes the metrics database by `deadline`, when it opened.
+///
+/// A checkpoint or connection close the deadline passed in does not fail the stage: it is
+/// recorded as a `warn` `database.close` record naming the close stage and its time, and
+/// the next open recovers the log.
 pub(crate) async fn close_logs(
     logs: Option<&rift_tracing::LogStore>,
     deadline: Instant,
@@ -366,16 +381,28 @@ pub(crate) async fn close_logs(
             stop_stage("metrics database close", deadline, async {
                 logs.close(deadline)
                     .await
-                    .map(|checkpoint| {
-                        rift_tracing::info!(
+                    .map(|closed| match closed {
+                        rift_tracing::StoreClose::Closed(checkpoint) => rift_tracing::info!(
                             component = "storage",
                             operation = "database.close",
                             database = "metrics",
                             busy = checkpoint.is_busy(),
                             log = checkpoint.log(),
                             checkpointed = checkpoint.checkpointed(),
+                            elapsed_ms = elapsed_ms(checkpoint.elapsed()),
                             "database checkpointed its write-ahead log"
-                        );
+                        ),
+                        rift_tracing::StoreClose::Timeout { stage, elapsed } => {
+                            rift_tracing::warn!(
+                                component = "storage",
+                                operation = "database.close",
+                                database = "metrics",
+                                stage,
+                                elapsed_ms = elapsed_ms(elapsed),
+                                "database checkpoint outlasted the shutdown deadline; the \
+                                 write-ahead log stays for the next open"
+                            );
+                        }
                     })
                     .map_err(|error| {
                         errors::mcp::http_serve_failed()
@@ -648,6 +675,11 @@ async fn drained_serve_outcome(
 }
 
 /// The stop log's outcome field for whether every part shut down cleanly.
+/// `elapsed` in whole milliseconds, as the `elapsed_ms` field of a record.
+fn elapsed_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
     if stopped_cleanly { "ok" } else { "error" }
 }
@@ -1284,6 +1316,59 @@ mod tests {
             ended[1].fields().contains("injected stage failure"),
             "{ended:?}"
         );
+    }
+
+    /// A metrics close whose checkpoint outlasts the stop's deadline ends its stage with
+    /// the outcome `timeout` and no error, so the stop's exit status stays clean, and
+    /// records the close at `warn` with the stage it was in.
+    #[tokio::test]
+    async fn a_metrics_checkpoint_past_the_stop_deadline_ends_its_stage_without_an_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BUDGET: Duration = Duration::from_secs(4);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let store = rift_tracing::LogStore::open(&directory.path().join("metrics"), None).await?;
+        let (holding, release) = store.hold_next_checkpoint();
+        let deadline = Instant::now() + BUDGET;
+
+        // The held writer answers nothing, so the paused clock reaches the deadline only
+        // once the close waits inside the checkpoint.
+        let (closed, held) = tokio::join!(super::close_logs(Some(&store), deadline), async {
+            let held = holding.await;
+            tokio::time::pause();
+            tokio::time::advance(BUDGET).await;
+            held
+        });
+
+        held?;
+        closed?;
+        tokio::time::resume();
+        release.send(())?;
+        drop(recorder);
+        let records = drain.queued_records();
+        let ended = records
+            .iter()
+            .find(|record| record.message() == "stop stage ended")
+            .ok_or("the stage ended with a record")?;
+        assert_eq!(ended.level(), "warn");
+        let ended: serde_json::Value = serde_json::from_str(ended.fields())?;
+        assert_eq!(ended["stage"], "metrics database close", "{ended}");
+        assert_eq!(ended["outcome"], "timeout", "{ended}");
+        let close = records
+            .iter()
+            .find(|record| record.operation() == "database.close")
+            .ok_or("the close was recorded")?;
+        assert_eq!(close.level(), "warn");
+        assert_eq!(
+            close.message(),
+            "database checkpoint outlasted the shutdown deadline; the write-ahead log stays \
+             for the next open"
+        );
+        let close: serde_json::Value = serde_json::from_str(close.fields())?;
+        assert_eq!(close["database"], "metrics", "{close}");
+        assert_eq!(close["stage"], "checkpoint", "{close}");
+        assert!(close.get("elapsed_ms").is_some(), "{close}");
+        Ok(())
     }
 
     /// Every stop stage records its opening, and the stage the stop deadline expires in
