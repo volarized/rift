@@ -14,7 +14,6 @@ mod update;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -28,23 +27,10 @@ use rift_tracing::{StderrPolicy, TracingRuntime};
 const BUILD_CHECKOUT: rift_mcp::BuildCheckout =
     rift_mcp::BuildCheckout::recorded(env!("RIFT_BUILD_COMMIT"), env!("RIFT_BUILD_DIRTY"));
 
-/// This binary's product version, as `rift --version` prints it and its servers publish it.
-///
-/// A dirty build whose executable cannot be read prints its commit and the dirty mark
-/// without the executable's metadata, where a server refuses to start instead.
-fn product_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        std::env::current_exe()
-            .and_then(|executable| BUILD_CHECKOUT.product_version(&executable))
-            .unwrap_or_else(|_| BUILD_CHECKOUT.version_without_stamp())
-    })
-}
-
 #[derive(Debug, Parser)]
 #[command(
     name = "rift",
-    version = product_version(),
+    version = env!("CARGO_PKG_VERSION"),
     about = "agentic development toolkit"
 )]
 struct Cli {
@@ -384,11 +370,11 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn version_prints_the_product_version() {
+    fn version_prints_the_package_version_alone() {
         let printed = Cli::try_parse_from(["rift", "--version"])
             .expect_err("--version prints and exits")
             .to_string();
-        assert_eq!(printed.trim(), format!("rift {}", super::product_version()));
+        assert_eq!(printed.trim(), concat!("rift ", env!("CARGO_PKG_VERSION")));
     }
 
     /// One git command in `root` with a fixed identity and signing off.

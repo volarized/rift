@@ -2484,8 +2484,8 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
     require_success(&printed, "version")?;
     assert_eq!(
         stdout_of(&printed).trim(),
-        format!("rift {}", document.identity.version),
-        "rift --version prints the version the server publishes"
+        concat!("rift ", env!("CARGO_PKG_VERSION")),
+        "rift --version prints the package version alone"
     );
 
     let stopped = rift(root, &["server", "stop"])?;

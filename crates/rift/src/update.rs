@@ -1905,11 +1905,10 @@ mod tests {
             .map_err(|error| {
                 windows_update_io_error("reading version output", &version_path, error)
             })?;
-        let (released, _build) = version_text
-            .trim()
-            .split_once('+')
-            .unwrap_or((version_text.trim(), ""));
-        assert_eq!(released, concat!("rift ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            version_text.trim(),
+            concat!("rift ", env!("CARGO_PKG_VERSION"))
+        );
         assert!(
             fs::metadata(&version_path)
                 .map_err(|error| windows_update_io_error(
