@@ -214,6 +214,9 @@ impl TracingRuntimeBuilder {
             stderr_layer.set_ansi(false);
         }
         let (otlp_layer, export) = otlp::layer();
+        #[cfg(feature = "otlp")]
+        let values = Arc::new(MetricValues::exporting(export.metrics()));
+        #[cfg(not(feature = "otlp"))]
         let values = Arc::new(MetricValues::default());
         let sampler = self.sample_interval.and_then(|interval| {
             if tokio::runtime::Handle::try_current().is_err() {
