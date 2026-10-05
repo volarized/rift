@@ -156,5 +156,6 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                         client.require_complete(READ_TOOLS)
                     server.stop()
                 except BaseException as error:
-                    error.add_note(server.read_log())
+                    for note in server.evidence():
+                        error.add_note(note)
                     raise

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +21,9 @@ from mcp.client.stdio import stdio_client
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.commands import DockerCommand, owned_environment
 from rift_dev.rift_test_client import (
+    LOG_BYTES_MAX,
+    LOG_FILTER,
+    RECORD_TAIL,
     Client,
     ToolFailure,
     array_value,
@@ -28,11 +33,14 @@ from rift_dev.rift_test_client import (
     remaining_seconds,
     require,
     stderr_log,
+    tail_text,
 )
 
 COLDSTART_SECONDS = 240.0
 START_SECONDS = 120.0
 STOP_SECONDS = 5.0
+EVIDENCE_SECONDS = 10.0
+CONTAINER_LOG_LINES = 200
 SOURCE = "pub fn beacon_cold() -> u8 { 7 }\n"
 START = r"""
 set -eu
@@ -162,6 +170,56 @@ async def check_missing_executable(client: Client, name: str) -> None:
     )
 
 
+def container_evidence(name: str, proxy_log: Path) -> list[str]:
+    """What a cold failure keeps: server stderr, proxy stderr, and the persisted records.
+
+    The container still exists, so Docker returns the server's last
+    `CONTAINER_LOG_LINES` lines of stderr and the container's own `rift server
+    logs` reads `.rift/metrics`. Each read has its own bound and no gate
+    deadline, because a timed-out gate is the failure this explains; a read that
+    fails is reported as text and never replaces the failure.
+    """
+    notes: list[str] = []
+    reads = [
+        (
+            f"server stderr (last {CONTAINER_LOG_LINES} lines)",
+            DockerCommand("logs", "--tail", str(CONTAINER_LOG_LINES), name),
+        ),
+        (
+            "persisted log records",
+            DockerCommand(
+                "exec",
+                "--workdir",
+                "/workspace",
+                name,
+                "/rift",
+                "server",
+                "logs",
+                "--tail",
+                str(RECORD_TAIL),
+            ),
+        ),
+    ]
+    for label, command in reads:
+        try:
+            text = (
+                command.with_timeout(EVIDENCE_SECONDS)
+                .with_output_limit(LOG_BYTES_MAX)
+                .output()
+            )
+        except (RuntimeError, OSError, ValueError) as error:
+            notes.append(f"{label} unavailable: {error}")
+        else:
+            notes.append(f"{label}:\n{tail_text(text)}")
+    try:
+        proxy = proxy_log.read_bytes().decode("utf-8", errors="replace")
+    except OSError as error:
+        notes.append(f"rift mcp stderr unavailable: {error}")
+    else:
+        notes.append(f"rift mcp stderr ({proxy_log}):\n{tail_text(proxy, proxy_log)}")
+    return notes
+
+
 async def check_coldstart(binary: Path, image: str, version: str | None = None) -> None:
     """Run supplied bytes under Docker and remove the container on every outcome."""
     async with gate_deadline("coldstart", COLDSTART_SECONDS):
@@ -185,6 +243,8 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             "2",
             "--pids-limit",
             "128",
+            "--env",
+            f"RUST_LOG={LOG_FILTER}",
             "--log-opt",
             "max-size=8m",
             "--log-opt",
@@ -199,6 +259,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             START,
         )
         failure: BaseException | None = None
+        proxy_log = Path(tempfile.mkdtemp(prefix="rift-coldstart-")) / "proxy.log"
         try:
             command.with_timeout(START_SECONDS).with_deadline(
                 current_deadline()
@@ -211,9 +272,12 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                     released == f"rift {version.removeprefix('v')}",
                     f"unexpected version: {observed}",
                 )
+            host = {
+                key: value for key, value in os.environ.items() if key != "RUST_LOG"
+            }
             with (
-                stderr_log() as log,
-                owned_environment(dict(os.environ)) as environment,
+                stderr_log(proxy_log) as log,
+                owned_environment(host) as environment,
             ):
                 parameters = StdioServerParameters(
                     command="docker",
@@ -221,6 +285,8 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                     args=[
                         "exec",
                         "-i",
+                        "--env",
+                        f"RUST_LOG={LOG_FILTER}",
                         "--workdir",
                         "/workspace",
                         name,
@@ -239,16 +305,11 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             stop_container(name, pid)
         except BaseException as error:
             failure = error
-            try:
-                error.add_note(
-                    DockerCommand("logs", "--tail", "200", name)
-                    .with_timeout(10)
-                    .output()
-                )
-            except (RuntimeError, OSError) as log_error:
-                error.add_note(f"container log collection failed: {log_error}")
+            for note in container_evidence(name, proxy_log):
+                error.add_note(note)
             raise
         finally:
+            shutil.rmtree(proxy_log.parent, ignore_errors=True)
             try:
                 DockerCommand("rm", "--force", name).with_timeout(30).output()
             except (RuntimeError, OSError) as cleanup_error:

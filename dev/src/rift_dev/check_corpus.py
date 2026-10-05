@@ -45,6 +45,7 @@ from rift_dev.corpus_assertions import (
 from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.rift_test_client import (
+    LOG_FILTER,
     Client,
     FailureLimit,
     Json,
@@ -56,6 +57,7 @@ from rift_dev.rift_test_client import (
     object_value,
     require,
     string_value,
+    utc_now,
 )
 
 # The budgets bounding one corpus case each stand strictly inside the one outside them,
@@ -152,31 +154,41 @@ class Corpus:
         self.binary = binary.resolve()
         self.report = report.resolve()
         self.actions: list[Json] = []
+        self.servers: list[Server] = []
+        self.evidence: list[Json] = []
         self.root = Path()
         self.sequence = 0
         self.started = time.monotonic()
+        self.mark = utc_now()
 
     def record(self, action: str, **values: Json) -> None:
+        """Append one finished action.
+
+        `started_at` is when the previous action finished, or the case began, and
+        `ended_at` is now, both UTC: the interval holds everything the action did.
+        """
+        ended = utc_now()
         entry: JsonObject = {
             "action": action,
             **values,
+            "started_at": self.mark,
+            "ended_at": ended,
             "elapsed_seconds": time.monotonic() - self.started,
         }
+        self.mark = ended
         self.actions.append(entry)
 
     def server(self, root: Path | None = None) -> Server:
         self.sequence += 1
-        return Server(
+        server = Server(
             self.binary,
             root or self.root,
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
-            output=sys.stderr.buffer,
-            env={
-                "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info",
-                "NO_COLOR": "1",
-            },
+            env={"RUST_LOG": LOG_FILTER, "NO_COLOR": "1"},
         )
+        self.servers.append(server)
+        return server
 
     def work_seconds(self) -> float:
         """The wall clock this case's own actions get.
@@ -193,6 +205,7 @@ class Corpus:
         """A timeout fails the suite after server cleanup writes its evidence."""
         started = time.monotonic()
         self.started = started
+        self.mark = utc_now()
         status = "failed"
         failure = ""
         budget = self.work_seconds()
@@ -222,6 +235,7 @@ class Corpus:
                         "seed": SEED,
                         "status": status,
                         "failure": failure,
+                        "evidence": self.evidence,
                         "elapsed_seconds": time.monotonic() - started,
                         "actions": self.actions,
                     },
@@ -232,6 +246,36 @@ class Corpus:
             )
 
     async def tree(self, directory: Path) -> None:
+        """Run the case; on failure keep each server's evidence before the tree goes."""
+        try:
+            await self.cases(directory)
+        except BaseException:
+            self.collect_evidence()
+            raise
+
+    def collect_evidence(self) -> None:
+        """Keep every server's stderr, proxy stderr, and persisted records of a failed case.
+
+        The files sit beside the report. The report names them, and the newest part of
+        each stream is written to stderr, which a pass never receives. The served
+        tree still exists here, so `rift server logs` can read its `.rift/metrics`.
+        """
+        for index, server in enumerate(self.servers, 1):
+            for note in server.evidence():
+                sys.stderr.write(note if note.endswith("\n") else note + "\n")
+            self.evidence.append(
+                {
+                    "server": index,
+                    "root": str(server.root),
+                    "stderr": str(server.log_path),
+                    "stderr_cut": server.output_cut,
+                    "proxy_stderr": [str(path) for path in server.proxy_logs],
+                    "records": str(server.records_path),
+                }
+            )
+        sys.stderr.flush()
+
+    async def cases(self, directory: Path) -> None:
         self.root = directory / "workspace"
         self.pin.checkout(self.root)
         self.configure()
