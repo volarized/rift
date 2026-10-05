@@ -91,6 +91,15 @@ impl DatabaseName {
         migration_lock_path(&self.path(state_directory))
     }
 
+    /// The name the database's write turn is recorded under, waits and holds alike.
+    #[must_use]
+    pub const fn write_lock_name(self) -> &'static str {
+        match self {
+            Self::Index => "index.write",
+            Self::Vectors => "vectors.write",
+        }
+    }
+
     /// The name of this database's worker thread. Linux keeps 15 bytes of a thread
     /// name, and both names fit.
     #[must_use]
@@ -478,7 +487,10 @@ impl WorkspaceDatabase {
     ///
     /// Every store's write transaction opens through this. The guard holds the
     /// turn until it drops, so the transaction it carries is the file's only
-    /// writer for its whole life.
+    /// writer for its whole life. The turn is recorded as the lock
+    /// [`DatabaseName::write_lock_name`]: a writer that waits records the wait, its
+    /// waiting operation, and the operation that holds the turn, and the held turn
+    /// stays in the table of operations in flight until the guard drops.
     ///
     /// # Errors
     ///
@@ -488,7 +500,9 @@ impl WorkspaceDatabase {
     ///
     /// Dropping the returned future releases the turn without writing.
     pub(crate) async fn writing(&self) -> Result<WriteAccess<'_>, RiftError> {
-        let turn = self.writes.lock().await;
+        let turn = rift_tracing::lock(self.name.write_lock_name())
+            .acquire(self.writes.lock())
+            .await;
         let connection = self.configured_connection(ConnectionAccess::Write).await?;
         Ok(WriteAccess {
             _turn: turn,
@@ -560,7 +574,7 @@ pub struct HeldConnection {
 /// The file's write turn, held with the connection that spends it.
 #[derive(Debug)]
 pub(crate) struct WriteAccess<'database> {
-    _turn: MutexGuard<'database, ()>,
+    _turn: rift_tracing::Held<MutexGuard<'database, ()>>,
     connection: Connection,
 }
 
@@ -1565,6 +1579,73 @@ mod tests {
         drop(first);
 
         tokio::time::timeout(Duration::from_secs(1), contender).await???;
+        Ok(())
+    }
+
+    /// The entries of the `operations` list a table record carries whose `field` is `value`.
+    fn listed_with(
+        record: &rift_tracing::LogRecord,
+        field: &str,
+        value: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        let listed: serde_json::Value =
+            serde_json::from_str(fields["operations"].as_str().ok_or("operations")?)?;
+        Ok(listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry[field] == value)
+            .cloned()
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn a_writer_waiting_for_the_write_turn_names_the_operation_that_holds_it() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, pool())
+                .await?;
+        let holder =
+            rift_tracing::traced!("documentation.store", async { database.writing().await })
+                .await?;
+        let mut waiter = std::pin::pin!(rift_tracing::traced!(
+            component = "lexical",
+            operation = "lexical.commit",
+            async { database.writing().await.map(drop) }
+        ));
+        let pending = tokio::select! {
+            biased;
+            _ = waiter.as_mut() => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(pending, "the holder keeps the write turn");
+        rift_tracing::publish_in_flight("write turn");
+        drop(holder);
+        waiter.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the table was published")?;
+        let waits = listed_with(table, "kind", "wait")?;
+        assert_eq!(waits.len(), 1, "{}", table.fields());
+        assert_eq!(waits[0]["lock.name"], "index.write");
+        assert_eq!(waits[0]["parent"], "lexical.commit");
+        let held = listed_with(table, "kind", "held")?;
+        assert_eq!(held.len(), 1, "{}", table.fields());
+        assert_eq!(held[0]["parent"], "documentation.store");
+        let wait = records
+            .iter()
+            .find(|record| record.message() == "lock.wait")
+            .ok_or("the wait closed with a record")?;
+        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
+        assert_eq!(wait["waiter"], "lexical.commit");
+        assert_eq!(wait["holder"], "documentation.store");
+        assert_eq!(wait["outcome"], "acquired");
         Ok(())
     }
 

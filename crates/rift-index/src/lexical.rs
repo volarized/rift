@@ -1656,6 +1656,7 @@ impl LexicalSearchIndex {
         rift_tracing::traced!(
             component = "lexical",
             operation = "lexical.commit",
+            open = true,
             mode = mode,
             async move {
                 let mut access = rift_tracing::traced!(

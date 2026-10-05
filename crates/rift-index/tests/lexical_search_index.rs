@@ -2303,3 +2303,31 @@ async fn test_the_store_holds_one_copy_of_the_text() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_lexical_search_index_commit_records_its_opening_before_it_closes() -> TestResult {
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let documents = [text_document("docs/a.md", "content")?];
+    index.replace_all(&documents, "revision-1").await?;
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let opened = records
+        .iter()
+        .position(|record| record.message() == "operation opened")
+        .ok_or("the commit records its opening")?;
+    assert_eq!(records[opened].operation(), "lexical.commit");
+    assert_eq!(records[opened].component(), "lexical");
+    let closed = records
+        .iter()
+        .position(|record| record.message() == "lexical.commit")
+        .ok_or("the commit closes with a record")?;
+    assert!(opened < closed);
+    Ok(())
+}
