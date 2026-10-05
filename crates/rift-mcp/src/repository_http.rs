@@ -659,42 +659,54 @@ impl RepositoryWorkspaceRegistry {
     }
 }
 
+/// Stops one workspace's engines, index supervisor, and databases by `deadline`.
+///
+/// The index and vectors databases close after the supervisor stopped, since the
+/// supervisor writes the index. The metrics database closes at once with that whole
+/// sequence: a repository server runs no log drain, so nothing in the sequence writes to
+/// the metrics database, and its checkpoint never waits on an index checkpoint's time.
 async fn stop_repository_workspace(
     workspace: &RepositoryWorkspace,
     deadline: Instant,
 ) -> Result<(), RiftError> {
     workspace.stop.cancel();
-    let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
-        .await
-        .map_err(|error| {
+    let indexing = async {
+        let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
+            .await
+            .map_err(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("workspace engines shutdown")
+                    .source(error)
+                    .error()
+            });
+        let supervisor = workspace.supervisor.shutdown(deadline).await;
+        let (index, vectors) = tokio::join!(
+            async {
+                match workspace.database.as_ref() {
+                    Some(database) => database.shutdown(deadline).await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match workspace.vectors.as_ref() {
+                    Some(vectors) => vectors.shutdown(deadline).await,
+                    None => Ok(()),
+                }
+            }
+        );
+        let database = index.and(vectors).map_err(|error| {
             errors::mcp::http_serve_failed()
-                .operation("workspace engines shutdown")
-                .source(error)
+                .operation("SQLite worker shutdown")
+                .cause(error)
                 .error()
         });
-    let supervisor = workspace.supervisor.shutdown(deadline).await;
-    let (index, vectors) = tokio::join!(
-        async {
-            match workspace.database.as_ref() {
-                Some(database) => database.shutdown(deadline).await,
-                None => Ok(()),
-            }
-        },
-        async {
-            match workspace.vectors.as_ref() {
-                Some(vectors) => vectors.shutdown(deadline).await,
-                None => Ok(()),
-            }
-        }
+        engines.and(supervisor).and(database)
+    };
+    let (indexing, logs) = tokio::join!(
+        indexing,
+        crate::http::close_logs(workspace.logs.as_deref(), deadline)
     );
-    let database = index.and(vectors).map_err(|error| {
-        errors::mcp::http_serve_failed()
-            .operation("SQLite worker shutdown")
-            .cause(error)
-            .error()
-    });
-    let logs = crate::http::close_logs(workspace.logs.as_deref(), deadline).await;
-    let outcome = engines.and(supervisor).and(database).and(logs);
+    let outcome = indexing.and(logs);
     if outcome.is_ok() {
         drop(workspace.lease.lock().await.take());
     }

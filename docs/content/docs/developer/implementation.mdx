@@ -205,8 +205,10 @@ stop begins, and each stage takes only what the one before it left:
 
 A foreground repository server opens no metrics database and runs no log drain of its own: each
 workspace it holds closes its databases inside the serving stage `repository workspaces
-shutdown`, every workspace at once. Its serving stages therefore end by the deadline minus
-`SERVER_EXPORT_STOP_RESERVE` alone, and its `otlp export` stage ends by the deadline.
+shutdown`, every workspace at once. The server's serving stages therefore end by the deadline
+minus `SERVER_EXPORT_STOP_RESERVE` alone, and its `otlp export` stage ends by the deadline. Within
+a workspace, the index and vectors databases close after the index supervisor stops, and the
+metrics database closes at the same time as that whole sequence: no log drain writes to it.
 
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
 `stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure. The outcome is `ok`
