@@ -44,6 +44,9 @@ pub(crate) const LOCK_HELD_SPAN: &str = "lock.held";
 pub(crate) const LOCK_NAME_FIELD: &str = "lock.name";
 /// The span field that marks a hold its holder keeps for as long as it runs.
 const LIFELONG_FIELD: &str = "lifelong";
+/// The span field that names the work an operation runs, as `worker.run` names the request
+/// operation it runs on a worker.
+const WORK_FIELD: &str = "work";
 
 /// What an entry of the table is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +87,8 @@ pub(crate) struct FlightEntry {
     pub(crate) component: String,
     pub(crate) kind: FlightKind,
     pub(crate) lock: String,
+    /// The span's `work` field, empty when it has none.
+    pub(crate) work: String,
     pub(crate) parent: Option<&'static str>,
     pub(crate) started_at_ms: i64,
     pub(crate) started: Duration,
@@ -107,6 +112,7 @@ impl FlightEntry {
             component: String::new(),
             kind,
             lock: String::new(),
+            work: String::new(),
             parent,
             started_at_ms,
             started,
@@ -116,7 +122,7 @@ impl FlightEntry {
     }
 
     /// The entry as one member of a table record's `operations` list: its name, kind, and
-    /// age at `now`, then its component, lock, and parent when it has them, and
+    /// age at `now`, then its component, lock, work, and parent when it has them, and
     /// `"lifelong": true` for a lifelong hold.
     fn listed(&self, now: Duration) -> Value {
         let mut member = Map::new();
@@ -129,6 +135,7 @@ impl FlightEntry {
         for (key, value) in [
             ("component", &self.component),
             (LOCK_NAME_FIELD, &self.lock),
+            (WORK_FIELD, &self.work),
         ] {
             if !value.is_empty() {
                 member.insert(key.to_owned(), Value::from(value.as_str()));
@@ -270,12 +277,13 @@ fn listed(mut entries: Vec<FlightEntry>, untracked: u64, now: Duration) -> Fligh
     }
 }
 
-/// The fields an entry takes from its span: `component`, the lock name, and the lifelong
-/// mark.
+/// The fields an entry takes from its span: `component`, the lock name, `work`, and the
+/// lifelong mark.
 #[derive(Default)]
 struct EntryFields {
     component: String,
     lock: String,
+    work: String,
     lifelong: bool,
 }
 
@@ -284,6 +292,7 @@ impl EntryFields {
         match field.name() {
             "component" => self.component = bounded(value, LOG_LABEL_BYTES_MAX),
             LOCK_NAME_FIELD => self.lock = bounded(value, LOG_LABEL_BYTES_MAX),
+            WORK_FIELD => self.work = bounded(value, LOG_LABEL_BYTES_MAX),
             _ => {}
         }
     }
@@ -301,7 +310,7 @@ impl Visit for EntryFields {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if matches!(field.name(), "component" | LOCK_NAME_FIELD) {
+        if matches!(field.name(), "component" | LOCK_NAME_FIELD | WORK_FIELD) {
             self.record(field, &format!("{value:?}"));
         }
     }
@@ -350,6 +359,7 @@ where
         );
         entry.component = fields.component;
         entry.lock = fields.lock;
+        entry.work = fields.work;
         entry.lifelong = fields.lifelong;
         self.table.join(id.into_u64(), entry);
     }
@@ -395,6 +405,32 @@ pub(crate) fn with_table<Answer>(read: impl FnOnce(&FlightTable) -> Answer) -> O
 pub fn publish_in_flight(reason: &'static str) {
     if let Some(listing) = with_table(|table| table.listing(monotonic_now())) {
         tracing::info!(
+            target: "rift_tracing::flight",
+            reason,
+            in_flight = listing.in_flight,
+            left_out = listing.left_out,
+            untracked = listing.untracked,
+            operations = %listing,
+            "operations in flight"
+        );
+    }
+}
+
+/// Publishes the table of operations in flight as [`publish_in_flight`] does, as one `WARN`
+/// record.
+///
+/// A deadline that expired is a warning, and a process whose filter admits warnings alone,
+/// such as one started under `RUST_LOG=warn`, keeps the table it publishes then: on stderr,
+/// and in the store when the drain writes before the process exits.
+///
+/// ```
+/// rift_tracing::traced!(component = "mcp", operation = "server.stop", {
+///     rift_tracing::warn_in_flight("stop deadline");
+/// });
+/// ```
+pub fn warn_in_flight(reason: &'static str) {
+    if let Some(listing) = with_table(|table| table.listing(monotonic_now())) {
+        tracing::warn!(
             target: "rift_tracing::flight",
             reason,
             in_flight = listing.in_flight,

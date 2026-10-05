@@ -325,7 +325,7 @@ pub async fn stop_stage<Value>(
             // what it, and every stage after it, met unfinished. A stage that starts past
             // the deadline publishes nothing, so one stop publishes once.
             if deadline_ahead && remaining.is_zero() {
-                rift_tracing::publish_in_flight("stop deadline");
+                rift_tracing::warn_in_flight("stop deadline");
             }
             match &outcome {
                 Ok(_) => rift_tracing::info!(
@@ -1320,6 +1320,11 @@ mod tests {
             .filter(|record| record.message() == "operations in flight")
             .collect::<Vec<_>>();
         assert_eq!(tables.len(), 1, "one publication per stop: {tables:?}");
+        assert_eq!(
+            tables[0].level(),
+            "warn",
+            "a WARN filter keeps it: {tables:?}"
+        );
         let table: serde_json::Value = serde_json::from_str(tables[0].fields())?;
         assert_eq!(table["reason"], "stop deadline", "{table}");
         assert_eq!(
