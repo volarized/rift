@@ -593,6 +593,14 @@ The flags narrow what prints:
 Agents read these records through [`rift://logs`](/docs/mcp#resource-logs).
 The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
 
+`rift-tracing` holds a record from its capture to its row. The `LogSink` layer copies each event
+and span close that `[logs]` `capture` admits into a queue of 4,096 records, and a full queue
+drops the newest record and counts it. The log drain writes the queue in batches. A batch the
+metrics database refuses stays with the drain, which retries it every 500 ms with no attempt
+count; meanwhile the queue fills and then drops, and the next batch written carries a
+`the log queue was full and dropped records` record with the `dropped` count. The stop's
+deadline bounds the retry: a drain aborted there reports what it held as `unwritten`.
+
 ## Shared ranking
 
 `rift-ranking` states the retrieval decisions every index makes: the document shape and its
