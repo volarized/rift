@@ -28,6 +28,7 @@ rift-provider.workspace = true
 rift-ranking.workspace = true
 rift-syntax.workspace = true
 rift-tracing.workspace = true
+rusqlite.workspace = true
 toasty.workspace = true
 toasty-core.workspace = true
 toasty-driver-sqlite.workspace = true
@@ -39,7 +40,6 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 regex-syntax.workspace = true
-rusqlite.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 rift-tracing = { workspace = true, features = ["fixtures"] }
 tokio = { workspace = true, features = ["test-util"] }

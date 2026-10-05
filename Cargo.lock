@@ -4536,6 +4536,7 @@ dependencies = [
  "rift-syntax",
  "rift-tracing",
  "rmcp",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",

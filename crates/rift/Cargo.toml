@@ -66,6 +66,7 @@ rift-tracing = { workspace = true, features = ["fixtures"] }
 axum.workspace = true
 jsonschema.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+rusqlite.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 unicode-width.workspace = true
