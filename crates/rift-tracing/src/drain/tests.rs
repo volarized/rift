@@ -14,6 +14,12 @@ use crate::{LOG_QUEUE_RECORDS, LogDrain, LogQuery, LogRecord, LogStore, log_capt
 
 /// A stop's deadline in these cases: the foreground server's four seconds.
 const STOP_DEADLINE: Duration = Duration::from_secs(4);
+/// Failure bound on one wait for the writer thread's close; never a way to order two
+/// events, and the bound the store's own cases use. On windows-2025 under the workspace
+/// suite, the close's `PRAGMA wal_checkpoint(TRUNCATE)` was measured past 2 s, all of it
+/// in the file syncs the checkpoint runs, and one WAL switch at 4 s; the bound sits above
+/// twice the longest of these.
+const THREAD_WAIT_MAX: Duration = Duration::from_secs(10);
 
 /// One lane with `accepted` sequences stamped, the drain written through
 /// `written_through`, and a drain that is running or is not.
@@ -118,7 +124,7 @@ async fn a_log_write_emits_no_record() {
             .expect("the batch lands");
     }
     store
-        .close(tokio::time::Instant::now() + LOG_SETTLE_TIMEOUT)
+        .close(tokio::time::Instant::now() + THREAD_WAIT_MAX)
         .await
         .expect("the store closes");
 
