@@ -48,7 +48,8 @@ from rift_dev.commands import (
     owned_environment,
     termination_handler,
 )
-from rift_dev.log_records import lines, newest_in_flight, newest_snapshots
+from rift_dev.log_records import Line, lines, newest_in_flight
+from rift_dev.trace import Collector, nanoseconds
 
 # `list` and `dict` are invariant, so a `list[JsonObject]` an assertion builds is
 # not a `list[Json]` and cannot be passed where a JSON value is expected. The
@@ -285,14 +286,14 @@ LogsReader: TypeAlias = Callable[[Sequence[str]], str]
 
 
 def logs_arguments(
-    until: str, *, since: str | None = None, kind: str = "all", tail: int = RECORD_TAIL
+    until: str, *, since: str | None = None, tail: int = RECORD_TAIL
 ) -> list[str]:
     """The arguments of a `rift server logs` read of records recorded before `until`.
 
     `since` and `until` are RFC 3339 instants, as `utc_now` prints them. `--since`
     keeps records at or after the instant and `--until` keeps those before it.
     """
-    arguments = ["server", "logs", "--tail", str(tail), "--kind", kind]
+    arguments = ["server", "logs", "--tail", str(tail)]
     if since is not None:
         arguments += ["--since", since]
     return [*arguments, "--until", until]
@@ -307,6 +308,103 @@ def cut_record(text: str) -> str:
     return f"{kept} [{len(encoded) - WINDOW_RECORD_BYTES} later bytes were left out]"
 
 
+# Metric points and spans one failure window prints, the newest of the window.
+WINDOW_POINTS_MAX = 200
+WINDOW_SPANS_MAX = 100
+# The field a printed log record names its MCP request with (`REQUEST_LABEL` in
+# `crates/rift-tracing/src/render.rs`).
+RECORD_REQUEST_LABEL = "req"
+NO_POINTS = "no metric points received"
+NO_SPANS = "no spans received"
+
+
+def telemetry_notes(
+    collector: Collector,
+    *,
+    since: str | None,
+    until: str,
+    records: Sequence[Line] = (),
+) -> list[str]:
+    """What `collector` received inside a failure's window, as notes.
+
+    The window `[since, until)` is the only key metric points and log records share:
+    a point carries `time_unix_nano`, a record its recorded time. A point carries no
+    request. A span carrying `request_id` names the count of `records` whose `req` is
+    the same, so a span and the records of its request read together. Each part prints
+    `WINDOW_POINTS_MAX` or `WINDOW_SPANS_MAX` lines at most, the newest, oldest
+    first; a collector that received nothing says so in one line, and what its bounds
+    dropped is stated whenever anything was.
+    """
+    lower = None if since is None else nanoseconds(since)
+    upper = nanoseconds(until)
+    start = since or "the first point received"
+    notes: list[str] = []
+    if collector.metrics.received == 0:
+        notes.append(NO_POINTS)
+    else:
+        points = collector.metrics.between(lower, upper)
+        shown = points[-WINDOW_POINTS_MAX:]
+        heading = (
+            f"metric points from {start} until {until}, the newest "
+            f"{WINDOW_POINTS_MAX} at most"
+        )
+        body = (
+            "\n".join(cut_record(point.line()) for point in shown)
+            if shown
+            else (
+                f"(no metric points in the window; {collector.metrics.received} "
+                "received in all)"
+            )
+        )
+        cut = (
+            f"[{len(points) - len(shown)} older points of the window were left out]\n"
+            if len(points) > len(shown)
+            else ""
+        )
+        notes.append(f"{heading}:\n{cut}{body}")
+    if collector.spans.received == 0:
+        notes.append(NO_SPANS)
+    else:
+        requests: dict[str, int] = {}
+        for record in records:
+            request = record.label(RECORD_REQUEST_LABEL)
+            if request:
+                requests[request] = requests.get(request, 0) + 1
+        spans = collector.spans.between(lower, upper)
+        shown_spans = spans[-WINDOW_SPANS_MAX:]
+        heading = (
+            f"spans ending from {start} until {until}, the newest {WINDOW_SPANS_MAX} at "
+            "most; records= counts the window's log records of the span's request_id"
+        )
+        body = (
+            "\n".join(
+                cut_record(
+                    span.line(
+                        None
+                        if span.request_id is None
+                        else requests.get(span.request_id, 0)
+                    )
+                )
+                for span in shown_spans
+            )
+            if shown_spans
+            else f"(no spans in the window; {collector.spans.received} received in all)"
+        )
+        cut = (
+            f"[{len(spans) - len(shown_spans)} older spans of the window were left out]\n"
+            if len(spans) > len(shown_spans)
+            else ""
+        )
+        notes.append(f"{heading}:\n{cut}{body}")
+    dropped = collector.dropped()
+    if dropped.any():
+        counts = " ".join(
+            f"{reason}={count}" for reason, count in dropped.counts().items() if count
+        )
+        notes.append(f"the collector's bounds dropped: {counts}")
+    return notes
+
+
 def failure_window(
     read: LogsReader,
     *,
@@ -314,6 +412,7 @@ def failure_window(
     lower_bound: str,
     until: str,
     file: Path | None = None,
+    collector: Collector | None = None,
 ) -> list[str]:
     """The records of a failure's window, as notes for the failure to carry.
 
@@ -321,29 +420,31 @@ def failure_window(
     never raising, so a pass cannot turn into a failure here and a failure keeps
     its own error:
 
-    - every kind of record from `since` to `until`, in full, through `tail_text`; the
+    - the log records from `since` to `until`, in full, through `tail_text`; the
       note states `lower_bound`, what `since` is, and when the read holds the newest
       `RECORD_TAIL` records the older ones of the window are left out;
-    - the newest `operations in flight` record and the newest `metric snapshot`
-      record of each group before `until`, wherever they were recorded, when they
-      are among the newest `RECORD_TAIL` records before `until`.
+    - the newest `operations in flight` record before `until`, wherever it was
+      recorded, when it is among the newest `RECORD_TAIL` records before `until`.
+
+    With a `collector`, the `telemetry_notes` of the same window follow.
     """
     heading = (
-        f"failure window: records of every kind from {since or 'the oldest kept record'} "
+        f"failure window: log records from {since or 'the oldest kept record'} "
         f"({lower_bound}) "
         f"until {until}, the newest {RECORD_TAIL} at most"
     )
     notes: list[str] = []
+    window: list[Line] = []
     try:
         text = read(logs_arguments(until, since=since))
     except (OSError, RuntimeError, ValueError) as error:
         notes.append(f"{heading}\nunavailable: {error}")
     else:
-        count = sum(1 for _ in lines(text))
+        window = list(lines(text))
         cut = (
             f"[the window holds {RECORD_TAIL} records; older records of the window "
             "were left out]\n"
-            if count >= RECORD_TAIL
+            if len(window) >= RECORD_TAIL
             else ""
         )
         body = tail_text(text, file) if text else "(no records in the window)\n"
@@ -351,29 +452,22 @@ def failure_window(
     try:
         before = list(lines(read(logs_arguments(until))))
     except (OSError, RuntimeError, ValueError) as error:
+        notes.append(f"newest operations in flight unavailable: {error}")
+    else:
+        flight = newest_in_flight(before)
         notes.append(
-            f"newest operations in flight and metric snapshots unavailable: {error}"
+            "newest operations in flight record before "
+            f"{until}:\n"
+            + (
+                cut_record(flight.text)
+                if flight is not None
+                else f"(none among the newest {RECORD_TAIL} records)"
+            )
         )
-        return notes
-    flight = newest_in_flight(before)
-    notes.append(
-        "newest operations in flight record before "
-        f"{until}:\n"
-        + (
-            cut_record(flight.text)
-            if flight is not None
-            else f"(none among the newest {RECORD_TAIL} records)"
+    if collector is not None:
+        notes.extend(
+            telemetry_notes(collector, since=since, until=until, records=window)
         )
-    )
-    snapshots = newest_snapshots(before)
-    notes.append(
-        f"newest metric snapshot of each group before {until}:\n"
-        + (
-            "\n".join(cut_record(snapshot.text) for snapshot in snapshots)
-            if snapshots
-            else f"(none among the newest {RECORD_TAIL} records)"
-        )
-    )
     return notes
 
 
@@ -676,7 +770,11 @@ class Server:
         startup_seconds: float = 120.0,
         env: Mapping[str, str] | None = None,
         output: BinaryIO | None = None,
+        collector: Collector | None = None,
     ) -> None:
+        """`collector`, when given, receives the server's OTLP export: its
+        `environment()` is set below `env`, and the failure window prints what it
+        received."""
         outside_workspace(log_path, root)
         require(startup_seconds > 0, "startup timeout must be positive")
         self.binary = binary.resolve()
@@ -685,6 +783,9 @@ class Server:
         self.startup_seconds = startup_seconds
         self.env = dict(os.environ)
         self.env["RUST_LOG"] = LOG_FILTER
+        self.collector = collector
+        if collector is not None:
+            self.env.update(collector.environment())
         self.env.update(env or {})
         self.output = output
         self.process: Process
@@ -865,6 +966,7 @@ class Server:
             lower_bound=lower_bound or "the server's start",
             until=until,
             file=self.window_path,
+            collector=self.collector,
         )
 
     def evidence(

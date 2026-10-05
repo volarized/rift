@@ -41,11 +41,9 @@ def test_failed_container_start_still_attempts_cleanup(
         "persisted log records unavailable",
         "rift mcp stderr unavailable",
     ]
-    assert notes[3].startswith("failure window: records of every kind from")
+    assert notes[3].startswith("failure window: log records from")
     assert notes[3].endswith("unavailable: failed exec")
-    assert notes[4] == (
-        "newest operations in flight and metric snapshots unavailable: failed exec"
-    )
+    assert notes[4] == ("newest operations in flight unavailable: failed exec")
     assert notes[5].startswith("container cleanup failed")
     command = commands[0]
     assert command[command.index("--env") + 1] == f"RUST_LOG={LOG_FILTER}"
@@ -277,10 +275,10 @@ def test_container_evidence_keeps_server_stderr_proxy_stderr_and_records(
     # The window reads the container's own `rift server logs` twice: the window, then
     # every record before the failure.
     assert notes[3].startswith(
-        "failure window: records of every kind from 2026-10-05T08:59:00.000+00:00 "
+        "failure window: log records from 2026-10-05T08:59:00.000+00:00 "
         "(read just before the container was created) until "
     )
-    assert len(notes) == 6
+    assert len(notes) == 5
     # Each read has its own bound and no gate deadline: a timed-out gate is what
     # the evidence explains.
     assert limits == [
@@ -305,6 +303,4 @@ def test_container_evidence_failure_never_raises(
     assert notes[1] == "persisted log records unavailable: docker is gone"
     assert notes[2].startswith("rift mcp stderr unavailable:")
     assert notes[3].endswith("unavailable: docker is gone")
-    assert notes[4] == (
-        "newest operations in flight and metric snapshots unavailable: docker is gone"
-    )
+    assert notes[4] == ("newest operations in flight unavailable: docker is gone")

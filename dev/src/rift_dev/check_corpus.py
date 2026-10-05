@@ -68,6 +68,7 @@ from rift_dev.rift_test_client import (
     string_value,
     utc_now,
 )
+from rift_dev.trace import Collector, collector
 
 # The budgets bounding one corpus case each stand strictly inside the one outside them,
 # so a breach fails naming the action that ran long instead of tearing down whatever the
@@ -172,6 +173,8 @@ class Corpus:
         self.mark = utc_now()
         # The action `mark` is the end of; None before the first one finishes.
         self.last_action: str | None = None
+        # The OTLP collector every server of the case exports to; None outside `run`.
+        self.telemetry: Collector | None = None
 
     def record(self, action: str, **values: Json) -> None:
         """Append one finished action.
@@ -199,6 +202,7 @@ class Corpus:
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
             env={"RUST_LOG": LOG_FILTER, "NO_COLOR": "1"},
+            collector=self.telemetry,
         )
         self.servers.append(server)
         return server
@@ -215,7 +219,11 @@ class Corpus:
         return max(self.pin.seconds - CLEANUP_RESERVE_SECONDS, 1.0)
 
     async def run(self) -> None:
-        """A timeout fails the suite after server cleanup writes its evidence."""
+        """A timeout fails the suite after server cleanup writes its evidence.
+
+        The OTLP collector starts before the first server and stops after the served
+        tree, and with it the last server, is gone.
+        """
         started = time.monotonic()
         self.started = started
         self.mark = utc_now()
@@ -227,9 +235,13 @@ class Corpus:
         print(machine_line(facts), flush=True)
         try:
             async with asyncio.timeout(budget):
-                with tempfile.TemporaryDirectory(
-                    prefix=f"rift-corpus-{self.pin.name}-"
-                ) as directory:
+                with (
+                    collector() as telemetry,
+                    tempfile.TemporaryDirectory(
+                        prefix=f"rift-corpus-{self.pin.name}-"
+                    ) as directory,
+                ):
+                    self.telemetry = telemetry
                     await self.tree(Path(directory).resolve())
                 elapsed = time.monotonic() - started
                 require(
@@ -253,6 +265,7 @@ class Corpus:
                         "failure": failure,
                         "evidence": self.evidence,
                         "stops": self.stops,
+                        "collector": self.collector_counts(),
                         "elapsed_seconds": time.monotonic() - started,
                         "actions": self.actions,
                     },
@@ -261,6 +274,16 @@ class Corpus:
                 + "\n",
                 encoding="utf-8",
             )
+
+    def collector_counts(self) -> JsonObject | None:
+        """What the case's collector received and dropped; None before it started."""
+        if self.telemetry is None:
+            return None
+        return {
+            "points": self.telemetry.metrics.received,
+            "spans": self.telemetry.spans.received,
+            "dropped": dict(self.telemetry.dropped().counts()),
+        }
 
     async def tree(self, directory: Path) -> None:
         """Run the case; on failure keep each server's evidence before the tree goes."""

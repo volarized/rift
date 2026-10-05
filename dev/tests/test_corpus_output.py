@@ -29,6 +29,7 @@ from rift_dev.rift_test_client import (
     cut_notice,
     stderr_log,
 )
+from rift_dev.trace import Collector
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -505,3 +506,27 @@ def test_the_report_names_the_machine_and_the_run_prints_it_once(
         if line.startswith("machine:")
     ]
     assert lines == [machine_line(facts)]
+
+
+def test_the_case_collector_reaches_every_server_and_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus, report, _ = corpus_with_server(tmp_path, monkeypatch, fails=False)
+    asyncio.run(corpus.run())
+    assert json.loads(report.read_text())["collector"] == {
+        "points": 0,
+        "spans": 0,
+        "dropped": {
+            "bodies": 0,
+            "metric_names": 0,
+            "series": 0,
+            "points": 0,
+            "kinds": 0,
+            "spans": 0,
+            "durations": 0,
+        },
+    }
+    corpus.telemetry = Collector(endpoint="http://127.0.0.1:4318")
+    server = corpus.server(tmp_path / "workspace")
+    assert server.collector is corpus.telemetry
+    assert server.env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
