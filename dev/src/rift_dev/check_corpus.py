@@ -39,6 +39,7 @@ from rift_dev.corpus_assertions import (
     probe_units,
     records,
     sample_symbols,
+    stop_sizes,
     token_past_chunk,
     warnings,
 )
@@ -140,6 +141,7 @@ class Corpus:
         self.actions: list[Json] = []
         self.servers: list[Server] = []
         self.evidence: list[Json] = []
+        self.stops: list[JsonObject] = []
         self.root = Path()
         self.sequence = 0
         self.started = time.monotonic()
@@ -220,6 +222,7 @@ class Corpus:
                         "status": status,
                         "failure": failure,
                         "evidence": self.evidence,
+                        "stops": self.stops,
                         "elapsed_seconds": time.monotonic() - started,
                         "actions": self.actions,
                     },
@@ -236,6 +239,26 @@ class Corpus:
         except BaseException:
             self.collect_evidence()
             raise
+
+    def stop(self, server: Server) -> None:
+        """Stop `server`, then keep its database sizes and persisted records.
+
+        The served tree still exists here. The report's `stops` entry names the
+        records file, or the error of a records read that failed; a failed read
+        never fails the case.
+        """
+        server.stop()
+        entry: JsonObject = {
+            "stderr": str(server.log_path),
+            "sizes": stop_sizes(server.root),
+            "records": str(server.records_path),
+        }
+        try:
+            server.read_records()
+        except (OSError, RuntimeError, ValueError) as error:
+            entry["records"] = None
+            entry["records_error"] = str(error)
+        self.stops.append(entry)
 
     def collect_evidence(self) -> None:
         """Keep every server's stderr, proxy stderr, and persisted records of a failed case.
@@ -329,7 +352,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
             self.record(
                 "stop", state="idle", process_gone=server.process.poll() is not None
             )
@@ -686,7 +709,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
             self.record("stop", state="after_churn", process_gone=True)
 
     async def churn(self, client: Client) -> None:
@@ -842,7 +865,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
         self.record("symlink_root", reads=True)
 
     async def shallow(self, root: Path) -> None:
@@ -866,7 +889,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
         self.record("shallow_history", complete=False, depth=1)
 
     async def source_bound(self) -> None:
@@ -934,7 +957,7 @@ class Corpus:
                         ),
                     )
                 server.check_running()
-                server.stop()
+                self.stop(server)
                 self.record(
                     "source_bound", field="source.files", observed=20001, maximum=20000
                 )
@@ -973,7 +996,7 @@ class Corpus:
                     ),
                     "lexical overflow removed symbol reads",
                 )
-            server.stop()
+            self.stop(server)
         self.configure()
         self.record(
             "lexical_bound",
@@ -989,7 +1012,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
         self.record("stop", state="idle", process_gone=True)
         await self.stop_during_rebuild()
         await self.stop_during_history_fill()
@@ -1031,7 +1054,7 @@ class Corpus:
     async def stop_observed(self, server: Server, operation: str, output: str) -> None:
         """Stop once `output` shows the operation started and not finished."""
         evidence = active_stdout(output, operation, None)
-        await asyncio.to_thread(server.stop)
+        await asyncio.to_thread(self.stop, server)
         self.record(
             "stop", state=f"mid_{operation}", stderr=evidence, process_gone=True
         )

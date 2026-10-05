@@ -191,6 +191,16 @@ report location. Nextest displays the foreground server and MCP proxy diagnostic
 corpus test completes. Action records stay in the JSON report. Logs and reports stay outside
 the served checkout.
 
+Each server a case starts keeps its standard error in a log file beside the report, cut at 8 MiB.
+When a case stops a server, the runner reads that server's persisted records with
+`rift server logs --tail 5000` after the stop and before the served checkout is removed, and keeps
+the newest 1 MiB beside the report as `<report>.server-<n>.records.log`, led by a line that counts
+the bytes left out. The `stops` list in the report holds one entry per stop with the log path, the
+records path, and the size in bytes of `index`, `metrics`, `vectors` and their `-wal` files. An
+absent file reads `"absent"`; `vectors` exists only after the first vector operation. A records
+read that fails sets `records` to null and states the error in `records_error`; the case
+continues. One case keeps at most three records files, 3 MiB.
+
 ## Artifact and agent checks
 
 Artifact checks run the native release binary from a temporary workspace. Agent checks use the

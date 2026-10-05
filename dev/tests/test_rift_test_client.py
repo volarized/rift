@@ -18,6 +18,7 @@ from mcp import ClientSession, types
 from rift_dev.commands import Command, Process
 from rift_dev.rift_test_client import (
     LOG_FILTER,
+    RECORDS_FILE_BYTES,
     Client,
     FailureCause,
     FailureLimit,
@@ -881,3 +882,39 @@ def test_evidence_tail_names_the_file_holding_the_rest(tmp_path: Path) -> None:
     assert kept.endswith("b" * EVIDENCE_TAIL_BYTES)
     assert tail_text("short", path) == "short"
     assert tail_text(text).startswith("[10 earlier bytes were left out]\n")
+
+
+BIG_RECORDS_BINARY = """
+print("x" * 1000 + "\\n", end="")
+print("y" * (1024 * 1024) + "\\nnewest stop record")
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_records_file_keeps_the_newest_bytes_and_states_the_cut(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = Server(
+        fake_binary(tmp_path, BIG_RECORDS_BINARY), root, tmp_path / "server.log"
+    )
+    server.read_records()
+    written = server.records_path.read_bytes()
+    assert written.endswith(b"newest stop record\n")
+    assert written.startswith(b"[")
+    assert b"earlier bytes were left out]\n" in written[:80]
+    assert len(written) <= RECORDS_FILE_BYTES + 80
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_read_records_raises_on_failure_for_the_caller_to_note(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = Server(
+        fake_binary(tmp_path, "import sys\nsys.exit(3)\n"), root, tmp_path / "s.log"
+    )
+    with pytest.raises(RuntimeError, match="rift exited 3"):
+        server.read_records()

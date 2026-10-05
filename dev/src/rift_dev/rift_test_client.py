@@ -58,8 +58,13 @@ LOG_FILTER = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"
 # What a failure keeps of one stream: the newest bytes, inline. The whole stream is
 # in its file next to the report.
 EVIDENCE_TAIL_BYTES = 256 * 1024
-# Newest persisted records `rift server logs` prints for a failure.
+# Newest persisted records `rift server logs` prints. A stop writes its `database.close`
+# and `stop stage ended` records last, so they are among the newest; the corpus
+# configuration keeps `page_records = 5000`, the same count.
 RECORD_TAIL = 5000
+# The newest bytes of one records file. Older bytes are replaced by a line naming
+# how many were left out.
+RECORDS_FILE_BYTES = 1024 * 1024
 EVIDENCE_SECONDS = 10.0
 MESSAGE_BYTES_MAX = 16 * 1024 * 1024
 PAGE_COUNT_MAX = 32
@@ -243,16 +248,18 @@ def cut_notice(stream: str, limit: int) -> str:
     return f"[rift-dev: {stream} cut at {limit} bytes; later output was dropped]\n"
 
 
-def tail_text(text: str, path: Path | None = None) -> str:
-    """The newest `EVIDENCE_TAIL_BYTES` of `text`, naming `path` when older bytes are left out.
+def tail_text(
+    text: str, path: Path | None = None, limit: int = EVIDENCE_TAIL_BYTES
+) -> str:
+    """The newest `limit` bytes of `text`, naming `path` when older bytes are left out.
 
     A stream held only in memory has no file, so it states the omitted count alone.
     """
     encoded = text.encode("utf-8")
-    if len(encoded) <= EVIDENCE_TAIL_BYTES:
+    if len(encoded) <= limit:
         return text
-    kept = encoded[-EVIDENCE_TAIL_BYTES:].decode("utf-8", errors="replace")
-    omitted = len(encoded) - EVIDENCE_TAIL_BYTES
+    kept = encoded[-limit:].decode("utf-8", errors="replace")
+    omitted = len(encoded) - limit
     where = f"are in {path}" if path is not None else "were left out"
     return f"[{omitted} earlier bytes {where}]\n{kept}"
 
@@ -665,25 +672,36 @@ class Server:
         """Whether the server wrote past `LOG_BYTES_MAX` and its log stops there."""
         return self._output_cut
 
-    def records(self) -> str:
-        """Read the persisted log records through `rift server logs`, bounded and never raising.
+    def read_records(self) -> str:
+        """Read the persisted log records through `rift server logs` into `records_path`.
 
         The records live in the workspace's `.rift/metrics`, which the CLI reads
-        without a server, so a killed server still answers. The text is also
-        written beside the server log. A failed read is reported as text so
-        collecting evidence cannot replace the failure it explains.
+        without a server, so a stopped or killed server still answers. The file
+        keeps the newest `RECORDS_FILE_BYTES`, with a line naming the bytes left
+        out. Raises `OSError`, `RuntimeError`, or `ValueError` when the read fails.
+        """
+        text = (
+            Command(self.binary, "server", "logs", "--tail", str(RECORD_TAIL))
+            .with_cwd(self.root)
+            .with_environment(self.env)
+            .with_timeout(EVIDENCE_SECONDS)
+            .with_output_limit(LOG_BYTES_MAX)
+            .output()
+        )
+        self.records_path.write_bytes(
+            tail_text(text, None, RECORDS_FILE_BYTES).encode("utf-8")
+        )
+        return text
+
+    def records(self) -> str:
+        """`read_records` for evidence: bounded and never raising.
+
+        A failed read is reported as text so collecting evidence cannot replace
+        the failure it explains.
         """
         path = self.records_path
         try:
-            text = (
-                Command(self.binary, "server", "logs", "--tail", str(RECORD_TAIL))
-                .with_cwd(self.root)
-                .with_environment(self.env)
-                .with_timeout(EVIDENCE_SECONDS)
-                .with_output_limit(LOG_BYTES_MAX)
-                .output()
-            )
-            path.write_bytes(text.encode("utf-8"))
+            text = self.read_records()
         except (OSError, RuntimeError, ValueError) as error:
             return f"persisted log records unavailable: {error}"
         return f"persisted log records ({path}):\n{tail_text(text, path)}"
