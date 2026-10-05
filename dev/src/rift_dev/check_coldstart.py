@@ -292,9 +292,8 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             pid = await_publication(name)
             if version is not None:
                 observed = container_command(name, ["/rift", "--version"]).strip()
-                released, _, _build = observed.partition("+")
                 require(
-                    released == f"rift {version.removeprefix('v')}",
+                    observed == f"rift {version.removeprefix('v')}",
                     f"unexpected version: {observed}",
                 )
             host = {
