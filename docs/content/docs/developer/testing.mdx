@@ -207,6 +207,11 @@ record, one per database. `stop_stages` lists the `stage`, `remaining`, and `out
 `stop stage ended` record. `lacks` names each of the two record kinds the records did not hold, and
 `records_lines` counts the records read; a count of 5000 means older records may be missing.
 
+The report also carries a `machine` section: `logical_cpus`, `cpu_model`, `memory_bytes`, `system`,
+`architecture`, and the runner values `runner_os`, `runner_arch`, `image_os`, `image_version` read
+from `RUNNER_OS`, `RUNNER_ARCH`, `ImageOS`, and `ImageVersion`. A fact the host does not give is
+null. The runner prints the same facts on one `machine:` line when the case starts.
+
 A failed case prints, for each server it started, the server's standard error, the standard error
 of each `rift mcp` proxy, the persisted records, and the failure window. The failure window is
 every kind of record that `rift server logs --kind all --since <start> --until <end>` selects, at

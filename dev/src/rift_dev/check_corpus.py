@@ -52,6 +52,7 @@ from rift_dev.log_records import (
     instant,
     stop_measurements,
 )
+from rift_dev.machine import machine, machine_line
 from rift_dev.rift_test_client import (
     LOG_FILTER,
     Client,
@@ -206,6 +207,8 @@ class Corpus:
         failure = ""
         budget = self.work_seconds()
         self.report.parent.mkdir(parents=True, exist_ok=True)
+        facts = machine()
+        print(machine_line(facts), flush=True)
         try:
             async with asyncio.timeout(budget):
                 with tempfile.TemporaryDirectory(
@@ -229,6 +232,7 @@ class Corpus:
                         "case": self.case,
                         "commit": self.pin.commit,
                         "seed": SEED,
+                        "machine": facts,
                         "status": status,
                         "failure": failure,
                         "evidence": self.evidence,

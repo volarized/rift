@@ -21,6 +21,7 @@ from rift_dev import cli, commands, rift_test_client
 from rift_dev.check_corpus import Corpus
 from rift_dev.commands import Command, CommandFailed, Process
 from rift_dev.corpus_cache import pins
+from rift_dev.machine import machine, machine_line
 from rift_dev.rift_test_client import (
     LOG_BYTES_MAX,
     Client,
@@ -53,7 +54,8 @@ def test_actions_and_complete_failure_stay_in_report(
         asyncio.run(corpus.run())
 
     output = capsys.readouterr()
-    assert output.out == output.err == ""
+    assert output.out == machine_line(machine()) + "\n"
+    assert output.err == ""
     retained = json.loads(report.read_text())
     assert retained["actions"][0]["symbols"] == 200
     assert retained["status"] == ("failed" if fails else "passed")
@@ -480,3 +482,25 @@ def test_the_report_carries_the_stops(
     corpus.stops.append({"stderr": "x", "sizes": {"vectors": "absent"}})
     asyncio.run(corpus.run())
     assert json.loads(report.read_text())["stops"] == corpus.stops
+
+
+def test_the_report_names_the_machine_and_the_run_prints_it_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    corpus, report, _ = corpus_with_server(tmp_path, monkeypatch, fails=False)
+    asyncio.run(corpus.run())
+    facts = json.loads(report.read_text())["machine"]
+    assert isinstance(facts["logical_cpus"], int)
+    assert isinstance(facts["system"], str)
+    assert isinstance(facts["architecture"], str)
+    for key in ("cpu_model", "memory_bytes", "runner_os", "image_version"):
+        assert key in facts
+    assert facts["memory_bytes"] is None or facts["memory_bytes"] > 0
+    lines = [
+        line
+        for line in capfd.readouterr().out.splitlines()
+        if line.startswith("machine:")
+    ]
+    assert lines == [machine_line(facts)]
