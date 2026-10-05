@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::{
     FlightEntry, FlightKind, FlightTable, OPERATIONS_IN_FLIGHT_MAX, OPERATIONS_LISTED_BYTES_MAX,
-    publish_in_flight, with_table,
+    publish_in_flight, warn_in_flight, with_table,
 };
 use crate::{LogRecord, ScopedRecorder};
 
@@ -196,6 +196,33 @@ fn a_published_table_names_the_open_operations_and_the_reason() -> TestResult {
     assert_eq!(listed[0]["operation"], "server.stop");
     assert_eq!(listed[1]["operation"], "lexical.commit");
     assert_eq!(listed[1]["parent"], "server.stop");
+    Ok(())
+}
+
+/// The warning form publishes the same table at `WARN`, so a filter that admits warnings
+/// alone keeps it, and an entry whose span names its `work` lists it.
+#[test]
+fn a_warned_table_is_a_warning_and_lists_the_work_of_an_entry() -> TestResult {
+    let (recorder, mut drain) = ScopedRecorder::builder().capture("warn").install()?;
+    let worker = crate::debug_span!(
+        "worker.run",
+        component = "worker",
+        operation = "worker.run",
+        work = "get_symbol"
+    );
+    worker.in_scope(|| warn_in_flight("stop deadline"));
+    drop(worker);
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let published = with_message(&records, "operations in flight");
+    assert_eq!(published.len(), 1, "{records:?}");
+    assert_eq!(published[0].level(), "warn");
+    let fields: Value = serde_json::from_str(published[0].fields())?;
+    assert_eq!(fields["reason"], "stop deadline");
+    let listed = operations(published[0])?;
+    assert_eq!(listed[0]["operation"], "worker.run");
+    assert_eq!(listed[0]["work"], "get_symbol");
     Ok(())
 }
 
