@@ -725,9 +725,13 @@ subscriber with a filter per layer:
 - the `LogSink` under `[logs]` `capture`, installed for a foreground server alone
 - with the `otlp` feature, the OTLP export under `RIFT_OTLP_FILTER`
 
-A foreground server whose stderr is not a terminal writes at most 1 MiB there. The write that
-crosses the bound is followed by one notice, `standard error reached its byte bound`, and every
-later write is discarded; the records the `LogSink` captured are unaffected.
+A foreground server whose stderr is not a terminal writes at most `[logs]` `stderr_limit`
+there, 1 MiB by default. The write that crosses the bound is followed by one notice,
+`standard error reached its byte bound`, and every later write is discarded and counted in
+`log.stderr.discarded`; the records the `LogSink` captured are unaffected. The log drain's
+stop records `standard error bytes discarded` with `stderr_limit` and the bytes `discarded`,
+at `warn` when the count is not zero. A second `TracingRuntimeBuilder::install` in one process
+returns `InstallError` and leaves the installation in place untouched.
 
 Stderr, `rift server logs`, and a failure window print a record through one renderer,
 `LogLines` in `rift-tracing`. A line holds the time in UTC with milliseconds, the level, the
@@ -742,8 +746,13 @@ function, three spaces, the context, two spaces, the nested operation, and the m
 - The nested operation is `↳` with the name and fields of the span the record belongs to,
   when that span is not the outermost.
 - A span close prints `close`, `✓` or `✗`, the reason it did not complete (`error.type=…`,
-  `panicked`, or `cancelled`), then `busy` and `idle` with three significant digits. A
-  lifecycle record prints its mark before its message. A metric snapshot record prints its
+  `panicked`, or `cancelled`), then `busy` and `idle` with three significant digits. `✗`
+  follows a `status.code` of `Error`, any `error.type`, or an `outcome` other than `ok` or
+  `acquired` that the span recorded itself, as a failed `index.build` records `error`. The
+  close record states the same `status.code`, and so does `traces.span.metrics.calls` for a
+  `traced!` operation, with `error.type` `_OTHER` for a recorded value it does not list. A
+  lifecycle record prints its mark before its message: `→` for `phase=start`, `✓` for
+  `outcome=ok`, `✗` for any other `outcome`. A metric snapshot record prints its
   values. Any other record prints its message, then its own fields sorted by key.
 
 ```text
@@ -794,10 +803,20 @@ Every request `rift server` answers records `mcp.server.operation.duration`, and
 `rift mcp` forwards to it records `mcp.client.operation.duration`, in seconds, bucketed at the
 boundaries the MCP semantic conventions advise, from 10 ms to 300 s. A series names
 `mcp.method.name`: `tools/call`, `tools/list`, `resources/list`, `resources/templates/list`, or
-`resources/read`. A tool call also names `gen_ai.tool.name`, when the tool is `get_symbol`,
+`resources/read`, and on the server also `initialize` and `ping`. A request the server answers
+also names `mcp.protocol.version`, the version rmcp knows or `_OTHER`, and `network.transport`
+`tcp`. A tool call also names `gen_ai.tool.name`, when the tool is `get_symbol`,
 `nodes`, or `search`. A tool answered with `isError` records `error.type` `tool_error`; a
 JSON-RPC error records its code as both `error.type` and `rpc.response.status_code`, such as
 `-32602`, or `error.type` `_OTHER` for a code outside the JSON-RPC, MCP, and Rift codes.
+
+Each `.rift/index` and `.rift/vectors` operation records `db.client.operation.duration` with
+`db.system.name` `sqlite`, `db.namespace`, and `db.operation.name`; a failed one adds
+`error.type` `_OTHER` and the SQLite primary result code as `db.response.status_code`, such as
+`5` for busy. A transaction records `sqlite.transaction.duration` by `sqlite.transaction.result`,
+`commit` or `rollback`, and `sqlite.transaction.statement.count`. Each append to `.rift/metrics`
+records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
+`sqlite.transaction.duration`, and `sqlite.commit.duration` under `db.namespace` `metrics`.
 
 <VersionBadge version="v0.0.62" />
 
@@ -808,9 +827,11 @@ records `process.memory.usage`, `process.memory.virtual`, `process.cpu.utilizati
 `process.unix.file_descriptor.count`, or `process.windows.handle.count` on Windows. A value the
 platform does not report stays absent and is never recorded as zero, and CPU usage is absent
 until a second sample at least 200 ms after the first. The same blocking read runs every sample
-hook registered through `rift_tracing::sample_hook`: each open `.rift/index` and `.rift/vectors`
-database registers one that records `sqlite.file.size` for the database file and its write-ahead
-log, so the sizes move on each tick between open and close. With the `otlp` feature and
+hook registered through `rift_tracing::sample_hook`: each open `.rift/index`, `.rift/vectors`,
+and `.rift/metrics` database registers one that records `sqlite.file.size` for the database file
+and its write-ahead log and `sqlite.queue.length`, the commands waiting for its worker, so the
+values move on each tick between open and close. The blocking pool registers one that records
+`worker_pool.permit.count` by `worker_pool.permit.state`, `available` or `used`. With the `otlp` feature and
 `OTEL_EXPORTER_OTLP_ENDPOINT` set, every recorded value is also forwarded to an OpenTelemetry
 meter whose reader exports at `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default.
 
