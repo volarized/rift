@@ -194,6 +194,31 @@ stop begins, and each stage takes only what the one before it left:
 Each stage runs inside a `server.stop` span and ends with a `stop stage ended` record carrying
 `stage`, `remaining`, and `outcome`, plus `error` and `causes` for a failure.
 
+A server records each step of its life at `INFO`, so the store keeps them under the default
+`[logs]` `capture`. A record that opens a step carries `phase = "start"`, and one that ends it
+carries `outcome = "ok"`:
+
+| Record | Operation | Fields |
+| --- | --- | --- |
+| `workspace election claimed` | `server.start` | `state_directory` |
+| `another rift server already serves this workspace; this process exits` | `server.start` | |
+| `MCP server ready` | | `transport`, `port` |
+| `index preparation started` | `index.build` | `total`, `phase` |
+| `index preparation progressed` | `index.build` | `prepared`, `total` |
+| `index snapshot published` | `index.publish` | `trigger`, `epoch` |
+| `lexical commit handed` | `search.commit` | `tree_revision` |
+| `lexical commit committing` | `search.commit` | `tree_revision`, `phase` |
+| `lexical commit settled` | `search.commit` | `tree_revision`, `outcome` |
+| `history fill started` | `history.fill` | `pending`, `phase` |
+| `history fill finished` | `history.fill` | `written`, `outcome` |
+| `stop stage ended` | `server.stop` | `stage`, `remaining`, `outcome` |
+| `workspace election released` | `server.stop` | `state_directory` |
+
+A lexical commit the store refused is owed instead of settled, and its `the lexical commit
+failed` record carries the error. A history fill with no commit pending records neither its
+start nor its end. The election guard drops after the metrics database closes, so
+`workspace election released` reaches stderr and not the store.
+
 A stopped server leaves its process as soon as serving has ended and the log drain has stopped,
 through the process exit rather than by returning from `main`. Dropping the runtime would wait
 for every blocking task still running, and a lexical transaction or a dependency pass that

@@ -2846,6 +2846,12 @@ impl LexicalLane {
         }
         let released = backlog.hand(LexicalCommit::new(write, published));
         drop(backlog);
+        rift_tracing::info!(
+            component = "search",
+            operation = "search.commit",
+            tree_revision,
+            "lexical commit handed"
+        );
         if released.is_some() {
             rift_tracing::debug!(
                 component = "search",
@@ -2961,7 +2967,25 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// Runs one held write, then wakes the waiters on [`LexicalLane::landed`] once the
     /// backlog records its end, success or failure.
     async fn write(&self, commit: LexicalCommit, whole_owed: bool) {
+        let tree_revision = commit.published.reads.tree_revision().to_owned();
+        rift_tracing::info!(
+            component = "search",
+            operation = "search.commit",
+            tree_revision,
+            phase = "start",
+            "lexical commit committing"
+        );
         let outcome = self.transaction(commit, whole_owed).await;
+        // A refused commit already recorded its cause, which the store is now owed.
+        if outcome.is_ok() {
+            rift_tracing::info!(
+                component = "search",
+                operation = "search.commit",
+                tree_revision,
+                outcome = "ok",
+                "lexical commit settled"
+            );
+        }
         let mut backlog = self.queue.locked();
         backlog.end_running();
         if let Err(error) = outcome {
@@ -3681,6 +3705,14 @@ async fn prepare_initial_workspace_steps(
 ) -> Result<(), RiftError> {
     let validation = Arc::clone(&context.validation);
     let cancellation = validation.cancellation.clone();
+    let total = initial.total;
+    rift_tracing::info!(
+        component = "index",
+        operation = "index.build",
+        total,
+        phase = "start",
+        "index preparation started"
+    );
     while let Some(target) = initial.preparation.next_checkpoint() {
         let (next_initial, outcome) =
             prepare_initial_workspace_batch(context, initial, target, cancellation.clone()).await?;
@@ -3688,6 +3720,13 @@ async fn prepare_initial_workspace_steps(
         if outcome == RebuildOutcome::Cancelled {
             return Ok(());
         }
+        rift_tracing::info!(
+            component = "index",
+            operation = "index.build",
+            prepared = target,
+            total,
+            "index preparation progressed"
+        );
     }
     let current = Arc::clone(&context.published.read().await.current);
     if current.preparation.is_none()
@@ -7994,6 +8033,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// Startup preparation records its start with the selected file count, and each
+    /// checkpoint it publishes with the files prepared so far.
+    #[tokio::test]
+    async fn initial_preparation_records_its_start_and_each_checkpoint() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(root.join("other.rs"), "pub fn lantern() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        let total = initial.total;
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=info")
+            .install()?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
+
+        let records: Vec<_> = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.operation() == "index.build")
+            .collect();
+        let started = records.first().ok_or("the preparation start is recorded")?;
+        assert_eq!(started.message(), "index preparation started");
+        let fields: serde_json::Value = serde_json::from_str(started.fields())?;
+        assert_eq!(fields["total"], total.to_string(), "{fields}");
+        assert_eq!(fields["phase"], "start", "{fields}");
+        let last = records.last().ok_or("a checkpoint is recorded")?;
+        assert_eq!(last.message(), "index preparation progressed");
+        let fields: serde_json::Value = serde_json::from_str(last.fields())?;
+        assert_eq!(fields["prepared"], total.to_string(), "{fields}");
+        assert_eq!(fields["total"], total.to_string(), "{fields}");
+        Ok(())
+    }
+
     /// A file edited after discovery is captured before its first prepared publication.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_file_edited_after_discovery_is_in_the_first_prepared_publication() -> TestResult {
@@ -8225,6 +8300,59 @@ pub(crate) mod tests {
             "the commit leaves the published unit set searchable"
         );
         cancellation.cancel();
+        Ok(())
+    }
+
+    /// A write the lane takes is recorded handed, then committing, then settled, each
+    /// naming the tree revision it answers for.
+    #[tokio::test]
+    async fn a_handed_write_is_recorded_handed_committing_and_settled() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let revision = published.reads.tree_revision().to_owned();
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=info")
+            .install()?;
+        let double = StoreDouble::new();
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        double.release_one();
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+
+        let records: Vec<_> = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.operation() == "search.commit")
+            .collect();
+        let messages: Vec<_> = records
+            .iter()
+            .map(rift_tracing::LogRecord::message)
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "lexical commit handed",
+                "lexical commit committing",
+                "lexical commit settled"
+            ]
+        );
+        for record in &records {
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields["tree_revision"], revision.as_str(), "{fields}");
+        }
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
         Ok(())
     }
 
