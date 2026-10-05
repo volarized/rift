@@ -21,7 +21,8 @@
 //! the metrics database until a stop joins it.
 //!
 //! A binary starts tracing once through [`TracingRuntime::builder`], which installs stderr,
-//! the capture, and the OTLP export under filters of their own, and stops it with
+//! the capture, the OTLP span export under filters of their own, and the OTLP log record
+//! export under the capture's filter, and stops it with
 //! [`TracingRuntime::shutdown`]. [`LogLines`] prints records the way stderr and
 //! `rift server logs` show them.
 //!

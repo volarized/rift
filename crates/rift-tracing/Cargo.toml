@@ -19,7 +19,8 @@ workspace = true
 [dependencies]
 # The OTLP export of every build: `TracingRuntimeBuilder::install` installs no exporter until
 # an operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` or, for metrics alone,
-# `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`. The service instance identifier is random.
+# `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, or, for log records alone,
+# `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The service instance identifier is random.
 getrandom.workspace = true
 jiff.workspace = true
 opentelemetry = { workspace = true, features = ["trace"] }

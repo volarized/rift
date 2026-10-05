@@ -1,23 +1,31 @@
-//! The OTLP export of Rift's `tracing` spans and metrics.
+//! The OTLP export of Rift's `tracing` spans, metrics, and log records.
 //!
 //! Every build carries the export, and a process exports nothing until an operator sets an
 //! OTLP endpoint variable - for the in-memory collector `just trace-collector` runs, or any
 //! other OTLP/HTTP receiver. Spans export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set;
-//! metrics when it or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is.
+//! metrics when it or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is; log records when it or
+//! `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is.
 //!
-//! Every exported span and metric carries the resource attributes `service.name` (`rift`),
-//! `service.version` (the workspace version), `service.instance.id` (random per process),
-//! and `process.pid`, so a collector that receives from several servers tells them apart.
+//! Every exported span, metric, and log record carries the resource attributes
+//! `service.name` (`rift`), `service.version` (the workspace version), `service.instance.id`
+//! (random per process), and `process.pid`, so a collector that receives from several
+//! servers tells them apart.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
-use opentelemetry::KeyValue;
+use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 use opentelemetry::metrics::MeterProvider as _;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig as _};
+use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+use opentelemetry::{Key, KeyValue};
+use opentelemetry_otlp::{
+    LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig as _,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkError;
+use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor;
+use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use opentelemetry_sdk::runtime;
@@ -25,7 +33,10 @@ use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProces
 use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, SdkTracerProvider};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
+
+use crate::record::LogRecord;
 
 /// The `service.name` resource attribute every exported span and metric carries.
 const SERVICE_NAME: &str = "rift";
@@ -39,15 +50,18 @@ const RIFT_OTLP_FILTER_VAR: &str = "RIFT_OTLP_FILTER";
 const DEFAULT_OTLP_FILTER: &str =
     "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info";
 
-/// Most time one export of metrics or of a span batch takes before the SDK gives it up,
-/// when `OTEL_METRIC_EXPORT_TIMEOUT` or `OTEL_BSP_EXPORT_TIMEOUT` sets none: the SDK's own
-/// default is 30 s. A given-up export is reported on stderr and its points sent again by
-/// the next cumulative export.
+/// Most time one export of metrics, of a span batch, or of a log record batch takes before
+/// the SDK gives it up, when `OTEL_METRIC_EXPORT_TIMEOUT`, `OTEL_BSP_EXPORT_TIMEOUT`, or
+/// `OTEL_BLRP_EXPORT_TIMEOUT` sets none: the SDK's own default is 30 s. A given-up export is
+/// reported on stderr; the next cumulative export sends its metric points again, and its
+/// spans and log records are lost.
 pub(crate) const OTLP_EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The variable the SDK reads the metric export timeout from.
 const METRIC_EXPORT_TIMEOUT_VAR: &str = "OTEL_METRIC_EXPORT_TIMEOUT";
 /// The variable the SDK reads the span export timeout from.
 const SPAN_EXPORT_TIMEOUT_VAR: &str = "OTEL_BSP_EXPORT_TIMEOUT";
+/// The variable the SDK reads the log record export timeout from.
+const LOG_EXPORT_TIMEOUT_VAR: &str = "OTEL_BLRP_EXPORT_TIMEOUT";
 
 /// The target the OpenTelemetry SDK's own reports carry.
 pub(crate) const SDK_TARGET: &str = "opentelemetry_sdk";
@@ -63,14 +77,26 @@ pub(crate) fn sdk_reports() -> Targets {
     Targets::new().with_target(SDK_TARGET, LevelFilter::WARN)
 }
 
-/// The installed exporter's tracer and meter providers, shut down at most once.
+/// The installed exporter's tracer, meter, and logger providers, shut down at most once.
 struct Providers {
     tracer: Option<SdkTracerProvider>,
     meters: Option<SdkMeterProvider>,
+    logs: Option<LoggerExport>,
 }
 
-/// The process's OTLP export: the installed tracer and meter providers, held so the process
-/// flushes and shuts them down before it exits.
+/// The logger provider and the gate the log record layer emits through.
+///
+/// The SDK's logger keeps handing records to its batch processor after the provider shut
+/// down, and the processor counts each one dropped and reports the first as a warning. The
+/// shutdown closes `open` first, so a record written after it reaches stderr and the store
+/// alone and the stop reports no drop.
+struct LoggerExport {
+    provider: SdkLoggerProvider,
+    open: Arc<AtomicBool>,
+}
+
+/// The process's OTLP export: the installed tracer, meter, and logger providers, held so the
+/// process flushes and shuts them down before it exits.
 ///
 /// Holds nothing when no collector endpoint was configured; [`Self::shutdown`] then
 /// answers at once, as it does for [`OtlpExport::default`]. Clones share the providers, and
@@ -87,10 +113,16 @@ impl std::fmt::Debug for OtlpExport {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map(|providers| (providers.tracer.is_some(), providers.meters.is_some()));
+            .map(|providers| {
+                (
+                    providers.tracer.is_some(),
+                    providers.meters.is_some(),
+                    providers.logs.is_some(),
+                )
+            });
         formatter
             .debug_struct("OtlpExport")
-            .field("tracer_and_meters", &held)
+            .field("tracer_meters_and_logs", &held)
             .finish()
     }
 }
@@ -99,7 +131,7 @@ impl std::fmt::Debug for OtlpExport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportShutdownError {
     /// The deadline passed first. The shutdown keeps running on its own thread until the
-    /// process exits, and the points and spans it had not sent are lost.
+    /// process exits, and the points, spans, and log records it had not sent are lost.
     TimedOut,
     /// The final export or the shutdown failed, with the SDK's words.
     Failed(String),
@@ -117,10 +149,18 @@ impl std::fmt::Display for ExportShutdownError {
 impl std::error::Error for ExportShutdownError {}
 
 impl OtlpExport {
-    /// An export that holds `tracer` and `meters`.
-    fn holding(tracer: Option<SdkTracerProvider>, meters: Option<SdkMeterProvider>) -> Self {
+    /// An export that holds `tracer`, `meters`, and `logs`.
+    fn holding(
+        tracer: Option<SdkTracerProvider>,
+        meters: Option<SdkMeterProvider>,
+        logs: Option<LoggerExport>,
+    ) -> Self {
         Self {
-            providers: Arc::new(Mutex::new(Some(Providers { tracer, meters }))),
+            providers: Arc::new(Mutex::new(Some(Providers {
+                tracer,
+                meters,
+                logs,
+            }))),
         }
     }
 
@@ -136,10 +176,11 @@ impl OtlpExport {
         }
     }
 
-    /// Flushes buffered spans and the final metric points, and shuts both providers down,
-    /// by `deadline`.
+    /// Flushes buffered spans, log records, and the final metric points, and shuts every
+    /// provider down, by `deadline`. A log record written after this call starts is not
+    /// exported.
     ///
-    /// The SDK's shutdown calls block and the async-runtime reader and batch processor
+    /// The SDK's shutdown calls block and the async-runtime reader and batch processors
     /// ignore the timeout they are handed: each waits for its worker task, which runs one
     /// more export bounded by the export timeout alone. Each shutdown therefore runs on a
     /// thread of its own, and this call stops waiting at `deadline` whatever the export
@@ -160,14 +201,23 @@ impl OtlpExport {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let Some(Providers { tracer, meters }) = taken else {
+        let Some(Providers {
+            tracer,
+            meters,
+            logs,
+        }) = taken
+        else {
             return Ok(());
         };
         let tracer = tracer.map(|tracer| shut_down_on_thread(move || tracer.shutdown()));
         let meters = meters.map(|meters| shut_down_on_thread(move || meters.shutdown()));
+        let logs = logs.map(|logs| {
+            logs.open.store(false, Ordering::Release);
+            shut_down_on_thread(move || logs.provider.shutdown())
+        });
         let waited = tokio::time::timeout_at(deadline, async move {
             let mut failures = Vec::new();
-            for answer in [tracer, meters].into_iter().flatten() {
+            for answer in [tracer, meters, logs].into_iter().flatten() {
                 match answer.await {
                     Ok(Ok(()) | Err(OTelSdkError::AlreadyShutdown)) => {}
                     Ok(Err(error)) => failures.push(error.to_string()),
@@ -205,14 +255,21 @@ const METRIC_ENDPOINT_VARS: [&str; 2] = [
     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 ];
+/// The variables that name where log records export: the logs endpoint, used as it is, or
+/// the base endpoint, which the exporter extends with `/v1/logs`.
+const LOG_ENDPOINT_VARS: [&str; 2] = [
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+];
 
 /// Whether the process sets `variable`.
 fn configured(variable: &str) -> bool {
     std::env::var_os(variable).is_some()
 }
 
-/// The resource every exported span and metric carries: `service.name`, `service.version`,
-/// a random `service.instance.id` in the UUID version 4 form, and `process.pid`.
+/// The resource every exported span, metric, and log record carries: `service.name`,
+/// `service.version`, a random `service.instance.id` in the UUID version 4 form, and
+/// `process.pid`.
 fn resource() -> Resource {
     let mut builder = Resource::builder()
         .with_service_name(SERVICE_NAME)
@@ -249,8 +306,9 @@ fn instance_id() -> Option<String> {
     ))
 }
 
-/// Installs an OTLP/HTTP export layer when `OTEL_EXPORTER_OTLP_ENDPOINT` names a
+/// Installs an OTLP/HTTP span export layer when `OTEL_EXPORTER_OTLP_ENDPOINT` names a
 /// collector, `None` otherwise, beside a meter provider when a metric endpoint variable
+/// names one, and a log record export layer under `log_filter` when a log endpoint variable
 /// names one.
 ///
 /// Generic in the subscriber `S` because `tracing_subscriber::registry().with(a).with(b)`
@@ -268,11 +326,35 @@ fn instance_id() -> Option<String> {
 /// on, and Rift never uses `reqwest::blocking`. Checking the endpoint variables before
 /// building anything keeps the export from silently dialing OTLP's default
 /// `http://localhost:4318`.
-pub(crate) fn layer<S>() -> (Option<impl Layer<S> + Send + Sync>, OtlpExport)
+pub(crate) fn layer<S>(
+    log_filter: tracing_subscriber::EnvFilter,
+) -> (impl Layer<S> + Send + Sync, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
     let resource = resource();
+    let logs = if LOG_ENDPOINT_VARS
+        .iter()
+        .any(|variable| configured(variable))
+    {
+        match LogExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .build()
+        {
+            Ok(exporter) => Some(logger_export(
+                exporter,
+                log_batch_config(),
+                resource.clone(),
+            )),
+            Err(error) => {
+                eprintln!("rift: warning: otlp log exporter did not build: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let meters = if METRIC_ENDPOINT_VARS
         .iter()
         .any(|variable| configured(variable))
@@ -291,29 +373,220 @@ where
     } else {
         None
     };
-    if !configured("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        return (None, OtlpExport::holding(None, meters));
-    }
-    let exporter = match SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-    {
-        Ok(exporter) => exporter,
-        Err(error) => {
-            eprintln!("rift: warning: otlp exporter did not build: {error}");
-            return (None, OtlpExport::holding(None, meters));
+    let tracer = if configured("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        match SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .build()
+        {
+            Ok(exporter) => Some(tracer_provider(exporter, batch_config(), resource)),
+            Err(error) => {
+                eprintln!("rift: warning: otlp exporter did not build: {error}");
+                None
+            }
         }
+    } else {
+        None
     };
-    let provider = tracer_provider(exporter, batch_config(), resource);
-    let filter = std::env::var(RIFT_OTLP_FILTER_VAR)
-        .ok()
-        .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
-        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_OTLP_FILTER));
+    let span_layer = tracer.as_ref().map(|provider| {
+        let filter = std::env::var(RIFT_OTLP_FILTER_VAR)
+            .ok()
+            .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
+            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_OTLP_FILTER));
+        export_layer(provider, filter)
+    });
+    let log_layer = logs.as_ref().map(|logs| log_record_layer(logs, log_filter));
+    // The log record layer runs first: a span's close reaches it while the span export
+    // still holds the span's trace and span identifiers.
     (
-        Some(export_layer(&provider, filter)),
-        OtlpExport::holding(Some(provider), meters),
+        Layer::<S>::and_then(log_layer, span_layer),
+        OtlpExport::holding(tracer, meters, logs),
     )
+}
+
+/// The log record batch processor's settings: the SDK's, read from the `OTEL_BLRP_*`
+/// variables, with [`OTLP_EXPORT_TIMEOUT`] when `OTEL_BLRP_EXPORT_TIMEOUT` sets no export
+/// timeout.
+fn log_batch_config() -> opentelemetry_sdk::logs::BatchConfig {
+    let builder = opentelemetry_sdk::logs::BatchConfigBuilder::default();
+    if configured(LOG_EXPORT_TIMEOUT_VAR) {
+        builder.build()
+    } else {
+        builder.with_max_export_timeout(OTLP_EXPORT_TIMEOUT).build()
+    }
+}
+
+/// The logger provider that batches every emitted log record into `exporter` under `batch`,
+/// with its gate open.
+///
+/// The batch processor is the SDK's async-runtime one, for the reason the span batches use
+/// it: the OTLP exporter posts over the async `reqwest` client, which needs a Tokio reactor.
+/// Must be called inside a Tokio runtime: the processor spawns its export task there.
+fn logger_export<E>(
+    exporter: E,
+    batch: opentelemetry_sdk::logs::BatchConfig,
+    resource: Resource,
+) -> LoggerExport
+where
+    E: opentelemetry_sdk::logs::LogExporter + 'static,
+{
+    let processor = BatchLogProcessor::builder(exporter, runtime::Tokio)
+        .with_batch_config(batch)
+        .build();
+    LoggerExport {
+        provider: SdkLoggerProvider::builder()
+            .with_resource(resource)
+            .with_log_processor(processor)
+            .build(),
+        open: Arc::new(AtomicBool::new(true)),
+    }
+}
+
+/// The layer that hands every record `filter` admits to `logs`, as the log store would
+/// keep it.
+///
+/// `filter` is reevaluated at every span and event, as the capture's is, so the export
+/// carries what a capture under the same filter records.
+fn log_record_layer<S>(
+    logs: &LoggerExport,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl Layer<S> + Send + Sync + use<S>
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+{
+    LogRecordExport {
+        logger: logs.provider.logger(SERVICE_NAME),
+        open: Arc::clone(&logs.open),
+    }
+    .with_filter(crate::runtime::reevaluated(filter))
+}
+
+/// The `tracing` layer that exports each event and each span close as an OTLP log record.
+///
+/// It builds the record the capture builds, through [`crate::capture::event_record`] and
+/// [`crate::capture::closed_record`], so an exported record carries what a stored one
+/// carries: `component` and `operation`, inherited from the nearest span that names them;
+/// every other field; and `root_span` and `nearest_span` for the spans around an event. A
+/// span close is exported too, and its fields carry `elapsed_ms` and `status.code`.
+/// `opentelemetry-appender-tracing` maps an event's own fields alone and exports no span
+/// close, so it is not used.
+struct LogRecordExport {
+    logger: SdkLogger,
+    open: Arc<AtomicBool>,
+}
+
+impl<S> Layer<S> for LogRecordExport
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+{
+    /// The SDK's logger takes the trace and span identifiers from the OpenTelemetry context
+    /// current on this thread: the one `tracing-opentelemetry` attaches when the event's
+    /// span is entered.
+    fn on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>) {
+        if !self.open.load(Ordering::Acquire) {
+            return;
+        }
+        let record = crate::capture::event_record(event, &context);
+        self.emit(*event.metadata().level(), &record, None);
+    }
+
+    /// A closing span is no longer entered, so its own trace and span identifiers are read
+    /// from `tracing-opentelemetry`'s data for it. This layer runs before the span export
+    /// layer, whose close ends that data.
+    fn on_close(&self, id: tracing::span::Id, context: Context<'_, S>) {
+        if !self.open.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(level) = context.metadata(&id).map(|metadata| *metadata.level()) else {
+            return;
+        };
+        let Some(record) = crate::capture::closed_record(&id, &context) else {
+            return;
+        };
+        let span = tracing::dispatcher::get_default(|dispatch| {
+            tracing_opentelemetry::get_otel_context(&id, dispatch)
+        });
+        self.emit(level, &record, span.as_ref());
+    }
+}
+
+impl LogRecordExport {
+    /// Emits `record` at `level`, under the trace and span identifiers of `span` when given.
+    ///
+    /// The record's target becomes the OTLP instrumentation scope name, its message the
+    /// body, and `component`, `operation`, and each member of its fields an attribute.
+    fn emit(
+        &self,
+        level: tracing::Level,
+        record: &LogRecord,
+        span: Option<&opentelemetry::Context>,
+    ) {
+        let mut exported = self.logger.create_log_record();
+        let recorded_at_ms = u64::try_from(record.recorded_at_ms()).unwrap_or(0);
+        exported.set_timestamp(UNIX_EPOCH + Duration::from_millis(recorded_at_ms));
+        exported.set_target(record.target().to_owned());
+        exported.set_severity_number(severity(level));
+        exported.set_severity_text(level.as_str());
+        exported.set_body(AnyValue::from(record.message().to_owned()));
+        for (label, value) in [
+            ("component", record.component()),
+            ("operation", record.operation()),
+        ] {
+            if !value.is_empty() {
+                exported.add_attribute(label, value.to_owned());
+            }
+        }
+        exported.add_attributes(field_attributes(record.fields()));
+        if let Some(span) = span {
+            let span = span.span();
+            let span_context = span.span_context();
+            if span_context.is_valid() {
+                exported.set_trace_context(
+                    span_context.trace_id(),
+                    span_context.span_id(),
+                    Some(span_context.trace_flags()),
+                );
+            }
+        }
+        self.logger.emit(exported);
+    }
+}
+
+/// The OpenTelemetry severity of a `tracing` level.
+const fn severity(level: tracing::Level) -> Severity {
+    match level {
+        tracing::Level::TRACE => Severity::Trace,
+        tracing::Level::DEBUG => Severity::Debug,
+        tracing::Level::INFO => Severity::Info,
+        tracing::Level::WARN => Severity::Warn,
+        tracing::Level::ERROR => Severity::Error,
+    }
+}
+
+/// The attributes of a record's fields: one per member of the JSON object, an object member
+/// such as `root_span` as a map. Fields cut at their bound are no longer a JSON object, and
+/// export whole as the one attribute `fields`.
+fn field_attributes(fields: &str) -> Vec<(Key, AnyValue)> {
+    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(fields) {
+        Ok(members) => members
+            .into_iter()
+            .map(|(name, value)| (Key::new(name), any_value(value)))
+            .collect(),
+        Err(_) => vec![(Key::new("fields"), AnyValue::from(fields.to_owned()))],
+    }
+}
+
+/// `value` as an OpenTelemetry attribute value. The capture writes every field value as a
+/// string and every span member as an object; any other value exports as its JSON text.
+fn any_value(value: serde_json::Value) -> AnyValue {
+    match value {
+        serde_json::Value::String(text) => AnyValue::from(text),
+        serde_json::Value::Object(members) => members
+            .into_iter()
+            .map(|(name, value)| (Key::new(name), any_value(value)))
+            .collect(),
+        other => AnyValue::from(other.to_string()),
+    }
 }
 
 /// The batch processor's settings: the SDK's, read from the `OTEL_BSP_*` variables, with
@@ -397,8 +670,15 @@ mod tests {
     use tracing_subscriber::layer::{Context, SubscriberExt as _};
     use tracing_subscriber::{EnvFilter, Layer};
 
+    use opentelemetry::Key;
+    use opentelemetry::logs::{AnyValue, Severity};
+    use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLogRecord};
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+
     use super::{
-        ExportShutdownError, OtlpExport, export_layer, meter_provider, resource, tracer_provider,
+        ExportShutdownError, LOG_ENDPOINT_VARS, OtlpExport, configured, export_layer,
+        field_attributes, log_batch_config, log_record_layer, logger_export, meter_provider,
+        resource, tracer_provider,
     };
 
     /// Spans each test ends; enough that one lost span shows as a count mismatch.
@@ -650,7 +930,7 @@ mod tests {
         let _entered = runtime.enter();
         let exporter = RecordingMetricExporter::default();
         let meters = meter_provider(exporter.clone(), resource());
-        let export = OtlpExport::holding(None, Some(meters.clone()));
+        let export = OtlpExport::holding(None, Some(meters.clone()), None);
         export.install_meter();
         crate::traced!(component = "search", operation = "search.request", {});
         assert!(crate::sampler::observe_process(
@@ -697,7 +977,7 @@ mod tests {
         let meters = meter_provider(StalledMetricExporter, resource());
         let tracer = tracer_provider(StalledExporter, BatchConfig::default(), resource());
         tracer.tracer("stalled").start("queued").end();
-        let export = OtlpExport::holding(Some(tracer), Some(meters));
+        let export = OtlpExport::holding(Some(tracer), Some(meters), None);
         let bound = std::time::Duration::from_millis(200);
         let started = std::time::Instant::now();
         let ended = runtime.block_on(export.shutdown(tokio::time::Instant::now() + bound));
@@ -708,6 +988,186 @@ mod tests {
             "the shutdown ends at its deadline: elapsed={elapsed:?}, bound={bound:?}"
         );
         assert!(bound + SHUTDOWN_SLACK < super::OTLP_EXPORT_TIMEOUT);
+    }
+
+    /// The attribute `key` of `record`, when it carries one.
+    fn attribute<'record>(record: &'record SdkLogRecord, key: &str) -> Option<&'record AnyValue> {
+        record
+            .attributes_iter()
+            .find(|(name, _)| name.as_str() == key)
+            .map(|(_, value)| value)
+    }
+
+    /// The exported record whose body is `body`.
+    fn exported<'records>(records: &'records [SdkLogRecord], body: &str) -> &'records SdkLogRecord {
+        records
+            .iter()
+            .find(|record| record.body() == Some(&AnyValue::from(body.to_owned())))
+            .unwrap_or_else(|| panic!("a record with the body {body:?} is exported: {records:?}"))
+    }
+
+    /// An event inside a span exports as the store keeps it - level, message, its own
+    /// fields, the span's `component` and `operation`, the `root_span` member - under the
+    /// span's trace and span identifiers, and the span's close exports under the same.
+    #[test]
+    fn an_event_and_its_span_close_export_as_log_records_in_the_span() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let spans = InMemorySpanExporter::default();
+        let tracer = tracer_provider(spans.clone(), BatchConfig::default(), resource());
+        let records = InMemoryLogExporter::default();
+        let logs = logger_export(records.clone(), log_batch_config(), resource());
+        let subscriber = crate::capture::registry()
+            .with(log_record_layer(&logs, EnvFilter::new("rift_tracing=info")))
+            .with(export_layer(&tracer, EnvFilter::new("rift_tracing=info")));
+        tracing::subscriber::with_default(subscriber, || {
+            crate::traced!(
+                component = "search",
+                operation = "search.request",
+                root = "/workspace",
+                {
+                    crate::info!(request_id = "r-1", hits = 3_u64, "search answered");
+                }
+            );
+        });
+        tracer.force_flush().expect("the span batch flushes");
+        logs.provider.force_flush().expect("the log batch flushes");
+        let span = spans
+            .get_finished_spans()
+            .expect("the span exporter is readable")
+            .into_iter()
+            .find(|span| span.name == "search.request")
+            .expect("the span is exported");
+        let records: Vec<SdkLogRecord> = records
+            .get_emitted_logs()
+            .expect("the log exporter is readable")
+            .into_iter()
+            .map(|exported| exported.record)
+            .collect();
+
+        let event = exported(&records, "search answered");
+        assert_eq!(event.severity_number(), Some(Severity::Info));
+        assert_eq!(event.severity_text(), Some("INFO"));
+        assert_eq!(
+            event.target().map(AsRef::as_ref),
+            Some("rift_tracing::otlp::tests")
+        );
+        for (key, value) in [
+            ("component", "search"),
+            ("operation", "search.request"),
+            ("request_id", "r-1"),
+            ("hits", "3"),
+        ] {
+            assert_eq!(
+                attribute(event, key),
+                Some(&AnyValue::from(value.to_owned())),
+                "{key}: {event:?}"
+            );
+        }
+        let Some(AnyValue::Map(root_span)) = attribute(event, "root_span") else {
+            panic!("the event carries its root span as a map: {event:?}");
+        };
+        assert_eq!(
+            root_span.get(&Key::new("name")),
+            Some(&AnyValue::from("search.request".to_owned()))
+        );
+        let Some(AnyValue::Map(span_fields)) = root_span.get(&Key::new("fields")) else {
+            panic!("the root span carries its fields as a map: {root_span:?}");
+        };
+        assert_eq!(
+            span_fields.get(&Key::new("root")),
+            Some(&AnyValue::from("/workspace".to_owned()))
+        );
+        let in_span = event
+            .trace_context()
+            .expect("the event carries the span's trace context");
+        assert_eq!(in_span.trace_id, span.span_context.trace_id());
+        assert_eq!(in_span.span_id, span.span_context.span_id());
+
+        let close = exported(&records, "search.request");
+        assert_eq!(
+            attribute(close, "status.code"),
+            Some(&AnyValue::from("Ok".to_owned()))
+        );
+        assert_eq!(
+            attribute(close, "root"),
+            Some(&AnyValue::from("/workspace".to_owned()))
+        );
+        let closed = close
+            .trace_context()
+            .expect("the close carries the span's own trace context");
+        assert_eq!(closed.trace_id, span.span_context.trace_id());
+        assert_eq!(closed.span_id, span.span_context.span_id());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let export = OtlpExport::holding(Some(tracer), None, Some(logs));
+        assert_eq!(runtime.block_on(export.shutdown(deadline)), Ok(()));
+    }
+
+    /// A record written after the shutdown started is not exported, and the batch processor
+    /// that already stopped reports no drop on stderr.
+    ///
+    /// The subscriber is the process's global one, as the runtime installs it: under a
+    /// scoped one, `tracing` hands an event emitted inside a layer's `on_event` to no
+    /// subscriber, and the SDK's report of the drop would be lost either way.
+    #[test]
+    fn a_record_after_the_shutdown_reports_no_drop() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let records = InMemoryLogExporter::default();
+        let logs = logger_export(records.clone(), log_batch_config(), resource());
+        let layer = log_record_layer(&logs, EnvFilter::new("rift_tracing=info"));
+        let export = OtlpExport::holding(None, None, Some(logs));
+        let stderr = Reports::default();
+        let filter = crate::runtime::stderr_filter(EnvFilter::new("rift=info"));
+        let subscriber = crate::capture::registry()
+            .with(layer)
+            .with(stderr.clone().with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("this case owns the process's subscriber");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(runtime.block_on(export.shutdown(deadline)), Ok(()));
+        // The batch processor answers its shutdown before its task ends and drops the queue;
+        // a record written after that finds the queue closed.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        crate::info!(component = "mcp", "written after the export stopped");
+        assert_eq!(stderr.count("BatchLogProcessor.LogDroppingStarted"), 0);
+        assert!(
+            records
+                .get_emitted_logs()
+                .expect("the log exporter is readable")
+                .is_empty()
+        );
+    }
+
+    /// Without an endpoint variable the process builds no logger provider, so no record is
+    /// handed to a log record exporter.
+    #[test]
+    fn no_endpoint_installs_no_log_export() {
+        assert!(
+            !LOG_ENDPOINT_VARS
+                .iter()
+                .any(|variable| configured(variable)),
+            "the test process sets no OTLP log endpoint variable"
+        );
+        let (_, export) = super::layer::<tracing_subscriber::Registry>(EnvFilter::new("rift=info"));
+        let holds_logs = export
+            .providers
+            .lock()
+            .expect("the providers are not poisoned")
+            .as_ref()
+            .map(|providers| providers.logs.is_some());
+        assert_eq!(holds_logs, Some(false));
+    }
+
+    /// Fields cut at their bound are no longer a JSON object, and export whole.
+    #[test]
+    fn fields_cut_at_their_bound_export_whole() {
+        let cut = "{\"request_id\":\"r-";
+        assert_eq!(
+            field_attributes(cut),
+            vec![(Key::new("fields"), AnyValue::from(cut.to_owned()))]
+        );
     }
 
     /// Every exported span and metric names the service, its version, this process's

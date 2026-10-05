@@ -194,9 +194,9 @@ stop begins, and each stage takes only what the one before it left:
    1.5 s: `SERVER_EXPORT_STOP_RESERVE`, `SERVER_LOG_FLUSH_RESERVE`, and
    `SERVER_DATABASE_STOP_RESERVE`, 500 ms each. A close failure becomes a `warn` record with
    operation `database.close`, so a later stage writes it.
-3. The `otlp export` stage sends the final spans and metric points and shuts the export down by
-   the deadline minus 1 s, and at most `SERVER_EXPORT_STOP_RESERVE` after it starts. A collector
-   that is down or stalled costs the stop that reserve and never fails it.
+3. The `otlp export` stage sends the final spans, log records, and metric points and shuts the
+   export down by the deadline minus 1 s, and at most `SERVER_EXPORT_STOP_RESERVE` after it
+   starts. A collector that is down or stalled costs the stop that reserve and never fails it.
 4. The log drain's final flush ends by the deadline minus `SERVER_DATABASE_STOP_RESERVE`. A
    drain that outlasts it is aborted, and its warning carries `unwritten`: the records the
    drain accepted and never wrote.
@@ -221,7 +221,9 @@ exports nothing records the stage `ok` at once.
 
 The stage runs before the log drain stops, so a drain the stop abandons counts its `unwritten`
 records in `log.queue.dropped` after the last export: the drain's `warn` record carries that
-count, and the collector never receives it.
+count, and the collector never receives it. The log record export stops with the stage too: the
+`stop stage ended` record of `otlp export` and every record of the later stages reach stderr and,
+before the drain stops, the metrics database, and the collector receives none of them.
 
 A stop that arrives while the index preparation runs a dependency version probe reaches the probe
 too. The probe reads the stop once per 25 ms poll, then kills its child and reaps it, and its close
@@ -775,6 +777,9 @@ subscriber with a filter per layer:
 - the `LogSink` under `[logs]` `capture`, installed for a foreground server alone
 - the OTLP span export under `RIFT_OTLP_FILTER`, installed when `OTEL_EXPORTER_OTLP_ENDPOINT` is
   set
+- the OTLP log record export under `[logs]` `capture`, or under the default targets in a process
+  without a capture, installed when `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set
 
 A foreground server whose stderr is not a terminal writes at most `[logs]` `stderr_limit`
 there, 1 MiB by default. The write that crosses the bound is followed by one notice,
@@ -876,12 +881,21 @@ Every build carries the OTLP export, and a process exports nothing until an oper
 endpoint variable. With `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`
 set, the process installs a meter whose reader exports over OTLP/HTTP protobuf every
 `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default; spans export when `OTEL_EXPORTER_OTLP_ENDPOINT` is
-set. With neither, the process builds no exporter, so it never dials OTLP's default
-`http://localhost:4318`.
+set; log records export to `/v1/logs` when it or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set,
+batched every `OTEL_BLRP_SCHEDULE_DELAY`, 1 s by default. With none of them, the process builds no
+exporter, so it never dials OTLP's default `http://localhost:4318`.
 
-One export takes at most `OTEL_METRIC_EXPORT_TIMEOUT` for metrics and `OTEL_BSP_EXPORT_TIMEOUT`
-for spans, 2 s each when unset, and the SDK reports a failed export on stderr. Every exported span
-and metric point carries the resource attributes `service.name` (`rift`), `service.instance.id`,
+An exported log record is the record the `LogSink` stores, for each event and each span close:
+its level as the severity, its target as the instrumentation scope name, its message as the body,
+and `component`, `operation`, and each member of its fields as an attribute, `root_span` and
+`nearest_span` as maps. A record written inside a span carries that span's trace and span
+identifiers, and a span close carries the closing span's own, when the span export admitted the
+span.
+
+One export takes at most `OTEL_METRIC_EXPORT_TIMEOUT` for metrics, `OTEL_BSP_EXPORT_TIMEOUT` for
+spans, and `OTEL_BLRP_EXPORT_TIMEOUT` for log records, 2 s each when unset, and the SDK reports a
+failed export on stderr. Every exported span, metric point, and log record carries the resource
+attributes `service.name` (`rift`), `service.instance.id`,
 a random UUID per process, `process.pid`, and `service.version`, the server's version, so a collector that receives from several servers
 tells them apart.
 

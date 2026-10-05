@@ -4,7 +4,8 @@
 //! Stderr keeps `RUST_LOG` or the default targets, because that stream belongs to whoever
 //! started the process. The capture records under the workspace's `[logs] capture` filter,
 //! so a workspace can record itself at debug without an operator exporting an environment
-//! variable into the process a proxy spawns detached. The export reads `RIFT_OTLP_FILTER`.
+//! variable into the process a proxy spawns detached. The span export reads
+//! `RIFT_OTLP_FILTER`; the log record export runs under the capture's filter.
 
 use std::fmt;
 use std::io::IsTerminal as _;
@@ -99,6 +100,17 @@ pub(crate) fn parsed_filter(filter: &str) -> Result<EnvFilter, LogFilterError> {
     EnvFilter::try_new(filter).map_err(LogFilterError)
 }
 
+/// The filter the capture records under: `capture`, the accepted `[logs] capture` value, or
+/// the default targets when it is absent or `tracing` cannot parse it.
+///
+/// The OTLP log record export runs under the same filter, so it carries the records the
+/// store keeps; a process without a capture exports under the default targets.
+fn capture_filter(capture: Option<&str>) -> EnvFilter {
+    capture
+        .and_then(|capture| parsed_filter(capture).ok())
+        .unwrap_or_else(|| EnvFilter::new(DEFAULT_TRACING_FILTER))
+}
+
 /// The capture layer: `sink` under `filter`, asked at every span and event.
 pub(crate) fn capture_layer<S>(sink: LogSink, filter: EnvFilter) -> impl Layer<S>
 where
@@ -166,8 +178,9 @@ impl TracingRuntime {
         self.export.clone()
     }
 
-    /// Stops the stall report and joins its task, then flushes buffered spans and metric
-    /// points and shuts the OTLP export down, waiting at most [`OTLP_SHUTDOWN_TIMEOUT`].
+    /// Stops the stall report and joins its task, then flushes buffered spans, log records,
+    /// and metric points and shuts the OTLP export down, waiting at most
+    /// [`OTLP_SHUTDOWN_TIMEOUT`].
     ///
     /// The caller runs it before either exit path: a normal return drops every other
     /// local first, and `process::exit` past it runs no destructor at all. An export that
@@ -248,16 +261,15 @@ impl TracingRuntimeBuilder {
     /// `log` logger: `tracing-subscriber`'s `try_init` refuses a second one. The
     /// installation in place stays untouched, and this builder starts no stall report.
     pub fn install(self) -> Result<(TracingRuntime, Option<LogDrain>), InstallError> {
-        let (sink, drain) = match self.capture {
+        let (sink, drain) = match self.capture.as_deref() {
             Some(capture) => {
                 let (sink, drain) = log_capture();
-                let filter = parsed_filter(&capture)
-                    .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
+                let filter = capture_filter(Some(capture));
                 (Some(capture_layer(sink, filter)), Some(drain))
             }
             None => (None, None),
         };
-        let (otlp_layer, export) = otlp::layer();
+        let (otlp_layer, export) = otlp::layer(capture_filter(self.capture.as_deref()));
         let (writer, drain) = match self.stderr {
             StderrPolicy::Unbounded => (BoxMakeWriter::new(std::io::stderr), drain),
             StderrPolicy::Bounded => {

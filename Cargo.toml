@@ -67,20 +67,23 @@ oas3 = "=0.22.0"
 # reports - the first span a full batch queue drops, the dropped total at shutdown, a failed
 # export - into `tracing` events on the `opentelemetry_sdk` target; without it they compile to
 # nothing and a full queue drops spans silently. rift-tracing's instruments record through
-# the `metrics` API, and its span export enables `trace`. The SDK aggregates
-# and its async-runtime periodic reader exports over the same Tokio-driven `reqwest` client
-# the span batches use.
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["metrics"] }
+# the `metrics` API, its span export enables `trace`, and its log record export enables
+# `logs`. The SDK aggregates and its async-runtime periodic reader exports over the same
+# Tokio-driven `reqwest` client the span batches and the log record batches use.
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["logs", "metrics"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = [
     "http-proto",
+    "logs",
     "metrics",
     "reqwest-client",
     "trace",
 ] }
 opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = [
+    "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_metrics_periodicreader_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
     "internal-logs",
+    "logs",
     "metrics",
     "rt-tokio",
     "trace",
