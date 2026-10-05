@@ -308,6 +308,70 @@ async fn a_tick_reports_an_entry_past_the_stall_delay_once_with_a_snapshot() -> 
     Ok(())
 }
 
+/// A lifelong hold open past the stall delay draws no stall report and no forced
+/// snapshot; an operation past the delay beside it is reported alone.
+#[tokio::test(start_paused = true)]
+async fn a_lifelong_hold_past_the_stall_delay_is_never_reported() -> TestResult {
+    let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
+    let flights = Arc::new(FlightTable::default());
+    for (identity, lock) in [(1, "history.live"), (2, "history.fill")] {
+        let mut held = FlightEntry::opened(
+            "lock.held",
+            FlightKind::Held,
+            Some("history.open"),
+            Duration::ZERO,
+            0,
+        );
+        held.lock = lock.to_owned();
+        held.lifelong = true;
+        flights.join(identity, held);
+    }
+    let (sent, mut reads) = mpsc::unbounded_channel();
+    let reader = CountingReader { reads: 0, sent };
+    let evidence = TickEvidence {
+        runtime: None,
+        flights: Some(Arc::clone(&flights)),
+        stall_delay: Some(Duration::ZERO),
+    };
+    let sampler = ProcessSampler::spawn(
+        reader,
+        Duration::from_secs(1),
+        Arc::new(MetricValues::default()),
+        evidence,
+    );
+    for expected in 1..=2 {
+        assert_eq!(reads.recv().await, Some(expected));
+    }
+    flights.join(
+        3,
+        FlightEntry::opened(
+            "lexical.commit",
+            FlightKind::Operation,
+            Some("search.request"),
+            Duration::ZERO,
+            0,
+        ),
+    );
+    assert_eq!(reads.recv().await, Some(3));
+    assert_eq!(reads.recv().await, Some(4), "the third tick published");
+    sampler.stopped().await;
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let stalled: Vec<_> = records
+        .iter()
+        .filter(|record| record.message() == "operations in flight past the stall delay")
+        .collect();
+    assert_eq!(stalled.len(), 1, "only the operation draws a report");
+    let fields: serde_json::Value = serde_json::from_str(stalled[0].fields())?;
+    assert_eq!(fields["in_flight"], "1");
+    let listed: serde_json::Value =
+        serde_json::from_str(fields["operations"].as_str().ok_or("operations is text")?)?;
+    assert_eq!(listed[0]["operation"], "lexical.commit");
+    assert!(!stalled[0].fields().contains("history.live"));
+    Ok(())
+}
+
 /// The value of the series `name` without labels in `values`.
 fn unlabeled(values: &MetricValues, name: &str) -> Option<SeriesValue> {
     values

@@ -5,7 +5,9 @@
 //! deadline failure needs to see: the work still running. The table keeps that work. An
 //! entry joins when its span opens and leaves when the span closes, and the runtime
 //! publishes the table as one record on demand ([`publish_in_flight`]) and on its sampler
-//! tick for each entry open past `[logs] stall_delay`.
+//! tick for each entry open past `[logs] stall_delay`. A held lock declared
+//! [`lifelong`](crate::Lock::lifelong) is listed with that mark and left out of the stall
+//! report: its holder keeps it for as long as the holder runs.
 //!
 //! The table holds at most [`OPERATIONS_IN_FLIGHT_MAX`] entries, each label cut at
 //! [`LOG_LABEL_BYTES_MAX`]; an entry that finds the table full is not tracked, and every
@@ -40,6 +42,8 @@ pub(crate) const LOCK_WAIT_SPAN: &str = "lock.wait";
 pub(crate) const LOCK_HELD_SPAN: &str = "lock.held";
 /// The span field that names a lock.
 pub(crate) const LOCK_NAME_FIELD: &str = "lock.name";
+/// The span field that marks a hold its holder keeps for as long as it runs.
+const LIFELONG_FIELD: &str = "lifelong";
 
 /// What an entry of the table is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +87,8 @@ pub(crate) struct FlightEntry {
     pub(crate) parent: Option<&'static str>,
     pub(crate) started_at_ms: i64,
     pub(crate) started: Duration,
+    /// Kept by its holder for as long as the holder runs: listed, never reported stalled.
+    pub(crate) lifelong: bool,
     stall_reported: bool,
 }
 
@@ -104,12 +110,14 @@ impl FlightEntry {
             parent,
             started_at_ms,
             started,
+            lifelong: false,
             stall_reported: false,
         }
     }
 
     /// The entry as one member of a table record's `operations` list: its name, kind, and
-    /// age at `now`, then its component, lock, and parent when it has them.
+    /// age at `now`, then its component, lock, and parent when it has them, and
+    /// `"lifelong": true` for a lifelong hold.
     fn listed(&self, now: Duration) -> Value {
         let mut member = Map::new();
         member.insert("operation".to_owned(), Value::from(self.name));
@@ -128,6 +136,9 @@ impl FlightEntry {
         }
         if let Some(parent) = self.parent {
             member.insert("parent".to_owned(), Value::from(parent));
+        }
+        if self.lifelong {
+            member.insert(LIFELONG_FIELD.to_owned(), Value::from(true));
         }
         Value::Object(member)
     }
@@ -212,13 +223,17 @@ impl FlightTable {
     }
 
     /// The entries open for `stall_delay` or longer at `now` that no earlier call reported,
-    /// marked reported, oldest first; `None` when there are none.
+    /// marked reported, oldest first; `None` when there are none. A lifelong entry is never
+    /// selected.
     pub(crate) fn stalled(&self, now: Duration, stall_delay: Duration) -> Option<FlightListing> {
         let (selected, untracked) = {
             let mut entries = self.lock();
             let mut selected = Vec::new();
             for entry in entries.open.values_mut() {
-                if !entry.stall_reported && now.saturating_sub(entry.started) >= stall_delay {
+                if !entry.lifelong
+                    && !entry.stall_reported
+                    && now.saturating_sub(entry.started) >= stall_delay
+                {
                     entry.stall_reported = true;
                     selected.push(entry.clone());
                 }
@@ -255,11 +270,13 @@ fn listed(mut entries: Vec<FlightEntry>, untracked: u64, now: Duration) -> Fligh
     }
 }
 
-/// The fields an entry takes from its span: `component` and the lock name.
+/// The fields an entry takes from its span: `component`, the lock name, and the lifelong
+/// mark.
 #[derive(Default)]
 struct EntryFields {
     component: String,
     lock: String,
+    lifelong: bool,
 }
 
 impl EntryFields {
@@ -275,6 +292,12 @@ impl EntryFields {
 impl Visit for EntryFields {
     fn record_str(&mut self, field: &Field, value: &str) {
         self.record(field, value);
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == LIFELONG_FIELD {
+            self.lifelong = value;
+        }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
@@ -308,10 +331,16 @@ where
         };
         let mut fields = EntryFields::default();
         attributes.record(&mut fields);
-        let parent = context
-            .span(id)
-            .and_then(|span| span.parent())
-            .map(|parent| parent.name());
+        // A lifelong hold opens as a root so the operation that took the lock can close; it
+        // names the span it was opened in as its parent. Any other root has none.
+        let parent = if fields.lifelong {
+            context.lookup_current().map(|current| current.name())
+        } else {
+            context
+                .span(id)
+                .and_then(|span| span.parent())
+                .map(|parent| parent.name())
+        };
         let mut entry = FlightEntry::opened(
             attributes.metadata().name(),
             kind,
@@ -321,6 +350,7 @@ where
         );
         entry.component = fields.component;
         entry.lock = fields.lock;
+        entry.lifelong = fields.lifelong;
         self.table.join(id.into_u64(), entry);
     }
 
@@ -352,7 +382,8 @@ pub(crate) fn with_table<Answer>(read: impl FnOnce(&FlightTable) -> Answer) -> O
 /// refused at [`OPERATIONS_IN_FLIGHT_MAX`]; and `operations`, a JSON array of the open
 /// entries, oldest first. Each entry names its `operation`, its `kind` (`operation`,
 /// `wait`, or `held`), its `age_ms`, its `started_at_ms`, and its `component`,
-/// `lock.name`, and `parent` operation when it has them.
+/// `lock.name`, and `parent` operation when it has them; a hold declared
+/// [`lifelong`](crate::Lock::lifelong) also carries `"lifelong": true`.
 ///
 /// A thread whose dispatcher keeps no table publishes nothing.
 ///
@@ -376,8 +407,8 @@ pub fn publish_in_flight(reason: &'static str) {
 }
 
 /// Publishes the entries of `table` open for `stall_delay` at `now` that no earlier tick
-/// reported, as one `WARN` record with the fields of [`publish_in_flight`] and the reason
-/// `stall_delay`. Answers whether it published.
+/// reported, lifelong holds left out, as one `WARN` record with the fields of
+/// [`publish_in_flight`] and the reason `stall_delay`. Answers whether it published.
 pub(crate) fn publish_stalled(table: &FlightTable, now: Duration, stall_delay: Duration) -> bool {
     let Some(listing) = table.stalled(now, stall_delay) else {
         return false;

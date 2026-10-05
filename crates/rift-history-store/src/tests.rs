@@ -841,6 +841,49 @@ fn a_refused_filler_records_the_refusal_and_names_the_holder() -> TestResult {
     Ok(())
 }
 
+/// The holds a server keeps while it runs, its shared live lock and its fill lock, are
+/// listed lifelong in the table of operations in flight, and neither keeps the operation
+/// that took it in flight.
+#[test]
+fn a_servers_live_and_fill_holds_are_listed_lifelong() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let store = rift_tracing::traced!(component = "history", operation = "history.open", {
+        HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))
+    })?;
+    let filler = rift_tracing::traced!(component = "history", operation = "history.fill", {
+        store.filler()
+    })?
+    .ok_or("the first filler takes the lock")?;
+    rift_tracing::publish_in_flight("stop");
+    drop(filler);
+    drop(store);
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let published = records
+        .iter()
+        .find(|record| record.message() == "operations in flight")
+        .ok_or("the table was published")?;
+    let fields: serde_json::Value = serde_json::from_str(published.fields())?;
+    let listed: Vec<serde_json::Value> =
+        serde_json::from_str(fields["operations"].as_str().ok_or("operations is text")?)?;
+    assert_eq!(listed.len(), 2, "the two holds alone: {listed:?}");
+    for (lock, parent) in [
+        ("history.live", "history.open"),
+        ("history.fill", "history.fill"),
+    ] {
+        let hold = listed
+            .iter()
+            .find(|entry| entry["lock.name"] == lock)
+            .ok_or(lock)?;
+        assert_eq!(hold["kind"], "held", "{lock}");
+        assert_eq!(hold["lifelong"], true, "{lock}");
+        assert_eq!(hold["parent"], parent, "{lock}");
+    }
+    Ok(())
+}
+
 #[test]
 fn a_sweep_records_the_live_lock_it_skips_and_the_one_it_takes() -> TestResult {
     let folder = tempfile::tempdir()?;
