@@ -28,7 +28,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tokenizers.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

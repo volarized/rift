@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use rift_core::{ProjectPath, SystemMonotonicClock, measure_elapsed};
+use rift_core::ProjectPath;
 use rift_protocol::read::Language;
 use rift_syntax::{
     MarkdownSyntaxProvider, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, registry,
@@ -140,7 +140,7 @@ fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
 fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument, Duration) {
     let path = ProjectPath::new("wide").expect("valid fixture path");
     let source = SyntaxSource { path: &path, text };
-    let (analysis, measurement) = measure_elapsed!(SystemMonotonicClock, "syntax.analyze", {
+    let (analysis, measurement) = rift_tracing::measure_elapsed!("syntax.analyze", {
         provider.analyze(source, SyntaxLimits::default())
     })
     .expect("the monotonic clock must not regress");

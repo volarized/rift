@@ -32,7 +32,6 @@ toasty.workspace = true
 toasty-core.workspace = true
 toasty-driver-sqlite.workspace = true
 rayon.workspace = true
-tracing.workspace = true
 same-file.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

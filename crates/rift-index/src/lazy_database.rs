@@ -157,7 +157,7 @@ impl LazyDatabase {
             .await
             .inspect_err(|error| {
                 let causes = causes(error).join(": ");
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "storage",
                     operation = "database.open",
                     database = %self.name,

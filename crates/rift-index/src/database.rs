@@ -37,7 +37,6 @@ use toasty::{Db, ModelSet};
 use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
-use tracing::Instrument as _;
 
 use crate::database_thread::{DatabaseThread, SqliteThreadDriver};
 use crate::documentation_store::{
@@ -432,7 +431,7 @@ impl WorkspaceDatabase {
     async fn checkpoint_before_close(&self, deadline: tokio::time::Instant) {
         let database = self.name.label();
         match tokio::time::timeout_at(deadline, self.truncate_write_ahead_log()).await {
-            Ok(Ok(checkpoint)) => tracing::info!(
+            Ok(Ok(checkpoint)) => rift_tracing::info!(
                 component = "storage",
                 operation = "database.close",
                 database,
@@ -441,14 +440,14 @@ impl WorkspaceDatabase {
                 checkpointed = checkpoint.checkpointed,
                 "database checkpointed its write-ahead log"
             ),
-            Ok(Err(error)) => tracing::warn!(
+            Ok(Err(error)) => rift_tracing::warn!(
                 component = "storage",
                 operation = "database.close",
                 database,
                 %error,
                 "database checkpoint failed; the write-ahead log stays for the next open"
             ),
-            Err(_elapsed) => tracing::warn!(
+            Err(_elapsed) => rift_tracing::warn!(
                 component = "storage",
                 operation = "database.close",
                 database,
@@ -537,16 +536,14 @@ impl WorkspaceDatabase {
     ) -> Result<Connection, RiftError> {
         // Every store operation checks a connection out, so the span sits at debug: an info
         // filter would print one closing line per checkout.
-        let mut connection = self
-            .database
-            .connection()
-            .instrument(tracing::debug_span!(
-                "database.checkout",
-                component = "database",
-                operation = "database.checkout"
-            ))
-            .await
-            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        let mut connection = rift_tracing::debug_span!(
+            "database.checkout",
+            component = "database",
+            operation = "database.checkout"
+        )
+        .instrument(self.database.connection())
+        .await
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }
