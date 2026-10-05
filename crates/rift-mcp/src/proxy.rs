@@ -448,6 +448,11 @@ impl RiftProxy {
             .await
         {
             Ok(handle) => {
+                // rmcp chooses the id inside the send, so it is known only once the
+                // send returns; the forwarding span declared the field empty to take it.
+                // After a reconnect the second send's id replaces the first.
+                rift_tracing::Span::current()
+                    .record("upstream_request_id", handle.id.to_string().as_str());
                 rift_tracing::debug!(component = "mcp", upstream_request_id = %handle.id, "forwarded request awaiting response");
                 let result = handle.await_response().await;
                 rift_tracing::debug!(
@@ -1426,7 +1431,8 @@ impl ServerHandler for RiftProxy {
             component = "mcp",
             operation = "tools/call",
             request_id = %context.id,
-            tool = %request.name
+            tool = %request.name,
+            upstream_request_id = rift_tracing::empty!()
         );
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("tools/call", {
@@ -2796,6 +2802,7 @@ mod tests {
             .as_str()
             .ok_or("the forward records its upstream request ID")?;
         assert_ne!(upstream_id, request_id);
+        assert_forward_joins_server_request(records, request_id, upstream_id)?;
         for event in [
             "tool request started",
             "worker admission started",
@@ -2835,6 +2842,40 @@ mod tests {
                 .any(|text| text.contains("zzdiagnosticsecret"))
             }),
             "request arguments stay out of diagnostics: {records:#?}"
+        );
+        Ok(())
+    }
+
+    /// The `mcp.forward` close record for the caller's `request_id` carries
+    /// `upstream_request_id`, and that value is the `request_id` of the server's
+    /// `mcp.request` span a server record was emitted in: one field joins the proxy's
+    /// line to the server's.
+    fn assert_forward_joins_server_request(
+        records: &[rift_tracing::LogRecord],
+        request_id: &str,
+        upstream_id: &str,
+    ) -> TestResult {
+        let closed = |record: &rift_tracing::LogRecord, span: &str| {
+            serde_json::from_str::<serde_json::Value>(record.fields())
+                .ok()
+                .filter(|fields| record.message() == span && fields["span"] == "closed")
+        };
+        let forward = records
+            .iter()
+            .filter_map(|record| closed(record, "mcp.forward"))
+            .find(|fields| fields["request_id"] == request_id && fields["tool"] == "search")
+            .ok_or_else(|| format!("the proxy closes the forwarding span: {records:#?}"))?;
+        let joined = forward["upstream_request_id"].as_str().ok_or_else(|| {
+            format!("the forwarding span carries the server's request id: {forward}")
+        })?;
+        assert_eq!(joined, upstream_id);
+        assert!(
+            records.iter().any(|record| {
+                record.message() == "tool request completed"
+                    && emitted_in(record, "mcp.request", joined)
+            }),
+            "the server's request span carries the id the forwarding span carries: \
+             {records:#?}"
         );
         Ok(())
     }
