@@ -22,12 +22,15 @@ mod rust_engine;
 )]
 mod test_case;
 
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use harness::{
-    FailureWindow, StopOnDrop, TestResult, proxy_client, require_success, run_rift, within,
-    workspace,
+    FailureWindow, LIBRARY, RelayedStderr, StopOnDrop, TestResult, await_workspace_ready,
+    laid_out_workspace, proxied_call, proxy_client, require_success, run_rift, within, workspace,
 };
+use rift_mcp::{BuildCheckout, PRESENCE_POLL_INTERVAL, ServerPresence};
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::Value;
@@ -533,6 +536,211 @@ async fn a_followed_read_prints_a_record_the_server_writes_later() -> TestResult
         followed,
         "the follower must print the record the server wrote after it started"
     );
+    failure_window.passed();
+    Ok(())
+}
+
+/// Probes one repository foreground start waits for its election document, at
+/// [`PRESENCE_POLL_INTERVAL`]: ten seconds.
+const REPOSITORY_START_ATTEMPTS: u32 = 100;
+/// Longest a repository foreground stop may take, the `rift server stop` command and the
+/// process exit included: the server's own stop keeps four seconds of it.
+const REPOSITORY_STOP_MAX: Duration = Duration::from_secs(5);
+
+/// The foreground repository server one case started; killed if the case ends first.
+struct RepositoryForeground(Child);
+
+impl Drop for RepositoryForeground {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Runs one Git command in `root` under a fixed identity, unsigned.
+fn fixture_git(root: &Path, arguments: &[&str]) -> TestResult {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Rift fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@rift.test")
+        .env("GIT_COMMITTER_NAME", "Rift fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@rift.test")
+        .output()?;
+    require_success(&output, "repository fixture Git command")
+}
+
+/// The repository's election directory for the `rift` binary under test.
+fn repository_state_directory(main: &Path) -> TestResult<PathBuf> {
+    let common = rift_mcp::repository::discover_common_directory(main)
+        .ok_or("the fixture repository has a common Git directory")?;
+    let checkout = BuildCheckout::recorded(env!("RIFT_BUILD_COMMIT"), env!("RIFT_BUILD_DIRTY"));
+    let identity = rift_mcp::product_identity_of(checkout, &harness::rift_binary())?;
+    Ok(rift_mcp::repository::repository_election_directory(
+        &common, &identity,
+    )?)
+}
+
+/// Starts `rift server start --foreground --repository` in `root` and waits until its
+/// election document names it; answers the child and its relayed stderr.
+async fn repository_foreground(
+    root: &Path,
+    state_directory: &Path,
+) -> TestResult<(RepositoryForeground, RelayedStderr)> {
+    let mut command = Command::new(harness::rift_binary());
+    let mut child = RepositoryForeground(
+        harness::with_child_log_variables(&mut command)
+            .args(["server", "start", "--foreground", "--repository"])
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let stderr =
+        harness::relayed_child_stderr(&mut child.0, "rift server start --foreground --repository")?;
+    for _ in 0..REPOSITORY_START_ATTEMPTS {
+        if child.0.try_wait()?.is_some() {
+            return Err(format!(
+                "the repository server exited before serving: {}",
+                stderr.snapshot()
+            )
+            .into());
+        }
+        if let ServerPresence::Serving(lock) = rift_mcp::probe_state_directory(state_directory)
+            && lock.pid == child.0.id()
+        {
+            return Ok((child, stderr));
+        }
+        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+    }
+    Err("the repository server did not publish its election document".into())
+}
+
+/// Stops the repository server through `rift server stop --repository` in `root` and
+/// waits for a clean exit, both within [`REPOSITORY_STOP_MAX`].
+async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForeground) -> TestResult {
+    let deadline = tokio::time::Instant::now() + REPOSITORY_STOP_MAX;
+    let stopped = tokio::time::timeout_at(
+        deadline,
+        run_rift(root, &["server", "stop", "--repository"]),
+    )
+    .await??;
+    require_success(&stopped, "repository foreground stop")?;
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            harness::record_exit(child.0.id(), status);
+            assert!(
+                status.success(),
+                "the repository server exits cleanly: {status:?}"
+            );
+            return Ok(());
+        }
+        tokio::time::timeout_at(deadline, tokio::time::sleep(PRESENCE_POLL_INTERVAL)).await?;
+    }
+}
+
+/// Whether any string inside `value` contains `text`.
+fn mentions(value: &Value, text: &str) -> bool {
+    match value {
+        Value::String(string) => string.contains(text),
+        Value::Array(items) => items.iter().any(|item| mentions(item, text)),
+        Value::Object(members) => members.values().any(|member| mentions(member, text)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Under repository serving, each workspace's `rift://logs` answers the records its own
+/// requests produced, naming its own root and never the other workspace's; after the
+/// server stops, `rift server logs` in that root reads the same store; and the stop ends
+/// every stage, the `log drain` stage included, with the outcome `ok`.
+#[tokio::test]
+async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
+    let main = laid_out_workspace(&[("lib.rs", LIBRARY)], &harness::assigned_port_key()?)?;
+    fixture_git(main.path(), &["init", "-q"])?;
+    fixture_git(main.path(), &["add", "lib.rs", "rift.toml"])?;
+    fixture_git(
+        main.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "add sources"],
+    )?;
+    let linked_parent = tempfile::tempdir()?;
+    let linked = linked_parent.path().join("linked");
+    fixture_git(
+        main.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().ok_or("the fixture path is UTF-8")?,
+            "HEAD",
+        ],
+    )?;
+    let roots = [
+        std::fs::canonicalize(main.path())?,
+        std::fs::canonicalize(&linked)?,
+    ];
+    let failure_window = FailureWindow::begin_over(&[roots[0].as_path(), roots[1].as_path()]);
+    let state_directory = repository_state_directory(main.path())?;
+    let (mut child, stderr) = repository_foreground(&roots[0], &state_directory).await?;
+
+    let mut clients = Vec::new();
+    for root in &roots {
+        let client = proxy_client(root).await?;
+        await_workspace_ready(&client).await?;
+        let lookup = proxied_call(
+            &client,
+            "get_symbol",
+            &serde_json::json!({"name": "beacon"}),
+        )
+        .await?;
+        assert_eq!(lookup["hits"][0]["symbol"]["name"], "beacon", "{lookup}");
+        clients.push(client);
+    }
+    for (index, client) in clients.iter().enumerate() {
+        let own = roots[index].display().to_string();
+        let other = roots[1 - index].display().to_string();
+        let records = recorded(client, LOGS_URI).await?;
+        assert!(
+            records.iter().any(|record| mentions(record, &own)),
+            "{own} answers a record naming it: {records:?}"
+        );
+        assert!(
+            !records.iter().any(|record| mentions(record, &other)),
+            "{own} answers no record of {other}: {records:?}"
+        );
+    }
+    for client in clients {
+        client.cancel().await?;
+    }
+    stop_repository_foreground(&roots[0], &mut child).await?;
+
+    let stop_lines = stderr.text().await?;
+    let stages = stop_lines
+        .lines()
+        .filter(|line| line.contains("stop stage ended"))
+        .collect::<Vec<_>>();
+    assert!(
+        stages.iter().any(|line| line.contains("stage=log drain")),
+        "the repository stop runs a log drain stage: {stages:#?}"
+    );
+    assert!(
+        stages.iter().all(|line| line.contains("outcome=ok")),
+        "every stop stage ends ok: {stages:#?}"
+    );
+    for (index, root) in roots.iter().enumerate() {
+        let output = run_rift(root, &["server", "logs"]).await?;
+        require_success(&output, "rift server logs after the stop")?;
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            printed.contains(&root.display().to_string()),
+            "the stopped workspace's store answers its records: {printed}"
+        );
+        assert!(
+            !printed.contains(&roots[1 - index].display().to_string()),
+            "the stopped workspace's store holds no record of the other: {printed}"
+        );
+    }
     failure_window.passed();
     Ok(())
 }

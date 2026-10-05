@@ -36,7 +36,7 @@ pub const LOG_QUEUE_RECORDS: usize = 4_096;
 pub(crate) static LOG_QUEUE_DROPPED: Counter<1> =
     Counter::declare("log.queue.dropped", "{record}", &["error.type"]);
 /// The `error.type` of a record the full queue refused.
-const QUEUE_FULL: &str = "queue_full";
+pub(crate) const QUEUE_FULL: &str = "queue_full";
 /// The `error.type` of a record a drain aborted at its stop deadline never wrote.
 pub(crate) const UNWRITTEN: &str = "unwritten";
 /// Bytes of a panic payload the recorded event keeps, at most.

@@ -4010,8 +4010,9 @@ impl RiftMcp {
         };
         let query = resource::log_query(uri, page_records)?;
         // The drain writes on a timer, so a read taken right after the request that produced a
-        // record would answer without it. This waits for the lane to reach what it has taken.
-        rift_tracing::settle_for_read().await;
+        // record would answer without it. This waits for the lane, and for this workspace's
+        // consumer when one process serves several, to reach what they have taken.
+        rift_tracing::settle_for_read(&self.root.display().to_string()).await;
         let Some(store) = self.logs.as_ref() else {
             return resource::logs_unavailable(
                 uri,

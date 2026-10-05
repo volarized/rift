@@ -14,7 +14,8 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::{any, post};
 use rift_error::{RiftError, errors};
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::configuration::ServerConfiguration;
+use rift_protocol::configuration::{SERVER_WORKSPACES_MAX, ServerConfiguration};
+use rift_tracing::RunningLogDrain;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, Semaphore};
@@ -42,6 +43,25 @@ const IDLE_EVICTION_TICK: Duration = Duration::from_secs(1);
 
 /// Wall-clock bound one workspace stop spends on its engines, supervisor, and database.
 const WORKSPACE_STOP_BOUND: Duration = Duration::from_secs(4);
+
+/// Time one workspace stop keeps for its log consumer's final flush: the engines, index
+/// supervisor, and index and vectors databases stop by this long before the flush's own
+/// bound, so the flush writes their close records.
+const WORKSPACE_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
+
+/// Time one workspace stop keeps for its metrics database's close, its last step: the log
+/// consumer's final flush ends this long before the stop's deadline.
+const WORKSPACE_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
+
+// Both reserves leave the index sequence a share of the bound one idle workspace stop
+// keeps.
+const _: () = assert!(
+    WORKSPACE_LOG_FLUSH_RESERVE.as_millis() + WORKSPACE_DATABASE_STOP_RESERVE.as_millis()
+        < WORKSPACE_STOP_BOUND.as_millis()
+);
+
+// Every workspace a repository process retains gets a log consumer of its own.
+const _: () = assert!(RunningLogDrain::WORKSPACE_CONSUMERS_MAX as u64 >= SERVER_WORKSPACES_MAX);
 
 /// The lock a repository request's admission is recorded under, waits and holds alike.
 const REPOSITORY_ADMISSION_LOCK: &str = "repository.admission";
@@ -155,6 +175,9 @@ struct RepositoryWorkspace {
     database: Option<Arc<rift_index::WorkspaceDatabase>>,
     vectors: Option<Arc<rift_index::LazyDatabase>>,
     logs: Option<Arc<rift_tracing::LogStore>>,
+    /// The consumer writing the records that name this workspace into `logs`, when the
+    /// process runs a routing log drain.
+    log_consumer: AsyncMutex<Option<RunningLogDrain>>,
     stop: CancellationToken,
     activity: Arc<IdleTracker>,
     lease: AsyncMutex<Option<Arc<ElectionGuard>>>,
@@ -485,6 +508,11 @@ impl RepositoryWorkspaceRegistry {
                 .with_json_response(true)
                 .with_cancellation_token(service_stop.clone()),
         );
+        // The consumer starts once the workspace serves: no record names a workspace before
+        // its first request.
+        let log_consumer = logs.as_ref().and_then(|store| {
+            RunningLogDrain::for_workspace(&root.display().to_string(), Arc::clone(store))
+        });
         let workspace = RepositoryWorkspace {
             service,
             supervisor,
@@ -492,6 +520,7 @@ impl RepositoryWorkspaceRegistry {
             database,
             vectors,
             logs,
+            log_consumer: AsyncMutex::new(log_consumer),
             stop: service_stop,
             activity,
             lease: AsyncMutex::new(Some(lease)),
@@ -542,7 +571,10 @@ impl RepositoryWorkspaceRegistry {
     ///
     /// Every workspace stops at once, each by the shared `deadline`: one workspace's
     /// database close never spends the bound of the workspaces after it. Each stop runs in
-    /// a `server.stop` span naming its `root`, so its records name the workspace.
+    /// a `server.stop` span naming its `root` and its `workspace`, opened as the root of
+    /// its own trace: the routing log drain reads a record's workspace from its own field,
+    /// the span it was emitted in, and the outermost span, so the close records of the
+    /// workspace's databases reach its own store.
     ///
     /// # Errors
     ///
@@ -564,10 +596,12 @@ impl RepositoryWorkspaceRegistry {
                 continue;
             }
             let root = root.display().to_string();
+            let workspace = root.clone();
             let stop = rift_tracing::traced!(
                 component = "mcp",
                 operation = "server.stop",
                 root = root,
+                workspace = workspace,
                 async move {
                     let outcome = match cell.get() {
                         Some(workspace) => stop_repository_workspace(workspace, deadline).await,
@@ -577,7 +611,7 @@ impl RepositoryWorkspaceRegistry {
                     outcome
                 }
             );
-            stopping.spawn(rift_tracing::Span::current().instrument(stop));
+            stopping.spawn(stop);
         }
         let mut outcome = Ok(());
         while let Some(joined) = stopping.join_next().await {
@@ -659,58 +693,78 @@ impl RepositoryWorkspaceRegistry {
     }
 }
 
-/// Stops one workspace's engines, index supervisor, and databases by `deadline`.
+/// Stops one workspace's engines, index supervisor, databases, and log consumer by
+/// `deadline`.
 ///
-/// The index and vectors databases close after the supervisor stopped, since the
-/// supervisor writes the index. The metrics database closes at once with that whole
-/// sequence: a repository server runs no log drain, so nothing in the sequence writes to
-/// the metrics database, and its checkpoint never waits on an index checkpoint's time.
+/// The steps keep the order of a workspace server's stop. The engines, the supervisor,
+/// then the index and vectors databases stop by [`WORKSPACE_LOG_FLUSH_RESERVE`] and
+/// [`WORKSPACE_DATABASE_STOP_RESERVE`] before `deadline`; the index closes after the
+/// supervisor, since the supervisor writes it. The log consumer's final flush follows, by
+/// [`WORKSPACE_DATABASE_STOP_RESERVE`] before `deadline`, writing the records of those
+/// closes; the metrics database closes last, by `deadline`. An index checkpoint that runs
+/// to its own bound leaves the flush and the metrics close their reserves.
 async fn stop_repository_workspace(
     workspace: &RepositoryWorkspace,
     deadline: Instant,
 ) -> Result<(), RiftError> {
     workspace.stop.cancel();
-    let indexing = async {
-        let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
-            .await
-            .map_err(|error| {
-                errors::mcp::http_serve_failed()
-                    .operation("workspace engines shutdown")
-                    .source(error)
-                    .error()
-            });
-        let supervisor = workspace.supervisor.shutdown(deadline).await;
-        let (index, vectors) = tokio::join!(
-            async {
-                match workspace.database.as_ref() {
-                    Some(database) => database.shutdown(deadline).await,
-                    None => Ok(()),
-                }
-            },
-            async {
-                match workspace.vectors.as_ref() {
-                    Some(vectors) => vectors.shutdown(deadline).await,
-                    None => Ok(()),
-                }
-            }
-        );
-        let database = index.and(vectors).map_err(|error| {
-            errors::mcp::http_serve_failed()
-                .operation("SQLite worker shutdown")
-                .cause(error)
-                .error()
-        });
-        engines.and(supervisor).and(database)
-    };
-    let (indexing, logs) = tokio::join!(
-        indexing,
-        crate::http::close_logs(workspace.logs.as_deref(), deadline)
-    );
+    let flush_deadline = reserved_before(deadline, WORKSPACE_DATABASE_STOP_RESERVE);
+    let indexing_deadline = reserved_before(flush_deadline, WORKSPACE_LOG_FLUSH_RESERVE);
+    let indexing = stop_workspace_indexing(workspace, indexing_deadline).await;
+    let log_consumer = workspace.log_consumer.lock().await.take();
+    if let Some(consumer) = log_consumer {
+        consumer.stop(flush_deadline).await;
+    }
+    let logs = crate::http::close_logs(workspace.logs.as_deref(), deadline).await;
     let outcome = indexing.and(logs);
     if outcome.is_ok() {
         drop(workspace.lease.lock().await.take());
     }
     outcome
+}
+
+/// The instant `reserve` before `deadline`, or `deadline` itself where the clock cannot
+/// represent the earlier instant.
+fn reserved_before(deadline: Instant, reserve: Duration) -> Instant {
+    deadline.checked_sub(reserve).unwrap_or(deadline)
+}
+
+/// Stops one workspace's engines and index supervisor, then closes its index and vectors
+/// databases, by `deadline`.
+async fn stop_workspace_indexing(
+    workspace: &RepositoryWorkspace,
+    deadline: Instant,
+) -> Result<(), RiftError> {
+    let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
+        .await
+        .map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("workspace engines shutdown")
+                .source(error)
+                .error()
+        });
+    let supervisor = workspace.supervisor.shutdown(deadline).await;
+    let (index, vectors) = tokio::join!(
+        async {
+            match workspace.database.as_ref() {
+                Some(database) => database.shutdown(deadline).await,
+                None => Ok(()),
+            }
+        },
+        async {
+            match workspace.vectors.as_ref() {
+                Some(vectors) => vectors.shutdown(deadline).await,
+                None => Ok(()),
+            }
+        }
+    );
+    let database = index.and(vectors).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("SQLite worker shutdown")
+            .cause(error)
+            .error()
+    });
+    engines.and(supervisor).and(database)
 }
 
 async fn watch_repository_idle(

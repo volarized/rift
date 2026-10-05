@@ -76,9 +76,12 @@ const _: () = assert!(
         < SERVER_STOP_DEADLINE.as_millis()
 );
 // Each mode's reserve is a share of the stop's deadline, and a repository server, which runs
-// fewer later stages, never keeps more than a workspace server.
+// the export and the log drain's final flush and closes no metrics database of its own, keeps
+// those two reserves and less than a workspace server.
 const _: () = assert!(
     later_stages_reserve(false).as_millis() == SERVER_LATER_STAGES_RESERVE.as_millis()
+        && later_stages_reserve(true).as_millis()
+            == SERVER_EXPORT_STOP_RESERVE.as_millis() + SERVER_LOG_FLUSH_RESERVE.as_millis()
         && later_stages_reserve(true).as_millis() < later_stages_reserve(false).as_millis()
         && later_stages_reserve(false).as_millis() < SERVER_STOP_DEADLINE.as_millis()
 );
@@ -969,10 +972,14 @@ fn process_absent(error: &io::Error) -> bool {
 /// it. Each stage records its name, what it left of the deadline, and its
 /// error, and a failed stop leaves with the rendered error on stderr.
 ///
-/// A repository server runs only the OTLP export after serving: its workspaces' databases
-/// close inside the serving stage `repository workspaces shutdown`, and it has no log
-/// drain or metrics database of its own, so its serving stages end by
-/// [`SERVER_EXPORT_STOP_RESERVE`] before the deadline and the export ends by the deadline
+/// A repository server's drain routes each record to the consumer of the workspace it
+/// names. Each workspace stops inside the serving stage `repository workspaces shutdown`
+/// in the same order: its index and vectors databases close, its consumer flushes, and
+/// its metrics database closes. After serving, the server runs the OTLP export and the
+/// `log drain` stage, which stops the routing drain; it has no metrics database of its
+/// own, so its serving stages end by [`SERVER_EXPORT_STOP_RESERVE`] and
+/// [`SERVER_LOG_FLUSH_RESERVE`] before the deadline, the export by
+/// [`SERVER_LOG_FLUSH_RESERVE`] before it, and the drain by the deadline
 /// ([`later_stages_reserve`]).
 ///
 /// A database close whose checkpoint started before its bound and outlasted it
@@ -999,8 +1006,8 @@ async fn serve_foreground(
     install_panic_hook();
     let shutdown = CancellationToken::new();
     let selection = foreground_selection(root, repository)?;
-    let (storage, guard, log_drain) = if repository {
-        (None, None, None)
+    let (storage, guard) = if repository {
+        (None, None)
     } else {
         let guard = std::sync::Arc::new(
             rift_mcp::claim(root).map_err(|error| foreground_refused(root, error))?,
@@ -1008,14 +1015,9 @@ async fn serve_foreground(
         let storage = WorkspaceStorage::open_elected(root, std::sync::Arc::clone(&guard))
             .await
             .map_err(|error| foreground_refused(root, error))?;
-        let log_drain = match (drain, storage.logs()) {
-            (Some(drain), Some(store)) => {
-                Some(RunningLogDrain::spawn(drain, store, retention_records))
-            }
-            _ => None,
-        };
-        (Some(storage), Some(guard), log_drain)
+        (Some(storage), Some(guard))
     };
+    let log_drain = start_log_drain(drain, storage.as_ref(), retention_records);
     let serving = if let Some(rift_mcp::repository::ServerConfigurationSelection::Repository {
         authority_root,
         common_directory,
@@ -1085,7 +1087,7 @@ async fn serve_foreground(
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;
-    let flush_deadline = deadline - SERVER_DATABASE_STOP_RESERVE;
+    let flush_deadline = deadline - log_flush_end_reserve(repository);
     let export_deadline = deadline - export_stage_end_reserve(repository);
     let search = database
         .close_search(export_deadline - SERVER_EXPORT_STOP_RESERVE)
@@ -1095,6 +1097,26 @@ async fn serve_foreground(
     let logs = database.close_logs(deadline).await;
     retire_before_exit(guard);
     stopped.and(search).and(logs)
+}
+
+/// Starts the log drain of a foreground server: writing into the metrics database of the
+/// workspace `storage` opened, or, for a repository server, which opens no `storage`,
+/// routing each record to the consumer of the workspace it names.
+///
+/// A workspace whose metrics database did not open records nothing, and neither does a
+/// process that built no `drain`.
+fn start_log_drain(
+    drain: Option<LogDrain>,
+    storage: Option<&WorkspaceStorage>,
+    retention_records: u64,
+) -> Option<RunningLogDrain> {
+    let drain = drain?;
+    match storage {
+        Some(storage) => storage
+            .logs()
+            .map(|store| RunningLogDrain::spawn(drain, store, retention_records)),
+        None => Some(RunningLogDrain::spawn_routed(drain, retention_records)),
+    }
 }
 
 /// Retires `server.json` and drops this stop's election guard, immediately before the
@@ -1150,13 +1172,14 @@ fn foreground_selection(
 ///
 /// A workspace server (`repository` false) runs the OTLP export, the log drain's final
 /// flush, and the metrics database's close, and keeps [`SERVER_LATER_STAGES_RESERVE`]. A
-/// repository server opens no workspace storage and no log drain of its own: its index,
-/// vectors, and metrics databases belong to its workspaces and close inside the serving
-/// stage `repository workspaces shutdown`, so its only later stage is the OTLP export, and
-/// it keeps [`SERVER_EXPORT_STOP_RESERVE`].
+/// repository server opens no workspace storage of its own: its index, vectors, and
+/// metrics databases and its workspace log consumers belong to its workspaces and stop
+/// inside the serving stage `repository workspaces shutdown`, so its later stages are the
+/// OTLP export and the stop of its routing log drain, and it keeps
+/// [`SERVER_EXPORT_STOP_RESERVE`] and [`SERVER_LOG_FLUSH_RESERVE`].
 const fn later_stages_reserve(repository: bool) -> Duration {
     if repository {
-        SERVER_EXPORT_STOP_RESERVE
+        SERVER_EXPORT_STOP_RESERVE.saturating_add(SERVER_LOG_FLUSH_RESERVE)
     } else {
         SERVER_LATER_STAGES_RESERVE
     }
@@ -1164,9 +1187,17 @@ const fn later_stages_reserve(repository: bool) -> Duration {
 
 /// How long before the stop's deadline the `otlp export` stage ends in this mode: the
 /// reserves of the stages after the export, which are the log drain's final flush and the
-/// metrics database's close on a workspace server and none on a repository server.
+/// metrics database's close on a workspace server and the log drain's final flush on a
+/// repository server.
 const fn export_stage_end_reserve(repository: bool) -> Duration {
     later_stages_reserve(repository).saturating_sub(SERVER_EXPORT_STOP_RESERVE)
+}
+
+/// How long before the stop's deadline the `log drain` stage ends in this mode: the
+/// metrics database's close on a workspace server, and nothing on a repository server,
+/// whose drain is its last stage.
+const fn log_flush_end_reserve(repository: bool) -> Duration {
+    export_stage_end_reserve(repository).saturating_sub(SERVER_LOG_FLUSH_RESERVE)
 }
 
 /// Sends the OTLP export's final spans and metric points and shuts it down by `deadline`,
@@ -1642,9 +1673,9 @@ mod tests {
         StartedServer, TailCount, TokenCheck, await_election_released,
         await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
         await_stopped_with_probe, discard_stale_document, export_stage_end_reserve,
-        foreground_refused, later_stages_reserve, logs_mode, logs_query, now_ms, print_logs,
-        request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
-        stop_log_drain, token_check,
+        foreground_refused, later_stages_reserve, log_flush_end_reserve, logs_mode, logs_query,
+        now_ms, print_logs, request_stop, stale_reason_phrase, start_detached, start_mode, status,
+        stop, stop_log_drain, token_check,
     };
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
@@ -1832,19 +1863,25 @@ mod tests {
             export_stage_end_reserve(false),
             SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE
         );
-        // A repository server runs the export only, and the export ends at the deadline.
+        assert_eq!(log_flush_end_reserve(false), SERVER_DATABASE_STOP_RESERVE);
+        // A repository server runs the export and its routing drain's stop, which ends at
+        // the deadline: its workspaces close their metrics databases while serving stops.
         let repository = later_stages_reserve(true);
-        assert_eq!(repository, SERVER_EXPORT_STOP_RESERVE);
-        assert_eq!(export_stage_end_reserve(true), Duration::ZERO);
+        assert_eq!(
+            repository,
+            SERVER_EXPORT_STOP_RESERVE + SERVER_LOG_FLUSH_RESERVE
+        );
+        assert_eq!(export_stage_end_reserve(true), SERVER_LOG_FLUSH_RESERVE);
+        assert_eq!(log_flush_end_reserve(true), Duration::ZERO);
         assert_eq!(
             workspace.checked_sub(repository),
-            Some(SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE),
-            "a repository server's serving stages gain the flush and close reserves"
+            Some(SERVER_DATABASE_STOP_RESERVE),
+            "a repository server's serving stages gain the close reserve"
         );
         assert_eq!(
             SERVER_STOP_DEADLINE.checked_sub(repository),
-            Some(Duration::from_millis(3_500)),
-            "a repository server's serving stages keep 3.5 s of the stop's 4 s"
+            Some(Duration::from_millis(3_000)),
+            "a repository server's serving stages keep 3 s of the stop's 4 s"
         );
     }
 
@@ -1900,6 +1937,49 @@ mod tests {
             .and_then(|reads| reads.count())
             .expect("the count reads");
         assert_eq!(stored, 1, "the final flush wrote the record");
+    }
+
+    /// A repository server's `log drain` stage stops its routing drain after each workspace
+    /// consumer flushed what named its workspace: the store holds the record, nothing is
+    /// left unwritten, and both stops end well inside the stop's deadline.
+    #[tokio::test]
+    async fn a_routing_log_drain_stops_after_its_workspace_consumer_flushed() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = Arc::new(
+            rift_tracing::LogStore::open(&directory.path().join("metrics"), None)
+                .await
+                .expect("the metrics database opens"),
+        );
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let routing = RunningLogDrain::spawn_routed(drain, 100);
+        let consumer = RunningLogDrain::for_workspace("/served", Arc::clone(&store))
+            .expect("the routing drain starts a consumer");
+        rift_tracing::info!(
+            component = "test",
+            workspace = "/served",
+            "written by the consumer's final flush"
+        );
+
+        let started = tokio::time::Instant::now();
+        let deadline = started + SERVER_STOP_DEADLINE;
+        let consumer_unwritten = consumer.stop(deadline - SERVER_LOG_FLUSH_RESERVE).await;
+        let routing_unwritten = stop_log_drain(Some(routing), deadline).await;
+
+        assert_eq!(consumer_unwritten, None, "the consumer joined");
+        assert_eq!(routing_unwritten, None, "the routing drain joined");
+        assert!(
+            started.elapsed() < SERVER_LOG_FLUSH_RESERVE,
+            "both stops ended inside the flush reserve: {:?}",
+            started.elapsed()
+        );
+        let stored = store
+            .reader()
+            .connect()
+            .and_then(|reads| reads.count())
+            .expect("the count reads");
+        assert_eq!(stored, 1, "the consumer's final flush wrote the record");
     }
 
     #[test]

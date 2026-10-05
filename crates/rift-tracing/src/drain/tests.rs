@@ -7,8 +7,8 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{
-    LOG_SETTLE_TIMEOUT, LOG_WRITE_RETRY_INTERVAL, LaneProgress, LogSettlement, RunningLogDrain,
-    caused_by, write_retained,
+    LOG_SETTLE_TIMEOUT, LOG_WORKSPACE_QUEUE_RECORDS, LOG_WRITE_RETRY_INTERVAL, LaneProgress,
+    LogRoutes, LogSettlement, RunningLogDrain, caused_by, workspace_of, write_retained,
 };
 use crate::{LOG_QUEUE_RECORDS, LogDrain, LogQuery, LogRecord, LogStore, log_capture};
 
@@ -32,7 +32,14 @@ fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlem
         }),
         flush: tokio::sync::Notify::new(),
         draining: AtomicBool::new(draining),
+        routes: std::sync::OnceLock::new(),
     }
+}
+
+/// One read's wait on `lane`, under the bound every `rift://logs` read keeps.
+async fn settle_for_read(lane: &LogSettlement) {
+    lane.settle_by(tokio::time::Instant::now() + LOG_SETTLE_TIMEOUT)
+        .await;
 }
 
 /// Drains what the queue currently holds, without a store.
@@ -75,7 +82,7 @@ fn count(store: &LogStore) -> u64 {
 #[tokio::test(start_paused = true)]
 async fn a_read_waits_for_a_drain_that_is_not_running() {
     let started = tokio::time::Instant::now();
-    settlement(4, 0, false).settle_for_read().await;
+    settle_for_read(&settlement(4, 0, false)).await;
     assert_eq!(
         tokio::time::Instant::now(),
         started,
@@ -87,7 +94,7 @@ async fn a_read_waits_for_a_drain_that_is_not_running() {
 #[tokio::test(start_paused = true)]
 async fn a_read_over_a_settled_queue_waits_for_nothing() {
     let started = tokio::time::Instant::now();
-    settlement(4, 4, true).settle_for_read().await;
+    settle_for_read(&settlement(4, 4, true)).await;
     assert_eq!(tokio::time::Instant::now(), started);
 }
 
@@ -96,7 +103,7 @@ async fn a_read_over_a_settled_queue_waits_for_nothing() {
 #[tokio::test(start_paused = true)]
 async fn a_read_past_the_settle_bound_still_answers() {
     let started = tokio::time::Instant::now();
-    settlement(4, 1, true).settle_for_read().await;
+    settle_for_read(&settlement(4, 1, true)).await;
     assert_eq!(
         tokio::time::Instant::now() - started,
         LOG_SETTLE_TIMEOUT,
@@ -195,7 +202,7 @@ async fn a_dropped_record_does_not_hold_a_read() {
     let settlement = Arc::clone(&sink.settlement);
     settlement.finish_written(LOG_QUEUE_RECORDS as u64, LOG_QUEUE_RECORDS as u64);
     let started = tokio::time::Instant::now();
-    settlement.settle_for_read().await;
+    settle_for_read(&settlement).await;
     assert_eq!(
         tokio::time::Instant::now(),
         started,
@@ -215,7 +222,7 @@ async fn a_read_waits_for_its_own_sequence_not_for_a_count() {
         progress.finished = 9;
     });
     let started = tokio::time::Instant::now();
-    lane.settle_for_read().await;
+    settle_for_read(&lane).await;
     assert_eq!(
         tokio::time::Instant::now() - started,
         LOG_SETTLE_TIMEOUT,
@@ -237,7 +244,7 @@ async fn a_read_waits_for_the_lane_its_dispatcher_records_into() {
     let started = tokio::time::Instant::now();
     {
         let _without_sink = tracing::subscriber::set_default(crate::capture::registry());
-        super::settle_for_read().await;
+        super::settle_for_read("/workspace").await;
     }
     assert_eq!(
         tokio::time::Instant::now(),
@@ -255,7 +262,7 @@ async fn a_read_waits_for_the_lane_its_dispatcher_records_into() {
             sink.with_filter(tracing_subscriber::EnvFilter::new("info")),
         ));
     let _with_sink = tracing::subscriber::set_default(subscriber);
-    super::settle_for_read().await;
+    super::settle_for_read("/workspace").await;
     assert_eq!(
         tokio::time::Instant::now() - started,
         LOG_SETTLE_TIMEOUT,
@@ -482,6 +489,7 @@ fn running_drain(task: tokio::task::JoinHandle<()>) -> RunningLogDrain {
         task,
         lane: log_capture().1.lane(),
         stop: CancellationToken::new(),
+        route: None,
     }
 }
 
@@ -517,6 +525,7 @@ async fn an_aborted_log_drain_counts_the_records_it_never_wrote() {
         task,
         lane,
         stop: CancellationToken::new(),
+        route: None,
     };
 
     let started = tokio::time::Instant::now();
@@ -576,4 +585,242 @@ fn a_full_queue_counts_each_refused_record_in_log_queue_dropped() {
     assert_eq!(dropped.unit(), "{record}");
     assert_eq!(dropped.labels(), [("error.type", "queue_full")]);
     assert_eq!(dropped.value(), &crate::SeriesValue::Sum(1.0));
+}
+
+/// The messages `store` holds, oldest first, read on a connection of its own.
+fn stored_messages(store: &LogStore) -> Vec<String> {
+    let mut records = store
+        .reader()
+        .connect()
+        .and_then(|reads| reads.recent(&LogQuery::newest(1_000)))
+        .expect("the records read");
+    records.reverse();
+    records
+        .iter()
+        .map(|stored| stored.record().message().to_owned())
+        .collect()
+}
+
+/// One record whose fields are `fields`.
+fn record_with_fields(message: &str, fields: &str) -> LogRecord {
+    LogRecord::new(
+        1,
+        "info",
+        "rift_tracing::drain",
+        "logs",
+        "logs.test",
+        message,
+        fields,
+    )
+}
+
+/// A record names its workspace in its own field, in the span it was emitted in, or in
+/// the outermost span around it, in that order; fields that name none, or do not parse,
+/// name no workspace.
+#[test]
+fn a_record_names_the_workspace_its_fields_or_spans_carry() {
+    let cases = [
+        (r#"{"workspace":"/a"}"#, Some("/a")),
+        (
+            r#"{"root_span":{"name":"mcp.request","fields":{"workspace":"/b"}}}"#,
+            Some("/b"),
+        ),
+        (
+            r#"{"root_span":{"name":"mcp.request","fields":{"workspace":"/b"}},"nearest_span":{"name":"index.read","fields":{"workspace":"/c"}}}"#,
+            Some("/c"),
+        ),
+        (
+            r#"{"workspace":"/a","root_span":{"name":"mcp.request","fields":{"workspace":"/b"}}}"#,
+            Some("/a"),
+        ),
+        (r#"{"root":"/a"}"#, None),
+        (r#"{"workspace":7}"#, None),
+        (r#"{"workspace":"/a""#, None),
+        ("{}", None),
+    ];
+    for (fields, expected) in cases {
+        assert_eq!(
+            workspace_of(&record_with_fields("routed", fields)).as_deref(),
+            expected,
+            "{fields}"
+        );
+    }
+}
+
+/// Under a routing drain, each workspace's store holds the records that name it, from a
+/// span around them or from their own field, and no other workspace's; a read in a
+/// workspace waits for that workspace's consumer. A stopped consumer leaves the routes.
+#[tokio::test]
+async fn a_routing_drain_writes_each_record_into_its_own_workspace_store() {
+    let (sink, drain) = log_capture();
+    let subscriber = crate::capture::registry()
+        .with(sink.with_filter(tracing_subscriber::EnvFilter::new("info")));
+    let _default = tracing::subscriber::set_default(subscriber);
+    let router = RunningLogDrain::spawn_routed(drain, 1_000);
+    let (_first_directory, first_store) = store().await;
+    let (_second_directory, second_store) = store().await;
+    let first = RunningLogDrain::for_workspace("/first", Arc::clone(&first_store))
+        .expect("a routing drain starts a consumer");
+    let second = RunningLogDrain::for_workspace("/second", Arc::clone(&second_store))
+        .expect("a routing drain starts a consumer");
+
+    tracing::info_span!("mcp.request", component = "mcp", workspace = "/first").in_scope(|| {
+        tracing::info_span!("index.read", component = "index")
+            .in_scope(|| tracing::info!("read inside the first workspace's request"));
+    });
+    tracing::info!(workspace = "/second", "named by its own field");
+    tracing::info!("named by nothing");
+    super::settle_for_read("/first").await;
+    super::settle_for_read("/second").await;
+
+    let first_messages = stored_messages(&first_store);
+    assert!(
+        first_messages.contains(&"read inside the first workspace's request".to_owned()),
+        "{first_messages:?}"
+    );
+    assert!(
+        first_messages.contains(&"mcp.request".to_owned()),
+        "the request's own close record names the workspace: {first_messages:?}"
+    );
+    assert_eq!(
+        stored_messages(&second_store),
+        ["named by its own field"],
+        "the second store holds its own record alone"
+    );
+
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    assert_eq!(first.stop(deadline).await, None);
+    tracing::info!(workspace = "/first", "after the first consumer stopped");
+    super::settle_for_read("/first").await;
+    assert!(
+        !stored_messages(&first_store).contains(&"after the first consumer stopped".to_owned()),
+        "a stopped consumer receives nothing"
+    );
+    assert_eq!(second.stop(deadline).await, None);
+    assert_eq!(router.stop(deadline).await, None);
+}
+
+/// A record that names no workspace, or a workspace with no consumer, reaches no store,
+/// and the routing lane still finishes with it, so no read waits on it.
+#[tokio::test]
+async fn a_record_with_no_workspace_reaches_no_store() {
+    let (sink, drain) = log_capture();
+    let settlement = Arc::clone(&sink.settlement);
+    let subscriber = crate::capture::registry()
+        .with(sink.with_filter(tracing_subscriber::EnvFilter::new("info")));
+    let _default = tracing::subscriber::set_default(subscriber);
+    let router = RunningLogDrain::spawn_routed(drain, 1_000);
+    let (_directory, store) = store().await;
+    let consumer = RunningLogDrain::for_workspace("/served", Arc::clone(&store))
+        .expect("a routing drain starts a consumer");
+
+    tracing::info!("named by nothing");
+    tracing::info!(
+        workspace = "/unserved",
+        "named by a workspace with no consumer"
+    );
+    super::settle_for_read("/served").await;
+
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    assert_eq!(consumer.stop(deadline).await, None);
+    assert_eq!(router.stop(deadline).await, None);
+    assert_eq!(count(&store), 0, "neither record reached the store");
+    assert_eq!(
+        settlement.progress.borrow().finished,
+        settlement.accepted.load(Ordering::SeqCst),
+        "the routing lane finished with every record it took"
+    );
+}
+
+/// A full consumer queue drops the routed record, counts each drop in
+/// `log.queue.dropped` with `error.type` `queue_full`, and its store holds one notice for
+/// all of them, not one record per drop.
+#[tokio::test]
+async fn a_full_workspace_queue_counts_each_drop_in_log_queue_dropped() {
+    const OVERFLOW: u32 = 5;
+    let (recorder, _records) = crate::ScopedRecorder::builder()
+        .install()
+        .expect("the default filter parses");
+    let routes = Arc::new(LogRoutes::new(10_000));
+    let upstream = Arc::new(LogSettlement::default());
+    let (_directory, store) = store().await;
+    let consumer = routes
+        .admit(&upstream, "/served", Arc::clone(&store))
+        .expect("the first consumer is admitted");
+
+    // The consumer task cannot run before this loop yields, so the queue fills.
+    for index in 0..LOG_WORKSPACE_QUEUE_RECORDS + OVERFLOW as usize {
+        routes.route(record_with_fields(
+            &format!("record {index}"),
+            r#"{"workspace":"/served"}"#,
+        ));
+    }
+    assert_eq!(
+        consumer
+            .stop(tokio::time::Instant::now() + STOP_DEADLINE)
+            .await,
+        None
+    );
+
+    let snapshot = recorder.metrics();
+    let dropped = snapshot
+        .find("log.queue.dropped", &[("error.type", "queue_full")])
+        .expect("the refused records are counted");
+    assert_eq!(
+        dropped.value(),
+        &crate::SeriesValue::Sum(f64::from(OVERFLOW))
+    );
+    let messages = stored_messages(&store);
+    assert_eq!(messages.len(), LOG_WORKSPACE_QUEUE_RECORDS + 1);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| *message == "the log queue was full and dropped records")
+            .count(),
+        1,
+        "one notice carries every drop"
+    );
+}
+
+/// A routing drain keeps at most `WORKSPACE_CONSUMERS_MAX` consumers: one more workspace
+/// starts none, and a workspace already routed is replaced, not refused.
+#[tokio::test]
+async fn routes_past_the_consumer_bound_start_no_consumer() {
+    let routes = Arc::new(LogRoutes::new(10_000));
+    let upstream = Arc::new(LogSettlement::default());
+    let (_directory, store) = store().await;
+    let mut consumers = (0..RunningLogDrain::WORKSPACE_CONSUMERS_MAX)
+        .map(|index| {
+            routes
+                .admit(&upstream, &format!("/w{index}"), Arc::clone(&store))
+                .expect("a consumer under the bound is admitted")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        routes
+            .admit(&upstream, "/one-more", Arc::clone(&store))
+            .is_none(),
+        "the bound refuses one more workspace"
+    );
+    let replaced = routes
+        .admit(&upstream, "/w0", Arc::clone(&store))
+        .expect("a routed workspace is replaced at the bound");
+    consumers.push(replaced);
+
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    for consumer in consumers {
+        assert_eq!(consumer.stop(deadline).await, None);
+    }
+    assert!(routes.consumers().is_empty(), "every stop left the routes");
+}
+
+/// A dispatcher whose lane does not route starts no workspace consumer.
+#[tokio::test]
+async fn a_lane_that_does_not_route_starts_no_consumer() {
+    let (sink, _drain) = log_capture();
+    let _default = tracing::subscriber::set_default(crate::capture::registry().with(sink));
+    let (_directory, store) = store().await;
+
+    assert!(RunningLogDrain::for_workspace("/served", store).is_none());
 }
