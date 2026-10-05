@@ -1240,6 +1240,7 @@ class ChurnPreparation(unittest.TestCase):
                 patch.object(corpus, "churn", churn),
                 patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
                 patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+                patch("rift_dev.check_corpus.LOCAL_PREPARATION_SECONDS", 0.01),
             ):
                 if failure is None:
                     asyncio.run(corpus.churn_case())
