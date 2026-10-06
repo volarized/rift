@@ -28,7 +28,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rift_mcp::{START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence, probe, stderr_file_path};
 use rift_protocol::lock::{
@@ -2519,37 +2519,12 @@ const ELECTION_FILE_NAME: &str = "server.lock";
 const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
 
 fn debug_lingering_lock(stage: &str, path: &Path) {
-    if !debug_lingering_lock_test() {
-        return;
-    }
-    let unix_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    eprintln!(
-        "DEBUG lingering shared lock {stage} unix_ns={unix_ns} pid={} path={}",
-        std::process::id(),
-        path.display(),
-    );
-}
-
-fn debug_lingering_lock_test() -> bool {
-    let test = "$a_start_lost_to_a_lingering_shared_lock_spawns_again";
-    std::env::var_os("NEXTEST_ATTEMPT_ID")
-        .is_some_and(|attempt| attempt.to_string_lossy().ends_with(test))
-}
-
-fn debug_lingering_output(label: &str, path: &Path) {
-    if !debug_lingering_lock_test() {
-        return;
-    }
-    let unix_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let content = fs::read_to_string(path).unwrap_or_else(|error| format!("<read error: {error}>"));
-    eprintln!(
-        "DEBUG lingering start output {label} unix_ns={unix_ns} pid={} path={} content={content:?}",
-        std::process::id(),
-        path.display(),
+    rift_tracing::debug!(
+        component = "mcp",
+        stage,
+        pid = std::process::id(),
+        path = %path.display(),
+        "lingering shared lock test"
     );
 }
 
@@ -2619,8 +2594,6 @@ fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     drop(lingering);
     debug_lingering_lock("handle dropped", &election_path);
     let status = start.wait()?;
-    debug_lingering_output("stdout", &stdout_path);
-    debug_lingering_output("stderr", &stderr_path);
     lost?;
 
     let stdout = fs::read_to_string(&stdout_path)?;
