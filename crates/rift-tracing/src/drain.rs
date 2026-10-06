@@ -314,10 +314,10 @@ impl LogDrain {
     ///
     /// Records are written in batches: the task takes what the queue holds, waits
     /// `LOG_FLUSH_INTERVAL` for more, and writes at most [`LOG_BATCH_RECORDS_MAX`] per
-    /// call, [`LOG_WORKSPACE_QUEUE_RECORDS`] for a workspace consumer. Each write trims the store back to `retention_records`. A batch the store
-    /// refuses is kept and retried every `LOG_WRITE_RETRY_INTERVAL` until it lands;
-    /// the first refusal of a batch is reported once to stderr, never into the queue the
-    /// drain is failing to write.
+    /// call, `LOG_WORKSPACE_QUEUE_RECORDS` for a workspace consumer. Each write trims the
+    /// store back to `retention_records`. A batch the store refuses is kept and retried
+    /// every `LOG_WRITE_RETRY_INTERVAL` until it lands; the first refusal of a batch is
+    /// reported once to stderr, never into the queue the drain is failing to write.
     ///
     /// # Cancel safety
     ///
