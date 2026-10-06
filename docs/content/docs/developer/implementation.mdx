@@ -777,12 +777,18 @@ keeps every span, so a record names a span its own filter left out, and stderr a
 write the same record. A dependency's span with neither `component` nor `operation`, such as
 `rmcp`'s `serve_inner`, takes no part: the Rift span inside it is the root.
 
+`rift mcp` opens `mcp.forward` with `request_id` empty and records the forwarded request's id
+once rmcp sends it, so the proxy's lines join the server's request group; records before the
+send carry none.
+
 `traced!`, `#[rift_tracing::timed]`, `info_span!`, `debug_span!`, and the event macros record
 `code.function.name`, the function that opened the span or emitted the event, read from the
 `type_name` of an item declared in its body; the format of that text is unspecified, so no
 filter or query selects by it. A tool call's `mcp.request` span carries `mcp.method.name`,
-`gen_ai.tool.name`, and `workspace`, the workspace root, beside `request_id` and `tool`. A close record carries `busy_ns` and `idle_ns` beside
-`elapsed_ms`, the nanoseconds the span was entered and was not, and `status.code`: `Ok`, or
+`gen_ai.tool.name`, and `workspace`, the workspace root, beside `request_id` and `tool`. A close record carries `busy_ns` and `idle_ns`,
+the nanoseconds the span was entered and was not, `elapsed_ms`, the time from the span's opening
+to the end of its `traced!` operation, the reading the duration histogram records, and
+`status.code`: `Ok`, or
 `Error` with `error.type` `panic` for a span closed while its thread unwinds a panic and
 `cancelled` for an awaited `traced!` operation dropped after its first poll. The
 `worker admission started` record of a search request carries:
@@ -853,7 +859,8 @@ function, three spaces, the context, two spaces, the nested operation, and the m
   follows a `status.code` of `Error`, any `error.type`, or an `outcome` other than `ok` or
   `acquired` that the span recorded itself, as a failed `index.build` records `error`. The
   close record states the same `status.code`, and so does `traces.span.metrics.calls` for a
-  `traced!` operation, with `error.type` `_OTHER` for a recorded value it does not list. A
+  `traced!` operation, with the recorded `error.type` when it is `panic`, `cancelled`,
+`timeout`, `refused`, or a registered error identity, and `_OTHER` otherwise. A
   lifecycle record prints its mark before its message: `→` for `phase=start`, `✓` for
   `outcome=ok`, `✗` for any other `outcome`. Any other record prints its message, then its own
   fields sorted by key.
@@ -899,8 +906,9 @@ and the SDK records a label set past that into one series carrying `otel.metric.
 `ScopedRecorder::metrics`. Every `traced!` operation records `traces.span.metrics.calls` and
 `traces.span.metrics.duration`, in seconds, labeled with its `span.name`, its `span.kind`,
 `Internal`, and its outcome as `status.code`, with `error.type` `panic` or `cancelled` when it did not finish. The metrics follow
-the operation, not its span: a span clone held elsewhere does not lengthen the duration, and the
-span's filters do not select it.
+the operation, not its span: the duration is read once, at the operation's end, and the close
+record's `elapsed_ms` states the same reading, so a span clone held elsewhere lengthens neither,
+and the span's filters do not select it.
 
 <VersionBadge version="v0.0.62" />
 
@@ -914,6 +922,8 @@ also names `mcp.protocol.version`, the version rmcp knows or `_OTHER`, and `netw
 `nodes`, or `search`. A tool answered with `isError` records `error.type` `tool_error`; a
 JSON-RPC error records its code as both `error.type` and `rpc.response.status_code`, such as
 `-32602`, or `error.type` `_OTHER` for a code outside the JSON-RPC, MCP, and Rift codes.
+`rift server` serves MCP statelessly through `NeverSessionManager` and records no session
+duration.
 
 Each `.rift/index` and `.rift/vectors` operation records `db.client.operation.duration` with
 `db.system.name` `sqlite`, `db.namespace`, and `db.operation.name`; a failed one adds
@@ -925,8 +935,12 @@ its stop records `close`. A
 transaction records `sqlite.transaction.duration` by `sqlite.transaction.result`,
 `commit` or `rollback`, and `sqlite.transaction.statement.count`. Each append to `.rift/metrics`
 records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
-`sqlite.transaction.duration`, and `sqlite.commit.duration` under `db.namespace` `metrics`. Its
-open records `PRAGMA wal_checkpoint(TRUNCATE)` and its close `PRAGMA wal_checkpoint(NOOP)` and
+`sqlite.transaction.duration`, `sqlite.commit.duration`, and
+`sqlite.transaction.statement.count` under `db.namespace` `metrics`, and its inserts and its trim
+as `insert` and `trim` in `db.client.operation.duration`; each read connection records `connect`
+and each page or count it reads `query`. The history store records `connect`, `insert`, `trim`,
+`query`, and `sqlite.transaction.statement.count` under `db.namespace` `history`. The metrics
+database's open records `PRAGMA wal_checkpoint(TRUNCATE)` and its close `PRAGMA wal_checkpoint(NOOP)` and
 `close` in `db.client.operation.duration`.
 
 The index supervisor counts `index.rebuilds` by `index.rebuild.trigger`: `startup` for the
@@ -989,7 +1003,8 @@ export interval while the global queue grows names a blocked runtime worker.
 
 The owners of a quantity read it the same way. Each open `.rift/index`, `.rift/vectors`, and
 `.rift/metrics` database reports `sqlite.file.size` for the database file and its write-ahead
-log, from file metadata, `sqlite.queue.length`, the commands waiting for its worker, and
+log, from file metadata, as the history store's filler does under `db.namespace` `history` while
+it holds the fill lock, `sqlite.queue.length`, the commands waiting for its worker, and
 `sqlite.page.count` by `sqlite.page.state`, `used` or `free`, from the page and freelist counts in
 the file header, which change at a checkpoint. The index and vectors databases also report
 `sqlite.transaction.active`, the transactions begun on the worker's connections and not ended,
