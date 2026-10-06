@@ -12,9 +12,10 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use super::{
     EVENT_SPAN_MEMBERS_BYTES_MAX, LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields,
     SPAN_FIELDS_BYTES_MAX, SpanContextLayer, install_panic_hook, log_capture, panic_payload,
-    quoted,
 };
-use crate::{LOG_LABEL_BYTES_MAX, LogDrain, LogRecord};
+use crate::{
+    LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogDrain, LogLines, LogQuery, LogRecord, LogStore,
+};
 
 /// Drains what the queue currently holds, without a store.
 fn queued(drain: &mut LogDrain) -> Vec<LogRecord> {
@@ -658,12 +659,104 @@ fn a_panic_payload_cut_moves_back_to_a_character_boundary() {
     assert!(cut.chars().all(|character| character == '€'));
 }
 
+/// A member holding `"`, `\`, a newline, and a C0 control is escaped by `serde_json`, in
+/// an event's own fields and in the span object it carries.
 #[test]
-fn a_json_string_escapes_what_json_reserves() {
+fn a_member_holding_what_json_reserves_is_escaped() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("mcp.request", path = "C:\\work\\\"a\"\nb");
+        span.in_scope(|| tracing::info!(text = "a\"b\\c\n\r\t\u{0001}d", "escaped"));
+    });
+
+    let records = events(queued(&mut drain));
     assert_eq!(
-        quoted("a\"b\\c\n\r\t\u{0001}d"),
-        "\"a\\\"b\\\\c\\n\\r\\t\\u0001d\""
+        records[0].fields(),
+        "{\"text\":\"a\\\"b\\\\c\\n\\r\\t\\u0001d\",\"root_span\":{\"name\":\"mcp.request\",\
+         \"fields\":{\"path\":\"C:\\\\work\\\\\\\"a\\\"\\nb\"}}}"
     );
+}
+
+/// An event's own members keep the order the event recorded them in, not the order of
+/// their names, and its span members follow them.
+#[test]
+fn an_event_keeps_the_order_it_recorded_its_members_in() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("mcp.request", zeta = 1, alpha = 2);
+        span.in_scope(|| tracing::info!(zulu = 1, bravo = 2, mike = 3, "ordered"));
+    });
+
+    let records = events(queued(&mut drain));
+    assert_eq!(
+        records[0].fields(),
+        "{\"zulu\":\"1\",\"bravo\":\"2\",\"mike\":\"3\",\"root_span\":{\"name\":\"mcp.request\",\
+         \"fields\":{\"zeta\":\"1\",\"alpha\":\"2\"}}}"
+    );
+}
+
+/// An event whose own members run past [`LOG_FIELDS_BYTES_MAX`] keeps the members that fit
+/// whole and its span member, counts the one left out, and stays a JSON object.
+#[test]
+fn an_event_past_the_record_field_bound_records_the_members_that_fit() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+    let long = "\"".repeat(LOG_FIELDS_BYTES_MAX / 2);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("mcp.request", request_id = 7);
+        span.in_scope(|| tracing::info!(first = 1, detail = long.as_str(), last = 2, "cut"));
+    });
+
+    let records = events(queued(&mut drain));
+    let fields = records[0].fields();
+    assert!(fields.len() <= LOG_FIELDS_BYTES_MAX, "{}", fields.len());
+    assert_eq!(
+        fields,
+        "{\"first\":\"1\",\"last\":\"2\",\"root_span\":{\"name\":\"mcp.request\",\
+         \"fields\":{\"request_id\":\"7\"}},\"fields_left_out\":\"1\"}"
+    );
+}
+
+/// A record with nested spans and escaped members reads back from the store with the bytes
+/// the capture wrote, parses and writes again to those bytes as `rift://logs` carries them,
+/// and prints the same line read back as queued.
+#[tokio::test]
+async fn a_record_reads_back_with_the_bytes_the_capture_wrote()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+    tracing::subscriber::with_default(subscriber, || {
+        let root = tracing::info_span!("mcp.request", component = "mcp", request_id = 7);
+        let _root = root.enter();
+        let nearest = tracing::info_span!("index.build", path = "a\\b \"c\"\nd");
+        nearest.in_scope(|| tracing::info!(zulu = "x\ty", alpha = 2, "nested"));
+    });
+    let queued = events(queued(&mut drain));
+    let directory = tempfile::tempdir()?;
+    let store = LogStore::open(&directory.path().join("metrics"), None).await?;
+
+    store.append(queued.clone(), 1_000).await?;
+
+    let read = store.reader().connect()?.recent(&LogQuery::newest(10))?;
+    assert_eq!(read.len(), 1);
+    let stored = read[0].record();
+    assert_eq!(stored.fields(), queued[0].fields());
+    let parsed =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(stored.fields())?;
+    assert_eq!(
+        serde_json::Value::Object(parsed).to_string(),
+        queued[0].fields()
+    );
+    assert_eq!(
+        LogLines::stored_page().lines([stored]),
+        LogLines::stored_page().lines(&queued)
+    );
+    Ok(())
 }
 
 #[test]

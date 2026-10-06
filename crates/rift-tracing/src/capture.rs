@@ -11,11 +11,12 @@
 //! failure here, because the alternative is a log write pausing the code being logged.
 
 use std::cell::RefCell;
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::{Map, Value};
 use tokio::sync::mpsc::{self, Sender, error::TrySendError};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -604,7 +605,6 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     let span = context.span(id)?;
-    let mut fields = String::from("{");
     let extensions = span.extensions();
     let entry = extensions.get::<SpanEntry>()?;
     let labels = entry.node.labels();
@@ -612,31 +612,31 @@ where
         busy_ns, idle_ns, ..
     } = entry.timings;
     let elapsed_ms = entry.timings.elapsed_ns() / 1_000_000;
-    if labels.fields.write_into(&mut fields) {
-        fields.push(',');
+    let mut own = labels.fields.object();
+    for (member, value) in [
+        ("span", "closed".to_owned()),
+        ("elapsed_ms", elapsed_ms.to_string()),
+        (BUSY_MEMBER, busy_ns.to_string()),
+        (IDLE_MEMBER, idle_ns.to_string()),
+    ] {
+        own.insert(member.to_owned(), Value::String(value));
     }
-    let _ = write!(
-        fields,
-        "\"span\":\"closed\",\"elapsed_ms\":\"{elapsed_ms}\",\"{BUSY_MEMBER}\":\"{busy_ns}\",\
-         \"{IDLE_MEMBER}\":\"{idle_ns}\","
-    );
-    if labels.error_type.is_some() {
-        let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Error\"");
-    } else if std::thread::panicking() {
-        let _ = write!(
-            fields,
-            "\"{STATUS_CODE_MEMBER}\":\"Error\",\"{ERROR_TYPE_MEMBER}\":\"panic\""
-        );
-    } else if labels.failed_outcome.is_some() {
-        let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Error\"");
-    } else {
-        let _ = write!(fields, "\"{STATUS_CODE_MEMBER}\":\"Ok\"");
+    let panicked = labels.error_type.is_none() && std::thread::panicking();
+    let completed = labels.error_type.is_none() && !panicked && labels.failed_outcome.is_none();
+    let status = if completed { "Ok" } else { "Error" };
+    own.insert(STATUS_CODE_MEMBER.to_owned(), Value::from(status));
+    if panicked {
+        own.insert(ERROR_TYPE_MEMBER.to_owned(), Value::from("panic"));
     }
     let (component, operation) = (labels.component.clone(), labels.operation.clone());
     drop(labels);
-    push_span_member(&mut fields, ROOT_SPAN_MEMBER, entry.node.root.as_deref());
+    let root = entry.node.root.clone();
     drop(extensions);
-    fields.push('}');
+    let spans = root
+        .as_deref()
+        .map(|root| (ROOT_SPAN_MEMBER, root))
+        .into_iter()
+        .collect::<Vec<_>>();
     Some(LogRecord::new(
         now_ms(),
         span.metadata().level().as_str(),
@@ -644,7 +644,7 @@ where
         &component,
         &operation,
         span.name(),
-        &fields,
+        &record_fields(own, &spans),
     ))
 }
 
@@ -657,23 +657,27 @@ where
 {
     let mut fields = RecordedFields::default();
     event.record(&mut fields);
-    let mut members = fields.members();
     let RecordedFields {
         message,
         mut component,
         mut operation,
-        rest: _,
+        rest,
     } = fields;
-    if let Some(nearest) = event_span(event, context) {
+    let nearest = event_span(event, context);
+    let mut spans = Vec::with_capacity(2);
+    if let Some(nearest) = nearest.as_deref() {
         nearest.inherited(&mut component, &mut operation);
         match nearest.root.as_deref() {
             Some(root) => {
-                push_span_member(&mut members, ROOT_SPAN_MEMBER, Some(root));
-                push_span_member(&mut members, NEAREST_SPAN_MEMBER, Some(&nearest));
+                spans.push((ROOT_SPAN_MEMBER, root));
+                spans.push((NEAREST_SPAN_MEMBER, nearest));
             }
-            None => push_span_member(&mut members, ROOT_SPAN_MEMBER, Some(&nearest)),
+            None => spans.push((ROOT_SPAN_MEMBER, nearest)),
         }
     }
+    let own = rest
+        .into_iter()
+        .map(|(name, value)| (name, Value::String(value)));
     LogRecord::new(
         now_ms(),
         event.metadata().level().as_str(),
@@ -681,22 +685,44 @@ where
         &component,
         &operation,
         &message,
-        &format!("{{{members}}}"),
+        &record_fields(own, &spans),
     )
 }
 
-/// Appends the object `span` keeps for the records inside it to `members`, under `member`.
+/// One record's fields as the JSON object `serde_json` writes: the `own` members in the
+/// order given, then the object each of `spans` keeps under its member name, at most
+/// [`LOG_FIELDS_BYTES_MAX`] bytes.
 ///
-/// The object was written when the span opened and when it recorded a field, so a record
-/// pays one copy of at most [`SPAN_CONTEXT_BYTES_MAX`] bytes per span member.
-fn push_span_member(members: &mut String, member: &str, span: Option<&SpanNode>) {
-    let Some(span) = span else {
-        return;
-    };
-    if !(members.is_empty() || members.ends_with('{')) {
-        members.push(',');
+/// The span objects are counted first and always fit (see [`EVENT_SPAN_MEMBERS_BYTES_MAX`]);
+/// an own member that does not fit whole in the bytes they leave is left out, and the count
+/// of members left out follows as [`FIELDS_LEFT_OUT_MEMBER`]. Each span object was written
+/// when the span opened and when it recorded a field, so a record pays one copy of at most
+/// [`SPAN_CONTEXT_BYTES_MAX`] bytes per span member.
+fn record_fields(
+    own: impl IntoIterator<Item = (String, Value)>,
+    spans: &[(&'static str, &SpanNode)],
+) -> String {
+    let maximum = LOG_FIELDS_BYTES_MAX - "{}".len() - FIELDS_LEFT_OUT_BYTES_MAX;
+    let contexts = spans
+        .iter()
+        .map(|(member, span)| {
+            let labels = span.labels();
+            (*member, labels.context.clone(), labels.context_bytes)
+        })
+        .collect::<Vec<_>>();
+    let reserved = contexts
+        .iter()
+        .map(|(member, _, bytes)| ",".len() + member_bytes(member, *bytes))
+        .sum::<usize>();
+    let mut members = BoundedMembers::new(maximum.saturating_sub(reserved));
+    for (name, value) in own {
+        members.push(name, value);
     }
-    let _ = write!(members, "\"{member}\":{}", span.labels().context);
+    members.maximum = maximum;
+    for (member, context, bytes) in contexts {
+        members.push_measured(member.to_owned(), context, bytes);
+    }
+    Value::Object(members.into_object()).to_string()
 }
 
 /// What one span keeps for the records written while it is open: its labels, its fields,
@@ -707,22 +733,23 @@ fn push_span_member(members: &mut String, member: &str, span: Option<&SpanNode>)
 /// them, which is what makes a component read return a lane's whole story rather than the
 /// lines that repeated the label.
 ///
-/// `fields` carries every other field the span recorded, as JSON object members, so the
-/// close record says what the span did and not only that it ended. `context` is the
-/// object an event record carries for the span, `{"name":…,"fields":{…}}`, its `fields`
-/// holding `component`, `operation`, and the span's other fields. Both member sets keep
-/// [`SPAN_FIELDS_BYTES_MAX`]. `context` is written when the span opens and again when it
-/// records a field, never per event. `error_type` holds the operation metrics' label of
-/// the `error.type` the span recorded, and `failed_outcome` that of an `outcome` it
-/// recorded that is not a completion, so its close states it did not complete.
+/// `fields` carries every other field the span recorded, so the close record says what the
+/// span did and not only that it ended. `context` is the object an event record carries for
+/// the span, `{"name":…,"fields":{…}}`, its `fields` holding `component`, `operation`, and
+/// the span's other fields, and `context_bytes` its length as `serde_json` writes it. Both
+/// member sets keep [`SPAN_FIELDS_BYTES_MAX`]. `context` is built when the span opens and
+/// again when it records a field, never per event. `error_type` holds the operation
+/// metrics' label of the `error.type` the span recorded, and `failed_outcome` that of an
+/// `outcome` it recorded that is not a completion, so its close states it did not complete.
 #[derive(Debug)]
 struct SpanLabels {
     component: String,
     operation: String,
-    fields: SpanFields,
-    context_fields: SpanFields,
-    quoted_name: String,
-    context: String,
+    fields: BoundedMembers,
+    context_fields: BoundedMembers,
+    name: String,
+    context: Value,
+    context_bytes: usize,
     error_type: Option<&'static str>,
     failed_outcome: Option<&'static str>,
 }
@@ -733,19 +760,20 @@ impl SpanLabels {
     fn opened(name: &str, fields: &RecordedFields) -> Self {
         let component = bounded(&fields.component, LOG_LABEL_BYTES_MAX);
         let operation = bounded(&fields.operation, LOG_LABEL_BYTES_MAX);
-        let mut context_fields = SpanFields::default();
+        let mut context_fields = BoundedMembers::new(SPAN_FIELDS_BYTES_MAX);
         for (label, value) in [("component", &component), ("operation", &operation)] {
             if !value.is_empty() {
-                context_fields.push(label, value);
+                context_fields.push(label.to_owned(), Value::from(value.as_str()));
             }
         }
         let mut labels = Self {
             component,
             operation,
-            fields: SpanFields::default(),
+            fields: BoundedMembers::new(SPAN_FIELDS_BYTES_MAX),
             context_fields,
-            quoted_name: quoted(&bounded(name, LOG_LABEL_BYTES_MAX)),
-            context: String::new(),
+            name: bounded(name, LOG_LABEL_BYTES_MAX),
+            context: Value::Null,
+            context_bytes: 0,
             error_type: None,
             failed_outcome: None,
         };
@@ -753,9 +781,9 @@ impl SpanLabels {
         labels
     }
 
-    /// Appends `rest` to both member sets and writes `context` again.
+    /// Appends `rest` to both member sets and builds `context` again.
     fn extend(&mut self, rest: &[(String, String)]) {
-        if rest.is_empty() && !self.context.is_empty() {
+        if rest.is_empty() && !self.context.is_null() {
             return;
         }
         for (name, value) in rest {
@@ -764,17 +792,15 @@ impl SpanLabels {
             } else if name == OUTCOME_FIELD {
                 self.failed_outcome = (!completed_outcome(value)).then(|| error_type_label(value));
             }
-            self.fields.push(name, value);
-            self.context_fields.push(name, value);
+            self.fields.push(name.clone(), Value::from(value.as_str()));
+            self.context_fields
+                .push(name.clone(), Value::from(value.as_str()));
         }
-        self.context.clear();
-        let _ = write!(
-            self.context,
-            "{{\"name\":{},\"fields\":{{",
-            self.quoted_name
-        );
-        self.context_fields.write_into(&mut self.context);
-        self.context.push_str("}}");
+        self.context = serde_json::json!({
+            "name": self.name,
+            "fields": self.context_fields.object(),
+        });
+        self.context_bytes = serialized_bytes(&self.context);
     }
 }
 
@@ -790,46 +816,84 @@ impl SpanLabels {
     }
 }
 
-/// One span's field members as JSON object text, without the enclosing braces, at most
-/// [`SPAN_FIELDS_BYTES_MAX`] bytes, with the count of the members left out at that bound.
-#[derive(Debug, Default)]
-struct SpanFields {
-    members: String,
+/// Field members of one JSON object, at most `maximum` bytes of members as `serde_json`
+/// writes them, without the enclosing braces, with the count of the members left out at
+/// that bound.
+///
+/// A member is kept whole or left out, so the object stays well formed. A member pushed
+/// again under a name the set holds replaces the value in its place, as a JSON reader keeps
+/// the last of two members of one name.
+#[derive(Clone, Debug)]
+struct BoundedMembers {
+    members: Map<String, Value>,
+    bytes: usize,
+    maximum: usize,
     left_out: u64,
 }
 
-impl SpanFields {
+impl BoundedMembers {
+    /// An empty set bounded at `maximum` bytes.
+    fn new(maximum: usize) -> Self {
+        Self {
+            members: Map::new(),
+            bytes: 0,
+            maximum,
+            left_out: 0,
+        }
+    }
+
     /// Appends the member `name`: `value` when it fits whole, and counts it left out when
     /// it does not.
-    fn push(&mut self, name: &str, value: &str) {
-        let member = format!("{}:{}", quoted(name), quoted(value));
-        let separator = usize::from(!self.members.is_empty());
-        if self.members.len() + separator + member.len() > SPAN_FIELDS_BYTES_MAX {
+    fn push(&mut self, name: String, value: Value) {
+        let bytes = serialized_bytes(&value);
+        self.push_measured(name, value, bytes);
+    }
+
+    /// [`Self::push`] of a `value` `serde_json` writes in `value_bytes` bytes.
+    fn push_measured(&mut self, name: String, value: Value, value_bytes: usize) {
+        let member = member_bytes(&name, value_bytes);
+        let bytes = match self.members.get(&name) {
+            Some(held) => self.bytes - member_bytes(&name, serialized_bytes(held)) + member,
+            None => self.bytes + usize::from(!self.members.is_empty()) * ",".len() + member,
+        };
+        if bytes > self.maximum {
             self.left_out = self.left_out.saturating_add(1);
             return;
         }
-        if separator == 1 {
-            self.members.push(',');
-        }
-        self.members.push_str(&member);
+        self.bytes = bytes;
+        self.members.insert(name, value);
     }
 
-    /// Writes the members into `out`, then [`FIELDS_LEFT_OUT_MEMBER`] when a member was
-    /// left out. Returns whether it wrote anything.
-    fn write_into(&self, out: &mut String) -> bool {
-        out.push_str(&self.members);
+    /// The members, then [`FIELDS_LEFT_OUT_MEMBER`] when a member was left out.
+    fn object(&self) -> Map<String, Value> {
+        self.clone().into_object()
+    }
+
+    /// [`Self::object`], taking the members.
+    fn into_object(self) -> Map<String, Value> {
+        let mut members = self.members;
         if self.left_out > 0 {
-            if !self.members.is_empty() {
-                out.push(',');
-            }
-            let _ = write!(out, "\"{FIELDS_LEFT_OUT_MEMBER}\":\"{}\"", self.left_out);
+            members.insert(
+                FIELDS_LEFT_OUT_MEMBER.to_owned(),
+                Value::String(self.left_out.to_string()),
+            );
         }
-        !self.members.is_empty() || self.left_out > 0
+        members
     }
 }
 
+/// Bytes `serde_json` writes for the member `name` holding a value of `value_bytes` bytes.
+fn member_bytes(name: &str, value_bytes: usize) -> usize {
+    serialized_bytes(&Value::from(name)) + ":".len() + value_bytes
+}
+
+/// Bytes of `value` as `serde_json` writes it, without whitespace.
+fn serialized_bytes(value: &Value) -> usize {
+    value.to_string().len()
+}
+
 /// The fields one event or span recorded: its message, the two labels the codebase
-/// files diagnostics under, and everything else as JSON.
+/// files diagnostics under, and everything else as text, in the order they were recorded.
 #[derive(Debug, Default)]
 struct RecordedFields {
     message: String,
@@ -839,23 +903,15 @@ struct RecordedFields {
 }
 
 impl RecordedFields {
-    /// The remaining fields as JSON object members, without the enclosing braces, in the
-    /// order they were recorded.
-    fn members(&self) -> String {
-        let mut members = String::new();
-        for (index, (name, value)) in self.rest.iter().enumerate() {
-            if index > 0 {
-                members.push(',');
-            }
-            let _ = write!(members, "{}:{}", quoted(name), quoted(value));
-        }
-        members
-    }
-
     /// The remaining fields as a JSON object, always well formed.
     #[cfg(test)]
     fn rendered(&self) -> String {
-        format!("{{{}}}", self.members())
+        record_fields(
+            self.rest
+                .iter()
+                .map(|(name, value)| (name.clone(), Value::from(value.as_str()))),
+            &[],
+        )
     }
 
     /// Files one recorded field under the member it belongs to.
@@ -894,11 +950,6 @@ impl Visit for RecordedFields {
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
         self.record(field, value.to_string());
     }
-}
-
-/// One JSON string, escaped by `serde_json`.
-fn quoted(value: &str) -> String {
-    serde_json::Value::from(value).to_string()
 }
 
 /// Installs the panic hook that records a panic before the default hook prints it.

@@ -8,7 +8,9 @@ pub const LOG_BATCH_RECORDS_MAX: usize = 4_096;
 /// truncated at a character boundary rather than refused: a log record exists
 /// to be read back, and half of it read back beats none.
 pub const LOG_MESSAGE_BYTES_MAX: usize = 8_192;
-/// Maximum UTF-8 bytes kept for one record's rendered fields.
+/// Maximum UTF-8 bytes kept for one record's rendered fields. The capture writes them
+/// through `serde_json` within this bound: a member is kept whole or left out, and the
+/// count of members left out follows as `fields_left_out`.
 pub const LOG_FIELDS_BYTES_MAX: usize = 8_192;
 /// Maximum UTF-8 bytes kept for one record's level, target, component, or
 /// operation. These are short by construction; the bound stops a caller's
@@ -109,7 +111,9 @@ impl LogRecord {
     /// its `fields`: `component`, `operation`, then the span's other fields as it recorded
     /// them, cut at 1 KiB with the count of the members left out as `fields_left_out`. A
     /// span close record carries the span's own fields, `span`, and `elapsed_ms`, then
-    /// `root_span` when the span closed inside another.
+    /// `root_span` when the span closed inside another. Members keep the order they were
+    /// recorded in. An own member that does not fit [`LOG_FIELDS_BYTES_MAX`] whole beside
+    /// the span members is left out, and the count follows as `fields_left_out`.
     #[must_use]
     pub fn fields(&self) -> &str {
         &self.fields
