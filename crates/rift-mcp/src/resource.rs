@@ -250,44 +250,28 @@ fn logs_json(uri: &str, page: &LogsPage<'_>) -> Value {
     body
 }
 
-/// One stored record as the view the text and the JSON are both made from. `fields` is the
-/// object it was rendered from when it parses, and the text when it does not, so a reader never
-/// has to unquote JSON out of a string.
+/// One stored record as the view the text and the JSON are both made from.
 fn log_line(stored: &StoredLogRecord) -> LogLine<'_> {
-    let record = stored.record();
     LogLine {
         identity: stored.identity(),
-        recorded_at_ms: record.recorded_at_ms(),
-        level: record.level(),
-        target: record.target(),
-        component: record.component(),
-        operation: record.operation(),
-        message: record.message(),
-        fields: LogFields::parse(record.fields()),
+        record: stored.record(),
     }
 }
 
-/// One record of the view as the JSON wire carries it.
+/// One record of the view as the JSON wire carries it. `fields` is the object it was rendered
+/// from when it parses, and the text when it does not, so a reader never has to unquote JSON out
+/// of a string.
 fn record_json(line: &LogLine<'_>) -> Value {
-    let LogLine {
-        identity,
-        recorded_at_ms,
-        level,
-        target,
-        component,
-        operation,
-        message,
-        fields,
-    } = line;
+    let LogLine { identity, record } = line;
     json!({
         "identity": identity,
-        "recorded_at_ms": recorded_at_ms,
-        "level": level,
-        "target": target,
-        "component": component,
-        "operation": operation,
-        "message": message,
-        "fields": fields.to_json(),
+        "recorded_at_ms": record.recorded_at_ms(),
+        "level": record.level(),
+        "target": record.target(),
+        "component": record.component(),
+        "operation": record.operation(),
+        "message": record.message(),
+        "fields": LogFields::parse(record.fields()).to_json(),
     })
 }
 
@@ -507,8 +491,9 @@ mod tests {
         assert_eq!(
             contents(&rendered, LOGS_URI).0,
             "2 records\n\
-             \t2026-10-04 10:42:07.120 info - - · not an object\n\
-             \t1970-01-01 00:00:00.007 warn index index.reconcile: the capture disagreed · epoch 4\n"
+             \t2026-10-04 10:42:07.120Z INFO  rift_mcp::server   not an object\n\
+             \t1970-01-01 00:00:00.007Z WARN  rift_mcp::server   component=index \
+             operation=index.reconcile epoch=4  the capture disagreed\n"
         );
     }
 

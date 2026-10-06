@@ -428,6 +428,19 @@ fn a_timestamp_prints_utc_with_milliseconds_and_z() {
     );
 }
 
+/// A millisecond count outside the range of a jiff timestamp prints as the count.
+#[test]
+fn a_timestamp_outside_the_range_of_jiff_prints_the_count() {
+    for count in [
+        253_402_207_200_001,
+        -377_705_023_201_001,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        assert_eq!(rendered_timestamp(count), count.to_string());
+    }
+}
+
 /// A message or a field value holding ` · ` or `: ` prints as a JSON string; `a:b` holds
 /// neither and prints as it is. Fields that are not a JSON object follow the same rule.
 #[test]

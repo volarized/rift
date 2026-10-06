@@ -1,4 +1,5 @@
-//! One record as the line stderr, `rift server logs`, and a failure window print.
+//! One record as the line stderr, `rift server logs`, the text of `rift://logs`, and a
+//! failure window print.
 //!
 //! A line holds, in order: the time in UTC, the level, the function, the context, the
 //! nested operation, and the message.
@@ -104,7 +105,7 @@ impl LogRecord {
 
 /// Prints records as lines: one record per line, a blank line between two groups.
 ///
-/// A stored page, `rift server logs` and a failure window, holds every record of a call
+/// A stored page, `rift server logs`, `rift://logs`, and a failure window, holds every record of a call
 /// and pads each column to the widest value of its group; a live stream, stderr and
 /// `rift server logs --follow`, pads to fixed widths. Both remember the group of the last
 /// line they printed, so the records of one run printed over several calls break where
@@ -148,11 +149,12 @@ impl LogLines {
         }
     }
 
-    /// The lines of `records`, oldest first, each ending in a newline, with a blank line
-    /// wherever the group changes, including against the last record of the previous call.
+    /// The lines of `records`, in the order given, each ending in a newline, with a blank
+    /// line wherever the group changes, including against the last record of the previous
+    /// call.
     #[must_use]
-    pub fn lines(&mut self, records: &[LogRecord]) -> String {
-        let parts = records.iter().map(LineParts::of).collect::<Vec<_>>();
+    pub fn lines<'a>(&mut self, records: impl IntoIterator<Item = &'a LogRecord>) -> String {
+        let parts = records.into_iter().map(LineParts::of).collect::<Vec<_>>();
         let mut text = String::new();
         let mut start = 0;
         while start < parts.len() {
