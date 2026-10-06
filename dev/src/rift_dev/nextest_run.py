@@ -31,6 +31,7 @@ Each part prints at most its named bound and says what the bound cut.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import platform
 import re
@@ -43,6 +44,7 @@ from pathlib import Path
 import tomllib
 
 from rift_dev.commands import REPOSITORY, Command, CommandFailed
+from rift_dev.progress import finish, start
 from rift_dev.trace import (
     PID_KEY,
     SPAN_REQUEST_KEY,
@@ -88,8 +90,13 @@ INSTRUMENT_LINES_MAX = 400
 OPEN_LINES_MAX = 100
 OUTPUT_LINES_MAX = 2_000
 STDERR_BYTES_MAX = 64 * 1024
-# How long the runner waits for nextest to exit once its output closed.
+# Bytes retained from one nextest invocation's raw output.
+RUN_LOG_BYTES_MAX = 16 * 1024 * 1024
+# How long the runner waits for nextest to exit once its output closes.
 EXIT_WAIT_SECONDS = 60.0
+# Decoded telemetry lines retained for each passing test and their run artifact.
+CASE_EVIDENCE_LINES_MAX = 40
+CASE_EVIDENCE_BYTES_MAX = 16 * 1024 * 1024
 # Characters one report line keeps.
 LINE_CHARS_MAX = 2_000
 # The log record message an operation declared with `open = true` opens with
@@ -492,55 +499,126 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     shown = " ".join([command.program, *command.arguments])
     arguments_seen = list(arguments if arguments is not None else command.arguments)
     profile = profile_of(arguments_seen)
+    progress_started = start("tests")
     started = time.time()
     cases = CaseStore()
     outcomes: dict[str, Outcome] = {}
-    with collector(cases=cases) as served:
-        # A test process that installs Rift's tracing itself must not export: its
-        # in-process export would differ from the runs the test was written for. The
-        # harness removes the variable from every `rift` process it spawns.
-        command.with_env(
-            **served.environment(), **{SDK_DISABLED: "true", RECORDER_STREAM: "1"}
+    log_path = REPORT_DIRECTORY / f"nextest-{profile}-{time.time_ns()}.log"
+    evidence_path = log_path.with_suffix(".telemetry.txt")
+    REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    log_kept = 0
+    log_dropped = 0
+    evidence_kept = 0
+    evidence_dropped = 0
+    pending = bytearray()
+    reading: Outcome | None = None
+    opened = False
+    status: int | None = None
+    stream_error: BaseException | None = None
+
+    def capture_passing(outcome: Outcome) -> None:
+        nonlocal evidence_kept, evidence_dropped
+        for name in cases.matching(outcome.names):
+            held = cases.take(name)
+            if held is None:
+                continue
+            evidence = [
+                f"test.case.name={name}",
+                f"logs={len(held.logs)} spans={len(held.spans)} points={len(held.points)}",
+                f"dropped={held.dropped.counts()}",
+                "---- log records ----",
+                *newest(
+                    [entry.line() for entry in held.logs], 3, "log records"
+                ),
+                "---- spans ----",
+                *newest([span.line() for span in held.spans], 3, "spans"),
+                "---- last metric value of each series ----",
+                *newest(last_values(held.points), 12, "metric series"),
+                "---- timeline ----",
+                *newest(timeline(held), CASE_EVIDENCE_LINES_MAX, "timeline lines"),
+                "",
+            ]
+            data = ("\n".join(evidence)).encode("utf-8")
+            remaining = max(0, CASE_EVIDENCE_BYTES_MAX - evidence_kept)
+            retained = data[:remaining]
+            if retained:
+                with evidence_path.open("ab") as artifact:
+                    artifact.write(retained)
+                evidence_kept += len(retained)
+            evidence_dropped += len(data) - len(retained)
+
+    def line(raw: bytes) -> None:
+        nonlocal reading, opened
+        text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        found = status_of(text)
+        if found is None:
+            if reading is not None and output_line(text, opened):
+                opened = True
+                reading.output.append(text)
+                if len(reading.output) > 2 * OUTPUT_LINES_MAX:
+                    del reading.output[:OUTPUT_LINES_MAX]
+            else:
+                reading = None
+            return
+        test_status, binary, test, stress = found
+        key = f"{binary}${test}@{stress}"
+        outcome = outcomes.setdefault(
+            key, Outcome(binary=binary, test=test, stress=stress)
         )
-        with command.spawn() as process:
-            assert process.stdout is not None
-            # The failed test whose first output block the lines that follow belong to.
-            reading: Outcome | None = None
-            opened = False
-            for raw in process.stdout:
-                line = raw.decode("utf-8", errors="replace")
-                echo(raw)
-                found = status_of(line.rstrip("\n"))
-                if found is None:
-                    if reading is not None and output_line(line.rstrip("\n"), opened):
-                        opened = True
-                        reading.output.append(line.rstrip("\n"))
-                        if len(reading.output) > 2 * OUTPUT_LINES_MAX:
-                            del reading.output[:OUTPUT_LINES_MAX]
-                    else:
-                        reading = None
-                    continue
-                status, binary, test, stress = found
-                outcome = outcomes.setdefault(
-                    f"{binary}${test}@{stress}",
-                    Outcome(binary=binary, test=test, stress=stress),
-                )
-                if line.strip() not in outcome.lines:
-                    outcome.lines.append(line.strip())
-                reading, opened = None, False
-                if failed_status(status):
-                    outcome.failed = True
-                    if not outcome.output:
-                        reading = outcome
-                elif not outcome.failed:
-                    cases.forget(outcome.names)
-                    del outcomes[f"{binary}${test}@{stress}"]
-            status = process.wait(EXIT_WAIT_SECONDS)
-        sys.stdout.flush()
+        if text.strip() not in outcome.lines:
+            outcome.lines.append(text.strip())
+        reading, opened = None, False
+        if failed_status(test_status):
+            outcome.failed = True
+            echo(f"{text.strip()}\n".encode())
+            if not outcome.output:
+                reading = outcome
+        elif not outcome.failed:
+            capture_passing(outcome)
+            cases.forget(outcome.names)
+            del outcomes[key]
+
+    def on_bytes(data: bytes) -> None:
+        nonlocal log_kept, log_dropped
+        remaining = max(0, RUN_LOG_BYTES_MAX - log_kept)
+        retained = data[:remaining]
+        if retained:
+            with log_path.open("ab") as log:
+                log.write(retained)
+            log_kept += len(retained)
+        log_dropped += len(data) - len(retained)
+        pending.extend(data)
+        while (newline := pending.find(b"\n")) >= 0:
+            current = bytes(pending[: newline + 1])
+            del pending[: newline + 1]
+            line(current)
+
+    with collector(cases=cases) as served:
+        # Keep an explicit caller choice. The default disables in-process exporters
+        # during the partial Rust migration; child processes still receive collector
+        # settings and the harness removes this variable from their environment.
+        inherited = command.environment()
+        if inherited is None:
+            inherited = os.environ
+        sdk_disabled = inherited.get(SDK_DISABLED, "true")
+        command.with_env(
+            **served.environment(),
+            **{SDK_DISABLED: sdk_disabled, RECORDER_STREAM: "1"},
+        )
+        try:
+            completion = asyncio.run(
+                command.stream(on_bytes, exit_wait_seconds=EXIT_WAIT_SECONDS)
+            )
+            status = completion.status
+        except BaseException as error:  # noqa: BLE001 - report evidence before re-raising.
+            stream_error = error
+            if isinstance(error, CommandFailed):
+                status = error.status
+        if pending:
+            line(bytes(pending))
+            pending.clear()
         failed = [outcome for outcome in outcomes.values() if outcome.failed]
         directory = REPOSITORY / WINDOW_DIRECTORY.format(profile=profile)
-        if failed:
-            REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
         for outcome in failed:
             telemetry = [
                 (name, held)
@@ -560,6 +638,21 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             path.write_text(report, encoding="utf-8")
             echo(report.encode("utf-8"))
             echo(f"[report written to {path}]\n".encode())
-        sys.stdout.flush()
+    failed = (
+        stream_error is not None
+        or status != 0
+        or any(outcome.failed for outcome in outcomes.values())
+    )
+    finish("tests", progress_started, failed=failed)
+    if log_dropped:
+        echo(f"[run log left out {log_dropped} bytes: {log_path}]\n".encode())
+    if evidence_kept:
+        echo(f"[telemetry evidence written to {evidence_path}]\n".encode())
+    if evidence_dropped:
+        echo(
+            f"[telemetry evidence left out {evidence_dropped} bytes: {evidence_path}]\n".encode()
+        )
+    if stream_error is not None:
+        raise stream_error.with_traceback(stream_error.__traceback__)
     if status != 0:
-        raise CommandFailed(command, status, "")
+        raise CommandFailed(command, status or 0, "")

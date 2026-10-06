@@ -14,8 +14,7 @@ receiver. The exporter appends `/v1/traces` and
   it, its value (a histogram's count, sum, and buckets),
   `start_time_unix_nano`, `time_unix_nano`, and aggregation temporality, at most
   `POINTS_MAX`;
-- the latest value of each metric series, for the summary `rift-dev trace-collector`
-  prints when it stops.
+- the latest value of each metric series, for a per-test report.
 
 Bounds: a request body, encoded and decompressed, is at most `BODY_BYTES_MAX` bytes; the
 summary keeps at most `METRICS_MAX` metric names and `SERIES_MAX` series per name; the
