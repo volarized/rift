@@ -1211,9 +1211,9 @@ const fn log_flush_end_reserve(repository: bool) -> Duration {
 /// final export failed, as with a refused connection. None fails the stop: the export
 /// carries diagnostics only. A process that exports nothing records `ok` at once.
 async fn stop_export(export: &rift_tracing::OtlpExport, deadline: tokio::time::Instant) {
-    let deadline = deadline.min(tokio::time::Instant::now() + SERVER_EXPORT_STOP_RESERVE);
-    let _ = rift_mcp::stop_stage("otlp export", deadline, async {
-        match export.shutdown(deadline).await {
+    let bound = deadline.min(tokio::time::Instant::now() + SERVER_EXPORT_STOP_RESERVE);
+    let _ = rift_mcp::stop_stage_within("otlp export", deadline, bound, async {
+        match export.shutdown(bound).await {
             Ok(()) | Err(rift_tracing::ExportShutdownError::TimedOut) => Ok(()),
             Err(failed @ rift_tracing::ExportShutdownError::Failed(_)) => {
                 errors::mcp::http_serve_failed()

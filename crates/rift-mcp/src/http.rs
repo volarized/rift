@@ -315,6 +315,28 @@ pub async fn stop_stage<Value>(
     deadline: Instant,
     work: impl std::future::Future<Output = Result<Value, RiftError>>,
 ) -> Result<Value, RiftError> {
+    stop_stage_within(stage, deadline, deadline, work).await
+}
+
+/// [`stop_stage`] for a stage that ends by `bound`, earlier than the stop's `deadline`,
+/// such as the OTLP export capped at its own reserve: the outcome is `timeout` once
+/// `bound` passed, and only the stop's `deadline` passing publishes the table of
+/// operations in flight, so a stage's own cap never publishes a second table.
+///
+/// # Errors
+///
+/// Returns the error `work` returned, unchanged.
+///
+/// # Cancel safety
+///
+/// Dropping the future drops `work` and records nothing.
+#[doc(hidden)]
+pub async fn stop_stage_within<Value>(
+    stage: &'static str,
+    deadline: Instant,
+    bound: Instant,
+    work: impl std::future::Future<Output = Result<Value, RiftError>>,
+) -> Result<Value, RiftError> {
     rift_tracing::traced!(
         component = "mcp",
         operation = "server.stop",
@@ -323,11 +345,12 @@ pub async fn stop_stage<Value>(
         async move {
             let deadline_ahead = Instant::now() < deadline;
             let outcome = work.await;
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            let remaining = bound.saturating_duration_since(now);
             // The stage the shared deadline expired in publishes the operations still open:
             // what it, and every stage after it, met unfinished. A stage that starts past
             // the deadline publishes nothing, so one stop publishes once.
-            if deadline_ahead && remaining.is_zero() {
+            if deadline_ahead && deadline <= now {
                 rift_tracing::warn_in_flight("stop deadline");
             }
             match &outcome {
@@ -1451,6 +1474,39 @@ mod tests {
                 .as_str()
                 .is_some_and(|listed| listed.contains("\"operation\":\"server.stop\"")),
             "{table}"
+        );
+        Ok(())
+    }
+
+    /// A stage whose own bound passes before the stop's deadline ends `timeout` and
+    /// publishes no table of operations in flight: only the stop's deadline does.
+    #[tokio::test(start_paused = true)]
+    async fn a_stage_past_its_own_bound_ends_timeout_and_publishes_no_table()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BOUND: Duration = Duration::from_millis(10);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let deadline = Instant::now() + BOUND * 10;
+        let bound = Instant::now() + BOUND;
+
+        super::stop_stage_within("otlp export", deadline, bound, async {
+            tokio::time::advance(BOUND * 2).await;
+            Ok::<_, rift_error::RiftError>(())
+        })
+        .await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let ended = records
+            .iter()
+            .find(|record| record.message() == "stop stage ended")
+            .ok_or("the stage ended with a record")?;
+        let ended: serde_json::Value = serde_json::from_str(ended.fields())?;
+        assert_eq!(ended["outcome"], "timeout", "{ended}");
+        assert!(
+            records
+                .iter()
+                .all(|record| record.message() != "operations in flight"),
+            "{records:?}"
         );
         Ok(())
     }
