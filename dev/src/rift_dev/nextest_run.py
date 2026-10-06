@@ -18,6 +18,10 @@ other files:
 - the last value of every instrument series;
 - the operations opened with no end received, and the newest `operations in flight`
   record;
+- the test's own stdout and stderr as nextest printed them under its failure, which
+  hold the records of every `ScopedRecorder` the test installed: the runner sets
+  `RIFT_SCOPED_RECORDER_STREAM`, so each record prints as it is recorded and a test
+  nextest ends at its timeout still leaves them;
 - each process the harness registered: its exit status and the tail of its stderr,
   from the failure window directory `target/nextest/<profile>/failure-windows/`;
 - what the collector received, dropped, and could not attribute.
@@ -65,6 +69,13 @@ STATUS_LINE = re.compile(
 # The OpenTelemetry specification's "Disable the SDK for all signals": "true" makes the
 # test processes themselves export nothing (`crates/rift-tracing/src/otlp.rs`).
 SDK_DISABLED = "OTEL_SDK_DISABLED"
+# Makes each `ScopedRecorder` print every record to stderr as it is recorded
+# (`crates/rift-tracing/src/recorder.rs`, `SCOPED_RECORDER_STREAM_VARIABLE`).
+RECORDER_STREAM = "RIFT_SCOPED_RECORDER_STREAM"
+# The header nextest opens a test's captured stdout or stderr with, under its status line.
+OUTPUT_HEADER = re.compile(r"^  (?:stdout|stderr) ───")
+# The line nextest opens its final summary with.
+SUMMARY_LINE = re.compile(r"^\s*Summary \[")
 # Statuses that end a test without a failure.
 PASSED = ("PASS", "LEAK", "FLAKY")
 # The report directory below the repository, which CI uploads.
@@ -75,6 +86,7 @@ WINDOW_DIRECTORY = "target/nextest/{profile}/failure-windows"
 TIMELINE_LINES_MAX = 3_000
 INSTRUMENT_LINES_MAX = 400
 OPEN_LINES_MAX = 100
+OUTPUT_LINES_MAX = 2_000
 STDERR_BYTES_MAX = 64 * 1024
 # How long the runner waits for nextest to exit once its output closed.
 EXIT_WAIT_SECONDS = 60.0
@@ -95,6 +107,8 @@ class Outcome:
     stress: int | None = None
     lines: list[str] = field(default_factory=list)
     failed: bool = False
+    # The test's stdout and stderr blocks nextest printed under its first failed status.
+    output: list[str] = field(default_factory=list)
 
     def names(self, case: str) -> bool:
         """Whether `case`, a nextest attempt identifier such as
@@ -127,6 +141,17 @@ def status_of(line: str) -> tuple[str, str, str, int | None] | None:
     iteration = found["iteration"]
     stress = None if iteration is None else int(iteration) - 1
     return found["status"], found["binary"], found["test"], stress
+
+
+def output_line(line: str, opened: bool) -> bool:
+    """Whether `line` belongs to a test's output block nextest prints under its status
+    line: a block header, or once a header `opened` the block, a blank line or a line
+    indented by four spaces that is not the summary."""
+    if OUTPUT_HEADER.match(line):
+        return True
+    return opened and (
+        not line.strip() or (line.startswith("    ") and not SUMMARY_LINE.match(line))
+    )
 
 
 def failed_status(status: str) -> bool:
@@ -419,6 +444,11 @@ def case_report(
     )
     sections.append("---- operations opened with no end received ----")
     sections.extend(still_open(logs, spans))
+    sections.append("---- test output ----")
+    sections.extend(
+        newest([cut(line) for line in outcome.output], OUTPUT_LINES_MAX, "output lines")
+        or ["nextest printed no output under this test's status"]
+    )
     sections.append("---- processes ----")
     sections.extend(processes(windows))
     cases = served.cases
@@ -466,14 +496,26 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
         # A test process that installs Rift's tracing itself must not export: its
         # in-process export would differ from the runs the test was written for. The
         # harness removes the variable from every `rift` process it spawns.
-        command.with_env(**served.environment(), **{SDK_DISABLED: "true"})
+        command.with_env(
+            **served.environment(), **{SDK_DISABLED: "true", RECORDER_STREAM: "1"}
+        )
         with command.spawn() as process:
             assert process.stdout is not None
+            # The failed test whose first output block the lines that follow belong to.
+            reading: Outcome | None = None
+            opened = False
             for raw in process.stdout:
                 line = raw.decode("utf-8", errors="replace")
                 echo(raw)
                 found = status_of(line.rstrip("\n"))
                 if found is None:
+                    if reading is not None and output_line(line.rstrip("\n"), opened):
+                        opened = True
+                        reading.output.append(line.rstrip("\n"))
+                        if len(reading.output) > 2 * OUTPUT_LINES_MAX:
+                            del reading.output[:OUTPUT_LINES_MAX]
+                    else:
+                        reading = None
                     continue
                 status, binary, test, stress = found
                 outcome = outcomes.setdefault(
@@ -482,8 +524,11 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                 )
                 if line.strip() not in outcome.lines:
                     outcome.lines.append(line.strip())
+                reading, opened = None, False
                 if failed_status(status):
                     outcome.failed = True
+                    if not outcome.output:
+                        reading = outcome
                 elif not outcome.failed:
                     cases.forget(outcome.names)
                     del outcomes[f"{binary}${test}@{stress}"]

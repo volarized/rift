@@ -90,7 +90,8 @@ pub use record::{
 #[cfg(any(test, feature = "fixtures"))]
 pub use recorder::{
     MetricSeries, MetricSnapshot, SCOPED_RECORDER_PRINT_BYTES_MAX,
-    SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder, ScopedRecorderBuilder, SeriesValue,
+    SCOPED_RECORDER_PRINT_RECORDS_MAX, SCOPED_RECORDER_STREAM_VARIABLE, ScopedRecorder,
+    ScopedRecorderBuilder, SeriesValue,
 };
 pub use render::LogLines;
 pub use runtime::{

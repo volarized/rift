@@ -16,7 +16,8 @@ from rift_dev.trace import CaseStore, collector
 # A child that sends one log record, one span, and one metric point under the test case
 # its first argument names, then prints nextest's status lines and exits 100. The second
 # argument selects `nothing`, which sends nothing, or `many`, which sends three log
-# records.
+# records. After the failing status it prints the test's output block as nextest does,
+# then the summary line, which belongs to no block.
 CHILD = textwrap.dedent(
     """
     import os, sys, time, urllib.request
@@ -27,6 +28,7 @@ CHILD = textwrap.dedent(
 
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
     assert os.environ.get("OTEL_SDK_DISABLED") == "true"
+    assert os.environ.get("RIFT_SCOPED_RECORDER_STREAM") == "1"
     case, mode = sys.argv[1], sys.argv[2]
     now = time.time_ns()
 
@@ -70,6 +72,13 @@ CHILD = textwrap.dedent(
         point.time_unix_nano, point.as_int = now, 4096
         send("/v1/metrics", metrics.SerializeToString())
     print("        FAIL [   1.500s] (2/2) suite failing_case", flush=True)
+    sys.stdout.buffer.write("  stdout \\u2500\\u2500\\u2500\\n".encode()); sys.stdout.flush()
+    print("", flush=True)
+    print("    running 1 test", flush=True)
+    sys.stdout.buffer.write("  stderr \\u2500\\u2500\\u2500\\n".encode()); sys.stdout.flush()
+    print("    2026-10-06T00:00:00.000Z INFO  database.close  streamed record", flush=True)
+    print("", flush=True)
+    print("     Summary [   1.510s] 2 tests run: 1 passed, 1 failed", flush=True)
     sys.exit(100)
     """
 )
@@ -134,6 +143,10 @@ def test_a_failed_case_reports_every_section_from_what_its_process_sent(
     assert "process pid=4242 rift server start --foreground: exit ExitStatus(0)" in text
     assert "stop stage ended stage=log drain outcome=ok" in text
     assert "received: 1 log records, 1 spans, 1 points" in text
+    output = text.split("---- test output ----\n", 1)[1].split("---- processes ----", 1)[0]
+    assert "    running 1 test" in output
+    assert "database.close  streamed record" in output
+    assert "Summary" not in output
     assert text in capsys.readouterr().out
     assert not (tmp_path / "reports" / "suite-passing_case.txt").exists()
 

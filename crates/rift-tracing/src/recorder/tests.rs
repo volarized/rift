@@ -2,8 +2,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    RetainedRecords, SCOPED_RECORDER_PRINT_BYTES_MAX, SCOPED_RECORDER_PRINT_RECORDS_MAX,
-    ScopedRecorder,
+    PanicOutput, RetainedRecords, SCOPED_RECORDER_PRINT_BYTES_MAX,
+    SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder,
 };
 use crate::record::{LOG_MESSAGE_BYTES_MAX, LogRecord};
 
@@ -129,6 +129,7 @@ fn a_recorder_prints_its_records_when_its_test_panics() {
 
     let unwound = catch_unwind(AssertUnwindSafe(move || {
         let (mut recorder, _drain) = ScopedRecorder::builder()
+            .stream(false)
             .install()
             .expect("the default filter parses");
         recorder.print_into(buffer);
@@ -203,5 +204,28 @@ fn the_print_keeps_the_newest_records_up_to_the_byte_bound() {
         body.lines()
             .last()
             .is_some_and(|line| line.contains(&format!("{newest}mmm")))
+    );
+}
+
+#[test]
+fn a_streaming_recorder_prints_each_record_as_it_is_kept() {
+    let printed = Arc::new(Mutex::new(String::new()));
+    let retained = RetainedRecords {
+        stream: Some(PanicOutput::Buffer(Arc::clone(&printed))),
+        ..RetainedRecords::default()
+    };
+
+    retained.keep(&record("first"));
+    let after_first = printed.lock().expect("not poisoned").clone();
+    retained.keep(&record("second"));
+
+    assert_eq!(after_first, format!("{}\n", record("first").rendered()));
+    assert_eq!(
+        *printed.lock().expect("not poisoned"),
+        format!(
+            "{}\n{}\n",
+            record("first").rendered(),
+            record("second").rendered()
+        )
     );
 }

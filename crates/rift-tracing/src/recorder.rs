@@ -8,7 +8,10 @@
 //! the metrics database.
 //!
 //! The recorder also keeps the newest records it captured, and prints them when its test
-//! panics, so a failed assertion carries what the code recorded before it.
+//! panics, so a failed assertion carries what the code recorded before it. A test that
+//! nextest ends at its timeout never unwinds, so that print never runs: with
+//! [`SCOPED_RECORDER_STREAM_VARIABLE`] set, the recorder prints each record to standard
+//! error as it is recorded instead, and nextest's captured stderr holds them at the kill.
 //!
 //! Metrics are the process's: the first recorder installs the process's meter, and
 //! [`ScopedRecorder::metrics`] reads what the OpenTelemetry SDK exports from it.
@@ -38,6 +41,15 @@ pub const SCOPED_RECORDER_PRINT_RECORDS_MAX: usize = 256;
 /// that fit are printed; the count of the earlier ones left out is printed once, first.
 pub const SCOPED_RECORDER_PRINT_BYTES_MAX: usize = 64 << 10;
 
+/// The environment variable that makes every recorder print each record to standard error
+/// as it is recorded, in the live stream's line, and no panic print. The nextest runner
+/// (`dev/src/rift_dev/nextest_run.py`) sets it. Nextest runs each test binary with
+/// `--nocapture`, so the lines reach the stderr nextest captures as they print: on a
+/// timeout nextest sends `SIGTERM`, then `SIGKILL` after the grace period on Unix, and
+/// kills the job object at once on Windows, and either way the lines printed before the
+/// kill stay in its output. Unset, a recorder prints only when its test panics.
+pub const SCOPED_RECORDER_STREAM_VARIABLE: &str = "RIFT_SCOPED_RECORDER_STREAM";
+
 /// The filter a recorder captures under when its builder names none: every level of
 /// every target.
 const RECORDER_DEFAULT_CAPTURE: &str = "trace";
@@ -52,7 +64,8 @@ const RECORDER_DEFAULT_CAPTURE: &str = "trace";
 ///
 /// When its test panics, the recorder prints the newest records it captured to standard
 /// error, bounded by [`SCOPED_RECORDER_PRINT_RECORDS_MAX`] and
-/// [`SCOPED_RECORDER_PRINT_BYTES_MAX`]. A test that passes prints nothing.
+/// [`SCOPED_RECORDER_PRINT_BYTES_MAX`]. A test that passes prints nothing, unless
+/// [`SCOPED_RECORDER_STREAM_VARIABLE`] is set: then every record prints as it is recorded.
 ///
 /// ```
 /// let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
@@ -81,7 +94,10 @@ pub struct ScopedRecorder {
 impl ScopedRecorder {
     /// A builder whose recorder captures every level of every target.
     pub fn builder() -> ScopedRecorderBuilder {
-        ScopedRecorderBuilder { capture: None }
+        ScopedRecorderBuilder {
+            capture: None,
+            stream: std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_some(),
+        }
     }
 
     /// Every series the process's instruments hold now, as the OpenTelemetry SDK exports
@@ -114,20 +130,11 @@ impl ScopedRecorder {
 
 impl Drop for ScopedRecorder {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
+        // A streaming recorder printed every record already.
+        if !std::thread::panicking() || self.retained.stream.is_some() {
             return;
         }
-        let printed = self.retained.printed();
-        match &self.output {
-            // `eprint!` reaches the test harness's output capture; a direct write to the
-            // stderr handle would bypass it under `cargo test`.
-            PanicOutput::Stderr => eprint!("{printed}"),
-            #[cfg(test)]
-            PanicOutput::Buffer(buffer) => buffer
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push_str(&printed),
-        }
+        self.output.print(&self.retained.printed());
     }
 }
 
@@ -136,6 +143,8 @@ impl Drop for ScopedRecorder {
 #[must_use = "a builder installs nothing until `install` runs"]
 pub struct ScopedRecorderBuilder {
     capture: Option<String>,
+    /// Whether [`SCOPED_RECORDER_STREAM_VARIABLE`] was set when the builder was made.
+    stream: bool,
 }
 
 impl ScopedRecorderBuilder {
@@ -146,6 +155,13 @@ impl ScopedRecorderBuilder {
     /// them: the SDK reports each instrument it builds at `DEBUG`.
     pub fn capture(mut self, filter: &str) -> Self {
         self.capture = Some(filter.to_owned());
+        self
+    }
+
+    /// Streams each record, or prints only on a panic, whatever the environment says.
+    #[cfg(test)]
+    pub(crate) fn stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
         self
     }
 
@@ -162,7 +178,11 @@ impl ScopedRecorderBuilder {
         if let Ok(reports) = format!("{SDK_TARGET}=warn").parse() {
             filter = filter.add_directive(reports);
         }
-        let retained = Arc::new(RetainedRecords::default());
+        let stream = self.stream.then_some(PanicOutput::Stderr);
+        let retained = Arc::new(RetainedRecords {
+            stream,
+            ..RetainedRecords::default()
+        });
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
         metrics::install();
@@ -181,12 +201,27 @@ impl ScopedRecorderBuilder {
     }
 }
 
-/// Where a panicking test's recorder prints.
+/// Where a recorder prints: its panic print, and the records it streams.
 #[derive(Debug)]
-enum PanicOutput {
+pub(crate) enum PanicOutput {
     Stderr,
     #[cfg(test)]
     Buffer(Arc<Mutex<String>>),
+}
+
+impl PanicOutput {
+    fn print(&self, text: &str) {
+        match self {
+            // `eprint!` reaches the test harness's output capture; a direct write to the
+            // stderr handle would bypass it under `cargo test`.
+            Self::Stderr => eprint!("{text}"),
+            #[cfg(test)]
+            Self::Buffer(buffer) => buffer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_str(text),
+        }
+    }
 }
 
 /// The newest records a recorder captured, kept for the print a panic triggers.
@@ -195,16 +230,25 @@ pub(crate) struct RetainedRecords {
     records: Mutex<VecDeque<LogRecord>>,
     /// Records pushed out by newer ones once [`SCOPED_RECORDER_PRINT_RECORDS_MAX`] were kept.
     left_out: AtomicU64,
+    /// Where each record prints as it is kept, when [`SCOPED_RECORDER_STREAM_VARIABLE`]
+    /// was set at the install.
+    pub(crate) stream: Option<PanicOutput>,
 }
 
 impl RetainedRecords {
-    /// Keeps a copy of `record`, leaving out the oldest kept record past the bound.
+    /// Keeps a copy of `record`, leaving out the oldest kept record past the bound, and
+    /// prints its live stream line when the recorder streams.
     pub(crate) fn keep(&self, record: &LogRecord) {
-        let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-        records.push_back(record.clone());
-        if records.len() > SCOPED_RECORDER_PRINT_RECORDS_MAX {
-            records.pop_front();
-            self.left_out.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+            records.push_back(record.clone());
+            if records.len() > SCOPED_RECORDER_PRINT_RECORDS_MAX {
+                records.pop_front();
+                self.left_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if let Some(stream) = &self.stream {
+            stream.print(&format!("{}\n", record.rendered()));
         }
     }
 
