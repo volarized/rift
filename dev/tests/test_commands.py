@@ -23,6 +23,7 @@ from unittest.mock import patch
 import anyio
 import psutil
 from rift_dev.commands import (
+    JOIN_SECONDS_MAX,
     OUTPUT_BYTES_MAX,
     OWNER_ENV,
     Command,
@@ -339,9 +340,15 @@ class ProcessTests(unittest.TestCase):
             except psutil.NoSuchProcess:
                 pass
             except psutil.TimeoutExpired:
+                read = time.time()
+                try:
+                    descendant.wait(timeout=JOIN_SECONDS_MAX)
+                    exited = f"exited {time.time() - read:.3f}s later"
+                except psutil.TimeoutExpired:
+                    exited = f"still ran {JOIN_SECONDS_MAX}s later"
                 self.fail(
-                    f"descendant {pid} created at {created} still ran at "
-                    f"{time.time()!r} after its owner returned"
+                    f"descendant {pid} created at {created} still ran at {read!r} "
+                    f"after its owner returned; {exited}"
                 )
 
 

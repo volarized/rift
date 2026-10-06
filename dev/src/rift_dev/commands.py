@@ -708,21 +708,16 @@ class JobOwner:
 
         Job termination is asynchronous, like `TerminateProcess`: a descendant can
         still run after the call returns, so each member's exit is awaited within
-        the cleanup bound. Closing the only handle stays the last stop.
+        the cleanup bound. Members are read before termination: once
+        `TerminateJobObject` returns, the job lists no process while its members
+        still exit. Closing the only handle stays the last stop.
         """
         import win32job
 
         deadline = time.monotonic() + JOIN_SECONDS_MAX
         try:
+            members = self.members()
             win32job.TerminateJobObject(int(self.handle), 1)
-            members: list[psutil.Process] = []
-            for pid in win32job.QueryInformationJobObject(
-                int(self.handle), win32job.JobObjectBasicProcessIdList
-            ):
-                try:
-                    members.append(psutil.Process(pid))
-                except psutil.NoSuchProcess:
-                    continue
             _, alive = psutil.wait_procs(
                 members, timeout=max(0, deadline - time.monotonic())
             )
@@ -731,6 +726,20 @@ class JobOwner:
                 raise RuntimeError(f"command descendants {pids} did not stop")
         finally:
             self.handle.Close()
+
+    def members(self) -> list[psutil.Process]:
+        """The processes in the job and its nested jobs, as identities read now."""
+        import win32job
+
+        members: list[psutil.Process] = []
+        for pid in win32job.QueryInformationJobObject(
+            int(self.handle), win32job.JobObjectBasicProcessIdList
+        ):
+            try:
+                members.append(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                continue
+        return members
 
 
 @contextmanager
