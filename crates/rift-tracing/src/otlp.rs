@@ -14,7 +14,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "fixtures"))]
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 #[cfg(any(test, feature = "fixtures"))]
 use std::time::Instant;
 use std::time::{Duration, UNIX_EPOCH};
@@ -1098,6 +1098,7 @@ where
     LogRecordExport {
         logger: logs.provider.logger(SERVICE_NAME),
         open: Arc::clone(&logs.open),
+        dispatch: OnceLock::new(),
     }
     .with_filter(crate::runtime::reevaluated(filter).and(export_others()))
 }
@@ -1114,15 +1115,19 @@ where
 struct LogRecordExport {
     logger: SdkLogger,
     open: Arc<AtomicBool>,
+    dispatch: OnceLock<tracing::dispatcher::WeakDispatch>,
 }
 
 impl<S> Layer<S> for LogRecordExport
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span>,
 {
-    /// The SDK's logger takes the trace and span identifiers from the OpenTelemetry context
-    /// current on this thread: the one `tracing-opentelemetry` attaches when the event's
-    /// span is entered.
+    fn on_register_dispatch(&self, subscriber: &tracing::Dispatch) {
+        let _ = self.dispatch.set(subscriber.downgrade());
+    }
+
+    /// The SDK's logger takes trace and span identifiers from the OpenTelemetry context
+    /// attached by `tracing-opentelemetry` to the dispatch that registered the span.
     fn on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>) {
         if !self.open.load(Ordering::Acquire) {
             return;
@@ -1144,9 +1149,13 @@ where
         let Some(record) = crate::capture::closed_record(&id, &context) else {
             return;
         };
-        let span = tracing::dispatcher::get_default(|dispatch| {
-            tracing_opentelemetry::get_otel_context(&id, dispatch)
-        });
+        let dispatch = self
+            .dispatch
+            .get()
+            .and_then(tracing::dispatcher::WeakDispatch::upgrade);
+        let span = dispatch
+            .as_ref()
+            .and_then(|dispatch| tracing_opentelemetry::get_otel_context(&id, dispatch));
         self.emit(level, &record, span.as_ref());
     }
 }
@@ -1354,7 +1363,7 @@ where
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+    use opentelemetry::trace::{Span as _, TraceContextExt as _, Tracer as _, TracerProvider as _};
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, SpanData, SpanExporter};
     use tracing::field::{Field, Visit};
@@ -2038,6 +2047,117 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let export = OtlpExport::holding(Some(tracer), None, Some(logs));
         assert_eq!(runtime.block_on(export.shutdown(deadline)), Ok(()));
+    }
+
+    #[test]
+    fn a_span_close_uses_its_origin_dispatch_for_log_context() {
+        type CaptureRegistry = tracing_subscriber::layer::Layered<
+            crate::capture::SpanContextLayer,
+            tracing_subscriber::Registry,
+        >;
+
+        let runtime = runtime();
+        let _entered = runtime.enter();
+
+        let origin_spans = InMemorySpanExporter::default();
+        let origin_tracer =
+            tracer_provider(origin_spans.clone(), BatchConfig::default(), resource());
+        let origin_records = InMemoryLogExporter::default();
+        let origin_logs = logger_export(origin_records.clone(), log_batch_config(), resource());
+        let origin_layers = tracing_subscriber::layer::Layer::<CaptureRegistry>::and_then(
+            log_record_layer(&origin_logs, EnvFilter::new("rift_tracing=info")),
+            export_layer(&origin_tracer, EnvFilter::new("rift_tracing=info")),
+        );
+        let origin_subscriber = crate::capture::registry().with(origin_layers);
+        let origin_dispatch = tracing::Dispatch::new(origin_subscriber);
+
+        let current_spans = InMemorySpanExporter::default();
+        let current_tracer =
+            tracer_provider(current_spans.clone(), BatchConfig::default(), resource());
+        let current_records = InMemoryLogExporter::default();
+        let current_logs = logger_export(current_records.clone(), log_batch_config(), resource());
+        let current_layers = tracing_subscriber::layer::Layer::<CaptureRegistry>::and_then(
+            log_record_layer(&current_logs, EnvFilter::new("rift_tracing=info")),
+            export_layer(&current_tracer, EnvFilter::new("rift_tracing=info")),
+        );
+        let current_subscriber = crate::capture::registry().with(current_layers);
+        let current_dispatch = tracing::Dispatch::new(current_subscriber);
+
+        let (origin_prior, origin_span, expected_context) =
+            tracing::dispatcher::with_default(&origin_dispatch, || {
+                let prior =
+                    tracing::info_span!(target: "rift_tracing::otlp::tests", "origin prior");
+                let span = tracing::info_span!(target: "rift_tracing::otlp::tests", "origin span");
+                span.in_scope(|| crate::info!(component = "test", "origin event"));
+                let context = span
+                    .with_subscriber(|(id, dispatch)| {
+                        tracing_opentelemetry::get_otel_context(id, dispatch)
+                    })
+                    .flatten()
+                    .expect("the origin dispatch owns the span's OpenTelemetry context");
+                (prior, span, context.span().span_context().clone())
+            });
+        let current_span = tracing::dispatcher::with_default(
+            &current_dispatch,
+            || tracing::info_span!(target: "rift_tracing::otlp::tests", "current span"),
+        );
+        assert_ne!(
+            origin_span.id().expect("the origin span is enabled"),
+            current_span.id().expect("the current span is enabled")
+        );
+
+        tracing::dispatcher::with_default(&current_dispatch, || drop(origin_span));
+        tracing::dispatcher::with_default(&current_dispatch, || drop(current_span));
+        tracing::dispatcher::with_default(&origin_dispatch, || drop(origin_prior));
+
+        origin_tracer
+            .force_flush()
+            .expect("the origin span batch flushes");
+        origin_logs
+            .provider
+            .force_flush()
+            .expect("the origin log batch flushes");
+        current_tracer
+            .force_flush()
+            .expect("the current span batch flushes");
+        current_logs
+            .provider
+            .force_flush()
+            .expect("the current log batch flushes");
+
+        let origin_span = origin_spans
+            .get_finished_spans()
+            .expect("the origin span exporter is readable")
+            .into_iter()
+            .find(|span| span.name == "origin span")
+            .expect("the origin span is exported");
+        assert_eq!(
+            origin_span.span_context.trace_id(),
+            expected_context.trace_id()
+        );
+        assert_eq!(
+            origin_span.span_context.span_id(),
+            expected_context.span_id()
+        );
+
+        let records: Vec<SdkLogRecord> = origin_records
+            .get_emitted_logs()
+            .expect("the origin log exporter is readable")
+            .into_iter()
+            .map(|exported| exported.record)
+            .collect();
+        let closed = exported(&records, "origin span");
+        let closed_context = closed
+            .trace_context()
+            .expect("the close record keeps its span trace context");
+        assert_eq!(closed_context.trace_id, expected_context.trace_id());
+        assert_eq!(closed_context.span_id, expected_context.span_id());
+
+        let origin_export = OtlpExport::holding(Some(origin_tracer), None, Some(origin_logs));
+        let current_export = OtlpExport::holding(Some(current_tracer), None, Some(current_logs));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(runtime.block_on(origin_export.shutdown(deadline)), Ok(()));
+        assert_eq!(runtime.block_on(current_export.shutdown(deadline)), Ok(()));
     }
 
     /// A record written after the shutdown started is not exported, and the batch processor
