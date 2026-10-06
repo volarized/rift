@@ -374,6 +374,81 @@ fn a_panicking_block_records_an_error_of_type_panic() {
     );
 }
 
+/// A failure of the metrics database, a `RiftError` with a registered identity.
+fn refused() -> rift_error::RiftError {
+    crate::store::store_failure("open", std::path::Path::new("metrics"), "refused")
+}
+
+/// A block whose value is `Err(RiftError)` records the error's registered identity as its
+/// `error.type` label; `Ok`, an error of another type, and a value whose type the caller's
+/// annotation infers record a finished call.
+#[test]
+fn a_block_returning_a_registered_error_records_its_identity() {
+    let recorder = recorder();
+    let failed: Result<u8, rift_error::RiftError> =
+        crate::traced!("test.returns_error", { Err(refused()) });
+    let finished: Result<u8, rift_error::RiftError> = crate::traced!("test.returns_ok", { Ok(1) });
+    let other: Result<u8, &str> = crate::traced!("test.returns_other", { Err("refused") });
+    let parsed: Result<u8, std::num::ParseIntError> = crate::traced!("test.parses", "7".parse());
+    assert!(failed.is_err());
+    assert_eq!(
+        (finished.ok(), other, parsed),
+        (Some(1), Err("refused"), Ok(7))
+    );
+
+    let identity = rift_error::errors::tracing::log_store_failed::SLUG.as_str();
+    let snapshot = recorder.metrics();
+    assert_eq!(
+        calls(
+            &snapshot,
+            "test.returns_error",
+            &[("status.code", "Error"), ("error.type", identity)]
+        ),
+        Some(1.0),
+        "{snapshot:?}"
+    );
+    for operation in ["test.returns_ok", "test.returns_other", "test.parses"] {
+        assert_eq!(calls(&snapshot, operation, &OK), Some(1.0), "{operation}");
+    }
+}
+
+/// An awaited operation whose output is `Err(RiftError)` records the error's registered
+/// identity as its `error.type` label.
+#[test]
+fn a_future_returning_a_registered_error_records_its_identity() {
+    let recorder = recorder();
+    let mut work = pin!(crate::traced!("test.awaits_error", async {
+        Err::<u8, _>(refused())
+    }));
+    assert!(matches!(poll_once(work.as_mut()), Poll::Ready(Err(_))));
+
+    let identity = rift_error::errors::tracing::log_store_failed::SLUG.as_str();
+    assert_eq!(
+        calls(
+            &recorder.metrics(),
+            "test.awaits_error",
+            &[("status.code", "Error"), ("error.type", identity)]
+        ),
+        Some(1.0)
+    );
+}
+
+/// Leaves a block through `return`: the block diverges, and its type falls back to `!`.
+fn traced_return() -> u8 {
+    crate::traced!("test.diverges", {
+        return 3;
+    })
+}
+
+/// A block that diverges compiles, and a block left through `return` records a finished
+/// call: the work's value never exists, so no identity is read.
+#[test]
+fn a_diverging_block_records_a_finished_call() {
+    let recorder = recorder();
+    assert_eq!(traced_return(), 3);
+    assert_eq!(calls(&recorder.metrics(), "test.diverges", &OK), Some(1.0));
+}
+
 #[test]
 fn a_returned_future_records_a_finished_call() {
     let recorder = recorder();

@@ -894,6 +894,53 @@ fn a_close_record_states_a_panic_and_a_cancellation() {
     }
 }
 
+/// A block or an awaited operation whose value is `Err(RiftError)` ends with the error's
+/// registered identity as `error.type` in its close record, with no record the work spells.
+/// `Ok`, an error of another type, and a value that is not a `Result` record none.
+#[test]
+fn a_returned_registered_error_is_the_close_record_error_type() {
+    let (sink, mut drain) = log_capture();
+    let subscriber = crate::capture::registry().with(sink);
+    let refused = || crate::store::store_failure("open", std::path::Path::new("logs"), "refused");
+
+    tracing::subscriber::with_default(subscriber, || {
+        let failed: Result<u8, rift_error::RiftError> =
+            crate::traced!("index.returns_error", { Err(refused()) });
+        assert!(failed.is_err());
+        let mut awaited = pin!(crate::traced!("index.awaits_error", async {
+            Err::<u8, _>(refused())
+        }));
+        let polled = awaited
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        assert!(matches!(polled, Poll::Ready(Err(_))));
+        let finished: Result<u8, rift_error::RiftError> =
+            crate::traced!("index.returns_ok", { Ok(1) });
+        assert!(finished.is_ok());
+        let other: Result<u8, &str> = crate::traced!("index.returns_other", { Err("refused") });
+        assert!(other.is_err());
+        assert_eq!(crate::traced!("index.returns_value", 2 + 2), 4);
+    });
+
+    let identity = rift_error::errors::tracing::log_store_failed::SLUG.as_str();
+    let records = queued(&mut drain);
+    for (message, status, error) in [
+        ("index.returns_error", "Error", Some(identity)),
+        ("index.awaits_error", "Error", Some(identity)),
+        ("index.returns_ok", "Ok", None),
+        ("index.returns_other", "Ok", None),
+        ("index.returns_value", "Ok", None),
+    ] {
+        let fields = fields_of(&records, message);
+        assert_eq!(fields["status.code"], status, "{message}: {fields}");
+        assert_eq!(
+            fields.get("error.type").and_then(serde_json::Value::as_str),
+            error,
+            "{message}: {fields}"
+        );
+    }
+}
+
 /// Runs one operation per way of ending, each recording how it ended on its own span.
 fn record_failures_on_spans() {
     let outcome = |name: &'static str, value: &'static str| {

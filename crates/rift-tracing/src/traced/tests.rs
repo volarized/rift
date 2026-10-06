@@ -574,16 +574,18 @@ fn failed_calls(
     }
 }
 
-/// Work that records its `RiftError`'s registered identity as `error.type` ends with that
-/// identity as the operation metrics' `error.type` label and in its close record; an
-/// identity the registry does not hold is labeled `_OTHER`, and the close record keeps it.
+/// Work that returns `Err(RiftError)` ends with its registered identity as the operation
+/// metrics' `error.type` label and in its close record; an identity the registry does not
+/// hold, recorded by hand, is labeled `_OTHER`, and the close record keeps it.
 #[test]
 fn a_registered_error_identity_is_the_error_type_label() -> Result<(), Box<dyn std::error::Error>> {
     let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
     let stored: Result<(), rift_error::RiftError> = crate::traced!("test.registered", {
-        let error = crate::store::store_failure("open", std::path::Path::new("metrics"), "refused");
-        crate::Span::current().record("error.type", error.slug().as_str());
-        Err(error)
+        Err(crate::store::store_failure(
+            "open",
+            std::path::Path::new("metrics"),
+            "refused",
+        ))
     });
     crate::traced!("test.unregistered", {
         crate::Span::current().record("error.type", "rift.tracing.unregistered");
