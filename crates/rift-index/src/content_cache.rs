@@ -1,10 +1,20 @@
 //! Shared content and syntax facts for workspace files.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
 use rift_core::FileDigest;
 use rift_syntax::{SyntaxFacts, SyntaxLimits, SyntaxProvider, registry};
+
+/// `cache.entry.count`: entries held by each bounded content cache.
+static ENTRY_COUNT: rift_tracing::ObservableUpDownCounter<1> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        crate::database_thread::SCOPE,
+        "cache.entry.count",
+        "{entry}",
+        &["cache.name"],
+    );
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ContentKey {
@@ -33,9 +43,33 @@ const CACHE_PRUNE_INTERVAL: usize = 1_024;
 /// Weak references to source content and syntax facts shared by workspace builds.
 ///
 /// Entries do not keep files alive after their workspace snapshots are dropped.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WorkspaceContentCache {
     state: Arc<RwLock<ContentCacheState>>,
+    entry_count: Arc<AtomicU64>,
+    _entry_count_reading: Option<Arc<rift_tracing::ObservationGuard>>,
+}
+
+impl Default for WorkspaceContentCache {
+    fn default() -> Self {
+        let entry_count = Arc::new(AtomicU64::new(0));
+        let observed_entry_count = Arc::downgrade(&entry_count);
+        let entry_count_reading = ENTRY_COUNT
+            .observe(move |observation| {
+                if let Some(entry_count) = observed_entry_count.upgrade() {
+                    observation.observe(
+                        ["WorkspaceContentCache"],
+                        entry_count.load(Ordering::Relaxed),
+                    );
+                }
+            })
+            .map(Arc::new);
+        Self {
+            state: Arc::new(RwLock::new(ContentCacheState::default())),
+            entry_count,
+            _entry_count_reading: entry_count_reading,
+        }
+    }
 }
 
 impl WorkspaceContentCache {
@@ -123,6 +157,10 @@ impl WorkspaceContentCache {
                 source: Arc::downgrade(&shared_source),
                 syntax: Arc::downgrade(&shared_syntax),
             },
+        );
+        self.entry_count.store(
+            u64::try_from(state.entries.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
         );
         (shared_source, shared_syntax)
     }
@@ -247,5 +285,69 @@ mod tests {
             &reused_syntax.expect("cached syntax remains live"),
             syntax
         ));
+    }
+
+    #[test]
+    fn entry_count_observation_follows_cache_clones_and_bound()
+    -> Result<(), rift_tracing::LogFilterError> {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let provider = registry::provider_for_extension("rs").expect("Rust provider");
+        let path = ProjectPath::new("src/cache.rs").expect("source path");
+        let limits = SyntaxLimits::default();
+        let cache = WorkspaceContentCache::default();
+        let clone = cache.clone();
+        let mut live = Vec::new();
+
+        for index in 0..3 {
+            let source = Arc::new(format!("pub fn beacon_{index}() {{}}\n"));
+            let syntax = provider
+                .analyze(
+                    SyntaxSource {
+                        path: &path,
+                        text: &source,
+                    },
+                    limits,
+                )
+                .expect("source parses")
+                .into_facts();
+            cache.insert(
+                FileDigest::of(source.as_bytes()),
+                limits,
+                provider,
+                &source,
+                &syntax,
+                2,
+            );
+            live.push((source, syntax));
+        }
+
+        let labels = [("cache.name", "WorkspaceContentCache")];
+        let held = recorder.metrics();
+        let count = held
+            .find("cache.entry.count", &labels)
+            .expect("cache count is observed");
+        assert_eq!(count.unit(), "{entry}");
+        assert_eq!(count.scope_name(), env!("CARGO_PKG_NAME"));
+        assert_eq!(count.value(), &rift_tracing::SeriesValue::Sum(2.0));
+
+        drop(cache);
+        let cloned = recorder.metrics();
+        assert_eq!(
+            cloned
+                .find("cache.entry.count", &labels)
+                .expect("clone keeps cache count observed")
+                .value(),
+            &rift_tracing::SeriesValue::Sum(2.0)
+        );
+
+        drop(clone);
+        assert!(
+            recorder
+                .metrics()
+                .find("cache.entry.count", &labels)
+                .is_none(),
+            "last cache clone removes its observation"
+        );
+        Ok(())
     }
 }
