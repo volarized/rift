@@ -414,7 +414,54 @@ fn a_timestamp_prints_utc_with_milliseconds_and_z() {
     assert_eq!(rendered_timestamp(SAMPLE_MS), "2026-10-04 20:42:58.787Z");
     assert_eq!(rendered_timestamp(0), "1970-01-01 00:00:00.000Z");
     assert_eq!(rendered_timestamp(-1), "1969-12-31 23:59:59.999Z");
-    assert_eq!(rendered_timestamp(i64::MAX), i64::MAX.to_string());
+    assert_eq!(
+        rendered_timestamp(1_709_210_096_789),
+        "2024-02-29 12:34:56.789Z"
+    );
+    assert_eq!(
+        rendered_timestamp(4_107_542_400_000),
+        "2100-03-01 00:00:00.000Z"
+    );
+    assert_eq!(
+        rendered_timestamp(253_402_207_200_000),
+        "9999-12-30 22:00:00.000Z"
+    );
+}
+
+/// A message or a field value holding ` · ` or `: ` prints as a JSON string; `a:b` holds
+/// neither and prints as it is. Fields that are not a JSON object follow the same rule.
+#[test]
+fn a_message_or_value_that_holds_a_delimiter_prints_quoted() {
+    let quoted = record(
+        0,
+        "warn",
+        ("mcp", "mcp.read"),
+        "read failed: a \"b\" · c\\d",
+        &json!({"note": "k: v", "path": "a · b", "plain": "a:b"}),
+    );
+    let text = LogRecord::new(SAMPLE_MS, "warn", "rift", "mcp", "", "plain", "x · y");
+    let inside = record(
+        0,
+        "info",
+        ("mcp", "tools/call"),
+        "answered: twice",
+        &json!({"reason": "k: v", "root_span": request_span(4, "nodes")}),
+    );
+
+    assert_eq!(
+        page(&[quoted]),
+        "2026-10-04 20:42:58.787Z WARN  rift_mcp::server   component=mcp operation=mcp.read \
+         note=\"k: v\" path=\"a · b\" plain=a:b  \"read failed: a \\\"b\\\" · c\\\\d\"\n"
+    );
+    assert_eq!(
+        page(&[text]),
+        "2026-10-04 20:42:58.787Z WARN  rift   component=mcp  plain \"x · y\"\n"
+    );
+    let inside = page(&[inside]);
+    assert!(
+        inside.ends_with("tool=nodes  \"answered: twice\" reason=\"k: v\"\n"),
+        "{inside}"
+    );
 }
 
 /// Text a record can carry from outside the process, each holding characters a terminal

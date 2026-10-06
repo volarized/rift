@@ -19,6 +19,8 @@
 //!   `busy` and `idle` for a span close; a mark and the message for a lifecycle record;
 //!   the message and the record's own fields otherwise.
 //!
+//! A message or a field value holding ` · ` or `: ` prints as a JSON string, between quotes.
+//!
 //! A group is a run of consecutive records of one request; without a request, of one
 //! root span; without a span, of one function. A blank line separates two groups. A stored page pads each column to the
 //! widest value of its group; a live stream, which does not know a group ahead, pads to
@@ -72,6 +74,10 @@ const LIVE_CONTEXT_WIDTH: usize = 48;
 const LIVE_NESTED_NAME_WIDTH: usize = 24;
 /// The width a live stream pads the nearest span's fields to.
 const LIVE_NESTED_FIELDS_WIDTH: usize = 40;
+/// The separators the compact text of a resource splits a line on, ` · ` and `: `. A
+/// message or a field value holding one prints quoted, so a `rift://logs` reader keeps it
+/// whole.
+const LINE_DELIMITERS: [&str; 2] = [" · ", ": "];
 
 /// Whether a rendered line colors its level with ANSI escape codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,8 +301,8 @@ impl LineParts {
         let Some(mut own) = parsed_fields(record.fields()) else {
             parts.function = escaped(record.target());
             parts.context = labels_context(record, &Map::new());
-            parts.message = escaped(record.message());
-            push_separated(&mut parts.message, &escaped(record.fields()));
+            parts.message = value(record.message());
+            push_separated(&mut parts.message, &value(record.fields()));
             parts.group = Some(Group::Function(parts.function.clone()));
             return parts;
         };
@@ -348,8 +354,8 @@ impl LineParts {
             parts.nested = Some((escaped(name), context_pairs(fields)));
         }
         parts.message = lifecycle_mark(&own).map_or_else(
-            || escaped(record.message()),
-            |mark| format!("{mark} {}", escaped(record.message())),
+            || value(record.message()),
+            |mark| format!("{mark} {}", value(record.message())),
         );
         if let Some(root) = &root {
             let root_fields = span_fields(root);
@@ -609,18 +615,40 @@ fn rendered_duration(nanoseconds: u64) -> String {
     format!("{:.0}s", value * 1_000.0)
 }
 
-/// `key=value`, both escaped, a string value without the quotes JSON puts around it.
+/// `key=value`, both escaped, a string value without the quotes JSON puts around it
+/// unless [`push_value`] quotes it.
 ///
 /// An array or object value prints as the JSON `serde_json` writes, which escapes C0
 /// controls alone, so its text is escaped as well.
-fn pair(key: &str, value: &Value) -> String {
+fn pair(key: &str, field: &Value) -> String {
     let mut text = escaped(key);
     text.push('=');
-    match value {
-        Value::String(value) => push_escaped(&mut text, value),
-        other => push_escaped(&mut text, &other.to_string()),
+    match field {
+        Value::String(field) => push_value(&mut text, field),
+        other => push_value(&mut text, &other.to_string()),
     }
     text
+}
+
+/// Appends `text` to `line` as one value: when it holds one of [`LINE_DELIMITERS`], as the
+/// JSON string `serde_json` writes, between quotes with `"`, `\`, and C0 controls escaped;
+/// else as it is. [`push_escaped`] then escapes what remains.
+fn push_value(line: &mut String, text: &str) {
+    if LINE_DELIMITERS
+        .iter()
+        .any(|delimiter| text.contains(delimiter))
+    {
+        push_escaped(line, &Value::from(text).to_string());
+    } else {
+        push_escaped(line, text);
+    }
+}
+
+/// `text` as one value, as [`push_value`] writes it.
+fn value(text: &str) -> String {
+    let mut line = String::with_capacity(text.len());
+    push_value(&mut line, text);
+    line
 }
 
 /// A field value as text: a string without its quotes, any other value as JSON.
