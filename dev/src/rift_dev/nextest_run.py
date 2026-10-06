@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import platform
 import re
@@ -41,6 +42,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from statistics import median
 
 import tomllib
 
@@ -106,6 +108,68 @@ LINE_CHARS_MAX = 2_000
 # (`crates/rift-tracing/src/span.rs`), and the table of operations in flight's.
 OPENED_MESSAGE = "operation opened"
 IN_FLIGHT_MESSAGE = "operations in flight"
+MEASUREMENT_FIELDS = {
+    "operation_record_cost": ("threads", ("operation_ns", "event_ns")),
+    "record_path_cost": (
+        "meter",
+        ("counter_ns_per_record", "histogram_ns_per_record"),
+    ),
+}
+
+
+def measurement_summary(logs: Iterable[LogEntry]) -> list[str]:
+    """Summarize recorded T-149 samples without combining separate processes."""
+    groups: dict[
+        tuple[str, str, str],
+        dict[str, list[tuple[float, int]]],
+    ] = {}
+    incomplete = 0
+    for entry in logs:
+        if entry.body not in MEASUREMENT_FIELDS:
+            continue
+        group_key, fields = MEASUREMENT_FIELDS[entry.body]
+        attributes = dict(entry.attributes)
+        group_value = attributes.get(group_key)
+        instance = entry.instance
+        if group_value is None or instance is None:
+            incomplete += 1
+            continue
+        key = (entry.body, group_value, instance)
+        samples = groups.setdefault(key, {name: [] for name in fields})
+        row_incomplete = False
+        for name in fields:
+            try:
+                value = float(attributes[name])
+            except (KeyError, ValueError):
+                row_incomplete = True
+                continue
+            if not math.isfinite(value):
+                row_incomplete = True
+                continue
+            samples[name].append((value, entry.time_unix_nano))
+        incomplete += int(row_incomplete)
+
+    if not groups and incomplete == 0:
+        return []
+    lines = ["---- T-149 measurement medians ----"]
+    for (measurement, group_value, instance), samples in sorted(groups.items()):
+        group_key = MEASUREMENT_FIELDS[measurement][0]
+        lines.append(
+            f"{measurement} {group_key}={group_value} "
+            f"service.instance.id={instance}"
+        )
+        for name, values in samples.items():
+            if not values:
+                lines.append(f"{name}: no complete samples")
+                continue
+            times = [timestamp for _, timestamp in values]
+            lines.append(
+                f"{name}: median={median(value for value, _ in values):g} "
+                f"samples={len(values)} time_unix_nano={min(times)}..{max(times)}"
+            )
+    if incomplete:
+        lines.append(f"incomplete measurement rows={incomplete}")
+    return lines
 
 
 @dataclass(slots=True)
@@ -548,10 +612,12 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                 *(("span", span) for span in held.spans),
                 *(("metric point", point) for point in held.points),
             ]
+            measurements = measurement_summary(held.logs)
             evidence = [
                 f"test.case.name={name}",
                 f"logs={len(held.logs)} spans={len(held.spans)} points={len(held.points)}",
                 f"dropped={held.dropped.counts()}",
+                *measurements,
                 "---- log records ----",
                 *newest(
                     [entry.line() for entry in held.logs], 3, "log records"
