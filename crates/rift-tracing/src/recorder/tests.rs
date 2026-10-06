@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use super::{
     PanicOutput, RetainedRecords, SCOPED_RECORDER_PRINT_BYTES_MAX,
-    SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder,
+    SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder, printed_points,
 };
+use crate::metrics::Counter;
 use crate::record::{LOG_MESSAGE_BYTES_MAX, LogRecord};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -124,6 +125,118 @@ fn a_recorder_prints_nothing_when_its_test_passes() -> TestResult {
     Ok(())
 }
 
+/// Runs `work` under a recorder that prints into the returned buffer and reads a clock the
+/// work moves, until `work` panics.
+fn panicking_under_a_recorder(stream: bool, work: impl FnOnce(&AtomicU64)) -> String {
+    let printed = Arc::new(Mutex::new(String::new()));
+    let buffer = Arc::clone(&printed);
+    let unwound = catch_unwind(AssertUnwindSafe(move || {
+        let clock = Arc::new(AtomicU64::new(0));
+        let reading = Arc::clone(&clock);
+        let (mut recorder, _drain) = ScopedRecorder::builder()
+            .stream(stream)
+            .clock(move || Duration::from_nanos(reading.load(Ordering::Relaxed)))
+            .install()
+            .expect("the default filter parses");
+        recorder.print_into(buffer);
+        work(&clock);
+        panic!("the assertion failed");
+    }));
+    assert!(unwound.is_err());
+    printed.lock().expect("not poisoned").clone()
+}
+
+/// The panic print carries the records, then the process's metric points, one line each:
+/// a sum's `value=`, a histogram's `count=`, `sum=`, and nonempty buckets.
+#[test]
+fn a_recorder_prints_its_records_and_metric_points_when_its_test_panics() {
+    let printed = panicking_under_a_recorder(false, |clock| {
+        crate::warn!(component = "index", "recorded before the panic");
+        crate::traced!("test.printed", {
+            clock.fetch_add(250_000_000, Ordering::Relaxed);
+        });
+    });
+
+    assert!(
+        printed.starts_with("scoped recorder: 2 records printed, 0 earlier records left out\n"),
+        "{printed}"
+    );
+    assert!(printed.contains("recorded before the panic"), "{printed}");
+    let (records, points) = printed
+        .split_once("scoped recorder: ")
+        .and_then(|(_, rest)| rest.split_once("scoped recorder: "))
+        .expect("a records header, then a metric points header");
+    assert!(!records.contains("metric points"), "{printed}");
+    assert!(
+        points.contains(" metric points printed, 0 left out\n"),
+        "{printed}"
+    );
+    for line in [
+        "traces.span.metrics.calls   span.kind=Internal span.name=test.printed \
+         status.code=Ok  value=1 unit={call}",
+        "traces.span.metrics.duration   span.kind=Internal span.name=test.printed \
+         status.code=Ok  count=1 sum=0.25 buckets=<=0.25:1 unit=s",
+    ] {
+        assert!(
+            points.lines().any(|printed| printed == line),
+            "{line}\n{printed}"
+        );
+    }
+}
+
+/// A streaming recorder printed each record as it was kept, so its panic prints the
+/// metric points alone.
+#[test]
+fn a_streaming_recorder_prints_only_its_metric_points_when_its_test_panics() {
+    let printed = panicking_under_a_recorder(true, |_| {
+        crate::traced!("test.streamed", {});
+    });
+
+    assert!(printed.starts_with("scoped recorder: "), "{printed}");
+    assert!(
+        printed.contains(" metric points printed, 0 left out\n"),
+        "{printed}"
+    );
+    assert!(!printed.contains("records printed"), "{printed}");
+    assert!(printed.contains("span.name=test.streamed"), "{printed}");
+}
+
+/// The metric points a panic prints stop at [`SCOPED_RECORDER_PRINT_BYTES_MAX`]; the
+/// header counts those left out.
+#[test]
+fn the_print_keeps_the_metric_points_up_to_the_byte_bound() -> TestResult {
+    static PRINTED: Counter<1> =
+        Counter::declare("test.printed.points", "{point}", &["test.point"]);
+    let (recorder, _drain) = ScopedRecorder::builder().install()?;
+    let points = 2 * SCOPED_RECORDER_PRINT_BYTES_MAX / 64;
+    for index in 0..points {
+        let label: &'static str = Box::leak(format!("{index:0>40}").into_boxed_str());
+        PRINTED.labeled([label]).add(1);
+    }
+    let snapshot = recorder.metrics();
+    drop(recorder);
+
+    let printed = printed_points(&snapshot);
+
+    let (header, body) = printed.split_once('\n').ok_or("a header line")?;
+    assert!(
+        body.len() <= SCOPED_RECORDER_PRINT_BYTES_MAX,
+        "{}",
+        body.len()
+    );
+    let kept = body.lines().count();
+    let total = snapshot.series().len();
+    assert!(kept > 0 && kept < total, "{kept} of {total}");
+    assert_eq!(
+        header,
+        format!(
+            "scoped recorder: {kept} metric points printed, {} left out",
+            total - kept
+        )
+    );
+    Ok(())
+}
+
 /// The clock a builder names is the one the recorder's thread reads, through
 /// `monotonic_now` and `measure_elapsed!`; another thread keeps the process clock.
 #[test]
@@ -152,30 +265,6 @@ fn a_recorder_clock_is_read_on_its_thread_alone() -> TestResult {
         "the clock ends with the recorder"
     );
     Ok(())
-}
-
-#[test]
-fn a_recorder_prints_its_records_when_its_test_panics() {
-    let printed = Arc::new(Mutex::new(String::new()));
-    let buffer = Arc::clone(&printed);
-
-    let unwound = catch_unwind(AssertUnwindSafe(move || {
-        let (mut recorder, _drain) = ScopedRecorder::builder()
-            .stream(false)
-            .install()
-            .expect("the default filter parses");
-        recorder.print_into(buffer);
-        crate::warn!(component = "index", "recorded before the panic");
-        panic!("the assertion failed");
-    }));
-
-    assert!(unwound.is_err());
-    let printed = printed.lock().expect("not poisoned").clone();
-    assert!(
-        printed.starts_with("scoped recorder: 1 records printed, 0 earlier records left out\n"),
-        "{printed}"
-    );
-    assert!(printed.contains("recorded before the panic"), "{printed}");
 }
 
 #[test]

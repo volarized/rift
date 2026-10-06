@@ -7,11 +7,12 @@
 //! the [`LogDrain`] the recorder returns, the representation a serving process writes into
 //! the metrics database.
 //!
-//! The recorder also keeps the newest records it captured, and prints them when its test
-//! panics, so a failed assertion carries what the code recorded before it. A test that
-//! nextest ends at its timeout never unwinds, so that print never runs: with
-//! [`SCOPED_RECORDER_STREAM_VARIABLE`] set, the recorder prints each record to standard
-//! error as it is recorded instead, and nextest's captured stderr holds them at the kill.
+//! The recorder also keeps the newest records it captured, and prints them with the
+//! process's metric points when its test panics, so a failed assertion carries what the
+//! code recorded before it. A test that nextest ends at its timeout never unwinds, so that
+//! print never runs: with [`SCOPED_RECORDER_STREAM_VARIABLE`] set, the recorder prints each
+//! record to standard error as it is recorded instead, and nextest's captured stderr holds
+//! them at the kill; a panic then prints the metric points alone.
 //!
 //! Metrics are the process's: the first recorder installs the process's meter, and
 //! [`ScopedRecorder::metrics`] reads what the OpenTelemetry SDK exports from it.
@@ -42,8 +43,10 @@ pub use self::metrics::{MetricSeries, MetricSnapshot, SeriesValue};
 
 /// Most records a panicking test's recorder prints: the newest ones it captured.
 pub const SCOPED_RECORDER_PRINT_RECORDS_MAX: usize = 256;
-/// Most bytes of rendered records a panicking test's recorder prints. The newest records
-/// that fit are printed; the count of the earlier ones left out is printed once, first.
+/// Most bytes of rendered records a panicking test's recorder prints, and, apart, most
+/// bytes of the metric points it prints beside them. The newest records that fit are
+/// printed, and the metric points that fit in instrument order; the count of those left out
+/// is printed once, first.
 pub const SCOPED_RECORDER_PRINT_BYTES_MAX: usize = 64 << 10;
 
 /// The environment variable that makes every recorder print each record to standard error
@@ -69,8 +72,10 @@ const RECORDER_DEFAULT_CAPTURE: &str = "trace";
 ///
 /// When its test panics, the recorder prints the newest records it captured to standard
 /// error, bounded by [`SCOPED_RECORDER_PRINT_RECORDS_MAX`] and
-/// [`SCOPED_RECORDER_PRINT_BYTES_MAX`]. A test that passes prints nothing, unless
-/// [`SCOPED_RECORDER_STREAM_VARIABLE`] is set: then every record prints as it is recorded.
+/// [`SCOPED_RECORDER_PRINT_BYTES_MAX`], then the process's metric points, one line each,
+/// bounded by [`SCOPED_RECORDER_PRINT_BYTES_MAX`]. A test that passes prints nothing, unless
+/// [`SCOPED_RECORDER_STREAM_VARIABLE`] is set: then every record prints as it is recorded,
+/// and a panic prints the metric points alone.
 ///
 /// ```
 /// let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
@@ -136,12 +141,33 @@ impl ScopedRecorder {
 
 impl Drop for ScopedRecorder {
     fn drop(&mut self) {
-        // A streaming recorder printed every record already.
-        if !std::thread::panicking() || self.retained.stream.is_some() {
+        if !std::thread::panicking() {
             return;
         }
-        self.output.print(&self.retained.printed());
+        // A streaming recorder printed every record already.
+        if self.retained.stream.is_none() {
+            self.output.print(&self.retained.printed());
+        }
+        self.output.print(&printed_points(&self.metrics()));
     }
+}
+
+/// The text a panic prints for `snapshot`: one line stating the metric points printed and
+/// left out, then each point that fits [`SCOPED_RECORDER_PRINT_BYTES_MAX`], in the
+/// snapshot's order, as [`MetricSeries`]'s `Display` writes it.
+fn printed_points(snapshot: &MetricSnapshot) -> String {
+    let mut lines = String::new();
+    let mut kept = 0_usize;
+    for series in snapshot.series() {
+        let line = format!("{series}\n");
+        if lines.len() + line.len() > SCOPED_RECORDER_PRINT_BYTES_MAX {
+            break;
+        }
+        lines.push_str(&line);
+        kept += 1;
+    }
+    let left_out = snapshot.series().len() - kept;
+    format!("scoped recorder: {kept} metric points printed, {left_out} left out\n{lines}")
 }
 
 /// The settings [`ScopedRecorderBuilder::install`] builds the recorder from.

@@ -8,6 +8,7 @@
 //! newest export: every series the SDK aggregated since the meter was installed. Nothing here aggregates; a series is one
 //! exported point, its labels and value as the SDK reported them.
 
+use std::fmt;
 use std::sync::OnceLock;
 
 use opentelemetry::metrics::MeterProvider as _;
@@ -236,6 +237,45 @@ impl MetricSeries {
     #[must_use]
     pub const fn value(&self) -> &SeriesValue {
         &self.value
+    }
+}
+
+/// One line per series, in the layout the developer collector prints a metric point
+/// (`dev/src/rift_dev/trace.py`, `MetricPoint.line`) without its time and sending process:
+/// the instrument's name, its labels as `key=value`, then `value=` for a sum or a gauge, or
+/// `count=`, `sum=`, and the nonempty buckets as `<=bound:count`, the last `>bound:count`,
+/// for a histogram, then `unit=` when the instrument names one.
+impl fmt::Display for MetricSeries {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}   ", self.name)?;
+        for (key, value) in &self.labels {
+            write!(formatter, "{key}={value} ")?;
+        }
+        if !self.labels.is_empty() {
+            formatter.write_str(" ")?;
+        }
+        match &self.value {
+            SeriesValue::Sum(value) | SeriesValue::Last(value) => {
+                write!(formatter, "value={value}")?;
+            }
+            SeriesValue::Buckets { count, sum, counts } => {
+                write!(formatter, "count={count} sum={sum}")?;
+                let mut separator = " buckets=";
+                let last_bound = counts.iter().rev().find_map(|(bound, _)| *bound);
+                for (bound, bucket) in counts.iter().filter(|(_, bucket)| *bucket > 0) {
+                    match (bound, last_bound) {
+                        (Some(bound), _) => write!(formatter, "{separator}<={bound}:{bucket}")?,
+                        (None, Some(last)) => write!(formatter, "{separator}>{last}:{bucket}")?,
+                        (None, None) => write!(formatter, "{separator}>-inf:{bucket}")?,
+                    }
+                    separator = ",";
+                }
+            }
+        }
+        if !self.unit.is_empty() {
+            write!(formatter, " unit={}", self.unit)?;
+        }
+        Ok(())
     }
 }
 
