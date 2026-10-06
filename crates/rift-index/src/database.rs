@@ -498,7 +498,7 @@ impl WorkspaceDatabase {
             .await
             .map_err(|source| name.failed(database_path, source))?;
         drop(migration_lock);
-        checkpoint_at_open(&database, name, database_path).await;
+        checkpoint_at_open(&database, name, database_path, pool).await;
         let queue_length = thread.observe_queue_length();
         let transactions_active = thread.observe_transactions_active();
         let sizes = database_path.to_owned();
@@ -789,14 +789,23 @@ pub struct HeldConnection {
 /// Moves what the write-ahead log holds into the database and empties the log, as an open
 /// does where no stop deadline runs: a close leaves the log, and this open is where its
 /// checkpoint runs. Records `database checkpointed its write-ahead log` with `busy`, the
-/// frames the log held as `log`, the frames it moved as `checkpointed`, and its
-/// `elapsed_ms`, operation `database.open`; a refused checkpoint is a `warn` record and
-/// fails nothing, as the log stays readable.
-async fn checkpoint_at_open(database: &Db, name: DatabaseName, path: &Path) {
+/// frames the log held as `log`, the frames it moved as `checkpointed`, its `elapsed_ms`,
+/// and the checkpoint configuration: `journal_size_limit`, the bytes every checkout of
+/// `pool` sets (`-1` sets no limit), and `wal_autocheckpoint`, the log pages at which a
+/// commit checkpoints, as `PRAGMA wal_autocheckpoint` answers on the connection; operation
+/// `database.open`. A refused checkpoint is a `warn` record and fails nothing, as the log
+/// stays readable.
+async fn checkpoint_at_open(database: &Db, name: DatabaseName, path: &Path, pool: DatabasePool) {
     let label = name.label();
     let started = tokio::time::Instant::now();
     let checkpointed = async {
         let mut connection = database.connection().await?;
+        let autocheckpoint = toasty::sql::query("PRAGMA wal_autocheckpoint")
+            .column_types([Type::I64])
+            .exec(&mut connection)
+            .await?;
+        let wal_autocheckpoint =
+            single_integer(&autocheckpoint).map_err(toasty_core::Error::from)?;
         let mut rows = Vec::with_capacity(2);
         for mode in ["NOOP", "TRUNCATE"] {
             let row = toasty::sql::query(format!("PRAGMA wal_checkpoint({mode})"))
@@ -805,11 +814,14 @@ async fn checkpoint_at_open(database: &Db, name: DatabaseName, path: &Path) {
                 .await?;
             rows.push(WalCheckpoint::from_row(&row).map_err(toasty_core::Error::from)?);
         }
-        Ok::<_, toasty_core::Error>(rows)
+        Ok::<_, toasty_core::Error>((rows, wal_autocheckpoint))
     }
     .await;
-    match checkpointed.as_deref() {
-        Ok([before, truncate]) => {
+    match checkpointed
+        .as_ref()
+        .map(|(rows, wal_autocheckpoint)| (rows.as_slice(), *wal_autocheckpoint))
+    {
+        Ok(([before, truncate], wal_autocheckpoint)) => {
             let checkpoint = CloseCheckpoint::after(*before, *truncate, started.elapsed());
             rift_tracing::info!(
                 component = "storage",
@@ -819,10 +831,12 @@ async fn checkpoint_at_open(database: &Db, name: DatabaseName, path: &Path) {
                 log = checkpoint.log,
                 checkpointed = checkpoint.checkpointed,
                 elapsed_ms = elapsed_ms(checkpoint.elapsed),
+                journal_size_limit = journal_size_limit(pool),
+                wal_autocheckpoint,
                 "database checkpointed its write-ahead log"
             );
         }
-        Ok(rows) => rift_tracing::warn!(
+        Ok((rows, _)) => rift_tracing::warn!(
             component = "storage",
             operation = "database.open",
             database = label,
@@ -1063,6 +1077,20 @@ fn observe_page_counts(
     }
 }
 
+/// The one integer a one-column pragma row answers; a row of another shape is the cause the
+/// caller's failure carries.
+fn single_integer(rows: &[Value]) -> Result<i64, std::io::Error> {
+    if let [Value::Record(record)] = rows
+        && let [Value::I64(value)] = record.as_slice()
+    {
+        return Ok(*value);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("unexpected single-integer pragma row: rows={rows:?}"),
+    ))
+}
+
 /// `path` with `suffix` appended to its whole file name, as `SQLite` names its
 /// sidecar files.
 fn appended(path: &Path, suffix: &str) -> PathBuf {
@@ -1098,6 +1126,14 @@ async fn configure_journal(
         .map_err(|source| name.failed(path, source))
 }
 
+/// The `PRAGMA journal_size_limit` value of `pool`: its limit in bytes, or `-1`, `SQLite`'s
+/// own default of no limit. A value past `i64::MAX` cannot be stored, and no configuration
+/// accepts one.
+fn journal_size_limit(pool: DatabasePool) -> i64 {
+    pool.journal_size_limit_bytes()
+        .map_or(-1, |bytes| i64::try_from(bytes).unwrap_or(i64::MAX))
+}
+
 /// Applies connection-local durability, lock wait, memory map, write-ahead log limit, and
 /// access policy.
 ///
@@ -1125,11 +1161,7 @@ async fn configure_connection(
         .exec(&mut *connection)
         .await
         .map_err(|source| name.failed(path, source))?;
-    // `-1` is `SQLite`'s own default, no limit; a value past `i64::MAX` cannot be stored, and
-    // no configuration accepts one.
-    let journal_size_limit = pool
-        .journal_size_limit_bytes()
-        .map_or(-1, |bytes| i64::try_from(bytes).unwrap_or(i64::MAX));
+    let journal_size_limit = journal_size_limit(pool);
     toasty::sql::query(format!("PRAGMA journal_size_limit = {journal_size_limit}"))
         .exec(&mut *connection)
         .await
@@ -1886,6 +1918,53 @@ mod tests {
             None,
             "a dropped database reports no transactions"
         );
+        Ok(())
+    }
+
+    /// The open record carries the checkpoint configuration: the pool's
+    /// `journal_size_limit`, `-1` where it sets none, and the `wal_autocheckpoint` a fresh
+    /// `SQLite` connection holds, which no checkout changes.
+    #[tokio::test]
+    async fn the_open_record_carries_the_checkpoint_configuration() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let limited_path = directory.path().join("limited");
+        let limited = limited_database(&limited_path, DatabaseName::Index).await?;
+        let unlimited = WorkspaceDatabase::open(
+            &directory.path().join("unlimited"),
+            DatabaseName::Vectors,
+            pool(),
+        )
+        .await?;
+        drop(recorder);
+        let fresh: i64 = rusqlite::Connection::open(&limited_path)?.query_row(
+            "PRAGMA wal_autocheckpoint",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let opens = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.message() == "database checkpointed its write-ahead log")
+            .map(|record| {
+                assert_eq!(record.operation(), "database.open");
+                serde_json::from_str(record.fields())
+            })
+            .collect::<Result<Vec<serde_json::Value>, _>>()?;
+        assert_eq!(opens.len(), 2, "one record per open: {opens:?}");
+        for (database, journal_size_limit) in [
+            ("index", WAL_TEST_LIMIT_BYTES.to_string()),
+            ("vectors", "-1".to_owned()),
+        ] {
+            let fields = opens
+                .iter()
+                .find(|fields| fields["database"] == database)
+                .ok_or_else(|| format!("the {database} open is recorded: {opens:?}"))?;
+            assert_eq!(fields["journal_size_limit"], journal_size_limit, "{fields}");
+            assert_eq!(fields["wal_autocheckpoint"], fresh.to_string(), "{fields}");
+        }
+        drop((limited, unlimited));
         Ok(())
     }
 
