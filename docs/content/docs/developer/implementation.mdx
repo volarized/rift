@@ -843,8 +843,9 @@ stop records `standard error bytes discarded` with `stderr_limit` and the bytes 
 at `warn` when the count is not zero. A second `TracingRuntimeBuilder::install` in one process
 returns `InstallError` and leaves the installation in place untouched.
 
-Stderr, `rift server logs`, and a failure window print a record through one renderer,
-`LogLines` in `rift-tracing`. A line holds the time in UTC with milliseconds, the level, the
+Stderr, `rift server logs`, the text of `rift://logs`, and a failure window print a record
+through one renderer, `LogLines` in `rift-tracing`. A message or a field value holding ` · ` or
+`: ` prints as a JSON string. A line holds the time in UTC with milliseconds, the level, the
 function, three spaces, the context, two spaces, the nested operation, and the message:
 
 - The function is the `code.function.name` of the outermost span around the record; outside
@@ -896,14 +897,20 @@ records no argument unless a field names it. The attribute lives in `rift-tracin
 `proc-macro-crate`, so a renamed dependency resolves too.
 
 Every instrument is a `static` declaration over an OpenTelemetry instrument: a `Counter`,
-`Gauge`, `Histogram`, or `ObservableUpDownCounter` with its name, unit, and label keys, whose label
-values are `&'static str` literals. A recording hands the value to the OpenTelemetry SDK, which
+`Gauge`, `Histogram`, or `ObservableUpDownCounter` with the `InstrumentScope` of the declaring
+crate, its name, unit, and label keys, whose label values are `&'static str` literals. Its points
+carry that crate's `CARGO_PKG_NAME` and `CARGO_PKG_VERSION` as their instrumentation scope, from
+one meter per scope, at most `SCOPES_MAX`, 6; a scope past it records nothing, and one `WARN`
+record, `meter refused an instrumentation scope past its bound`, names it. The
+`traces.span.metrics.*` points of a `traced!` operation take the scope of the crate whose
+`traced!` opened it. A recording hands the value to the OpenTelemetry SDK, which
 aggregates and exports it, so `rift-tracing` holds no value of its own. A process that installed
 no meter records nothing, at the cost of two atomic reads per recording.
 
 A view on the meter provider bounds every instrument at `CARDINALITY_LIMIT`, 2,000 label sets,
 and the SDK records a label set past that into one series carrying `otel.metric.overflow`. A test reads what the SDK exported through
-`ScopedRecorder::metrics`. Every `traced!` operation records `traces.span.metrics.calls` and
+`ScopedRecorder::metrics`, each series naming its scope, printed as `otel.scope.name` and
+`otel.scope.version`. Every `traced!` operation records `traces.span.metrics.calls` and
 `traces.span.metrics.duration`, in seconds, labeled with its `span.name`, its `span.kind`,
 `Internal`, and its outcome as `status.code`, with `error.type` `panic` or `cancelled` when it did not finish. The metrics follow
 the operation, not its span: the duration is read once, at the operation's end, and the close

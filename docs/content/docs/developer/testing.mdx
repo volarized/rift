@@ -70,7 +70,8 @@ single test at a time.
 test process. Each `ScopedRecorder` a test installs then streams its records to stderr as it
 records them, so the report of a failed test, or of one nextest ended at its timeout, carries
 them under `---- test output ----`. A recorder whose test panics prints its newest records, then
-the process's metric points, one line each; a streaming recorder prints the metric points alone.
+the process's metric points, one line each naming its scope as `otel.scope.name` and
+`otel.scope.version`; a streaming recorder prints the metric points alone.
 `ScopedRecorderBuilder::clock` names the clock span timings and `measure_elapsed!` read on the
 recorder's thread, so a test advances time instead of sleeping.
 
@@ -239,7 +240,8 @@ The newest `operations in flight` record before the window's end follows the win
 what the collector received inside the same window, oldest first:
 
 - the newest 200 metric points, each with its time, kind, name, the `service.instance.id` of the
-  server that sent it, its attributes, and its value
+  server that sent it, its instrumentation scope as `otel.scope.name` and `otel.scope.version`
+  when the point carries one, its attributes, and its value
 - the newest 100 spans, each at its end time with its name, attributes, and elapsed time; a span
   that carries `request_id` adds `records=`, the count of the window's log records whose `req` is
   the same, so the span and the records of its request read together

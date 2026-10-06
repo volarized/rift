@@ -2377,14 +2377,12 @@ A record emitted inside a span carries two more `fields` members: `root_span` fo
 The compact text has these parts:
 
 - the title `N records`, or `1 record`
-- directly below the title, one line for each record, indented by one level, in the order of the JSON `records`
-- on each line, the time as `YYYY-MM-DD HH:MM:SS.mmm` in UTC from `recorded_at_ms`, then the `level`, the `component`, and the `operation`, with `-` for a `component` or `operation` that is empty
-- `: ` and the `message`, when it is not empty
-- each entry of `fields` as ` · key value`, an object value such as `root_span` written as compact JSON; a `fields` value that is not an object is written as ` · ` and its text
-- when the store could not be opened, the section `1 warning` after `0 records`, with the line `unavailable: <reason>` indented by one level
-- a `message`, field value, or `unavailable` reason holding ` · ` or `: ` is quoted
+- directly below the title, one line for each record, indented by one level, in the order of the JSON `records`: the line `rift server logs` prints for a stored page, the time as `YYYY-MM-DD HH:MM:SS.mmmZ` in UTC from `recorded_at_ms`, the level, the function (the `code.function.name` of the outermost span around the record, else the record's own, else its `target`), the context of `component`, `operation`, and the other fields as `key=value`, and the message
+- an empty line between two groups, a group being the consecutive records of one request, of one root span, or of one function
+- a message or field value holding ` · ` or `: ` is written as a JSON string
+- when the store could not be opened, the section `1 warning` after `0 records`, with the line `unavailable: <reason>` indented by one level; a reason holding ` · ` or `: ` is quoted
 
-The text does not write `identity` or `target`. A `recorded_at_ms` before -9999-01-02 01:59:59 UTC or after 9999-12-30 22:00:00 UTC, which bounds the years -9999 to 9999, is written as its count. A read of a level or component template names the requested `uri` in both contents.
+The text does not write `identity`. A `recorded_at_ms` before -9999-01-02 01:59:59 UTC or after 9999-12-30 22:00:00 UTC, which bounds the years -9999 to 9999, is written as its count. A read of a level or component template names the requested `uri` in both contents.
 
 The tabs below show a read of `rift://logs` that answers two records, the newer one with an `operation` and the older one without:
 
@@ -2398,8 +2396,8 @@ The tabs below show a read of `rift://logs` that answers two records, the newer 
 
 ```text
 2 records
-	2026-10-04 10:42:07.120 warn index index.build: file left out of the index · path src/deep.rs · reason syntax tree depth exceeds accepted limit 512
-	2026-10-04 10:41:58.317 info mcp -: MCP server starting · transport http
+	2026-10-04 10:42:07.120Z WARN  rift_mcp::server   component=index operation=index.build path=src/deep.rs reason=syntax tree depth exceeds accepted limit 512  file left out of the index
+	2026-10-04 10:41:58.317Z INFO  rift_mcp::server   component=mcp transport=http                                                                                MCP server starting
 ```
 
 </Tab>
