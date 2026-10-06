@@ -668,6 +668,112 @@ impl OtlpExport {
             .and_then(|providers| providers.recorder_metric_reader.clone())
     }
 
+    /// Flushes ended spans and metric points by `deadline` while leaving every provider open.
+    ///
+    /// Each SDK call runs on its own thread because the metrics reader blocks while it
+    /// waits for its export worker. The caller stops waiting at `deadline`; the SDK keeps
+    /// its requests in its worker queues, where later shutdown requests follow them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportShutdownError::TimedOut`] when `deadline` passes first, and
+    /// [`ExportShutdownError::Failed`] when a provider reports a failed flush.
+    pub async fn flush_traces_and_metrics(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let (tracer, meters) = {
+            let held = self
+                .providers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(providers) = held.as_ref() else {
+                return Ok(());
+            };
+            (providers.tracer.clone(), providers.meters.clone())
+        };
+        let mut operations = Vec::new();
+        if let Some(tracer) = tracer {
+            operations.push(export_operation_on_thread(move || tracer.force_flush()));
+        }
+        if let Some(meters) = meters {
+            operations.push(export_operation_on_thread(move || meters.force_flush()));
+        }
+        wait_for_export_operations(
+            deadline,
+            operations,
+            "the export worker did not return a result",
+        )
+        .await
+    }
+
+    /// Shuts down the span and meter providers by `deadline`, leaving the log provider open.
+    ///
+    /// Call this after records produced by the stop stage have left their spans. The span
+    /// provider's shutdown performs its final export, including the stop-stage span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportShutdownError::TimedOut`] when `deadline` passes first, and
+    /// [`ExportShutdownError::Failed`] when a provider reports a failed final export or
+    /// shutdown.
+    pub async fn shutdown_traces_and_metrics(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let (tracer, meters) = {
+            let mut held = self
+                .providers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(providers) = held.as_mut() else {
+                return Ok(());
+            };
+            (providers.tracer.take(), providers.meters.take())
+        };
+        let mut operations = Vec::new();
+        if let Some(tracer) = tracer {
+            operations.push(export_operation_on_thread(move || tracer.shutdown()));
+        }
+        if let Some(meters) = meters {
+            operations.push(export_operation_on_thread(move || meters.shutdown()));
+        }
+        wait_for_export_operations(deadline, operations, "the shutdown thread did not start").await
+    }
+
+    /// Shuts down the log provider by `deadline`, after stop results have been recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportShutdownError::TimedOut`] when `deadline` passes first, and
+    /// [`ExportShutdownError::Failed`] when the provider reports a failed final export or
+    /// shutdown.
+    pub async fn shutdown_logs(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let logs = {
+            let mut held = self
+                .providers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(providers) = held.as_mut() else {
+                return Ok(());
+            };
+            providers.logs.take()
+        };
+        let Some(logs) = logs else {
+            return Ok(());
+        };
+        logs.open.store(false, Ordering::Release);
+        wait_for_export_operations(
+            deadline,
+            vec![export_operation_on_thread(move || logs.provider.shutdown())],
+            "the shutdown thread did not start",
+        )
+        .await
+    }
+
     /// Flushes buffered spans, log records, and the final metric points, and shuts every
     /// provider down, by `deadline`. A log record written after this call starts is not
     /// exported.
@@ -702,34 +808,23 @@ impl OtlpExport {
         else {
             return Ok(());
         };
-        let tracer = tracer.map(|tracer| shut_down_on_thread(move || tracer.shutdown()));
-        let meters = meters.map(|meters| shut_down_on_thread(move || meters.shutdown()));
+        let tracer = tracer.map(|tracer| export_operation_on_thread(move || tracer.shutdown()));
+        let meters = meters.map(|meters| export_operation_on_thread(move || meters.shutdown()));
         let logs = logs.map(|logs| {
             logs.open.store(false, Ordering::Release);
-            shut_down_on_thread(move || logs.provider.shutdown())
+            export_operation_on_thread(move || logs.provider.shutdown())
         });
-        let waited = tokio::time::timeout_at(deadline, async move {
-            let mut failures = Vec::new();
-            for answer in [tracer, meters, logs].into_iter().flatten() {
-                match answer.await {
-                    Ok(Ok(()) | Err(OTelSdkError::AlreadyShutdown)) => {}
-                    Ok(Err(error)) => failures.push(error.to_string()),
-                    Err(_) => failures.push("the shutdown thread did not start".to_owned()),
-                }
-            }
-            failures
-        })
-        .await;
-        match waited {
-            Err(_) => Err(ExportShutdownError::TimedOut),
-            Ok(failures) if failures.is_empty() => Ok(()),
-            Ok(failures) => Err(ExportShutdownError::Failed(failures.join("; "))),
-        }
+        wait_for_export_operations(
+            deadline,
+            [tracer, meters, logs].into_iter().flatten().collect(),
+            "the shutdown thread did not start",
+        )
+        .await
     }
 }
 
-/// Runs `shutdown` on a thread of its own, and answers its result when it returns.
-fn shut_down_on_thread(
+/// Runs one SDK operation on a thread of its own, and answers its result when it returns.
+fn export_operation_on_thread(
     shutdown: impl FnOnce() -> Result<(), OTelSdkError> + Send + 'static,
 ) -> tokio::sync::oneshot::Receiver<Result<(), OTelSdkError>> {
     let (sent, answer) = tokio::sync::oneshot::channel();
@@ -740,6 +835,33 @@ fn shut_down_on_thread(
             let _ = sent.send(shutdown());
         });
     answer
+}
+
+async fn wait_for_export_operations(
+    deadline: tokio::time::Instant,
+    operations: Vec<tokio::sync::oneshot::Receiver<Result<(), OTelSdkError>>>,
+    missing_worker: &'static str,
+) -> Result<(), ExportShutdownError> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let waited = tokio::time::timeout_at(deadline, async move {
+        let mut failures = Vec::new();
+        for answer in operations {
+            match answer.await {
+                Ok(Ok(()) | Err(OTelSdkError::AlreadyShutdown)) => {}
+                Ok(Err(error)) => failures.push(error.to_string()),
+                Err(_) => failures.push(missing_worker.to_owned()),
+            }
+        }
+        failures
+    })
+    .await;
+    match waited {
+        Err(_) => Err(ExportShutdownError::TimedOut),
+        Ok(failures) if failures.is_empty() => Ok(()),
+        Ok(failures) => Err(ExportShutdownError::Failed(failures.join("; "))),
+    }
 }
 
 /// The variables that name where metrics export: the metrics endpoint, used as it is, or
@@ -1385,7 +1507,8 @@ mod tests {
     use super::{
         ExportShutdownError, LOG_ENDPOINT_VARS, OTLP_EXPORT_TIMEOUT, OtlpExport, TestLogProcessor,
         TestSpanProcessor, configured, export_layer, field_attributes, log_batch_config,
-        log_record_layer, logger_export, meter_provider, resource, tracer_provider,
+        log_record_layer, logger_export, meter_provider, resource, test_process_layer,
+        tracer_provider,
     };
 
     /// Spans each test ends; enough that one lost span shows as a count mismatch.
@@ -1444,6 +1567,29 @@ mod tests {
             _batch: LogBatch<'_>,
         ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
             std::future::pending()
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingLogExporter {
+        bodies: Arc<Mutex<Vec<AnyValue>>>,
+    }
+
+    impl LogExporter for RecordingLogExporter {
+        fn export(
+            &self,
+            batch: LogBatch<'_>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            let mut bodies = self
+                .bodies
+                .lock()
+                .expect("the recorded log bodies are not poisoned");
+            bodies.extend(
+                batch
+                    .iter()
+                    .filter_map(|(record, _)| record.body().cloned()),
+            );
+            std::future::ready(Ok(()))
         }
     }
 
@@ -1726,11 +1872,121 @@ mod tests {
             );
         }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(
+            runtime.block_on(export.flush_traces_and_metrics(deadline)),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.block_on(export.shutdown_traces_and_metrics(deadline)),
+            Ok(())
+        );
+        assert_eq!(runtime.block_on(export.shutdown_logs(deadline)), Ok(()));
         assert_eq!(runtime.block_on(export.shutdown(deadline)), Ok(()));
         assert_eq!(
             runtime.block_on(export.shutdown(deadline)),
             Ok(()),
             "a second shutdown finds nothing to shut down"
+        );
+    }
+
+    #[test]
+    fn staged_shutdown_keeps_logs_open_until_trace_and_meter_shutdown_finishes() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let spans = RecordingExporter::default();
+        let tracer = tracer_provider(spans.clone(), BatchConfig::default(), resource());
+        let records = RecordingLogExporter::default();
+        let logs = logger_export(records.clone(), log_batch_config(), resource());
+        let (collector_layer, collector_export) =
+            test_process_layer(EnvFilter::new("rift_tracing=debug"));
+        let subscriber = crate::capture::registry()
+            .with(log_record_layer(
+                &logs,
+                EnvFilter::new("rift_tracing=debug"),
+            ))
+            .with(export_layer(&tracer, EnvFilter::new("rift_tracing=debug")));
+        let export = OtlpExport::holding(Some(tracer), None, Some(logs));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let (
+            flush_result,
+            shutdown_result,
+            logs_result,
+            ended_during_stage,
+            ended_after_stage_close,
+            ended_after_shutdown,
+        ) = tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "rift_tracing::otlp::tests", phase = "before_stage", ?export);
+            let flush_result = crate::traced!(
+                component = "mcp",
+                operation = "server.stop",
+                stage = "otlp export",
+                {
+                    crate::info!("stop stage ended");
+                    runtime.block_on(export.flush_traces_and_metrics(deadline))
+                }
+            );
+            let ended_during_stage = spans.count("server.stop");
+            tracing::debug!(target: "rift_tracing::otlp::tests", phase = "stage_closed_after_flush", ended_during_stage, ?flush_result, ?export);
+            let ended_after_stage_close = spans.count("server.stop");
+            let shutdown_result = runtime.block_on(export.shutdown_traces_and_metrics(deadline));
+            let ended_after_shutdown = spans.count("server.stop");
+            tracing::debug!(target: "rift_tracing::otlp::tests", phase = "trace_meter_shutdown_finished", ?shutdown_result, ended_after_shutdown, ?export);
+
+            crate::warn!(
+                operation = "server.stop",
+                outcome = "ok",
+                "otlp export ended"
+            );
+            let logs_result = runtime.block_on(export.shutdown_logs(deadline));
+            tracing::debug!(target: "rift_tracing::otlp::tests", phase = "log_shutdown_finished", ?logs_result, ?export);
+            (
+                flush_result,
+                shutdown_result,
+                logs_result,
+                ended_during_stage,
+                ended_after_stage_close,
+                ended_after_shutdown,
+            )
+        });
+
+        let exported_span_count = spans.count("server.stop");
+        let exported_logs = records
+            .bodies
+            .lock()
+            .expect("the recorded log bodies are not poisoned")
+            .clone();
+        let diagnostic_subscriber = tracing_subscriber::registry().with(collector_layer);
+        tracing::subscriber::with_default(diagnostic_subscriber, || {
+            tracing::debug!(
+                target: "rift_tracing::otlp::tests",
+                phase = "shutdown_snapshot",
+                ?flush_result,
+                ?shutdown_result,
+                ?logs_result,
+                ended_during_stage,
+                ended_after_stage_close,
+                ended_after_shutdown,
+                span_count = exported_span_count,
+                found_stop_span = exported_span_count > 0,
+                log_count = exported_logs.len(),
+                found_stop_result = exported_logs
+                    .contains(&AnyValue::from("otlp export ended".to_owned())),
+                ?export,
+            );
+        });
+        let collector_result = runtime.block_on(collector_export.shutdown(deadline));
+        assert_eq!(flush_result, Ok(()));
+        assert_eq!(shutdown_result, Ok(()));
+        assert_eq!(logs_result, Ok(()));
+        assert_eq!(collector_result, Ok(()));
+        assert!(
+            exported_span_count > 0,
+            "the stop stage span reaches the exporter: {exported_span_count}"
+        );
+        assert!(
+            exported_logs.contains(&AnyValue::from("otlp export ended".to_owned())),
+            "the shutdown result is logged after trace shutdown"
         );
     }
 
