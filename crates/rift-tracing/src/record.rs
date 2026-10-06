@@ -210,6 +210,15 @@ impl LogQuery {
         self
     }
 
+    /// Sets the reading `since_age` and `until_age` count back from to `clock_ms`, in place
+    /// of the first `SystemTime::now()` reading `crate::capture::now_ms` takes.
+    #[cfg(feature = "fixtures")]
+    #[must_use]
+    pub const fn at_clock_ms(mut self, clock_ms: i64) -> Self {
+        self.clock_ms = Some(clock_ms);
+        self
+    }
+
     /// Restricts the read to records recorded at or after the cutoff `age` before the
     /// tracing clock's reading.
     ///
