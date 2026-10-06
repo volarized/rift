@@ -70,14 +70,16 @@ from opentelemetry.proto.metrics.v1.metrics_pb2 import (
 )
 from starlette.applications import Starlette
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 TRACES_PATH = "/v1/traces"
 METRICS_PATH = "/v1/metrics"
 LOGS_PATH = "/v1/logs"
+CASE_LOGS_PATH = "/test/case/logs"
 PROTOBUF = "application/x-protobuf"
 BODY_BYTES_MAX = 8 * 1024 * 1024
+CASE_LOG_SNAPSHOT_BYTES_MAX = 1024 * 1024
 METRICS_MAX = 512
 SERIES_MAX = 256
 GZIP_WINDOW = 31
@@ -119,6 +121,7 @@ TEST_CASE_KEY = "test.case.name"
 CASE_POINTS_MAX = 20_000
 CASE_SPANS_MAX = 5_000
 CASE_LOGS_MAX = 20_000
+CASE_LOG_SNAPSHOT_MAX = 256
 # Tests `CaseStore` holds at once; a test past it is counted, not kept.
 CASES_MAX = 512
 # Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
@@ -661,8 +664,7 @@ class MetricStore:
             if self.tests is not None:
                 self.tests.keep(resource, kept)
             duplicate = (
-                kept.temporality == "cumulative"
-                and kept in self.cumulative_points
+                kept.temporality == "cumulative" and kept in self.cumulative_points
             )
             if duplicate:
                 continue
@@ -906,6 +908,17 @@ class CaseStore:
         with self.lock:
             return self.tests.pop(test, None)
 
+    def log_snapshot(
+        self, test: str, limit: int
+    ) -> tuple[tuple[LogEntry, ...], int, int] | None:
+        """The newest `limit` log records for `test`, dropped count, and retained count."""
+        with self.lock:
+            held = self.tests.get(test)
+            if held is None:
+                return None
+            logs = tuple(reversed(held.logs))
+            return logs[:limit], held.dropped.logs, len(logs)
+
     def forget(self, names: Callable[[str], bool]) -> int:
         """Drops every held test `names` accepts; answers how many."""
         with self.lock:
@@ -951,12 +964,16 @@ async def bounded_body(request: Request) -> bytes | None:
 
 
 def receiver(
-    spans: SpanStore, metrics: MetricStore | None = None, logs: LogStore | None = None
+    spans: SpanStore,
+    metrics: MetricStore | None = None,
+    logs: LogStore | None = None,
+    cases: CaseStore | None = None,
 ) -> Starlette:
     """The application that feeds OTLP/HTTP export requests into `spans`, `metrics`, and
     `logs`.
 
-    Starlette answers any other path with 404 and any other method with 405.
+    Starlette answers any other path with 404 and any other method with 405. When `cases`
+    is supplied, it also serves a bounded read-only snapshot of one live test's logs.
     """
     held = metrics if metrics is not None else MetricStore()
     records = logs if logs is not None else LogStore()
@@ -996,28 +1013,89 @@ def receiver(
 
         return Route(path, export, methods=["POST"])
 
-    return Starlette(
-        routes=[
-            route(
-                TRACES_PATH,
-                spans.record,
-                ExportTraceServiceResponse().SerializeToString(),
-                "ExportTraceServiceRequest",
-            ),
-            route(
-                METRICS_PATH,
-                held.record,
-                ExportMetricsServiceResponse().SerializeToString(),
-                "ExportMetricsServiceRequest",
-            ),
-            route(
-                LOGS_PATH,
-                records.record,
-                ExportLogsServiceResponse().SerializeToString(),
-                "ExportLogsServiceRequest",
-            ),
-        ]
-    )
+    routes = [
+        route(
+            TRACES_PATH,
+            spans.record,
+            ExportTraceServiceResponse().SerializeToString(),
+            "ExportTraceServiceRequest",
+        ),
+        route(
+            METRICS_PATH,
+            held.record,
+            ExportMetricsServiceResponse().SerializeToString(),
+            "ExportMetricsServiceRequest",
+        ),
+        route(
+            LOGS_PATH,
+            records.record,
+            ExportLogsServiceResponse().SerializeToString(),
+            "ExportLogsServiceRequest",
+        ),
+    ]
+    if cases is not None:
+
+        async def case_logs(request: Request) -> Response:
+            test = request.query_params.get(TEST_CASE_KEY)
+            if not test:
+                return PlainTextResponse(
+                    f"query parameter {TEST_CASE_KEY} is required", 400
+                )
+            raw_limit = request.query_params.get("limit", str(CASE_LOG_SNAPSHOT_MAX))
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                return PlainTextResponse("limit must be an integer", 400)
+            if not 1 <= limit <= CASE_LOG_SNAPSHOT_MAX:
+                return PlainTextResponse(
+                    f"limit must be between 1 and {CASE_LOG_SNAPSHOT_MAX}", 400
+                )
+            snapshot = cases.log_snapshot(test, limit)
+            if snapshot is None:
+                return PlainTextResponse("test case has no retained telemetry", 404)
+            newest_logs, dropped, retained = snapshot
+            rows: list[dict[str, object]] = []
+            size = 0
+            for entry in newest_logs:
+                row: dict[str, object] = {
+                    "time_unix_nano": entry.time_unix_nano,
+                    "severity": entry.severity,
+                    "body": entry.body,
+                    "attributes": dict(entry.attributes),
+                    "resource": dict(entry.resource),
+                    "trace_id": entry.trace_id,
+                    "span_id": entry.span_id,
+                }
+                row_size = len(
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                if row_size > CASE_LOG_SNAPSHOT_BYTES_MAX:
+                    return PlainTextResponse(
+                        "a log record exceeds the case snapshot byte bound", 413
+                    )
+                if size + row_size > CASE_LOG_SNAPSHOT_BYTES_MAX:
+                    break
+                rows.append(row)
+                size += row_size
+            omitted = retained - len(rows)
+            return JSONResponse(
+                {
+                    "test_case": test,
+                    "retained": retained,
+                    "dropped": dropped,
+                    "omitted": omitted,
+                    "logs": list(reversed(rows)),
+                }
+            )
+
+        routes.append(Route(CASE_LOGS_PATH, case_logs, methods=["GET"]))
+
+    return Starlette(routes=routes)
 
 
 @dataclass(slots=True)
@@ -1146,7 +1224,7 @@ def collector(
         port = listener.getsockname()[1]
         server = uvicorn.Server(
             uvicorn.Config(
-                receiver(stores.spans, stores.metrics, stores.logs),
+                receiver(stores.spans, stores.metrics, stores.logs, stores.cases),
                 lifespan="off",
                 log_config=None,
                 log_level="warning",
