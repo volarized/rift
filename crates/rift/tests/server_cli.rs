@@ -1259,6 +1259,78 @@ fn assert_export_stage_outcome(expected: &[&str]) -> TestResult {
 }
 
 #[cfg(unix)]
+fn case_snapshot(path: &str) -> TestResult<serde_json::Value> {
+    let attempt = std::env::var("NEXTEST_ATTEMPT_ID")?;
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
+    let mut url = reqwest::Url::parse(&format!("{}{}", endpoint.trim_end_matches('/'), path))?;
+    url.query_pairs_mut()
+        .append_pair("test.case.name", &attempt)
+        .append_pair("limit", "256");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let body = runtime.block_on(async {
+        reqwest::Client::new()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await
+    })?;
+    let response: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(response["test_case"], attempt);
+    assert_eq!(response["dropped"], 0);
+    Ok(response)
+}
+
+#[cfg(unix)]
+fn assert_database_readings_follow_close() -> TestResult {
+    let logs = case_snapshot("/test/case/logs")?;
+    let close = logs["logs"]
+        .as_array()
+        .ok_or("collector logs are an array")?
+        .iter()
+        .find(|record| {
+            record["body"] == "database closed; the write-ahead log stays for the next open"
+                && record["attributes"]["operation"] == "database.close"
+        })
+        .ok_or("the collector retains the database.close record")?;
+    let close_time = close["time_unix_nano"]
+        .as_u64()
+        .ok_or("database.close has an OTLP timestamp")?;
+    let metrics = case_snapshot("/test/case/metrics")?;
+    assert_eq!(metrics["omitted"], 0);
+    let points = metrics["points"]
+        .as_array()
+        .ok_or("collector metric points are an array")?;
+    let attempt = std::env::var("NEXTEST_ATTEMPT_ID")?;
+
+    for namespace in ["index", "metrics"] {
+        for (name, attribute, value) in [
+            ("sqlite.file.size", "sqlite.file.type", "database"),
+            ("sqlite.file.size", "sqlite.file.type", "wal"),
+            ("sqlite.page.count", "sqlite.page.state", "used"),
+            ("sqlite.page.count", "sqlite.page.state", "free"),
+        ] {
+            assert!(
+                points.iter().any(|point| {
+                    point["name"] == name
+                        && point["attributes"]["db.namespace"] == namespace
+                        && point["attributes"][attribute] == value
+                        && point["resource"]["test.case.name"] == attempt
+                        && point["time_unix_nano"]
+                            .as_u64()
+                            .is_some_and(|time| time > close_time)
+                }),
+                "the collector retains post-close {name} for {namespace} with {attribute}={value}: {points:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test]
 fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     let directory = workspace()?;
@@ -1373,6 +1445,10 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
+        .env(
+            "OTEL_METRIC_EXPORT_INTERVAL",
+            EXPORT_INTERVAL_PAST_THE_TEST_MS,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1408,6 +1484,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         !stderr.contains("outlasted the stop deadline"),
         "the log drain's final flush must get its share of the budget: {stderr}"
     );
+    assert_database_readings_follow_close()?;
     failure_window.passed();
     Ok(())
 }
