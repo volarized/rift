@@ -170,9 +170,9 @@ def failed_status(status: str) -> bool:
 
 
 def profile_of(arguments: Sequence[str]) -> str:
-    """The nextest profile `--profile` selects, else `NEXTEST_PROFILE`, else `default`."""
+    """The nextest profile `-P` or `--profile` selects, else `NEXTEST_PROFILE`, else `default`."""
     for index, argument in enumerate(arguments):
-        if argument == "--profile" and index + 1 < len(arguments):
+        if argument in ("-P", "--profile") and index + 1 < len(arguments):
             return arguments[index + 1]
         if argument.startswith("--profile="):
             return argument.split("=", 1)[1]
