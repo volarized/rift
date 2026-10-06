@@ -414,7 +414,7 @@ impl ScopedRecorderBuilder {
 }
 
 /// A Tokio runtime held on its owner thread until the scoped recorder shuts its export down.
-struct TestOtlpRuntime {
+pub(crate) struct TestOtlpRuntime {
     handle: tokio::runtime::Handle,
     shutdown: SyncSender<OtlpExport>,
     thread: Option<JoinHandle<()>>,
@@ -423,6 +423,17 @@ struct TestOtlpRuntime {
 impl TestOtlpRuntime {
     fn when_configured() -> Option<Self> {
         otlp::recorder_export_configured().then(Self::start)
+    }
+
+    pub(crate) fn when_configured_without_runtime() -> Option<Self> {
+        tokio::runtime::Handle::try_current()
+            .is_err()
+            .then(Self::when_configured)
+            .flatten()
+    }
+
+    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
+        self.handle.enter()
     }
 
     fn start() -> Self {
@@ -466,6 +477,17 @@ impl TestOtlpRuntime {
         }
     }
 
+    pub(crate) fn shutdown(mut self, export: OtlpExport) {
+        if self.shutdown.send(export).is_err() {
+            eprintln!("rift: warning: test OTLP runtime stopped before export shutdown");
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("rift: warning: test OTLP runtime thread panicked");
+        }
+    }
+
     fn with_export(self, export: OtlpExport) -> TestOtlpExport {
         TestOtlpExport {
             runtime: Some(self),
@@ -493,15 +515,8 @@ impl Drop for TestOtlpExport {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        if let Some(export) = self.export.take()
-            && runtime.shutdown.send(export).is_err()
-        {
-            eprintln!("rift: warning: test OTLP runtime stopped before export shutdown");
-        }
-        if let Some(thread) = runtime.thread
-            && thread.join().is_err()
-        {
-            eprintln!("rift: warning: test OTLP runtime thread panicked");
+        if let Some(export) = self.export.take() {
+            runtime.shutdown(export);
         }
     }
 }

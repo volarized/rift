@@ -26,6 +26,8 @@ use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable, StallReport, observe_active};
 use crate::metrics::ObservationGuard;
 use crate::otlp::{self, OtlpExport};
+#[cfg(any(test, feature = "fixtures"))]
+use crate::recorder::TestOtlpRuntime;
 use crate::render::LevelColor;
 use crate::sampler::{SystemProcessReader, observe_process, observe_runtime};
 use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrLines};
@@ -153,6 +155,8 @@ pub struct TracingRuntime {
     stall: Option<StallReport>,
     /// Keeps the table of operations in flight reported in `operation.active`.
     _in_flight: Option<ObservationGuard>,
+    #[cfg(any(test, feature = "fixtures"))]
+    test_otlp_runtime: Option<TestOtlpRuntime>,
 }
 
 /// How long [`TracingRuntime::shutdown`] waits for the OTLP export's final flush and
@@ -186,11 +190,23 @@ impl TracingRuntime {
     /// local first, and `process::exit` past it runs no destructor at all. An export that
     /// fails or outlasts its bound is reported on stderr and fails nothing.
     pub async fn shutdown(self) {
-        if let Some(stall) = self.stall {
+        let Self {
+            export,
+            stall,
+            _in_flight,
+            #[cfg(any(test, feature = "fixtures"))]
+            test_otlp_runtime,
+        } = self;
+        if let Some(stall) = stall {
             stall.stop().await;
         }
         let deadline = tokio::time::Instant::now() + OTLP_SHUTDOWN_TIMEOUT;
-        if let Err(error) = self.export.shutdown(deadline).await {
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(runtime) = test_otlp_runtime {
+            runtime.shutdown(export);
+            return;
+        }
+        if let Err(error) = export.shutdown(deadline).await {
             eprintln!("rift: warning: {error}");
         }
     }
@@ -269,6 +285,16 @@ impl TracingRuntimeBuilder {
             }
             None => (None, None),
         };
+        #[cfg(any(test, feature = "fixtures"))]
+        let test_otlp_runtime = TestOtlpRuntime::when_configured_without_runtime();
+        #[cfg(any(test, feature = "fixtures"))]
+        let (otlp_layer, export) = if let Some(runtime) = &test_otlp_runtime {
+            let _entered = runtime.enter();
+            otlp::layer(capture_filter(self.capture.as_deref()))
+        } else {
+            otlp::layer(capture_filter(self.capture.as_deref()))
+        };
+        #[cfg(not(any(test, feature = "fixtures")))]
         let (otlp_layer, export) = otlp::layer(capture_filter(self.capture.as_deref()));
         let (writer, drain) = match self.stderr {
             StderrPolicy::Unbounded => (BoxMakeWriter::new(std::io::stderr), drain),
@@ -301,6 +327,11 @@ impl TracingRuntimeBuilder {
             .with(otlp_layer)
             .try_init();
         if let Err(error) = installed {
+            #[cfg(any(test, feature = "fixtures"))]
+            if let Some(runtime) = test_otlp_runtime {
+                runtime.shutdown(export);
+                return Err(InstallError(error));
+            }
             // Dropping the providers blocks on their shutdown, which waits for export tasks
             // this runtime drives; a thread of its own drops them instead.
             let _ = std::thread::Builder::new()
@@ -327,6 +358,8 @@ impl TracingRuntimeBuilder {
                 export,
                 stall,
                 _in_flight: in_flight,
+                #[cfg(any(test, feature = "fixtures"))]
+                test_otlp_runtime,
             },
             drain,
         ))
