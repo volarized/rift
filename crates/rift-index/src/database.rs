@@ -585,7 +585,8 @@ impl WorkspaceDatabase {
     ///
     /// The close records `database closed; the write-ahead log stays for the next open` with
     /// the frames the log held as `log`, the frames already moved as `checkpointed`, and its
-    /// `elapsed_ms`. A connection that cannot open by `deadline` is recorded at `warn`, and
+    /// `elapsed_ms`. The connection's open is recorded at `debug` as `the close keeps the
+    /// write-ahead log`. A connection that cannot open by `deadline` is recorded at `warn`, and
     /// the worker stops anyway; its last connection's close then checkpoints.
     ///
     /// A worker whose stop outlasts `deadline` does not fail the close, whatever it was
@@ -673,7 +674,15 @@ impl WorkspaceDatabase {
         let error = match spawned {
             Err(error) => error.to_string(),
             Ok(_thread) => match tokio::time::timeout_at(deadline, opening).await {
-                Ok(Ok(Ok(keeper))) => return Some(keeper),
+                Ok(Ok(Ok(keeper))) => {
+                    rift_tracing::debug!(
+                        component = "storage",
+                        operation = "database.close",
+                        database,
+                        "the close keeps the write-ahead log"
+                    );
+                    return Some(keeper);
+                }
                 Ok(Ok(Err(error))) => error.to_string(),
                 Ok(Err(_)) => "the connection's thread ended without an answer".to_owned(),
                 Err(_elapsed) => "the connection did not open by the shutdown deadline".to_owned(),
@@ -2923,7 +2932,10 @@ mod tests {
             .collect();
         assert_eq!(
             messages,
-            ["database closed; the write-ahead log stays for the next open"],
+            [
+                "the close keeps the write-ahead log",
+                "database closed; the write-ahead log stays for the next open"
+            ],
             "{closes:?}"
         );
         Ok(())
@@ -2969,9 +2981,13 @@ mod tests {
         drop(recorder);
 
         let closes = close_records(&drain.queued_records())?;
-        let [(level, message, fields)] = &closes[..] else {
-            return Err(format!("one close record: {closes:?}").into());
+        let [(kept_level, kept, _), (level, message, fields)] = &closes[..] else {
+            return Err(format!("the kept log and one close record: {closes:?}").into());
         };
+        assert_eq!(
+            (kept_level.as_str(), kept.as_str()),
+            ("debug", "the close keeps the write-ahead log")
+        );
         assert_eq!(level, "info");
         assert_eq!(
             message,
@@ -3124,6 +3140,7 @@ mod tests {
         assert_eq!(
             messages,
             [
+                ("debug", "the close keeps the write-ahead log"),
                 (
                     "warn",
                     "SQLite worker outlasted the shutdown deadline; the write-ahead log stays \
@@ -3136,11 +3153,11 @@ mod tests {
             ]
         );
         assert!(
-            closes[0].2["error"]
+            closes[1].2["error"]
                 .as_str()
                 .is_some_and(|error| error.contains("exceeded deadline")),
             "{:?}",
-            closes[0].2
+            closes[1].2
         );
         let main_alone = copies.path().join("main-alone");
         std::fs::copy(&left, &main_alone)?;
@@ -3163,6 +3180,10 @@ mod tests {
 
     /// A close that starts past its deadline runs no checkpoint, and the worker it finds
     /// held outlasts it without failing the close: the stop is a `warn` record.
+    ///
+    /// The clock is real: the worker stop joins the held thread on a blocking task, and a
+    /// blocking task stops a paused clock's auto-advance, so a deadline timer the close
+    /// sets could not fire before the release.
     #[tokio::test]
     async fn a_close_that_starts_past_its_deadline_outlasts_a_held_worker_without_failing()
     -> TestResult {
