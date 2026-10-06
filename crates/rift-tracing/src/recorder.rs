@@ -36,7 +36,7 @@ mod unscoped;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -85,6 +85,9 @@ static UNSCOPED_TRIED: AtomicBool = AtomicBool::new(false);
 /// Whether this process installed a recorder: from then on the unscoped stream enables
 /// nothing (`unscoped.rs` states why).
 static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Owns test-process exporters until the nextest child exits.
+#[cfg(any(test, feature = "fixtures"))]
+static UNSCOPED_TEST_EXPORT: OnceLock<TestOtlpExport> = OnceLock::new();
 
 /// Installs the unscoped stream once per process, when [`SCOPED_RECORDER_STREAM_VARIABLE`]
 /// is set and nextest started the process. `tracing-core`'s global default "can only be
@@ -95,27 +98,50 @@ pub(crate) fn stream_unscoped() {
         return;
     }
     if RECORDER_INSTALLED.load(Ordering::Relaxed)
-        || std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_none()
         || !std::env::args_os().any(|argument| argument == NEXTEST_ARGUMENT)
     {
+        return;
+    }
+    let stream = std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_some();
+    #[cfg(any(test, feature = "fixtures"))]
+    let export_enabled = otlp::test_process_export_configured();
+    #[cfg(not(any(test, feature = "fixtures")))]
+    let export_enabled = false;
+    if !stream && !export_enabled {
         return;
     }
     let Ok(filter) = recorder_filter(Some(UNSCOPED_CAPTURE)) else {
         return;
     };
     let retained = Arc::new(RetainedRecords {
-        stream: Some(PanicOutput::Stderr),
+        stream: stream.then_some(PanicOutput::Stderr),
         ..RetainedRecords::default()
     });
     // No drain reads the queue: a closed queue counts no drop in `log.queue.dropped`.
     let (sink, _drain) = log_capture();
     let flights = Arc::new(FlightTable::default());
+    #[cfg(any(test, feature = "fixtures"))]
+    let (otlp_layer, test_export) = if export_enabled {
+        let runtime = TestOtlpRuntime::start();
+        let entered = runtime.handle.enter();
+        let (layer, export) = otlp::test_process_layer(filter.clone());
+        drop(entered);
+        (Some(layer), Some(runtime.with_export(export)))
+    } else {
+        (None, None)
+    };
     let subscriber = crate::capture::registry()
         .with(FlightLayer::new(Arc::clone(&flights)))
         .with(capture_layer(sink.retaining(retained), filter))
         .with(unscoped::StopAtRecorder);
+    #[cfg(any(test, feature = "fixtures"))]
+    let subscriber = subscriber.with(otlp_layer);
     if tracing::subscriber::set_global_default(subscriber).is_err() {
         return;
+    }
+    #[cfg(any(test, feature = "fixtures"))]
+    if let Some(test_export) = test_export {
+        let _ = UNSCOPED_TEST_EXPORT.set(test_export);
     }
     let _ = std::thread::Builder::new()
         .name("rift-unscoped-stream".to_owned())

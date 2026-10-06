@@ -12,8 +12,9 @@
 //! servers tells them apart.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
@@ -22,14 +23,16 @@ use opentelemetry_otlp::{
     LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig as _,
 };
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::error::OTelSdkError;
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor;
-use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
+use opentelemetry_sdk::logs::{LogBatch, LogProcessor, SdkLogRecord, SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
-use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, SdkTracerProvider};
+use opentelemetry_sdk::trace::{
+    BatchConfig, BatchConfigBuilder, SdkTracerProvider, Span, SpanData, SpanProcessor,
+};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{FilterExt as _, LevelFilter, Targets};
 use tracing_subscriber::layer::Context;
@@ -112,6 +115,408 @@ fn export_others() -> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Met
 /// or an unreachable collector reaches the operator instead of thinning the trace unseen.
 pub(crate) fn sdk_reports() -> Targets {
     Targets::new().with_target(SDK_TARGET, LevelFilter::WARN)
+}
+
+/// The test process queue uses the SDK's span queue bound.
+#[cfg(any(test, feature = "fixtures"))]
+const TEST_SPAN_EXPORT_QUEUE_MAX: usize = opentelemetry_sdk::trace::OTEL_BSP_MAX_QUEUE_SIZE_DEFAULT;
+#[cfg(any(test, feature = "fixtures"))]
+const TEST_LOG_EXPORT_QUEUE_MAX: usize = opentelemetry_sdk::logs::OTEL_BLRP_MAX_QUEUE_SIZE_DEFAULT;
+
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug)]
+enum TestSpanRequest {
+    Export {
+        span: Box<SpanData>,
+        deadline: Instant,
+        reply: SyncSender<OTelSdkResult>,
+    },
+    Flush {
+        deadline: Instant,
+        reply: SyncSender<OTelSdkResult>,
+    },
+    SetResource(Resource),
+    Shutdown {
+        timeout: Duration,
+        deadline: Instant,
+        reply: SyncSender<OTelSdkResult>,
+    },
+}
+
+/// A nextest process exports each ended span before its caller returns.
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug)]
+struct TestSpanProcessor {
+    sender: tokio::sync::mpsc::Sender<TestSpanRequest>,
+    queue_full_reported: AtomicBool,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl TestSpanProcessor {
+    fn new<E>(mut exporter: E) -> Self
+    where
+        E: opentelemetry_sdk::trace::SpanExporter + 'static,
+    {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(TEST_SPAN_EXPORT_QUEUE_MAX);
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    TestSpanRequest::Export {
+                        span,
+                        deadline,
+                        reply,
+                    } => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let result = if remaining.is_zero() {
+                            Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                        } else {
+                            match tokio::time::timeout(remaining, exporter.export(vec![*span]))
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT)),
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    TestSpanRequest::Flush { deadline, reply } => {
+                        let result = if Instant::now() < deadline {
+                            // Every preceding request completes before this FIFO command.
+                            // The OTLP exporter has no buffered state of its own.
+                            Ok(())
+                        } else {
+                            Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                        };
+                        let _ = reply.send(result);
+                    }
+                    TestSpanRequest::SetResource(resource) => exporter.set_resource(&resource),
+                    TestSpanRequest::Shutdown {
+                        timeout,
+                        deadline,
+                        reply,
+                    } => {
+                        let remaining = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(timeout);
+                        let result = if remaining.is_zero() {
+                            Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                        } else {
+                            exporter.shutdown()
+                        };
+                        let _ = reply.send(result);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            sender,
+            queue_full_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn submit(
+        &self,
+        request: impl FnOnce(SyncSender<OTelSdkResult>, Instant) -> TestSpanRequest,
+    ) -> OTelSdkResult {
+        let deadline = Instant::now() + OTLP_EXPORT_TIMEOUT;
+        let (reply, response) = mpsc::sync_channel(1);
+        let result = match self.sender.try_send(request(reply, deadline)) {
+            Ok(()) => response
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => Err(OTelSdkError::InternalFailure(
+                        "the test span export worker stopped".to_owned(),
+                    )),
+                }),
+            Err(error) => {
+                let (queue_full, reason) = match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        (true, "the test span export worker queue is full")
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        (false, "the test span export worker stopped")
+                    }
+                };
+                if queue_full && !self.queue_full_reported.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(
+                        target: SDK_TARGET,
+                        name = "BatchSpanProcessor.SpanDroppingStarted",
+                        message = "Beginning to drop span messages due to full/internal errors."
+                    );
+                }
+                Err(OTelSdkError::InternalFailure(reason.to_owned()))
+            }
+        };
+        if let Err(error) = &result {
+            tracing::error!(
+                target: SDK_TARGET,
+                name = "BatchSpanProcessor.Export.Error",
+                reason = %error,
+                message = "Failed during the export process"
+            );
+        }
+        result
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl SpanProcessor for TestSpanProcessor {
+    fn on_start(&self, _span: &mut Span, _cx: &opentelemetry::Context) {}
+
+    fn on_end(&self, span: SpanData) {
+        if span.span_context.is_sampled() {
+            let _ = self.submit(|reply, deadline| TestSpanRequest::Export {
+                span: Box::new(span),
+                deadline,
+                reply,
+            });
+        }
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.submit(|reply, deadline| TestSpanRequest::Flush { deadline, reply })
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let deadline = Instant::now() + timeout.min(OTLP_EXPORT_TIMEOUT);
+        let (reply, response) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(TestSpanRequest::Shutdown {
+                timeout,
+                deadline,
+                reply,
+            })
+            .map_err(|error| OTelSdkError::InternalFailure(format!("{error:?}")))?;
+        match response.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(OTelSdkError::Timeout(timeout.min(OTLP_EXPORT_TIMEOUT)))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(OTelSdkError::InternalFailure(
+                "the test span export worker stopped".to_owned(),
+            )),
+        }
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        if self
+            .sender
+            .try_send(TestSpanRequest::SetResource(resource.clone()))
+            .is_err()
+        {
+            tracing::warn!(
+                target: SDK_TARGET,
+                name = "BatchSpanProcessor.ResourceUpdate.Error",
+                message = "The test span export worker refused its resource"
+            );
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug)]
+enum TestLogRequest {
+    Export {
+        record: Box<SdkLogRecord>,
+        instrumentation: opentelemetry::InstrumentationScope,
+        deadline: Instant,
+        reply: SyncSender<OTelSdkResult>,
+    },
+    Flush {
+        deadline: Instant,
+        reply: SyncSender<OTelSdkResult>,
+    },
+    SetResource(Resource),
+    Shutdown {
+        timeout: Duration,
+        deadline: Instant,
+        reply: SyncSender<OTelSdkResult>,
+    },
+}
+
+/// A nextest process exports each log record before its caller returns.
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug)]
+struct TestLogProcessor {
+    sender: tokio::sync::mpsc::Sender<TestLogRequest>,
+    queue_full_reported: AtomicBool,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl TestLogProcessor {
+    fn new<E>(mut exporter: E) -> Self
+    where
+        E: opentelemetry_sdk::logs::LogExporter + 'static,
+    {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(TEST_LOG_EXPORT_QUEUE_MAX);
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                match request {
+                    TestLogRequest::Export {
+                        record,
+                        instrumentation,
+                        deadline,
+                        reply,
+                    } => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let result = if remaining.is_zero() {
+                            Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                        } else {
+                            let record = *record;
+                            let records = [(&record, &instrumentation)];
+                            match tokio::time::timeout(
+                                remaining,
+                                exporter.export(LogBatch::new(&records)),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT)),
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    TestLogRequest::Flush { deadline, reply } => {
+                        let result = if Instant::now() < deadline {
+                            // Every preceding request completes before this FIFO command.
+                            // The OTLP exporter has no buffered state of its own.
+                            Ok(())
+                        } else {
+                            Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                        };
+                        let _ = reply.send(result);
+                    }
+                    TestLogRequest::SetResource(resource) => exporter.set_resource(&resource),
+                    TestLogRequest::Shutdown {
+                        timeout,
+                        deadline,
+                        reply,
+                    } => {
+                        let remaining = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(timeout);
+                        let result = if remaining.is_zero() {
+                            Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                        } else {
+                            exporter.shutdown_with_timeout(remaining)
+                        };
+                        let _ = reply.send(result);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            sender,
+            queue_full_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn submit(
+        &self,
+        request: impl FnOnce(SyncSender<OTelSdkResult>, Instant) -> TestLogRequest,
+    ) -> OTelSdkResult {
+        let deadline = Instant::now() + OTLP_EXPORT_TIMEOUT;
+        let (reply, response) = mpsc::sync_channel(1);
+        let result = match self.sender.try_send(request(reply, deadline)) {
+            Ok(()) => response
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        Err(OTelSdkError::Timeout(OTLP_EXPORT_TIMEOUT))
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => Err(OTelSdkError::InternalFailure(
+                        "the test log export worker stopped".to_owned(),
+                    )),
+                }),
+            Err(error) => {
+                let (queue_full, reason) = match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        (true, "the test log export worker queue is full")
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        (false, "the test log export worker stopped")
+                    }
+                };
+                if queue_full && !self.queue_full_reported.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(
+                        target: SDK_TARGET,
+                        name = "BatchLogProcessor.LogDroppingStarted",
+                        message = "BatchLogProcessor dropped a LogRecord due to queue full/internal errors."
+                    );
+                }
+                Err(OTelSdkError::InternalFailure(reason.to_owned()))
+            }
+        };
+        if let Err(error) = &result {
+            tracing::error!(
+                target: SDK_TARGET,
+                name = "BatchLogProcessor.Export.Error",
+                reason = %error,
+                message = "Failed during the export process"
+            );
+        }
+        result
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl LogProcessor for TestLogProcessor {
+    fn emit(
+        &self,
+        record: &mut SdkLogRecord,
+        instrumentation: &opentelemetry::InstrumentationScope,
+    ) {
+        let _ = self.submit(|reply, deadline| TestLogRequest::Export {
+            record: Box::new(record.clone()),
+            instrumentation: instrumentation.clone(),
+            deadline,
+            reply,
+        });
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.submit(|reply, deadline| TestLogRequest::Flush { deadline, reply })
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        let deadline = Instant::now() + timeout.min(OTLP_EXPORT_TIMEOUT);
+        let (reply, response) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(TestLogRequest::Shutdown {
+                timeout,
+                deadline,
+                reply,
+            })
+            .map_err(|error| OTelSdkError::InternalFailure(format!("{error:?}")))?;
+        match response.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(OTelSdkError::Timeout(timeout.min(OTLP_EXPORT_TIMEOUT)))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(OTelSdkError::InternalFailure(
+                "the test log export worker stopped".to_owned(),
+            )),
+        }
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        if self
+            .sender
+            .try_send(TestLogRequest::SetResource(resource.clone()))
+            .is_err()
+        {
+            tracing::warn!(
+                target: SDK_TARGET,
+                name = "BatchLogProcessor.ResourceUpdate.Error",
+                message = "The test log export worker refused its resource"
+            );
+        }
+    }
 }
 
 /// The installed exporter's tracer, meter, and logger providers, shut down at most once.
@@ -335,6 +740,20 @@ pub(crate) fn recorder_export_configured() -> bool {
         .any(|variable| std::env::var_os(variable).is_some())
 }
 
+/// Whether this nextest test process should export records directly to its collector.
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) fn test_process_export_configured() -> bool {
+    !sdk_disabled()
+        && std::env::var_os("NEXTEST_ATTEMPT_ID").is_some()
+        && std::env::args_os().any(|argument| argument == "--exact")
+        && [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        ]
+        .iter()
+        .any(|variable| configured(variable))
+}
+
 /// Whether [`SDK_DISABLED_VAR`] reads `true`, in any case.
 fn sdk_disabled() -> bool {
     disables_sdk(std::env::var(SDK_DISABLED_VAR).ok().as_deref())
@@ -415,7 +834,18 @@ pub(crate) fn layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(log_filter, meter_provider)
+    layer_inner(log_filter, meter_provider, false)
+}
+
+/// The test process's raw log and span exporters, without SDK batch delays.
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) fn test_process_layer<S>(
+    log_filter: tracing_subscriber::EnvFilter,
+) -> (impl Layer<S> + Send + Sync, OtlpExport)
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+{
+    layer_inner(log_filter, meter_provider, true)
 }
 
 /// The recorder's OTLP layer, with an in-memory reader on its meter provider so local
@@ -428,14 +858,19 @@ pub(crate) fn recorder_layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(log_filter, move |exporter, resource| {
-        meter_provider_with_local_reader(exporter, resource, local_metrics)
-    })
+    layer_inner(
+        log_filter,
+        move |exporter, resource| {
+            meter_provider_with_local_reader(exporter, resource, local_metrics)
+        },
+        false,
+    )
 }
 
 fn layer_inner<S>(
     log_filter: tracing_subscriber::EnvFilter,
     make_meter_provider: impl FnOnce(MetricExporter, Resource) -> SdkMeterProvider,
+    test_process: bool,
 ) -> (impl Layer<S> + Send + Sync, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
@@ -450,11 +885,11 @@ where
             .with_protocol(Protocol::HttpBinary)
             .build()
         {
-            Ok(exporter) => Some(logger_export(
-                exporter,
-                log_batch_config(),
-                resource.clone(),
-            )),
+            Ok(exporter) => Some(if test_process {
+                logger_export_with_mode(exporter, log_batch_config(), resource.clone(), true)
+            } else {
+                logger_export(exporter, log_batch_config(), resource.clone())
+            }),
             Err(error) => {
                 eprintln!("rift: warning: otlp log exporter did not build: {error}");
                 None
@@ -487,7 +922,11 @@ where
             .with_protocol(Protocol::HttpBinary)
             .build()
         {
-            Ok(exporter) => Some(tracer_provider(exporter, batch_config(), resource)),
+            Ok(exporter) => Some(if test_process {
+                tracer_provider_with_mode(exporter, batch_config(), resource, true)
+            } else {
+                tracer_provider(exporter, batch_config(), resource)
+            }),
             Err(error) => {
                 eprintln!("rift: warning: otlp exporter did not build: {error}");
                 None
@@ -538,14 +977,41 @@ fn logger_export<E>(
 where
     E: opentelemetry_sdk::logs::LogExporter + 'static,
 {
-    let processor = BatchLogProcessor::builder(exporter, runtime::Tokio)
-        .with_batch_config(batch)
-        .build();
-    LoggerExport {
-        provider: SdkLoggerProvider::builder()
+    logger_export_with_mode(exporter, batch, resource, false)
+}
+
+fn logger_export_with_mode<E>(
+    exporter: E,
+    batch: opentelemetry_sdk::logs::BatchConfig,
+    resource: Resource,
+    test_process: bool,
+) -> LoggerExport
+where
+    E: opentelemetry_sdk::logs::LogExporter + 'static,
+{
+    let provider = if test_process {
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            SdkLoggerProvider::builder()
+                .with_resource(resource)
+                .with_log_processor(TestLogProcessor::new(exporter))
+                .build()
+        }
+        #[cfg(not(any(test, feature = "fixtures")))]
+        {
+            unreachable!("test process exporter is test-only")
+        }
+    } else {
+        let processor = BatchLogProcessor::builder(exporter, runtime::Tokio)
+            .with_batch_config(batch)
+            .build();
+        SdkLoggerProvider::builder()
             .with_resource(resource)
             .with_log_processor(processor)
-            .build(),
+            .build()
+    };
+    LoggerExport {
+        provider,
         open: Arc::new(AtomicBool::new(true)),
     }
 }
@@ -764,10 +1230,26 @@ where
 ///
 /// Must be called inside a Tokio runtime: the batch processor spawns its export task
 /// there.
-fn tracer_provider<E>(exporter: E, batch: BatchConfig, resource: Resource) -> SdkTracerProvider
+fn tracer_provider_with_mode<E>(
+    exporter: E,
+    batch: BatchConfig,
+    resource: Resource,
+    test_process: bool,
+) -> SdkTracerProvider
 where
     E: opentelemetry_sdk::trace::SpanExporter + 'static,
 {
+    if test_process {
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            return SdkTracerProvider::builder()
+                .with_resource(resource)
+                .with_span_processor(TestSpanProcessor::new(exporter))
+                .build();
+        }
+        #[cfg(not(any(test, feature = "fixtures")))]
+        unreachable!("test process exporter is test-only");
+    }
     let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
         .with_batch_config(batch)
         .build();
@@ -775,6 +1257,13 @@ where
         .with_resource(resource)
         .with_span_processor(processor)
         .build()
+}
+
+fn tracer_provider<E>(exporter: E, batch: BatchConfig, resource: Resource) -> SdkTracerProvider
+where
+    E: opentelemetry_sdk::trace::SpanExporter + 'static,
+{
+    tracer_provider_with_mode(exporter, batch, resource, false)
 }
 
 /// The layer that hands every span `filter` enables to `provider`.
@@ -805,14 +1294,16 @@ mod tests {
     use tracing_subscriber::{EnvFilter, Layer};
 
     use opentelemetry::Key;
-    use opentelemetry::logs::{AnyValue, Severity};
-    use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLogRecord};
+    use opentelemetry::logs::{AnyValue, Logger as _, LoggerProvider as _, Severity};
+    use opentelemetry_sdk::logs::{
+        InMemoryLogExporter, LogBatch, LogExporter, SdkLogRecord, SdkLoggerProvider,
+    };
     use opentelemetry_sdk::trace::InMemorySpanExporter;
 
     use super::{
-        ExportShutdownError, LOG_ENDPOINT_VARS, OtlpExport, configured, export_layer,
-        field_attributes, log_batch_config, log_record_layer, logger_export, meter_provider,
-        resource, tracer_provider,
+        ExportShutdownError, LOG_ENDPOINT_VARS, OTLP_EXPORT_TIMEOUT, OtlpExport, TestLogProcessor,
+        TestSpanProcessor, configured, export_layer, field_attributes, log_batch_config,
+        log_record_layer, logger_export, meter_provider, resource, tracer_provider,
     };
 
     /// Spans each test ends; enough that one lost span shows as a count mismatch.
@@ -856,6 +1347,19 @@ mod tests {
         fn export(
             &self,
             _batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            std::future::pending()
+        }
+    }
+
+    /// A log exporter whose request never completes.
+    #[derive(Debug)]
+    struct StalledLogExporter;
+
+    impl LogExporter for StalledLogExporter {
+        fn export(
+            &self,
+            _batch: LogBatch<'_>,
         ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
             std::future::pending()
         }
@@ -964,6 +1468,55 @@ mod tests {
             .enable_all()
             .build()
             .expect("a test runtime builds")
+    }
+
+    #[test]
+    fn test_process_export_callbacks_stop_waiting_at_the_export_timeout() {
+        let runtime = runtime();
+        let entered = runtime.enter();
+        let span_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_span_processor(TestSpanProcessor::new(StalledExporter))
+            .build();
+        let tracer = span_provider.tracer("test");
+        let log_provider = SdkLoggerProvider::builder()
+            .with_log_processor(TestLogProcessor::new(StalledLogExporter))
+            .build();
+        let logger = log_provider.logger("test");
+        drop(entered);
+
+        let span_elapsed = runtime
+            .block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    let started = std::time::Instant::now();
+                    tracer.start("stalled").end();
+                    started.elapsed()
+                })
+                .await
+            })
+            .expect("the span callback worker joins");
+        let log_elapsed = runtime
+            .block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    let started = std::time::Instant::now();
+                    logger.emit(logger.create_log_record());
+                    started.elapsed()
+                })
+                .await
+            })
+            .expect("the log callback worker joins");
+
+        let bound = OTLP_EXPORT_TIMEOUT + std::time::Duration::from_millis(500);
+        assert!(
+            span_elapsed < bound,
+            "span callback waited {span_elapsed:?}"
+        );
+        assert!(log_elapsed < bound, "log callback waited {log_elapsed:?}");
+        span_provider
+            .shutdown_with_timeout(std::time::Duration::from_secs(1))
+            .expect("span exporter worker shuts down after its request times out");
+        log_provider
+            .shutdown_with_timeout(std::time::Duration::from_secs(1))
+            .expect("log exporter worker shuts down after its request times out");
     }
 
     /// `toasty` asks `tracing::event_enabled!` about a `toasty::query` warning before every
