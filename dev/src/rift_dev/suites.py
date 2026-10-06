@@ -101,7 +101,7 @@ def unit(archive: Path | None) -> None:
                 "--run-ignored",
                 "all",
                 "-E",
-                "binary(=rift-mcp) and test(=output::render::tests::output_allocation_cost)",
+                "binary(=rift_mcp) and test(=output::render::tests::output_allocation_cost)",
             ],
             {"OTEL_SDK_DISABLED": "false"},
         ),
