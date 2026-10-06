@@ -9222,7 +9222,19 @@ done
         )
         .await?;
         let server = assembled.supervised().await;
-        double.calls_within_bound(1).await?;
+        // The first write is a whole one, and a store holding nothing it can keep is cleared
+        // before a whole write lands. The double runs the clear through the store at once,
+        // on the one pooled connection; the apply that follows waits at the gate before it
+        // checks a connection out. So the slot is free once the apply follows the clear.
+        let revision = current_publication(&server)
+            .await
+            .reads
+            .tree_revision()
+            .to_owned();
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![("clear", String::new()), ("apply", revision)]
+        );
         Ok((server, double, database))
     }
 
