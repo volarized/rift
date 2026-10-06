@@ -789,7 +789,7 @@ jobs:
       - name: Report corpus coverage
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
         # `generate-check` validates generated wire bytes; coverage measures maintained Rust source.
-        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated\.rs$' --lcov --output-path target/corpus.lcov
+        run: uv run --locked --project dev rift-dev coverage-report --nextest-archive-file target/integration.tar.zst --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated\.rs$' --lcov --output-path target/corpus.lcov
       # A Dependabot-triggered run reads the Dependabot secret scope, not the
       # Actions scope that holds `CODECOV_TOKEN` - see the `rust` job's own
       # coverage uploads above. Skip both uploads so the missing token fails

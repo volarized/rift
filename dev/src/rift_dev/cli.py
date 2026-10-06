@@ -29,9 +29,10 @@ from rift_dev import (
     suites,
     worktrees,
 )
-from rift_dev.commands import CommandFailed
+from rift_dev.commands import CargoCommand, CommandFailed
 from rift_dev.config import BinaryOptions, CorpusCase, CorpusName, CorpusOptions
 from rift_dev.corpus_cache import git, measure, pins
+from rift_dev.progress import finish, start
 from rift_dev.rift_test_client import candidate_binary, run_gate, workspace_version
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -193,7 +194,9 @@ def build(context: typer.Context) -> None:
 )
 def check(context: typer.Context) -> None:
     """Run `cargo check` with the given arguments and compact output."""
-    build_run.run(forwarded_arguments(context), cargo_arguments=("check",), label="check")
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("check",), label="check"
+    )
 
 
 @app.command(
@@ -203,7 +206,9 @@ def check(context: typer.Context) -> None:
 )
 def clippy(context: typer.Context) -> None:
     """Run `cargo clippy` with the given arguments and compact output."""
-    build_run.run(forwarded_arguments(context), cargo_arguments=("clippy",), label="clippy")
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("clippy",), label="clippy"
+    )
 
 
 @app.command(
@@ -219,6 +224,34 @@ def docs(context: typer.Context) -> None:
         environment={"RUSTDOCFLAGS": "-D warnings"},
         label="docs",
     )
+
+
+@app.command(
+    "fmt",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def format_rust(context: typer.Context) -> None:
+    """Check Rust formatting with compact output."""
+    started = start("format")
+    failed = False
+    try:
+        CargoCommand("fmt", *forwarded_arguments(context)).run()
+    except Exception:
+        failed = True
+        raise
+    finally:
+        finish("format", started, failed=failed)
+
+
+@app.command(
+    "coverage-report",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def coverage_report(context: typer.Context) -> None:
+    """Write an llvm-cov report with its selected output visible."""
+    CargoCommand("llvm-cov", "report", *forwarded_arguments(context)).run()
 
 
 @app.command("rust-architecture")
@@ -286,9 +319,7 @@ def archive(context: typer.Context) -> None:
 )
 def nextest_archive(context: typer.Context) -> None:
     """Build a cargo-nextest archive with compact output."""
-    build_run.run(
-        forwarded_arguments(context), cargo_arguments=("nextest", "archive")
-    )
+    build_run.run(forwarded_arguments(context), cargo_arguments=("nextest", "archive"))
 
 
 @test_app.command("live")

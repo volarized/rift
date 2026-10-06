@@ -3,7 +3,7 @@ set dotenv-load := false
 rift_dev := "uv run --locked --project dev rift-dev"
 
 format:
-    cargo fmt --all --check
+    {{ rift_dev }} fmt --all --check
 
 generate:
     {{ rift_dev }} generate
