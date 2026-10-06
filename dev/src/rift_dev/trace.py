@@ -126,6 +126,8 @@ SPAN_KEYS_OMITTED = frozenset(["target", "busy_ns", "idle_ns"])
 SPAN_KEY_PREFIXES_OMITTED = ("code.", "thread.")
 
 Attributes = tuple[tuple[str, str], ...]
+# An instrumentation scope's name and version.
+Scope = tuple[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +265,15 @@ def instance_text(instance: str) -> str:
     return f"{INSTANCE_KEY}={instance}  " if instance else ""
 
 
+def scope_text(scope: Scope) -> str:
+    """The `otel.scope.name=<name> otel.scope.version=<version>  ` part of a printed
+    line; empty for a point that arrived under an unnamed scope."""
+    name, version = scope
+    if not name:
+        return ""
+    return f"otel.scope.name={name} otel.scope.version={version}  "
+
+
 def number_value(point: NumberDataPoint) -> float:
     """A number data point's value, whichever of `as_double` and `as_int` it set."""
     if point.WhichOneof("value") == "as_int":
@@ -309,7 +320,8 @@ class MetricPoint:
     `bucket_counts` are a histogram's and stay empty otherwise. `temporality` is
     `cumulative` or `delta` for a sum or histogram and empty for a gauge. The printed line
     names the sending process by its `service.instance.id`, so the points of two servers
-    stay apart.
+    stay apart. `scope` is the instrumentation scope the point arrived under, its name and
+    version: the crate that emitted it.
     """
 
     name: str
@@ -324,6 +336,7 @@ class MetricPoint:
     count: int | None = None
     bounds: tuple[float, ...] = ()
     bucket_counts: tuple[int, ...] = ()
+    scope: Scope = ("", "")
 
     @property
     def instance(self) -> str:
@@ -333,7 +346,8 @@ class MetricPoint:
 
     def line(self) -> str:
         """The point as one line in the layout of a printed log record: time, kind,
-        name, attributes, then the value.
+        name, the sending process, the instrumentation scope as `otel.scope.name` and
+        `otel.scope.version`, attributes, then the value.
 
         A histogram prints its nonempty buckets as `<=bound:count`, the last one
         `>bound:count`.
@@ -362,6 +376,7 @@ class MetricPoint:
         return (
             f"{stamp(self.time_unix_nano)} {self.kind:<9} {self.name}   "
             + instance_text(self.instance)
+            + scope_text(self.scope)
             + (f"{context}  " if context else "")
             + reading
             + (f" {extra}" if extra else "")
@@ -538,11 +553,14 @@ class MetricSummary:
 
 @dataclass(slots=True)
 class MetricSeries:
-    """One metric name's series, each as its latest or accumulated value and count."""
+    """One metric name's series, each as its latest or accumulated value and count, keyed
+    by the instrumentation scope the point arrived under, then its attributes."""
 
     kind: str
     unit: str
-    values: dict[Attributes, tuple[float, int]] = field(default_factory=dict)
+    values: dict[tuple[Scope, Attributes], tuple[float, int]] = field(
+        default_factory=dict
+    )
     points: int = 0
 
 
@@ -572,12 +590,16 @@ class MetricStore:
             for resource_metrics in request.resource_metrics:
                 resource = attribute_key(resource_metrics.resource.attributes)
                 for scope_metrics in resource_metrics.scope_metrics:
+                    scope = (scope_metrics.scope.name, scope_metrics.scope.version)
                     for metric in scope_metrics.metrics:
-                        self.keep(metric, resource)
+                        self.keep(metric, resource, scope)
 
-    def keep(self, metric: Metric, resource: Attributes = ()) -> None:
-        """Keeps the data points of one metric of a supported kind; the caller holds the
-        lock. A summary or exponential histogram is counted under `kinds`."""
+    def keep(
+        self, metric: Metric, resource: Attributes = (), scope: Scope = ("", "")
+    ) -> None:
+        """Keeps the data points of one metric of a supported kind, under the
+        instrumentation `scope` it arrived in; the caller holds the lock. A summary or
+        exponential histogram is counted under `kinds`."""
         which = metric.WhichOneof("data")
         temporality = ""
         if which == "gauge":
@@ -600,7 +622,8 @@ class MetricStore:
             held = MetricSeries(which, metric.unit)
             self.metrics[name] = held
         for point in points:
-            key = attribute_key(point.attributes)
+            attributes = attribute_key(point.attributes)
+            key = (scope, attributes)
             if key not in held.values and len(held.values) >= SERIES_MAX:
                 self.dropped.series += 1
                 continue
@@ -611,7 +634,7 @@ class MetricStore:
                     which,
                     metric.unit,
                     temporality,
-                    key,
+                    attributes,
                     resource,
                     point.start_time_unix_nano,
                     point.time_unix_nano,
@@ -619,6 +642,7 @@ class MetricStore:
                     count,
                     tuple(point.explicit_bounds),
                     tuple(point.bucket_counts),
+                    scope,
                 )
             else:
                 value, count = number_value(point), 0
@@ -627,11 +651,12 @@ class MetricStore:
                     which,
                     metric.unit,
                     temporality,
-                    key,
+                    attributes,
                     resource,
                     point.start_time_unix_nano,
                     point.time_unix_nano,
                     value,
+                    scope=scope,
                 )
             self.received += 1
             if self.tests is not None:

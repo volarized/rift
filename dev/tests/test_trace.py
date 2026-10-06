@@ -179,6 +179,32 @@ def test_the_metrics_path_keeps_the_latest_value_per_series() -> None:
     assert not spans.summary()
 
 
+def test_a_point_keeps_and_prints_the_scope_it_arrived_under() -> None:
+    metrics = MetricStore()
+    request = ExportMetricsServiceRequest()
+    resource_metrics = request.resource_metrics.add()
+    for name in ("rift-index", "rift-mcp"):
+        scope_metrics = resource_metrics.scope_metrics.add()
+        scope_metrics.scope.name = name
+        scope_metrics.scope.version = "0.0.62"
+        counter("sqlite.commit.duration", [(1, "ok")])(scope_metrics.metrics.add())
+    unnamed = resource_metrics.scope_metrics.add()
+    counter("sqlite.commit.duration", [(1, "ok")])(unnamed.metrics.add())
+    metrics.record(request.SerializeToString())
+
+    points = metrics.between(None, None)
+    assert [point.scope for point in points] == [
+        ("rift-index", "0.0.62"),
+        ("rift-mcp", "0.0.62"),
+        ("", ""),
+    ]
+    assert "otel.scope.name=rift-index otel.scope.version=0.0.62  " in points[0].line()
+    assert "otel.scope.name" not in points[2].line()
+    assert summaries(metrics)["sqlite.commit.duration"]["series"] == 3, (
+        "equal attributes under two scopes stay two series"
+    )
+
+
 def test_a_delta_sum_adds_each_data_point() -> None:
     metrics = MetricStore()
     app = receiver(SpanStore(), metrics)
