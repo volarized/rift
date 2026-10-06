@@ -98,7 +98,7 @@ pub(crate) fn stream_unscoped() {
     {
         return;
     }
-    let Ok(filter) = recorder_filter(None) else {
+    let Ok(filter) = recorder_filter(Some(UNSCOPED_CAPTURE)) else {
         return;
     };
     let retained = Arc::new(RetainedRecords {
@@ -149,6 +149,13 @@ fn recorder_filter(capture: Option<&str>) -> Result<tracing_subscriber::EnvFilte
 /// The filter a recorder captures under when its builder names none: every level of
 /// every target.
 const RECORDER_DEFAULT_CAPTURE: &str = "trace";
+
+/// The filter the unscoped stream captures under: `INFO` and above of every target, the
+/// level `traced!` opens its spans at. Every level, as a recorder captures by default,
+/// streamed each SQLite statement's `TRACE` and `DEBUG` records: on windows-11-arm two
+/// `rift-mcp` tests with no recorder took 21.9 s and 25.5 s against 5.5 s and 8.0 s
+/// without the stream (runs 37421565023 and 37416927532).
+const UNSCOPED_CAPTURE: &str = "info";
 
 /// A test's log capture, installed as the calling thread's default subscriber while held.
 ///
