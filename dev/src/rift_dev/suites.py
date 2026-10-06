@@ -73,22 +73,57 @@ def archive_selection(archive: Path | None, sources: list[str]) -> list[str]:
 
 
 def unit(archive: Path | None) -> None:
-    """Runs the unit suite under coverage and holds it to the line floor.
+    """Runs unit and selected measurement tests under one coverage report.
 
     Unit tests use local fixtures and require no language servers or model
     downloads.
     """
     coverage_target()
-    command = CargoCommand(
-        "llvm-cov",
-        "nextest",
-        *archive_selection(
-            archive, ["--workspace", "--all-targets", "--all-features", "--locked"]
+    CargoCommand("llvm-cov", "clean", "--workspace").run()
+    unit_sources = ["--workspace", "--all-targets", "--all-features", "--locked"]
+    invocations = [
+        (archive_selection(archive, unit_sources), [], {}),
+        (
+            archive_selection(
+                archive, ["-p", "rift-tracing", "--lib", "--all-features", "--locked"]
+            ),
+            [
+                "-E",
+                "test(=recorder::tests::a_test_with_no_recorder_exports_from_sync_async_and_unwinding_contexts)",
+            ],
+            {"OTEL_SDK_DISABLED": "false", "RIFT_OTLP_FILTER": "debug"},
         ),
-        "--profile",
-        "ci",
-        "--no-tests",
-        "fail",
+        (
+            archive_selection(
+                archive, ["-p", "rift-mcp", "--lib", "--all-features", "--locked"]
+            ),
+            [
+                "--run-ignored",
+                "all",
+                "-E",
+                "binary(=rift-mcp) and test(=output::render::tests::output_allocation_cost)",
+            ],
+            {"OTEL_SDK_DISABLED": "false"},
+        ),
+    ]
+    for selection, filters, environment in invocations:
+        command = CargoCommand(
+            "llvm-cov",
+            "nextest",
+            "--no-report",
+            *selection,
+            "--profile",
+            "ci",
+            "--no-tests",
+            "fail",
+            *filters,
+        )
+        command.with_env(**environment)
+        nextest_run.run(command)
+
+    CargoCommand(
+        "llvm-cov",
+        "report",
         "--ignore-filename-regex",
         GENERATED_CLIENT,
         "--lcov",
@@ -96,8 +131,7 @@ def unit(archive: Path | None) -> None:
         "lcov.info",
         "--fail-under-lines",
         COVERAGE_FLOOR,
-    )
-    nextest_run.run(command)
+    ).run()
 
 
 def live(archive: Path | None) -> None:
