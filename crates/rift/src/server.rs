@@ -13,7 +13,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rift_error::{ErrorContext, RiftError, errors};
 use rift_mcp::{
@@ -225,13 +225,21 @@ impl LogsBound {
         })
     }
 
-    /// The bound in milliseconds since the Unix epoch, an age counted back from `now_ms`.
-    fn recorded_at_ms(self, now_ms: i64) -> i64 {
+    /// `query` restricted to records recorded at or after this bound: an age through
+    /// [`LogQuery::since_age`], on the tracing clock.
+    fn since(self, query: LogQuery) -> LogQuery {
         match self {
-            Self::Age(age) => {
-                now_ms.saturating_sub(i64::try_from(age.milliseconds()).unwrap_or(i64::MAX))
-            }
-            Self::At(instant) => instant.as_millisecond(),
+            Self::Age(age) => query.since_age(Duration::from_millis(age.milliseconds())),
+            Self::At(instant) => query.since_ms(instant.as_millisecond()),
+        }
+    }
+
+    /// `query` restricted to records recorded before this bound: an age through
+    /// [`LogQuery::until_age`], on the tracing clock.
+    fn until(self, query: LogQuery) -> LogQuery {
+        match self {
+            Self::Age(age) => query.until_age(Duration::from_millis(age.milliseconds())),
+            Self::At(instant) => query.until_ms(instant.as_millisecond()),
         }
     }
 }
@@ -1478,8 +1486,9 @@ struct LogsWindow {
 /// The store read one `rift server logs` run issues.
 ///
 /// The page is the `--tail` count, bounded by [`LOG_PAGE_RECORDS_MAX`]; `all`
-/// reads a whole page at a time. `--since` and `--until` become absolute bounds here,
-/// both counted from one clock read, so every page of one run selects the same window.
+/// reads a whole page at a time. `--since` and `--until` become absolute bounds here: an
+/// age counts back from the one tracing clock reading the query keeps, so every page of one
+/// run selects the same window.
 fn logs_query(
     tail: TailCount,
     window: LogsWindow,
@@ -1497,12 +1506,11 @@ fn logs_query(
     if let Some(component) = component {
         query = query.for_component(component);
     }
-    let now_ms = now_ms();
     if let Some(since) = window.since {
-        query = query.since_ms(since.recorded_at_ms(now_ms));
+        query = since.since(query);
     }
     if let Some(until) = window.until {
-        query = query.until_ms(until.recorded_at_ms(now_ms));
+        query = until.until(query);
     }
     query
 }
@@ -1603,11 +1611,7 @@ async fn print_newest_records(
 
 /// Prints `page` on stdout as `lines` lays it out.
 fn print_page(page: &[StoredLogRecord], lines: &mut LogLines) {
-    let records = page
-        .iter()
-        .map(|stored| stored.record().clone())
-        .collect::<Vec<_>>();
-    print!("{}", lines.lines(&records));
+    print!("{}", lines.lines(page.iter().map(StoredLogRecord::record)));
 }
 
 /// Prints records as the server writes them, until the operator interrupts.
@@ -1648,15 +1652,6 @@ async fn follow_until_interrupt(
     Ok(())
 }
 
-/// Milliseconds since the Unix epoch, or zero on a clock before it.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::IntoFuture as _;
@@ -1664,16 +1659,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AuthMode, ChildWatch, LogLevel, LogsBound, LogsMode, LogsWindow, PRESENCE_POLL_INTERVAL,
-        ProcessExit, RunningLogDrain, SERVER_DATABASE_STOP_RESERVE, SERVER_EXPORT_STOP_RESERVE,
-        SERVER_LOG_FLUSH_RESERVE, SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-        STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns,
-        StartedServer, TailCount, TokenCheck, await_election_released,
-        await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
-        await_stopped_with_probe, discard_stale_document, export_stage_end_reserve,
-        foreground_refused, later_stages_reserve, log_flush_end_reserve, logs_mode, logs_query,
-        now_ms, print_logs, request_stop, stale_reason_phrase, start_detached, start_mode, status,
-        stop, stop_log_drain, token_check,
+        AuthMode, ChildWatch, LogLevel, LogQuery, LogsBound, LogsMode, LogsWindow,
+        PRESENCE_POLL_INTERVAL, ProcessExit, RunningLogDrain, SERVER_DATABASE_STOP_RESERVE,
+        SERVER_EXPORT_STOP_RESERVE, SERVER_LOG_FLUSH_RESERVE, SERVER_STOP_DEADLINE,
+        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
+        ServerOutcome, StaleReason, StartMode, StartSpawns, StartedServer, TailCount, TokenCheck,
+        await_election_released, await_election_released_with_probe, await_serving,
+        await_serving_with_probe, await_stopped, await_stopped_with_probe, discard_stale_document,
+        export_stage_end_reserve, foreground_refused, later_stages_reserve, log_flush_end_reserve,
+        logs_mode, logs_query, print_logs, request_stop, stale_reason_phrase, start_detached,
+        start_mode, status, stop, stop_log_drain, token_check,
     };
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
@@ -3156,30 +3151,48 @@ mod tests {
         );
     }
 
+    /// The system clock in milliseconds since the Unix epoch: the clock a record is stamped
+    /// on and [`LogQuery::since_age`] counts back from.
+    fn wall_clock_ms() -> i64 {
+        jiff::Timestamp::now().as_millisecond()
+    }
+
+    /// An `info` record of `index.build` at `recorded_at_ms` carrying `message`.
+    fn build_record(recorded_at_ms: i64, message: &str) -> LogRecord {
+        LogRecord::new(
+            recorded_at_ms,
+            "info",
+            "rift_mcp::server",
+            "index",
+            "index.build",
+            message,
+            "{}",
+        )
+    }
+
+    /// The messages of `records`, in the order read.
+    fn messages(records: &[rift_tracing::StoredLogRecord]) -> Vec<String> {
+        records
+            .iter()
+            .map(|stored| stored.record().message().to_owned())
+            .collect()
+    }
+
+    /// `--since 10m` counts back from the tracing clock: a record an hour old is left out.
     #[tokio::test]
-    async fn a_since_read_selects_only_records_inside_its_window() -> TestResult {
+    async fn a_logs_since_age_selects_only_records_inside_its_window() -> TestResult {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let now = now_ms();
-        let older = LogRecord::new(
-            now - MILLISECONDS_PER_HOUR,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "index.build",
-            "old",
-            "{}",
-        );
-        let fresh = LogRecord::new(
-            now,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "index.build",
-            "fresh",
-            "{}",
-        );
-        store.append(&[older, fresh], 1_000).await?;
+        let now = wall_clock_ms();
+        store
+            .append(
+                &[
+                    build_record(now - MILLISECONDS_PER_HOUR, "old"),
+                    build_record(now, "fresh"),
+                ],
+                1_000,
+            )
+            .await?;
         let since = rift_protocol::configuration::Duration::parse("10m")?;
         assert_eq!(since.milliseconds(), 600_000);
         assert!(rift_protocol::configuration::Duration::parse("10").is_err());
@@ -3194,71 +3207,125 @@ mod tests {
                 .connect()?
                 .following(&logs_query(TailCount::All, window, None, None))?;
 
-        assert_eq!(read.len(), 1);
-        assert_eq!(read[0].record().message(), "fresh");
+        assert_eq!(messages(&read), ["fresh"]);
         Ok(())
     }
 
+    /// `--since 2h --until 30m` counts both ages back from one clock reading: the record an
+    /// hour old is inside, the one three hours old and the one a minute old are outside.
     #[tokio::test]
-    async fn an_until_read_selects_records_before_its_bound() -> TestResult {
+    async fn a_logs_since_and_until_age_select_the_window_between_them() -> TestResult {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let record = |recorded_at_ms, message| {
-            LogRecord::new(
-                recorded_at_ms,
-                "info",
-                "rift_mcp::server",
-                "index",
-                "index.build",
-                message,
-                "{}",
-            )
-        };
-        let started = 1_759_600_000_000;
+        let now = wall_clock_ms();
         store
             .append(
                 &[
-                    record(started - 1, "before"),
-                    record(started, "first"),
-                    record(started + 999, "last"),
-                    record(started + 1_000, "after"),
+                    build_record(now - 3 * MILLISECONDS_PER_HOUR, "too old"),
+                    build_record(now - MILLISECONDS_PER_HOUR, "inside"),
+                    build_record(now - 60_000, "too new"),
                 ],
                 1_000,
             )
             .await?;
-        let since = LogsBound::parse("2025-10-04T17:46:40Z")?;
-        let until = LogsBound::parse("2025-10-04T17:46:41Z")?;
-        assert_eq!(since.recorded_at_ms(0), started);
-        let reads = store.reader().connect()?;
         let window = LogsWindow {
-            since: Some(since),
-            until: Some(until),
+            since: Some(LogsBound::parse("2h")?),
+            until: Some(LogsBound::parse("30m")?),
         };
-        let messages: Vec<String> = reads
-            .following(&logs_query(TailCount::All, window, None, None))?
-            .iter()
-            .map(|stored| stored.record().message().to_owned())
-            .collect();
 
-        assert_eq!(messages, ["first", "last"]);
+        let read =
+            store
+                .reader()
+                .connect()?
+                .following(&logs_query(TailCount::All, window, None, None))?;
+
+        assert_eq!(messages(&read), ["inside"]);
         Ok(())
     }
 
+    /// A follow read takes each later page with `after`, and the age cutoff the query
+    /// resolved when it was built still holds: a record appended after the first page, older
+    /// than the cutoff, stays out; one inside it prints.
+    #[tokio::test]
+    async fn a_logs_follow_page_keeps_the_age_cutoff_of_its_query() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let now = wall_clock_ms();
+        store.append(&[build_record(now, "first")], 1_000).await?;
+        let window = LogsWindow {
+            since: Some(LogsBound::parse("10m")?),
+            ..LogsWindow::default()
+        };
+        let query = logs_query(TailCount::All, window, None, None);
+        let reads = store.reader().connect()?;
+        let first = reads.following(&query)?;
+        assert_eq!(messages(&first), ["first"]);
+        let newest = first
+            .last()
+            .map_or(0, rift_tracing::StoredLogRecord::identity);
+
+        store
+            .append(
+                &[
+                    build_record(now - MILLISECONDS_PER_HOUR, "late but old"),
+                    build_record(now, "late"),
+                ],
+                1_000,
+            )
+            .await?;
+        let next = reads.following(&query.clone().after(newest))?;
+
+        assert_eq!(messages(&next), ["late"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_logs_until_instant_selects_records_before_its_bound() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let started = 1_759_600_000_000;
+        store
+            .append(
+                &[
+                    build_record(started - 1, "before"),
+                    build_record(started, "first"),
+                    build_record(started + 999, "last"),
+                    build_record(started + 1_000, "after"),
+                ],
+                1_000,
+            )
+            .await?;
+        let window = LogsWindow {
+            since: Some(LogsBound::parse("2025-10-04T17:46:40Z")?),
+            until: Some(LogsBound::parse("2025-10-04T17:46:41Z")?),
+        };
+        let read =
+            store
+                .reader()
+                .connect()?
+                .following(&logs_query(TailCount::All, window, None, None))?;
+
+        assert_eq!(messages(&read), ["first", "last"]);
+        Ok(())
+    }
+
+    /// An instant bound becomes its own milliseconds; an age bound is resolved by the query.
     #[test]
-    fn a_window_bound_reads_an_age_or_an_rfc_3339_timestamp() {
+    fn a_logs_window_bound_reads_an_age_or_an_rfc_3339_timestamp() {
         assert_eq!(
             LogsBound::parse("10m"),
             Ok(LogsBound::Age(
                 rift_protocol::configuration::Duration::from_millis(600_000)
             ))
         );
+        let instant = LogsBound::parse("1970-01-01T00:00:01.5Z").expect("an RFC 3339 instant");
         assert_eq!(
-            LogsBound::parse("10m").map(|bound| bound.recorded_at_ms(1_000_000)),
-            Ok(400_000)
+            instant.since(LogQuery::newest(1)),
+            LogQuery::newest(1).since_ms(1_500)
         );
         assert_eq!(
-            LogsBound::parse("1970-01-01T00:00:01.5Z").map(|bound| bound.recorded_at_ms(0)),
-            Ok(1_500)
+            instant.until(LogQuery::newest(1)),
+            LogQuery::newest(1).until_ms(1_500)
         );
         let refused = LogsBound::parse("yesterday").expect_err("a word is no bound");
         assert!(refused.contains("RFC 3339"), "{refused}");
