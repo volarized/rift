@@ -455,7 +455,7 @@ impl CloseProgress {
 enum Command {
     /// Append one batch and trim back to `retention_records`.
     Append {
-        records: Vec<LogRecord>,
+        records: Arc<[LogRecord]>,
         retention_records: u64,
         /// When the caller started to send it.
         queued: std::time::Instant,
@@ -571,6 +571,9 @@ impl LogStore {
     /// transaction that inserts. A batch longer than [`LOG_BATCH_RECORDS_MAX`] is refused
     /// whole rather than half written. A retention of zero leaves the store empty.
     ///
+    /// The writer thread inserts from the shared slice `records` converts into, so a caller
+    /// that retries a refused batch hands the same slice again without copying a record.
+    ///
     /// Returns the number of rows the trim dropped.
     ///
     /// # Errors
@@ -586,9 +589,10 @@ impl LogStore {
     /// it whether or not the caller still waits.
     pub async fn append(
         &self,
-        records: &[LogRecord],
+        records: impl Into<Arc<[LogRecord]>>,
         retention_records: u64,
     ) -> Result<u64, RiftError> {
+        let records = records.into();
         if records.is_empty() {
             return Ok(0);
         }
@@ -600,7 +604,7 @@ impl LogStore {
         }
         let (reply, answer) = oneshot::channel();
         let command = Command::Append {
-            records: records.to_vec(),
+            records,
             retention_records,
             queued: std::time::Instant::now(),
             reply,

@@ -400,7 +400,7 @@ mod tests {
             .expect("the metrics database opens");
         store
             .append(
-                &[
+                [
                     LogRecord::new(
                         7,
                         "WARN",

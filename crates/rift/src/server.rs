@@ -3186,7 +3186,7 @@ mod tests {
         let now = wall_clock_ms();
         store
             .append(
-                &[
+                [
                     build_record(now - MILLISECONDS_PER_HOUR, "old"),
                     build_record(now, "fresh"),
                 ],
@@ -3220,7 +3220,7 @@ mod tests {
         let now = wall_clock_ms();
         store
             .append(
-                &[
+                [
                     build_record(now - 3 * MILLISECONDS_PER_HOUR, "too old"),
                     build_record(now - MILLISECONDS_PER_HOUR, "inside"),
                     build_record(now - 60_000, "too new"),
@@ -3251,7 +3251,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
         let now = wall_clock_ms();
-        store.append(&[build_record(now, "first")], 1_000).await?;
+        store.append([build_record(now, "first")], 1_000).await?;
         let window = LogsWindow {
             since: Some(LogsBound::parse("10m")?),
             ..LogsWindow::default()
@@ -3266,7 +3266,7 @@ mod tests {
 
         store
             .append(
-                &[
+                [
                     build_record(now - MILLISECONDS_PER_HOUR, "late but old"),
                     build_record(now, "late"),
                 ],
@@ -3286,7 +3286,7 @@ mod tests {
         let started = 1_759_600_000_000;
         store
             .append(
-                &[
+                [
                     build_record(started - 1, "before"),
                     build_record(started, "first"),
                     build_record(started + 999, "last"),
@@ -3355,7 +3355,7 @@ mod tests {
         let store = LogStore::open(&state_directory.join("metrics"), None).await?;
         store
             .append(
-                &[LogRecord::new(
+                [LogRecord::new(
                     0,
                     "info",
                     "rift",
@@ -3400,7 +3400,7 @@ mod tests {
             .map(|_| LogRecord::new(0, "info", "rift", "index", "index.build", "x", "{}"))
             .collect();
         let refused = store
-            .append(&oversized, 1_000)
+            .append(oversized, 1_000)
             .await
             .expect_err("an oversized batch must be refused");
 
@@ -3507,7 +3507,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
         let followed = LogRecord::new(0, "info", "rift", "index", "index.build", "followed", "{}");
-        store.append(&[followed], 1_000).await?;
+        store.append([followed], 1_000).await?;
         let reader = store.reader();
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
         let interrupted = tokio_util::sync::CancellationToken::new();
@@ -3543,7 +3543,7 @@ mod tests {
         std::fs::create_dir(&state_directory)?;
         let store = LogStore::open(&state_directory.join("metrics"), None).await?;
         let kept = LogRecord::new(0, "info", "rift", "index", "index.build", "kept", "{}");
-        store.append(&[kept], 1_000).await?;
+        store.append([kept], 1_000).await?;
         let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
         let following = print_logs(
             directory.path(),

@@ -277,7 +277,7 @@ mod tests {
             "refused",
             "{}",
         );
-        logs.append(&[record], 10).await.expect("the record lands");
+        logs.append([record], 10).await.expect("the record lands");
         let reader =
             WorkspaceStorage::open_logs(directory.path()).expect("the metrics file exists");
         let read = reader

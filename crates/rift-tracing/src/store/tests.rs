@@ -88,7 +88,7 @@ async fn appended_records_read_back_newest_first() -> TestResult {
     let store = store(&directory).await?;
 
     store
-        .append(&[record("first"), record("second")], KEEP_EVERY)
+        .append([record("first"), record("second")], KEEP_EVERY)
         .await?;
 
     let read = reads(&store)?.recent(&LogQuery::newest(10))?;
@@ -104,8 +104,8 @@ async fn identities_ascend_across_appends() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
 
-    store.append(&[record("first")], KEEP_EVERY).await?;
-    store.append(&[record("second")], KEEP_EVERY).await?;
+    store.append([record("first")], KEEP_EVERY).await?;
+    store.append([record("second")], KEEP_EVERY).await?;
 
     let read = reads(&store)?.recent(&LogQuery::newest(10))?;
     assert_eq!(read[0].identity(), 2);
@@ -119,7 +119,7 @@ async fn retention_drops_the_oldest_records() -> TestResult {
     let store = store(&directory).await?;
     let batch: Vec<LogRecord> = (0..10).map(|index| record(&index.to_string())).collect();
 
-    let dropped = store.append(&batch, 4).await?;
+    let dropped = store.append(batch, 4).await?;
 
     assert_eq!(dropped, 6);
     let reads = reads(&store)?;
@@ -134,11 +134,9 @@ async fn retention_drops_the_oldest_records() -> TestResult {
 async fn retention_counts_records_the_store_already_held() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store
-        .append(&[record("first"), record("second")], 8)
-        .await?;
+    store.append([record("first"), record("second")], 8).await?;
 
-    let dropped = store.append(&[record("third")], 2).await?;
+    let dropped = store.append([record("third")], 2).await?;
 
     assert_eq!(dropped, 1);
     assert_eq!(reads(&store)?.count()?, 2);
@@ -150,9 +148,7 @@ async fn a_retention_of_zero_leaves_the_store_empty() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
 
-    let dropped = store
-        .append(&[record("first"), record("second")], 0)
-        .await?;
+    let dropped = store.append([record("first"), record("second")], 0).await?;
 
     assert_eq!(dropped, 2);
     assert_eq!(reads(&store)?.count()?, 0);
@@ -165,7 +161,7 @@ async fn a_level_read_returns_only_that_level() -> TestResult {
     let store = store(&directory).await?;
     let warning = LogRecord::new(1, "warn", "rift_mcp", "search", "search.open", "late", "{}");
     store
-        .append(&[record("routine"), warning], KEEP_EVERY)
+        .append([record("routine"), warning], KEEP_EVERY)
         .await?;
 
     let read = reads(&store)?.recent(&LogQuery::newest(10).at_level("WARN"))?;
@@ -189,7 +185,7 @@ async fn a_component_read_returns_only_that_component() -> TestResult {
         "{}",
     );
     store
-        .append(&[record("reconciled"), search], KEEP_EVERY)
+        .append([record("reconciled"), search], KEEP_EVERY)
         .await?;
 
     let read = reads(&store)?.recent(&LogQuery::newest(10).for_component("search"))?;
@@ -204,7 +200,7 @@ async fn a_read_bounds_its_own_page() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     let batch: Vec<LogRecord> = (0..5).map(|index| record(&index.to_string())).collect();
-    store.append(&batch, KEEP_EVERY).await?;
+    store.append(batch, KEEP_EVERY).await?;
 
     let read = reads(&store)?.recent(&LogQuery::newest(2))?;
 
@@ -217,7 +213,7 @@ async fn a_followed_read_returns_records_oldest_first() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     store
-        .append(&[record("first"), record("second")], KEEP_EVERY)
+        .append([record("first"), record("second")], KEEP_EVERY)
         .await?;
 
     let read = reads(&store)?.following(&LogQuery::newest(10))?;
@@ -234,7 +230,7 @@ async fn a_read_after_an_identity_returns_only_later_records() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     let batch = [record("first"), record("second"), record("third")];
-    store.append(&batch, KEEP_EVERY).await?;
+    store.append(batch, KEEP_EVERY).await?;
 
     let read = reads(&store)?.following(&LogQuery::newest(10).after(2))?;
 
@@ -265,7 +261,7 @@ async fn a_since_read_drops_records_recorded_earlier() -> TestResult {
         "new",
         "{}",
     );
-    store.append(&[older, newer], KEEP_EVERY).await?;
+    store.append([older, newer], KEEP_EVERY).await?;
 
     let reads = reads(&store)?;
     let followed = reads.following(&LogQuery::newest(10).since_ms(9))?;
@@ -297,7 +293,7 @@ async fn a_window_holds_the_records_recorded_inside_it_in_time_order() -> TestRe
     let store = store(&directory).await?;
     store
         .append(
-            &[
+            [
                 recorded(99, "before"),
                 recorded(100, "opened"),
                 recorded(150, "inside"),
@@ -329,8 +325,8 @@ async fn a_window_pages_past_the_page_bound_and_starts_at_what_retention_kept() 
             .collect()
     };
     let retention = (2 * LOG_BATCH_RECORDS_MAX - 100) as u64;
-    store.append(&batch(0), retention).await?;
-    store.append(&batch(batch_records), retention).await?;
+    store.append(batch(0), retention).await?;
+    store.append(batch(batch_records), retention).await?;
     let reads = reads(&store)?;
     let window = LogQuery::newest(LOG_PAGE_RECORDS_MAX)
         .since_ms(0)
@@ -368,7 +364,7 @@ async fn a_followed_read_keeps_the_level_and_component_filters() -> TestResult {
     let store = store(&directory).await?;
     let warning = LogRecord::new(1, "warn", "rift_mcp", "search", "search.open", "late", "{}");
     store
-        .append(&[record("routine"), warning], KEEP_EVERY)
+        .append([record("routine"), warning], KEEP_EVERY)
         .await?;
 
     let reads = reads(&store)?;
@@ -387,7 +383,7 @@ async fn a_followed_page_bounds_itself() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     let batch: Vec<LogRecord> = (0..5).map(|index| record(&index.to_string())).collect();
-    store.append(&batch, KEEP_EVERY).await?;
+    store.append(batch, KEEP_EVERY).await?;
 
     let read = reads(&store)?.following(&LogQuery::newest(2))?;
 
@@ -403,7 +399,7 @@ async fn an_oversized_batch_is_refused_whole() -> TestResult {
     let batch: Vec<LogRecord> = (0..=LOG_BATCH_RECORDS_MAX).map(|_| record("x")).collect();
 
     let refusal = store
-        .append(&batch, KEEP_EVERY)
+        .append(batch, KEEP_EVERY)
         .await
         .expect_err("an oversized batch must be refused");
 
@@ -420,7 +416,7 @@ async fn an_empty_batch_changes_nothing() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
 
-    assert_eq!(store.append(&[], KEEP_EVERY).await?, 0);
+    assert_eq!(store.append([], KEEP_EVERY).await?, 0);
     assert_eq!(reads(&store)?.count()?, 0);
     Ok(())
 }
@@ -429,7 +425,7 @@ async fn an_empty_batch_changes_nothing() -> TestResult {
 async fn a_reopened_store_keeps_its_records() -> TestResult {
     let directory = tempfile::tempdir()?;
     let first = store(&directory).await?;
-    first.append(&[record("survivor")], KEEP_EVERY).await?;
+    first.append([record("survivor")], KEEP_EVERY).await?;
     first.close(close_deadline()).await?;
 
     let store = store(&directory).await?;
@@ -531,7 +527,7 @@ async fn a_file_of_another_version_is_refused_by_a_reader_and_recreated_by_the_w
     assert_eq!(user_version(&path)?, METRICS_SCHEMA_VERSION);
     let reads = reads(&store)?;
     assert_eq!(reads.count()?, 0, "recreation discards the older rows");
-    store.append(&[record("fresh")], KEEP_EVERY).await?;
+    store.append([record("fresh")], KEEP_EVERY).await?;
     assert_eq!(
         reads.recent(&LogQuery::newest(10))?[0].record().message(),
         "fresh"
@@ -596,7 +592,7 @@ async fn the_writer_thread_is_named_and_releases_its_owner_before_the_close_answ
         "a second close answers the first one's checkpoint"
     );
     let refusal = store
-        .append(&[record("late")], KEEP_EVERY)
+        .append([record("late")], KEEP_EVERY)
         .await
         .expect_err("a closed store writes nothing");
     assert_eq!(
@@ -659,7 +655,7 @@ async fn a_failed_open_releases_its_owner() -> TestResult {
 async fn a_close_leaves_the_write_ahead_log_for_the_next_open() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("written")], KEEP_EVERY).await?;
+    store.append([record("written")], KEEP_EVERY).await?;
 
     let checkpoint = closed(&store).await?;
 
@@ -696,7 +692,7 @@ async fn a_close_leaves_the_write_ahead_log_for_the_next_open() -> TestResult {
 async fn a_close_beside_another_connection_keeps_its_records_readable() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("written")], KEEP_EVERY).await?;
+    store.append([record("written")], KEEP_EVERY).await?;
     let other = reads(&store)?;
 
     closed(&store).await?;
@@ -713,14 +709,14 @@ async fn a_restarted_write_ahead_log_is_cut_to_its_limit() -> TestResult {
     let store = store(&directory).await?;
     let long = "x".repeat(LOG_MESSAGE_BYTES_MAX);
     let batch: Vec<LogRecord> = (0..1_024).map(|_| record(&long)).collect();
-    store.append(&batch, KEEP_EVERY * 4).await?;
+    store.append(batch, KEEP_EVERY * 4).await?;
     let grown = std::fs::metadata(wal_path(store.path()))?.len();
     assert!(
         grown > super::METRICS_JOURNAL_SIZE_LIMIT_BYTES as u64,
         "{grown}"
     );
 
-    store.append(&[record("restart")], KEEP_EVERY * 4).await?;
+    store.append([record("restart")], KEEP_EVERY * 4).await?;
 
     let kept = std::fs::metadata(wal_path(store.path()))?.len();
     assert!(
@@ -747,7 +743,7 @@ async fn a_close_queued_behind_a_held_writer_times_out_in_the_queued_stage() -> 
     store
         .sender
         .send(super::Command::Append {
-            records: vec![record("held")],
+            records: Arc::from([record("held")]),
             retention_records: KEEP_EVERY,
             queued: std::time::Instant::now(),
             reply,
@@ -799,10 +795,10 @@ async fn a_close_past_its_deadline_times_out_and_the_next_open_recovers_the_log(
     let (owner, released) = release_probe();
     let weak = Arc::downgrade(&owner);
     let store = LogStore::open(&metrics_path(&directory), Some(owner)).await?;
-    let written: Vec<LogRecord> = (0..8)
+    let written: Arc<[LogRecord]> = (0..8)
         .map(|index| record(&format!("committed {index}")))
         .collect();
-    store.append(&written, KEEP_EVERY).await?;
+    store.append(Arc::clone(&written), KEEP_EVERY).await?;
     let (holding, release) = store.hold_next_close();
     let deadline = Instant::now() + THREAD_WAIT_MAX;
 
@@ -878,7 +874,7 @@ async fn a_reader_names_the_file_its_store_writes() -> TestResult {
 fn a_command_debugs_with_its_record_count_and_no_reply() {
     let (reply, _answer) = tokio::sync::oneshot::channel();
     let append = super::Command::Append {
-        records: vec![record("first"), record("second")],
+        records: Arc::from([record("first"), record("second")]),
         retention_records: 5,
         queued: std::time::Instant::now(),
         reply,
@@ -894,11 +890,11 @@ fn a_command_debugs_with_its_record_count_and_no_reply() {
 async fn an_append_the_database_refuses_names_the_step_that_failed() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("first")], KEEP_EVERY).await?;
+    store.append([record("first")], KEEP_EVERY).await?;
     rusqlite::Connection::open(store.path())?.execute_batch("DROP TABLE log_records")?;
 
     let refusal = store
-        .append(&[record("second")], KEEP_EVERY)
+        .append([record("second")], KEEP_EVERY)
         .await
         .expect_err("an append needs the table it writes");
 
@@ -919,7 +915,7 @@ async fn an_append_records_the_metrics_database_signals() -> TestResult {
     let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("measured")], KEEP_EVERY).await?;
+    store.append([record("measured")], KEEP_EVERY).await?;
     let metrics = recorder.metrics();
 
     let metrics_namespace = ("db.namespace", "metrics");
@@ -971,7 +967,7 @@ async fn the_close_records_each_statement_it_runs() -> TestResult {
     let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("written")], KEEP_EVERY).await?;
+    store.append([record("written")], KEEP_EVERY).await?;
 
     closed(&store).await?;
     let metrics = recorder.metrics();
@@ -1045,7 +1041,7 @@ async fn an_append_behind_another_writer_counts_its_busy_retries() -> TestResult
     let before = retries();
 
     let behind = [record("behind")];
-    let append = store.append(&behind, KEEP_EVERY);
+    let append = store.append(behind, KEEP_EVERY);
     let mut append = std::pin::pin!(append);
     let waited = Instant::now() + THREAD_WAIT_MAX;
     while retries() <= before {
@@ -1071,7 +1067,7 @@ async fn a_collection_reads_the_metrics_database_page_counts() -> TestResult {
     let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("counted")], KEEP_EVERY).await?;
+    store.append([record("counted")], KEEP_EVERY).await?;
     let (used, free) = {
         let connection = rusqlite::Connection::open(store.path())?;
         connection.busy_timeout(Duration::from_secs(1))?;
@@ -1140,10 +1136,10 @@ async fn an_append_records_its_insert_and_trim_and_counts_its_statements() -> Te
     let statements = [("db.namespace", "metrics")];
 
     store
-        .append(&[record("one"), record("two"), record("three")], KEEP_EVERY)
+        .append([record("one"), record("two"), record("three")], KEEP_EVERY)
         .await?;
     let first = recorder.metrics();
-    store.append(&[record("four")], KEEP_EVERY).await?;
+    store.append([record("four")], KEEP_EVERY).await?;
     let second = recorder.metrics();
 
     for operation in ["insert", "trim"] {
@@ -1188,7 +1184,7 @@ async fn a_refused_insert_records_its_failure_and_the_statements_it_started() ->
     }
 
     store
-        .append(&[record("kept"), record("refused")], KEEP_EVERY)
+        .append([record("kept"), record("refused")], KEEP_EVERY)
         .await
         .expect_err("the trigger refuses the second insert");
     let metrics = recorder.metrics();
@@ -1241,7 +1237,7 @@ async fn a_read_records_its_connect_and_each_query() -> TestResult {
     let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[record("read")], KEEP_EVERY).await?;
+    store.append([record("read")], KEEP_EVERY).await?;
 
     let reads = reads(&store)?;
     reads.recent(&LogQuery::newest(10))?;
@@ -1315,7 +1311,7 @@ async fn age_cutoffs_select_the_records_inside_them_on_every_follow_page() -> Te
     let store = store(&directory).await?;
     store
         .append(
-            &[
+            [
                 recorded(4_999, "older"),
                 recorded(5_000, "cutoff"),
                 recorded(7_000, "inside"),
@@ -1360,7 +1356,7 @@ async fn age_cutoffs_select_the_records_inside_them_on_every_follow_page() -> Te
 async fn an_age_cutoff_reads_the_tracing_clock_once() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
-    store.append(&[recorded(1, "early")], KEEP_EVERY).await?;
+    store.append([recorded(1, "early")], KEEP_EVERY).await?;
     let before = crate::capture::now_ms();
 
     let query = LogQuery::newest(10)

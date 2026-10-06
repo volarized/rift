@@ -2669,7 +2669,7 @@ mod tests {
 
         tokio::time::timeout(
             LOG_BESIDE_INDEX_MAX,
-            logs.append(&[log_record("beside")], 100),
+            logs.append([log_record("beside")], 100),
         )
         .await
         .map_err(|_elapsed| "the log append waited on the held index commit")??;
@@ -2706,7 +2706,7 @@ mod tests {
 
         tokio::time::timeout(
             LOG_BESIDE_INDEX_MAX,
-            logs.append(&[log_record("beside")], 100),
+            logs.append([log_record("beside")], 100),
         )
         .await
         .map_err(|_elapsed| "the log append waited on the index write lock")??;

@@ -2078,7 +2078,7 @@ mod tests {
         holder.execute_batch("BEGIN IMMEDIATE")?;
         let held = rift_tracing::LogRecord::new(0, "info", "rift", "storage", "test", "held", "{}");
         let records = [held];
-        let mut append = Box::pin(store.append(&records, 1_000));
+        let mut append = Box::pin(store.append(records, 1_000));
         let first_poll =
             std::future::Future::poll(append.as_mut(), &mut Context::from_waker(Waker::noop()));
         assert!(

@@ -372,8 +372,8 @@ impl LogDrain {
     ///
     /// The highest sequence in the batch is written through, and every lower one is
     /// written or was dropped, because the queue is first in, first out. The records move
-    /// out of `batch` into the write, so the drain holds one copy of them while it
-    /// retries.
+    /// out of `batch` into one shared slice, and every attempt hands the writer thread that
+    /// slice, so a retry copies no record.
     async fn write_turn(
         &self,
         store: &LogStore,
@@ -393,9 +393,11 @@ impl LogDrain {
         // it among the records finished with would let `finished` pass `accepted`, and a
         // read waiting on a record still queued would be released by that overshoot.
         let stamped = batch.iter().filter(|queued| queued.sequence != 0).count() as u64;
-        let records: Vec<LogRecord> = batch.drain(..).map(|queued| queued.record).collect();
-        let held = records.as_slice();
-        write_retained(held.len(), move || store.append(held, retention_records)).await;
+        let records: Arc<[LogRecord]> = batch.drain(..).map(|queued| queued.record).collect();
+        write_retained(records.len(), || {
+            store.append(Arc::clone(&records), retention_records)
+        })
+        .await;
         self.settlement.finish_written(stamped, written_through);
     }
 

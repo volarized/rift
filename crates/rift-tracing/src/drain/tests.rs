@@ -126,7 +126,7 @@ async fn a_log_write_emits_no_record() {
     tracing::info!(component = "logs", "emitted by the test");
     for index in 0..4 {
         store
-            .append(&[record(&format!("batch {index}"))], 10_000)
+            .append([record(&format!("batch {index}"))], 10_000)
             .await
             .expect("the batch lands");
     }
