@@ -891,7 +891,7 @@ where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
     layer_inner(
-        log_filter,
+        otlp_filter(log_filter),
         |exporter, resource| (meter_provider(exporter, resource), None),
         true,
         false,
@@ -908,7 +908,7 @@ where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
     layer_inner(
-        log_filter,
+        otlp_filter(log_filter),
         |exporter, resource| {
             let (provider, reader) = meter_provider_with_recorder_reader(exporter, resource);
             (provider, Some(reader))
@@ -998,10 +998,7 @@ where
         None
     };
     let span_layer = tracer.as_ref().map(|provider| {
-        let filter = std::env::var(RIFT_OTLP_FILTER_VAR)
-            .ok()
-            .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
-            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_OTLP_FILTER));
+        let filter = otlp_filter(tracing_subscriber::EnvFilter::new(DEFAULT_OTLP_FILTER));
         export_layer(provider, filter)
     });
     let log_layer = logs.as_ref().map(|logs| log_record_layer(logs, log_filter));
@@ -1016,6 +1013,14 @@ where
             recorder_metric_reader,
         ),
     )
+}
+
+/// Uses `RIFT_OTLP_FILTER` when valid, otherwise keeps `fallback`.
+fn otlp_filter(fallback: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
+    std::env::var(RIFT_OTLP_FILTER_VAR)
+        .ok()
+        .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
+        .unwrap_or(fallback)
 }
 
 /// The log record batch processor's settings: the SDK's, read from the `OTEL_BLRP_*`

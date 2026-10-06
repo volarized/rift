@@ -87,7 +87,7 @@ static UNSCOPED_TRIED: AtomicBool = AtomicBool::new(false);
 static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Owns test-process exporters until the nextest child exits.
 #[cfg(any(test, feature = "fixtures"))]
-static UNSCOPED_TEST_EXPORT: OnceLock<TestOtlpExport> = OnceLock::new();
+static UNSCOPED_TEST_EXPORT: OnceLock<Mutex<Option<TestOtlpExport>>> = OnceLock::new();
 
 /// Installs the unscoped stream once per process, when [`SCOPED_RECORDER_STREAM_VARIABLE`]
 /// is set and nextest started the process. `tracing-core`'s global default "can only be
@@ -141,7 +141,8 @@ pub(crate) fn stream_unscoped() {
     }
     #[cfg(any(test, feature = "fixtures"))]
     if let Some(test_export) = test_export {
-        let _ = UNSCOPED_TEST_EXPORT.set(test_export);
+        test_export.install_meter();
+        let _ = UNSCOPED_TEST_EXPORT.set(Mutex::new(Some(test_export)));
     }
     let _ = std::thread::Builder::new()
         .name("rift-unscoped-stream".to_owned())
@@ -162,6 +163,15 @@ pub(crate) fn stream_unscoped() {
                 }
             }
         });
+}
+
+/// Shuts down the unscoped test export after a passing test has emitted its records.
+#[cfg(test)]
+pub(crate) fn shutdown_unscoped_test_export() {
+    if let Some(export) = UNSCOPED_TEST_EXPORT.get() {
+        let export = { export.lock().unwrap_or_else(PoisonError::into_inner).take() };
+        drop(export);
+    }
 }
 
 /// The filter a recorder captures under: `capture`, or every level of every target, with
@@ -518,6 +528,14 @@ impl Drop for TestOtlpExport {
         };
         if let Some(export) = self.export.take() {
             runtime.shutdown(export);
+        }
+    }
+}
+
+impl TestOtlpExport {
+    fn install_meter(&self) {
+        if let Some(export) = self.export.as_ref() {
+            export.install_meter();
         }
     }
 }

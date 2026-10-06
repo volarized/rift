@@ -397,7 +397,8 @@ fn a_streaming_recorder_prints_each_record_as_it_is_kept() {
 const UNSCOPED_CHILD_VARIABLE: &str = "RIFT_TRACING_UNSCOPED_CHILD";
 
 /// The child process the unscoped stream tests start, as nextest would: `--exact` and
-/// `--nocapture`. `plain` records on a spawned thread and on its own, with no recorder;
+/// `--nocapture`. `plain` records on a spawned thread and on its own; `current-thread` and
+/// `multi-thread` record from Tokio runtimes; `unwind` records before a caught panic;
 /// `scoped` records once with no recorder, then installs a recorder that does not stream,
 /// records on its thread and another, and checks the drain kept its own thread's record
 /// alone.
@@ -418,13 +419,47 @@ fn unscoped_stream_child() -> TestResult {
             messages(&drain.queued_records()),
             ["recorded on the recorder's thread"]
         );
+    } else if mode == "current-thread" {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(crate::info_span!("search.request").instrument(async {
+                crate::info!(component = "test", "recorded with no recorder");
+            }));
+    } else if mode == "multi-thread" {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(crate::info_span!("search.request").instrument(async {
+                crate::info!(component = "test", "recorded with no recorder");
+            }));
+    } else if mode == "unwind" {
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let span = crate::info_span!("search.request");
+            span.in_scope(|| {
+                crate::info!(component = "test", "recorded with no recorder");
+                panic!("the test body unwinds");
+            });
+        }));
+        assert!(unwind.is_err());
     } else {
         std::thread::spawn(|| crate::info!(component = "index", "recorded on another thread"))
             .join()
             .map_err(|_| "the recording thread panicked")?;
         crate::info!(component = "index", "recorded with no recorder");
+        record_unscoped_span_and_log();
+        crate::debug!(component = "test", "debug record exported");
+        crate::traced!(component = "test", operation = "search.request", {});
     }
+    super::shutdown_unscoped_test_export();
     Ok(())
+}
+
+/// Records one log and one ended span without a scoped recorder.
+fn record_unscoped_span_and_log() {
+    let span = crate::info_span!("search.request");
+    span.in_scope(|| crate::info!(component = "test", "recorded with no recorder"));
 }
 
 /// The child's stderr, run with `mode` and with the stream variable set or not.
@@ -436,6 +471,7 @@ fn unscoped_child_stderr(mode: &str, stream: bool) -> Result<String, Box<dyn std
             "recorder::tests::unscoped_stream_child",
             "--nocapture",
         ])
+        .env("RIFT_OTLP_FILTER", "debug")
         .env(UNSCOPED_CHILD_VARIABLE, mode);
     if stream {
         command.env(SCOPED_RECORDER_STREAM_VARIABLE, "1");
@@ -453,6 +489,10 @@ fn a_test_with_no_recorder_streams_every_thread_under_the_variable() -> TestResu
     let stderr = unscoped_child_stderr("plain", true)?;
     assert!(stderr.contains("recorded on another thread"), "{stderr}");
     assert!(stderr.contains("recorded with no recorder"), "{stderr}");
+    for mode in ["current-thread", "multi-thread", "unwind"] {
+        let stderr = unscoped_child_stderr(mode, true)?;
+        assert!(stderr.contains("recorded with no recorder"), "{stderr}");
+    }
     Ok(())
 }
 
