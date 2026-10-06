@@ -14,6 +14,15 @@
 //! record to standard error as it is recorded instead, and nextest's captured stderr holds
 //! them at the kill; a panic then prints the metric points alone.
 //!
+//! A test that installs no recorder records nowhere, so a timeout leaves nothing of it.
+//! Under the same variable, in a process nextest started, the first record, span, or lock
+//! of the process installs the unscoped stream: a process-wide default subscriber that
+//! prints each record to standard error as a recorder streams, and every
+//! [`UNSCOPED_IN_FLIGHT_INTERVAL`] the operations still in flight. The stream records
+//! until the process installs a recorder, and nothing after: the recorder takes its own
+//! thread's records, since `tracing-core` uses the global default only "as a fallback if
+//! no thread-local dispatch has been set in a thread", and streams them itself.
+//!
 //! Metrics are the process's: the first recorder installs the process's meter, and
 //! [`ScopedRecorder::metrics`] reads what the OpenTelemetry SDK exports from it.
 //!
@@ -22,9 +31,10 @@
 //! hand instead of sleeping.
 
 mod metrics;
+mod unscoped;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -33,6 +43,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use crate::capture::{SpanContextLayer, log_capture};
 use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable, observe_active};
+use crate::measurement::monotonic_now;
 use crate::metrics::ObservationGuard;
 use crate::otlp::SDK_TARGET;
 use crate::record::LogRecord;
@@ -57,6 +68,83 @@ pub const SCOPED_RECORDER_PRINT_BYTES_MAX: usize = 64 << 10;
 /// kills the job object at once on Windows, and either way the lines printed before the
 /// kill stay in its output. Unset, a recorder prints only when its test panics.
 pub const SCOPED_RECORDER_STREAM_VARIABLE: &str = "RIFT_SCOPED_RECORDER_STREAM";
+
+/// How often the unscoped stream prints the operations still in flight, while any is.
+pub const UNSCOPED_IN_FLIGHT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The argument nextest passes every test it runs: it runs `<binary> --exact <name>
+/// --nocapture` (`nextest-runner/src/list/test_list.rs`, 0.9.145). A `rift` process a
+/// test starts never carries it, so its own [`TracingRuntime`](crate::TracingRuntime)
+/// keeps the global default.
+const NEXTEST_ARGUMENT: &str = "--nocapture";
+
+/// Whether this process tried the unscoped stream already.
+static UNSCOPED_TRIED: AtomicBool = AtomicBool::new(false);
+/// Whether this process installed a recorder: from then on the unscoped stream enables
+/// nothing (`unscoped.rs` states why).
+static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Installs the unscoped stream once per process, when [`SCOPED_RECORDER_STREAM_VARIABLE`]
+/// is set and nextest started the process. `tracing-core`'s global default "can only be
+/// set once; subsequent attempts to set the global default will fail", so a process that
+/// set one first keeps it, and no stream starts.
+pub(crate) fn stream_unscoped() {
+    if UNSCOPED_TRIED.load(Ordering::Relaxed) || UNSCOPED_TRIED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if RECORDER_INSTALLED.load(Ordering::Relaxed)
+        || std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_none()
+        || !std::env::args_os().any(|argument| argument == NEXTEST_ARGUMENT)
+    {
+        return;
+    }
+    let Ok(filter) = recorder_filter(None) else {
+        return;
+    };
+    let retained = Arc::new(RetainedRecords {
+        stream: Some(PanicOutput::Stderr),
+        ..RetainedRecords::default()
+    });
+    // No drain reads the queue: a closed queue counts no drop in `log.queue.dropped`.
+    let (sink, _drain) = log_capture();
+    let flights = Arc::new(FlightTable::default());
+    let subscriber = crate::capture::registry()
+        .with(FlightLayer::new(Arc::clone(&flights)))
+        .with(capture_layer(sink.retaining(retained), filter))
+        .with(unscoped::StopAtRecorder);
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("rift-unscoped-stream".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(UNSCOPED_IN_FLIGHT_INTERVAL);
+                let listing = flights.listing(monotonic_now());
+                if listing.in_flight > 0 {
+                    tracing::info!(
+                        target: "rift_tracing::flight",
+                        reason = "unscoped_stream",
+                        in_flight = listing.in_flight,
+                        left_out = listing.left_out,
+                        untracked = listing.untracked,
+                        operations = %listing,
+                        "operations in flight"
+                    );
+                }
+            }
+        });
+}
+
+/// The filter a recorder captures under: `capture`, or every level of every target, with
+/// the OpenTelemetry SDK's own reports at `WARN` and above.
+fn recorder_filter(capture: Option<&str>) -> Result<tracing_subscriber::EnvFilter, LogFilterError> {
+    let mut filter = parsed_filter(capture.unwrap_or(RECORDER_DEFAULT_CAPTURE))?;
+    if let Ok(reports) = format!("{SDK_TARGET}=warn").parse() {
+        filter = filter.add_directive(reports);
+    }
+    Ok(filter)
+}
 
 /// The filter a recorder captures under when its builder names none: every level of
 /// every target.
@@ -248,11 +336,8 @@ impl ScopedRecorderBuilder {
     ///
     /// Returns [`LogFilterError`] when the [`Self::capture`] filter does not parse.
     pub fn install(self) -> Result<(ScopedRecorder, LogDrain), LogFilterError> {
-        let mut filter =
-            parsed_filter(self.capture.as_deref().unwrap_or(RECORDER_DEFAULT_CAPTURE))?;
-        if let Ok(reports) = format!("{SDK_TARGET}=warn").parse() {
-            filter = filter.add_directive(reports);
-        }
+        let filter = recorder_filter(self.capture.as_deref())?;
+        RECORDER_INSTALLED.store(true, Ordering::Relaxed);
         let stream = self.stream.then_some(PanicOutput::Stderr);
         let retained = Arc::new(RetainedRecords {
             stream,

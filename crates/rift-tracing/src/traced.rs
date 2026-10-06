@@ -420,7 +420,8 @@ macro_rules! __rift_traced_span {
     (
         [$($held:ident $parent:expr)?] [$($component:expr)?] $operation:literal
         [$($field:ident = $value:expr),*]
-    ) => {
+    ) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::span!(
             $(parent: &$held,)?
             $crate::__private::tracing::Level::INFO,
@@ -431,7 +432,7 @@ macro_rules! __rift_traced_span {
             code.function.name = $crate::__rift_function_name!(),
             error.type = $crate::__private::tracing::field::Empty
         )
-    };
+    }};
 }
 
 #[cfg(test)]

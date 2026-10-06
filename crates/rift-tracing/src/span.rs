@@ -100,22 +100,25 @@ macro_rules! __rift_named_span {
     ($macro:ident [$($parent:tt)*] parent: $value:expr, $($rest:tt)+) => {
         $crate::__rift_named_span!($macro [parent: $value,] $($rest)+)
     };
-    ($macro:ident [$($parent:tt)*] $name:literal $(,)?) => {
+    ($macro:ident [$($parent:tt)*] $name:literal $(,)?) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::$macro!(
             $($parent)* $name,
             code.function.name = $crate::__rift_function_name!()
         )
-    };
-    ($macro:ident [$($parent:tt)*] $name:literal, $($fields:tt)+) => {
+    }};
+    ($macro:ident [$($parent:tt)*] $name:literal, $($fields:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::$macro!(
             $($parent)* $name,
             code.function.name = $crate::__rift_function_name!(),
             $($fields)+
         )
-    };
-    ($macro:ident [$($parent:tt)*] $($arguments:tt)+) => {
+    }};
+    ($macro:ident [$($parent:tt)*] $($arguments:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::$macro!($($parent)* $($arguments)+)
-    };
+    }};
 }
 
 /// The fully-qualified name of the function the macro expands in, as the field
@@ -159,28 +162,31 @@ pub fn function_name(raw: &'static str) -> &'static str {
 /// record outside every span.
 #[macro_export]
 macro_rules! trace {
-    (target: $target:expr, $($rest:tt)+) => {
+    (target: $target:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             target: $target,
             $crate::__private::tracing::Level::TRACE,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    (parent: $parent:expr, $($rest:tt)+) => {
+    }};
+    (parent: $parent:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             parent: $parent,
             $crate::__private::tracing::Level::TRACE,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    ($($rest:tt)+) => {
+    }};
+    ($($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::trace!(
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
+    }};
 }
 
 /// Emits an event at the `debug` level, with the caller's module path as its target.
@@ -190,28 +196,31 @@ macro_rules! trace {
 /// record outside every span.
 #[macro_export]
 macro_rules! debug {
-    (target: $target:expr, $($rest:tt)+) => {
+    (target: $target:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             target: $target,
             $crate::__private::tracing::Level::DEBUG,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    (parent: $parent:expr, $($rest:tt)+) => {
+    }};
+    (parent: $parent:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             parent: $parent,
             $crate::__private::tracing::Level::DEBUG,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    ($($rest:tt)+) => {
+    }};
+    ($($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::debug!(
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
+    }};
 }
 
 /// Emits an event at the `info` level, with the caller's module path as its target.
@@ -221,28 +230,31 @@ macro_rules! debug {
 /// record outside every span.
 #[macro_export]
 macro_rules! info {
-    (target: $target:expr, $($rest:tt)+) => {
+    (target: $target:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             target: $target,
             $crate::__private::tracing::Level::INFO,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    (parent: $parent:expr, $($rest:tt)+) => {
+    }};
+    (parent: $parent:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             parent: $parent,
             $crate::__private::tracing::Level::INFO,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    ($($rest:tt)+) => {
+    }};
+    ($($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::info!(
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
+    }};
 }
 
 /// Emits an event at the `warn` level, with the caller's module path as its target.
@@ -252,28 +264,31 @@ macro_rules! info {
 /// record outside every span.
 #[macro_export]
 macro_rules! warn {
-    (target: $target:expr, $($rest:tt)+) => {
+    (target: $target:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             target: $target,
             $crate::__private::tracing::Level::WARN,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    (parent: $parent:expr, $($rest:tt)+) => {
+    }};
+    (parent: $parent:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             parent: $parent,
             $crate::__private::tracing::Level::WARN,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    ($($rest:tt)+) => {
+    }};
+    ($($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::warn!(
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
+    }};
 }
 
 /// Emits an event at the `error` level, with the caller's module path as its target.
@@ -283,28 +298,31 @@ macro_rules! warn {
 /// record outside every span.
 #[macro_export]
 macro_rules! error {
-    (target: $target:expr, $($rest:tt)+) => {
+    (target: $target:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             target: $target,
             $crate::__private::tracing::Level::ERROR,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    (parent: $parent:expr, $($rest:tt)+) => {
+    }};
+    (parent: $parent:expr, $($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::event!(
             parent: $parent,
             $crate::__private::tracing::Level::ERROR,
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
-    ($($rest:tt)+) => {
+    }};
+    ($($rest:tt)+) => {{
+        $crate::__private::stream_unscoped();
         $crate::__private::tracing::error!(
             code.function.name = $crate::__rift_function_name!(),
             $($rest)+
         )
-    };
+    }};
 }
 
 /// A span field declared at opening and given its value later with [`Span::record`].

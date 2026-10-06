@@ -91,7 +91,7 @@ pub use record::{
 pub use recorder::{
     MetricSeries, MetricSnapshot, SCOPED_RECORDER_PRINT_BYTES_MAX,
     SCOPED_RECORDER_PRINT_RECORDS_MAX, SCOPED_RECORDER_STREAM_VARIABLE, ScopedRecorder,
-    ScopedRecorderBuilder, SeriesValue,
+    ScopedRecorderBuilder, SeriesValue, UNSCOPED_IN_FLIGHT_INTERVAL,
 };
 pub use render::LogLines;
 pub use runtime::{
@@ -184,4 +184,17 @@ pub mod __private {
     pub use crate::span::{function_name, span_from};
     pub use crate::traced::{parent_span, traced_future};
     pub use tracing;
+
+    /// Installs the unscoped stream on a nextest test process's first record, span, or
+    /// lock: [`crate::ScopedRecorder`]'s module documents it.
+    #[cfg(any(test, feature = "fixtures"))]
+    #[inline]
+    pub fn stream_unscoped() {
+        crate::recorder::stream_unscoped();
+    }
+
+    /// Without the `fixtures` feature no process streams unscoped.
+    #[cfg(not(any(test, feature = "fixtures")))]
+    #[inline(always)]
+    pub const fn stream_unscoped() {}
 }

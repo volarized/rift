@@ -337,7 +337,13 @@ async fn without_a_subscriber_a_lock_still_locks_and_records_nothing() {
     **turn += 1;
     drop(turn);
     assert_eq!(*writes.lock().await, 1);
-    assert!(with_table(|table| table.holder_of("index.write")).is_none());
+    // Under the nextest runner the unscoped stream is this process's subscriber: its table,
+    // when there is one, names no holder once the turn dropped.
+    assert!(
+        with_table(|table| table.holder_of("index.write"))
+            .flatten()
+            .is_none()
+    );
 }
 
 #[tokio::test]

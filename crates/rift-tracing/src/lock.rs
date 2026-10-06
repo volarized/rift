@@ -274,6 +274,7 @@ impl Lock {
 
     /// Opens the `lock.wait` span under the current span, naming the waiter and the holder.
     fn wait_span(self) -> tracing::Span {
+        crate::__private::stream_unscoped();
         let waiter = current_operation();
         let holder = with_table(|table| table.holder_of(self.name)).flatten();
         tracing::info_span!(
@@ -452,6 +453,7 @@ impl<Guard> Held<Guard> {
     /// the hold ends. Its `holder` field and its table entry still name that operation.
     fn acquired(lock: Lock, guard: Guard, contended: bool) -> Self {
         let holder = current_operation();
+        crate::__private::stream_unscoped();
         let lifelong = lock.lifelong.then_some(true);
         let parent = if lock.lifelong {
             None

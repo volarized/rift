@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use super::{
     PanicOutput, RetainedRecords, SCOPED_RECORDER_PRINT_BYTES_MAX,
-    SCOPED_RECORDER_PRINT_RECORDS_MAX, ScopedRecorder, printed_points,
+    SCOPED_RECORDER_PRINT_RECORDS_MAX, SCOPED_RECORDER_STREAM_VARIABLE, ScopedRecorder,
+    printed_points,
 };
 use crate::metrics::Counter;
 use crate::record::{LOG_MESSAGE_BYTES_MAX, LogRecord};
@@ -349,4 +350,86 @@ fn a_streaming_recorder_prints_each_record_as_it_is_kept() {
             record("second").rendered()
         )
     );
+}
+
+/// Selects what [`unscoped_stream_child`] records when a test starts it; unset, it records
+/// nothing.
+const UNSCOPED_CHILD_VARIABLE: &str = "RIFT_TRACING_UNSCOPED_CHILD";
+
+/// The child process the unscoped stream tests start, as nextest would: `--exact` and
+/// `--nocapture`. `plain` records on a spawned thread and on its own, with no recorder;
+/// `scoped` records once with no recorder, then installs a recorder that does not stream,
+/// records on its thread and another, and checks the drain kept its own thread's record
+/// alone.
+#[test]
+fn unscoped_stream_child() -> TestResult {
+    let Some(mode) = std::env::var_os(UNSCOPED_CHILD_VARIABLE) else {
+        return Ok(());
+    };
+    if mode == "scoped" {
+        crate::info!(component = "index", "recorded before the recorder");
+        let (recorder, mut drain) = ScopedRecorder::builder().stream(false).install()?;
+        crate::info!(component = "index", "recorded on the recorder's thread");
+        std::thread::spawn(|| crate::info!(component = "index", "recorded on another thread"))
+            .join()
+            .map_err(|_| "the recording thread panicked")?;
+        drop(recorder);
+        assert_eq!(
+            messages(&drain.queued_records()),
+            ["recorded on the recorder's thread"]
+        );
+    } else {
+        std::thread::spawn(|| crate::info!(component = "index", "recorded on another thread"))
+            .join()
+            .map_err(|_| "the recording thread panicked")?;
+        crate::info!(component = "index", "recorded with no recorder");
+    }
+    Ok(())
+}
+
+/// The child's stderr, run with `mode` and with the stream variable set or not.
+fn unscoped_child_stderr(mode: &str, stream: bool) -> Result<String, Box<dyn std::error::Error>> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "recorder::tests::unscoped_stream_child",
+            "--nocapture",
+        ])
+        .env(UNSCOPED_CHILD_VARIABLE, mode);
+    if stream {
+        command.env(SCOPED_RECORDER_STREAM_VARIABLE, "1");
+    } else {
+        command.env_remove(SCOPED_RECORDER_STREAM_VARIABLE);
+    }
+    let output = command.output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(output.status.success(), "{stderr}");
+    Ok(stderr)
+}
+
+#[test]
+fn a_test_with_no_recorder_streams_every_thread_under_the_variable() -> TestResult {
+    let stderr = unscoped_child_stderr("plain", true)?;
+    assert!(stderr.contains("recorded on another thread"), "{stderr}");
+    assert!(stderr.contains("recorded with no recorder"), "{stderr}");
+    Ok(())
+}
+
+/// The stream prints the record made before the recorder; the recorder then takes its own
+/// thread's record, and the stream, stopped at the install, prints the other thread's
+/// record no more.
+#[test]
+fn a_recorder_takes_its_thread_and_stops_the_unscoped_stream() -> TestResult {
+    let stderr = unscoped_child_stderr("scoped", true)?;
+    assert!(stderr.contains("recorded before the recorder"), "{stderr}");
+    assert!(!stderr.contains("recorded on"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_test_without_the_variable_streams_nothing() -> TestResult {
+    let stderr = unscoped_child_stderr("plain", false)?;
+    assert!(!stderr.contains("recorded"), "{stderr}");
+    Ok(())
 }
