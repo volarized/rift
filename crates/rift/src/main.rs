@@ -160,11 +160,12 @@ async fn main() -> ExitCode {
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
     let export = tracing_runtime.export();
     let succeeded = match run(cli, drain, retention_records, export).await {
-        Ok(Some(outcome)) => {
-            println!("{outcome}");
+        Ok(outcome) => {
+            if let Some(outcome) = outcome {
+                println!("{outcome}");
+            }
             true
         }
-        Ok(None) => true,
         Err(error) => {
             eprint!("{}", error.rendered());
             false

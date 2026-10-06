@@ -1026,13 +1026,13 @@ impl ListeningForeground {
     /// Starts a foreground server in `root` with `variables` added to the inherited
     /// environment, and returns once it has printed its listening line: the server installs
     /// its stop signal handlers before it prints that line.
-    fn start(root: &Path, variables: &[(&str, &str)]) -> TestResult<Self> {
+    fn start(root: &Path, variables: &[(String, String)]) -> TestResult<Self> {
         use std::io::BufRead as _;
 
         let mut child = rift_command()?
             .args(["server", "start", "--foreground"])
             .envs(SERVER_LOG_VARIABLES)
-            .envs(variables.iter().copied())
+            .envs(variables.iter().map(|(name, value)| (name, value)))
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1187,15 +1187,75 @@ const EXPORT_INTERVAL_PAST_THE_TEST_MS: &str = "600000";
 
 /// The variables that point a server at `endpoint` with no scheduled export.
 #[cfg(unix)]
-fn export_variables(endpoint: &str) -> [(&str, &str); 3] {
-    [
-        ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
-        ("OTEL_BSP_SCHEDULE_DELAY", EXPORT_INTERVAL_PAST_THE_TEST_MS),
+fn export_variables(endpoint: &str) -> TestResult<Vec<(String, String)>> {
+    let collector = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
+    Ok(vec![
         (
-            "OTEL_METRIC_EXPORT_INTERVAL",
-            EXPORT_INTERVAL_PAST_THE_TEST_MS,
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT".to_owned(),
+            format!("{}/v1/traces", endpoint.trim_end_matches('/')),
         ),
-    ]
+        (
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT".to_owned(),
+            format!("{}/v1/metrics", endpoint.trim_end_matches('/')),
+        ),
+        (
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_owned(),
+            format!("{}/v1/logs", collector.trim_end_matches('/')),
+        ),
+        (
+            "OTEL_BSP_SCHEDULE_DELAY".to_owned(),
+            EXPORT_INTERVAL_PAST_THE_TEST_MS.to_owned(),
+        ),
+        (
+            "OTEL_METRIC_EXPORT_INTERVAL".to_owned(),
+            EXPORT_INTERVAL_PAST_THE_TEST_MS.to_owned(),
+        ),
+    ])
+}
+
+#[cfg(unix)]
+fn assert_export_stage_outcome(expected: &[&str]) -> TestResult {
+    let attempt = std::env::var("NEXTEST_ATTEMPT_ID")?;
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/test/case/logs",
+        endpoint.trim_end_matches('/')
+    ))?;
+    url.query_pairs_mut()
+        .append_pair("test.case.name", &attempt)
+        .append_pair("limit", "256");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let body = runtime.block_on(async {
+        reqwest::Client::new()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await
+    })?;
+    let response: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(response["test_case"], attempt);
+    assert_eq!(response["dropped"], 0);
+    assert_eq!(response["omitted"], 0);
+    let logs = response["logs"]
+        .as_array()
+        .ok_or("collector logs are an array")?;
+    assert!(
+        logs.iter().any(|record| {
+            record["body"] == "stop stage ended"
+                && record["resource"]["test.case.name"] == attempt
+                && record["attributes"]["stage"] == "otlp export"
+                && record["attributes"]["phase"] == "traces and metrics"
+                && expected
+                    .iter()
+                    .any(|outcome| record["attributes"]["outcome"] == *outcome)
+        }),
+        "the Python OTLP collector records export-stage outcome {expected:?}: {logs:?}"
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1208,7 +1268,7 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     let receiver = TraceReceiver::start()?;
     let endpoint = receiver.endpoint();
 
-    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let server = ListeningForeground::start(root, &export_variables(&endpoint)?)?;
     let signalled = std::time::Instant::now();
     let (status, elapsed, stderr) = server.terminate()?;
 
@@ -1231,9 +1291,7 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
         1,
         "the export shutdown sends the final metric points once: {points:?}"
     );
-    let records = stored_records(root)?;
-    let export = stage_ended_line(&records, "otlp export")?;
-    assert!(export.contains("outcome=ok"), "{export}");
+    assert_export_stage_outcome(&["ok"])?;
     failure_window.passed();
     Ok(())
 }
@@ -1256,7 +1314,7 @@ fn a_stalled_collector_ends_the_export_stage_timeout_inside_the_stop_bound() -> 
         drop(held);
     });
 
-    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let server = ListeningForeground::start(root, &export_variables(&endpoint)?)?;
     let (status, elapsed, stderr) = server.terminate()?;
 
     assert!(
@@ -1267,10 +1325,7 @@ fn a_stalled_collector_ends_the_export_stage_timeout_inside_the_stop_bound() -> 
         elapsed <= STOP_EXIT_BOUND,
         "the export stage holds the stop for its reserve alone: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
-    let records = stored_records(root)?;
-    let export = stage_ended_line(&records, "otlp export")?;
-    assert!(export.contains("outcome=timeout"), "{export}");
-    assert!(export.contains("WARN"), "{export}");
+    assert_export_stage_outcome(&["timeout"])?;
     failure_window.passed();
     Ok(())
 }
@@ -1290,7 +1345,7 @@ fn a_refused_collector_ends_the_export_stage_error_and_the_stop_cleanly() -> Tes
     let endpoint = format!("http://127.0.0.1:{}", refused.local_addr()?.port());
     drop(refused);
 
-    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let server = ListeningForeground::start(root, &export_variables(&endpoint)?)?;
     let (status, elapsed, stderr) = server.terminate()?;
 
     assert!(
@@ -1301,13 +1356,7 @@ fn a_refused_collector_ends_the_export_stage_error_and_the_stop_cleanly() -> Tes
         elapsed <= STOP_EXIT_BOUND,
         "elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
-    let records = stored_records(root)?;
-    let export = stage_ended_line(&records, "otlp export")?;
-    assert!(
-        export.contains("outcome=error") || export.contains("outcome=timeout"),
-        "{export}"
-    );
-    assert!(export.contains("WARN"), "{export}");
+    assert_export_stage_outcome(&["error", "timeout"])?;
     failure_window.passed();
     Ok(())
 }
