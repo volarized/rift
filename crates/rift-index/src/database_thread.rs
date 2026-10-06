@@ -80,12 +80,8 @@ static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
     "sqlite.transaction.statement.count",
     "{statement}",
     &["db.namespace"],
-    &STATEMENT_BOUNDARIES,
+    &rift_tracing::STATEMENT_BOUNDARIES,
 );
-/// Upper bucket bounds of [`TRANSACTION_STATEMENTS`], in statements.
-const STATEMENT_BOUNDARIES: [f64; 13] = [
-    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
-];
 /// `sqlite.queue.wait.duration`: one driver operation's round trip to the worker less its
 /// execution there: the wait to enter the queue, the wait in it, and the reply.
 static QUEUE_WAIT: Histogram<2> = Histogram::declare(

@@ -304,13 +304,8 @@ static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
     "sqlite.transaction.statement.count",
     "{statement}",
     &["db.namespace"],
-    &STATEMENT_BOUNDARIES,
+    &rift_tracing::STATEMENT_BOUNDARIES,
 );
-/// Upper bucket bounds of [`TRANSACTION_STATEMENTS`], in statements: the bounds the index
-/// and vectors workers use.
-const STATEMENT_BOUNDARIES: [f64; 13] = [
-    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
-];
 /// `db.client.operation.duration`: one operation on a store connection, by
 /// `db.operation.name`; a failed one adds `error.type` `_OTHER`, and the busy or locked
 /// result code as `db.response.status_code`.
@@ -358,10 +353,12 @@ fn timed<Answer>(
     if let Some(took) = took {
         let (status, failed) = match &result {
             Ok(_) => ("", ""),
-            Err(refusal) => match sqlite_cause(refusal).map_or("_OTHER", error_type) {
-                "_OTHER" => ("", "_OTHER"),
-                code => (code, "_OTHER"),
-            },
+            Err(refusal) => {
+                match sqlite_cause(refusal).map_or("_OTHER", rift_tracing::sqlite_error_type) {
+                    "_OTHER" => ("", "_OTHER"),
+                    code => (code, "_OTHER"),
+                }
+            }
         };
         OPERATION_DURATION
             .labeled([DB_SYSTEM, DB_NAMESPACE, operation, status, failed])
@@ -403,16 +400,6 @@ impl CountedTransaction<'_> {
     }
 }
 
-/// The `error.type` of a failed statement: `SQLite`'s result code for busy, `5`, and for
-/// locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
-fn error_type(failure: &rusqlite::Error) -> &'static str {
-    match failure.sqlite_error_code() {
-        Some(rusqlite::ErrorCode::DatabaseBusy) => "5",
-        Some(rusqlite::ErrorCode::DatabaseLocked) => "6",
-        _ => "_OTHER",
-    }
-}
-
 /// Runs `body` inside one `BEGIN IMMEDIATE` transaction on `connection` and commits
 /// what it wrote; a failed `body` rolls back. `operations` name the begin and the commit
 /// in a refusal.
@@ -434,7 +421,10 @@ fn in_write_transaction<Answer>(
     .ok()
     .map(|((), waited)| waited);
     if let Some(waited) = waited {
-        let failed = begun.as_ref().err().map_or("", error_type);
+        let failed = begun
+            .as_ref()
+            .err()
+            .map_or("", rift_tracing::sqlite_error_type);
         WRITE_LOCK_WAIT
             .labeled([DB_NAMESPACE, failed])
             .record(waited.elapsed());
@@ -1025,7 +1015,7 @@ mod tests {
     use rift_tracing::{MetricSeries, MetricSnapshot, ScopedRecorder, SeriesValue};
     use rusqlite::ffi;
 
-    use super::{QUERY_OPERATION, error_type, timed};
+    use super::{QUERY_OPERATION, timed};
     use crate::{CommitRecord, HistoryStore, StoreLocation};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1175,14 +1165,5 @@ mod tests {
 
     fn failure(code: std::ffi::c_int) -> rusqlite::Error {
         rusqlite::Error::SqliteFailure(ffi::Error::new(code), None)
-    }
-
-    #[test]
-    fn error_type_names_busy_and_locked_by_result_code_and_every_other_failure_as_other() {
-        assert_eq!(error_type(&failure(ffi::SQLITE_BUSY)), "5");
-        assert_eq!(error_type(&failure(ffi::SQLITE_LOCKED)), "6");
-        assert_eq!(error_type(&failure(ffi::SQLITE_LOCKED_SHAREDCACHE)), "6");
-        assert_eq!(error_type(&failure(ffi::SQLITE_IOERR)), "_OTHER");
-        assert_eq!(error_type(&rusqlite::Error::QueryReturnedNoRows), "_OTHER");
     }
 }

@@ -103,10 +103,11 @@ static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
     &["db.namespace"],
     &STATEMENT_BOUNDARIES,
 );
-/// Upper bucket bounds of [`TRANSACTION_STATEMENTS`], in statements: the bounds the index
-/// and vectors workers use. One append runs at most [`LOG_BATCH_RECORDS_MAX`] inserts and
-/// two statements more.
-const STATEMENT_BOUNDARIES: [f64; 13] = [
+/// Upper bucket bounds of `sqlite.transaction.statement.count`, in statements, for every
+/// database that records it: the metrics database, the index and vectors workers, and the
+/// history store. One metrics append runs at most [`LOG_BATCH_RECORDS_MAX`] inserts and two
+/// statements more.
+pub const STATEMENT_BOUNDARIES: [f64; 13] = [
     1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
 ];
 
@@ -211,7 +212,7 @@ pub(crate) fn timed<Answer, Failure>(
     if let Some(took) = took {
         let (status, failed) = match &result {
             Ok(_) => ("", ""),
-            Err(failure) => match error_type(cause(failure)) {
+            Err(failure) => match sqlite_error_type(cause(failure)) {
                 "_OTHER" => ("", "_OTHER"),
                 code => (code, "_OTHER"),
             },
@@ -223,9 +224,10 @@ pub(crate) fn timed<Answer, Failure>(
     result
 }
 
-/// The `error.type` of a failed `BEGIN IMMEDIATE`: `SQLite`'s result code for busy, `5`,
-/// and for locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
-fn error_type(failure: &rusqlite::Error) -> &'static str {
+/// The `error.type` of a failed `SQLite` statement: the result code for busy, `5`, and for
+/// locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
+#[must_use]
+pub fn sqlite_error_type(failure: &rusqlite::Error) -> &'static str {
     match failure.sqlite_error_code() {
         Some(rusqlite::ErrorCode::DatabaseBusy) => "5",
         Some(rusqlite::ErrorCode::DatabaseLocked) => "6",
@@ -769,7 +771,7 @@ impl MetricsWriter {
         let begun = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate);
-        let failed = begun.as_ref().err().map_or("", error_type);
+        let failed = begun.as_ref().err().map_or("", sqlite_error_type);
         WRITE_LOCK_WAIT
             .labeled([DB_NAMESPACE, failed])
             .record(started.elapsed());

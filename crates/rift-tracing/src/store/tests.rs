@@ -1409,3 +1409,29 @@ async fn an_open_records_no_insert_or_trim() -> TestResult {
     );
     Ok(())
 }
+
+fn sqlite_failure(code: std::ffi::c_int) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+}
+
+#[test]
+fn sqlite_error_type_names_busy_and_locked_by_result_code_and_every_other_failure_as_other() {
+    use rusqlite::ffi;
+
+    use super::sqlite_error_type;
+
+    assert_eq!(sqlite_error_type(&sqlite_failure(ffi::SQLITE_BUSY)), "5");
+    assert_eq!(sqlite_error_type(&sqlite_failure(ffi::SQLITE_LOCKED)), "6");
+    assert_eq!(
+        sqlite_error_type(&sqlite_failure(ffi::SQLITE_LOCKED_SHAREDCACHE)),
+        "6"
+    );
+    assert_eq!(
+        sqlite_error_type(&sqlite_failure(ffi::SQLITE_IOERR)),
+        "_OTHER"
+    );
+    assert_eq!(
+        sqlite_error_type(&rusqlite::Error::QueryReturnedNoRows),
+        "_OTHER"
+    );
+}
