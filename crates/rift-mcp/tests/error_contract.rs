@@ -231,3 +231,27 @@ async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_non_string_query_refuses_the_search_with_registered_identity() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::HERMETIC_TABLES,
+    )?;
+    let failure = failing_tool_error(directory.path(), "search", json!({ "query": 42 })).await?;
+    assert!(
+        failure.message.contains("field query"),
+        "the refusal must name the parameter at fault: {failure:?}"
+    );
+    assert!(
+        failure
+            .text
+            .lines()
+            .any(|line| line.trim() == "rift.mcp.parameter_invalid"),
+        "the refusal must retain its registered identity: {}",
+        failure.text
+    );
+    Ok(())
+}

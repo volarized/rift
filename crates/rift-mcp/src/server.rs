@@ -66,7 +66,7 @@ use crate::metrics::{
     RESOURCES_LIST, RESOURCES_READ, SCOPE, TOOLS_CALL, TOOLS_LIST,
 };
 use crate::output::{Json, ToolFailure};
-use crate::parameters::Parameters;
+use crate::parameters::{ParameterFailure, Parameters};
 use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
@@ -876,7 +876,7 @@ impl ResolvedWorkspace {
         phase: wire::ErrorPhase,
         capture_elapsed: Duration,
     ) -> Result<Self, ToolFailure> {
-        published.configuration.accepted(phase)?;
+        published.configuration.accepted_for_tool(phase)?;
         let stale = moved.map(|moved| stale_index_warning(&published, captured, moved, reason));
         Ok(Self {
             published,
@@ -2397,7 +2397,7 @@ impl RiftMcp {
         resolved
             .published
             .configuration
-            .accepted(wire::ErrorPhase::Read)?;
+            .accepted_for_tool(wire::ErrorPhase::Read)?;
         let reads = Arc::clone(&resolved.published.reads);
         if let Some(history) = &self.history {
             reads.attach_history_store(history.stored());
@@ -3298,7 +3298,9 @@ impl RiftMcp {
     /// Committed source is what `[providers.history]` gates, so a workspace that turns the
     /// table off refuses here, before any revision is resolved.
     fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ToolFailure> {
-        let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
+        let configuration = published
+            .configuration
+            .accepted_for_tool(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
             return errors::server::read_unsupported()
                 .capability("revision reads (providers.history disabled)")
@@ -3337,7 +3339,7 @@ impl RiftMcp {
         resolved
             .published
             .configuration
-            .accepted(wire::ErrorPhase::Read)?;
+            .accepted_for_tool(wire::ErrorPhase::Read)?;
         let reads = Arc::clone(&resolved.published.reads);
         if let Some(history) = &self.history {
             reads.attach_history_store(history.stored());
@@ -3373,7 +3375,7 @@ impl RiftMcp {
         resolved
             .published
             .configuration
-            .accepted(wire::ErrorPhase::Read)?;
+            .accepted_for_tool(wire::ErrorPhase::Read)?;
         let reads = Arc::clone(&resolved.published.reads);
         let cancellation = self.validation.cancellation.child_token();
         let timed_cancellation = cancellation.clone();
@@ -3563,7 +3565,7 @@ impl RiftMcp {
                 && configuration_matches
                 && !self.project_environment_moved(&current, phase).await?
             {
-                current.configuration.accepted(phase)?;
+                current.configuration.accepted_for_tool(phase)?;
                 return Ok(ResolvedWorkspace::current(current, capture.capture_elapsed));
             }
             let changes =
@@ -4153,8 +4155,10 @@ impl ServerHandler for RiftMcp {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let parameter_failure = ParameterFailure::default();
+        let _ = context.extensions.insert(parameter_failure.clone());
         let measured =
             McpRequest::tool_call(&request.name).served(context.protocol_version().as_ref());
         // `workspace` routes every record inside the request to this workspace's log store
@@ -4176,7 +4180,13 @@ impl ServerHandler for RiftMcp {
                     rift_tracing::debug!("tool request started");
                     let routed = ToolCallContext::new(self, request, context);
                     let result = match self.tool_router.call(routed).await {
-                        Err(error) => ToolFailure::from(error).into_call_tool_result(),
+                        Err(error) => {
+                            let failure = parameter_failure.take().map_or_else(
+                                || ToolFailure::from(error),
+                                |failure| ToolFailure::Registered(failure, wire::ErrorPhase::Read),
+                            );
+                            failure.into_call_tool_result()
+                        }
                         Ok(response) => Ok(response),
                     };
                     rift_tracing::debug!(
