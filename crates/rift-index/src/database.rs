@@ -489,6 +489,7 @@ impl WorkspaceDatabase {
             .await
             .map_err(|source| name.failed(database_path, source))?;
         drop(migration_lock);
+        checkpoint_at_open(&database, name, database_path).await;
         let queue_length = thread.observe_queue_length();
         let sizes = database_path.to_owned();
         let file_sizes =
@@ -546,30 +547,33 @@ impl WorkspaceDatabase {
         self.name.failed(&self.path, source)
     }
 
-    /// Checkpoints the write-ahead log, then stops the SQLite worker, both by `deadline`.
+    /// Stops the SQLite worker by `deadline` without a checkpoint: the write-ahead log stays
+    /// for the next open, whose checkpoint moves it into the database.
     ///
-    /// The checkpoint waits for the file's write turn, sets the busy timeout of its write
-    /// connection to zero, reads the frames the log holds with `PRAGMA
-    /// wal_checkpoint(NOOP)`, and runs `PRAGMA wal_checkpoint(TRUNCATE)`, which empties the
-    /// log file unless another connection holds it busy. It records `busy`, the frames the
-    /// log held as `log`, the frames it moved as `checkpointed`, and its `elapsed_ms` as a
-    /// `database.close` event. A turn not free by `deadline`, a busy answer, or a refused
-    /// checkpoint does not fail the close: the worker still stops, and `SQLite` recovers
-    /// whatever the log holds at the next open. The worker drops every connection it holds,
-    /// and the last connection's close removes the log file. The wait for the write turn is
-    /// the lock wait `writing` records; each statement and each connection close is
-    /// one `db.client.operation.duration` point whose `db.operation.name` is the statement
-    /// (`PRAGMA busy_timeout`, `PRAGMA wal_checkpoint(NOOP)`, `PRAGMA
-    /// wal_checkpoint(TRUNCATE)`) or `close`.
+    /// A checkpoint syncs the database file, and on Windows a pending flush holds the
+    /// process exit: "The terminated process cannot exit until all pending I/O has been
+    /// completed or canceled" (`TerminateProcess`). The close therefore starts no sync. The
+    /// last connection's close checkpoints unless `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` is set
+    /// on it (`sqlite3PagerClose`), and the worker's connections live inside the Toasty
+    /// driver, which takes no configuration. So before the worker stops, the close opens one
+    /// connection of its own on the file with that flag set and reads the log's frames with
+    /// `PRAGMA wal_checkpoint(NOOP)`, which syncs nothing. Its read leaves it a `SHARED` lock
+    /// on the database file, which a WAL connection keeps until it closes, so no worker
+    /// connection gets the `EXCLUSIVE` lock its close checkpoint needs (`sqlite3WalClose`).
+    /// It closes last, without a checkpoint either. Every committed transaction stays in the
+    /// log, which the next open recovers.
     ///
-    /// A worker whose stop outlasts `deadline` does not fail the close either, whatever it
-    /// was running: a checkpoint that started before `deadline`, or other work that held it
-    /// when a close started past `deadline`. The stop is recorded as a `warn` event, the
-    /// worker keeps running until it finishes or the process exits, and every transaction
-    /// committed before the close is in the log the next open recovers; one still open is
-    /// rolled back there.
+    /// The close records `database closed; the write-ahead log stays for the next open` with
+    /// the frames the log held as `log`, the frames already moved as `checkpointed`, and its
+    /// `elapsed_ms`. A connection that cannot open by `deadline` is recorded at `warn`, and
+    /// the worker stops anyway; its last connection's close then checkpoints.
     ///
-    /// Only the first call checkpoints; a later one awaits the worker's stop alone.
+    /// A worker whose stop outlasts `deadline` does not fail the close, whatever it was
+    /// running: the stop is recorded as a `warn` event, the worker keeps running until it
+    /// finishes or the process exits, and every transaction committed before the close is in
+    /// the log the next open recovers; one still open is rolled back there.
+    ///
+    /// Only the first call opens the connection; a later one awaits the worker's stop alone.
     ///
     /// Each call is the operation `database.close`, component `storage`, naming its
     /// `database`: it records `operation opened` when it starts, sits in the table of
@@ -582,8 +586,8 @@ impl WorkspaceDatabase {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future during the checkpoint releases the write turn; a worker stop
-    /// already queued still completes.
+    /// Dropping the future closes the connection it opened; a worker stop already queued
+    /// still completes.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
         let database = self.name.label();
         rift_tracing::traced!(
@@ -592,12 +596,13 @@ impl WorkspaceDatabase {
             open = true,
             database = database,
             async {
-                if !self.checkpointed.swap(true, Ordering::AcqRel) {
-                    // Boxed: the checkpoint holds a write checkout, and every stop path that
-                    // awaits this future would otherwise carry it inline.
-                    Box::pin(self.checkpoint_before_close(deadline)).await;
-                }
-                match self.thread.stop(deadline).await {
+                let started = tokio::time::Instant::now();
+                let keeper = if self.checkpointed.swap(true, Ordering::AcqRel) {
+                    None
+                } else {
+                    self.log_keeper(deadline).await
+                };
+                let stopped = match self.thread.stop(deadline).await {
                     Ok(()) => Ok(()),
                     Err(ShutdownFailure::Deadline(error)) => {
                         rift_tracing::warn!(
@@ -611,74 +616,58 @@ impl WorkspaceDatabase {
                         Ok(())
                     }
                     Err(failure) => Err(self.failed(failure.into_error())),
+                };
+                if let Some(keeper) = keeper {
+                    let frames = keeper.frames;
+                    drop(keeper);
+                    rift_tracing::info!(
+                        component = "storage",
+                        operation = "database.close",
+                        database,
+                        log = frames.log,
+                        checkpointed = frames.checkpointed,
+                        elapsed_ms = elapsed_ms(started.elapsed()),
+                        "database closed; the write-ahead log stays for the next open"
+                    );
                 }
+                stopped
             }
         )
         .await
     }
 
-    /// The truncate checkpoint of [`Self::shutdown`], recorded and never failing the close.
-    async fn checkpoint_before_close(&self, deadline: tokio::time::Instant) {
+    /// The connection [`Self::shutdown`] holds while the worker stops, opened by `deadline`
+    /// on a blocking thread; `None`, recorded at `warn`, when it cannot open.
+    async fn log_keeper(&self, deadline: tokio::time::Instant) -> Option<LogKeeper> {
         let database = self.name.label();
-        let started = tokio::time::Instant::now();
-        match tokio::time::timeout_at(deadline, self.truncate_write_ahead_log()).await {
-            Ok(Ok(checkpoint)) => {
-                rift_tracing::info!(
-                    component = "storage",
-                    operation = "database.close",
-                    database,
-                    busy = checkpoint.busy,
-                    log = checkpoint.log,
-                    checkpointed = checkpoint.checkpointed,
-                    elapsed_ms = elapsed_ms(checkpoint.elapsed),
-                    "database checkpointed its write-ahead log"
-                );
-            }
-            Ok(Err(error)) => rift_tracing::warn!(
-                component = "storage",
-                operation = "database.close",
-                database,
-                %error,
-                "database checkpoint failed; the write-ahead log stays for the next open"
-            ),
-            Err(_elapsed) => {
-                rift_tracing::warn!(
-                    component = "storage",
-                    operation = "database.close",
-                    database,
-                    elapsed_ms = elapsed_ms(started.elapsed()),
-                    "database checkpoint outlasted the shutdown deadline; the write-ahead log \
-                     stays for the next open"
-                );
-            }
-        }
-    }
-
-    /// Takes the write turn and truncates the write-ahead log without waiting on another
-    /// connection's lock.
-    async fn truncate_write_ahead_log(&self) -> Result<CloseCheckpoint, RiftError> {
-        let mut access = self.writing().await?;
-        toasty::sql::query("PRAGMA busy_timeout = 0")
-            .exec(&mut access.connection)
-            .await
-            .map_err(|source| self.failed(source))?;
-        let started = tokio::time::Instant::now();
-        let mut rows = Vec::with_capacity(2);
-        for mode in ["NOOP", "TRUNCATE"] {
-            let row = toasty::sql::query(format!("PRAGMA wal_checkpoint({mode})"))
-                .column_types([Type::I64, Type::I64, Type::I64])
-                .exec(&mut access.connection)
-                .await
-                .map_err(|source| self.failed(source))?;
-            rows.push(WalCheckpoint::from_row(&row).map_err(|source| self.failed(source))?);
-        }
-        let [before, truncate] = rows[..] else {
-            return Err(self.failed(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unexpected wal_checkpoint rows: rows={rows:?}"),
-            )));
+        let path = self.path.clone();
+        let busy_timeout = Duration::from_millis(u64::from(self.pool.busy_timeout_ms()));
+        // A thread of its own, not the blocking pool: the open is bounded by `deadline`
+        // here, and a thread it leaves behind holds no runtime shutdown.
+        let (opened, opening) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name(LOG_KEEPER_THREAD_NAME.to_owned())
+            .spawn(move || {
+                let _ = opened.send(LogKeeper::open(&path, busy_timeout));
+            });
+        let error = match spawned {
+            Err(error) => error.to_string(),
+            Ok(_thread) => match tokio::time::timeout_at(deadline, opening).await {
+                Ok(Ok(Ok(keeper))) => return Some(keeper),
+                Ok(Ok(Err(error))) => error.to_string(),
+                Ok(Err(_)) => "the connection's thread ended without an answer".to_owned(),
+                Err(_elapsed) => "the connection did not open by the shutdown deadline".to_owned(),
+            },
         };
-        Ok(CloseCheckpoint::after(before, truncate, started.elapsed()))
+        rift_tracing::warn!(
+            component = "storage",
+            operation = "database.close",
+            database,
+            error,
+            "the close could not keep the write-ahead log; the last connection's close \
+             checkpoints it"
+        );
+        None
     }
 
     /// Exclusive write access to the file: the file's write turn, and a
@@ -782,6 +771,104 @@ impl WorkspaceDatabase {
 #[must_use = "dropping the value returns the slot at once"]
 pub struct HeldConnection {
     _connection: Connection,
+}
+
+/// Moves what the write-ahead log holds into the database and empties the log, as an open
+/// does where no stop deadline runs: a close leaves the log, and this open is where its
+/// checkpoint runs. Records `database checkpointed its write-ahead log` with `busy`, the
+/// frames the log held as `log`, the frames it moved as `checkpointed`, and its
+/// `elapsed_ms`, operation `database.open`; a refused checkpoint is a `warn` record and
+/// fails nothing, as the log stays readable.
+async fn checkpoint_at_open(database: &Db, name: DatabaseName, path: &Path) {
+    let label = name.label();
+    let started = tokio::time::Instant::now();
+    let checkpointed = async {
+        let mut connection = database.connection().await?;
+        let mut rows = Vec::with_capacity(2);
+        for mode in ["NOOP", "TRUNCATE"] {
+            let row = toasty::sql::query(format!("PRAGMA wal_checkpoint({mode})"))
+                .column_types([Type::I64, Type::I64, Type::I64])
+                .exec(&mut connection)
+                .await?;
+            rows.push(WalCheckpoint::from_row(&row).map_err(toasty_core::Error::from)?);
+        }
+        Ok::<_, toasty_core::Error>(rows)
+    }
+    .await;
+    match checkpointed.as_deref() {
+        Ok([before, truncate]) => {
+            let checkpoint = CloseCheckpoint::after(*before, *truncate, started.elapsed());
+            rift_tracing::info!(
+                component = "storage",
+                operation = "database.open",
+                database = label,
+                busy = checkpoint.busy,
+                log = checkpoint.log,
+                checkpointed = checkpoint.checkpointed,
+                elapsed_ms = elapsed_ms(checkpoint.elapsed),
+                "database checkpointed its write-ahead log"
+            );
+        }
+        Ok(rows) => rift_tracing::warn!(
+            component = "storage",
+            operation = "database.open",
+            database = label,
+            path = %path.display(),
+            rows = rows.len(),
+            "database checkpoint failed; the write-ahead log stays for the next open"
+        ),
+        Err(error) => rift_tracing::warn!(
+            component = "storage",
+            operation = "database.open",
+            database = label,
+            path = %path.display(),
+            %error,
+            "database checkpoint failed; the write-ahead log stays for the next open"
+        ),
+    }
+}
+
+/// The name of the thread that opens a close's own connection, [`LogKeeper`].
+const LOG_KEEPER_THREAD_NAME: &str = "rift-db-close";
+
+/// A connection of the close's own on the database file, which keeps the write-ahead log
+/// past the worker's stop: it holds a `SHARED` lock, so no worker connection's close
+/// checkpoints, and it closes without a checkpoint itself.
+struct LogKeeper {
+    _connection: rusqlite::Connection,
+    /// What the log held when the close read it.
+    frames: WalCheckpoint,
+}
+
+impl LogKeeper {
+    /// Opens an existing database file, sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, and reads
+    /// the log's frames, which opens the log and takes the `SHARED` lock.
+    fn open(path: &Path, busy_timeout: Duration) -> rusqlite::Result<Self> {
+        let connection = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        connection.busy_timeout(busy_timeout)?;
+        // The read opens the log and leaves the connection its `SHARED` lock.
+        connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let frames = connection.query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
+            Ok(WalCheckpoint {
+                busy: row.get::<_, i64>(0)? != 0,
+                log: row.get(1)?,
+                checkpointed: row.get(2)?,
+            })
+        })?;
+        Ok(Self {
+            _connection: connection,
+            frames,
+        })
+    }
 }
 
 /// The file's write turn, held with the connection that spends it.
@@ -2463,59 +2550,73 @@ mod tests {
         }
     }
 
-    /// A close checkpoints and drops every connection, so a log written past the limit
-    /// leaves no `-wal` file, for each database.
+    /// A close runs no checkpoint: the log written past the limit stays with every committed
+    /// row, and the next open's checkpoint moves it into the database and empties the log
+    /// file, for each database.
     #[tokio::test]
-    async fn a_closed_database_leaves_no_write_ahead_log() -> TestResult {
+    async fn a_close_leaves_the_write_ahead_log_and_the_next_open_empties_it() -> TestResult {
         for name in [DatabaseName::Index, DatabaseName::Vectors] {
             let directory = tempfile::tempdir()?;
             let path = name.path(directory.path());
             let database = limited_database(&path, name).await?;
             write_past_the_limit(&database).await?;
             let written = wal_bytes(&path)?.ok_or("the write leaves a write-ahead log")?;
-            assert!(
-                written > WAL_TEST_LIMIT_BYTES,
-                "the {name} write must pass the limit before the close: written={written}"
-            );
 
             database
                 .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
                 .await?;
+            drop(database);
 
             assert_eq!(
                 wal_bytes(&path)?,
-                None,
-                "a closed {name} database must leave no write-ahead log"
+                Some(written),
+                "a closed {name} database keeps its write-ahead log"
             );
+            let reopened = limited_database(&path, name).await?;
+            assert_eq!(
+                wal_bytes(&path)?,
+                Some(0),
+                "the {name} open's checkpoint empties the log"
+            );
+            let reader = rusqlite::Connection::open(&path)?;
+            let rows: i64 =
+                reader.query_row("SELECT COUNT(*) FROM wal_scratch", [], |row| row.get(0))?;
+            assert_eq!(
+                rows, WAL_TEST_ROWS,
+                "the {name} open reads every committed row"
+            );
+            drop(reader);
+            reopened
+                .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await?;
         }
         Ok(())
     }
 
-    /// With another connection still open on the file, the log outlives the close but the
-    /// truncate checkpoint leaves it empty.
+    /// With another connection open on the file, the close leaves the log to it, and it
+    /// still reads every committed row.
     #[tokio::test]
-    async fn a_close_beside_another_connection_leaves_an_empty_write_ahead_log() -> TestResult {
+    async fn a_close_beside_another_connection_keeps_every_row_readable() -> TestResult {
         for name in [DatabaseName::Index, DatabaseName::Vectors] {
             let directory = tempfile::tempdir()?;
             let path = name.path(directory.path());
             let database = limited_database(&path, name).await?;
             write_past_the_limit(&database).await?;
             let other = rusqlite::Connection::open(&path)?;
-            let rows: i64 =
-                other.query_row("SELECT COUNT(*) FROM wal_scratch", [], |row| row.get(0))?;
-            assert_eq!(
-                rows, WAL_TEST_ROWS,
-                "the other connection reads the committed rows"
-            );
 
             database
                 .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
                 .await?;
 
+            let rows: i64 =
+                other.query_row("SELECT COUNT(*) FROM wal_scratch", [], |row| row.get(0))?;
             assert_eq!(
-                wal_bytes(&path)?,
-                Some(0),
-                "the checkpoint must empty the {name} write-ahead log the other connection keeps"
+                rows, WAL_TEST_ROWS,
+                "the other connection reads the {name} rows"
+            );
+            assert!(
+                wal_bytes(&path)?.is_some_and(|bytes| bytes > 0),
+                "the {name} log stays"
             );
             drop(other);
         }
@@ -2577,11 +2678,10 @@ mod tests {
         Ok(())
     }
 
-    /// A checkpoint whose write connection the held pool refuses records the failure and
-    /// still stops the worker: the close answers without an error.
+    /// A close takes no pool connection, so a pool whose every slot is held does not keep
+    /// it from closing and recording what the log holds.
     #[tokio::test]
-    async fn a_checkpoint_the_held_pool_refuses_records_the_failure_and_still_closes() -> TestResult
-    {
+    async fn a_close_beside_a_held_pool_still_closes_and_records_the_log() -> TestResult {
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
@@ -2594,29 +2694,15 @@ mod tests {
         drop(held);
         drop(recorder);
 
-        let closes: Vec<rift_tracing::LogRecord> = drain
-            .queued_records()
-            .into_iter()
-            .filter(|record| record.message().starts_with("database checkpoint"))
-            .collect();
+        let closes = close_records(&drain.queued_records())?;
         let messages: Vec<&str> = closes
             .iter()
-            .map(rift_tracing::LogRecord::message)
+            .map(|(_, message, _)| message.as_str())
             .collect();
         assert_eq!(
             messages,
-            ["database checkpoint failed; the write-ahead log stays for the next open"],
-            "the refused checkpoint records one failure and no checkpointed row"
-        );
-        assert_eq!(closes[0].level(), "warn");
-        let fields = closes[0].fields();
-        assert!(
-            fields.contains("waiting for a slot"),
-            "the record names the refusal: {fields}"
-        );
-        assert!(
-            fields.contains("on the index database at"),
-            "the refusal names its database: {fields}"
+            ["database closed; the write-ahead log stays for the next open"],
+            "{closes:?}"
         );
         Ok(())
     }
@@ -2645,11 +2731,10 @@ mod tests {
             .collect()
     }
 
-    /// The close checkpoint records the frames the log held before it ran, the frames it
-    /// moved, and how long it ran: a truncate's own row reads zero for both once the log
-    /// is empty.
+    /// The close records the frames the log held, the frames already moved, and how long
+    /// it ran; the written frames stay unmoved.
     #[tokio::test]
-    async fn the_close_checkpoint_records_the_frames_it_moved_and_its_time() -> TestResult {
+    async fn the_close_records_the_frames_it_leaves_and_its_time() -> TestResult {
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let path = DatabaseName::Index.path(directory.path());
@@ -2666,21 +2751,19 @@ mod tests {
             return Err(format!("one close record: {closes:?}").into());
         };
         assert_eq!(level, "info");
-        assert_eq!(message, "database checkpointed its write-ahead log");
+        assert_eq!(
+            message,
+            "database closed; the write-ahead log stays for the next open"
+        );
         // The recorder keeps every field value as text.
         let count = |name: &str| {
             fields[name]
                 .as_str()
                 .and_then(|value| value.parse::<u64>().ok())
         };
-        assert_eq!(fields["busy"], "false", "{fields}");
         let log = count("log").ok_or("log is a count")?;
-        assert!(log > 0, "the log held the written frames: {fields}");
-        assert_eq!(
-            count("checkpointed"),
-            Some(log),
-            "every frame moved: {fields}"
-        );
+        let moved = count("checkpointed").ok_or("checkpointed is a count")?;
+        assert!(log > moved, "the written frames stay in the log: {fields}");
         assert!(count("elapsed_ms").is_some(), "{fields}");
         Ok(())
     }
@@ -2724,10 +2807,11 @@ mod tests {
         Ok(())
     }
 
-    /// The close records each statement it runs, and each connection the worker closes,
-    /// as a `db.client.operation.duration` point named for it.
+    /// The open's checkpoint statements and each connection the worker closes at the stop
+    /// are `db.client.operation.duration` points named for them, and the truncate
+    /// checkpoint runs once, at the open.
     #[tokio::test]
-    async fn the_close_records_each_statement_it_runs() -> TestResult {
+    async fn the_open_checkpoint_and_the_close_record_each_statement() -> TestResult {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let path = DatabaseName::Index.path(directory.path());
@@ -2762,7 +2846,11 @@ mod tests {
             ("db.operation.name", "PRAGMA wal_checkpoint(TRUNCATE)"),
         ];
         let queued = series(&metrics, "sqlite.queue.wait.duration", &truncate)?;
-        assert_eq!(observations(queued), 1, "one truncate checkpoint");
+        assert_eq!(
+            observations(queued),
+            1,
+            "one truncate checkpoint, the open's"
+        );
         Ok(())
     }
 
@@ -2781,12 +2869,11 @@ mod tests {
         Ok(copied)
     }
 
-    /// A close checkpoint that started before its deadline and outlasts it, behind a held
-    /// worker, does not fail the close: the checkpoint and the worker's stop are recorded at
-    /// `warn`, and the files the running worker leaves recover every committed row from
-    /// the log at the next open.
+    /// A close behind a held worker does not fail: the worker's stop is recorded at `warn`,
+    /// the close's record follows, and the files the running worker leaves recover every
+    /// committed row from the log at the next open.
     #[tokio::test]
-    async fn a_checkpoint_past_the_deadline_closes_and_the_next_open_recovers_the_log() -> TestResult
+    async fn a_close_behind_a_held_worker_closes_and_the_next_open_recovers_the_log() -> TestResult
     {
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
@@ -2795,17 +2882,13 @@ mod tests {
         write_past_the_limit(&database).await?;
         let (holding, release) = database.thread.hold_for_test().await?;
         holding.await?;
-        // The held worker answers nothing, so the paused clock reaches the deadline the
-        // moment the checkpoint waits on it.
-        tokio::time::pause();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
 
         database.shutdown(deadline).await?;
 
         let copies = tempfile::tempdir()?;
         let left = copy_left_files(&path, copies.path())?;
         release.send(()).map_err(|()| "the held worker resumes")?;
-        tokio::time::resume();
         database
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
             .await?;
@@ -2821,30 +2904,21 @@ mod tests {
             [
                 (
                     "warn",
-                    "database checkpoint outlasted the shutdown deadline; the write-ahead log \
-                     stays for the next open"
-                ),
-                (
-                    "warn",
                     "SQLite worker outlasted the shutdown deadline; the write-ahead log stays \
                      for the next open"
+                ),
+                (
+                    "info",
+                    "database closed; the write-ahead log stays for the next open"
                 ),
             ]
         );
         assert!(
-            closes[0].2["elapsed_ms"]
-                .as_str()
-                .and_then(|elapsed| elapsed.parse::<u64>().ok())
-                .is_some_and(|elapsed| elapsed >= 5_000),
-            "the checkpoint ran until the deadline: {:?}",
-            closes[0].2
-        );
-        assert!(
-            closes[1].2["error"]
+            closes[0].2["error"]
                 .as_str()
                 .is_some_and(|error| error.contains("exceeded deadline")),
             "{:?}",
-            closes[1].2
+            closes[0].2
         );
         let main_alone = copies.path().join("main-alone");
         std::fs::copy(&left, &main_alone)?;
@@ -2972,7 +3046,7 @@ mod tests {
             "metrics" => {
                 index.shutdown(closed).await?;
                 vectors.shutdown(closed).await?;
-                let (holding, release) = metrics.hold_next_checkpoint();
+                let (holding, release) = metrics.hold_next_close();
                 let short = tokio::time::Instant::now() + Duration::from_millis(50);
                 let (close, holding) = tokio::join!(metrics.close(short), holding);
                 holding?;

@@ -297,7 +297,7 @@ impl DeferredDatabaseShutdown {
 /// and, for a failure, the error and its causes, so a stop that leaves with a failure
 /// names the stage that returned it. The outcome is `ok` for a stage that succeeded inside
 /// `deadline`, `timeout` at `warn` for one that succeeded with nothing of it left, such as
-/// a database close whose checkpoint outlasted it, and `error` at `warn` for a failure;
+/// a database close whose thread outlasted it, and `error` at `warn` for a failure;
 /// only a failure reaches the caller as an error. The span records its opening too, so a
 /// stage the process never finishes still names itself, and the stage the deadline
 /// expired in publishes the table of operations in flight with the reason `stop deadline`.
@@ -419,11 +419,10 @@ pub(crate) async fn close_logs(
                         component = "storage",
                         operation = "database.close",
                         database = "metrics",
-                        busy = checkpoint.is_busy(),
                         log = checkpoint.log(),
                         checkpointed = checkpoint.checkpointed(),
                         elapsed_ms = elapsed_ms(checkpoint.elapsed()),
-                        "database checkpointed its write-ahead log"
+                        "database closed; the write-ahead log stays for the next open"
                     ),
                     rift_tracing::StoreClose::Timeout { stage, elapsed } => {
                         rift_tracing::warn!(
@@ -432,7 +431,7 @@ pub(crate) async fn close_logs(
                             database = "metrics",
                             stage,
                             elapsed_ms = elapsed_ms(elapsed),
-                            "database checkpoint outlasted the shutdown deadline; the \
+                            "database close outlasted the shutdown deadline; the \
                                  write-ahead log stays for the next open"
                         );
                     }
@@ -528,7 +527,7 @@ impl HttpServer {
     /// saturating at zero, so a `reserve` at or past `budget` leaves these stages nothing
     /// and never moves the bound before the stop began. A supervisor still running at
     /// that bound is aborted, and its stage ends with the outcome `timeout` and the table
-    /// of operations in flight, the form a close checkpoint that outlasts its bound uses.
+    /// of operations in flight, the form a close whose thread outlasts its bound uses.
     #[doc(hidden)]
     pub async fn stopped_before_database(
         self,
@@ -1368,21 +1367,21 @@ mod tests {
         );
     }
 
-    /// A metrics close whose checkpoint outlasts the stop's deadline ends its stage with
-    /// the outcome `timeout` and no error, so the stop's exit status stays clean, and
-    /// records the close at `warn` with the stage it was in.
+    /// A metrics close held past the stop's deadline ends its stage with the outcome
+    /// `timeout` and no error, so the stop's exit status stays clean, and records the
+    /// close at `warn` with the stage it was in.
     #[tokio::test]
-    async fn a_metrics_checkpoint_past_the_stop_deadline_ends_its_stage_without_an_error()
+    async fn a_metrics_close_past_the_stop_deadline_ends_its_stage_without_an_error()
     -> Result<(), Box<dyn std::error::Error>> {
         const BUDGET: Duration = Duration::from_secs(4);
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let store = rift_tracing::LogStore::open(&directory.path().join("metrics"), None).await?;
-        let (holding, release) = store.hold_next_checkpoint();
+        let (holding, release) = store.hold_next_close();
         let deadline = Instant::now() + BUDGET;
 
         // The held writer answers nothing, so the paused clock reaches the deadline only
-        // once the close waits inside the checkpoint.
+        // once the close waits inside its close stage.
         let (closed, held) = tokio::join!(super::close_logs(Some(&store), deadline), async {
             let held = holding.await;
             tokio::time::pause();
@@ -1408,18 +1407,18 @@ mod tests {
             .iter()
             .find(|record| {
                 record.operation() == "database.close"
-                    && record.message().starts_with("database checkpoint")
+                    && record.message().starts_with("database close outlasted")
             })
             .ok_or("the close was recorded")?;
         assert_eq!(close.level(), "warn");
         assert_eq!(
             close.message(),
-            "database checkpoint outlasted the shutdown deadline; the write-ahead log stays \
-             for the next open"
+            "database close outlasted the shutdown deadline; the write-ahead log stays for \
+             the next open"
         );
         let close: serde_json::Value = serde_json::from_str(close.fields())?;
         assert_eq!(close["database"], "metrics", "{close}");
-        assert_eq!(close["stage"], "checkpoint", "{close}");
+        assert_eq!(close["stage"], "close", "{close}");
         assert!(close.get("elapsed_ms").is_some(), "{close}");
         Ok(())
     }
@@ -2106,7 +2105,7 @@ mod tests {
             .iter()
             .find(|record| {
                 record.operation() == "database.close"
-                    && record.message().starts_with("database checkpoint")
+                    && record.message().starts_with("database close outlasted")
             })
             .ok_or("the close was recorded")?;
         assert_eq!(close.level(), "warn");
@@ -2308,13 +2307,12 @@ mod tests {
 
     /// A stop failure of the index database lands in the metrics database: another
     /// connection holds the write lock on `.rift/index` while a lexical write waits on it
-    /// past the index close, so the close's checkpoint and worker stop outlast their
-    /// deadline, and the drain's final flush writes their `database.close` records to
-    /// `.rift/metrics`.
+    /// past the index close, so the worker's stop outlasts its deadline, and the drain's
+    /// final flush writes its `database.close` records to `.rift/metrics`.
     ///
     /// The close starts only once the lexical write holds the write turn: its
     /// `lexical.write_turn` span has ended, so its transaction start is waiting on the
-    /// held lock, and the checkpoint cannot take the turn before that lock is released.
+    /// held lock, and the worker cannot stop before that lock is released.
     #[tokio::test]
     async fn an_index_close_behind_a_held_write_lock_is_recorded_in_the_metrics_database()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2403,7 +2401,7 @@ mod tests {
         let outlasted = closes
             .iter()
             .find(|(_, message, _)| {
-                message.starts_with("database checkpoint outlasted the shutdown deadline")
+                message.starts_with("SQLite worker outlasted the shutdown deadline")
             })
             .ok_or_else(|| format!("the metrics database holds the index close: {closes:?}"))?;
         assert_eq!(outlasted.0, "warn");

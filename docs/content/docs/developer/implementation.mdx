@@ -209,8 +209,9 @@ stop begins, and each stage takes only what the one before it left:
 
 On Windows, a process does not end while one of its threads has pending I/O: "The terminated
 process cannot exit until all pending I/O has been completed or canceled" (`TerminateProcess`).
-A database thread still inside its close checkpoint's file flush keeps the process alive past the
-`process exits` record until that flush returns.
+A checkpoint syncs the database file, and on a slow disk that flush took up to 3.3 s against the
+4 s stop, so no stop closes a database with a checkpoint: a flush that started would hold the exit
+past the bound. The checkpoint runs at the next open instead, where no stop deadline runs.
 
 A foreground repository server opens no metrics database of its own; its log drain routes each
 record to the consumer of the workspace the record names. Each workspace stops inside the serving
@@ -245,10 +246,9 @@ After the kill the probe waits at most 200 ms for the child's output pipes to cl
 child runs inside a Job object of its own, so the kill ends every process the child started. On
 Unix a process the child started can keep the pipes open, and the probe stops waiting on it.
 
-A database close runs a checkpoint, and the checkpoint's file syncs can take longer than the
-close's bound. Such a close ends its stage with `timeout`: the thread running the checkpoint keeps running until
-it finishes or the process exits, and the next open recovers every committed transaction from the
-write-ahead log. A metrics close ends with `timeout` whatever stage its bound passed in, a close
+A database close runs no checkpoint and syncs no file; the write-ahead log keeps every committed
+transaction for the next open. A close whose thread outlasts its bound ends its stage with
+`timeout`: the thread keeps running until it finishes or the process exits. A metrics close ends with `timeout` whatever stage its bound passed in, a close
 still queued behind an earlier write included. An index or vectors close that started past its
 bound ends with `timeout` too when the worker it finds still running outlasts it; a transaction
 that worker left open is rolled back at the next open. An index supervisor still running at its
@@ -610,22 +610,34 @@ is zero on the vectors database, and `journal_size_limit` comes from
 
 Each close is the operation `database.close`, component `storage`, naming its `database`: it
 records `operation opened` when it starts, sits in the table of operations in flight while it
-runs, and its close record carries `elapsed_ms` and the outcome. The close's wait for the write
-turn is the lock wait every writer records.
+runs, and its close record carries `elapsed_ms` and the outcome.
 
-At close, `WorkspaceDatabase::shutdown` takes the write turn, sets the busy timeout of its write
-connection to zero, reads the frames the log holds with `PRAGMA wal_checkpoint(NOOP)`, and runs
-`PRAGMA wal_checkpoint(TRUNCATE)`. A truncate that succeeds reads zero frames from the log it
-emptied, so the `database.close` record takes `log` from the NOOP row, derives `checkpointed` from
-both rows, and adds `busy` and `elapsed_ms`. Then the worker drops its connections, and the last
-connection's close removes the write-ahead log.
+A close runs no checkpoint. SQLite's last connection checkpoints when it closes, unless
+`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` is set on it, and the index worker's connections live inside
+the Toasty driver, which takes no configuration. So `WorkspaceDatabase::shutdown` first opens one
+connection of its own on the file, on the `rift-db-close` thread, with that flag set, and reads
+the log's frames with `PRAGMA wal_checkpoint(NOOP)`, which syncs nothing. A WAL connection keeps
+a `SHARED` lock on the database file while it is open, so no worker connection gets the
+`EXCLUSIVE` lock its close checkpoint needs; the close's own connection closes last, without a
+checkpoint. The close then records `database closed; the write-ahead log stays for the next
+open` with the frames the log held as `log`, the frames an earlier checkpoint had moved as
+`checkpointed`, and `elapsed_ms`. A worker whose stop outlasts the deadline is a `warn` record
+with operation `database.close` and fails nothing. The metrics writer thread sets the same flag on
+its connection and closes it after reading the frames, and the stop records the same message, or,
+past the deadline, `database close outlasted the shutdown deadline; the write-ahead log stays for
+the next open` at `warn`, naming the close `stage`, `queued` or `close`, and its `elapsed_ms`.
 
-A turn not free by the deadline, a busy answer, or a refused checkpoint does not fail the close:
-SQLite recovers whatever the log holds at the next open. A checkpoint that outlasts the deadline
-keeps the worker busy, and the worker's stop past the deadline is a second `warn` record with
-operation `database.close`. The metrics writer thread runs the same checkpoint when it closes, and
-the stop records its row as a `database.close` record too, or, past the deadline, a `warn` record
-naming the close `stage` the thread was in and its `elapsed_ms`.
+Every open runs `PRAGMA wal_checkpoint(TRUNCATE)` after its migrations, where no stop deadline
+runs: SQLite reads the log the last process left ("the WAL file might be retained on disk after
+all connections to the database have been closed"), and the checkpoint moves it into the
+database and empties the file. The index and vectors open records `database checkpointed its
+write-ahead log` with operation `database.open`. Between opens the log stays bounded by SQLite's
+automatic checkpoint, "when the WAL file reaches a threshold size of 1000 pages", and is cut back
+to `journal_size_limit` (`[search]` for the index and vectors databases,
+`METRICS_JOURNAL_SIZE_LIMIT_BYTES`, 4 MiB, for the metrics database) at the commit that restarts
+it. Under `synchronous = NORMAL` "no sync operations occur during most transactions", so a
+commit the close leaves in the log survives a process exit and can roll back after a power loss,
+as any commit since the last checkpoint can.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.
@@ -907,13 +919,14 @@ Each `.rift/index` and `.rift/vectors` operation records `db.client.operation.du
 `error.type` `_OTHER` and the SQLite primary result code as `db.response.status_code`, such as
 `5` for busy. A raw statement that starts with `PRAGMA busy_timeout`, `PRAGMA
 wal_checkpoint(NOOP)`, or `PRAGMA wal_checkpoint(TRUNCATE)` records that text as its
-`db.operation.name`, and each connection the worker closes at its stop records `close`. A
+`db.operation.name`, the open's checkpoint among them, and each connection the worker closes at
+its stop records `close`. A
 transaction records `sqlite.transaction.duration` by `sqlite.transaction.result`,
 `commit` or `rollback`, and `sqlite.transaction.statement.count`. Each append to `.rift/metrics`
 records `sqlite.queue.wait.duration`, `sqlite.write_lock.wait.duration`,
 `sqlite.transaction.duration`, and `sqlite.commit.duration` under `db.namespace` `metrics`. Its
-close records `PRAGMA busy_timeout`, both checkpoints, and `close` in
-`db.client.operation.duration`, as the index close does.
+open records `PRAGMA wal_checkpoint(TRUNCATE)` and its close `PRAGMA wal_checkpoint(NOOP)` and
+`close` in `db.client.operation.duration`.
 
 The index supervisor counts `index.rebuilds` by `index.rebuild.trigger`: `startup` for the
 preparation at start, `filesystem` for a rebuild that reads the paths its observation names,

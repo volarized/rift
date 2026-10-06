@@ -334,7 +334,7 @@ mod tests {
 
     /// The election outlasts every database thread of elected storage: with the index and
     /// vectors databases closed and every guard handle dropped, the metrics writer held in
-    /// its close checkpoint keeps the election, and a claim succeeds once it is released.
+    /// its close keeps the election, and a claim succeeds once it is released.
     #[tokio::test]
     async fn the_election_outlasts_a_held_metrics_writer() {
         const STEP_MAX: std::time::Duration = std::time::Duration::from_secs(10);
@@ -356,7 +356,7 @@ mod tests {
         let closed = tokio::time::Instant::now() + STEP_MAX;
         index.shutdown(closed).await.expect("the index closes");
         vectors.shutdown(closed).await.expect("the vectors close");
-        let (holding, release) = logs.hold_next_checkpoint();
+        let (holding, release) = logs.hold_next_close();
         let short = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
         let (close, holding) = tokio::join!(logs.close(short), holding);
         holding.expect("the writer holds its checkpoint");

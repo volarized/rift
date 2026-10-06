@@ -701,8 +701,9 @@ impl RepositoryWorkspaceRegistry {
 /// [`WORKSPACE_DATABASE_STOP_RESERVE`] before `deadline`; the index closes after the
 /// supervisor, since the supervisor writes it. The log consumer's final flush follows, by
 /// [`WORKSPACE_DATABASE_STOP_RESERVE`] before `deadline`, writing the records of those
-/// closes; the metrics database closes last, by `deadline`. An index checkpoint that runs
-/// to its own bound leaves the flush and the metrics close their reserves.
+/// closes; the metrics database closes last, by `deadline`. No close runs a checkpoint, so
+/// each costs its connection's close; an index worker held past its own bound leaves the
+/// flush and the metrics close their reserves.
 async fn stop_repository_workspace(
     workspace: &RepositoryWorkspace,
     deadline: Instant,

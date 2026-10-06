@@ -653,43 +653,56 @@ async fn a_failed_open_releases_its_owner() -> TestResult {
     Ok(())
 }
 
+/// A close runs no checkpoint: the write-ahead log keeps the committed frames, and the
+/// next open moves them into the database and empties the log, with every record readable.
 #[tokio::test]
-async fn a_close_removes_the_write_ahead_log() -> TestResult {
+async fn a_close_leaves_the_write_ahead_log_for_the_next_open() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     store.append(&[record("written")], KEEP_EVERY).await?;
-    assert!(
-        wal_path(store.path()).exists(),
-        "an open WAL database keeps its log"
-    );
 
     let checkpoint = closed(&store).await?;
 
-    assert!(!checkpoint.is_busy());
     assert!(
-        checkpoint.log() > 0,
-        "the checkpoint reads the frames the log held before it emptied it: {checkpoint:?}"
+        checkpoint.log() > checkpoint.checkpointed(),
+        "the close leaves unmoved frames in the log: {checkpoint:?}"
     );
-    assert_eq!(checkpoint.log(), checkpoint.checkpointed());
+    let left = std::fs::metadata(wal_path(store.path()))?.len();
     assert!(
-        !wal_path(store.path()).exists(),
-        "the last connection's close deletes the WAL file"
+        left > 0,
+        "the close keeps the write-ahead log: {left} bytes"
     );
+    let path = store.path().to_path_buf();
+    drop(store);
+
+    let reopened = LogStore::open(&path, None).await?;
+    assert_eq!(
+        std::fs::metadata(wal_path(&path))?.len(),
+        0,
+        "the open's checkpoint empties the log"
+    );
+    assert_eq!(
+        reads(&reopened)?.count()?,
+        1,
+        "the next open reads every record"
+    );
+    closed(&reopened).await?;
     Ok(())
 }
 
+/// A close beside another connection leaves the log to that connection, which still reads
+/// every committed record.
 #[tokio::test]
-async fn a_close_beside_another_connection_leaves_an_empty_write_ahead_log() -> TestResult {
+async fn a_close_beside_another_connection_keeps_its_records_readable() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = store(&directory).await?;
     store.append(&[record("written")], KEEP_EVERY).await?;
     let other = reads(&store)?;
+
+    closed(&store).await?;
+
     assert_eq!(other.count()?, 1);
-
-    let checkpoint = closed(&store).await?;
-
-    assert!(!checkpoint.is_busy());
-    assert_eq!(std::fs::metadata(wal_path(store.path()))?.len(), 0);
+    assert!(wal_path(store.path()).exists());
     drop(other);
     Ok(())
 }
@@ -777,12 +790,11 @@ fn copy_left_files(path: &Path, into: &Path) -> Result<PathBuf, Box<dyn std::err
     Ok(copied)
 }
 
-/// A close whose checkpoint outlasts its deadline answers a timeout naming the stage, and
+/// A close the thread is held inside past its deadline answers a timeout naming the stage, and
 /// the files the running writer thread leaves recover every committed record from the log
 /// at the next open. The thread keeps its owner until it finishes.
 #[tokio::test]
-async fn a_checkpoint_past_the_close_deadline_times_out_and_the_next_open_recovers_the_log()
--> TestResult {
+async fn a_close_past_its_deadline_times_out_and_the_next_open_recovers_the_log() -> TestResult {
     let directory = tempfile::tempdir()?;
     let (owner, released) = release_probe();
     let weak = Arc::downgrade(&owner);
@@ -791,11 +803,11 @@ async fn a_checkpoint_past_the_close_deadline_times_out_and_the_next_open_recove
         .map(|index| record(&format!("committed {index}")))
         .collect();
     store.append(&written, KEEP_EVERY).await?;
-    let (holding, release) = store.hold_next_checkpoint();
+    let (holding, release) = store.hold_next_close();
     let deadline = Instant::now() + THREAD_WAIT_MAX;
 
     // The held thread answers nothing, so the paused clock reaches the deadline only once
-    // the close waits inside the checkpoint.
+    // the close waits inside its close stage.
     let (answer, held) = tokio::join!(store.close(deadline), async {
         let held = holding.await;
         tokio::time::pause();
@@ -805,10 +817,10 @@ async fn a_checkpoint_past_the_close_deadline_times_out_and_the_next_open_recove
 
     held?;
     let StoreClose::Timeout { stage, elapsed } = answer? else {
-        return Err("a held checkpoint outlasts the deadline".into());
+        return Err("a held close outlasts the deadline".into());
     };
     // The thread's stage times run on the monotonic clock the paused clock does not move.
-    assert_eq!(stage, "checkpoint", "{elapsed:?}");
+    assert_eq!(stage, "close", "{elapsed:?}");
     assert!(
         weak.upgrade().is_some(),
         "the held thread keeps its owner past the deadline"
@@ -817,12 +829,14 @@ async fn a_checkpoint_past_the_close_deadline_times_out_and_the_next_open_recove
     let left = copy_left_files(store.path(), copies.path())?;
     let main_alone = copies.path().join("main-alone");
     std::fs::copy(&left, &main_alone)?;
-    let tables: i64 = rusqlite::Connection::open(&main_alone)?.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'log_records'",
+    // The open's checkpoint moved the schema into the database file; the records written
+    // after it live in the log alone.
+    let rows: i64 = rusqlite::Connection::open(&main_alone)?.query_row(
+        "SELECT COUNT(*) FROM log_records",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(tables, 0, "the committed records live in the log alone");
+    assert_eq!(rows, 0, "the committed records live in the log alone");
     let recovered = rusqlite::Connection::open(&left)?;
     let mut messages = recovered.prepare("SELECT message FROM log_records ORDER BY id")?;
     let messages = messages
@@ -962,10 +976,10 @@ async fn the_close_records_each_statement_it_runs() -> TestResult {
     closed(&store).await?;
     let metrics = recorder.metrics();
 
+    // The open runs the truncate checkpoint; the close reads the frames and closes.
     for statement in [
-        "PRAGMA busy_timeout",
-        "PRAGMA wal_checkpoint(NOOP)",
         "PRAGMA wal_checkpoint(TRUNCATE)",
+        "PRAGMA wal_checkpoint(NOOP)",
         "close",
     ] {
         let labels = [

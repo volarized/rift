@@ -1578,9 +1578,9 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
 const HELD_INDEX_BUSY_TIMEOUT: &str = "30s";
 
 /// A server whose index write waits on a lock another process holds is stopped: the
-/// write keeps the database's write turn and its SQLite worker, so the index close's
-/// checkpoint and the worker's stop both outlast their bound. The stop still exits 0,
-/// ends the `SQLite worker shutdown` stage `timeout` with the checkpoint named, and
+/// write keeps its SQLite worker, so the worker's stop outlasts its bound; the close runs no
+/// checkpoint. The stop still exits 0, ends the `SQLite worker shutdown` stage `timeout`
+/// with the held worker named, and
 /// retires `server.json` before the process leaves, while the held worker keeps the
 /// election until the process exits.
 #[test]
@@ -1650,8 +1650,9 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
         .ok_or_else(|| format!("the SQLite worker stage ended with a record: {stderr}"))?;
     assert!(worker_stage.contains("outcome=timeout"), "{worker_stage}");
     assert!(
-        stderr.contains("database checkpoint outlasted the shutdown deadline"),
-        "the outlasted checkpoint is named: {stderr}"
+        stderr.contains("SQLite worker outlasted the shutdown deadline")
+            && stderr.contains("database closed; the write-ahead log stays for the next open"),
+        "the held worker and the close without a checkpoint are named: {stderr}"
     );
     // The held writer still waits inside SQLite's busy handler when the process leaves:
     // a thread blocked in user space does not hold the exit, and the exit is the stop's

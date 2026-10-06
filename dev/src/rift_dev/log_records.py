@@ -26,6 +26,8 @@ from datetime import datetime
 from typing import NamedTuple, TypedDict
 
 CHECKPOINTED = "database checkpointed its write-ahead log"
+# The record a close writes: it runs no checkpoint and names what the log held.
+CLOSED = "database closed; the write-ahead log stays for the next open"
 STAGE_ENDED = "stop stage ended"
 IN_FLIGHT = "operations in flight"
 STALL_REPORT = "operations in flight past the stall delay"
@@ -245,8 +247,9 @@ def database_closes(records: Iterable[Line]) -> list[Entry]:
         # are not close outcomes.
         if record.closes() or record.is_message(OPERATION_OPENED):
             continue
-        if record.is_message(CHECKPOINTED):
-            values = record.fields(CHECKPOINTED)
+        closed = record.is_message(CLOSED)
+        if closed or record.is_message(CHECKPOINTED):
+            values = record.fields(CLOSED if closed else CHECKPOINTED)
             found.append(
                 {
                     "database": number_or_text(values.get("database")),

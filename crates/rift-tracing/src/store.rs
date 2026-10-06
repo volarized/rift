@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use rift_error::{RiftError, errors};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
@@ -41,17 +42,14 @@ const WRITER_THREAD_NAME: &str = "rift-db-metrics";
 /// Commands the writer's queue holds while the thread runs one.
 const WRITER_QUEUE_COMMANDS: usize = 1;
 /// The stages one close runs through, in order: the command waits in the writer's queue,
-/// then the thread clears the busy timeout, checkpoints the write-ahead log, and closes
-/// the connection. Each thread stage carries the operation its failure names.
-const CLOSE_STAGES: [&str; 4] = ["queued", "clear the busy timeout", "checkpoint", "close"];
+/// then the thread reads the log's frames and closes the connection without a checkpoint.
+/// The thread stage carries the operation its failure names.
+const CLOSE_STAGES: [&str; 2] = ["queued", "close"];
 /// [`CLOSE_STAGES`] index of the command waiting in the queue.
 const CLOSE_QUEUED: usize = 0;
-/// [`CLOSE_STAGES`] index of the busy timeout's clearing.
-const CLOSE_CLEAR_BUSY_TIMEOUT: usize = 1;
-/// [`CLOSE_STAGES`] index of `PRAGMA wal_checkpoint(TRUNCATE)`.
-const CLOSE_CHECKPOINT: usize = 2;
-/// [`CLOSE_STAGES`] index of the connection's close.
-const CLOSE_CONNECTION: usize = 3;
+/// [`CLOSE_STAGES`] index of the connection's close: the read of the log's frames, then
+/// the close itself.
+const CLOSE_CONNECTION: usize = 1;
 
 /// The `db.namespace` every signal of the metrics database carries.
 const DB_NAMESPACE: &str = "metrics";
@@ -159,16 +157,14 @@ fn retry_busy(count: i32) -> bool {
 
 /// The `db.system.name` of the metrics database.
 const DB_SYSTEM: &str = "sqlite";
-/// The close statement that clears the busy handler, so the checkpoint never waits on
-/// another connection's lock. `SQLite` evaluates `PRAGMA busy_timeout = N` as
-/// `sqlite3_busy_timeout(db, N)`, and a timeout of zero clears every busy handler.
-const BUSY_TIMEOUT_STATEMENT: &str = "PRAGMA busy_timeout";
-/// The close checkpoint that reads the frames the log holds and moves none.
+/// The close statement that reads the frames the log holds: it takes no lock, moves
+/// nothing, and syncs no file.
 const CHECKPOINT_NOOP: &str = "PRAGMA wal_checkpoint(NOOP)";
-/// The close checkpoint that moves every frame and empties the log file.
+/// The checkpoint an open runs, which moves every frame and empties the log file.
 const CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
-/// The `db.operation.name` of the connection's close: the last connection's close
-/// checkpoints and removes the write-ahead log.
+/// The `db.operation.name` of the connection's close. The close runs no checkpoint: the
+/// connection sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` first, so the write-ahead log stays
+/// for the next open.
 const CONNECTION_CLOSE: &str = "close";
 
 /// Runs one close step named `statement` and records its duration in
@@ -248,16 +244,14 @@ const INSERT_RECORD: &str = "INSERT INTO log_records
 /// `retention_records` rows are exactly those above it.
 const TRIM_RECORDS: &str = "DELETE FROM log_records WHERE id <= ?1";
 
-/// What the close checkpoint did: whether it met a busy lock, the frames the write-ahead
-/// log held, the frames it moved into the database, and how long it ran.
+/// What a close left in the write-ahead log, read with `PRAGMA wal_checkpoint(NOOP)` before
+/// the connection closed: the frames the log held, the frames an earlier checkpoint had
+/// already moved into the database, and how long the close ran.
 ///
-/// A truncate checkpoint that succeeds answers zero frames held and zero moved, because it
-/// reads both after it emptied the log. The close therefore reads the frames first with
-/// `PRAGMA wal_checkpoint(NOOP)`, which takes no lock and moves nothing, and derives the
-/// frames moved from the two rows.
+/// The close runs no checkpoint, so the frames past `checkpointed` stay in the log and the
+/// next open's checkpoint moves them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalCheckpoint {
-    busy: bool,
     log: i64,
     checkpointed: i64,
     elapsed: Duration,
@@ -283,44 +277,19 @@ impl CheckpointRow {
 }
 
 impl WalCheckpoint {
-    /// The checkpoint `truncate` answered, read against the `before` row of the NOOP
-    /// checkpoint that preceded it, after running for `elapsed`.
-    ///
-    /// A truncate that met no busy lock moved every frame the log held and had not yet
-    /// moved; a busy one moved what its own count of moved frames adds to the earlier one.
-    fn after(before: CheckpointRow, truncate: CheckpointRow, elapsed: Duration) -> Self {
-        let moved = if truncate.busy {
-            truncate.checkpointed - before.checkpointed
-        } else {
-            before.log - before.checkpointed
-        };
-        Self {
-            busy: truncate.busy,
-            log: before.log,
-            checkpointed: moved.max(0),
-            elapsed,
-        }
-    }
-
-    /// Whether the checkpoint met another connection's lock and stopped short.
-    #[must_use]
-    pub const fn is_busy(&self) -> bool {
-        self.busy
-    }
-
-    /// Frames the write-ahead log held when the checkpoint ran.
+    /// Frames the write-ahead log held at the close.
     #[must_use]
     pub const fn log(&self) -> i64 {
         self.log
     }
 
-    /// Frames the checkpoint moved into the database.
+    /// Frames an earlier checkpoint had already moved into the database.
     #[must_use]
     pub const fn checkpointed(&self) -> i64 {
         self.checkpointed
     }
 
-    /// How long the two checkpoint statements ran on the writer thread.
+    /// How long the close ran on the writer thread.
     #[must_use]
     pub const fn elapsed(&self) -> Duration {
         self.elapsed
@@ -330,17 +299,15 @@ impl WalCheckpoint {
 /// How one close of the metrics database ended without a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreClose {
-    /// The writer thread checkpointed and closed the connection, and released its owner.
+    /// The writer thread closed the connection without a checkpoint, and released its owner.
     Closed(WalCheckpoint),
     /// The deadline passed before the writer thread finished the close: while the command
-    /// waited in the queue behind an earlier command, or while the thread ran a later stage,
-    /// such as the checkpoint or the connection's close, both of which sync files. The
-    /// thread keeps running, and keeps its owner, until it finishes or the process exits; a
-    /// log the checkpoint did not empty stays for the next open, which recovers every
-    /// committed record from it.
+    /// waited in the queue behind an earlier command, or while the thread closed the
+    /// connection. The thread keeps running, and keeps its owner, until it finishes or the
+    /// process exits; the log stays for the next open, which recovers every committed
+    /// record from it.
     Timeout {
-        /// The close stage the close was in: one of `queued`, `clear the busy timeout`,
-        /// `checkpoint`, or `close`.
+        /// The close stage the close was in: `queued` or `close`.
         stage: &'static str,
         /// How long the thread had been in that stage when the deadline passed.
         elapsed: Duration,
@@ -356,10 +323,10 @@ pub enum StoreClose {
 #[derive(Debug, Default)]
 struct CloseProgress {
     stages: Mutex<CloseStages>,
-    /// Holds the writer thread at the start of its next checkpoint: the thread answers on
+    /// Holds the writer thread at the start of its next close: the thread answers on
     /// the sender once it holds, and resumes once the receiver fires or its sender drops.
     #[cfg(any(test, feature = "fixtures"))]
-    checkpoint_hold: Mutex<Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    close_hold: Mutex<Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// The instants one close reached, each read on the monotonic clock.
@@ -409,14 +376,14 @@ impl CloseProgress {
         self.stages.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Arms a hold of the next checkpoint: the receiver answers once the writer thread
+    /// Arms a hold of the next close: the receiver answers once the writer thread
     /// holds, and the thread resumes once the sender fires or drops.
     #[cfg(any(test, feature = "fixtures"))]
-    fn hold_next_checkpoint(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    fn hold_next_close(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (holding, held) = oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         *self
-            .checkpoint_hold
+            .close_hold
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((holding, released));
         (held, release)
@@ -424,9 +391,9 @@ impl CloseProgress {
 
     /// Runs an armed hold on the writer thread; returns at once when none is armed.
     #[cfg(any(test, feature = "fixtures"))]
-    fn checkpoint_held(&self) {
+    fn close_held(&self) {
         let hold = self
-            .checkpoint_hold
+            .close_hold
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
@@ -592,12 +559,11 @@ impl LogStore {
         self.request(command, answer, "append").await
     }
 
-    /// Checkpoints the write-ahead log, closes the connection, and releases the owner,
-    /// all by `deadline`.
+    /// Closes the connection without a checkpoint and releases the owner, all by
+    /// `deadline`.
     ///
-    /// The checkpoint truncates the WAL file to zero bytes unless another connection, such
-    /// as a `rift server logs --follow` reader, holds it busy. A received answer means the
-    /// owner is released. A thread that misses `deadline` keeps running and keeps its
+    /// The write-ahead log stays with every committed record, and the next open's checkpoint
+    /// moves it into the database. A received answer means the owner is released. A thread that misses `deadline` keeps running and keeps its
     /// owner until it finishes. A second close answers what the first close answered.
     ///
     /// A deadline that passes before the thread answers, whatever stage the close is in,
@@ -609,7 +575,7 @@ impl LogStore {
     /// # Errors
     ///
     /// Returns `tracing.log_store_failed` when the thread already stopped, or `SQLite`
-    /// refuses the checkpoint or the close.
+    /// refuses the close.
     ///
     /// # Cancel safety
     ///
@@ -643,14 +609,14 @@ impl LogStore {
         Ok(*self.closed.get_or_init(|| closed))
     }
 
-    /// Holds the writer thread at the start of its next close checkpoint, as a test holds a
-    /// checkpoint that outlasts its deadline: the receiver answers once the thread holds,
+    /// Holds the writer thread at the start of its next close, as a test holds a close
+    /// that outlasts its deadline: the receiver answers once the thread holds,
     /// and the thread resumes once the sender fires or drops.
     #[cfg(any(test, feature = "fixtures"))]
     #[doc(hidden)]
     #[must_use]
-    pub fn hold_next_checkpoint(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.progress.hold_next_checkpoint()
+    pub fn hold_next_close(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.progress.hold_next_close()
     }
 
     /// Queues `command` and awaits the thread's answer to it.
@@ -739,6 +705,16 @@ impl MetricsWriter {
             .pragma_update(None, "journal_size_limit", METRICS_JOURNAL_SIZE_LIMIT_BYTES)
             .map_err(|source| failure("set the WAL size limit", source))?;
         prepare_schema(&mut connection, path)?;
+        // A stop closes without a checkpoint, so the log the last process left is moved
+        // into the database here, where no stop deadline runs.
+        // The writer thread writes no record of its own, so the checkpoint is recorded as
+        // its `db.client.operation.duration` point alone.
+        timed(
+            CHECKPOINT_TRUNCATE,
+            || connection.query_row(CHECKPOINT_TRUNCATE, [], CheckpointRow::read),
+            |source| source,
+        )
+        .map_err(|source| failure("checkpoint the write-ahead log", source))?;
         Ok(Self {
             connection,
             path: Arc::clone(path),
@@ -807,39 +783,32 @@ impl MetricsWriter {
         Ok(dropped as u64)
     }
 
-    /// Truncates the write-ahead log without waiting on another connection's lock, then
-    /// closes the connection. No transaction is open: the thread runs one command at a time.
-    /// Starts each stage in `progress` before running it, and records each statement and the
-    /// connection's close as one `db.client.operation.duration` point.
+    /// Closes the connection without a checkpoint, then answers what the log held.
+    ///
+    /// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` keeps the close from running the checkpoint the
+    /// last connection's close runs otherwise (`sqlite3PagerClose` passes no buffer to
+    /// `sqlite3WalClose` when the flag is set), so the close syncs no file and a stop never
+    /// waits on a flush; the next open's checkpoint moves what the log holds. Starts each
+    /// stage in `progress` before running it.
     fn close(self, progress: &CloseProgress) -> Result<WalCheckpoint, RiftError> {
         let Self {
             connection, path, ..
         } = self;
         let failure =
             |operation: &str, source: rusqlite::Error| store_failure(operation, &path, source);
-        let checkpoint_row = |statement: &'static str| {
-            timed(
-                statement,
-                || connection.query_row(statement, [], CheckpointRow::read),
-                |source| source,
-            )
-            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CHECKPOINT], source))
-        };
-        progress.start(CLOSE_CLEAR_BUSY_TIMEOUT);
-        timed(
-            BUSY_TIMEOUT_STATEMENT,
-            || connection.pragma_update(None, "busy_timeout", 0),
+        progress.start(CLOSE_CONNECTION);
+        #[cfg(any(test, feature = "fixtures"))]
+        progress.close_held();
+        let started = std::time::Instant::now();
+        let frames = timed(
+            CHECKPOINT_NOOP,
+            || connection.query_row(CHECKPOINT_NOOP, [], CheckpointRow::read),
             |source| source,
         )
-        .map_err(|source| failure(CLOSE_STAGES[CLOSE_CLEAR_BUSY_TIMEOUT], source))?;
-        progress.start(CLOSE_CHECKPOINT);
-        #[cfg(any(test, feature = "fixtures"))]
-        progress.checkpoint_held();
-        let started = std::time::Instant::now();
-        let before = checkpoint_row(CHECKPOINT_NOOP)?;
-        let truncate = checkpoint_row(CHECKPOINT_TRUNCATE)?;
-        let checkpoint = WalCheckpoint::after(before, truncate, started.elapsed());
-        progress.start(CLOSE_CONNECTION);
+        .map_err(|source| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
+        connection
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .map_err(|source| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
         // A refused close hands the connection back; dropping it closes it again.
         timed(
             CONNECTION_CLOSE,
@@ -848,7 +817,11 @@ impl MetricsWriter {
         )
         .map_err(|source| failure(CLOSE_STAGES[CLOSE_CONNECTION], source))?;
         progress.end();
-        Ok(checkpoint)
+        Ok(WalCheckpoint {
+            log: frames.log,
+            checkpointed: frames.checkpointed,
+            elapsed: started.elapsed(),
+        })
     }
 }
 

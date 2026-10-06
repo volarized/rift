@@ -982,17 +982,15 @@ fn process_absent(error: &io::Error) -> bool {
 /// [`SERVER_LOG_FLUSH_RESERVE`] before it, and the drain by the deadline
 /// ([`later_stages_reserve`]).
 ///
-/// A database close whose checkpoint started before its bound and outlasted it
-/// ends its stage with the outcome `timeout` and fails nothing: the thread that
-/// runs the checkpoint keeps running until it finishes or the process exits, and
-/// the next open recovers every committed transaction from the write-ahead log.
-/// A metrics close ends `timeout` the same way whatever stage the bound passed
-/// in, a close still queued behind an earlier command included, and so does an
-/// index or vectors close that started past its bound on a worker that outlasts
-/// it. An index supervisor still running at its bound is aborted
-/// the same way a checkpoint is left behind: its stage ends `timeout` with the
-/// table of operations in flight and fails nothing, and blocking work it
-/// started ends with the process.
+/// A database close runs no checkpoint and syncs no file, so no pending flush
+/// holds the process exit; the next open's checkpoint moves the write-ahead log.
+/// A close whose thread outlasts its bound ends its stage with the outcome
+/// `timeout` and fails nothing: the thread keeps running until it finishes or
+/// the process exits. A metrics close ends `timeout` whatever stage the bound
+/// passed in, a close still queued behind an earlier command included. An index
+/// supervisor still running at its bound is aborted the same way: its stage
+/// ends `timeout` with the table of operations in flight and fails nothing, and
+/// blocking work it started ends with the process.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
