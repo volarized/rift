@@ -429,7 +429,7 @@ fn origin_fact(origin: &SymbolOrigin) -> Result<String, TextError> {
         version,
     }) = package
     {
-        parts.push(format!("{name}@{version}"));
+        parts.push(quoted_value(&format!("{name}@{version}")).into_owned());
     }
     Ok(parts.join(" "))
 }

@@ -1409,6 +1409,30 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
     );
     assert_eq!(
         facts(origin(
+            project,
+            Some(package("serde · core", "1.0.0")),
+            SourceKind::Authored
+        )),
+        "project \"serde · core@1.0.0\""
+    );
+    assert_eq!(
+        facts(origin(
+            project,
+            Some(package("serde", "1.0: 0")),
+            SourceKind::Authored
+        )),
+        "project \"serde@1.0: 0\""
+    );
+    assert_eq!(
+        facts(origin(
+            project,
+            Some(package("serde", "1.0:0")),
+            SourceKind::Authored
+        )),
+        "project serde@1.0:0"
+    );
+    assert_eq!(
+        facts(origin(
             Some(SourceLocationKind::Stdlib),
             None,
             SourceKind::Authored
