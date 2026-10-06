@@ -22,15 +22,16 @@ rift-core.workspace = true
 rift-analysis.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
+rift-tracing.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 validator.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 jsonschema.workspace = true
+rift-tracing = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true

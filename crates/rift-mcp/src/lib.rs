@@ -8,6 +8,7 @@ mod history;
 mod http;
 mod identity;
 pub mod logs;
+mod metrics;
 mod output;
 mod parameters;
 mod proxy;
@@ -30,21 +31,17 @@ pub use election::{
 pub use failure::{McpErrorExt, McpErrorFailExt, McpFailure};
 pub use http::{
     DeferredDatabaseShutdown, HttpServer, STOP_REQUEST_TIMEOUT, StopRequestFailure, TokenCheck,
-    request_stop, serve_http,
+    request_stop, serve_http, stop_stage, stop_stage_within,
 };
 pub use identity::{BuildCheckout, product_identity_of};
-pub use logs::{
-    LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogSettlement, LogSink,
-    PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture, logs_configuration,
-};
+pub use logs::logs_configuration;
 pub use output::OutputPolicy;
 pub use proxy::{forward_budget, serve_proxy};
 pub use server::RiftMcp;
 pub use spawn::{
-    BoundedStderr, BoundedWriter, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BYTES_MAX,
-    SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT, START_SPAWN_COUNT_MAX, START_WAIT_MAX,
-    SpawnPollOutcome, SpawnedServer, StartExit, StartSpawns, StartedServer, spawn_detached_server,
-    stderr_file_path,
+    PRESENCE_POLL_INTERVAL, SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT,
+    START_SPAWN_COUNT_MAX, START_WAIT_MAX, SpawnPollOutcome, SpawnedServer, StartExit, StartSpawns,
+    StartedServer, spawn_detached_server, stderr_file_path,
 };
 pub use storage::WorkspaceStorage;
 

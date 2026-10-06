@@ -74,15 +74,6 @@ pub trait FieldSet<Target> {
     fn set(target: Target, value: ErrorValue) -> Self::Output;
 }
 
-/// Sets or clears optional generated evidence on a builder.
-pub trait OptionalFieldSet<Target> {
-    /// Builder state after the optional field is set.
-    type Output;
-
-    /// Sets or clears evidence and returns the resulting builder.
-    fn set_optional(target: Target, value: Option<ErrorValue>) -> Self::Output;
-}
-
 /// Stable registry identity for one error.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ErrorSlug(&'static str);

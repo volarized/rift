@@ -2692,7 +2692,7 @@ mod tests {
         }
         let refused = [
             ".rift",
-            ".rift/db",
+            ".rift/index",
             "/src",
             "src/",
             "src//lib.rs",

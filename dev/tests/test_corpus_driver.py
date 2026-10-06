@@ -183,6 +183,13 @@ def test_churn_validates_all_tools_overlap_and_final_source(
             )
             for entry in reads
         )
+        # Each read names the age of the newest write when it began and whether it ran
+        # in the convergence loop, which starts once the writer has stopped.
+        assert all(cast(float, entry["seconds_since_write"]) >= 0.0 for entry in reads)
+        converging = [bool(entry["convergence"]) for entry in reads]
+        assert not converging[0]
+        assert converging == sorted(converging)
+        assert converging.count(True) >= len(check_corpus.CHURN_REQUESTS)
         assert set(object_value(summary["latency"], "latency")) == {
             "search",
             "get_symbol",

@@ -13,23 +13,20 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use jiff::Timestamp;
-use jiff::fmt::temporal::DateTimePrinter;
-use jiff::tz::TimeZone;
-
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_error::{ErrorContext, RiftError, errors};
-use rift_index::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, LogStore, StoredLogRecord};
 use rift_mcp::{
-    LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence,
+    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence,
     SpawnPollOutcome, SpawnedServer, StaleReason, StartSpawns, StartedServer, StopRequestFailure,
-    TokenCheck, WorkspaceStorage, install_panic_hook, probe, read_serving,
-    serve_elected_with_storage, spawn_detached_server,
+    TokenCheck, WorkspaceStorage, probe, read_serving, serve_elected_with_storage,
+    spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
-use serde_json::{Map, Value};
+use rift_tracing::{
+    LOG_PAGE_RECORDS_MAX, LogDrain, LogLines, LogQuery, LogReader, LogReads, RunningLogDrain,
+    StoredLogRecord, install_panic_hook,
+};
 use tokio_util::sync::CancellationToken;
 use waitpid_any::WaitHandle;
 
@@ -52,8 +49,46 @@ const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// flush runs, each taking only what the stage before it left of that
 /// deadline.
 const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(4);
-/// Shutdown time reserved for the shared SQLite worker after final log writes.
+/// Time the stop keeps for the metrics database's close, its last stage: the log drain's
+/// final flush ends this long before the stop's deadline.
 const SERVER_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
+/// Time the stop keeps for the log drain's final flush: the OTLP export shuts down by this
+/// long before the flush's own bound, so the flush can write the export's stop record.
+const SERVER_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
+/// Time the stop keeps for the OTLP export's final flush and shutdown: the index and
+/// vectors databases close by this long before the export's own bound. A collector that
+/// accepts and never answers costs the stop this much and no more, whatever the
+/// `OTEL_METRIC_EXPORT_TIMEOUT` and `OTEL_BSP_EXPORT_TIMEOUT` variables are set to.
+const SERVER_EXPORT_STOP_RESERVE: Duration = Duration::from_millis(500);
+/// Time a workspace server's stop keeps for the stages after serving and the index and
+/// vectors close: the OTLP export, the log drain's final flush, and the metrics database's
+/// close.
+const SERVER_LATER_STAGES_RESERVE: Duration = SERVER_DATABASE_STOP_RESERVE
+    .saturating_add(SERVER_LOG_FLUSH_RESERVE)
+    .saturating_add(SERVER_EXPORT_STOP_RESERVE);
+// The reserves leave the serving stages and the index and vectors close a share of the
+// stop's deadline: the deadline less every reserve still lands after the instant the stop
+// began, so no subtraction of a reserve from the deadline underflows.
+const _: () = assert!(
+    SERVER_DATABASE_STOP_RESERVE.as_millis()
+        + SERVER_LOG_FLUSH_RESERVE.as_millis()
+        + SERVER_EXPORT_STOP_RESERVE.as_millis()
+        < SERVER_STOP_DEADLINE.as_millis()
+);
+// Each mode's reserve is a share of the stop's deadline, and a repository server, which runs
+// the export and the log drain's final flush and closes no metrics database of its own, keeps
+// those two reserves and less than a workspace server.
+const _: () = assert!(
+    later_stages_reserve(false).as_millis() == SERVER_LATER_STAGES_RESERVE.as_millis()
+        && later_stages_reserve(true).as_millis()
+            == SERVER_EXPORT_STOP_RESERVE.as_millis() + SERVER_LOG_FLUSH_RESERVE.as_millis()
+        && later_stages_reserve(true).as_millis() < later_stages_reserve(false).as_millis()
+        && later_stages_reserve(false).as_millis() < SERVER_STOP_DEADLINE.as_millis()
+);
+// The final log drain, aborted by the stop's deadline at the latest, leaves a five-second
+// stop request time to observe the process exit.
+const _: () =
+    assert!(SERVER_STOP_DEADLINE.as_millis() < rift_mcp::STOP_REQUEST_TIMEOUT.as_millis());
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The form `--tail` accepts, named in every refusal.
@@ -61,12 +96,6 @@ const TAIL_COUNT_EXPECTED: &str = "`all`, or a positive integer such as `20`";
 /// What a workspace holding no recorded diagnostics prints on stderr.
 const NO_RECORDED_LOGS: &str = "💤 no server diagnostics recorded for this workspace yet; \
                                 start one with `rift server start`";
-/// Renders a logged instant with exactly 3 fractional-second digits.
-///
-/// `DateTimePrinter::new` and `precision` are both `const fn`, so the
-/// configured printer is a compile-time value shared by every render.
-const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(3));
-
 fn stop_timeout(process: ProcessExit, holder: &ServerLock) -> Result<(), RiftError> {
     let mut builder = errors::cli::server_stop_timed_out()
         .waited(STOP_WAIT_MAX)
@@ -131,13 +160,13 @@ pub(super) enum ServerCommand {
         /// Print only the newest COUNT records; `all` prints every kept record.
         #[arg(short = 'n', long, default_value = "all", value_name = "COUNT")]
         tail: TailCount,
-        /// Print only records newer than DURATION ago, such as `10m` or `2h`.
-        #[arg(
-            long,
-            value_name = "DURATION",
-            value_parser = rift_protocol::configuration::Duration::parse
-        )]
-        since: Option<rift_protocol::configuration::Duration>,
+        /// Print only records recorded at or after WHEN: an age such as `10m` or `2h`,
+        /// or an RFC 3339 timestamp such as `2026-10-04T20:42:58Z`.
+        #[arg(long, value_name = "WHEN", value_parser = LogsBound::parse)]
+        since: Option<LogsBound>,
+        /// Print only records recorded before WHEN, in the forms `--since` takes.
+        #[arg(long, value_name = "WHEN", value_parser = LogsBound::parse)]
+        until: Option<LogsBound>,
         /// Print only records at this severity, as the store spells it.
         #[arg(long, value_name = "LEVEL")]
         level: Option<LogLevel>,
@@ -167,6 +196,50 @@ impl FromStr for TailCount {
         match text.parse::<u64>() {
             Ok(0) | Err(_) => Err(format!("expected {TAIL_COUNT_EXPECTED}, not {text:?}")),
             Ok(count) => Ok(Self::Newest(count)),
+        }
+    }
+}
+
+/// One bound of the window a logs read selects: an age before the read starts, or one
+/// instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LogsBound {
+    /// This long before the read starts.
+    Age(rift_protocol::configuration::Duration),
+    /// One instant, given in RFC 3339.
+    At(jiff::Timestamp),
+}
+
+impl LogsBound {
+    /// Reads an age in the configuration's duration spelling, or else an RFC 3339
+    /// timestamp; the refusal names both forms.
+    fn parse(text: &str) -> Result<Self, String> {
+        if let Ok(age) = rift_protocol::configuration::Duration::parse(text) {
+            return Ok(Self::Age(age));
+        }
+        text.parse::<jiff::Timestamp>().map(Self::At).map_err(|_| {
+            format!(
+                "expected an age such as `10m` or an RFC 3339 timestamp such as \
+                 `2026-10-04T20:42:58Z`, not {text:?}"
+            )
+        })
+    }
+
+    /// `query` restricted to records recorded at or after this bound: an age through
+    /// [`LogQuery::since_age`], on the tracing clock.
+    fn since(self, query: LogQuery) -> LogQuery {
+        match self {
+            Self::Age(age) => query.since_age(Duration::from_millis(age.milliseconds())),
+            Self::At(instant) => query.since_ms(instant.as_millisecond()),
+        }
+    }
+
+    /// `query` restricted to records recorded before this bound: an age through
+    /// [`LogQuery::until_age`], on the tracing clock.
+    fn until(self, query: LogQuery) -> LogQuery {
+        match self {
+            Self::Age(age) => query.until_age(Duration::from_millis(age.milliseconds())),
+            Self::At(instant) => query.until_ms(instant.as_millisecond()),
         }
     }
 }
@@ -337,6 +410,7 @@ pub(super) async fn run(
     command: ServerCommand,
     drain: Option<LogDrain>,
     retention_records: u64,
+    export: rift_tracing::OtlpExport,
 ) -> Result<Option<ServerOutcome>, RiftError> {
     let root = Path::new(".");
     match command {
@@ -354,6 +428,7 @@ pub(super) async fn run(
                 retention_records,
                 token_check(auth),
                 repository,
+                export,
             )
             .await
             .map(|()| None),
@@ -377,12 +452,13 @@ pub(super) async fn run(
             follow,
             tail,
             since,
+            until,
             level,
             component,
         } => {
-            let query = logs_query(tail, since, level, component.as_deref());
-            let time_zone = TimeZone::system();
-            print_logs(root, &query, tail, &logs_mode(follow), &time_zone)
+            let window = LogsWindow { since, until };
+            let query = logs_query(tail, window, level, component.as_deref());
+            print_logs(root, &query, tail, &logs_mode(follow))
                 .await
                 .map(|()| None)
         }
@@ -664,7 +740,7 @@ where
         }
         let observed = tokio::time::Instant::now();
         let deadline_reached = observed >= deadline;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "cli",
             operation = "server.start",
             probe_count,
@@ -690,7 +766,7 @@ where
     }
     // A holder that has not published is starting, whether the document is
     // absent or still the pre-spawn leftover it has yet to scrub.
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "cli",
         operation = "server.start",
         probe_count = probe_count + 1,
@@ -768,7 +844,7 @@ where
         }
         let observed = tokio::time::Instant::now();
         let deadline_reached = observed >= deadline;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "cli",
             operation = "server.election",
             probe_count = probe_index + 1,
@@ -884,29 +960,60 @@ fn process_absent(error: &io::Error) -> bool {
 /// The listening line prints before blocking. Ctrl-C, and SIGTERM on unix,
 /// cancel the shutdown token; an authorized stop request and the idle timeout
 /// end serving the same way. This is the process that records: the drain
-/// writes what the tracing layer queued into the workspace database until the
+/// writes what the tracing layer queued into the metrics database until the
 /// same token stops it.
 ///
 /// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
-/// task drains, the engines and index supervisor shut down, the log drain's
-/// final flush runs, and only then is the election released, by dropping the
-/// guard right before the process exits - so a stop the CLI reports as
-/// success means the process is leaving. The deadline starts where the stop
-/// begins, and each stage takes only what the one before it left of it.
+/// task drains and the engines and index supervisor shut down, by
+/// [`SERVER_EXPORT_STOP_RESERVE`], [`SERVER_LOG_FLUSH_RESERVE`], and
+/// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline, so a stage that runs out its
+/// bound leaves the later stages their reserves; the index and vectors databases close,
+/// by the same instant; the OTLP export sends its final spans and metric points and shuts
+/// down, by [`SERVER_LOG_FLUSH_RESERVE`] and [`SERVER_DATABASE_STOP_RESERVE`] before the
+/// deadline, recording how it ended and failing nothing; the log drain's final flush
+/// runs, writing what the stages before it recorded, by
+/// [`SERVER_DATABASE_STOP_RESERVE`] before the deadline; the metrics database
+/// closes by the deadline; and only then is the election released, by
+/// dropping the guard right before the process exits - so a stop the CLI
+/// reports as success means the process is leaving. The deadline starts where
+/// the stop begins, and each stage takes only what the one before it left of
+/// it. Each stage records its name, what it left of the deadline, and its
+/// error, and a failed stop leaves with the rendered error on stderr.
+///
+/// A repository server's drain routes each record to the consumer of the workspace it
+/// names. Each workspace stops inside the serving stage `repository workspaces shutdown`
+/// in the same order: its index and vectors databases close, its consumer flushes, and
+/// its metrics database closes. After serving, the server runs the OTLP export and the
+/// `log drain` stage, which stops the routing drain; it has no metrics database of its
+/// own, so its serving stages end by [`SERVER_EXPORT_STOP_RESERVE`] and
+/// [`SERVER_LOG_FLUSH_RESERVE`] before the deadline, the export by
+/// [`SERVER_LOG_FLUSH_RESERVE`] before it, and the drain by the deadline
+/// ([`later_stages_reserve`]).
+///
+/// A database close runs no checkpoint and syncs no file, so no pending flush
+/// holds the process exit; the next open's checkpoint moves the write-ahead log.
+/// A close whose thread outlasts its bound ends its stage with the outcome
+/// `timeout` and fails nothing: the thread keeps running until it finishes or
+/// the process exits. A metrics close ends `timeout` whatever stage the bound
+/// passed in, a close still queued behind an earlier command included. An index
+/// supervisor still running at its bound is aborted the same way: its stage
+/// ends `timeout` with the table of operations in flight and fails nothing, and
+/// blocking work it started ends with the process.
 async fn serve_foreground(
     root: &Path,
     drain: Option<LogDrain>,
     retention_records: u64,
     check: TokenCheck,
     repository: bool,
+    export: rift_tracing::OtlpExport,
 ) -> Result<(), RiftError> {
     // A detached server's panic reaches its stderr file at best; the hook
     // records it through the same lane every other diagnostic takes.
     install_panic_hook();
     let shutdown = CancellationToken::new();
     let selection = foreground_selection(root, repository)?;
-    let (storage, guard, log_drain) = if repository {
-        (None, None, None)
+    let (storage, guard) = if repository {
+        (None, None)
     } else {
         let guard = std::sync::Arc::new(
             rift_mcp::claim(root).map_err(|error| foreground_refused(root, error))?,
@@ -914,16 +1021,9 @@ async fn serve_foreground(
         let storage = WorkspaceStorage::open_elected(root, std::sync::Arc::clone(&guard))
             .await
             .map_err(|error| foreground_refused(root, error))?;
-        let log_drain = match (drain, storage.logs()) {
-            (Some(drain), Some(store)) => Some(tokio::spawn(drain.run(
-                store,
-                retention_records,
-                shutdown.clone(),
-            ))),
-            _ => None,
-        };
-        (Some(storage), Some(guard), log_drain)
+        (Some(storage), Some(guard))
     };
+    let log_drain = start_log_drain(drain, storage.as_ref(), retention_records);
     let serving = if let Some(rift_mcp::repository::ServerConfigurationSelection::Repository {
         authority_root,
         common_directory,
@@ -986,18 +1086,64 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    let (guard, deadline, stopped, database) =
-        server.stopped_before_database(SERVER_STOP_DEADLINE).await;
-    let stopped = stopped;
+    // Serving ends by the reserves of the later stages this mode runs, so they keep theirs.
+    let (guard, deadline, stopped, mut database) = server
+        .stopped_before_database(SERVER_STOP_DEADLINE, later_stages_reserve(repository))
+        .await;
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;
-    stop_log_drain(log_drain, deadline - SERVER_DATABASE_STOP_RESERVE).await;
-    let database = database.shutdown(deadline).await;
-    // The election releases last: dropping the guard retires the document and
-    // unlocks, immediately before the process exits.
+    let flush_deadline = deadline - log_flush_end_reserve(repository);
+    let export_deadline = deadline - export_stage_end_reserve(repository);
+    let search = database
+        .close_search(export_deadline - SERVER_EXPORT_STOP_RESERVE)
+        .await;
+    stop_export(&export, export_deadline).await;
+    stop_log_drain(log_drain, flush_deadline).await;
+    let logs = database.close_logs(deadline).await;
+    retire_before_exit(guard);
+    stopped.and(search).and(logs)
+}
+
+/// Starts the log drain of a foreground server: writing into the metrics database of the
+/// workspace `storage` opened, or, for a repository server, which opens no `storage`,
+/// routing each record to the consumer of the workspace it names.
+///
+/// A workspace whose metrics database did not open records nothing, and neither does a
+/// process that built no `drain`.
+fn start_log_drain(
+    drain: Option<LogDrain>,
+    storage: Option<&WorkspaceStorage>,
+    retention_records: u64,
+) -> Option<RunningLogDrain> {
+    let drain = drain?;
+    match storage {
+        Some(storage) => storage
+            .logs()
+            .map(|store| RunningLogDrain::spawn(drain, store, retention_records)),
+        None => Some(RunningLogDrain::spawn_routed(drain, retention_records)),
+    }
+}
+
+/// Retires `server.json` and drops this stop's election guard, immediately before the
+/// process exits.
+///
+/// Each database thread holds a clone of the guard until it exits, so a close that
+/// ended `timeout` leaves a thread still holding it: the election stays held until the
+/// process exits, and the operating system releases the lock then. The document is
+/// retired here either way, because the process no longer serves; dropping the last
+/// clone retires it again, which finds it gone.
+fn retire_before_exit(guard: std::sync::Arc<rift_mcp::ElectionGuard>) {
+    guard.retire();
+    if std::sync::Arc::strong_count(&guard) > 1 {
+        rift_tracing::warn!(
+            component = "mcp",
+            operation = "server.stop",
+            "a database thread still holds the workspace election; it is released when the \
+             process exits"
+        );
+    }
     drop(guard);
-    stopped.and(database)
 }
 
 fn foreground_selection(
@@ -1028,28 +1174,81 @@ fn foreground_selection(
     Ok(Some(selected))
 }
 
-/// Joins the diagnostics drain by `deadline`, the stop's shared deadline.
+/// Time the stop keeps after serving for the later stages a server in this mode runs.
 ///
-/// The drain runs last, so its final flush takes only what the engines and the
-/// index supervisor left of `deadline`. When the write turn a rebuild holds
-/// does not free in time, the drain drops its last batch with its own
-/// "refused a batch" stderr line, and this abort stops it waiting further.
-async fn stop_log_drain(
-    drain: Option<tokio::task::JoinHandle<()>>,
-    deadline: tokio::time::Instant,
-) {
-    let Some(mut drain) = drain else {
-        return;
-    };
-    match tokio::time::timeout_at(deadline, &mut drain).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(component = "logs", %error, "log drain task failed"),
-        Err(_) => {
-            drain.abort();
-            let _ = drain.await;
-            tracing::warn!(component = "logs", "log drain outlasted the stop deadline");
-        }
+/// A workspace server (`repository` false) runs the OTLP export, the log drain's final
+/// flush, and the metrics database's close, and keeps [`SERVER_LATER_STAGES_RESERVE`]. A
+/// repository server opens no workspace storage of its own: its index, vectors, and
+/// metrics databases and its workspace log consumers belong to its workspaces and stop
+/// inside the serving stage `repository workspaces shutdown`, so its later stages are the
+/// OTLP export and the stop of its routing log drain, and it keeps
+/// [`SERVER_EXPORT_STOP_RESERVE`] and [`SERVER_LOG_FLUSH_RESERVE`].
+const fn later_stages_reserve(repository: bool) -> Duration {
+    if repository {
+        SERVER_EXPORT_STOP_RESERVE.saturating_add(SERVER_LOG_FLUSH_RESERVE)
+    } else {
+        SERVER_LATER_STAGES_RESERVE
     }
+}
+
+/// How long before the stop's deadline the `otlp export` stage ends in this mode: the
+/// reserves of the stages after the export, which are the log drain's final flush and the
+/// metrics database's close on a workspace server and the log drain's final flush on a
+/// repository server.
+const fn export_stage_end_reserve(repository: bool) -> Duration {
+    later_stages_reserve(repository).saturating_sub(SERVER_EXPORT_STOP_RESERVE)
+}
+
+/// How long before the stop's deadline the `log drain` stage ends in this mode: the
+/// metrics database's close on a workspace server, and nothing on a repository server,
+/// whose drain is its last stage.
+const fn log_flush_end_reserve(repository: bool) -> Duration {
+    export_stage_end_reserve(repository).saturating_sub(SERVER_LOG_FLUSH_RESERVE)
+}
+
+/// Sends the OTLP export's final spans and metric points and shuts it down by `deadline`,
+/// or [`SERVER_EXPORT_STOP_RESERVE`] after the stage starts when that comes first, as the
+/// `otlp export` stop stage: a collector that is down or stalled costs the stop that
+/// reserve at most, even when the stages before left more.
+///
+/// The stage records `outcome="ok"` when the export shut down inside `deadline`,
+/// `outcome="timeout"` at `warn` when the deadline passed first, as with a collector that
+/// accepts and never answers, and `outcome="error"` at `warn` with the SDK's words when the
+/// final export failed, as with a refused connection. None fails the stop: the export
+/// carries diagnostics only. A process that exports nothing records `ok` at once.
+async fn stop_export(export: &rift_tracing::OtlpExport, deadline: tokio::time::Instant) {
+    let bound = deadline.min(tokio::time::Instant::now() + SERVER_EXPORT_STOP_RESERVE);
+    let _ = rift_mcp::stop_stage_within("otlp export", deadline, bound, async {
+        match export.shutdown(bound).await {
+            Ok(()) | Err(rift_tracing::ExportShutdownError::TimedOut) => Ok(()),
+            Err(failed @ rift_tracing::ExportShutdownError::Failed(_)) => {
+                errors::mcp::http_serve_failed()
+                    .operation("otlp export")
+                    .source(io::Error::other(failed))
+                    .fail()
+            }
+        }
+    })
+    .await;
+}
+
+/// Stops the diagnostics drain and joins it by `deadline`, as the `log drain` stop stage;
+/// answers the records left unwritten when the drain had to be aborted.
+///
+/// [`RunningLogDrain::stop`] flushes what the drain holds within what the stages before
+/// it left of `deadline`, and aborts a drain the metrics database holds past it. The stage
+/// records its elapsed time beside the other stages.
+async fn stop_log_drain(
+    drain: Option<RunningLogDrain>,
+    deadline: tokio::time::Instant,
+) -> Option<u64> {
+    let drain = drain?;
+    rift_mcp::stop_stage("log drain", deadline, async {
+        Ok(drain.stop(deadline).await)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Cancels `shutdown` when the process receives an interrupt.
@@ -1061,7 +1260,7 @@ async fn stop_log_drain(
 async fn cancel_on_interrupt(shutdown: CancellationToken) {
     match tokio::signal::ctrl_c().await {
         Ok(()) => shutdown.cancel(),
-        Err(error) => tracing::warn!(component = "cli", %error, "interrupt listener failed"),
+        Err(error) => rift_tracing::warn!(component = "cli", %error, "interrupt listener failed"),
     }
 }
 
@@ -1088,7 +1287,7 @@ fn cancel_on_stop_signal(shutdown: CancellationToken) -> tokio::task::JoinHandle
         let (mut interrupt, mut terminate) = match installed {
             Ok(signals) => signals,
             Err(error) => {
-                tracing::warn!(component = "cli", %error, "interrupt listener failed");
+                rift_tracing::warn!(component = "cli", %error, "interrupt listener failed");
                 return;
             }
         };
@@ -1231,7 +1430,7 @@ where
         }
         let observed = tokio::time::Instant::now();
         let deadline_reached = observed >= deadline;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "cli",
             operation = "server.stop",
             probe_count = probe_index + 1,
@@ -1262,7 +1461,7 @@ fn discard_stale_document(root: &Path) {
     match std::fs::remove_file(&document_path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!(
+        Err(error) => rift_tracing::warn!(
             component = "cli",
             path = %document_path.display(),
             %error,
@@ -1277,14 +1476,22 @@ async fn restart(root: &Path) -> Result<ServerOutcome, RiftError> {
     start_detached(root, STOP_POLL_ATTEMPT_COUNT).await
 }
 
+/// The window one `rift server logs` run selects.
+#[derive(Clone, Copy, Debug, Default)]
+struct LogsWindow {
+    since: Option<LogsBound>,
+    until: Option<LogsBound>,
+}
+
 /// The store read one `rift server logs` run issues.
 ///
 /// The page is the `--tail` count, bounded by [`LOG_PAGE_RECORDS_MAX`]; `all`
-/// reads a whole page at a time. `--since` becomes an absolute floor here, so
-/// every page of one run selects the same window.
+/// reads a whole page at a time. `--since` and `--until` become absolute bounds here: an
+/// age counts back from the one tracing clock reading the query keeps, so every page of one
+/// run selects the same window.
 fn logs_query(
     tail: TailCount,
-    since: Option<rift_protocol::configuration::Duration>,
+    window: LogsWindow,
     level: Option<LogLevel>,
     component: Option<&str>,
 ) -> LogQuery {
@@ -1292,52 +1499,86 @@ fn logs_query(
         TailCount::All => LOG_PAGE_RECORDS_MAX,
         TailCount::Newest(count) => usize::try_from(count).unwrap_or(LOG_PAGE_RECORDS_MAX),
     };
-    let mut query = LogQuery::newest(limit);
+    restricted_query(LogQuery::newest(limit), window, level, component)
+}
+
+/// `query` restricted to `level`, `component`, and `window`; an age bound counts back from
+/// the clock reading `query` already holds, or else reads the tracing clock.
+fn restricted_query(
+    mut query: LogQuery,
+    window: LogsWindow,
+    level: Option<LogLevel>,
+    component: Option<&str>,
+) -> LogQuery {
     if let Some(level) = level {
         query = query.at_level(level.label());
     }
     if let Some(component) = component {
         query = query.for_component(component);
     }
-    if let Some(since) = since {
-        let age_ms = i64::try_from(since.milliseconds()).unwrap_or(i64::MAX);
-        query = query.since_ms(now_ms().saturating_sub(age_ms));
+    if let Some(since) = window.since {
+        query = since.since(query);
+    }
+    if let Some(until) = window.until {
+        query = until.until(query);
     }
     query
 }
 
 /// Prints this workspace's recorded diagnostics, oldest first.
 ///
-/// The store is read directly, so a workspace whose server has stopped still
-/// answers. A workspace holding no `.rift/db` prints nothing, says so on
-/// stderr, and creates no state directory.
+/// The metrics database is read directly, so a workspace whose server has stopped still
+/// answers, with no server, no index database, and no valid `rift.toml`. A workspace
+/// holding no `.rift/metrics` prints nothing, says so on stderr, and creates no state
+/// directory.
+///
+/// The records print through `rift-tracing`'s [`LogLines`], in UTC: as a stored page, each
+/// group padded to its own widths, or, when following, as the live stream stderr prints.
 async fn print_logs(
     root: &Path,
     query: &LogQuery,
     tail: TailCount,
     mode: &LogsMode,
-    time_zone: &TimeZone,
 ) -> Result<(), RiftError> {
-    let database = root
-        .join(RIFT_STATE_DIRECTORY)
-        .join(WORKSPACE_DATABASE_FILE_NAME);
-    if !database.exists() {
+    let Some(reader) = WorkspaceStorage::open_logs(root) else {
         eprintln!("{NO_RECORDED_LOGS}");
         return Ok(());
-    }
-    let Some(store) = WorkspaceStorage::open(root).await.logs() else {
-        return errors::cli::server_logs_unavailable()
-            .detail("the workspace database at `.rift/db` did not open")
-            .fail();
+    };
+    let mut lines = match mode {
+        LogsMode::Once => LogLines::stored_page(),
+        LogsMode::Following => LogLines::live_stream(),
     };
     let printed = match tail {
-        TailCount::All => print_records_after(&store, query, 0, time_zone).await?,
-        TailCount::Newest(_) => print_newest_records(&store, query, time_zone).await?,
+        TailCount::All => print_records_after(&reader, query, 0, &mut lines).await?,
+        TailCount::Newest(_) => print_newest_records(&reader, query, &mut lines).await?,
     };
     match mode {
         LogsMode::Once => Ok(()),
-        LogsMode::Following => follow_records(&store, query, printed, time_zone).await,
+        LogsMode::Following => follow_records(&reader, query, printed, &mut lines).await,
     }
+}
+
+/// One read of the metrics database on a blocking thread, through a connection of its own.
+async fn read_records(
+    reader: &LogReader,
+    query: LogQuery,
+    read: fn(&LogReads, &LogQuery) -> Result<Vec<StoredLogRecord>, RiftError>,
+) -> Result<Vec<StoredLogRecord>, RiftError> {
+    let reader = reader.clone();
+    let records = tokio::task::spawn_blocking(move || read(&reader.connect()?, &query))
+        .await
+        .map_err(|error| {
+            errors::cli::server_logs_unavailable()
+                .operation("read recorded logs")
+                .detail(error.to_string())
+                .error()
+        })?;
+    records.map_err(|source| {
+        errors::cli::server_logs_unavailable()
+            .operation("read recorded logs")
+            .source(source)
+            .error()
+    })
 }
 
 /// Prints every record after `after`, oldest first, and returns the newest
@@ -1347,26 +1588,17 @@ async fn print_logs(
 /// [`LOG_PAGE_RECORDS_MAX`]. The loop repeats only while a page comes back
 /// full, and the store's retention bounds how many full pages there can be.
 async fn print_records_after(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     after: i64,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<i64, RiftError> {
     let mut newest = after;
     loop {
-        let page = store
-            .following(&query.clone().after(newest))
-            .await
-            .map_err(|source| {
-                errors::cli::server_logs_unavailable()
-                    .operation("read recorded logs")
-                    .source(source)
-                    .error()
-            })?;
-        for stored in &page {
-            let line = rendered_record(stored, time_zone);
-            println!("{line}");
-            newest = stored.identity();
+        let page = read_records(reader, query.clone().after(newest), LogReads::following).await?;
+        print_page(&page, lines);
+        if let Some(last) = page.last() {
+            newest = last.identity();
         }
         if page.len() < query.limit() {
             return Ok(newest);
@@ -1377,36 +1609,31 @@ async fn print_records_after(
 /// Prints the newest records the query selects, oldest first, and returns the
 /// newest identity it printed. The read is bounded by the query's own page.
 async fn print_newest_records(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<i64, RiftError> {
-    let mut records = store.recent(query).await.map_err(|source| {
-        errors::cli::server_logs_unavailable()
-            .operation("read recorded logs")
-            .source(source)
-            .error()
-    })?;
+    let mut records = read_records(reader, query.clone(), LogReads::recent).await?;
     records.reverse();
-    let mut newest = 0;
-    for stored in &records {
-        let line = rendered_record(stored, time_zone);
-        println!("{line}");
-        newest = stored.identity();
-    }
-    Ok(newest)
+    print_page(&records, lines);
+    Ok(records.last().map_or(0, StoredLogRecord::identity))
+}
+
+/// Prints `page` on stdout as `lines` lays it out.
+fn print_page(page: &[StoredLogRecord], lines: &mut LogLines) {
+    print!("{}", lines.lines(page.iter().map(StoredLogRecord::record)));
 }
 
 /// Prints records as the server writes them, until the operator interrupts.
 async fn follow_records(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     printed: i64,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<(), RiftError> {
     let interrupted = CancellationToken::new();
     let interrupt = tokio::spawn(cancel_on_interrupt(interrupted.clone()));
-    let followed = follow_until_interrupt(store, query, printed, &interrupted, time_zone).await;
+    let followed = follow_until_interrupt(reader, query, printed, &interrupted, lines).await;
     interrupt.abort();
     let _ = interrupt.await;
     followed
@@ -1418,15 +1645,15 @@ async fn follow_records(
 /// interrupt, as `docker logs -f` does. Each iteration reads one page, bounded
 /// by the query's own limit.
 async fn follow_until_interrupt(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     printed: i64,
     interrupted: &CancellationToken,
-    time_zone: &TimeZone,
+    lines: &mut LogLines,
 ) -> Result<(), RiftError> {
     let mut newest = printed;
     while !interrupted.is_cancelled() {
-        newest = print_records_after(store, query, newest, time_zone).await?;
+        newest = print_records_after(reader, query, newest, lines).await?;
         tokio::select! {
             () = interrupted.cancelled() => {}
             () = tokio::time::sleep(LOG_FOLLOW_POLL_INTERVAL) => {}
@@ -1435,122 +1662,32 @@ async fn follow_until_interrupt(
     Ok(())
 }
 
-/// One stored record as one printed line.
-fn rendered_record(stored: &StoredLogRecord, time_zone: &TimeZone) -> String {
-    rendered_line(stored.record(), time_zone)
-}
-
-/// One record as the operator reads it: when it happened, how severe it was,
-/// where it came from, what it said, and the fields it carried.
-fn rendered_line(record: &LogRecord, time_zone: &TimeZone) -> String {
-    let timestamp = rendered_timestamp(record.recorded_at_ms(), time_zone);
-    let glyph = level_glyph(record.level());
-    let level = record.level().to_uppercase();
-    let component = label(record.component());
-    let operation = label(record.operation());
-    let message = record.message();
-    let fields = rendered_fields(record.fields());
-    format!("{timestamp} {glyph} {level:<5} {component:<8} {operation:<12} {message}{fields}")
-}
-
-/// The glyph one severity prints under. A level outside the five the store
-/// records prints under the least severe one.
-fn level_glyph(level: &str) -> &'static str {
-    match level {
-        "error" => "🔴",
-        "warn" => "🟡",
-        "info" => "🔵",
-        "debug" => "⚪",
-        _ => "⚫",
-    }
-}
-
-/// The label a record carried, or `-` when it carried none.
-fn label(value: &str) -> &str {
-    if value.is_empty() { "-" } else { value }
-}
-
-/// The record's remaining fields as ` key=value` pairs, or as the text the
-/// store holds when that text is not a JSON object.
-fn rendered_fields(fields: &str) -> String {
-    if fields.is_empty() {
-        return String::new();
-    }
-    let Ok(named) = serde_json::from_str::<Map<String, Value>>(fields) else {
-        return format!(" {fields}");
-    };
-    let mut fields = named.iter().collect::<Vec<_>>();
-    fields.sort_by_key(|(key, _)| *key);
-    let mut rendered = String::new();
-    for (key, value) in fields {
-        rendered.push(' ');
-        rendered.push_str(key);
-        rendered.push('=');
-        rendered.push_str(&rendered_value(value));
-    }
-    rendered
-}
-
-/// One field value without the quotes JSON puts around a string.
-fn rendered_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// One recorded instant as an RFC 3339 timestamp in `time_zone`'s local offset.
-///
-/// Local offset needs the tz database; jiff owns both parsing the recorded
-/// millisecond count and rendering it, with exactly 3 fractional digits and
-/// a numeric offset - never `Z`, since the offset is always known here. A
-/// millisecond count outside jiff's representable range falls back to the
-/// raw count instead of panicking.
-fn rendered_timestamp(recorded_at_ms: i64, time_zone: &TimeZone) -> String {
-    let Ok(timestamp) = Timestamp::from_millisecond(recorded_at_ms) else {
-        return recorded_at_ms.to_string();
-    };
-    let offset = time_zone.to_offset(timestamp);
-    TIMESTAMP_PRINTER.timestamp_with_offset_to_string(&timestamp, offset)
-}
-
-/// Milliseconds since the Unix epoch, or zero on a clock before it.
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::IntoFuture as _;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
-        SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerOutcome, StaleReason, StartMode, StartSpawns, StartedServer,
-        TailCount, TokenCheck, await_election_released, await_election_released_with_probe,
-        await_serving, await_serving_with_probe, await_stopped, await_stopped_with_probe,
-        discard_stale_document, foreground_refused, label, level_glyph, logs_mode, logs_query,
-        now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp, request_stop,
-        stale_reason_phrase, start_detached, start_mode, status, stop, stop_log_drain, token_check,
+        AuthMode, ChildWatch, LogLevel, LogQuery, LogsBound, LogsMode, LogsWindow,
+        PRESENCE_POLL_INTERVAL, ProcessExit, RunningLogDrain, SERVER_DATABASE_STOP_RESERVE,
+        SERVER_EXPORT_STOP_RESERVE, SERVER_LOG_FLUSH_RESERVE, SERVER_STOP_DEADLINE,
+        START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT, STOP_WAIT_MAX,
+        ServerOutcome, StaleReason, StartMode, StartSpawns, StartedServer, TailCount, TokenCheck,
+        await_election_released, await_election_released_with_probe, await_serving,
+        await_serving_with_probe, await_stopped, await_stopped_with_probe, discard_stale_document,
+        export_stage_end_reserve, foreground_refused, later_stages_reserve, log_flush_end_reserve,
+        logs_mode, logs_query, print_logs, request_stop, restricted_query, stale_reason_phrase,
+        start_detached, start_mode, status, stop, stop_log_drain, token_check,
     };
-    use jiff::tz::{Offset, TimeZone};
     use rift_error::errors;
-    use rift_index::{
-        LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
-    };
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
+    use rift_tracing::{
+        LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
+    };
     use std::path::Path;
-
-    /// Milliseconds in one hour, for fixture instants only.
-    const MILLISECONDS_PER_HOUR: i64 = 3_600_000;
+    use std::time::Duration;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1715,6 +1852,40 @@ mod tests {
     }
 
     #[test]
+    fn each_mode_reserves_only_the_later_stop_stages_it_runs() {
+        // A workspace server keeps time for the export, the log flush, and the metrics close.
+        let workspace = later_stages_reserve(false);
+        assert_eq!(
+            workspace,
+            SERVER_EXPORT_STOP_RESERVE + SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE
+        );
+        assert_eq!(
+            export_stage_end_reserve(false),
+            SERVER_LOG_FLUSH_RESERVE + SERVER_DATABASE_STOP_RESERVE
+        );
+        assert_eq!(log_flush_end_reserve(false), SERVER_DATABASE_STOP_RESERVE);
+        // A repository server runs the export and its routing drain's stop, which ends at
+        // the deadline: its workspaces close their metrics databases while serving stops.
+        let repository = later_stages_reserve(true);
+        assert_eq!(
+            repository,
+            SERVER_EXPORT_STOP_RESERVE + SERVER_LOG_FLUSH_RESERVE
+        );
+        assert_eq!(export_stage_end_reserve(true), SERVER_LOG_FLUSH_RESERVE);
+        assert_eq!(log_flush_end_reserve(true), Duration::ZERO);
+        assert_eq!(
+            workspace.checked_sub(repository),
+            Some(SERVER_DATABASE_STOP_RESERVE),
+            "a repository server's serving stages gain the close reserve"
+        );
+        assert_eq!(
+            SERVER_STOP_DEADLINE.checked_sub(repository),
+            Some(Duration::from_millis(3_000)),
+            "a repository server's serving stages keep 3 s of the stop's 4 s"
+        );
+    }
+
+    #[test]
     fn the_server_stop_deadline_leaves_before_the_cli_gives_up() {
         assert!(
             SERVER_STOP_DEADLINE < STOP_WAIT_MAX,
@@ -1736,42 +1907,79 @@ mod tests {
         assert_eq!(AuthMode::default(), AuthMode::Token);
     }
 
+    /// The `log drain` stop stage flushes what the drain holds into the metrics database
+    /// and leaves nothing unwritten when it joins by its deadline.
     #[tokio::test]
-    async fn a_failed_log_drain_is_joined() {
-        let drain = tokio::spawn(async { panic!("injected log drain failure") });
+    async fn a_joined_log_drain_leaves_its_records_written() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = Arc::new(
+            rift_tracing::LogStore::open(&directory.path().join("metrics"), None)
+                .await
+                .expect("the metrics database opens"),
+        );
+        let (recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        rift_tracing::info!(component = "test", "written by the final flush");
+        drop(recorder);
+        let running = RunningLogDrain::spawn(drain, Arc::clone(&store), 100);
 
-        stop_log_drain(
-            Some(drain),
+        let unwritten = stop_log_drain(
+            Some(running),
             tokio::time::Instant::now() + SERVER_STOP_DEADLINE,
         )
         .await;
+
+        assert_eq!(unwritten, None, "a joined drain leaves nothing to count");
+        let stored = store
+            .reader()
+            .connect()
+            .and_then(|reads| reads.count())
+            .expect("the count reads");
+        assert_eq!(stored, 1, "the final flush wrote the record");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_log_drain_is_aborted_at_its_deadline() {
-        struct Stopped(Arc<AtomicBool>);
-        impl Drop for Stopped {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
-        let stopped = Arc::new(AtomicBool::new(false));
-        let task_stopped = Arc::clone(&stopped);
-        let drain = tokio::spawn(async move {
-            let _stopped = Stopped(task_stopped);
-            std::future::pending::<()>().await;
-        });
-        tokio::task::yield_now().await;
+    /// A repository server's `log drain` stage stops its routing drain after each workspace
+    /// consumer flushed what named its workspace: the store holds the record, nothing is
+    /// left unwritten, and both stops end well inside the stop's deadline.
+    #[tokio::test]
+    async fn a_routing_log_drain_stops_after_its_workspace_consumer_flushed() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let store = Arc::new(
+            rift_tracing::LogStore::open(&directory.path().join("metrics"), None)
+                .await
+                .expect("the metrics database opens"),
+        );
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let routing = RunningLogDrain::spawn_routed(drain, 100);
+        let consumer = RunningLogDrain::for_workspace("/served", Arc::clone(&store))
+            .expect("the routing drain starts a consumer");
+        rift_tracing::info!(
+            component = "test",
+            workspace = "/served",
+            "written by the consumer's final flush"
+        );
 
         let started = tokio::time::Instant::now();
-        stop_log_drain(Some(drain), started + SERVER_STOP_DEADLINE).await;
+        let deadline = started + SERVER_STOP_DEADLINE;
+        let consumer_unwritten = consumer.stop(deadline - SERVER_LOG_FLUSH_RESERVE).await;
+        let routing_unwritten = stop_log_drain(Some(routing), deadline).await;
 
-        assert!(stopped.load(Ordering::Acquire));
+        assert_eq!(consumer_unwritten, None, "the consumer joined");
+        assert_eq!(routing_unwritten, None, "the routing drain joined");
         assert!(
-            started.elapsed() < rift_mcp::STOP_REQUEST_TIMEOUT,
-            "the final log drain must leave time for a five-second stop to observe process exit"
+            started.elapsed() < SERVER_LOG_FLUSH_RESERVE,
+            "both stops ended inside the flush reserve: {:?}",
+            started.elapsed()
         );
+        let stored = store
+            .reader()
+            .connect()
+            .and_then(|reads| reads.count())
+            .expect("the count reads");
+        assert_eq!(stored, 1, "the consumer's final flush wrote the record");
     }
 
     #[test]
@@ -2500,13 +2708,9 @@ mod tests {
     /// A stop wait with slow probes ends inside its polling window.
     #[tokio::test(start_paused = true)]
     async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let process = ProcessExit::open(pid);
@@ -2543,13 +2747,9 @@ mod tests {
     /// The wait for a holder to release its election ends at its window under slow probes.
     #[tokio::test(start_paused = true)]
     async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let probe_times = std::cell::RefCell::new(Vec::new());
@@ -2585,13 +2785,9 @@ mod tests {
     /// one probe it adds past the window.
     #[tokio::test(start_paused = true)]
     async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let mut spawns = StartSpawns::<FakeChild>::default();
         let probe_times = std::cell::RefCell::new(Vec::new());
@@ -2629,13 +2825,9 @@ mod tests {
     /// Records actual blocking probe costs alongside the start wait's deadline decisions.
     #[tokio::test]
     async fn a_start_wait_records_synchronous_probe_costs() -> TestResult {
-        let _trace = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_test_writer()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        );
+        let (_trace, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let directory = tempfile::tempdir()?;
         let mut spawns = StartSpawns::<FakeChild>::default();
         let mut observations = Vec::new();
@@ -2911,14 +3103,9 @@ mod tests {
         Ok(())
     }
 
-    /// A log store on a temporary database, for the reads these cases drive.
+    /// A log store on a temporary metrics database, for the reads these cases drive.
     async fn log_store(directory: &tempfile::TempDir) -> TestResult<LogStore> {
-        let database = rift_index::WorkspaceDatabase::open(
-            &directory.path().join("db"),
-            rift_index::DatabasePool::new(2, 1_000),
-        )
-        .await?;
-        Ok(LogStore::attached(database))
+        Ok(LogStore::open(&directory.path().join("metrics"), None).await?)
     }
 
     #[test]
@@ -2957,7 +3144,7 @@ mod tests {
     fn a_logs_query_carries_its_tail_level_and_component() {
         let query = logs_query(
             TailCount::Newest(20),
-            None,
+            LogsWindow::default(),
             Some(LogLevel::Warn),
             Some("index"),
         );
@@ -2966,61 +3153,242 @@ mod tests {
         assert_eq!(query.level(), Some("warn"));
         assert_eq!(query.component(), Some("index"));
         assert_eq!(
-            logs_query(TailCount::All, None, None, None).limit(),
+            logs_query(TailCount::All, LogsWindow::default(), None, None).limit(),
             LOG_PAGE_RECORDS_MAX
         );
     }
 
+    /// The tracing clock's reading, in milliseconds since the Unix epoch, every age cutoff
+    /// of the logs tests counts back from.
+    const CLOCK_MS: i64 = 10_000_000;
+
+    /// A logs read as `rift server logs` builds it, with the tracing clock fixed at
+    /// [`CLOCK_MS`].
+    fn logs_query_at_fixed_clock(window: LogsWindow) -> LogQuery {
+        restricted_query(
+            LogQuery::newest(LOG_PAGE_RECORDS_MAX).at_clock_ms(CLOCK_MS),
+            window,
+            None,
+            None,
+        )
+    }
+
+    /// An `info` record of `index.build` at `recorded_at_ms` carrying `message`.
+    fn build_record(recorded_at_ms: i64, message: &str) -> LogRecord {
+        LogRecord::new(
+            recorded_at_ms,
+            "info",
+            "rift_mcp::server",
+            "index",
+            "index.build",
+            message,
+            "{}",
+        )
+    }
+
+    /// The messages of `records`, in the order read.
+    fn messages(records: &[rift_tracing::StoredLogRecord]) -> Vec<String> {
+        records
+            .iter()
+            .map(|stored| stored.record().message().to_owned())
+            .collect()
+    }
+
+    /// `--since 10m` selects `recorded_at >= clock - 600_000`: a record at the cutoff is
+    /// answered, one a millisecond before it is not.
     #[tokio::test]
-    async fn a_since_read_selects_only_records_inside_its_window() -> TestResult {
+    async fn a_logs_since_age_includes_its_cutoff_and_excludes_one_millisecond_before() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let now = now_ms();
-        let older = LogRecord::new(
-            now - MILLISECONDS_PER_HOUR,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "index.build",
-            "old",
-            "{}",
-        );
-        let fresh = LogRecord::new(
-            now,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "index.build",
-            "fresh",
-            "{}",
-        );
-        store.append(&[older, fresh], 1_000).await?;
+        let cutoff = CLOCK_MS - 600_000;
+        store
+            .append(
+                [
+                    build_record(cutoff - 1, "outside"),
+                    build_record(cutoff, "at cutoff"),
+                    build_record(cutoff + 1, "inside"),
+                ],
+                1_000,
+            )
+            .await?;
         let since = rift_protocol::configuration::Duration::parse("10m")?;
         assert_eq!(since.milliseconds(), 600_000);
         assert!(rift_protocol::configuration::Duration::parse("10").is_err());
 
+        let window = LogsWindow {
+            since: Some(LogsBound::Age(since)),
+            ..LogsWindow::default()
+        };
         let read = store
-            .following(&logs_query(TailCount::All, Some(since), None, None))
-            .await?;
+            .reader()
+            .connect()?
+            .following(&logs_query_at_fixed_clock(window))?;
 
-        assert_eq!(read.len(), 1);
-        assert_eq!(read[0].record().message(), "fresh");
+        assert_eq!(messages(&read), ["at cutoff", "inside"]);
         Ok(())
+    }
+
+    /// `--until 30m` selects `recorded_at < clock - 1_800_000`: a record at the cutoff is
+    /// not answered, one a millisecond before it is.
+    #[tokio::test]
+    async fn a_logs_until_age_excludes_its_cutoff_and_includes_one_millisecond_before() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let cutoff = CLOCK_MS - 1_800_000;
+        store
+            .append(
+                [
+                    build_record(cutoff - 1, "inside"),
+                    build_record(cutoff, "at cutoff"),
+                    build_record(cutoff + 1, "outside"),
+                ],
+                1_000,
+            )
+            .await?;
+        let window = LogsWindow {
+            until: Some(LogsBound::parse("30m")?),
+            ..LogsWindow::default()
+        };
+        let read = store
+            .reader()
+            .connect()?
+            .following(&logs_query_at_fixed_clock(window))?;
+
+        assert_eq!(messages(&read), ["inside"]);
+        Ok(())
+    }
+
+    /// `--since 2h --until 30m` counts both ages back from one clock reading: the window is
+    /// `clock - 7_200_000 <= recorded_at < clock - 1_800_000`, exact at both ends.
+    #[tokio::test]
+    async fn a_logs_since_and_until_age_select_the_window_between_them() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let since = CLOCK_MS - 7_200_000;
+        let until = CLOCK_MS - 1_800_000;
+        store
+            .append(
+                [
+                    build_record(since - 1, "before since"),
+                    build_record(since, "at since"),
+                    build_record(until - 1, "before until"),
+                    build_record(until, "at until"),
+                ],
+                1_000,
+            )
+            .await?;
+        let window = LogsWindow {
+            since: Some(LogsBound::parse("2h")?),
+            until: Some(LogsBound::parse("30m")?),
+        };
+
+        let read = store
+            .reader()
+            .connect()?
+            .following(&logs_query_at_fixed_clock(window))?;
+
+        assert_eq!(messages(&read), ["at since", "before until"]);
+        Ok(())
+    }
+
+    /// A follow read takes each later page with `after`, and the age cutoff the query
+    /// resolved when it was built still holds: a record appended after the first page, one
+    /// millisecond before the cutoff, stays out; one at the cutoff prints.
+    #[tokio::test]
+    async fn a_logs_follow_page_keeps_the_age_cutoff_of_its_query() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let cutoff = CLOCK_MS - 600_000;
+        store
+            .append([build_record(cutoff + 1, "first")], 1_000)
+            .await?;
+        let window = LogsWindow {
+            since: Some(LogsBound::parse("10m")?),
+            ..LogsWindow::default()
+        };
+        let query = logs_query_at_fixed_clock(window);
+        let reads = store.reader().connect()?;
+        let first = reads.following(&query)?;
+        assert_eq!(messages(&first), ["first"]);
+        let newest = first
+            .last()
+            .map_or(0, rift_tracing::StoredLogRecord::identity);
+
+        store
+            .append(
+                [
+                    build_record(cutoff - 1, "late but old"),
+                    build_record(cutoff, "late"),
+                ],
+                1_000,
+            )
+            .await?;
+        let next = reads.following(&query.clone().after(newest))?;
+
+        assert_eq!(messages(&next), ["late"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_logs_until_instant_selects_records_before_its_bound() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let started = 1_759_600_000_000;
+        store
+            .append(
+                [
+                    build_record(started - 1, "before"),
+                    build_record(started, "first"),
+                    build_record(started + 999, "last"),
+                    build_record(started + 1_000, "after"),
+                ],
+                1_000,
+            )
+            .await?;
+        let window = LogsWindow {
+            since: Some(LogsBound::parse("2025-10-04T17:46:40Z")?),
+            until: Some(LogsBound::parse("2025-10-04T17:46:41Z")?),
+        };
+        let read =
+            store
+                .reader()
+                .connect()?
+                .following(&logs_query(TailCount::All, window, None, None))?;
+
+        assert_eq!(messages(&read), ["first", "last"]);
+        Ok(())
+    }
+
+    /// An instant bound becomes its own milliseconds; an age bound is resolved by the query.
+    #[test]
+    fn a_logs_window_bound_reads_an_age_or_an_rfc_3339_timestamp() {
+        assert_eq!(
+            LogsBound::parse("10m"),
+            Ok(LogsBound::Age(
+                rift_protocol::configuration::Duration::from_millis(600_000)
+            ))
+        );
+        let instant = LogsBound::parse("1970-01-01T00:00:01.5Z").expect("an RFC 3339 instant");
+        assert_eq!(
+            instant.since(LogQuery::newest(1)),
+            LogQuery::newest(1).since_ms(1_500)
+        );
+        assert_eq!(
+            instant.until(LogQuery::newest(1)),
+            LogQuery::newest(1).until_ms(1_500)
+        );
+        let refused = LogsBound::parse("yesterday").expect_err("a word is no bound");
+        assert!(refused.contains("RFC 3339"), "{refused}");
     }
 
     #[tokio::test]
     async fn a_workspace_without_a_database_prints_nothing_and_creates_nothing() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let query = logs_query(TailCount::All, None, None, None);
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
-        print_logs(
-            directory.path(),
-            &query,
-            TailCount::All,
-            &LogsMode::Once,
-            &TimeZone::UTC,
-        )
-        .await?;
+        print_logs(directory.path(), &query, TailCount::All, &LogsMode::Once).await?;
 
         assert!(
             !directory.path().join(".rift").exists(),
@@ -3029,17 +3397,51 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn an_unopened_database_names_itself_in_the_refusal() {
-        let error = errors::cli::server_logs_unavailable()
-            .detail("the workspace database at `.rift/db` did not open")
-            .error();
+    /// `rift server logs` needs no server and no index database: with only
+    /// `.rift/metrics` present it reads the records and creates nothing else.
+    #[tokio::test]
+    async fn logs_print_from_the_metrics_database_alone() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir(&state_directory)?;
+        let store = LogStore::open(&state_directory.join("metrics"), None).await?;
+        store
+            .append(
+                [LogRecord::new(
+                    0,
+                    "info",
+                    "rift",
+                    "index",
+                    "index.build",
+                    "kept",
+                    "{}",
+                )],
+                1_000,
+            )
+            .await?;
+        store
+            .close(tokio::time::Instant::now() + SERVER_STOP_DEADLINE)
+            .await?;
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
-        assert_eq!(error.slug(), errors::cli::server_logs_unavailable::SLUG);
-        let rendered = error.to_string();
-        assert!(rendered.contains("did not open"), "{rendered}");
-        assert!(rendered.contains(".rift/db"), "{rendered}");
-        assert!(std::error::Error::source(&error).is_none());
+        print_logs(directory.path(), &query, TailCount::All, &LogsMode::Once).await?;
+        print_logs(
+            directory.path(),
+            &query,
+            TailCount::Newest(5),
+            &LogsMode::Once,
+        )
+        .await?;
+
+        let mut names: Vec<String> = std::fs::read_dir(&state_directory)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        names.retain(|name| !name.starts_with("metrics"));
+        assert!(
+            names.is_empty(),
+            "a logs read creates no other state: {names:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3050,7 +3452,7 @@ mod tests {
             .map(|_| LogRecord::new(0, "info", "rift", "index", "index.build", "x", "{}"))
             .collect();
         let refused = store
-            .append(&oversized, 1_000)
+            .append(oversized, 1_000)
             .await
             .expect_err("an oversized batch must be refused");
 
@@ -3069,109 +3471,142 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_rendered_line_carries_every_column() {
-        let record = LogRecord::new(
-            1_756_552_944_123,
-            "info",
-            "rift_mcp::server",
-            "index",
-            "rebuild",
-            "published 412 units",
-            "{\"unit_count\":412}",
-        );
+    /// A metrics file that is not a database fails each read with the read's operation, and
+    /// the store failure stays on the source chain.
+    #[tokio::test]
+    async fn a_logs_read_the_reader_refuses_names_the_read_and_keeps_its_source() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir(&state_directory)?;
+        std::fs::write(state_directory.join("metrics"), b"not a sqlite database")?;
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
 
-        assert_eq!(
-            rendered_line(&record, &TimeZone::UTC),
-            "2025-08-30T11:22:24.123+00:00 🔵 INFO  index    rebuild      \
-             published 412 units unit_count=412"
-        );
-    }
+        for tail in [TailCount::All, TailCount::Newest(5)] {
+            let refused = print_logs(directory.path(), &query, tail, &LogsMode::Once)
+                .await
+                .expect_err("a file that is not a database cannot be read");
 
-    #[test]
-    fn a_record_without_labels_prints_a_dash_in_each_column() {
-        let record = LogRecord::new(0, "warn", "rift", "", "", "late", "{}");
-
-        assert_eq!(
-            rendered_line(&record, &TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00 🟡 WARN  -        -            late"
-        );
-        assert_eq!(label(""), "-");
-        assert_eq!(label("index"), "index");
-    }
-
-    #[test]
-    fn every_level_prints_its_own_glyph() {
-        for (level, glyph) in [
-            ("error", "🔴"),
-            ("warn", "🟡"),
-            ("info", "🔵"),
-            ("debug", "⚪"),
-            ("trace", "⚫"),
-            ("loud", "⚫"),
-        ] {
-            assert_eq!(level_glyph(level), glyph, "{level}");
+            assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
+            let rendered = refused.to_string();
+            assert!(rendered.contains("read recorded logs"), "{rendered}");
+            assert!(
+                std::error::Error::source(&refused).is_some(),
+                "the store failure must stay on the source chain"
+            );
         }
+        Ok(())
     }
 
-    #[test]
-    fn fields_print_as_pairs_or_as_the_text_the_store_holds() {
-        assert_eq!(rendered_fields("{}"), "");
-        assert_eq!(rendered_fields(""), "");
-        assert_eq!(
-            rendered_fields("{\"epoch\":\"4\",\"count\":7}"),
-            " count=7 epoch=4"
-        );
-        assert_eq!(rendered_fields("not json"), " not json");
-        assert_eq!(rendered_fields("[1]"), " [1]");
+    /// A read that panics on its blocking thread is reported as an unavailable read.
+    #[tokio::test]
+    async fn a_read_that_panics_is_reported_as_an_unavailable_read() -> TestResult {
+        use super::{LogQuery, LogReads, StoredLogRecord, read_records};
+
+        fn panicking(
+            _reads: &LogReads,
+            _query: &LogQuery,
+        ) -> Result<Vec<StoredLogRecord>, rift_error::RiftError> {
+            panic!("injected read failure")
+        }
+
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
+
+        let refused = read_records(&store.reader(), query, panicking)
+            .await
+            .expect_err("a panicking read cannot answer");
+
+        assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
+        let rendered = refused.to_string();
+        assert!(rendered.contains("read recorded logs"), "{rendered}");
+        Ok(())
     }
 
-    #[test]
-    fn rendered_timestamp_uses_the_given_time_zones_offset() {
-        assert_eq!(
-            rendered_timestamp(0, &TimeZone::UTC),
-            "1970-01-01T00:00:00.000+00:00"
-        );
-        assert_eq!(
-            rendered_timestamp(-1, &TimeZone::UTC),
-            "1969-12-31T23:59:59.999+00:00"
-        );
+    /// A follow whose read is refused fails at once rather than waiting to poll again.
+    #[tokio::test]
+    async fn a_follow_whose_read_is_refused_fails_before_it_waits() -> TestResult {
+        use super::{LogLines, LogReader, follow_until_interrupt};
 
-        let positive = TimeZone::fixed(Offset::from_hours(2).expect("+2h must be a valid offset"));
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &positive),
-            "2025-08-30T13:22:24.123+02:00"
-        );
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("metrics");
+        std::fs::write(&path, b"not a sqlite database")?;
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
+        let interrupted = tokio_util::sync::CancellationToken::new();
 
-        let negative = TimeZone::fixed(Offset::from_hours(-5).expect("-5h must be a valid offset"));
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &negative),
-            "2025-08-30T06:22:24.123-05:00"
-        );
+        let refused = follow_until_interrupt(
+            &LogReader::new(&path),
+            &query,
+            0,
+            &interrupted,
+            &mut LogLines::live_stream(),
+        )
+        .await
+        .expect_err("a file that is not a database cannot be followed");
 
-        let berlin =
-            TimeZone::get("Europe/Berlin").expect("the tz database must carry Europe/Berlin");
-        assert_eq!(
-            rendered_timestamp(1_756_552_944_123, &berlin),
-            "2025-08-30T13:22:24.123+02:00",
-            "August is daylight saving time in Berlin, CEST"
-        );
-        assert_eq!(
-            rendered_timestamp(1_736_940_144_123, &berlin),
-            "2025-01-15T12:22:24.123+01:00",
-            "January is standard time in Berlin, CET"
-        );
+        assert_eq!(refused.slug(), errors::cli::server_logs_unavailable::SLUG);
+        Ok(())
     }
 
-    #[test]
-    fn an_out_of_range_millisecond_count_falls_back_to_the_raw_count() {
-        assert_eq!(
-            rendered_timestamp(i64::MAX, &TimeZone::UTC),
-            i64::MAX.to_string()
+    /// An interrupt that arrives inside the follow loop ends the follow once the read in
+    /// flight answers. The first poll enters the loop and returns pending, on the read or on
+    /// the poll interval, so the interrupt always lands inside the loop.
+    #[tokio::test]
+    async fn a_follow_ends_after_the_read_in_flight_when_interrupted() -> TestResult {
+        use super::{LogLines, follow_until_interrupt};
+        use std::task::{Context, Waker};
+
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let followed = LogRecord::new(0, "info", "rift", "index", "index.build", "followed", "{}");
+        store.append([followed], 1_000).await?;
+        let reader = store.reader();
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
+        let interrupted = tokio_util::sync::CancellationToken::new();
+        let mut lines = LogLines::live_stream();
+        let mut follow = Box::pin(follow_until_interrupt(
+            &reader,
+            &query,
+            0,
+            &interrupted,
+            &mut lines,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        let first_poll = std::future::Future::poll(follow.as_mut(), &mut context);
+        assert!(
+            first_poll.is_pending(),
+            "the loop waits on a read or on its interval"
         );
-        assert_eq!(
-            rendered_timestamp(i64::MIN, &TimeZone::UTC),
-            i64::MIN.to_string()
+
+        interrupted.cancel();
+
+        follow.await?;
+        Ok(())
+    }
+
+    /// `--follow` prints until the operator interrupts, so a followed read has not ended
+    /// when a bound on it elapses. The clock is paused: it advances only while no read is
+    /// on a blocking thread, so the bound elapses inside the poll interval of the follow
+    /// loop, after the first page printed, on every run.
+    #[tokio::test(start_paused = true)]
+    async fn a_followed_read_ends_only_on_the_interrupt() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir(&state_directory)?;
+        let store = LogStore::open(&state_directory.join("metrics"), None).await?;
+        let kept = LogRecord::new(0, "info", "rift", "index", "index.build", "kept", "{}");
+        store.append([kept], 1_000).await?;
+        let query = logs_query(TailCount::All, LogsWindow::default(), None, None);
+        let following = print_logs(
+            directory.path(),
+            &query,
+            TailCount::Newest(5),
+            &LogsMode::Following,
         );
+
+        let followed = tokio::time::timeout(std::time::Duration::from_secs(2), following).await;
+
+        assert!(followed.is_err(), "a follow ends only on the interrupt");
+        Ok(())
     }
 }

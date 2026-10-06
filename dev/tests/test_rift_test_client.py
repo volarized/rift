@@ -17,11 +17,14 @@ from jsonschema import ValidationError
 from mcp import ClientSession, types
 from rift_dev.commands import Command, Process
 from rift_dev.rift_test_client import (
+    LOG_FILTER,
+    RECORDS_FILE_BYTES,
     Client,
     FailureCause,
     FailureLimit,
     Server,
     ToolFailure,
+    cut_notice,
     outside_workspace,
     parse_failure,
 )
@@ -505,7 +508,12 @@ def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="log collection failed"):
         server.check_running()
     process.poll.assert_not_called()
-    assert server.log_path.stat().st_size == LOG_BYTES_MAX
+    notice = cut_notice("server output", LOG_BYTES_MAX)
+    retained = server.log_path.read_bytes()
+    assert len(retained) == LOG_BYTES_MAX + len(notice)
+    assert retained.endswith(notice.encode())
+    assert server.output_cut
+    assert server.read_log().endswith(notice)
 
 
 def test_tool_error_cannot_satisfy_a_read() -> None:
@@ -655,7 +663,10 @@ def test_sdk_stderr_overflow_is_bounded(tmp_path: Path) -> None:
         stderr_log(path) as log,
     ):
         anyio.run(transport, log)
-    assert path.stat().st_size == LOG_BYTES_MAX
+    notice = cut_notice("SDK stderr", LOG_BYTES_MAX)
+    retained = path.read_bytes()
+    assert len(retained) == LOG_BYTES_MAX + len(notice)
+    assert retained.endswith(notice.encode())
 
 
 def test_gate_deadline_cancels_async_work_after_cleanup_and_records_failure(
@@ -783,3 +794,166 @@ def test_unexercised_read_tool_is_rejected() -> None:
         client.require_complete({"search"})
     asyncio.run(client.call("search", {}))
     client.require_complete({"search"})
+
+
+def test_server_sets_its_log_filter_and_never_inherits_rust_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUST_LOG", "trace")
+    server = Server(tmp_path / "rift", tmp_path / "workspace", tmp_path / "server.log")
+    assert server.env["RUST_LOG"] == LOG_FILTER
+    explicit = Server(
+        tmp_path / "rift",
+        tmp_path / "workspace",
+        tmp_path / "server.log",
+        env={"RUST_LOG": "rift=error"},
+    )
+    assert explicit.env["RUST_LOG"] == "rift=error"
+
+
+RECORDS_BINARY = """
+import os, sys
+with open(os.environ["RECORD_ARGUMENTS"], "w") as seen:
+    seen.write(" ".join(sys.argv[1:]) + "|" + os.getcwd() + "|" + os.environ["RUST_LOG"])
+print("2026-10-05T09:00:00.000Z ERROR index build failed")
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_records_read_the_persisted_log_without_a_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    seen = tmp_path / "arguments"
+    monkeypatch.setenv("RECORD_ARGUMENTS", str(seen))
+    server = Server(
+        fake_binary(tmp_path, RECORDS_BINARY), root, tmp_path / "server.log"
+    )
+    text = server.records()
+    assert seen.read_text() == f"server logs --tail 5000|{root.resolve()}|{LOG_FILTER}"
+    assert "ERROR index build failed" in text
+    assert text.startswith(f"persisted log records ({server.records_path}):")
+    assert "ERROR index build failed" in server.records_path.read_text()
+    assert server.records_path == tmp_path / "server.records.log"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_records_failure_is_text_and_never_raises(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    binary = fake_binary(tmp_path, "import sys\nsys.exit(3)\n")
+    server = Server(binary, root, tmp_path / "server.log")
+    assert server.records().startswith(
+        "persisted log records unavailable: rift exited 3"
+    )
+    missing = Server(tmp_path / "absent", root, tmp_path / "other.log")
+    assert missing.records().startswith("persisted log records unavailable:")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_evidence_keeps_server_stderr_proxy_stderr_and_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    monkeypatch.setenv("RECORD_ARGUMENTS", str(tmp_path / "arguments"))
+    server = Server(
+        fake_binary(tmp_path, RECORDS_BINARY), root, tmp_path / "server.log"
+    )
+    server.log_path.write_text("server: bound 127.0.0.1\n", encoding="utf-8")
+    proxy = server.log_path.with_suffix(".mcp.log")
+    proxy.write_text("proxy: waiting for lock\n", encoding="utf-8")
+    server._proxy_logs.append(proxy)
+    notes = server.evidence()
+    assert notes[0] == f"server stderr ({server.log_path}):\nserver: bound 127.0.0.1\n"
+    assert notes[1] == f"rift mcp stderr ({proxy}):\nproxy: waiting for lock\n"
+    assert "ERROR index build failed" in notes[2]
+    assert notes[-1].startswith("machine: logical_cpus=")
+    assert server.proxy_logs == (proxy,)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_evidence_falls_back_to_server_stderr_after_a_store_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rift_dev.rift_test_client import STORE_FALLBACK, STORE_REFUSAL
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    monkeypatch.setenv("RECORD_ARGUMENTS", str(tmp_path / "arguments"))
+    server = Server(
+        fake_binary(tmp_path, RECORDS_BINARY), root, tmp_path / "server.log"
+    )
+    refusal = f"{STORE_REFUSAL} of 3; the log drain keeps it: database is locked\n"
+    server.log_path.write_text(f"server: bound\n{refusal}", encoding="utf-8")
+    notes = server.evidence()
+    assert notes[0] == (
+        f"server stderr ({server.log_path}):\n{STORE_FALLBACK}server: bound\n{refusal}"
+    )
+    server.log_path.write_text(f"server: quoted {refusal}", encoding="utf-8")
+    assert STORE_FALLBACK not in server.evidence()[0]
+
+
+def test_evidence_tail_names_the_file_holding_the_rest(tmp_path: Path) -> None:
+    from rift_dev.rift_test_client import EVIDENCE_TAIL_BYTES, tail_text
+
+    path = tmp_path / "server.log"
+    text = "a" * 10 + "b" * EVIDENCE_TAIL_BYTES
+    kept = tail_text(text, path)
+    assert kept.startswith(f"[10 earlier bytes are in {path}]\n")
+    assert kept.endswith("b" * EVIDENCE_TAIL_BYTES)
+    assert tail_text("short", path) == "short"
+    assert tail_text(text).startswith("[10 earlier bytes were left out]\n")
+
+
+BIG_RECORDS_BINARY = """
+print("x" * 1000 + "\\n", end="")
+print("y" * (1024 * 1024) + "\\nnewest stop record")
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_records_file_keeps_the_newest_bytes_and_states_the_cut(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = Server(
+        fake_binary(tmp_path, BIG_RECORDS_BINARY), root, tmp_path / "server.log"
+    )
+    server.read_records()
+    written = server.records_path.read_bytes()
+    assert written.endswith(b"newest stop record\n")
+    assert written.startswith(b"[")
+    assert b"earlier bytes were left out]\n" in written[:80]
+    assert len(written) <= RECORDS_FILE_BYTES + 80
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_read_records_raises_on_failure_for_the_caller_to_note(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = Server(
+        fake_binary(tmp_path, "import sys\nsys.exit(3)\n"), root, tmp_path / "s.log"
+    )
+    with pytest.raises(RuntimeError, match="rift exited 3"):
+        server.read_records()
+
+
+def test_tool_error_keeps_the_registered_identity_apart_from_diagnostics() -> None:
+    failure = parse_failure(
+        "search",
+        "1 error\n\tinvalid_request · retry never\n"
+        "\t\tthe request does not match the documented form\n"
+        "\t\terror[E0308] src/lib.rs:3:5: mismatched types\n"
+        "\t\trift.server.read_invalid\n",
+    )
+    assert failure.identity == "rift.server.read_invalid"
+    assert failure.diagnostics == ["error[E0308] src/lib.rs:3:5: mismatched types"]
+    unregistered = parse_failure(
+        "search", "1 error\n\tinternal_error · retry never\n\t\tbad request\n"
+    )
+    assert unregistered.identity == ""

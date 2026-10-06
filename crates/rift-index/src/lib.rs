@@ -9,8 +9,8 @@ mod database_thread;
 mod documentation;
 mod documentation_store;
 mod language;
+mod lazy_database;
 mod lexical;
-mod log;
 mod semantic;
 mod trigram_store;
 
@@ -24,15 +24,12 @@ pub use change_set::{
     ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
 };
 pub use content_cache::WorkspaceContentCache;
-pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
+pub use database::{DatabaseName, DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
+pub use lazy_database::LazyDatabase;
 pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
-};
-pub use log::{
-    LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
-    LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, LogStore, StoredLogRecord,
 };
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;

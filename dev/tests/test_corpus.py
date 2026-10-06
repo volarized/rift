@@ -28,6 +28,7 @@ from rift_dev.corpus_assertions import (
     active_stdout,
     build_records,
     chunked_answer,
+    database_bytes,
     exact_degradation,
     language_counts,
     last_line_pattern,
@@ -402,25 +403,52 @@ class Decisions(unittest.TestCase):
     def test_synchronous_rebuild_requires_matching_epoch_without_completion(
         self,
     ) -> None:
-        start = 'DEBUG rift_mcp::validation: index capture started component="index" operation="index.build" phase="start" epoch=7\n'
+        start = (
+            "2026-10-05 10:27:17.470Z DEBUG rift_mcp::validation::supervise   "
+            "component=index epoch=7 trigger=filesystem  ↳ worker.run component=worker "
+            "operation=worker.run work=filesystem index rebuild → index capture started "
+            "component=index operation=index.build epoch=7 phase=start\n"
+        )
         self.assertEqual(active_stdout(start, "rebuild", "7"), start.strip())
         self.assertEqual(active_stdout(start, "rebuild", None), start.strip())
-        wrong_close = 'INFO index.build{component="index" epoch=6}: rift_mcp::validation: close time.busy=1s\n'
+        wrong_close = (
+            "2026-10-05 10:27:17.487Z INFO  rift_mcp::validation::supervise   "
+            "component=index epoch=6 trigger=filesystem  ↳ index.build component=index "
+            "outcome=ok close ✓ busy=18.0ms idle=19.3µs\n"
+        )
+        nested_close = (
+            "2026-10-05 10:27:17.486Z INFO  rift_mcp::validation::supervise   "
+            "component=index epoch=7 trigger=filesystem  ↳ worker.run component=worker "
+            "operation=worker.run close ✓ busy=1.02ms idle=4.10µs\n"
+        )
         self.assertEqual(
-            active_stdout(start + wrong_close, "rebuild", "7"), start.strip()
+            active_stdout(start + wrong_close + nested_close, "rebuild", "7"),
+            start.strip(),
         )
         matching_close = wrong_close.replace("epoch=6", "epoch=7")
-        for output, epoch in ((start, "8"), (start + matching_close, "7"), ("", "7")):
+        failed_close = matching_close.replace(
+            "outcome=ok close ✓", "outcome=error close ✗"
+        )
+        for output, epoch in (
+            (start, "8"),
+            (start + matching_close, "7"),
+            (start + failed_close, "7"),
+            ("", "7"),
+        ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", epoch)
         for output in (
-            start.replace('component="index"', 'component="dependency"'),
-            start.replace('operation="index.build"', 'operation="index.publish"'),
-            start.replace('phase="start"', 'phase="complete"'),
+            start.replace(
+                "component=index operation", "component=dependency operation"
+            ),
+            start.replace("operation=index.build", "operation=index.publish"),
+            start.replace("phase=start", "phase=complete"),
             start.replace("epoch=7", "epoch=0"),
             start.replace("epoch=7", ""),
             start + matching_close,
-            start + 'INFO index snapshot published operation="index.publish"\n',
+            start + "2026-10-05 10:27:17.487Z INFO  rift_mcp::validation::supervise   "
+            "component=index epoch=7 trigger=filesystem  index snapshot published "
+            "operation=index.publish epoch=7 trigger=filesystem\n",
         ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", None)
@@ -428,19 +456,24 @@ class Decisions(unittest.TestCase):
     def test_synchronous_history_requires_an_open_batch_with_pending_commits(
         self,
     ) -> None:
-        span = 'history.batch{component="history" operation="history.batch"}'
         start = (
-            f"DEBUG {span}: rift_mcp::history: history batch started "
-            'component="history" operation="history.batch" phase="start" pending=4\n'
+            "2026-10-05 10:27:14.892Z DEBUG rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  → history batch started "
+            "pending=4 phase=start\n"
         )
-        close = f"INFO {span}: rift_mcp::history: close time.busy=1ms time.idle=2s\n"
+        close = (
+            "2026-10-05 10:27:14.913Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  close ✓ busy=17.0ms idle=7.08µs\n"
+        )
         analyzed = (
-            f'INFO {span}:history.analyze{{component="history" operation="history.analyze"}}:'
-            " rift_mcp::history: close time.busy=1s\n"
+            "2026-10-05 10:27:14.898Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  ↳ history.analyze "
+            "component=history operation=history.analyze close ✓ busy=2.01ms idle=4.10µs\n"
         )
         written = (
-            f'INFO {span}:history.write{{component="history" operation="history.write"}}:'
-            " rift_mcp::history: close time.busy=1ms\n"
+            "2026-10-05 10:27:14.913Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+            "component=history operation=history.batch  ↳ history.write "
+            "component=history operation=history.write close ✓ busy=3.02ms idle=4.10µs\n"
         )
         self.assertEqual(active_stdout(start, "history", None), start.strip())
         self.assertEqual(
@@ -457,6 +490,7 @@ class Decisions(unittest.TestCase):
             start.replace("pending=4", "pending=0"),
             start.replace(" pending=4", ""),
             start.replace("history batch started", "history batch opened"),
+            start.replace("component=history", "component=mcp"),
             start + close + start.replace("pending=4", "pending=0"),
         ):
             with self.assertRaises(AssertionError):
@@ -881,11 +915,36 @@ BEACON_ROW = (
 
 
 class PersistedContent(unittest.TestCase):
+    def test_database_bytes_sizes_each_database_and_its_sidecar_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".rift"
+            state.mkdir()
+            for name, size in (
+                ("index", 4),
+                ("index-wal", 3),
+                ("metrics", 2),
+                ("metrics-wal", 1),
+                ("vectors-shm", 5),
+                ("server.json", 9),
+            ):
+                (state / name).write_bytes(b"x" * size)
+            self.assertEqual(
+                database_bytes(root),
+                {
+                    "index": 4,
+                    "index-wal": 3,
+                    "metrics": 2,
+                    "metrics-wal": 1,
+                    "vectors-shm": 5,
+                },
+            )
+
     def test_reads_close_connections_on_success_and_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
-            with closing(sqlite3.connect(root / ".rift/db")) as fixture:
+            with closing(sqlite3.connect(root / ".rift/index")) as fixture:
                 fixture.execute(DOCUMENTS_TABLE)
                 fixture.execute(BEACON_ROW)
                 fixture.commit()
@@ -918,7 +977,7 @@ class PersistedContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
-            with sqlite3.connect(root / ".rift/db") as connection:
+            with sqlite3.connect(root / ".rift/index") as connection:
                 connection.execute(DOCUMENTS_TABLE)
                 connection.execute(BEACON_ROW)
                 connection.commit()
@@ -942,7 +1001,7 @@ class PersistedContent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".rift").mkdir()
-            with sqlite3.connect(root / ".rift/db") as connection:
+            with sqlite3.connect(root / ".rift/index") as connection:
                 connection.execute(DOCUMENTS_TABLE)
                 connection.commit()
                 with self.assertRaisesRegex(AssertionError, "empty"):
@@ -1046,6 +1105,10 @@ class SourceBound(unittest.TestCase):
     ) -> tuple[Corpus, MagicMock]:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
+        server.root = Path("workspace")
+        server.log_path = Path("server.log")
         client = AsyncMock(spec=Client)
         client.call.side_effect = responses
         client.resource.return_value = {
@@ -1150,6 +1213,10 @@ class SourceBound(unittest.TestCase):
     def test_refusal_wait_keeps_one_deadline_and_closes_on_timeout(self) -> None:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
+        server.root = Path("workspace")
+        server.log_path = Path("server.log")
         client = AsyncMock(spec=Client)
 
         async def held_read(_name: str, _arguments: JsonObject) -> JsonObject:
@@ -1177,6 +1244,10 @@ class SourceBound(unittest.TestCase):
     def test_stop_failure_cannot_record_passed_source_bound(self) -> None:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
+        server.root = Path("workspace")
+        server.log_path = Path("server.log")
         server.stop.side_effect = AssertionError("server stop exceeded its deadline")
         client = AsyncMock(spec=Client)
         client.call.side_effect = self.refusal()
@@ -1212,6 +1283,10 @@ class ChurnPreparation(unittest.TestCase):
             corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
             corpus.root = Path(directory)
             server = MagicMock(spec=Server)
+            server.started_at = ""
+            server.read_records.return_value = ""
+            server.root = Path("workspace")
+            server.log_path = Path("server.log")
             server.__enter__.return_value = server
 
             def close(*_arguments: object) -> None:

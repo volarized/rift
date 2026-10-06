@@ -1350,8 +1350,8 @@ while IFS= read -r header; do
 done
 "#;
 
-/// A walk whose engine answers only after the request deadline is refused as before,
-/// `temporarily_unavailable` with `retry: same_request`, and keeps its engine session:
+/// A walk whose engine answers only after the request deadline is refused with
+/// `temporarily_unavailable` and `retry: same_request`, and keeps its engine session:
 /// the next walk is served by the same engine process, which reads `didClose` for the
 /// document the refused walk left open before it reads that document's next `didOpen`,
 /// and the refused walk's late answer is discarded on the way.
@@ -1439,7 +1439,7 @@ done
 "#;
 
 /// A walk whose engine is still starting when `[server] readiness_timeout` is spent is
-/// refused as before, `temporarily_unavailable` with `retry: same_request`, and the start
+/// refused with `temporarily_unavailable` and `retry: same_request`, and the start
 /// keeps running: the next walk meets the one engine process that start brought up.
 #[cfg(unix)]
 #[tokio::test]

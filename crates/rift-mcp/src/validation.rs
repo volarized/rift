@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock, Weak};
 use std::time::Duration;
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
@@ -49,9 +49,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
+use crate::metrics::SCOPE;
 use crate::server::{BlockingExecutor, EngineHold};
 
 /// Filesystem events coalesced while one rebuild is pending.
@@ -60,6 +60,9 @@ pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
 pub(crate) const INDEX_DEBOUNCE: Duration = Duration::from_millis(50);
 /// Complete capture retries while the tree keeps moving.
 pub(crate) const INDEX_CAPTURE_ATTEMPTS_MAX: usize = 3;
+/// Most observed paths one running capture reads again to decide whether a later
+/// observation supersedes it. Past it the capture runs to its end and publication decides.
+pub(crate) const RUNNING_CAPTURE_READS_MAX: usize = 64;
 
 /// What the next rebuild must cover, accumulated between publications.
 ///
@@ -97,6 +100,16 @@ impl PendingWork {
     /// Whether this observation asks for every visible file to be read again.
     pub(crate) const fn covers_whole_workspace(&self) -> bool {
         self.whole_workspace
+    }
+
+    /// The `index.rebuild.trigger` of the rebuild this observation starts: `rescan` when
+    /// it reads every visible file again, `filesystem` when it reads the paths it names.
+    const fn rebuild_trigger(&self) -> &'static str {
+        if self.whole_workspace {
+            REBUILD_TRIGGER_RESCAN
+        } else {
+            REBUILD_TRIGGER_FILESYSTEM
+        }
     }
 
     /// The paths this observation retains, in project-path order.
@@ -146,7 +159,14 @@ pub(crate) struct RebuildRequest {
     pub(crate) previous: Option<Arc<PublishedWorkspace>>,
     /// Supervisor stop state, checked between files by index capture.
     pub(crate) cancellation: CancellationToken,
+    /// The validation whose observation this rebuild answers, asked between files and at
+    /// phase boundaries whether a later observation already supersedes the capture.
+    /// Absent for a request a test builds without one.
+    pub(crate) observation: Option<Weak<IndexValidation>>,
 }
+
+/// The record one capture read for each path its observation named.
+type CapturedRecords = BTreeMap<ProjectPath, Option<FileRecord>>;
 
 impl RebuildRequest {
     /// The rebuild startup runs: every visible file, with nothing to share.
@@ -157,6 +177,7 @@ impl RebuildRequest {
             work: PendingWork::whole_workspace(),
             previous: None,
             cancellation: CancellationToken::new(),
+            observation: None,
         }
     }
 
@@ -167,34 +188,48 @@ impl RebuildRequest {
     /// incremental change. A path whose bytes cannot be read for any reason other than its
     /// absence, a directory, or the per-file byte bound asks for a whole scan, because that
     /// scan decides whether the path is a refusal or a removal.
+    #[cfg(test)]
     fn change_set(&self, root: &Path, configuration: &ConfigurationState) -> ChangeSet {
+        self.change_set_with_records(root, configuration).0
+    }
+
+    /// Resolves this observation as [`Self::change_set`] documents, and keeps the record
+    /// read for each named path beside an incremental change set.
+    ///
+    /// The records are what a running capture compares a later observation with. A whole
+    /// scan, and a configuration change that reads no named path, keep none.
+    fn change_set_with_records(
+        &self,
+        root: &Path,
+        configuration: &ConfigurationState,
+    ) -> (ChangeSet, Option<CapturedRecords>) {
         let Some(previous) = self.previous.as_ref() else {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         };
         if self.work.whole_workspace {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         }
         if previous.configuration.fingerprint != configuration.fingerprint {
             if previous
                 .configuration
                 .index_configuration_differs(configuration)
             {
-                return ChangeSet::Full;
+                return (ChangeSet::Full, None);
             }
-            return ChangeSet::Incremental(PathChanges::default());
+            return (ChangeSet::Incremental(PathChanges::default()), None);
         }
         if previous.holds_files_below_a_gone_path(root, &self.work.paths) {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         }
         let Some(source_policy) = previous.source_policy.as_deref() else {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         };
         let Some(observed) = observed_records(root, &self.work.paths, source_policy) else {
-            return ChangeSet::Full;
+            return (ChangeSet::Full, None);
         };
-        ChangeSet::Incremental(PathChanges::resolve(observed, |path| {
-            previous.file_record(path)
-        }))
+        let records = observed.iter().cloned().collect();
+        let changes = PathChanges::resolve(observed, |path| previous.file_record(path));
+        (ChangeSet::Incremental(changes), Some(records))
     }
 }
 
@@ -374,11 +409,32 @@ impl PublishedWorkspace {
     /// A file left out under the per-file byte bound matches only a publication that left
     /// it out the same way; an I/O error matches nothing.
     fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        self.holds_observed_beside(root, paths, &CapturedRecords::new())
+    }
+
+    /// Whether a capture resolved against this publication holds what every one of
+    /// `paths` holds on disk: the record in `records` for a path the capture read, and
+    /// this publication's own record for every other path.
+    ///
+    /// This is [`Self::holds_observed`] asked before the capture's candidate exists, with
+    /// the same reads and the same comparison.
+    fn holds_observed_beside(
+        &self,
+        root: &Path,
+        paths: &BTreeSet<ProjectPath>,
+        records: &CapturedRecords,
+    ) -> bool {
         self.source_policy
             .as_deref()
             .and_then(|policy| observed_records(root, paths, policy))
             .is_some_and(|observed| {
-                PathChanges::resolve(observed, |path| self.file_record(path)).is_empty()
+                PathChanges::resolve(observed, |path| {
+                    records
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| self.file_record(path))
+                })
+                .is_empty()
             })
     }
 
@@ -443,19 +499,118 @@ fn publication_map(
     reads: &ReadService,
     preparation: Option<&LocalIndexPreparation>,
 ) -> Arc<WorkspaceMap> {
-    let mut map = preparation.map_or_else(
-        || reads.workspace_map(),
-        |preparation| {
-            reads.workspace_preparation_map(
-                &preparation.map_source_paths,
-                &preparation.map_text_paths,
-            )
-        },
-    );
+    let mut map = rift_tracing::traced!(component = "index", operation = "index.map", {
+        preparation.map_or_else(
+            || reads.workspace_map(),
+            |preparation| {
+                reads.workspace_preparation_map(
+                    &preparation.map_source_paths,
+                    &preparation.map_text_paths,
+                )
+            },
+        )
+    });
     if let Some(warning) = preparation.and_then(LocalIndexPreparation::warning) {
         map.warnings.push(warning);
     }
     Arc::new(map)
+}
+
+/// `index.epoch`: the epoch the index last published and the filesystem epoch it last
+/// observed, recorded where each one moves. An observed epoch running ahead of the
+/// published one is an index behind the tree.
+static INDEX_EPOCH: rift_tracing::Gauge<u64, 1> =
+    rift_tracing::Gauge::declare(SCOPE, "index.epoch", "{epoch}", &["index.epoch.kind"]);
+/// The `index.epoch.kind` of the epoch a publication installs.
+const INDEX_EPOCH_PUBLISHED: &str = "published";
+/// The `index.epoch.kind` of the epoch an observation reaches.
+const INDEX_EPOCH_OBSERVED: &str = "observed";
+
+/// `index.invalidation.dropped`: observations whose signal the supervisor's invalidation
+/// channel refused because it was full, by the `event` route the observation took. The
+/// channel holds [`INDEX_INVALIDATIONS_MAX`] signals and the supervisor takes all pending
+/// work on the turn one signal starts, so a refused signal loses no work: the count is the
+/// observations that joined a turn already announced. No record is written per refusal.
+static INDEX_INVALIDATION_DROPPED: rift_tracing::Counter<1> =
+    rift_tracing::Counter::declare(SCOPE, "index.invalidation.dropped", "{event}", &["event"]);
+
+/// `watch.events`: native watch events, by `watch.event.kind`, notify's spelling of the
+/// event's kind, and `watch.event.route`, the [`WatchImpact`] it took.
+static WATCH_EVENTS: rift_tracing::Counter<2> = rift_tracing::Counter::declare(
+    SCOPE,
+    "watch.events",
+    "{event}",
+    &["watch.event.kind", "watch.event.route"],
+);
+/// The `watch.event.route` of an event that cannot change the index.
+const WATCH_ROUTE_NONE: &str = "none";
+/// The `watch.event.route` of an event naming the visible files it moved.
+const WATCH_ROUTE_PATHS: &str = "paths";
+/// The `watch.event.route` of an event that asks for every visible file to be read again.
+const WATCH_ROUTE_WHOLE_WORKSPACE: &str = "whole_workspace";
+
+/// `index.rebuilds`: rebuilds by `index.rebuild.trigger`, and by `error.type` for one that
+/// ended without an outcome: the failure's registered identity, or `cancelled`.
+static INDEX_REBUILDS: rift_tracing::Counter<2> = rift_tracing::Counter::declare(
+    SCOPE,
+    "index.rebuilds",
+    "{rebuild}",
+    &["index.rebuild.trigger", "error.type"],
+);
+/// The `index.rebuild.trigger` of the preparation a server runs once as it starts.
+const REBUILD_TRIGGER_STARTUP: &str = "startup";
+/// The `index.rebuild.trigger` of a rebuild that reads the paths its observation names.
+const REBUILD_TRIGGER_FILESYSTEM: &str = "filesystem";
+/// The `index.rebuild.trigger` of a rebuild that reads every visible file again.
+const REBUILD_TRIGGER_RESCAN: &str = "rescan";
+/// The `error.type` of a rebuild the supervisor's cancellation ended.
+const REBUILD_CANCELLED: &str = "cancelled";
+
+/// Counts one rebuild `trigger` started into `index.rebuilds`, under `error_type`: empty
+/// for a rebuild that reached an outcome.
+fn count_rebuild(trigger: &'static str, error_type: &'static str) {
+    INDEX_REBUILDS.labeled([trigger, error_type]).add(1);
+}
+
+/// The `error.type` of a rebuild that ended with `result`.
+fn rebuild_error_type(result: &Result<RebuildOutcome, RiftError>) -> &'static str {
+    match result {
+        Ok(RebuildOutcome::Cancelled) => REBUILD_CANCELLED,
+        Ok(_) => "",
+        Err(error) => error.slug().as_str(),
+    }
+}
+
+/// The lock a write of the published snapshot, [`IndexState`], is recorded under.
+pub(crate) const PUBLISHED_SNAPSHOT_LOCK: &str = "index.snapshot";
+
+/// Takes the published snapshot's write lock on a blocking thread, recorded as the lock
+/// [`PUBLISHED_SNAPSHOT_LOCK`]: the wait for its readers to leave and the time the write
+/// stays held. The held write stays in the table of operations in flight until the guard
+/// drops. Tokio's `RwLock` is write-preferring, so every read that arrives meanwhile waits
+/// for that guard.
+fn write_published(
+    published: &RwLock<IndexState>,
+) -> rift_tracing::Held<tokio::sync::RwLockWriteGuard<'_, IndexState>> {
+    let Ok(state) = rift_tracing::lock(PUBLISHED_SNAPSHOT_LOCK)
+        .try_acquire(|| Ok::<_, std::convert::Infallible>(published.blocking_write()));
+    state
+}
+
+/// Takes the published snapshot's read lock, recorded as the lock
+/// [`PUBLISHED_SNAPSHOT_LOCK`] in shared mode: a read that waits behind a held or queued
+/// write records that wait and the time the read stays held.
+///
+/// # Cancel safety
+///
+/// As cancel-safe as `RwLock::read`: dropping the future gives up its place in the queue.
+pub(crate) async fn read_published(
+    published: &RwLock<IndexState>,
+) -> rift_tracing::Held<tokio::sync::RwLockReadGuard<'_, IndexState>> {
+    rift_tracing::lock(PUBLISHED_SNAPSHOT_LOCK)
+        .shared()
+        .acquire(published.read())
+        .await
 }
 
 /// Published workspace plus failure for latest observed epoch.
@@ -480,6 +635,9 @@ impl IndexState {
         if candidate.epoch != observed_epoch {
             return false;
         }
+        INDEX_EPOCH
+            .labeled_value([INDEX_EPOCH_PUBLISHED], candidate.epoch)
+            .record();
         self.current = candidate;
         self.failure = None;
         true
@@ -507,8 +665,8 @@ pub(crate) struct IndexValidation {
     pub(crate) watch_failed: Arc<AtomicBool>,
     pub(crate) invalidations: mpsc::Sender<()>,
     pub(crate) changed: Arc<Notify>,
-    /// Latest successful candidate whose publication was superseded. A publication at
-    /// or beyond this epoch makes the recorded movement obsolete.
+    /// Latest capture superseded while it ran or at publication. A publication at or
+    /// beyond this epoch makes the recorded movement obsolete.
     superseded_epoch: AtomicU64,
     /// The publication linearization point, holding the work the next rebuild owes.
     /// Observation and publication both take it, so a path observed between a rebuild's
@@ -529,13 +687,15 @@ pub(crate) struct IndexValidation {
     /// The supervisor is the only writer of published snapshots. If it ends -
     /// cancelled, or unwound by a panic in a rebuild - the observed epoch keeps
     /// advancing with every filesystem event and nothing ever publishes again,
-    /// so every read waits its whole readiness budget and refuses. That was
-    /// silent: the flag makes it a named refusal on the first request instead
-    /// of a timeout on every one.
+    /// so every read waits its whole readiness budget and refuses. The flag
+    /// makes that a named refusal on the first request rather than a timeout on
+    /// every one.
     pub(crate) supervisor_running: Arc<AtomicBool>,
     /// The engine hold each publication hands its changed files to, set once the server
     /// holds one. Absent in a test that builds no server.
     engines: std::sync::OnceLock<Arc<EngineHold>>,
+    /// The watch failures recorded since the last report of their repeats.
+    watch_failures: SyncMutex<WatchFailures>,
 }
 
 /// Owned shutdown handle for the workspace index supervisor.
@@ -832,6 +992,7 @@ impl IndexValidation {
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
                 engines: std::sync::OnceLock::new(),
+                watch_failures: SyncMutex::new(WatchFailures::default()),
             }),
             receiver,
         )
@@ -866,7 +1027,7 @@ impl IndexValidation {
     pub(crate) fn observe_whole_workspace(&self) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         publication.escalate();
-        let result = self.observe_locked(&mut publication);
+        let result = self.observe_locked(&mut publication, WATCH_ROUTE_WHOLE_WORKSPACE);
         drop(publication);
         result
     }
@@ -878,7 +1039,7 @@ impl IndexValidation {
     ) -> Result<u64, RiftError> {
         let mut publication = self.locked_pending();
         publication.retain(paths, self.paths_max);
-        let result = self.observe_locked(&mut publication);
+        let result = self.observe_locked(&mut publication, WATCH_ROUTE_PATHS);
         drop(publication);
         result
     }
@@ -888,14 +1049,32 @@ impl IndexValidation {
         let mut publication = self.locked_pending();
         self.watch_failed.store(true, Ordering::Release);
         publication.escalate();
-        let result = self.observe_locked(&mut publication);
+        let result = self.observe_locked(&mut publication, WATCH_ROUTE_WHOLE_WORKSPACE);
         drop(publication);
         result
     }
 
+    /// Records `error` from the watch callback's `step`: see [`WatchFailures::record`].
+    fn record_watch_failure(&self, step: WatchStep, error: RiftError) {
+        self.locked_watch_failures().record(step, error);
+    }
+
+    /// Records the repeats of each watch failure since it was recorded, once, and forgets
+    /// the failures: see [`WatchFailures::report`]. The supervisor calls it on each turn
+    /// and when the watch stops.
+    fn report_watch_failures(&self) {
+        self.locked_watch_failures().report();
+    }
+
+    fn locked_watch_failures(&self) -> std::sync::MutexGuard<'_, WatchFailures> {
+        self.watch_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Takes the work the next rebuild owes, with the epoch it answers for, under the one
     /// lane observation also takes.
-    pub(crate) fn take_pending(&self) -> RebuildRequest {
+    pub(crate) fn take_pending(self: &Arc<Self>) -> RebuildRequest {
         let mut publication = self.locked_pending();
         let work = std::mem::take(&mut *publication);
         let epoch = self.observed_epoch();
@@ -905,6 +1084,7 @@ impl IndexValidation {
             work,
             previous: None,
             cancellation: self.cancellation.clone(),
+            observation: Some(Arc::downgrade(self)),
         }
     }
 
@@ -923,8 +1103,13 @@ impl IndexValidation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records one invalidation while caller owns publication lane.
-    fn observe_locked(&self, pending: &mut PendingWork) -> Result<u64, RiftError> {
+    /// Records one invalidation while caller owns publication lane; `event` is the
+    /// `watch.event.route` the observation took, the label a refused signal counts under.
+    fn observe_locked(
+        &self,
+        pending: &mut PendingWork,
+        event: &'static str,
+    ) -> Result<u64, RiftError> {
         let previous = self
             .observed_epoch
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
@@ -939,8 +1124,14 @@ impl IndexValidation {
                     .error()
             })?;
         let epoch = previous + 1;
+        INDEX_EPOCH
+            .labeled_value([INDEX_EPOCH_OBSERVED], epoch)
+            .record();
         match self.invalidations.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(())) => {
+                INDEX_INVALIDATION_DROPPED.labeled([event]).add(1);
+            }
             Err(mpsc::error::TrySendError::Closed(())) => {
                 self.watch_failed.store(true, Ordering::Release);
                 pending.escalate();
@@ -958,17 +1149,24 @@ impl IndexValidation {
         self.observed_epoch.load(Ordering::SeqCst)
     }
 
-    /// Latest successful capture superseded after this publication was built, if any.
+    /// Latest capture superseded after this publication was built, if any.
     pub(crate) fn superseded_after(&self, published_epoch: u64) -> Option<u64> {
         let epoch = self.superseded_epoch();
         (epoch > published_epoch).then_some(epoch)
     }
 
-    /// Epoch of the latest successful capture superseded at publication.
+    /// Epoch of the latest capture superseded while it ran or at publication.
     ///
     /// Zero before the first one.
     pub(crate) fn superseded_epoch(&self) -> u64 {
         self.superseded_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Records that the capture answering `epoch` was superseded, and wakes the reads
+    /// waiting on its publication so each captures the tree again.
+    fn record_superseded(&self, epoch: u64) {
+        self.superseded_epoch.fetch_max(epoch, Ordering::SeqCst);
+        self.changed.notify_waiters();
     }
 
     /// Installs one publication under publication linearization.
@@ -992,17 +1190,24 @@ impl IndexValidation {
     /// Classifies and observes one event within the publication critical section, so the
     /// paths it names cannot be lost between the classification and the epoch that
     /// promises to cover them.
+    ///
+    /// The event counts into `watch.events` under its kind and the route it took.
     fn observe_event(&self, roots: &WatchRoots, event: &Event) -> Result<Option<u64>, RiftError> {
         let mut publication = self.locked_pending();
-        let result = match watch_event_impact(roots, self, event) {
+        let impact = watch_event_impact(roots, self, event);
+        let route = impact.route();
+        WATCH_EVENTS
+            .labeled([watch_event_kind(event.kind), route])
+            .add(1);
+        let result = match impact {
             WatchImpact::None => Ok(None),
             WatchImpact::WholeWorkspace => {
                 publication.escalate();
-                self.observe_locked(&mut publication).map(Some)
+                self.observe_locked(&mut publication, route).map(Some)
             }
             WatchImpact::Paths(paths) => {
                 publication.retain(paths, self.paths_max);
-                self.observe_locked(&mut publication).map(Some)
+                self.observe_locked(&mut publication, route).map(Some)
             }
         };
         drop(publication);
@@ -1118,6 +1323,17 @@ impl Drop for IndexValidation {
     }
 }
 
+/// How one supervisor shutdown ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupervisorJoin {
+    /// The supervisor ended inside the deadline, or had ended before the shutdown.
+    Joined,
+    /// The supervisor was still running at the deadline and was aborted. Blocking work it
+    /// started keeps running on the blocking pool until it reads its cancellation or the
+    /// process exits.
+    Aborted,
+}
+
 impl IndexSupervisor {
     /// Cancels the supervisor and joins it, bounded by `deadline`.
     ///
@@ -1134,12 +1350,33 @@ impl IndexSupervisor {
     /// Cancellation is requested before the join begins. Dropping this future
     /// after it takes task ownership detaches that terminating task.
     pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), RiftError> {
+        match self.joined_by(deadline).await? {
+            SupervisorJoin::Joined => Ok(()),
+            SupervisorJoin::Aborted => errors::server::read_unavailable()
+                .operation("index supervisor shutdown")
+                .detail("shutdown deadline elapsed")
+                .fail(),
+        }
+    }
+
+    /// Cancels the supervisor and joins it by `deadline`, answering whether it joined or
+    /// was aborted at `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the task panics.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation is requested before the join begins. Dropping this future
+    /// after it takes task ownership detaches that terminating task.
+    pub(crate) async fn joined_by(&self, deadline: Instant) -> Result<SupervisorJoin, RiftError> {
         self.validation.cancellation.cancel();
         let Some(mut task) = self.validation.task.lock().await.take() else {
-            return Ok(());
+            return Ok(SupervisorJoin::Joined);
         };
         if let Ok(result) = tokio::time::timeout_at(deadline, &mut task).await {
-            result.map_err(|error| {
+            result.map(|()| SupervisorJoin::Joined).map_err(|error| {
                 errors::server::read_task()
                     .operation("index supervisor shutdown")
                     .detail(error.to_string())
@@ -1148,10 +1385,7 @@ impl IndexSupervisor {
         } else {
             task.abort();
             let _ = task.await;
-            errors::server::read_unavailable()
-                .operation("index supervisor shutdown")
-                .detail("shutdown deadline elapsed")
-                .fail()
+            Ok(SupervisorJoin::Aborted)
         }
     }
 }
@@ -1314,44 +1548,166 @@ pub(crate) fn unwatched(
 
 /// Observes one watcher callback: a delivered event enters the inclusion filter, and a
 /// backend failure marks the watch unhealthy.
+///
+/// A failure of either step is held in [`WatchFailures`], which records it once and
+/// counts its repeats until the supervisor's next turn reports them.
 pub(crate) fn report_watch_outcome(
     roots: &WatchRoots,
     validation: &IndexValidation,
     outcome: notify::Result<Event>,
 ) {
-    let Ok(event) = outcome else {
-        let _ = validation.observe_watch_failure();
-        tracing::warn!(
-            component = "index",
-            operation = "watch.receive",
-            "index watch backend reported failure"
-        );
-        return;
+    let event = match outcome {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = validation.observe_watch_failure();
+            let error = errors::server::read_unavailable()
+                .operation("workspace watch")
+                .detail(error.to_string())
+                .error();
+            validation.record_watch_failure(WatchStep::Receive, error);
+            return;
+        }
     };
     // Git control changes live outside linked worktrees. Route HEAD and index.lock
     // before the source floor; access events keep the existing rescan classification.
-    if !matches!(event.kind, EventKind::Access(_))
-        && roots.git_directory.as_ref().is_some_and(|directory| {
-            event.paths.iter().any(|path| {
-                path.parent() == Some(directory.as_path())
-                    && matches!(
-                        path.file_name().and_then(|name| name.to_str()),
-                        Some("HEAD" | "index.lock")
-                    )
-            })
-        })
-    {
-        if let Err(error) = validation.observe_whole_workspace() {
-            tracing::error!(component = "index", operation = "watch.observe", error = %error, "index watch failed");
-        }
-        return;
+    let observed = if names_git_control(roots, &event) {
+        WATCH_EVENTS
+            .labeled([watch_event_kind(event.kind), WATCH_ROUTE_WHOLE_WORKSPACE])
+            .add(1);
+        validation.observe_whole_workspace().map(Some)
+    } else {
+        validation.observe_event(roots, &event)
+    };
+    if let Err(error) = observed {
+        validation.record_watch_failure(WatchStep::Observe, error);
     }
-    if validation.observe_event(roots, &event).is_err() {
-        tracing::error!(
-            component = "index",
-            operation = "watch.observe",
-            "index watch failed"
-        );
+}
+
+/// Whether `event`, other than an access, names `HEAD` or `index.lock` directly inside the
+/// Git directory.
+fn names_git_control(roots: &WatchRoots, event: &Event) -> bool {
+    let Some(directory) = roots.git_directory.as_ref() else {
+        return false;
+    };
+    !matches!(event.kind, EventKind::Access(_))
+        && event.paths.iter().any(|path| {
+            path.parent() == Some(directory.as_path())
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("HEAD" | "index.lock")
+                )
+        })
+}
+
+/// The `watch.event.kind` of `kind`: notify's own serde spelling of its top-level kind.
+const fn watch_event_kind(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Any => "any",
+        EventKind::Access(_) => "access",
+        EventKind::Create(_) => "create",
+        EventKind::Modify(_) => "modify",
+        EventKind::Remove(_) => "remove",
+        EventKind::Other => "other",
+    }
+}
+
+/// The step of a watcher callback that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchStep {
+    /// The watch backend delivered an error in place of an event: `watch.receive`.
+    Receive,
+    /// An event could not be observed: `watch.observe`.
+    Observe,
+}
+
+impl WatchStep {
+    /// Records `error` as this step's failure; `count` is the number of repeats a report
+    /// carries, absent on the failure's first record.
+    fn record(self, error: &RiftError, count: Option<u64>) {
+        let error_type = error.slug().as_str();
+        match self {
+            Self::Receive => rift_tracing::warn!(
+                component = "index",
+                operation = "watch.receive",
+                error = %error,
+                error.type = error_type,
+                count,
+                "index watch backend reported failure"
+            ),
+            Self::Observe => rift_tracing::error!(
+                component = "index",
+                operation = "watch.observe",
+                error = %error,
+                error.type = error_type,
+                count,
+                "index watch failed"
+            ),
+        }
+    }
+}
+
+/// The failure one watch step last recorded, and how often it repeated since.
+#[derive(Debug)]
+struct RepeatedFailure {
+    error: RiftError,
+    repeats: u64,
+}
+
+/// Watch failures between two reports: one slot per [`WatchStep`], so the held state is
+/// bounded by construction whatever the backend delivers.
+///
+/// A failure records once, with its error and `error.type`, its registered identity. A
+/// repeat of the same identity in the same step records nothing and counts. A report
+/// records each held failure's repeats once, with `count`, and empties the slots, so the
+/// next failure records at once again. A different identity in a step reports the held
+/// one's repeats before it takes the slot. A step whose every event fails, as a stopped
+/// supervisor makes them, writes one record per identity and one per report rather than
+/// one per event.
+#[derive(Debug, Default)]
+struct WatchFailures {
+    receive: Option<RepeatedFailure>,
+    observe: Option<RepeatedFailure>,
+}
+
+impl WatchFailures {
+    const fn slot(&mut self, step: WatchStep) -> &mut Option<RepeatedFailure> {
+        match step {
+            WatchStep::Receive => &mut self.receive,
+            WatchStep::Observe => &mut self.observe,
+        }
+    }
+
+    /// Records `error` from `step` at its first sighting, and counts a repeat of the
+    /// identity the step holds.
+    fn record(&mut self, step: WatchStep, error: RiftError) {
+        let slot = self.slot(step);
+        if let Some(held) = slot.as_mut()
+            && held.error.slug() == error.slug()
+        {
+            held.repeats = held.repeats.saturating_add(1);
+            return;
+        }
+        if let Some(previous) = slot.take() {
+            report_repeats(step, &previous);
+        }
+        step.record(&error, None);
+        *slot = Some(RepeatedFailure { error, repeats: 0 });
+    }
+
+    /// Records each held failure's repeats once and empties every slot.
+    fn report(&mut self) {
+        for step in [WatchStep::Receive, WatchStep::Observe] {
+            if let Some(held) = self.slot(step).take() {
+                report_repeats(step, &held);
+            }
+        }
+    }
+}
+
+/// Records `held`'s repeats as one `step` record with their count; no repeat, no record.
+fn report_repeats(step: WatchStep, held: &RepeatedFailure) {
+    if held.repeats > 0 {
+        step.record(&held.error, Some(held.repeats));
     }
 }
 
@@ -1376,10 +1732,43 @@ impl Drop for SupervisorRunning {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         self.changed.notify_waiters();
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "index.supervisor",
             "the index supervisor stopped; no further snapshot publishes in this process"
+        );
+    }
+}
+
+/// Holds the filesystem watcher for as long as the index supervisor runs.
+///
+/// Dropping it with the supervisor - on return, on cancellation, or while a panic unwinds
+/// the task - drops the watcher, which ends its event delivery, reports the repeats of the
+/// watch failures held since the supervisor's last turn, and records that the watch
+/// stopped. A callback the backend delivers after that drop records a first failure, and
+/// its repeats stay uncounted in any record.
+struct WatchRunning {
+    watcher: Option<notify::RecommendedWatcher>,
+    validation: Arc<IndexValidation>,
+}
+
+impl WatchRunning {
+    fn new(watcher: notify::RecommendedWatcher, validation: &Arc<IndexValidation>) -> Self {
+        Self {
+            watcher: Some(watcher),
+            validation: Arc::clone(validation),
+        }
+    }
+}
+
+impl Drop for WatchRunning {
+    fn drop(&mut self) {
+        drop(self.watcher.take());
+        self.validation.report_watch_failures();
+        rift_tracing::info!(
+            component = "index",
+            operation = "index.supervisor",
+            "index watch stopped"
         );
     }
 }
@@ -1398,6 +1787,15 @@ pub(crate) enum WatchImpact {
 }
 
 impl WatchImpact {
+    /// The `watch.event.route` of this impact.
+    const fn route(&self) -> &'static str {
+        match self {
+            Self::None => WATCH_ROUTE_NONE,
+            Self::Paths(_) => WATCH_ROUTE_PATHS,
+            Self::WholeWorkspace => WATCH_ROUTE_WHOLE_WORKSPACE,
+        }
+    }
+
     /// Folds one path's impact into the event's, keeping the widest one seen.
     fn absorb(self, other: Self) -> Self {
         match (self, other) {
@@ -1438,10 +1836,10 @@ pub(crate) fn watch_event_impact(
 ///
 /// The path is placed under the canonical root first, because the watcher reports
 /// whatever spelling the platform hands it, and the floor's names say nothing about a
-/// path it cannot place. A path under neither spelling is dropped. This arm used to admit
-/// such a path instead, and what it admitted was the server's own `.rift` state: the
-/// workspace database moves continuously while SQLite runs, so every one of those writes
-/// moved the filesystem epoch that reads and the initial build both wait on.
+/// path it cannot place. A path under neither spelling is dropped. Admitting such a path
+/// would admit the server's own `.rift` state: the workspace database moves continuously
+/// while SQLite runs, so every one of those writes would move the filesystem epoch that
+/// reads and the initial build both wait on.
 ///
 /// Dropping an unplaceable path is safe only beside that placement. On a platform whose
 /// root reaches the watcher through a symlink every event carries the other spelling, so
@@ -1695,6 +2093,123 @@ pub(crate) enum WorkspaceCandidate {
     },
     /// Configuration moved during capture.
     ConfigurationChanged,
+    /// An observation made while the capture ran asks for the whole workspace, or names a
+    /// path whose bytes on disk differ from the record the capture holds for it. The
+    /// capture stopped between files or at a phase boundary and built no candidate.
+    Superseded,
+}
+
+/// One running capture's standing against the observation made since its rebuild took
+/// its work.
+///
+/// Publication decides whether a candidate answers a later observation; see
+/// [`answered_candidate`]. A capture that still runs asks the same question between files
+/// and at phase boundaries, so a rebuild publication would refuse stops there instead of
+/// running to its end. An observation that asks for the whole workspace supersedes every
+/// capture. An observation that names paths supersedes an incremental capture when one of
+/// them holds bytes other than the record the capture read for it, or than the
+/// publication's record for a path the capture did not name. A whole scan decides what
+/// it holds only when it ends, so a path observation leaves it running.
+///
+/// The comparison runs once for each observed epoch the capture meets. It reads one
+/// digest for each pending path, outside the publication lane, and at most
+/// [`RUNNING_CAPTURE_READS_MAX`] paths over one capture. A larger observation leaves the
+/// decision to publication.
+///
+/// The answer is a prediction about bytes that can move again before publication. A
+/// capture stopped here publishes nothing and returns its work, so a wrong prediction
+/// costs one repeated rebuild and never a publication.
+struct RunningCapture<'request> {
+    root: &'request Path,
+    request: &'request RebuildRequest,
+    /// The records an incremental capture read, absent for a whole scan.
+    records: Option<CapturedRecords>,
+    /// The validation's epoch counter, absent when the request names no validation or it
+    /// is already gone.
+    observed_epoch: Option<Arc<AtomicU64>>,
+    /// The observed epoch the last comparison answered for.
+    compared_epoch: AtomicU64,
+    /// Set once a comparison found the capture superseded; pending work never narrows
+    /// while the capture runs, so the answer stands.
+    superseded: AtomicBool,
+    /// Path reads the capture may still spend on comparisons.
+    reads_left: AtomicUsize,
+}
+
+impl<'request> RunningCapture<'request> {
+    fn new(
+        root: &'request Path,
+        request: &'request RebuildRequest,
+        records: Option<CapturedRecords>,
+    ) -> Self {
+        let observed_epoch = request
+            .observation
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|validation| Arc::clone(&validation.observed_epoch));
+        Self {
+            root,
+            request,
+            records,
+            observed_epoch,
+            compared_epoch: AtomicU64::new(request.epoch),
+            superseded: AtomicBool::new(false),
+            reads_left: AtomicUsize::new(RUNNING_CAPTURE_READS_MAX),
+        }
+    }
+
+    /// Whether an observation made since the rebuild took its work supersedes this
+    /// capture. An unmoved epoch costs one atomic read.
+    fn is_superseded(&self) -> bool {
+        let Some(observed_epoch) = self.observed_epoch.as_ref() else {
+            return false;
+        };
+        if self.superseded.load(Ordering::SeqCst) {
+            return true;
+        }
+        let observed = observed_epoch.load(Ordering::SeqCst);
+        if self.compared_epoch.swap(observed, Ordering::SeqCst) == observed {
+            return false;
+        }
+        let superseded = self
+            .request
+            .observation
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|validation| self.pending_supersedes(&validation));
+        if superseded {
+            self.superseded.store(true, Ordering::SeqCst);
+        }
+        superseded
+    }
+
+    /// Compares the publication lane's pending work with what this capture holds.
+    fn pending_supersedes(&self, validation: &IndexValidation) -> bool {
+        let incremental = self.records.as_ref().zip(self.request.previous.as_ref());
+        let pending = validation.locked_pending();
+        let whole_workspace = pending.covers_whole_workspace();
+        let named =
+            (incremental.is_some() && !whole_workspace && self.takes_reads(pending.paths.len()))
+                .then(|| pending.paths.clone());
+        drop(pending);
+        if whole_workspace {
+            return true;
+        }
+        incremental
+            .zip(named)
+            .is_some_and(|((records, previous), paths)| {
+                !previous.holds_observed_beside(self.root, &paths, records)
+            })
+    }
+
+    /// Spends `paths` reads of this capture's bound, or none when fewer are left.
+    fn takes_reads(&self, paths: usize) -> bool {
+        self.reads_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(paths)
+            })
+            .is_ok()
+    }
 }
 
 /// Builds one snapshot candidate and verifies configuration around its scan.
@@ -1724,7 +2239,7 @@ fn build_workspace_candidate_with_cache(
     request: &RebuildRequest,
     content_cache: &rift_index::WorkspaceContentCache,
 ) -> Result<WorkspaceCandidate, RiftError> {
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "index",
         operation = "index.build",
         phase = "start",
@@ -1732,9 +2247,10 @@ fn build_workspace_candidate_with_cache(
         "index capture started"
     );
     let configuration = ConfigurationState::accept(root);
-    let change_set = request.change_set(root, &configuration);
-    let cancelled = || request.cancellation.is_cancelled();
-    let candidate = match &change_set {
+    let (change_set, records) = request.change_set_with_records(root, &configuration);
+    let running = RunningCapture::new(root, request, records);
+    let cancelled = || request.cancellation.is_cancelled() || running.is_superseded();
+    let captured = match &change_set {
         ChangeSet::Full => {
             let sharing = request.previous.as_deref().filter(|previous| {
                 !previous
@@ -1749,7 +2265,7 @@ fn build_workspace_candidate_with_cache(
                 sharing,
                 &cancelled,
                 content_cache,
-            )?
+            )
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
@@ -1764,9 +2280,16 @@ fn build_workspace_candidate_with_cache(
                 configuration,
                 request.epoch,
                 &cancelled,
-            )?
+            )
         }
     };
+    // A capture stopped by its own comparison ends as superseded, whatever error the
+    // stop surfaced as; a supervisor stop keeps its error, which the caller reads as
+    // cancelled.
+    if !request.cancellation.is_cancelled() && running.is_superseded() {
+        return Ok(WorkspaceCandidate::Superseded);
+    }
+    let candidate = captured?;
     if candidate.configuration.fingerprint != configuration_fingerprint(root) {
         return Ok(WorkspaceCandidate::ConfigurationChanged);
     }
@@ -1791,9 +2314,12 @@ pub(crate) fn lexical_write(
     }
     match change_set {
         ChangeSet::Full => LexicalWrite::Whole,
-        ChangeSet::Incremental(changes) => {
-            LexicalWrite::Change(published.reads.lexical_change(changes))
-        }
+        ChangeSet::Incremental(changes) => rift_tracing::traced!(
+            component = "index",
+            operation = "index.lexical_write",
+            paths = changes.len(),
+            { LexicalWrite::Change(published.reads.lexical_change(changes)) }
+        ),
     }
 }
 
@@ -1879,13 +2405,16 @@ fn whole_workspace_candidate(
     let source_policy = Some(reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     }));
-    let visible_files = complete_visible_digests(
-        root,
-        &reads,
-        source_policy.as_deref().unwrap_or_else(|| {
-            unreachable!("a current-tree read service always compiles its source policy")
-        }),
-    )?;
+    let visible_files =
+        rift_tracing::traced!(component = "index", operation = "index.visible_digests", {
+            complete_visible_digests(
+                root,
+                &reads,
+                source_policy.as_deref().unwrap_or_else(|| {
+                    unreachable!("a current-tree read service always compiles its source policy")
+                }),
+            )
+        })?;
     let map = publication_map(&reads, None);
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
@@ -1949,7 +2478,12 @@ fn shared_workspace_candidate(
         }
     }
     let reads = previous.reads.rebuilt_cancellable(changes, cancelled)?;
-    let visible_files = previous.update_visible_digests(root, &reads, observed_paths)?;
+    let visible_files = rift_tracing::traced!(
+        component = "index",
+        operation = "index.visible_digests",
+        paths = observed_paths.len(),
+        { previous.update_visible_digests(root, &reads, observed_paths) }
+    )?;
     let map = publication_map(&reads, previous.preparation.as_ref());
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
@@ -1979,6 +2513,8 @@ fn shared_workspace_candidate(
 /// Population failure is a warning, never a request failure: the vector ranking reports its
 /// own readiness, and the next successful publication asks for another pass.
 /// A disabled vector ranking still reports chunked files, then skips declaration derivation.
+/// Any other pass records `vector population started` at its start, and at its end either
+/// `vector population finished` or the warning, which carries `outcome = "error"`.
 ///
 /// # Cancel safety
 ///
@@ -1990,7 +2526,7 @@ pub(crate) async fn populate_search(
     embedding: Embedding,
 ) {
     for (path, chunks) in published.reads.chunked_text_files() {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "search",
             operation = "search.populate",
             path = %path.as_str(),
@@ -2005,18 +2541,33 @@ pub(crate) async fn populate_search(
     let units = published.reads.symbol_index_documents_by_file();
     let described = published.reads.described_symbol_units_by_file(&units);
     let tree_revision = published.reads.tree_revision();
-    if let Err(error) = index
+    rift_tracing::info!(
+        component = "search",
+        operation = "search.populate",
+        tree_revision,
+        phase = "start",
+        "vector population started"
+    );
+    match index
         .embed_described(&described, embedding, tree_revision)
         .await
     {
-        tracing::warn!(
+        Ok(()) => rift_tracing::info!(
+            component = "search",
+            operation = "search.populate",
+            tree_revision,
+            outcome = "ok",
+            "vector population finished"
+        ),
+        Err(error) => rift_tracing::warn!(
             component = "search",
             operation = "search.populate",
             tree_revision = published.reads.tree_revision(),
             error = %error,
+            outcome = "error",
             "the vector ranking could not embed this publication; the full-text tier keeps \
              answering until a later pass lands"
-        );
+        ),
     }
 }
 
@@ -2168,7 +2719,7 @@ fn within_unit_bound(
 /// form `file left out of the index` takes.
 fn record_units_left_out(left_out: &[IndexDocument], unit_bytes_max: usize) {
     for unit in left_out {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "index.build",
             path = unit.project_path().map_or("", ProjectPath::as_str),
@@ -2342,6 +2893,14 @@ struct LexicalBacklog {
     whole_owed: Option<String>,
     /// Whether the lane's task has ended, so a later write has no one to run it.
     ended: bool,
+    /// When the held write was first handed, while one is held: a merge keeps the
+    /// instant of the write it merges into.
+    held_since: Option<Instant>,
+    /// When the lane took the running write, while one runs.
+    running_since: Option<Instant>,
+    /// The part the running write commits, counted from one, and how many parts it
+    /// has, once its parts are derived.
+    running_part: Option<(usize, usize)>,
 }
 
 impl LexicalBacklog {
@@ -2350,6 +2909,7 @@ impl LexicalBacklog {
     fn hand(&mut self, commit: LexicalCommit) -> Option<Arc<PublishedWorkspace>> {
         let Some(held) = self.held.take() else {
             self.held = Some(commit);
+            self.held_since = Some(Instant::now());
             return None;
         };
         let (merged, released) = held.merged_with(commit);
@@ -2364,7 +2924,17 @@ impl LexicalBacklog {
         let commit = self.held.take()?;
         let whole_owed = self.whole_owed.take().is_some();
         self.running = commit.answers.iter().cloned().collect();
+        self.held_since = None;
+        self.running_since = Some(Instant::now());
+        self.running_part = None;
         Some((commit, whole_owed))
+    }
+
+    /// Records that the running write ended, success or failure.
+    fn end_running(&mut self) {
+        self.running.clear();
+        self.running_since = None;
+        self.running_part = None;
     }
 
     /// Records that the store missed a commit for the reason `cause` renders, so the next
@@ -2392,6 +2962,94 @@ impl LexicalBacklog {
             },
             None => LexicalCommitState::Settled,
         }
+    }
+
+    /// Where `tree_revision` stands, with what the lane was doing when that was read.
+    fn report_of(&self, tree_revision: &str) -> LexicalCommitReport {
+        let now = Instant::now();
+        let running = !self.running.is_empty();
+        let write = if self
+            .running
+            .iter()
+            .any(|answered| answered == tree_revision)
+        {
+            Some("running")
+        } else if self
+            .held
+            .as_ref()
+            .is_some_and(|commit| commit.answers_for(tree_revision))
+        {
+            Some("held")
+        } else {
+            None
+        };
+        LexicalCommitReport {
+            state: self.state_of(tree_revision),
+            write,
+            held_for: self
+                .held
+                .as_ref()
+                .and(self.held_since)
+                .map(|since| now.saturating_duration_since(since)),
+            running_for: self
+                .running_since
+                .filter(|_| running)
+                .map(|since| now.saturating_duration_since(since)),
+            running_part: self.running_part.filter(|_| running),
+        }
+    }
+}
+
+/// Where one tree revision stands with the lexical lane, and what the lane was doing when
+/// that was read, from one read of its backlog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LexicalCommitReport {
+    pub(crate) state: LexicalCommitState,
+    /// Which write answers for the revision, `running` or `held`, while one does.
+    write: Option<&'static str>,
+    /// How long the held write has waited for the lane, while one is held.
+    held_for: Option<Duration>,
+    /// How long the running write has run, while one runs.
+    running_for: Option<Duration>,
+    /// The part the running write commits, counted from one, and how many parts it has.
+    running_part: Option<(usize, usize)>,
+}
+
+impl LexicalCommitReport {
+    /// The report for a server with no lexical lane: nothing could commit the revision.
+    pub(crate) const fn settled() -> Self {
+        Self {
+            state: LexicalCommitState::Settled,
+            write: None,
+            held_for: None,
+            running_for: None,
+            running_part: None,
+        }
+    }
+
+    /// Logs why a search for `tree_revision` answered without the lexical ranking, when
+    /// this report's state is the reason: a commit held or running, or one the store
+    /// missed. A settled state logs nothing.
+    pub(crate) fn record_unranked(&self, tree_revision: &str) {
+        let (commit_state, cause) = match &self.state {
+            LexicalCommitState::Committing => ("committing", None),
+            LexicalCommitState::Owed { cause } => ("owed", Some(cause.as_str())),
+            LexicalCommitState::Settled => return,
+        };
+        rift_tracing::info!(
+            component = "search",
+            operation = "search.commit",
+            tree_revision,
+            commit_state,
+            cause,
+            write = self.write,
+            held_ms = self.held_for.map(|held| held.as_millis()),
+            running_ms = self.running_for.map(|running| running.as_millis()),
+            part = self.running_part.map(|(part, _)| part),
+            parts = self.running_part.map(|(_, parts)| parts),
+            "search answered without the lexical ranking for a tree revision the lexical lane \
+             has not committed"
+        );
     }
 }
 
@@ -2503,7 +3161,7 @@ impl LexicalLane {
         let mut backlog = self.queue.locked();
         if backlog.ended {
             drop(backlog);
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "search",
                 operation = "search.commit",
                 tree_revision,
@@ -2516,8 +3174,14 @@ impl LexicalLane {
         }
         let released = backlog.hand(LexicalCommit::new(write, published));
         drop(backlog);
+        rift_tracing::info!(
+            component = "search",
+            operation = "search.commit",
+            tree_revision,
+            "lexical commit handed"
+        );
         if released.is_some() {
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "search",
                 operation = "search.commit",
                 tree_revision,
@@ -2531,8 +3195,16 @@ impl LexicalLane {
 
     /// Where `tree_revision` stands with the lane, for a search that found the store
     /// holding another tree.
+    #[cfg(test)]
     pub(crate) fn commit_state(&self, tree_revision: &str) -> LexicalCommitState {
         self.queue.locked().state_of(tree_revision)
+    }
+
+    /// Where `tree_revision` stands with the lane, for a search that found the store
+    /// holding another tree, with what the lane was doing when that was read, from one
+    /// read of the backlog.
+    pub(crate) fn commit_report(&self, tree_revision: &str) -> LexicalCommitReport {
+        self.queue.locked().report_of(tree_revision)
     }
 
     /// A wake-up for the lane's next landing: a write's end, success or failure, or a
@@ -2623,9 +3295,27 @@ impl<Store: LexicalStore> LexicalTask<Store> {
     /// Runs one held write, then wakes the waiters on [`LexicalLane::landed`] once the
     /// backlog records its end, success or failure.
     async fn write(&self, commit: LexicalCommit, whole_owed: bool) {
+        let tree_revision = commit.published.reads.tree_revision().to_owned();
+        rift_tracing::info!(
+            component = "search",
+            operation = "search.commit",
+            tree_revision,
+            phase = "start",
+            "lexical commit committing"
+        );
         let outcome = self.transaction(commit, whole_owed).await;
+        // A refused commit already recorded its cause, which the store is now owed.
+        if outcome.is_ok() {
+            rift_tracing::info!(
+                component = "search",
+                operation = "search.commit",
+                tree_revision,
+                outcome = "ok",
+                "lexical commit settled"
+            );
+        }
         let mut backlog = self.queue.locked();
-        backlog.running.clear();
+        backlog.end_running();
         if let Err(error) = outcome {
             backlog.owe_whole(error.to_string());
         }
@@ -2665,7 +3355,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         let running = tokio::spawn(async move { store.index_trigrams().await });
         match self.store_answer(running).await {
             Ok(batch) => {
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "search",
                     operation = "search.commit",
                     indexed = batch.indexed(),
@@ -2676,7 +3366,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             }
             Err(error) => {
                 if !self.cancellation.is_cancelled() {
-                    tracing::warn!(
+                    rift_tracing::warn!(
                         component = "search",
                         operation = "search.commit",
                         error = %error,
@@ -2749,8 +3439,10 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         record_units_left_out(&left_out, self.bounds.unit_bytes_max);
         // A source selection or resolved reference can change metadata without changing
         // lexical documents, so the last part stamps and writes metadata even when empty.
-        let last = parts.len().saturating_sub(1);
+        let count = parts.len();
+        let last = count.saturating_sub(1);
         for (index, part) in parts.into_iter().enumerate() {
+            self.queue.locked().running_part = Some((index.saturating_add(1), count));
             let closing = index == last;
             let stamp = if closing {
                 LexicalStamp::published(&tree_revision, &derivation)
@@ -2926,7 +3618,7 @@ async fn abort_transaction<T>(running: JoinHandle<T>) {
 
 /// Records one transaction that ran past its deadline, once.
 fn record_commit_delay(tree_revision: &str, form: &'static str, deadline: Duration) {
-    tracing::error!(
+    rift_tracing::error!(
         component = "search",
         operation = "search.commit",
         tree_revision,
@@ -2940,11 +3632,12 @@ fn record_commit_delay(tree_revision: &str, form: &'static str, deadline: Durati
 /// Records one commit the store did not take, with its cause.
 fn record_commit_failure(tree_revision: &str, form: &'static str, error: &RiftError) {
     let causes = rift_error::causes(error).join("; ");
-    tracing::error!(
+    rift_tracing::error!(
         component = "search",
         operation = "search.commit",
         tree_revision,
         form,
+        outcome = "error",
         error = %error,
         causes,
         "the lexical commit failed; the next publication compares every file with the \
@@ -2955,12 +3648,12 @@ fn record_commit_failure(tree_revision: &str, form: &'static str, error: &RiftEr
 /// The population lane: one long-lived task owning every search index population, and the
 /// handle a caller hands one publication to.
 ///
-/// Population used to run wherever it was wanted, and the wait was the caller's. Startup
-/// awaited its own pass before the server answered anything, which held the first answer
-/// for around fifteen seconds on a real workspace, and every change awaited a whole lexical
+/// A pass run wherever it is wanted makes its caller wait for it. A startup that awaits its
+/// own pass before the server answers anything holds the first answer for around fifteen
+/// seconds on a real workspace, and a change that awaits its pass waits for a whole lexical
 /// replacement plus the embedding of each new declaration inside the request path. The lane
-/// runs one pass per publication on its own task instead, so no request and no startup step
-/// awaits a pass.
+/// runs one pass per publication on its own task, so no request and no startup step awaits
+/// a pass.
 ///
 /// Requests coalesce. The channel holds exactly one publication, so a request landing while
 /// an earlier one still waits overwrites it, and the lane always runs the newest tree it
@@ -3035,7 +3728,7 @@ impl PopulationLane {
             return;
         }
         if self.publications.is_closed() {
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "search",
                 operation = "search.populate",
                 "the population lane has ended, so this publication is not populated for"
@@ -3081,6 +3774,10 @@ pub(crate) enum RebuildOutcome {
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
 ///
+/// Each turn runs a due background validation, then the rebuild pending work owes. On the
+/// turn after a superseded rebuild the owed rebuild runs first and the validation takes
+/// the following turn; `BackgroundValidation::rebuild_runs_first` bounds that order.
+///
 /// A published rebuild hands its snapshot to the population lane, then moves on to the
 /// next batch. The supervisor awaiting a pass itself
 /// would hold the whole reconciliation loop for as long as that pass ran, and the filesystem
@@ -3110,17 +3807,28 @@ struct InitialPreparationFailure {
     queued_epoch: Option<u64>,
 }
 
+/// Runs the startup preparation and counts it once into `index.rebuilds` under the trigger
+/// `startup`: a failure under its registered identity, and a preparation that ended with
+/// the supervisor's cancellation under `cancelled`. A discovery that leaves nothing to
+/// prepare - the validation held no preparation, or the cancellation ended the first
+/// publication - counts nothing.
 async fn prepare_initial_workspace_with_epoch(
     context: &IndexSupervisorContext,
 ) -> Result<(), Box<InitialPreparationFailure>> {
-    let preparation = match discover_initial_workspace(context).await {
-        Ok(preparation) => preparation,
-        Err(error) => return Err(Box::new(initial_preparation_failure(context, error))),
+    let result = match discover_initial_workspace(context).await {
+        Ok(Some(preparation)) => {
+            prepare_initial_workspace_from_with_epoch(context, preparation).await
+        }
+        Ok(None) => return Ok(()),
+        Err(error) => Err(Box::new(initial_preparation_failure(context, error))),
     };
-    let Some(preparation) = preparation else {
-        return Ok(());
+    let error_type = match &result {
+        Ok(()) if context.validation.cancellation.is_cancelled() => REBUILD_CANCELLED,
+        Ok(()) => "",
+        Err(failure) => failure.error.slug().as_str(),
     };
-    prepare_initial_workspace_from_with_epoch(context, preparation).await
+    count_rebuild(REBUILD_TRIGGER_STARTUP, error_type);
+    result
 }
 
 /// Retained owner and immutable discovery result for one startup preparation.
@@ -3145,9 +3853,7 @@ pub(crate) async fn discover_initial_workspace(
     let root = context.root.clone();
     let limits = context.limits;
     let cancellation = validation.cancellation.clone();
-    let configuration = context
-        .published
-        .read()
+    let configuration = read_published(&context.published)
         .await
         .snapshot()
         .0
@@ -3197,7 +3903,16 @@ pub(crate) async fn discover_initial_workspace(
         map_text_paths,
         last: LastCapture::default(),
     };
-    publish_initial_empty(context, initial, empty_index, configuration).await
+    // Boxed: the publication future holds the discovery result, the empty index, and the
+    // configuration by value (9,416 bytes on aarch64), and every startup caller and the
+    // supervisor would otherwise embed it in their own state. One allocation per startup.
+    Box::pin(publish_initial_empty(
+        context,
+        initial,
+        empty_index,
+        configuration,
+    ))
+    .await
 }
 
 async fn publish_initial_empty(
@@ -3229,6 +3944,7 @@ async fn publish_initial_empty(
             "initial index empty publication",
             cancellation,
             move |token| {
+                let cancelled = || token.is_cancelled();
                 let preparation_state = (total > 0).then(|| LocalIndexPreparation {
                     prepared: 0,
                     total: Some(total),
@@ -3244,6 +3960,7 @@ async fn publish_initial_empty(
                     &configuration,
                     preparation_state,
                     validation.observed_epoch(),
+                    &cancelled,
                 )?;
                 if token.is_cancelled() {
                     return errors::server::read_cancelled().fail();
@@ -3292,7 +4009,10 @@ async fn prepare_initial_workspace_from_with_epoch(
     context: &IndexSupervisorContext,
     initial: InitialWorkspacePreparation,
 ) -> Result<(), Box<InitialPreparationFailure>> {
-    let result = prepare_initial_workspace_steps(context, initial).await;
+    // Boxed: the batch loop holds the discovery result across each batch's blocking read
+    // (10,656 bytes on aarch64), and every startup caller and the supervisor would otherwise
+    // embed it in their own state. One allocation per startup, outside the batch loop.
+    let result = Box::pin(prepare_initial_workspace_steps(context, initial)).await;
     result.map_err(|error| Box::new(initial_preparation_failure(context, error)))
 }
 
@@ -3325,6 +4045,14 @@ async fn prepare_initial_workspace_steps(
 ) -> Result<(), RiftError> {
     let validation = Arc::clone(&context.validation);
     let cancellation = validation.cancellation.clone();
+    let total = initial.total;
+    rift_tracing::info!(
+        component = "index",
+        operation = "index.build",
+        total,
+        phase = "start",
+        "index preparation started"
+    );
     while let Some(target) = initial.preparation.next_checkpoint() {
         let (next_initial, outcome) =
             prepare_initial_workspace_batch(context, initial, target, cancellation.clone()).await?;
@@ -3332,8 +4060,15 @@ async fn prepare_initial_workspace_steps(
         if outcome == RebuildOutcome::Cancelled {
             return Ok(());
         }
+        rift_tracing::info!(
+            component = "index",
+            operation = "index.build",
+            prepared = target,
+            total,
+            "index preparation progressed"
+        );
     }
-    let current = Arc::clone(&context.published.read().await.current);
+    let current = Arc::clone(&read_published(&context.published).await.current);
     if current.preparation.is_none()
         && let Some(population) = &context.population
     {
@@ -3454,6 +4189,7 @@ fn prepare_initial_batch(
         &batch.configuration,
         candidate_state,
         batch.validation.observed_epoch(),
+        &cancelled,
     )?;
     let handoff = if batch.complete {
         batch
@@ -3472,6 +4208,13 @@ fn prepare_initial_batch(
     Ok((preparation, last, outcome))
 }
 
+/// Builds the publication of one preparation batch: the dependency context and every
+/// visible digest for the complete batch, the prepared counts alone for a partial one.
+///
+/// `cancelled` is read before the build starts, before and during each dependency version
+/// probe, and before the visible digests are read. A cancelled build answers
+/// `rift.server.read_cancelled` and builds nothing, so no context read under the
+/// cancellation is published.
 fn preparation_publication(
     root: &Path,
     index: rift_index::WorkspaceIndex,
@@ -3479,13 +4222,18 @@ fn preparation_publication(
     configuration: &ConfigurationState,
     preparation: Option<LocalIndexPreparation>,
     epoch: u64,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Arc<PublishedWorkspace>, RiftError> {
+    if cancelled() {
+        return errors::server::read_cancelled().fail();
+    }
     let context = match &preparation {
         Some(_) => DependencyContext::default(),
         None => ReadService::dependency_context_for_policy(
             root,
             &source_policy,
             &configuration.dependencies_configuration(),
+            cancelled,
         )?,
     };
     let reads = ReadService::from_prepared_index(
@@ -3501,6 +4249,9 @@ fn preparation_publication(
             refused: Arc::new(BTreeMap::new()),
         }
     } else {
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
         complete_visible_digests(root, &reads, &source_policy)?
     };
     let map = publication_map(&reads, preparation.as_ref());
@@ -3517,6 +4268,13 @@ fn preparation_publication(
     }))
 }
 
+/// Publishes one preparation batch's candidate under the publication lane, unless the
+/// observation the lane holds supersedes it.
+///
+/// Pending work that asks for the whole workspace, a `rift.toml` that moved, or an
+/// observation the candidate cannot answer leaves the publication to the supervisor's
+/// next rebuild, and records `index preparation superseded` once with the pending
+/// work's trigger.
 fn publish_preparation_after(
     root: &Path,
     published: &RwLock<IndexState>,
@@ -3529,16 +4287,18 @@ fn publish_preparation_after(
     if pending.covers_whole_workspace()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
     {
+        trace_preparation_superseded(candidate.epoch, observed_epoch, &pending);
         drop(pending);
         return RebuildOutcome::Superseded;
     }
     let answer = answered_candidate(root, candidate, &pending, observed_epoch)
         .published_at_startup(candidate);
     let Some(answer) = answer else {
+        trace_preparation_superseded(candidate.epoch, observed_epoch, &pending);
         drop(pending);
         return RebuildOutcome::Superseded;
     };
-    let mut state = published.blocking_write();
+    let mut state = write_published(published);
     if state.current.preparation.is_none() || answer.epoch < state.current.epoch {
         drop(state);
         drop(pending);
@@ -3562,10 +4322,10 @@ fn publish_preparation_after(
     validation.changed.notify_waiters();
     if answer.preparation.is_none() {
         let published_epoch = answer.epoch;
-        tracing::info!(
+        rift_tracing::info!(
             component = "index",
             operation = "index.publish",
-            trigger = "startup",
+            trigger = REBUILD_TRIGGER_STARTUP,
             epoch = published_epoch,
             "index snapshot published"
         );
@@ -3579,11 +4339,14 @@ fn publish_preparation_after(
 /// A cancelled rebuild ends the loop: the token is cancelled only at shutdown, and the
 /// capture it interrupted finishes on its own thread with nothing left to publish.
 pub(crate) async fn run_index_supervisor_with(
-    _watcher: notify::RecommendedWatcher,
+    watcher: notify::RecommendedWatcher,
     mut invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
     capture: impl CaptureWorkspace + Clone + Send + 'static,
 ) {
+    // Declared ahead of the running guard, so it drops after it: the supervisor's end is
+    // recorded, then the watcher's.
+    let _watch = WatchRunning::new(watcher, &context.validation);
     let validation = Arc::clone(&context.validation);
     let published = Arc::clone(&context.published);
     let population = context.population.clone();
@@ -3609,6 +4372,8 @@ pub(crate) async fn run_index_supervisor_with(
     {
         publish_rebuild_failure(&context, epoch, failure.error).await;
     }
+    // Whether the last rebuild turn ended superseded, so its work is owed again.
+    let mut superseded = false;
     loop {
         let Some(trigger) = background
             .next(&mut invalidations, &validation.cancellation)
@@ -3620,6 +4385,7 @@ pub(crate) async fn run_index_supervisor_with(
             () = validation.cancellation.cancelled() => return,
             () = tokio::time::sleep(INDEX_DEBOUNCE) => {}
         }
+        validation.report_watch_failures();
         match version_control.wait(&context).await {
             Ok(true) => {}
             Ok(false) => return,
@@ -3628,7 +4394,11 @@ pub(crate) async fn run_index_supervisor_with(
                 continue;
             }
         }
+        // After a superseded rebuild, the rebuild it left owed runs before a due validation.
+        let after_superseded = std::mem::take(&mut superseded);
+        let deferred = background.defers(trigger, after_superseded, validation.observed_epoch());
         if trigger == background::Trigger::Validation
+            && !deferred
             && let Err(error) = background.validate(&context).await
         {
             if validation.cancellation.is_cancelled() {
@@ -3645,35 +4415,37 @@ pub(crate) async fn run_index_supervisor_with(
             !pending.covers_whole_workspace() && pending.paths.is_empty()
         };
         if pending_is_empty
-            && validation.observed_epoch() <= published.read().await.snapshot().0.epoch
+            && validation.observed_epoch() <= read_published(&published).await.snapshot().0.epoch
         {
             continue;
         }
         let request = validation.take_pending();
         let epoch = request.epoch;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "watch.batch",
             epoch,
             whole_workspace = request.work.covers_whole_workspace(),
             "filesystem invalidations coalesced"
         );
-        let result = rebuild_workspace(&context, request, capture.clone())
-            .instrument(tracing::info_span!(
-                "index.build",
-                component = "index",
-                trigger = "filesystem",
-                epoch
-            ))
-            .await;
+        let result = rift_tracing::info_span!(
+            "index.build",
+            component = "index",
+            trigger = request.work.rebuild_trigger(),
+            epoch
+        )
+        .instrument(rebuild_workspace(&context, request, capture.clone()))
+        .await;
+        superseded = matches!(result, Ok(RebuildOutcome::Superseded));
         match result {
             Ok(RebuildOutcome::Published) => {
-                let (current, _) = published.read().await.snapshot();
+                let (current, _) = read_published(&published).await.snapshot();
                 if let Some(lane) = population.as_ref() {
                     lane.request(current);
                 }
             }
-            Ok(RebuildOutcome::Unchanged | RebuildOutcome::Superseded) => {}
+            Ok(RebuildOutcome::Unchanged) => {}
+            Ok(RebuildOutcome::Superseded) => trace_superseded(epoch, validation.observed_epoch()),
             Ok(RebuildOutcome::Cancelled) => return,
             Err(error) => publish_rebuild_failure(&context, epoch, error).await,
         }
@@ -3683,7 +4455,7 @@ pub(crate) async fn run_index_supervisor_with(
 /// Records one failed rebuild under the publication lane and wakes the requests waiting
 /// on it; a failure the pool can no longer record marks the watch unhealthy instead.
 async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, error: RiftError) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         epoch,
@@ -3729,10 +4501,11 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// [`RebuildOutcome::Unchanged`]: nothing is recorded as a publication, and the supervisor
 /// hands nothing to the lanes.
 ///
-/// A superseded candidate hands nothing to the lane. A successful capture superseded at
-/// publication records its epoch and wakes reads, so a read captures the tree again and
-/// answers stale when it moved since that read's previous capture, while changes keep
-/// waiting for a current publication.
+/// A superseded candidate hands nothing to the lane. A capture superseded while it runs
+/// stops between files or at a phase boundary; see [`RunningCapture`]. That capture, and
+/// one superseded at publication, records its epoch and wakes reads, so a read captures
+/// the tree again and answers stale when it moved since that read's previous capture,
+/// while changes keep waiting for a current publication.
 ///
 /// Each blocking operation races the supervisor's cancellation token. A stop that lands
 /// while the capture scans a large tree answers [`RebuildOutcome::Cancelled`] at once
@@ -3756,10 +4529,27 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// spawns nothing. The capture meets the token at its next phase boundary and returns
 /// its work to the observation; a publication that took its locks before the token was
 /// cancelled still lands, and nobody hands it to the lanes.
+///
+/// Each rebuild counts once into `index.rebuilds` under the trigger its observation names,
+/// [`PendingWork::rebuild_trigger`].
 pub(crate) async fn rebuild_workspace(
     context: &IndexSupervisorContext,
     request: RebuildRequest,
     capture: impl CaptureWorkspace + Send + 'static,
+) -> Result<RebuildOutcome, RiftError> {
+    let trigger = request.work.rebuild_trigger();
+    let result = rebuild_captured(context, request, capture, trigger).await;
+    count_rebuild(trigger, rebuild_error_type(&result));
+    result
+}
+
+/// Captures and publishes one rebuild, as [`rebuild_workspace`] documents; a publication
+/// records `trigger`.
+async fn rebuild_captured(
+    context: &IndexSupervisorContext,
+    request: RebuildRequest,
+    capture: impl CaptureWorkspace + Send + 'static,
+    trigger: &'static str,
 ) -> Result<RebuildOutcome, RiftError> {
     let epoch = request.epoch;
     let root = context.root.clone();
@@ -3792,7 +4582,7 @@ pub(crate) async fn rebuild_workspace(
                 .map(|lane| LexicalHandoff::new(lane, write));
             let outcome = publish_captured(context, published, change_set, work, lexical).await?;
             if outcome == RebuildOutcome::Published {
-                trace_publication(epoch);
+                trace_publication(epoch, trigger);
             }
             Ok(outcome)
         }
@@ -3872,7 +4662,8 @@ pub(crate) enum CapturedRebuild {
         /// The observation's work, returned to the supervisor when nothing publishes.
         work: PendingWork,
     },
-    /// The observation was already superseded, or configuration moved during the capture.
+    /// The observation was already superseded, a later observation superseded the capture
+    /// while it ran, or configuration moved during the capture.
     Superseded,
     /// The supervisor was cancelled before the capture ran, or before its candidate was
     /// handed on; the observation's work is returned and nothing publishes.
@@ -3893,6 +4684,11 @@ pub(crate) enum CapturedRebuild {
 /// read again and no lexical write is owed. Such a capture answers
 /// [`CapturedRebuild::Unchanged`], and the caller stamps the publication with the
 /// observation's epoch instead of publishing and handing on a twin of it.
+///
+/// A capture that a later observation superseded while it ran answers
+/// [`WorkspaceCandidate::Superseded`]. The attempt returns its work, records its epoch as
+/// superseded, and wakes the reads waiting on it, exactly as a candidate superseded at
+/// publication does.
 ///
 /// The supervisor's cancellation is checked at the phase boundaries: before the capture
 /// runs, and before the candidate's lexical write is derived. A stop that lands during a
@@ -3929,13 +4725,20 @@ pub(crate) fn capture_rebuild_with(
             return error.fail();
         }
     };
-    let WorkspaceCandidate::Stable {
-        published: candidate,
-        change_set,
-    } = candidate
-    else {
-        let _ = validation.observe_whole_workspace();
-        return Ok(CapturedRebuild::Superseded);
+    let (candidate, change_set) = match candidate {
+        WorkspaceCandidate::Stable {
+            published,
+            change_set,
+        } => (published, change_set),
+        WorkspaceCandidate::ConfigurationChanged => {
+            let _ = validation.observe_whole_workspace();
+            return Ok(CapturedRebuild::Superseded);
+        }
+        WorkspaceCandidate::Superseded => {
+            validation.restore_pending(request.work);
+            validation.record_superseded(request.epoch);
+            return Ok(CapturedRebuild::Superseded);
+        }
     };
     if validation.cancellation.is_cancelled() {
         validation.restore_pending(request.work);
@@ -3983,10 +4786,7 @@ pub(crate) fn finish_rebuild(
     } else {
         validation.restore_pending(work);
         if outcome == RebuildOutcome::Superseded {
-            validation
-                .superseded_epoch
-                .fetch_max(candidate.epoch, Ordering::SeqCst);
-            validation.changed.notify_waiters();
+            validation.record_superseded(candidate.epoch);
         }
     }
     outcome
@@ -4047,7 +4847,7 @@ pub(crate) fn publish_rebuild_after(
     let observed_epoch = validation.observed_epoch();
     let candidate =
         answered_candidate(root, candidate, &publication, observed_epoch).into_current();
-    let mut state = published.blocking_write();
+    let mut state = write_published(published);
     after_state_lock();
     if validation.cancellation.is_cancelled() {
         drop(state);
@@ -4177,19 +4977,49 @@ pub(crate) fn record_rebuild_failure(
 ) -> bool {
     let publication = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
-    let recorded = published
-        .blocking_write()
-        .record_failure(epoch, observed_epoch, error);
+    let recorded = write_published(published).record_failure(epoch, observed_epoch, error);
     drop(publication);
     recorded
 }
 
-/// Emits one path-free filesystem publication event.
-pub(crate) fn trace_publication(epoch: u64) {
-    tracing::info!(
+/// Emits the one record of a superseded rebuild: the epoch it answered for and the epoch
+/// the observation stood at when the supervisor took its outcome.
+///
+/// A superseded rebuild publishes nothing and records no failure, so this record is what
+/// names the rebuild a waiting read was woken by.
+fn trace_superseded(epoch: u64, observed_epoch: u64) {
+    rift_tracing::debug!(
+        component = "index",
+        operation = "index.build",
+        epoch,
+        observed_epoch,
+        "index rebuild superseded"
+    );
+}
+
+/// Emits the one record of a preparation batch whose publication the observation under
+/// the publication lane superseded: the epoch its candidate answers, the epoch the
+/// observation stood at, and the `index.rebuild.trigger` of the rebuild `pending` starts.
+///
+/// The record is at `info`, beside the preparation's own progress records, because the
+/// startup publication it names falls to the supervisor's next rebuild.
+fn trace_preparation_superseded(epoch: u64, observed_epoch: u64, pending: &PendingWork) {
+    rift_tracing::info!(
+        component = "index",
+        operation = "index.build",
+        epoch,
+        observed_epoch,
+        trigger = pending.rebuild_trigger(),
+        "index preparation superseded"
+    );
+}
+
+/// Emits one path-free publication event for a rebuild `trigger` started.
+pub(crate) fn trace_publication(epoch: u64, trigger: &'static str) {
+    rift_tracing::info!(
         component = "index",
         operation = "index.publish",
-        trigger = "filesystem",
+        trigger,
         epoch,
         "index snapshot published"
     );
@@ -4680,7 +5510,6 @@ pub(crate) mod tests {
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, VectorReadiness};
     use tokio::sync::{Barrier as AsyncBarrier, RwLock};
     use tokio_util::sync::CancellationToken;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, LANE_WAIT_MAX, StoreDouble};
     use super::{
@@ -4767,7 +5596,7 @@ pub(crate) mod tests {
     ) -> TestResult<Arc<PublishedWorkspace>> {
         match build_workspace_candidate(root, limits, &RebuildRequest::initial(epoch))? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
-            WorkspaceCandidate::ConfigurationChanged => {
+            WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                 Err("fixture configuration must remain stable".into())
             }
         }
@@ -5177,6 +6006,136 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A publication holding the published snapshot's write lock sits in the table of
+    /// operations in flight as a held lock under the operation that publishes, so every
+    /// read waiting for that write can be traced to it.
+    #[test]
+    fn a_held_snapshot_write_is_listed_under_the_operation_that_publishes() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let fixture = publication_fixture()?;
+        let outcome = rift_tracing::traced!(component = "index", operation = "index.build", {
+            publish_rebuild_after(
+                fixture.root(),
+                &fixture.state,
+                &fixture.validation,
+                &fixture.after,
+                &ChangeSet::Full,
+                None,
+                || rift_tracing::publish_in_flight("stop"),
+            )
+        });
+        assert_eq!(outcome, RebuildOutcome::Published);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the hook published the table")?;
+        let table: serde_json::Value = serde_json::from_str(table.fields())?;
+        let listed: serde_json::Value =
+            serde_json::from_str(table["operations"].as_str().ok_or("operations")?)?;
+        let held = listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["kind"] == "held")
+            .collect::<Vec<_>>();
+        assert_eq!(held.len(), 1, "{table}");
+        assert_eq!(
+            held[0]["lock.name"],
+            super::PUBLISHED_SNAPSHOT_LOCK,
+            "{table}"
+        );
+        assert_eq!(held[0]["parent"], "index.build", "{table}");
+        Ok(())
+    }
+
+    /// A read of the published snapshot behind a held write records its wait as the
+    /// snapshot lock in shared mode, naming the read that waited and the operation that
+    /// holds the write, and acquires once that write drops.
+    #[tokio::test]
+    async fn a_snapshot_read_behind_a_held_write_records_its_wait() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let fixture = publication_fixture()?;
+        let state = Arc::clone(&fixture.state);
+        let write = rift_tracing::traced!(component = "index", operation = "index.build", async {
+            rift_tracing::lock(super::PUBLISHED_SNAPSHOT_LOCK)
+                .acquire(state.write())
+                .await
+        })
+        .await;
+        let reading = Arc::clone(&fixture.state);
+        let reader = tokio::spawn(rift_tracing::traced!(
+            component = "search",
+            operation = "search.request",
+            async move { super::read_published(&reading).await.current.epoch }
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "the held write keeps the read waiting"
+        );
+        drop(write);
+        reader.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let waits = records
+            .iter()
+            .filter(|record| record.message() == "lock.wait")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(waits.len(), 1, "one wait, one record: {records:?}");
+        let wait = &waits[0];
+        assert_eq!(wait["lock.name"], super::PUBLISHED_SNAPSHOT_LOCK, "{wait}");
+        assert_eq!(wait["lock.mode"], "shared", "{wait}");
+        assert_eq!(wait["waiter"], "search.request", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "acquired", "{wait}");
+        Ok(())
+    }
+
+    /// An observation records the filesystem epoch it reaches, and a publication the epoch
+    /// it installs, so the two read apart while the index is behind the tree.
+    #[test]
+    fn observation_and_publication_record_their_index_epochs() -> TestResult {
+        let recorder = rift_tracing::ScopedRecorder::builder().install()?.0;
+        let fixture = publication_fixture()?;
+        let epoch = |kind| {
+            recorder
+                .metrics()
+                .find("index.epoch", &[("index.epoch.kind", kind)])
+                .map(|series| series.value().clone())
+        };
+        let observed = fixture.validation.observe_whole_workspace()?;
+        assert_eq!(
+            epoch("observed"),
+            Some(rift_tracing::SeriesValue::Last(f64::from(u32::try_from(
+                observed
+            )?)))
+        );
+        assert_eq!(epoch("published"), None, "nothing published since");
+        let current = stable_candidate(fixture.root(), observed)?;
+        let outcome = publish_rebuild_after(
+            fixture.root(),
+            &fixture.state,
+            &fixture.validation,
+            &current,
+            &ChangeSet::Full,
+            None,
+            || {},
+        );
+        assert_eq!(outcome, RebuildOutcome::Published);
+        assert_eq!(
+            epoch("published"),
+            Some(rift_tracing::SeriesValue::Last(f64::from(u32::try_from(
+                observed
+            )?)))
+        );
+        Ok(())
+    }
+
     #[test]
     fn superseded_state_updates_are_rejected_and_success_clears_failure() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -5386,6 +6345,214 @@ pub(crate) mod tests {
         assert!(validation.watch_failed.load(Ordering::Acquire));
     }
 
+    /// The value the series of `name` under exactly `labels` holds, if any.
+    fn series(
+        snapshot: &rift_tracing::MetricSnapshot,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<rift_tracing::SeriesValue> {
+        snapshot
+            .find(name, labels)
+            .map(|series| series.value().clone())
+    }
+
+    /// The fields of every record named `message`.
+    fn records_named(
+        records: &[rift_tracing::LogRecord],
+        message: &str,
+    ) -> TestResult<Vec<serde_json::Value>> {
+        records
+            .iter()
+            .filter(|record| record.message() == message)
+            .map(|record| Ok(serde_json::from_str(record.fields())?))
+            .collect()
+    }
+
+    /// The channel holds `INDEX_INVALIDATIONS_MAX` (one) signal: each observation past it
+    /// counts under the route it took, and none writes a record.
+    #[test]
+    fn a_full_invalidation_channel_counts_each_refused_signal_by_its_route() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, mut receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.observe_paths([ProjectPath::new("lib.rs")?])?;
+        validation.observe_paths([ProjectPath::new("main.rs")?])?;
+        validation.observe_whole_workspace()?;
+        validation.observe_watch_failure()?;
+        receiver.try_recv()?;
+        validation.observe_paths([ProjectPath::new("lib.rs")?])?;
+        let snapshot = recorder.metrics();
+        drop(recorder);
+
+        let dropped = "index.invalidation.dropped";
+        assert_eq!(
+            series(&snapshot, dropped, &[("event", "paths")]),
+            Some(rift_tracing::SeriesValue::Sum(1.0)),
+            "the first signal and the one after the receive were taken: {snapshot:?}"
+        );
+        assert_eq!(
+            series(&snapshot, dropped, &[("event", "whole_workspace")]),
+            Some(rift_tracing::SeriesValue::Sum(2.0)),
+            "{snapshot:?}"
+        );
+        let records = drain.queued_records();
+        assert!(
+            records.is_empty(),
+            "a refused signal writes no record: {records:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn each_watch_event_counts_under_its_kind_and_route() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let root = std::path::Path::new("/rift-workspace");
+        let roots = super::WatchRoots::at(root);
+        let configuration =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
+        let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(root.join("lib.rs"));
+        let rescan = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        for event in [configuration.clone(), configuration, access, rescan] {
+            super::report_watch_outcome(&roots, &validation, Ok(event));
+        }
+        let snapshot = recorder.metrics();
+        drop(recorder);
+
+        let expected = [
+            ("modify", "paths", 2.0),
+            ("access", "none", 1.0),
+            ("other", "whole_workspace", 1.0),
+        ];
+        for (kind, route, count) in expected {
+            assert_eq!(
+                series(
+                    &snapshot,
+                    "watch.events",
+                    &[("watch.event.kind", kind), ("watch.event.route", route)],
+                ),
+                Some(rift_tracing::SeriesValue::Sum(count)),
+                "{kind} {route}: {snapshot:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With the supervisor gone every observation fails: each step records its failure
+    /// once with its registered identity, and a report records the repeats with a count.
+    #[test]
+    fn repeated_watch_failures_record_once_and_report_one_count_of_the_repeats() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (validation, receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        drop(receiver);
+        let root = std::path::Path::new("/rift-workspace");
+        let roots = super::WatchRoots::at(root);
+        let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
+        for _ in 0..3 {
+            super::report_watch_outcome(&roots, &validation, Ok(event.clone()));
+        }
+        for _ in 0..2 {
+            let failure = notify::Error::generic("test backend failure");
+            super::report_watch_outcome(&roots, &validation, Err(failure));
+        }
+        let first = drain.queued_records();
+        validation.report_watch_failures();
+        let reported = drain.queued_records();
+        validation.report_watch_failures();
+        super::report_watch_outcome(&roots, &validation, Ok(event));
+        let again = drain.queued_records();
+        drop(recorder);
+
+        let unavailable = errors::server::read_unavailable::SLUG.as_str();
+        let observed = records_named(&first, "index watch failed")?;
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0]["error.type"], unavailable);
+        assert!(
+            observed[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("index supervisor is not running")),
+            "{observed:?}"
+        );
+        assert!(observed[0].get("count").is_none(), "{observed:?}");
+        let backend = records_named(&first, "index watch backend reported failure")?;
+        assert_eq!(backend.len(), 1, "{backend:?}");
+        assert_eq!(backend[0]["error.type"], unavailable);
+        assert!(
+            backend[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("test backend failure")),
+            "{backend:?}"
+        );
+
+        let observed = records_named(&reported, "index watch failed")?;
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0]["count"], "2");
+        let backend = records_named(&reported, "index watch backend reported failure")?;
+        assert_eq!(backend.len(), 1, "{backend:?}");
+        assert_eq!(backend[0]["count"], "1");
+
+        let observed = records_named(&again, "index watch failed")?;
+        assert_eq!(observed.len(), 1, "a report empties the slot: {again:?}");
+        assert!(observed[0].get("count").is_none(), "{observed:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_rebuild_counts_under_its_trigger_and_a_failure_under_its_identity() -> TestResult
+    {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        super::prepare_initial_workspace(&context).await?;
+        context
+            .validation
+            .observe_paths([ProjectPath::new("lib.rs")?])?;
+        let paths = context.validation.take_pending();
+        super::rebuild_workspace(&context, paths, super::workspace_capture()).await?;
+        context.validation.observe_whole_workspace()?;
+        let whole = context.validation.take_pending();
+        super::rebuild_workspace(&context, whole, super::workspace_capture()).await?;
+        context.validation.observe_whole_workspace()?;
+        let failing = context.validation.take_pending();
+        let refuse = |_: &std::path::Path,
+                      _: WorkspaceIndexLimits,
+                      _: &RebuildRequest|
+         -> Result<WorkspaceCandidate, rift_error::RiftError> {
+            errors::server::read_unavailable()
+                .operation("index capture")
+                .detail("the test capture refuses")
+                .fail()
+        };
+        super::rebuild_workspace(&context, failing, refuse)
+            .await
+            .expect_err("the refusing capture fails the rebuild");
+        let snapshot = recorder.metrics();
+        drop(recorder);
+
+        let unavailable = errors::server::read_unavailable::SLUG.as_str();
+        let expected = [
+            ("startup", None),
+            ("filesystem", None),
+            ("rescan", None),
+            ("rescan", Some(unavailable)),
+        ];
+        for (trigger, error_type) in expected {
+            let mut labels = vec![("index.rebuild.trigger", trigger)];
+            labels.extend(error_type.map(|error_type| ("error.type", error_type)));
+            assert_eq!(
+                series(&snapshot, "index.rebuilds", &labels),
+                Some(rift_tracing::SeriesValue::Sum(1.0)),
+                "{trigger} {error_type:?}: {snapshot:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn watch_event_after_supervisor_loss_marks_the_watch_unhealthy() {
         let (validation, receiver) =
@@ -5562,8 +6729,8 @@ pub(crate) mod tests {
 
     /// A server does not index its own state. The walk's hard floor prunes `.rift` by
     /// name before either lane sees it, so neither the syntax-indexed files nor the
-    /// recorded set holds the workspace database, whose bytes move for as long as SQLite
-    /// runs.
+    /// recorded set holds the index, metrics, and vectors databases, whose bytes move for
+    /// as long as SQLite runs.
     #[test]
     fn the_index_holds_no_path_under_the_state_directory() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -5572,7 +6739,15 @@ pub(crate) mod tests {
             .path()
             .join(rift_core::constants::RIFT_STATE_DIRECTORY);
         fs::create_dir_all(&state)?;
-        for name in ["db", "db-shm", "db-wal", "server.json"] {
+        for name in [
+            "index",
+            "index-shm",
+            "index-wal",
+            "metrics",
+            "metrics-wal",
+            "vectors",
+            "server.json",
+        ] {
             fs::write(state.join(name), "state\n")?;
         }
 
@@ -5612,7 +6787,7 @@ pub(crate) mod tests {
         let canonical = directory.path().canonicalize()?;
         let state = canonical
             .join(rift_core::constants::RIFT_STATE_DIRECTORY)
-            .join("db");
+            .join(rift_core::constants::METRICS_DATABASE_FILE_NAME);
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let written = |path: &std::path::Path| {
@@ -5640,7 +6815,7 @@ pub(crate) mod tests {
             let roots = super::WatchRoots::resolve(&linked)?;
             let linked_state = linked
                 .join(rift_core::constants::RIFT_STATE_DIRECTORY)
-                .join("db");
+                .join(rift_core::constants::INDEX_DATABASE_FILE_NAME);
             assert_eq!(
                 super::watch_event_impact(&roots, &validation, &written(&linked_state)),
                 super::WatchImpact::None,
@@ -5947,7 +7122,7 @@ pub(crate) mod tests {
     /// The change set one taken observation resolves to against `previous`.
     fn change_set_of(
         root: &std::path::Path,
-        validation: &IndexValidation,
+        validation: &Arc<IndexValidation>,
         previous: &Arc<PublishedWorkspace>,
     ) -> ChangeSet {
         let mut request = validation.take_pending();
@@ -6122,13 +7297,14 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([path.clone()]),
             previous: Some(Arc::clone(previous)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
         match build_workspace_candidate(root, WorkspaceIndexLimits::default(), &request)? {
             WorkspaceCandidate::Stable {
                 published,
                 change_set,
             } => Ok((published, change_set)),
-            WorkspaceCandidate::ConfigurationChanged => {
+            WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                 Err("fixture configuration must remain stable".into())
             }
         }
@@ -6328,6 +7504,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("pkg")?]),
             previous: Some(previous),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
         let configuration = ConfigurationState::accept(directory.path());
         assert_eq!(
@@ -6403,6 +7580,51 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// One span closes for each stage of a one-path rebuild that covers every held file,
+    /// so the record of a rebuild says where its time went.
+    #[test]
+    fn a_one_path_rebuild_closes_one_span_for_each_stage() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        });
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let request = validation.take_pending();
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            super::workspace_capture(),
+        )?;
+        drop(recorder);
+        assert!(matches!(outcome, super::CapturedRebuild::Candidate { .. }));
+        let records = drain.queued_records();
+        for stage in [
+            "index.semantics",
+            "documentation.declarations",
+            "documentation.collect",
+            "index.visible_digests",
+            "index.map",
+            "index.lexical_write",
+        ] {
+            let closed = records
+                .iter()
+                .filter(|record| record.message() == stage)
+                .filter(|record| record.fields().contains("\"span\":\"closed\""))
+                .count();
+            assert_eq!(closed, 1, "one closed span for the {stage} stage");
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_whole_workspace_rebuild_rescans_under_unchanged_index_configuration() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -6417,6 +7639,7 @@ pub(crate) mod tests {
                 work: super::PendingWork::whole_workspace(),
                 previous: Some(Arc::clone(&previous)),
                 cancellation: CancellationToken::new(),
+                observation: None,
             };
             match build_workspace_candidate(directory.path(), limits, &request)? {
                 WorkspaceCandidate::Stable {
@@ -6430,7 +7653,7 @@ pub(crate) mod tests {
                     );
                     Ok(published)
                 }
-                WorkspaceCandidate::ConfigurationChanged => {
+                WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                     Err("fixture configuration must remain stable".into())
                 }
             }
@@ -6468,6 +7691,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("lib.rs")?]),
             previous: Some(Arc::clone(&previous)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
 
         let limits = WorkspaceIndexLimits::default();
@@ -6501,6 +7725,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("lib.rs")?]),
             previous: Some(Arc::clone(&previous)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
 
         let limits = WorkspaceIndexLimits::default();
@@ -6536,6 +7761,7 @@ pub(crate) mod tests {
                 work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
                 previous: Some(Arc::clone(&previous)),
                 cancellation: CancellationToken::new(),
+                observation: None,
             };
 
             let WorkspaceCandidate::Stable {
@@ -6584,6 +7810,7 @@ pub(crate) mod tests {
                 work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
                 previous: Some(Arc::clone(&previous)),
                 cancellation: CancellationToken::new(),
+                observation: None,
             };
 
             let WorkspaceCandidate::Stable {
@@ -6847,6 +8074,360 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A publication of `lib.rs`, one observed rewrite of it, and the request that
+    /// rewrite's rebuild runs from, resolved against the publication.
+    type RunningCaptureFixture = (
+        tempfile::TempDir,
+        Arc<IndexValidation>,
+        RebuildRequest,
+        Option<super::CapturedRecords>,
+        tokio::sync::mpsc::Receiver<()>,
+    );
+
+    fn running_capture_fixture() -> TestResult<RunningCaptureFixture> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn first() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let mut request = validation.take_pending();
+        request.previous = Some(previous);
+        let configuration = ConfigurationState::accept(directory.path());
+        let (change_set, records) =
+            request.change_set_with_records(directory.path(), &configuration);
+        assert!(matches!(change_set, ChangeSet::Incremental(_)));
+        Ok((directory, validation, request, records, invalidations))
+    }
+
+    /// The recorded churn sequence: the path a capture already read is written again.
+    #[test]
+    fn a_running_capture_is_superseded_once_its_own_path_holds_other_bytes() -> TestResult {
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let root = directory.path();
+        let path = rift_core::ProjectPath::new("lib.rs")?;
+        let running = super::RunningCapture::new(root, &request, records);
+        assert!(!running.is_superseded(), "nothing was observed since");
+
+        validation.observe_paths([path.clone()])?;
+        assert!(
+            !running.is_superseded(),
+            "a late report of the bytes the capture read supersedes nothing"
+        );
+        fs::write(root.join("lib.rs"), "pub fn second() {}\n")?;
+        assert!(
+            !running.is_superseded(),
+            "an unmoved epoch asks for no comparison"
+        );
+        validation.observe_paths([path])?;
+        assert!(
+            running.is_superseded(),
+            "the observed path holds bytes the capture did not read"
+        );
+        fs::write(root.join("lib.rs"), "pub fn first() {}\n")?;
+        assert!(running.is_superseded(), "a superseded capture stays so");
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_capture_compares_an_unnamed_path_with_the_publication() -> TestResult {
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let root = directory.path();
+        let other = rift_core::ProjectPath::new("other.rs")?;
+        let running = super::RunningCapture::new(root, &request, records);
+
+        validation.observe_paths([other.clone()])?;
+        assert!(
+            !running.is_superseded(),
+            "a path absent from the disk and from the publication moved nothing"
+        );
+        fs::write(root.join("other.rs"), "pub fn other() {}\n")?;
+        validation.observe_paths([other])?;
+        assert!(
+            running.is_superseded(),
+            "the publication the capture shares holds no file at the observed path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_workspace_observation_supersedes_every_running_capture() -> TestResult {
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let root = directory.path();
+        let incremental = super::RunningCapture::new(root, &request, records);
+        let scan = super::RunningCapture::new(root, &request, None);
+
+        fs::write(root.join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        assert!(
+            !scan.is_superseded(),
+            "a whole scan decides what it holds only when it ends"
+        );
+        validation.observe_whole_workspace()?;
+        assert!(scan.is_superseded());
+        assert!(incremental.is_superseded());
+
+        let unobserved = RebuildRequest::initial(request.epoch);
+        assert!(
+            !super::RunningCapture::new(root, &unobserved, None).is_superseded(),
+            "a request that names no validation is never superseded while it runs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_capture_reads_no_more_paths_than_its_bound() -> TestResult {
+        let named = |count: usize| -> TestResult<Vec<rift_core::ProjectPath>> {
+            let mut paths = vec![rift_core::ProjectPath::new("lib.rs")?];
+            for index in 1..count {
+                paths.push(rift_core::ProjectPath::new(format!("absent{index}.rs"))?);
+            }
+            Ok(paths)
+        };
+
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let running = super::RunningCapture::new(directory.path(), &request, records);
+        fs::write(directory.path().join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths(named(super::RUNNING_CAPTURE_READS_MAX + 1)?)?;
+        assert!(
+            !running.is_superseded(),
+            "an observation past the bound leaves the decision to publication"
+        );
+
+        let (directory, validation, request, records, _invalidations) = running_capture_fixture()?;
+        let running = super::RunningCapture::new(directory.path(), &request, records);
+        fs::write(directory.path().join("lib.rs"), "pub fn second() {}\n")?;
+        validation.observe_paths(named(super::RUNNING_CAPTURE_READS_MAX)?)?;
+        assert!(
+            running.is_superseded(),
+            "an observation at the bound is compared"
+        );
+        Ok(())
+    }
+
+    /// One published `lib.rs`, one observed rewrite of it, and the state a capture of
+    /// that rewrite publishes into.
+    type ObservedRewrite = (
+        tempfile::TempDir,
+        Arc<IndexValidation>,
+        RwLock<IndexState>,
+        u64,
+        tokio::sync::mpsc::Receiver<()>,
+    );
+
+    fn observed_rewrite() -> TestResult<ObservedRewrite> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        });
+        fs::write(directory.path().join("lib.rs"), "pub fn first() {}\n")?;
+        let epoch = validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        Ok((directory, validation, state, epoch, invalidations))
+    }
+
+    #[test]
+    fn a_capture_stops_once_a_later_observation_names_bytes_it_does_not_hold() -> TestResult {
+        use std::future::Future as _;
+
+        let (directory, validation, state, epoch, _invalidations) = observed_rewrite()?;
+        let request = validation.take_pending();
+        let woken = validation.changed.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        let observing = Arc::clone(&validation);
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            move |root, limits, request| {
+                fs::write(root.join("other.rs"), "pub fn other() {}\n")
+                    .expect("the later source must land");
+                observing.observe_paths([
+                    rift_core::ProjectPath::new("other.rs").expect("fixture path is valid")
+                ])?;
+                build_workspace_candidate(root, limits, request)
+            },
+        )?;
+        assert!(
+            matches!(outcome, super::CapturedRebuild::Superseded),
+            "the capture stops before it builds a candidate"
+        );
+        assert_eq!(
+            validation.superseded_after(0),
+            Some(epoch),
+            "the stopped capture records its epoch as superseded"
+        );
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            woken.as_mut().poll(&mut context).is_ready(),
+            "the stopped capture wakes the reads waiting on it"
+        );
+        let state = state.blocking_read();
+        assert_eq!(
+            state.current.epoch, 0,
+            "a stopped capture publishes nothing"
+        );
+        assert!(state.failure.is_none(), "a stopped capture is no failure");
+        drop(state);
+        let next = validation.take_pending();
+        let paths: Vec<&str> = next
+            .work
+            .paths()
+            .map(rift_core::ProjectPath::as_str)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["lib.rs", "other.rs"],
+            "the stopped capture returns its work beside what landed while it ran"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_scan_stops_once_a_later_observation_asks_for_the_whole_workspace() -> TestResult {
+        let (directory, validation, state, _epoch, _invalidations) = observed_rewrite()?;
+        let epoch = validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+        let observing = Arc::clone(&validation);
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            move |root, limits, request| {
+                observing.observe_whole_workspace()?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                assert!(matches!(candidate, WorkspaceCandidate::Superseded));
+                Ok(candidate)
+            },
+        )?;
+        assert!(matches!(outcome, super::CapturedRebuild::Superseded));
+        assert_eq!(validation.superseded_after(0), Some(epoch));
+        assert!(
+            validation.locked_pending().covers_whole_workspace(),
+            "the stopped scan leaves the whole workspace owed"
+        );
+        Ok(())
+    }
+
+    /// A read's own request and a watcher's late report both observe bytes the running
+    /// capture already read. That capture runs to its end and its candidate publishes
+    /// under the later epoch.
+    #[tokio::test]
+    async fn a_capture_holding_the_observed_bytes_still_publishes() -> TestResult {
+        let (directory, validation, state, _epoch, _invalidations) = observed_rewrite()?;
+        let published = Arc::new(state);
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let request = validation.take_pending();
+        let observing = Arc::clone(&validation);
+        let later = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reported = Arc::clone(&later);
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest| {
+            let path = rift_core::ProjectPath::new("lib.rs").expect("fixture path is valid");
+            reported.store(observing.observe_paths([path])?, Ordering::SeqCst);
+            build_workspace_candidate(root, limits, request)
+        };
+        let outcome = super::rebuild_workspace(&context, request, capture).await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let (current, failure) = published.read().await.snapshot();
+        assert!(failure.is_none());
+        assert_eq!(
+            current.epoch,
+            later.load(Ordering::SeqCst),
+            "the candidate answers the later observation as its twin"
+        );
+        assert_eq!(declarations_named(&current, "first")?, 1);
+        assert!(validation.superseded_after(0).is_none());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_records_a_superseded_rebuild_with_both_epochs() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let published = Arc::new(RwLock::new(IndexState {
+            current: stable_candidate(directory.path(), 0)?,
+            failure: None,
+        }));
+        let watcher = unwatched(directory.path(), &validation)?;
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let observing = Arc::clone(&validation);
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&captures);
+        // The first capture meets a later observation of a file the publication does
+        // not hold; every later capture runs undisturbed.
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::write(root.join("other.rs"), "pub fn other() {}\n")
+                    .expect("the later source must land");
+                let path = rift_core::ProjectPath::new("other.rs").expect("fixture path is valid");
+                observing.observe_paths([path])?;
+            }
+            build_workspace_candidate(root, limits, request)
+        };
+        let supervisor = tokio::spawn(super::run_index_supervisor_with(
+            watcher,
+            invalidations,
+            cancellation_context(directory.path(), &validation, &published, &blocking),
+            capture,
+        ));
+        fs::write(directory.path().join("lib.rs"), "pub fn first() {}\n")?;
+        let epoch = validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let current = tokio::time::timeout(LANE_WAIT_MAX, async {
+            loop {
+                let changed = validation.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let current = published.read().await.snapshot().0;
+                if current.epoch > epoch {
+                    return current;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| "the rebuild after the superseded one must publish")?;
+        validation.cancellation.cancel();
+        supervisor.await?;
+
+        assert_eq!(current.epoch, epoch + 1);
+        assert_eq!(declarations_named(&current, "first")?, 1);
+        assert_eq!(declarations_named(&current, "other")?, 1);
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
+        let records = drain.queued_records();
+        let superseded: Vec<_> = records
+            .iter()
+            .filter(|record| record.message() == "index rebuild superseded")
+            .collect();
+        assert_eq!(
+            superseded.len(),
+            1,
+            "one record for the one superseded rebuild"
+        );
+        assert_eq!(superseded[0].component(), "index");
+        assert_eq!(superseded[0].operation(), "index.build");
+        let fields: serde_json::Value = serde_json::from_str(superseded[0].fields())?;
+        assert_eq!(fields["epoch"], epoch.to_string());
+        assert_eq!(fields["observed_epoch"], (epoch + 1).to_string());
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn supervisor_marks_the_watch_unhealthy_when_blocking_work_is_gone() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -6891,6 +8472,57 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A supervisor that ends drops its watcher with it and records both ends, the
+    /// supervisor's first.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_that_ends_records_that_its_watch_stopped() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let current = stable_candidate(directory.path(), 0)?;
+        let published = Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        }));
+        let watcher = unwatched(directory.path(), &validation)?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let supervisor = tokio::spawn(super::run_index_supervisor(
+            watcher,
+            invalidations,
+            super::IndexSupervisorContext {
+                root: directory.path().to_path_buf(),
+                limits: WorkspaceIndexLimits::default(),
+                published,
+                validation: Arc::clone(&validation),
+                blocking: crate::server::BlockingExecutor::isolated(1, 60_000),
+                population: None,
+                lexical: None,
+            },
+        ));
+        validation.cancellation.cancel();
+        supervisor.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let position = |message: &str| {
+            records
+                .iter()
+                .position(|record| record.message() == message)
+                .ok_or(format!("a record says {message}: {records:?}"))
+        };
+        let supervisor_stopped = position(
+            "the index supervisor stopped; no further snapshot publishes in this process",
+        )?;
+        let watch_stopped = position("index watch stopped")?;
+        assert!(supervisor_stopped < watch_stopped, "{records:?}");
+        let stopped = &records[watch_stopped];
+        assert_eq!(stopped.level(), "info");
+        assert_eq!(stopped.component(), "index");
+        assert_eq!(stopped.operation(), "index.supervisor");
+        Ok(())
+    }
+
     #[test]
     fn rebuild_acceptance_fails_after_watcher_failure() {
         let (validation, receiver) =
@@ -6908,11 +8540,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn supervisor_records_rebuild_failure_and_notifies_waiters() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let (validation, invalidations) =
@@ -6975,9 +8603,10 @@ pub(crate) mod tests {
         let (context, _invalidations) = initial_preparation_context(root)?;
         let partial = Arc::clone(&context.published.blocking_read().current);
         let complete = stable_candidate(root, 0)?;
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // At info: the snapshot's uncontended write hold closes at debug on every publish.
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("info")
+            .install()?;
         let publish = |candidate| {
             super::publish_preparation_after(
                 root,
@@ -6989,12 +8618,12 @@ pub(crate) mod tests {
         };
 
         assert_eq!(publish(&partial), RebuildOutcome::Published);
-        assert!(queued_records(&mut drain).is_empty());
+        assert!(drain.queued_records().is_empty());
         let epoch = context
             .validation
             .observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
         assert_eq!(publish(&complete), RebuildOutcome::Published);
-        let records = queued_records(&mut drain);
+        let records = drain.queued_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].component(), "index");
         assert_eq!(records[0].operation(), "index.publish");
@@ -7007,10 +8636,13 @@ pub(crate) mod tests {
         assert_eq!(published.current.epoch, epoch);
         drop(published);
         assert_eq!(publish(&complete), RebuildOutcome::Superseded);
-        assert!(queued_records(&mut drain).is_empty());
+        assert!(drain.queued_records().is_empty());
         Ok(())
     }
 
+    /// A preparation batch superseded by whole-workspace work publishes nothing and
+    /// records `index preparation superseded` once, naming the epochs and the `rescan`
+    /// trigger the supervisor's next rebuild runs under.
     #[test]
     fn superseded_preparation_emits_no_startup_publication() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -7018,10 +8650,10 @@ pub(crate) mod tests {
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         let (context, _invalidations) = initial_preparation_context(root)?;
         let complete = stable_candidate(root, 0)?;
-        context.validation.observe_whole_workspace()?;
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let observed_epoch = context.validation.observe_whole_workspace()?;
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("info")
+            .install()?;
 
         assert_eq!(
             super::publish_preparation_after(
@@ -7041,7 +8673,20 @@ pub(crate) mod tests {
                 .preparation
                 .is_some()
         );
-        assert!(queued_records(&mut drain).is_empty());
+        let records = drain.queued_records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].level(), "info");
+        assert_eq!(records[0].component(), "index");
+        assert_eq!(records[0].operation(), "index.build");
+        assert_eq!(records[0].message(), "index preparation superseded");
+        let fields: serde_json::Value = serde_json::from_str(records[0].fields())?;
+        assert_eq!(fields["epoch"], complete.epoch.to_string(), "{fields}");
+        assert_eq!(
+            fields["observed_epoch"],
+            observed_epoch.to_string(),
+            "{fields}"
+        );
+        assert_eq!(fields["trigger"], "rescan", "{fields}");
         Ok(())
     }
 
@@ -7063,15 +8708,17 @@ pub(crate) mod tests {
                 cancellation.cancel();
             }
             let batch = complete_initial_batch(&context, initial);
-            let (sink, mut drain) = crate::logs::log_capture();
-            let subscriber = tracing_subscriber::registry().with(sink);
-            let outcome = tokio::task::spawn_blocking(move || {
-                tracing::subscriber::with_default(subscriber, || {
-                    super::prepare_initial_batch(&cancellation, batch)
-                })
+            // The blocking thread does not inherit this thread's default subscriber:
+            // the closure installs its own recorder and hands its drain back.
+            let (outcome, mut drain) = tokio::task::spawn_blocking(move || {
+                let (recorder, drain) = rift_tracing::ScopedRecorder::builder().install()?;
+                let outcome = super::prepare_initial_batch(&cancellation, batch);
+                drop(recorder);
+                Ok::<_, rift_tracing::LogFilterError>((outcome, drain))
             })
-            .await?;
-            let publications = queued_records(&mut drain)
+            .await??;
+            let publications = drain
+                .queued_records()
                 .into_iter()
                 .filter(|record| record.operation() == "index.publish")
                 .collect::<Vec<_>>();
@@ -7086,6 +8733,152 @@ pub(crate) mod tests {
                 let fields: serde_json::Value = serde_json::from_str(publications[0].fields())?;
                 assert_eq!(fields["trigger"], "startup");
             }
+        }
+        Ok(())
+    }
+
+    /// Native events delivered after the empty startup publication and before the complete
+    /// batch publishes, in the order the macOS stream delivered them. The capture boundary's
+    /// `.rift` writes stay below the hard floor: the epoch holds and the preparation
+    /// publishes the tree. A `Create(Folder)` for `src`, a directory the fixture wrote
+    /// before the watcher started, asks for the whole workspace: the preparation records
+    /// `index preparation superseded` and publishes nothing, and the supervisor's rescan
+    /// publishes the tree a cold build reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_directory_event_during_preparation_leaves_the_startup_tree_to_the_supervisor()
+    -> TestResult {
+        for directory_event in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path();
+            fs::create_dir(root.join("src"))?;
+            fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
+            fs::write(root.join("README.md"), "See [Beacon](src/lib.rs#Beacon).\n")?;
+            let cold = published_facts(stable_candidate(root, 0)?.as_ref())?;
+            let (context, invalidations) = initial_preparation_context(root)?;
+            let validation = Arc::clone(&context.validation);
+            let state = Arc::clone(&context.published);
+            let roots = super::WatchRoots::resolve(root)?;
+            let initial = super::discover_initial_workspace(&context)
+                .await?
+                .ok_or("initial discovery was cancelled")?;
+
+            let state_directory = roots.canonical().join(".rift");
+            let boundary = state_directory.join(".tmpEa4R8n");
+            for event in [
+                Event::new(EventKind::Create(CreateKind::Folder)).add_path(state_directory),
+                Event::new(EventKind::Create(CreateKind::File)).add_path(boundary.clone()),
+                Event::new(EventKind::Remove(RemoveKind::File)).add_path(boundary),
+            ] {
+                super::report_watch_outcome(&roots, &validation, Ok(event));
+            }
+            assert_eq!(
+                validation.observed_epoch(),
+                0,
+                "`.rift` events move no epoch"
+            );
+            if directory_event {
+                let event = Event::new(EventKind::Create(CreateKind::Folder))
+                    .add_path(roots.canonical().join("src"));
+                super::report_watch_outcome(&roots, &validation, Ok(event));
+                assert_eq!(validation.observed_epoch(), 1);
+            }
+
+            let batch = complete_initial_batch(&context, initial);
+            let cancellation = validation.cancellation.clone();
+            // The blocking thread does not inherit this thread's default subscriber:
+            // the closure installs its own recorder and hands its drain back.
+            let (outcome, mut drain) = tokio::task::spawn_blocking(move || {
+                let (recorder, drain) = rift_tracing::ScopedRecorder::builder()
+                    .capture("rift_mcp=info")
+                    .install()?;
+                let outcome = super::prepare_initial_batch(&cancellation, batch);
+                drop(recorder);
+                Ok::<_, rift_tracing::LogFilterError>((outcome, drain))
+            })
+            .await??;
+            let records = drain
+                .queued_records()
+                .into_iter()
+                .filter(|record| matches!(record.operation(), "index.build" | "index.publish"))
+                .map(|record| record.message().to_owned())
+                .collect::<Vec<_>>();
+            if directory_event {
+                assert_eq!(outcome?.2, RebuildOutcome::Superseded);
+                assert_eq!(records, ["index preparation superseded"]);
+                assert!(state.read().await.current.preparation.is_some());
+            } else {
+                assert_eq!(outcome?.2, RebuildOutcome::Published);
+                assert_eq!(records, ["index snapshot published"]);
+            }
+
+            let watcher = super::unwatched(root, &validation)?;
+            let supervisor =
+                tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
+            let published = publication_matching(&state, &validation, &cold.digests).await;
+            validation.cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
+            let published = published?;
+            assert!(published.preparation.is_none());
+            assert_eq!(published.epoch, u64::from(directory_event));
+            assert_eq!(
+                published_facts(&published)?,
+                cold,
+                "startup publication facts must equal an independent cold build"
+            );
+        }
+        Ok(())
+    }
+
+    /// The complete batch's publication reads its cancellation at four points under a
+    /// static `[dependencies]` table: before it starts, as the dependency read starts,
+    /// after the version probes, and before the visible digests. A cancellation seen at
+    /// any of them answers `rift.server.read_cancelled` and builds no publication, so no
+    /// dependency context read under it is published.
+    #[tokio::test]
+    async fn complete_publication_answers_cancelled_at_each_of_its_checks() -> TestResult {
+        use std::sync::atomic::AtomicUsize;
+
+        /// The checks one uncancelled build reads.
+        const CHECKS: usize = 4;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            root.join("rift.toml"),
+            "[dependencies]\nresolution = \"static\"\n",
+        )?;
+        for cancelled_from in 0..=CHECKS {
+            let (context, _invalidations) = initial_preparation_context(root)?;
+            let initial = super::discover_initial_workspace(&context)
+                .await?
+                .ok_or("initial discovery was cancelled")?;
+            let index = initial.preparation.empty_snapshot()?;
+            let reads = AtomicUsize::new(0);
+            let cancelled = || reads.fetch_add(1, Ordering::Relaxed) >= cancelled_from;
+            let built = super::preparation_publication(
+                root,
+                index,
+                Arc::clone(&initial.source_policy),
+                &initial.configuration,
+                None,
+                0,
+                &cancelled,
+            );
+            if cancelled_from < CHECKS {
+                let error = built.err().ok_or("a cancelled build publishes nothing")?;
+                assert_eq!(
+                    error.slug(),
+                    errors::server::read_cancelled::SLUG,
+                    "cancelled from check {cancelled_from}"
+                );
+            } else {
+                assert!(built.is_ok(), "an uncancelled build completes");
+                assert_eq!(reads.load(Ordering::Relaxed), CHECKS);
+            }
+            assert!(
+                context.published.read().await.current.preparation.is_some(),
+                "the build itself publishes nothing"
+            );
         }
         Ok(())
     }
@@ -7109,6 +8902,42 @@ pub(crate) mod tests {
             map_text_paths: initial.map_text_paths,
             lexical: None,
         }
+    }
+
+    /// Startup preparation records its start with the selected file count, and each
+    /// checkpoint it publishes with the files prepared so far.
+    #[tokio::test]
+    async fn initial_preparation_records_its_start_and_each_checkpoint() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(root.join("other.rs"), "pub fn lantern() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        let total = initial.total;
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=info")
+            .install()?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
+
+        let records: Vec<_> = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.operation() == "index.build")
+            .collect();
+        let started = records.first().ok_or("the preparation start is recorded")?;
+        assert_eq!(started.message(), "index preparation started");
+        let fields: serde_json::Value = serde_json::from_str(started.fields())?;
+        assert_eq!(fields["total"], total.to_string(), "{fields}");
+        assert_eq!(fields["phase"], "start", "{fields}");
+        let last = records.last().ok_or("a checkpoint is recorded")?;
+        assert_eq!(last.message(), "index preparation progressed");
+        let fields: serde_json::Value = serde_json::from_str(last.fields())?;
+        assert_eq!(fields["prepared"], total.to_string(), "{fields}");
+        assert_eq!(fields["total"], total.to_string(), "{fields}");
+        Ok(())
     }
 
     /// A file edited after discovery is captured before its first prepared publication.
@@ -7228,11 +9057,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_commit_persists_every_chunk_of_an_oversized_text_file() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // The enforced minimum `max_chunk` against a several-kilobyte guide forces the file
@@ -7346,6 +9171,59 @@ pub(crate) mod tests {
             "the commit leaves the published unit set searchable"
         );
         cancellation.cancel();
+        Ok(())
+    }
+
+    /// A write the lane takes is recorded handed, then committing, then settled, each
+    /// naming the tree revision it answers for.
+    #[tokio::test]
+    async fn a_handed_write_is_recorded_handed_committing_and_settled() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let revision = published.reads.tree_revision().to_owned();
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=info")
+            .install()?;
+        let double = StoreDouble::new();
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        double.release_one();
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+
+        let records: Vec<_> = drain
+            .queued_records()
+            .into_iter()
+            .filter(|record| record.operation() == "search.commit")
+            .collect();
+        let messages: Vec<_> = records
+            .iter()
+            .map(rift_tracing::LogRecord::message)
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "lexical commit handed",
+                "lexical commit committing",
+                "lexical commit settled"
+            ]
+        );
+        for record in &records {
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields["tree_revision"], revision.as_str(), "{fields}");
+        }
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
         Ok(())
     }
 
@@ -7583,9 +9461,7 @@ pub(crate) mod tests {
     async fn a_refused_trigram_batch_is_recorded_and_the_next_write_owes_another() -> TestResult {
         let directory = tempfile::tempdir()?;
         let published = candidate_declaring(directory.path(), 0, "beacon")?;
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let double = StoreDouble::new();
         double.refuse_trigrams();
         let cancellation = CancellationToken::new();
@@ -7611,7 +9487,8 @@ pub(crate) mod tests {
             "the write ran between the batches"
         );
         assert_eq!(double.trigram_batches(), 0, "the store took no batch");
-        let refused = queued_records(&mut drain)
+        let refused = drain
+            .queued_records()
             .into_iter()
             .find(|record| {
                 record
@@ -7630,7 +9507,7 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
-        // The store lives outside the captured tree, as `.rift/db` does: the second capture
+        // The store lives outside the captured tree, as `.rift/index` does: the second capture
         // runs after the open, and a file the open writes beside the database would join
         // the tree as a moved file.
         let state = tempfile::tempdir()?;
@@ -7725,6 +9602,7 @@ pub(crate) mod tests {
             defaults.busy_timeout_ms(),
         );
         let limits = SearchIndexLimits::builder(lexical).disable_vector().build();
+        std::fs::create_dir_all(database)?;
         Ok(SearchIndex::open(database, limits).await?)
     }
 
@@ -7829,9 +9707,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         committed_through(
             &lane,
@@ -7859,7 +9735,7 @@ pub(crate) mod tests {
             ["rift://symbol/rust/blob.rs/BLOB"],
             "the oversized file row is absent and its declaration's row stays"
         );
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         let left_out = recorded
             .iter()
             .find(|record| record.message().contains("lexical unit left out"))
@@ -7874,15 +9750,6 @@ pub(crate) mod tests {
         );
         cancellation.cancel();
         Ok(())
-    }
-
-    /// Drains what the queue currently holds, without a store.
-    fn queued_records(drain: &mut crate::logs::LogDrain) -> Vec<rift_index::LogRecord> {
-        let mut records = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            records.push(record);
-        }
-        records
     }
 
     #[tokio::test]
@@ -7916,6 +9783,7 @@ pub(crate) mod tests {
             work: super::PendingWork::naming([rift_core::ProjectPath::new("moved.rs")?]),
             previous: Some(Arc::clone(&first)),
             cancellation: CancellationToken::new(),
+            observation: None,
         };
         let limits = WorkspaceIndexLimits::default();
         let WorkspaceCandidate::Stable {
@@ -8346,9 +10214,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         double.release_one();
         lane.request(
@@ -8375,7 +10241,7 @@ pub(crate) mod tests {
             lane.owes_whole(),
             "a failed change leaves a whole comparison owed"
         );
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         let failure = recorded
             .iter()
             .find(|record| record.message().contains("the lexical commit failed"))
@@ -8430,9 +10296,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         let write = change_naming_lib()?;
         let deadline = commit_deadline(1);
@@ -8444,7 +10308,7 @@ pub(crate) mod tests {
         double.calls_within_bound(1).await?;
 
         tokio::time::sleep(deadline + Duration::from_millis(1)).await;
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         let delay = recorded
             .iter()
             .find(|record| record.message().contains("ran past its deadline"))
@@ -8891,9 +10755,7 @@ pub(crate) mod tests {
             cancellation.clone(),
             Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         // The first write runs and holds the lane at the store's gate.
         lane.request(change_naming_lib()?, Arc::clone(&publications[0]));
@@ -8908,7 +10770,7 @@ pub(crate) mod tests {
                 LexicalCommitState::Committing
             );
         }
-        let recorded = queued_records(&mut drain);
+        let recorded = drain.queued_records();
         assert!(
             recorded
                 .iter()
@@ -9228,6 +11090,7 @@ pub(crate) mod tests {
     /// no trace at all, and the lexical stamp now belongs to the lexical lane.
     async fn counting_index(database: &std::path::Path) -> TestResult<SearchIndex> {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default()).build();
+        std::fs::create_dir_all(database)?;
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(
             index.pass_readiness(),
@@ -9484,14 +11347,12 @@ pub(crate) mod tests {
             !before.is_empty(),
             "the lexical lane must publish the declaration"
         );
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         super::populate_search(&index, &published, rift_search::Embedding::Every).await;
         assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
         assert_eq!(index.tree_revision().await?.as_deref(), Some(revision));
         assert_eq!(ranked_at(&index, revision, "beacon", 8).await?, before);
-        let records = queued_records(&mut drain);
+        let records = drain.queued_records();
         let warning = records
             .iter()
             .find(|record| {
@@ -9501,7 +11362,47 @@ pub(crate) mod tests {
             .ok_or("a disabled vector ranking must still report the chunked guide")?;
         assert_eq!(warning.level(), "warn");
         assert_eq!(warning.component(), "search");
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.message().starts_with("vector population")),
+            "a disabled vector ranking runs no population: {records:?}"
+        );
         cancellation.cancel();
+        Ok(())
+    }
+
+    /// A pass of an enabled vector ranking records its start and its end, each naming the
+    /// tree revision it embeds.
+    #[tokio::test]
+    async fn a_population_pass_records_its_start_and_its_end() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let published = stable_candidate(directory.path(), 0)?;
+        let index = counting_index(&directory.path().join("search.db")).await?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        super::populate_search(&index, &published, rift_search::Embedding::Every).await;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let lifecycle = records
+            .iter()
+            .filter(|record| record.message().starts_with("vector population"))
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2, "{records:?}");
+        assert_eq!(lifecycle[0].message(), "vector population started");
+        assert_eq!(lifecycle[1].message(), "vector population finished");
+        let revision = published.reads.tree_revision();
+        for (record, field, value) in [
+            (lifecycle[0], "phase", "start"),
+            (lifecycle[1], "outcome", "ok"),
+        ] {
+            assert_eq!(record.level(), "info");
+            assert_eq!(record.operation(), "search.populate");
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields[field], value, "{fields}");
+            assert_eq!(fields["tree_revision"], revision, "{fields}");
+        }
         Ok(())
     }
 
@@ -9511,6 +11412,7 @@ pub(crate) mod tests {
         let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
             .disable_vector()
             .build();
+        std::fs::create_dir_all(database)?;
         let index = SearchIndex::open(database, limits).await?;
         assert_eq!(index.pass_readiness(), VectorReadiness::Disabled);
         Ok(index)
@@ -10041,7 +11943,45 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A second native watcher on `root` that records what the platform delivers while
+    /// startup runs. Its stream is separate from the one `workspace_watcher` holds, so it
+    /// names the events this platform reported, not proof that the validation saw the
+    /// same ones.
+    fn native_event_recorder(
+        root: &std::path::Path,
+    ) -> TestResult<(
+        notify::RecommendedWatcher,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    )> {
+        use notify::Watcher as _;
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&delivered);
+        let mut recorder =
+            notify::recommended_watcher(move |outcome: notify::Result<notify::Event>| {
+                let line = match outcome {
+                    Ok(event) => format!(
+                        "{:?} need_rescan={} {:?}",
+                        event.kind,
+                        event.need_rescan(),
+                        event.paths
+                    ),
+                    Err(error) => format!("watch error: {error}"),
+                };
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line);
+            })?;
+        recorder.watch(root, notify::RecursiveMode::Recursive)?;
+        Ok((recorder, delivered))
+    }
+
     /// A native workspace watcher publishes complete facts equal to a cold build.
+    ///
+    /// The startup publication is the first whose digests equal a cold build's, read once
+    /// the supervisor runs. `FSEvents` can deliver the fixture's own writes, made before the
+    /// watcher started, while the preparation runs: a `src` directory event asks for the
+    /// whole workspace, the preparation's publication is superseded, and the supervisor's
+    /// rescan publishes the tree.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn native_watcher_publication_matches_cold_indexed_facts() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -10053,40 +11993,49 @@ pub(crate) mod tests {
         )?;
         fs::write(root.join("src/removed.rs"), "pub struct Removed;\n")?;
         fs::write(root.join("README.md"), "See [Beacon](src/lib.rs#Beacon).\n")?;
-
-        let (context, invalidations) = initial_preparation_context(root)?;
-        let validation = Arc::clone(&context.validation);
-        let watcher = super::workspace_watcher(root, &validation)?;
-        let initial = super::discover_initial_workspace(&context)
-            .await?
-            .ok_or("initial discovery was cancelled")?;
-        super::prepare_initial_workspace_from(&context, initial).await?;
-        let state = Arc::clone(&context.published);
-        let startup = Arc::clone(&state.read().await.current);
+        let cold_a = stable_candidate(root, 0)?;
         assert!(
-            !startup
+            !cold_a
                 .reads
                 .documentation_snapshot()
                 .index()
                 .references
                 .is_empty(),
-            "fixture must publish documentation references"
-        );
-        let startup_facts = published_facts(&startup)?;
-        let cold_a = stable_candidate(root, 0)?;
-        assert!(
-            startup_facts.relationships.is_empty(),
-            "fixture semantic edges are empty"
+            "fixture must carry documentation references"
         );
         let cold_a_facts = published_facts(&cold_a)?;
-        assert_eq!(
-            startup_facts, cold_a_facts,
-            "startup publication facts must equal an independent cold build"
+        assert!(
+            cold_a_facts.relationships.is_empty(),
+            "fixture semantic edges are empty"
         );
 
+        let (context, invalidations) = initial_preparation_context(root)?;
+        let validation = Arc::clone(&context.validation);
+        let state = Arc::clone(&context.published);
+        let watcher = super::workspace_watcher(root, &validation)?;
+        let (_recorder, delivered) = native_event_recorder(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
         let supervisor = tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
 
         let observed = async {
+            let startup = publication_matching(&state, &validation, &cold_a_facts.digests)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "startup publication: {error}, delivered={:?}",
+                        delivered
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    )
+                })?;
+            assert_eq!(
+                published_facts(&startup)?,
+                cold_a_facts,
+                "startup publication facts must equal an independent cold build"
+            );
             fs::write(
                 root.join("src/lib.rs"),
                 "pub struct Beacon;\npub fn new() {}\n",
@@ -10131,5 +12080,79 @@ pub(crate) mod tests {
         validation.cancellation.cancel();
         tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
         observed
+    }
+
+    /// A search that ranks nothing while a write for its tree is held, running, or owed
+    /// logs one record per answer naming the revision, the commit state, which write
+    /// answers for it, how long that write has waited or run, and the part it commits.
+    /// A settled revision logs nothing.
+    #[test]
+    fn an_unranked_search_records_the_commit_it_waits_on() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let publications = declaring_publications(directory.path(), 2)?;
+        let first = publications[0].reads.tree_revision().to_owned();
+        let commit = |epoch: usize| -> TestResult<super::LexicalCommit> {
+            Ok(super::LexicalCommit::new(
+                change_naming_lib()?,
+                Arc::clone(&publications[epoch]),
+            ))
+        };
+        let mut backlog = super::LexicalBacklog::default();
+        assert!(backlog.hand(commit(0)?).is_none());
+        let held = backlog.report_of(&first);
+        assert_eq!(held.state, LexicalCommitState::Committing);
+        backlog.take_next().ok_or("the write is held")?;
+        backlog.running_part = Some((2, 3));
+        assert!(backlog.hand(commit(1)?).is_none());
+        let running = backlog.report_of(&first);
+        backlog.owe_whole("the store refused".to_owned());
+        backlog.end_running();
+        let owed = backlog.report_of(&first);
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        for report in [
+            &held,
+            &running,
+            &owed,
+            &super::LexicalCommitReport::settled(),
+        ] {
+            report.record_unranked(&first);
+        }
+        drop(recorder);
+        let records = drain.queued_records();
+        assert_eq!(
+            records.len(),
+            3,
+            "one record per unranked answer, none when settled"
+        );
+        let fields = records
+            .iter()
+            .map(|record| {
+                assert_eq!(record.level(), "info");
+                assert_eq!(record.component(), "search");
+                assert_eq!(record.operation(), "search.commit");
+                serde_json::from_str::<serde_json::Value>(record.fields())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for field in &fields {
+            assert_eq!(field["tree_revision"], first.as_str());
+        }
+        assert_eq!(fields[0]["commit_state"], "committing");
+        assert_eq!(fields[0]["write"], "held");
+        assert!(fields[0]["held_ms"].is_string(), "{}", fields[0]);
+        assert!(fields[0].get("running_ms").is_none(), "{}", fields[0]);
+        assert_eq!(fields[1]["commit_state"], "committing");
+        assert_eq!(fields[1]["write"], "running");
+        assert!(fields[1]["running_ms"].is_string(), "{}", fields[1]);
+        assert!(
+            fields[1]["held_ms"].is_string(),
+            "the write held behind it: {}",
+            fields[1]
+        );
+        assert_eq!(fields[1]["part"], "2");
+        assert_eq!(fields[1]["parts"], "3");
+        assert_eq!(fields[2]["commit_state"], "owed");
+        assert_eq!(fields[2]["cause"], "the store refused");
+        assert!(fields[2].get("running_ms").is_none(), "{}", fields[2]);
+        Ok(())
     }
 }

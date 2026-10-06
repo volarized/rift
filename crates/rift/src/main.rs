@@ -7,53 +7,30 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod install;
 mod mcp;
-mod otlp;
 mod progress;
 mod server;
 mod steer;
 mod update;
 use std::fmt;
-use std::io::IsTerminal as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::time::Duration;
 
 #[cfg(test)]
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
 use rift_mcp::McpErrorExt as _;
-use tracing::subscriber::Interest;
-use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter};
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
-use tracing_subscriber::layer::{Filter, SubscriberExt as _};
-use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{EnvFilter, Layer as _};
-
-/// Default filter keeps dependency diagnostics out of MCP stderr.
-const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+use rift_tracing::{StderrPolicy, TracingRuntime};
 
 /// The checkout this binary was built from, as `build.rs` recorded it. Every server and
 /// proxy this binary runs names its build through it.
 const BUILD_CHECKOUT: rift_mcp::BuildCheckout =
     rift_mcp::BuildCheckout::recorded(env!("RIFT_BUILD_COMMIT"), env!("RIFT_BUILD_DIRTY"));
 
-/// This binary's product version, as `rift --version` prints it and its servers publish it.
-///
-/// A dirty build whose executable cannot be read prints its commit and the dirty mark
-/// without the executable's metadata, where a server refuses to start instead.
-fn product_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        std::env::current_exe()
-            .and_then(|executable| BUILD_CHECKOUT.product_version(&executable))
-            .unwrap_or_else(|_| BUILD_CHECKOUT.version_without_stamp())
-    })
-}
-
 #[derive(Debug, Parser)]
 #[command(
     name = "rift",
-    version = product_version(),
+    version = env!("CARGO_PKG_VERSION"),
     about = "agentic development toolkit"
 )]
 struct Cli {
@@ -113,6 +90,39 @@ impl Cli {
             })
         )
     }
+
+    /// Whether this command serves repository workspaces through one process.
+    const fn serves_repository(&self) -> bool {
+        matches!(
+            &self.command,
+            Some(CliCommand::Server {
+                command: server::ServerCommand::Start {
+                    foreground: true,
+                    repository: true,
+                    ..
+                }
+            })
+        )
+    }
+}
+
+/// The folder whose `[logs]` table sets this process's capture, sampling, and retention.
+///
+/// Under repository serving one process holds one runtime, so its process-wide `[logs]`
+/// values come from the main worktree that `select_server_configuration` takes `[server]`
+/// from. Every other command, and a repository start whose selection fails (which the
+/// start then refuses), reads `start`.
+fn logs_root(cli: &Cli, start: &Path) -> PathBuf {
+    if !cli.serves_repository() {
+        return start.to_path_buf();
+    }
+    match rift_mcp::repository::select_server_configuration(start, None) {
+        Ok(rift_mcp::repository::ServerConfigurationSelection::Repository {
+            authority_root,
+            ..
+        }) => authority_root,
+        _ => start.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -129,12 +139,27 @@ const FAILED_EXIT_STATUS: i32 = 1;
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let serves = cli.records_logs();
-    let logs = serves.then(|| rift_mcp::logs_configuration(Path::new(".")));
-    let stderr = stderr_policy(serves, std::io::stderr().is_terminal());
-    let (drain, otlp_export) =
-        initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()), stderr);
+    let logs = serves.then(|| rift_mcp::logs_configuration(&logs_root(&cli, Path::new("."))));
+    let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
+    if let Some(logs) = &logs {
+        let stall_delay = Duration::from_millis(logs.stall_delay.milliseconds());
+        tracing_builder = tracing_builder
+            .capture(&logs.capture)
+            .stall_delay(stall_delay)
+            .stderr_limit(logs.stderr_limit.bytes());
+    }
+    // `main` installs once; a refusal means something installed tracing before it, and
+    // that installation stays in place while the process reports the refusal and leaves.
+    let (tracing_runtime, drain) = match tracing_builder.install() {
+        Ok(installed) => installed,
+        Err(error) => {
+            eprintln!("rift: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
-    let succeeded = match run(cli, drain, retention_records).await {
+    let export = tracing_runtime.export();
+    let succeeded = match run(cli, drain, retention_records, export).await {
         Ok(Some(outcome)) => {
             println!("{outcome}");
             true
@@ -145,131 +170,46 @@ async fn main() -> ExitCode {
             false
         }
     };
-    // Flushes buffered spans before either exit path: the normal return below drops
-    // every other local first, and `process::exit` past it runs no destructor at all.
-    otlp_export.shutdown();
     if serves {
         // A foreground server's index build, a lane's pass, or a lexical transaction can
         // still be running when serving ends. Returning would drop the runtime, and that
         // drop waits for every `spawn_blocking` task to return and for every running task
         // to yield, which nothing can cancel; the server's outcome is already printed, its
         // log drain stopped, and its lock document retired, so the process leaves here.
-        std::process::exit(if succeeded {
+        //
+        // Both steps are recorded on stderr as the stop's last stages: the tracing shutdown
+        // with its outcome, then the exit with its status. A process the operating system
+        // keeps after the exit record, such as Windows waiting for a database thread's
+        // pending file flush to complete, shows as the time between that record and the
+        // close of its stderr.
+        let status = if succeeded {
             SERVED_EXIT_STATUS
         } else {
             FAILED_EXIT_STATUS
-        });
+        };
+        let deadline = tokio::time::Instant::now() + rift_tracing::OTLP_SHUTDOWN_TIMEOUT;
+        let _ = rift_mcp::stop_stage("tracing shutdown", deadline, async {
+            tracing_runtime.shutdown().await;
+            Ok::<(), rift_error::RiftError>(())
+        })
+        .await;
+        rift_tracing::info!(
+            component = "mcp",
+            operation = "server.stop",
+            stage = "process exit",
+            status,
+            "process exits"
+        );
+        std::process::exit(status);
     }
+    // Flushes buffered spans and metric points before the process returns, which drops
+    // every other local first.
+    tracing_runtime.shutdown().await;
     if succeeded {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
-}
-
-/// How much the process may write to its standard error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StderrPolicy {
-    /// Everything the filter admits: the stream belongs to whoever reads it.
-    Unbounded,
-    /// At most [`rift_mcp::SERVER_STDERR_BYTES_MAX`] bytes: the stream is
-    /// the file `rift server start` handed its detached server.
-    Bounded,
-}
-
-/// The policy for this invocation: a server whose stderr is not a terminal
-/// is writing into a file or a pipe that outlives every reader, so it is
-/// bounded; every other command, and a server an operator watches in a
-/// terminal, writes freely.
-fn stderr_policy(serves: bool, terminal: bool) -> StderrPolicy {
-    if serves && !terminal {
-        StderrPolicy::Bounded
-    } else {
-        StderrPolicy::Unbounded
-    }
-}
-
-/// Installs stderr tracing and optional foreground-server recording.
-///
-/// The two carry their own filters. Stderr keeps `RUST_LOG` or the default
-/// targets, because that stream belongs to whoever started the process. The
-/// store captures under the workspace's `[logs] capture` filter, so a workspace
-/// can record itself at debug without an operator exporting an environment
-/// variable into the process a proxy spawns detached.
-///
-/// The returned drain exists only for a foreground server. Other commands install no
-/// recording layer and allocate no log queue.
-///
-/// The returned [`otlp::Export`] is a no-op handle unless the `otlp` feature is compiled
-/// in and `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; the caller shuts it down
-/// before the process exits either way.
-fn initialize_tracing(
-    capture: Option<&str>,
-    stderr: StderrPolicy,
-) -> (Option<rift_mcp::LogDrain>, otlp::Export) {
-    let (sink, drain) = match capture {
-        Some(capture) => {
-            let (sink, drain) = rift_mcp::log_capture();
-            let filter = EnvFilter::try_new(capture)
-                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
-            (Some(sink.with_filter(reevaluated(filter))), Some(drain))
-        }
-        None => (None, None),
-    };
-    let writer = match stderr {
-        StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
-        StderrPolicy::Bounded => BoxMakeWriter::new(rift_mcp::BoundedStderr::default()),
-    };
-    let mut stderr_layer = tracing_subscriber::fmt::layer()
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_writer(writer);
-    // Escape codes color a terminal. A pipe or a file hands them to its reader as bytes:
-    // `rift mcp` keeps a spawned server's first startup lines verbatim, and the codes
-    // nearly double each line.
-    if !std::io::stderr().is_terminal() {
-        stderr_layer.set_ansi(false);
-    }
-    let (otlp_layer, otlp_export) = otlp::layer();
-    tracing_subscriber::registry()
-        .with(
-            stderr_layer.with_filter(stderr_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
-            )),
-        )
-        .with(sink)
-        .with(otlp_layer)
-        .init();
-    (drain, otlp_export)
-}
-
-/// The stderr filter: `operator` plus the OTLP export's own reports.
-///
-/// `operator` is `RUST_LOG` or the default targets, and rarely names the OpenTelemetry SDK's
-/// target, through which the export reports what it drops; `otlp::sdk_reports` rides beside
-/// it so those reports reach stderr either way.
-fn stderr_filter<S>(operator: EnvFilter) -> impl Filter<S> {
-    reevaluated(operator.or(otlp::sdk_reports()))
-}
-
-/// Wraps a per-layer filter so the subscriber asks it at every span and event.
-///
-/// `tracing-subscriber` hands each per-layer filter's answer to the registry through one
-/// thread-local state that only an `enabled` pass writes, and a callsite whose interest is
-/// cached as `always` opens its span without such a pass. `tracing::event_enabled!` runs a
-/// pass and dispatches nothing - `toasty` asks it about a `toasty::query` warning before
-/// every statement - so without this wrapper the next such span on that thread inherits the
-/// probe's answers, and each layer whose filter refused the probe loses the span: the log
-/// store does not record it, and the OTLP export does not export it.
-///
-/// The `DynFilterFn` beside `filter` enables everything and answers `sometimes` for every
-/// callsite `filter` does not refuse, so no callsite's interest is cached as `always`. Its
-/// `TRACE` hint leaves `filter`'s own level hint in force.
-fn reevaluated<S>(filter: impl Filter<S>) -> impl Filter<S> {
-    let every_time = DynFilterFn::new(|_, _| true)
-        .with_callsite_filter(|_| Interest::sometimes())
-        .with_max_level_hint(LevelFilter::TRACE);
-    filter.and(every_time)
 }
 
 #[derive(Debug)]
@@ -399,8 +339,9 @@ impl fmt::Display for CliOutcome {
 
 async fn run(
     cli: Cli,
-    drain: Option<rift_mcp::LogDrain>,
+    drain: Option<rift_tracing::LogDrain>,
     retention_records: u64,
+    export: rift_tracing::OtlpExport,
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
@@ -410,10 +351,12 @@ async fn run(
                 .map_err(|error| CliError::Mcp(error.mcp()))?;
             Ok(None)
         }
-        Some(CliCommand::Server { command }) => server::run(command, drain, retention_records)
-            .await
-            .map(|outcome| outcome.map(CliOutcome::Server))
-            .map_err(CliError::Server),
+        Some(CliCommand::Server { command }) => {
+            server::run(command, drain, retention_records, export)
+                .await
+                .map(|outcome| outcome.map(CliOutcome::Server))
+                .map_err(CliError::Server)
+        }
         Some(CliCommand::Update) => update::update()
             .await
             .map(CliOutcome::Update)
@@ -440,20 +383,84 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::sync::{Arc, Mutex};
 
     use super::{Cli, CliCommand, CliError, cli_code, cli_command, mcp};
     use clap::Parser;
-    use tracing::span::{Attributes, Id};
-    use tracing_subscriber::layer::{Context, SubscriberExt as _};
-    use tracing_subscriber::{EnvFilter, Layer};
 
     #[test]
-    fn version_prints_the_product_version() {
+    fn version_prints_the_package_version_alone() {
         let printed = Cli::try_parse_from(["rift", "--version"])
             .expect_err("--version prints and exits")
             .to_string();
-        assert_eq!(printed.trim(), format!("rift {}", super::product_version()));
+        assert_eq!(printed.trim(), concat!("rift ", env!("CARGO_PKG_VERSION")));
+    }
+
+    /// One git command in `root` with a fixed identity and signing off.
+    fn git(root: &std::path::Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Rift Fixture",
+                "-c",
+                "user.email=fixture@rift.invalid",
+            ])
+            .args(arguments)
+            .status()
+            .expect("git must run");
+        assert!(status.success(), "git {arguments:?} must succeed");
+    }
+
+    /// A linked worktree whose `[logs]` differs from the main worktree's: repository
+    /// serving reads the main worktree's table, and a workspace start reads its own.
+    #[test]
+    fn repository_serving_reads_logs_from_the_main_worktree() {
+        let main = tempfile::tempdir().expect("main worktree");
+        git(main.path(), &["init", "-q"]);
+        std::fs::write(main.path().join("lib.rs"), "pub fn beacon() {}\n").expect("source");
+        git(main.path(), &["add", "lib.rs"]);
+        git(main.path(), &["commit", "-qm", "add source"]);
+        let linked_parent = tempfile::tempdir().expect("linked parent");
+        let linked = linked_parent.path().join("linked");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().expect("temporary path is UTF-8"),
+                "HEAD",
+            ],
+        );
+        std::fs::write(
+            main.path().join("rift.toml"),
+            "[logs]\nretention_records = 200\n",
+        )
+        .expect("main configuration");
+        std::fs::write(
+            linked.join("rift.toml"),
+            "[logs]\nretention_records = 300\n",
+        )
+        .expect("linked configuration");
+
+        let repository =
+            Cli::try_parse_from(["rift", "server", "start", "--foreground", "--repository"])
+                .expect("repository start parses");
+        let root = super::logs_root(&repository, &linked);
+        assert_eq!(
+            root,
+            std::fs::canonicalize(main.path()).expect("canonical main root")
+        );
+        assert_eq!(rift_mcp::logs_configuration(&root).retention_records, 200);
+
+        let workspace = Cli::try_parse_from(["rift", "server", "start", "--foreground"])
+            .expect("workspace start parses");
+        let root = super::logs_root(&workspace, &linked);
+        assert_eq!(root, linked);
+        assert_eq!(rift_mcp::logs_configuration(&root).retention_records, 300);
     }
 
     #[test]
@@ -464,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn empty_invocation_runs_no_command() {
         let cli = Cli::try_parse_from(["rift"]).expect("empty invocation must parse");
-        let outcome = super::run(cli, None, 1_000)
+        let outcome = super::run(cli, None, 1_000, rift_tracing::OtlpExport::default())
             .await
             .expect("empty invocation must succeed");
         assert!(outcome.is_none());
@@ -735,6 +742,7 @@ mod tests {
                     follow,
                     tail,
                     since,
+                    until,
                     level,
                     component,
                 },
@@ -745,6 +753,7 @@ mod tests {
         assert!(!follow);
         assert_eq!(tail, super::server::TailCount::All);
         assert_eq!(since, None);
+        assert_eq!(until, None);
         assert_eq!(level, None);
         assert_eq!(component, None);
     }
@@ -764,6 +773,8 @@ mod tests {
             "index",
             "--since",
             "10m",
+            "--until",
+            "2026-10-04T20:42:58Z",
         ])
         .expect("a filtered logs read must parse");
         let rendered = format!("{parsed:?}");
@@ -773,6 +784,7 @@ mod tests {
                     follow,
                     tail,
                     since,
+                    until,
                     level,
                     component,
                 },
@@ -784,7 +796,17 @@ mod tests {
         assert_eq!(tail, super::server::TailCount::Newest(20));
         assert_eq!(
             since,
-            Some(rift_protocol::configuration::Duration::from_millis(600_000))
+            Some(super::server::LogsBound::Age(
+                rift_protocol::configuration::Duration::from_millis(600_000)
+            ))
+        );
+        assert_eq!(
+            until,
+            Some(super::server::LogsBound::At(
+                "2026-10-04T20:42:58Z"
+                    .parse()
+                    .expect("the timestamp parses")
+            ))
         );
         assert_eq!(level, Some(super::server::LogLevel::Warn));
         assert_eq!(component.as_deref(), Some("index"));
@@ -877,26 +899,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_server_off_a_terminal_bounds_its_stderr() {
-        assert_eq!(
-            super::stderr_policy(true, false),
-            super::StderrPolicy::Bounded
-        );
-        assert_eq!(
-            super::stderr_policy(true, true),
-            super::StderrPolicy::Unbounded
-        );
-        assert_eq!(
-            super::stderr_policy(false, false),
-            super::StderrPolicy::Unbounded
-        );
-        assert_eq!(
-            super::stderr_policy(false, true),
-            super::StderrPolicy::Unbounded
-        );
-    }
-
-    #[test]
     fn unknown_commands_are_rejected() {
         let error = Cli::try_parse_from(["rift", "serve"])
             .expect_err("unknown operational command must fail");
@@ -947,60 +949,5 @@ mod tests {
             Cli::try_parse_from(["rift", "steer", "--session-id", "abc"]).is_err(),
             "steer reads the hook call from stdin, not flags"
         );
-    }
-
-    /// Spans the filter test opens; enough that one lost span shows as a count mismatch.
-    const OPENED_SPANS: usize = 32;
-
-    /// Every span name one layer saw open, in order.
-    #[derive(Clone, Default)]
-    struct OpenedSpans {
-        names: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    impl OpenedSpans {
-        fn count(&self, name: &str) -> usize {
-            self.names
-                .lock()
-                .expect("the opened span names are not poisoned")
-                .iter()
-                .filter(|opened| **opened == name)
-                .count()
-        }
-    }
-
-    impl<S: tracing::Subscriber> Layer<S> for OpenedSpans {
-        fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
-            self.names
-                .lock()
-                .expect("the opened span names are not poisoned")
-                .push(attributes.metadata().name());
-        }
-    }
-
-    /// `toasty` asks `tracing::event_enabled!` about a `toasty::query` warning before every
-    /// statement. A stderr filter with a bare `warn` default, such as `RUST_LOG=warn,rift=info`,
-    /// enables that probe while the log store's capture filter refuses it, and the capture
-    /// must still see every span that follows on the thread.
-    #[test]
-    fn a_reevaluated_filter_sees_every_span_after_a_probe_it_refuses() {
-        let capture = OpenedSpans::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                OpenedSpans::default()
-                    .with_filter(super::reevaluated(EnvFilter::new("warn,rift=info"))),
-            )
-            .with(
-                capture
-                    .clone()
-                    .with_filter(super::reevaluated(EnvFilter::new("rift=info"))),
-            );
-        tracing::subscriber::with_default(subscriber, || {
-            for _ in 0..OPENED_SPANS {
-                let _ = tracing::event_enabled!(target: "toasty::query", tracing::Level::WARN);
-                rift_core::traced!(component = "search", operation = "search.request", {});
-            }
-        });
-        assert_eq!(capture.count("search.request"), OPENED_SPANS);
     }
 }

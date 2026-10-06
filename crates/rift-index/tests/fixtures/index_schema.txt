@@ -1,0 +1,162 @@
+type: table
+name: __toasty_migrations
+tbl_name: __toasty_migrations
+sql: CREATE TABLE __toasty_migrations (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+
+type: table
+name: documentation_manifest
+tbl_name: documentation_manifest
+sql: CREATE TABLE documentation_manifest(id BIGINT PRIMARY KEY NOT NULL, payload TEXT NOT NULL)
+
+type: table
+name: documentation_references
+tbl_name: documentation_references
+sql: CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL)
+
+type: index
+name: documentation_references_source
+tbl_name: documentation_references
+sql: CREATE INDEX documentation_references_source ON documentation_references(source)
+
+type: index
+name: documentation_references_target
+tbl_name: documentation_references
+sql: CREATE INDEX documentation_references_target ON documentation_references(target)
+
+type: table
+name: documentation_sources
+tbl_name: documentation_sources
+sql: CREATE TABLE documentation_sources(identity TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, payload TEXT NOT NULL)
+
+type: table
+name: lexical_documents
+tbl_name: lexical_documents
+sql: CREATE TABLE lexical_documents(
+        id INTEGER PRIMARY KEY,
+        identity TEXT NOT NULL UNIQUE,
+        path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        byte_length BIGINT NOT NULL,
+        byte_offset BIGINT,
+        name TEXT,
+        qualified_name TEXT,
+        identifier_terms TEXT,
+        signature TEXT,
+        documentation TEXT,
+        file_content TEXT
+    )
+
+type: index
+name: lexical_documents_file_rows
+tbl_name: lexical_documents
+sql: CREATE INDEX lexical_documents_file_rows ON lexical_documents(id) WHERE file_content IS NOT NULL
+
+type: table
+name: lexical_documents_fts
+tbl_name: lexical_documents_fts
+sql: CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(name, qualified_name, identifier_terms, signature, documentation, file_content, content='lexical_documents', content_rowid='id', tokenize='unicode61 remove_diacritics 0')
+
+type: table
+name: lexical_documents_fts_config
+tbl_name: lexical_documents_fts_config
+sql: CREATE TABLE 'lexical_documents_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID
+
+type: table
+name: lexical_documents_fts_data
+tbl_name: lexical_documents_fts_data
+sql: CREATE TABLE 'lexical_documents_fts_data'(id INTEGER PRIMARY KEY, block BLOB)
+
+type: table
+name: lexical_documents_fts_docsize
+tbl_name: lexical_documents_fts_docsize
+sql: CREATE TABLE 'lexical_documents_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)
+
+type: table
+name: lexical_documents_fts_idx
+tbl_name: lexical_documents_fts_idx
+sql: CREATE TABLE 'lexical_documents_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID
+
+type: index
+name: lexical_documents_path
+tbl_name: lexical_documents
+sql: CREATE INDEX lexical_documents_path ON lexical_documents(path)
+
+type: table
+name: lexical_documents_trigram
+tbl_name: lexical_documents_trigram
+sql: CREATE VIRTUAL TABLE lexical_documents_trigram USING fts5(file_content, content='lexical_documents', content_rowid='id', tokenize='trigram', detail='none', columnsize=0)
+
+type: table
+name: lexical_documents_trigram_config
+tbl_name: lexical_documents_trigram_config
+sql: CREATE TABLE 'lexical_documents_trigram_config'(k PRIMARY KEY, v) WITHOUT ROWID
+
+type: table
+name: lexical_documents_trigram_data
+tbl_name: lexical_documents_trigram_data
+sql: CREATE TABLE 'lexical_documents_trigram_data'(id INTEGER PRIMARY KEY, block BLOB)
+
+type: table
+name: lexical_documents_trigram_idx
+tbl_name: lexical_documents_trigram_idx
+sql: CREATE TABLE 'lexical_documents_trigram_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID
+
+type: table
+name: lexical_documents_vocabulary
+tbl_name: lexical_documents_vocabulary
+sql: CREATE VIRTUAL TABLE lexical_documents_vocabulary USING fts5vocab('lexical_documents_fts', 'col')
+
+type: table
+name: lexical_files
+tbl_name: lexical_files
+sql: CREATE TABLE lexical_files(path TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)
+
+type: table
+name: lexical_index_state
+tbl_name: lexical_index_state
+sql: CREATE TABLE lexical_index_state(
+        id BIGINT PRIMARY KEY NOT NULL,
+        tree_revision TEXT,
+        corpus_revision TEXT NOT NULL,
+        derivation_revision TEXT NOT NULL
+    )
+
+type: table
+name: lexical_trigram_pending
+tbl_name: lexical_trigram_pending
+sql: CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)
+
+type: index
+name: sqlite_autoindex_documentation_manifest_1
+tbl_name: documentation_manifest
+sql:
+
+type: index
+name: sqlite_autoindex_documentation_references_1
+tbl_name: documentation_references
+sql:
+
+type: index
+name: sqlite_autoindex_documentation_sources_1
+tbl_name: documentation_sources
+sql:
+
+type: index
+name: sqlite_autoindex_lexical_documents_1
+tbl_name: lexical_documents
+sql:
+
+type: index
+name: sqlite_autoindex_lexical_files_1
+tbl_name: lexical_files
+sql:
+
+type: index
+name: sqlite_autoindex_lexical_index_state_1
+tbl_name: lexical_index_state
+sql:

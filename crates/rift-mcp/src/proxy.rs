@@ -14,7 +14,10 @@ use std::time::{Duration, SystemTime};
 
 use axum::http::{HeaderName, HeaderValue};
 use rift_core::CapturedStream;
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
+use rift_core::constants::{
+    INDEX_DATABASE_FILE_NAME, METRICS_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY,
+    WRITE_AHEAD_LOG_SUFFIX,
+};
 use rift_error::{RiftError, errors};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
@@ -34,12 +37,18 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
-use tracing::Instrument as _;
 
-use crate::election::{ServerPresence, StaleReason, probe, probe_state_directory};
+use crate::election::{
+    ElectionObservation, ServerPresence, StaleReason, observe, presence_field, probe,
+    probe_state_directory,
+};
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
+use crate::metrics::{
+    Ending, MCP_CLIENT_OPERATION_DURATION, McpRequest, RESOURCE_TEMPLATES_LIST, RESOURCES_LIST,
+    RESOURCES_READ, TOOLS_LIST,
+};
 use crate::output::OutputPolicy;
 use crate::repository::{
     ServerConfigurationSelection, repository_election_directory, select_server_configuration,
@@ -49,10 +58,6 @@ use crate::spawn::{
     StartSpawns, StartupCapture,
 };
 use crate::validation::ConfigurationState;
-
-/// The suffix `SQLite` gives a WAL database's write-ahead log, appended to the
-/// database file's name.
-const WRITE_AHEAD_LOG_SUFFIX: &str = "-wal";
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -86,7 +91,12 @@ pub async fn serve_proxy(
     checkout: BuildCheckout,
     output: OutputPolicy,
 ) -> Result<(), RiftError> {
-    tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
+    rift_tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        phase = "start",
+        "MCP proxy starting"
+    );
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
@@ -115,12 +125,17 @@ where
             .source(error)
             .error()
     })?;
-    tracing::info!(component = "mcp", transport = "stdio", "MCP proxy ready");
+    rift_tracing::info!(
+        component = "mcp",
+        transport = "stdio",
+        outcome = "ok",
+        "MCP proxy ready"
+    );
     let reason = service.waiting().await;
     let outcome = reason
         .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())
         .and_then(quit_reason_result);
-    tracing::info!(
+    rift_tracing::info!(
         component = "mcp",
         transport = "stdio",
         outcome = if outcome.is_ok() { "ok" } else { "error" },
@@ -153,7 +168,7 @@ fn quit_reason_result(reason: QuitReason) -> Result<(), RiftError> {
 /// demand through the same single-flight slot.
 async fn warm_up(proxy: RiftProxy) {
     if let Err(refusal) = proxy.leased_peer(None).await {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             refusal = %refusal.message,
             "upstream warmup did not connect"
@@ -396,7 +411,7 @@ impl RiftProxy {
             Err(error) if transport_failed(&error) => error,
             Err(error) => return forwarded_error(error).fail(),
         };
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             failure = %failure,
             "upstream connection lost; reconnecting"
@@ -433,9 +448,15 @@ impl RiftProxy {
             .await
         {
             Ok(handle) => {
-                tracing::debug!(component = "mcp", upstream_request_id = %handle.id, "forwarded request awaiting response");
+                // rmcp chooses the id inside the send, so it is known only once the
+                // send returns; the forwarding span declared `request_id` empty to take
+                // the id the server's request span carries, so the forward's records
+                // share the server request's `request_id`. After a reconnect the second
+                // send's id replaces the first.
+                rift_tracing::Span::current().record("request_id", handle.id.to_string().as_str());
+                rift_tracing::debug!(component = "mcp", request_id = %handle.id, "forwarded request awaiting response");
                 let result = handle.await_response().await;
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "mcp",
                     is_error = result.is_err(),
                     "forwarded request completed"
@@ -446,12 +467,13 @@ impl RiftProxy {
         };
         match answer {
             Err(ServiceError::Timeout { .. }) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     budget = ?budget,
                     "the workspace server did not answer a forwarded request within its budget; \
                      the request is cancelled"
                 );
+                rift_tracing::publish_in_flight("forward budget");
                 errors::mcp::forward_unanswered()
                     .waited(budget)
                     .mcp()
@@ -544,9 +566,16 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// [`START_SPAWN_COUNT_MAX`](crate::spawn::START_SPAWN_COUNT_MAX) spawns in
 /// all, and any other exit refuses with the server's captured stderr.
 /// When the window closes on a holder of the election that is still building
-/// its first index and wrote to the workspace database during the window,
+/// its first index and wrote the index or the metrics database during the window,
 /// the refusal is one the caller resends; any other exhaustion refuses with
 /// the operator's next step.
+///
+/// A workspace whose settings select a repository server asks that server
+/// first, and again on each poll round while its answer is
+/// [`RepositoryAsk::Transient`]: the repository server claims the
+/// workspace's election and publishes no document there, so the workspace's
+/// own election probes as [`ServerPresence::Starting`] until the window
+/// closes. A [`RepositoryAsk::Terminal`] answer ends the asking.
 ///
 /// A recorded server of another identity is weighed by [`ServerStanding`].
 /// One this process replaces is asked to stop first, and the spawn waits
@@ -565,9 +594,32 @@ async fn connect_upstream(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<RunningService<RoleClient, ()>, ErrorData> {
-    if let Some(running) = connect_repository_server(root, identity).await? {
-        return Ok(running);
-    }
+    connect_upstream_with(root, identity, || connect_repository_server(root, identity)).await
+}
+
+/// [`connect_upstream`] over any ask of the repository server, so a test
+/// can order what each ask answers.
+async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
+    root: &Path,
+    identity: &ProductIdentity,
+    mut ask_repository: impl FnMut() -> Asking,
+) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+    let started = tokio::time::Instant::now();
+    let mut reported = None;
+    let mut closing = StartWindowClose::default();
+    let asked = ask_repository().await;
+    asked.report_change(&mut reported);
+    let mut repository_transient = match asked {
+        RepositoryAsk::Connected(running) => return Ok(running),
+        RepositoryAsk::Transient(miss) => {
+            closing.repository_miss = Some(miss);
+            true
+        }
+        RepositoryAsk::Terminal(miss) => {
+            closing.repository_miss = Some(miss);
+            false
+        }
+    };
     let mut replacement = Replacement::default();
     if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
         return Ok(running);
@@ -587,9 +639,14 @@ async fn connect_upstream(
     let opened = DatabaseActivity::observed(root).await;
     let mut building = false;
     let mut still_serving = None;
+    let mut probe_reads = None;
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        let presence = probed(root).await;
+        let observation = observed(root).await;
+        observation.report_change(&mut probe_reads);
+        let presence = observation.presence;
+        closing.rounds += 1;
+        closing.presence = presence_field(&presence);
         building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
         still_serving = replacement.refusal_while_serving(&presence, identity);
@@ -601,7 +658,10 @@ async fn connect_upstream(
             spawns.spawn_captured(root);
         }
         match spawns.poll(adopted, election_held) {
-            SpawnPollOutcome::Ready(running) => return Ok(running),
+            SpawnPollOutcome::Ready(running) => {
+                closing.record_answered(started.elapsed());
+                return Ok(running);
+            }
             SpawnPollOutcome::Failed(capture) => return server_start_failed(&capture).fail(),
             SpawnPollOutcome::ElectionUnheld => spawns.spawn_captured(root),
             SpawnPollOutcome::Waiting => {}
@@ -610,28 +670,94 @@ async fn connect_upstream(
             break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+        if repository_transient {
+            let asked = ask_repository().await;
+            asked.report_change(&mut reported);
+            match asked {
+                RepositoryAsk::Connected(running) => {
+                    closing.record_answered(started.elapsed());
+                    return Ok(running);
+                }
+                RepositoryAsk::Transient(miss) => closing.repository_miss = Some(miss),
+                RepositoryAsk::Terminal(miss) => {
+                    repository_transient = false;
+                    closing.repository_miss = Some(miss);
+                }
+            }
+        }
     }
+    closing.building = building;
     if let Some(refusal) = still_serving {
+        closing.record(started.elapsed(), None, &refusal);
         return refusal.fail();
     }
     let closed = DatabaseActivity::observed(root).await;
-    start_window_refusal(building && opened != closed).fail()
+    let wrote = opened != closed;
+    let refusal = start_window_refusal(building && wrote);
+    closing.record(started.elapsed(), Some(wrote), &refusal);
+    refusal.fail()
 }
 
-/// What the workspace database's files looked like at one instant: each
+/// What a start window last saw, logged once as the window closes: on a
+/// server that answers, or beside the refusal it returns.
+#[derive(Debug, Default)]
+struct StartWindowClose {
+    /// The poll rounds the window ran.
+    rounds: u32,
+    /// The workspace election's presence at the last round.
+    presence: String,
+    /// The last ask of the repository server, when it missed.
+    repository_miss: Option<RepositoryMiss>,
+    /// Whether the last round found the election held with no document.
+    building: bool,
+}
+
+impl StartWindowClose {
+    /// Logs the window's close after `elapsed`, with `wrote` naming whether
+    /// a database file changed during the window when the close read it, and
+    /// the `refusal` the request gets.
+    fn record(&self, elapsed: Duration, wrote: Option<bool>, refusal: &ErrorData) {
+        rift_tracing::info!(
+            component = "mcp",
+            rounds = self.rounds,
+            elapsed_ms = elapsed.as_millis(),
+            presence = %self.presence,
+            repository_miss = self.repository_miss.as_ref().map(|miss| format!("{miss:?}")),
+            building = self.building,
+            wrote,
+            refusal = %refusal.message,
+            "start window closed without a server that answers"
+        );
+    }
+
+    /// Logs the window's close after `elapsed` on a server that answers: the poll rounds
+    /// it ran and the workspace election's presence at the last round.
+    fn record_answered(&self, elapsed: Duration) {
+        rift_tracing::info!(
+            component = "mcp",
+            rounds = self.rounds,
+            elapsed_ms = elapsed.as_millis(),
+            presence = %self.presence,
+            outcome = "ok",
+            "start window closed with a server that answers"
+        );
+    }
+}
+
+/// What the index and metrics databases' files looked like at one instant: each
 /// file's length and modification time, or nothing for an absent file.
 ///
-/// A server records its diagnostics into `.rift/db` from before it claims the
-/// election, while it builds its first index too, and `SQLite` in WAL mode
-/// appends each commit to the write-ahead log. Two readings that differ
+/// A server writes `.rift/index` while it builds its first index and records its
+/// diagnostics into `.rift/metrics`, and `SQLite` in WAL mode appends each commit to
+/// the database's write-ahead log. Two readings that differ in any of the four files
 /// therefore show that a process wrote between them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseActivity {
-    files: [Option<(u64, SystemTime)>; 2],
+    files: [Option<(u64, SystemTime)>; 4],
 }
 
 impl DatabaseActivity {
-    /// Reads the database file and its write-ahead log below `root`, and none
+    /// Reads each database file and its write-ahead log below `root`, and none
     /// of their bytes, on the blocking pool. A reading the pool could not
     /// finish names no file.
     ///
@@ -642,20 +768,22 @@ impl DatabaseActivity {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || Self::read(&root))
             .await
-            .unwrap_or(Self {
-                files: [None, None],
-            })
+            .unwrap_or(Self { files: [None; 4] })
     }
 
-    /// Reads the database file and its write-ahead log below `root`.
+    /// Reads the index and metrics database files and their write-ahead logs below
+    /// `root`.
     fn read(root: &Path) -> Self {
         let state = root.join(RIFT_STATE_DIRECTORY);
-        let database = state.join(WORKSPACE_DATABASE_FILE_NAME);
-        let log = state.join(format!(
-            "{WORKSPACE_DATABASE_FILE_NAME}{WRITE_AHEAD_LOG_SUFFIX}"
-        ));
+        let log = |database: &str| state.join(format!("{database}{WRITE_AHEAD_LOG_SUFFIX}"));
+        let paths = [
+            state.join(INDEX_DATABASE_FILE_NAME),
+            log(INDEX_DATABASE_FILE_NAME),
+            state.join(METRICS_DATABASE_FILE_NAME),
+            log(METRICS_DATABASE_FILE_NAME),
+        ];
         Self {
-            files: [database, log].map(|path| {
+            files: paths.map(|path| {
                 let metadata = std::fs::metadata(path).ok()?;
                 Some((metadata.len(), metadata.modified().ok()?))
             }),
@@ -733,6 +861,21 @@ async fn probed(root: &Path) -> ServerPresence {
     probed_with(root, probe).await
 }
 
+/// [`probed`] with the reads that decided the presence, so the start poll
+/// can log a read that failed.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the answer; the probe itself finishes on
+/// the blocking pool and changes nothing.
+async fn observed(root: &Path) -> ElectionObservation {
+    let root = root.to_path_buf();
+    let fallback = ElectionObservation::unobservable(&root);
+    tokio::task::spawn_blocking(move || observe(&root))
+        .await
+        .unwrap_or(fallback)
+}
+
 /// [`probed`] over any probe, so a test can hold one probe open.
 async fn probed_with(
     root: &Path,
@@ -758,7 +901,7 @@ async fn adopt_presence(
     let lock = match presence {
         ServerPresence::Serving(lock) => lock,
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 pid,
                 "recorded server did not answer; treating the lock as stale"
@@ -779,7 +922,7 @@ async fn adopt_presence(
     }
     match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, root).await {
         Ok(running) => {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 port = lock.port,
                 pid = lock.pid,
@@ -789,7 +932,7 @@ async fn adopt_presence(
         }
         Err(failure) => {
             let detail = failure.detail();
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 %detail,
                 "recorded server did not answer; treating the lock as stale"
@@ -799,44 +942,181 @@ async fn adopt_presence(
     }
 }
 
+/// What one ask of the repository server answered.
+#[derive(Debug)]
+enum RepositoryAsk {
+    /// The repository server answered for this workspace.
+    Connected(RunningService<RoleClient, ()>),
+    /// A later ask within the start window can connect: the repository
+    /// server is not serving yet, or did not answer the connect while it
+    /// builds the workspace inside the initialize request.
+    Transient(RepositoryMiss),
+    /// No later ask within the start window connects: the workspace selects
+    /// its own server, or the repository server is one this process does not
+    /// adopt.
+    Terminal(RepositoryMiss),
+}
+
+impl RepositoryAsk {
+    /// Logs this ask's miss when its arm differs from the arm `reported`
+    /// holds, so a start window of repeated misses logs each change of arm
+    /// once, not once per poll round.
+    fn report_change(&self, reported: &mut Option<std::mem::Discriminant<RepositoryMiss>>) {
+        let (Self::Transient(miss) | Self::Terminal(miss)) = self else {
+            return;
+        };
+        let arm = std::mem::discriminant(miss);
+        if *reported != Some(arm) {
+            *reported = Some(arm);
+            miss.report();
+        }
+    }
+}
+
+/// Why one ask of the repository server did not connect.
+#[derive(Debug)]
+enum RepositoryMiss {
+    /// The workspace's settings select its own server.
+    NotRepository,
+    /// The workspace configuration was refused, or reading it did not finish.
+    SelectionRefused { detail: String },
+    /// The repository election directory could not be named.
+    ElectionDirectory { detail: String },
+    /// The repository election names no serving server.
+    NotServing { presence: String },
+    /// The serving server records other settings or another identity.
+    NotAdopted {
+        pid: u32,
+        settings_match: bool,
+        identity_adopted: bool,
+    },
+    /// The serving server did not answer the connect.
+    Unanswered {
+        pid: u32,
+        port: u16,
+        elapsed_ms: u128,
+        detail: String,
+    },
+}
+
+impl RepositoryMiss {
+    /// Logs this miss. A workspace that selects its own server is the
+    /// ordinary case and logs nothing.
+    fn report(&self) {
+        match self {
+            Self::NotRepository => {}
+            Self::SelectionRefused { detail } => rift_tracing::info!(
+                component = "mcp",
+                %detail,
+                "server configuration selection refused; polling the workspace election"
+            ),
+            Self::ElectionDirectory { detail } => rift_tracing::info!(
+                component = "mcp",
+                %detail,
+                "repository election directory unavailable; polling the workspace election"
+            ),
+            Self::NotServing { presence } => rift_tracing::info!(
+                component = "mcp",
+                %presence,
+                "repository server not serving; polling the workspace election"
+            ),
+            Self::NotAdopted {
+                pid,
+                settings_match,
+                identity_adopted,
+            } => rift_tracing::info!(
+                component = "mcp",
+                pid,
+                settings_match,
+                identity_adopted,
+                "repository server not adopted; polling the workspace election"
+            ),
+            Self::Unanswered {
+                pid,
+                port,
+                elapsed_ms,
+                detail,
+            } => rift_tracing::info!(
+                component = "mcp",
+                pid,
+                port,
+                elapsed_ms,
+                %detail,
+                "repository server did not answer; polling the workspace election"
+            ),
+        }
+    }
+}
+
+/// Asks the repository server the workspace's settings select, once.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the ask; it changes nothing.
 async fn connect_repository_server(
     workspace_root: &Path,
     identity: &ProductIdentity,
-) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
+) -> RepositoryAsk {
     let root = workspace_root.to_path_buf();
-    let selection = tokio::task::spawn_blocking(move || select_server_configuration(&root, None))
-        .await
-        .ok()
-        .and_then(Result::ok);
-    let Some(ServerConfigurationSelection::Repository {
+    let selection =
+        match tokio::task::spawn_blocking(move || select_server_configuration(&root, None)).await {
+            Ok(Ok(selection)) => selection,
+            Ok(Err(refusal)) => {
+                return RepositoryAsk::Terminal(RepositoryMiss::SelectionRefused {
+                    detail: refusal.message.to_string(),
+                });
+            }
+            Err(error) => {
+                return RepositoryAsk::Terminal(RepositoryMiss::SelectionRefused {
+                    detail: error.to_string(),
+                });
+            }
+        };
+    let ServerConfigurationSelection::Repository {
         common_directory,
         server,
         ..
-    }) = selection
+    } = selection
     else {
-        return Ok(None);
+        return RepositoryAsk::Terminal(RepositoryMiss::NotRepository);
     };
-    let Some(state_directory) = repository_election_directory(&common_directory, identity).ok()
-    else {
-        return Ok(None);
+    let state_directory = match repository_election_directory(&common_directory, identity) {
+        Ok(state_directory) => state_directory,
+        Err(refusal) => {
+            return RepositoryAsk::Terminal(RepositoryMiss::ElectionDirectory {
+                detail: refusal.message.to_string(),
+            });
+        }
     };
     let presence = tokio::task::spawn_blocking(move || probe_state_directory(&state_directory))
         .await
         .unwrap_or(ServerPresence::Stale(StaleReason::ElectionUnobservable));
     let ServerPresence::Serving(lock) = presence else {
-        return Ok(None);
+        return RepositoryAsk::Transient(RepositoryMiss::NotServing {
+            presence: format!("{presence:?}"),
+        });
     };
-    if lock.server.as_ref() != Some(&server)
-        || !matches!(
-            ServerStanding::of(identity, &lock.identity),
-            ServerStanding::Adopt
-        )
-    {
-        return Ok(None);
+    let settings_match = lock.server.as_ref() == Some(&server);
+    let identity_adopted = matches!(
+        ServerStanding::of(identity, &lock.identity),
+        ServerStanding::Adopt
+    );
+    if !settings_match || !identity_adopted {
+        return RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+            pid: lock.pid,
+            settings_match,
+            identity_adopted,
+        });
     }
+    let started = tokio::time::Instant::now();
     match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, workspace_root).await {
-        Ok(running) => Ok(Some(running)),
-        Err(_) => Ok(None),
+        Ok(running) => RepositoryAsk::Connected(running),
+        Err(failure) => RepositoryAsk::Transient(RepositoryMiss::Unanswered {
+            pid: lock.pid,
+            port: lock.port,
+            elapsed_ms: started.elapsed().as_millis(),
+            detail: failure.detail(),
+        }),
     }
 }
 
@@ -935,14 +1215,14 @@ impl Replacement {
         }
         match request_stop(lock).await {
             Ok(()) => self.accepted = true,
-            Err(StopRequestFailure::Failed(failure)) => tracing::warn!(
+            Err(StopRequestFailure::Failed(failure)) => rift_tracing::warn!(
                 component = "mcp",
                 pid = lock.pid,
                 failure = ?failure,
                 "the stop request to the workspace server failed in transport; the election decides"
             ),
             Err(failure @ StopRequestFailure::Refused(_)) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     pid = lock.pid,
                     failure = ?failure,
@@ -952,7 +1232,7 @@ impl Replacement {
             }
         }
         let server_version = lock.identity.version.as_str();
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             pid = lock.pid,
             server_version,
@@ -1141,48 +1421,71 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let listing = self
-            .forward(list_tools_request(request), |result| match result {
-                ServerResult::ListToolsResult(result) => Some(result),
-                _ => None,
-            })
-            .await?;
-        Ok(self.output.select_listing(listing))
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("tools/list", {
+            answered = self
+                .forward(list_tools_request(request), |result| match result {
+                    ServerResult::ListToolsResult(result) => Some(result),
+                    _ => None,
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(TOOLS_LIST).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        Ok(self.output.select_listing(answered?))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let span = tracing::info_span!(
+        let measured = McpRequest::tool_call(&request.name);
+        let span = rift_tracing::info_span!(
             "mcp.forward",
             component = "mcp",
             operation = "tools/call",
-            request_id = %context.id,
+            request_id = rift_tracing::empty!(),
             tool = %request.name
         );
-        let response = async {
-            tracing::debug!("tool forward started");
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-            let result = self
-                .forward(request, |result| match result {
-                    ServerResult::CallToolResult(result) => {
-                        Some(CallToolResponse::Complete(result))
-                    }
-                    ServerResult::InputRequiredResult(result) => {
-                        Some(CallToolResponse::InputRequired(result))
-                    }
-                    ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
-                    _ => None,
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("tools/call", {
+            answered = span
+                .instrument(async {
+                    rift_tracing::debug!("tool forward started");
+                    let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+                    let result = self
+                        .forward(request, |result| match result {
+                            ServerResult::CallToolResult(result) => {
+                                Some(CallToolResponse::Complete(result))
+                            }
+                            ServerResult::InputRequiredResult(result) => {
+                                Some(CallToolResponse::InputRequired(result))
+                            }
+                            ServerResult::CreateTaskResult(result) => {
+                                Some(CallToolResponse::Task(result))
+                            }
+                            _ => None,
+                        })
+                        .await;
+                    rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
+                    result
                 })
                 .await;
-            tracing::debug!(is_error = result.is_err(), "tool forward completed");
-            result
-        }
-        .instrument(span)
-        .await?;
-        Ok(self.selected_response(response))
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        measured.record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of_tool_call(&answered),
+        );
+        Ok(self.selected_response(answered?))
     }
 
     async fn list_resources(
@@ -1195,11 +1498,23 @@ impl ServerHandler for RiftProxy {
             params: request,
             extensions: Extensions::default(),
         });
-        self.forward(request, |result| match result {
-            ServerResult::ListResourcesResult(result) => Some(result),
-            _ => None,
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/list", {
+            answered = self
+                .forward(request, |result| match result {
+                    ServerResult::ListResourcesResult(result) => Some(result),
+                    _ => None,
+                })
+                .await;
         })
-        .await
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_LIST).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        answered
     }
 
     async fn list_resource_templates(
@@ -1212,11 +1527,23 @@ impl ServerHandler for RiftProxy {
             params: request,
             extensions: Extensions::default(),
         });
-        self.forward(request, |result| match result {
-            ServerResult::ListResourceTemplatesResult(result) => Some(result),
-            _ => None,
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/templates/list", {
+            answered = self
+                .forward(request, |result| match result {
+                    ServerResult::ListResourceTemplatesResult(result) => Some(result),
+                    _ => None,
+                })
+                .await;
         })
-        .await
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCE_TEMPLATES_LIST).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        answered
     }
 
     async fn read_resource(
@@ -1225,18 +1552,28 @@ impl ServerHandler for RiftProxy {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(request));
-        let response = self
-            .forward(request, |result| match result {
-                ServerResult::ReadResourceResult(result) => {
-                    Some(ReadResourceResponse::Complete(result))
-                }
-                ServerResult::InputRequiredResult(result) => {
-                    Some(ReadResourceResponse::InputRequired(result))
-                }
-                _ => None,
-            })
-            .await?;
-        Ok(self.selected_resource(response))
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/read", {
+            answered = self
+                .forward(request, |result| match result {
+                    ServerResult::ReadResourceResult(result) => {
+                        Some(ReadResourceResponse::Complete(result))
+                    }
+                    ServerResult::InputRequiredResult(result) => {
+                        Some(ReadResourceResponse::InputRequired(result))
+                    }
+                    _ => None,
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_READ).record(
+            &MCP_CLIENT_OPERATION_DURATION,
+            elapsed,
+            Ending::of(&answered),
+        );
+        Ok(self.selected_resource(answered?))
     }
 }
 
@@ -1273,10 +1610,11 @@ mod tests {
     use tokio::io::AsyncBufReadExt as _;
 
     use super::{
-        ConnectAttemptFailure, Replacement, RiftProxy, ServerStanding, Upstream, UpstreamSlot,
-        adopt_serving, connect_recorded, connect_upstream, fallback_info, forwarded_error,
-        identity_refusal, mirrored_info, quit_reason_result, reuse_current, serve_connection,
-        server_start_failed, start_window_refusal, transport_failed,
+        ConnectAttemptFailure, Replacement, RepositoryAsk, RepositoryMiss, RiftProxy,
+        ServerStanding, Upstream, UpstreamSlot, adopt_serving, connect_recorded, connect_upstream,
+        connect_upstream_with, fallback_info, forwarded_error, identity_refusal, mirrored_info,
+        quit_reason_result, reuse_current, serve_connection, server_start_failed,
+        start_window_refusal, transport_failed,
     };
     use crate::election::{ServerPresence, StaleReason, claim};
     use crate::output::OutputPolicy;
@@ -1933,6 +2271,7 @@ mod tests {
     /// refusal is one the caller can retry.
     #[tokio::test(start_paused = true)]
     async fn a_forward_the_server_never_answers_refuses_at_its_budget() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         std::fs::write(
             directory.path().join("rift.toml"),
@@ -1950,9 +2289,12 @@ mod tests {
         }
 
         let started = tokio::time::Instant::now();
-        let forward = proxy.forward(super::list_tools_request(None), |result| match result {
-            ServerResult::ListToolsResult(result) => Some(result),
-            _ => None,
+        // A silent server answers nothing, so the forward's `answer` never runs.
+        let forward = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            let request = super::list_tools_request(None);
+            proxy
+                .forward(request, |_answer| None::<ListToolsResult>)
+                .await
         });
         let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
             .await
@@ -1973,6 +2315,24 @@ mod tests {
             refusal.message.contains("did not answer"),
             "{}",
             refusal.message
+        );
+        drop(recorder);
+        let records = drain.queued_records();
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the budget's end published the operations in flight")?;
+        let table: serde_json::Value = serde_json::from_str(table.fields())?;
+        assert_eq!(table["reason"], "forward budget", "{table}");
+        let listed: serde_json::Value =
+            serde_json::from_str(table["operations"].as_str().ok_or("operations")?)?;
+        assert!(
+            listed
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["operation"] == "tools/call"),
+            "{table}"
         );
 
         // The silent server received the request, then its cancellation, both naming
@@ -2106,14 +2466,101 @@ mod tests {
         Ok(())
     }
 
-    /// A holder of the election that publishes nothing but writes to the
-    /// workspace database during the start window is still building: the
-    /// connect refuses with a refusal the caller resends, naming the build.
+    /// A repository server holds the workspace's election and publishes no
+    /// document there, which the held election below stands in for. Its first
+    /// ask misses through a transient arm, and the start window asks again on
+    /// the next poll round, which connects. The window's close logs once,
+    /// naming the rounds it ran and the outcome.
     #[tokio::test(start_paused = true)]
-    async fn a_building_holder_refuses_with_a_retryable_refusal() -> TestResult {
+    async fn a_transient_repository_miss_is_asked_again_inside_the_start_window() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = claim(directory.path())?;
-        let log = directory.path().join(".rift").join("db-wal");
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (running, _kept_alive) = direct_upstream();
+        let mut answers = vec![
+            RepositoryAsk::Connected(running),
+            RepositoryAsk::Transient(RepositoryMiss::Unanswered {
+                pid: 4_242,
+                port: 0,
+                elapsed_ms: 5_000,
+                detail: "connect timed out after 5s".to_owned(),
+            }),
+        ];
+        let mut asked = 0_u32;
+        let connected = connect_upstream_with(directory.path(), &test_identity(), || {
+            asked += 1;
+            std::future::ready(
+                answers
+                    .pop()
+                    .unwrap_or(RepositoryAsk::Terminal(RepositoryMiss::NotRepository)),
+            )
+        })
+        .await;
+        assert!(connected.is_ok(), "{connected:?}");
+        assert_eq!(asked, 2, "the second ask connects");
+        drop(recorder);
+        let records = drain.queued_records();
+        let closed = records
+            .iter()
+            .filter(|record| record.message() == "start window closed with a server that answers")
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1, "the window's close logs once: {records:?}");
+        assert_eq!(closed[0].level(), "info");
+        let fields: serde_json::Value = serde_json::from_str(closed[0].fields())?;
+        assert_eq!(fields["rounds"], "1");
+        assert_eq!(fields["outcome"], "ok");
+        assert_eq!(fields["presence"], "Starting");
+        assert!(fields["elapsed_ms"].is_string(), "{fields}");
+        Ok(())
+    }
+
+    /// A terminal repository miss ends the asking, and the workspace's own
+    /// election decides the start window: a holder that publishes no document
+    /// exhausts it.
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_repository_miss_is_asked_once() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let mut asked = 0_u32;
+        let refusal = connect_upstream_with(directory.path(), &test_identity(), || {
+            asked += 1;
+            std::future::ready(RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            }))
+        })
+        .await
+        .expect_err("a holder that never publishes must exhaust the start window");
+        assert_eq!(asked, 1, "a terminal miss is asked once");
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            refusal
+                .message
+                .contains("no rift server answered for this workspace within 30s"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
+    /// A holder of the election that publishes nothing but writes the
+    /// index database's or the metrics database's write-ahead log alone during
+    /// the start window is still building: the connect refuses with a refusal
+    /// the caller resends, naming the build.
+    #[tokio::test(start_paused = true)]
+    async fn a_building_holder_refuses_with_a_retryable_refusal() -> TestResult {
+        for written_log in ["index-wal", "metrics-wal"] {
+            building_holder_refuses_after_writing(written_log).await?;
+        }
+        Ok(())
+    }
+
+    /// One start window whose election holder writes `written_log` below `.rift`.
+    async fn building_holder_refuses_after_writing(written_log: &str) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let log = directory.path().join(".rift").join(written_log);
         let writing = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             std::fs::write(&log, b"a commit the building server wrote")
@@ -2182,18 +2629,24 @@ mod tests {
     }
 
     /// Database activity reads each file's length and modification time, and
-    /// moves when either file is written.
+    /// moves when any one of the four files is written alone.
     #[test]
-    fn database_activity_moves_when_the_database_is_written() -> TestResult {
+    fn database_activity_moves_when_any_database_file_is_written() -> TestResult {
         let directory = tempfile::tempdir()?;
         let before = super::DatabaseActivity::read(directory.path());
-        assert_eq!(before.files, [None, None]);
-        std::fs::create_dir_all(directory.path().join(".rift"))?;
-        std::fs::write(directory.path().join(".rift").join("db"), b"pages")?;
-        let written = super::DatabaseActivity::read(directory.path());
-        assert_ne!(written, before);
-        std::fs::write(directory.path().join(".rift").join("db-wal"), b"a commit")?;
-        assert_ne!(super::DatabaseActivity::read(directory.path()), written);
+        assert_eq!(before.files, [None; 4]);
+        let state = directory.path().join(".rift");
+        std::fs::create_dir_all(&state)?;
+        let mut previous = before;
+        for file in ["index", "index-wal", "metrics", "metrics-wal"] {
+            std::fs::write(state.join(file), b"a commit")?;
+            let written = super::DatabaseActivity::read(directory.path());
+            assert_ne!(
+                written, previous,
+                "writing {file} alone must move the reading"
+            );
+            previous = written;
+        }
         Ok(())
     }
 
@@ -2280,13 +2733,9 @@ mod tests {
         use rmcp::ServiceExt as _;
 
         // Issue #483 needs the request still awaiting an answer to retain its IDs.
-        let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter("rift=info,rift_mcp=debug,rift_server=debug,rift_index=info")
-            .with_ansi(false)
-            .with_writer(log.reopen()?)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift=info,rift_mcp=debug,rift_server=debug,rift_index=info")
+            .install()?;
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         crate::server::hermetic_workspace(directory.path(), "")?;
@@ -2343,29 +2792,53 @@ mod tests {
                 .is_some_and(|block| block.text.contains("invalid_request")),
             "invalid paths retain the refusal code: {invalid:?}"
         );
-        let records = std::fs::read_to_string(log.path())?;
-        assert_tool_diagnostics(&records, &request_id)?;
+        assert_tool_diagnostics(&drain.queued_records(), &request_id)?;
         client.cancel().await?;
         forwarding.cancel().await?;
         serving.cancel().await?;
         Ok(())
     }
 
-    fn assert_tool_diagnostics(records: &str, request_id: &str) -> TestResult {
-        let forwarded = records
-            .lines()
-            .find(|line| {
-                line.contains("forwarded request awaiting response")
-                    && line.contains(&format!("request_id={request_id}"))
-                    && line.contains("tool=search")
-            })
-            .ok_or("the proxy records the active forward and downstream request ID")?;
-        let upstream_id = forwarded
-            .split("upstream_request_id=")
-            .nth(1)
-            .and_then(|value| value.split_whitespace().next())
-            .ok_or("the forward records its upstream request ID")?;
-        assert_ne!(upstream_id, request_id);
+    /// Whether `record` was emitted inside the `span` that served `request_id` for the
+    /// `search` tool: its `root_span` member names that span and carries both fields.
+    ///
+    /// The member is the span the record was emitted in, read from the subscriber's span
+    /// stack when the event fired. A record a background lane's task emits while the
+    /// request waits carries the lane's root span or none, never this one.
+    fn emitted_in(record: &rift_tracing::LogRecord, span: &str, request_id: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(record.fields()).is_ok_and(|fields| {
+            let root = &fields["root_span"];
+            root["name"] == span
+                && root["fields"]["request_id"] == request_id
+                && root["fields"]["tool"] == "search"
+        })
+    }
+
+    /// The `request_id` of the `mcp.forward` span the record of `message` was emitted in
+    /// for the `search` tool, once the forward recorded it.
+    fn forward_request_id(records: &[rift_tracing::LogRecord], message: &str) -> Option<String> {
+        records.iter().find_map(|record| {
+            let fields = serde_json::from_str::<serde_json::Value>(record.fields()).ok()?;
+            let root = &fields["root_span"];
+            (record.message() == message
+                && root["name"] == "mcp.forward"
+                && root["fields"]["tool"] == "search")
+                .then(|| root["fields"]["request_id"].as_str().map(str::to_owned))
+                .flatten()
+        })
+    }
+
+    /// The proxy's forward of the caller's `caller_id` and the server's request carry one
+    /// `request_id`, the id the server's `mcp.request` span carries, and the caller's id
+    /// is not it; `is_error=false` maps to the `is_error` field `"false"`.
+    fn assert_tool_diagnostics(records: &[rift_tracing::LogRecord], caller_id: &str) -> TestResult {
+        let server_id = forward_request_id(records, "forwarded request awaiting response")
+            .ok_or("the proxy records the active forward under the server's request id")?;
+        assert_ne!(
+            server_id, caller_id,
+            "the forwarding span carries the id the server sees, not the caller's"
+        );
+        assert_forward_joins_server_request(records, &server_id)?;
         for event in [
             "tool request started",
             "worker admission started",
@@ -2374,29 +2847,76 @@ mod tests {
             "tool request completed",
         ] {
             assert!(
-                records.lines().any(|line| {
-                    line.contains("mcp.request{")
-                        && line.contains(&format!("request_id={upstream_id}"))
-                        && line.contains(event)
+                records.iter().any(|record| {
+                    record.message() == event && emitted_in(record, "mcp.request", &server_id)
                 }),
-                "the server event retains the upstream request ID: {event}\n{records}"
+                "the server event retains the forwarded request id: {event}\n{records:#?}"
             );
         }
+        let completed = |record: &rift_tracing::LogRecord, is_error: &str| {
+            record.message() == "tool request completed"
+                && serde_json::from_str::<serde_json::Value>(record.fields())
+                    .is_ok_and(|fields| fields["is_error"] == is_error)
+        };
         assert!(
-            records
-                .lines()
-                .any(|line| line.contains("tool request completed")
-                    && line.contains("is_error=false"))
+            records.iter().any(|record| {
+                completed(record, "false") && emitted_in(record, "mcp.request", &server_id)
+            }),
+            "the forwarded search completes without an error: {records:#?}"
+        );
+        assert!(records.iter().any(|record| completed(record, "true")));
+        assert!(
+            !records.iter().any(|record| {
+                [
+                    record.target(),
+                    record.component(),
+                    record.operation(),
+                    record.message(),
+                    record.fields(),
+                ]
+                .iter()
+                .any(|text| text.contains("zzdiagnosticsecret"))
+            }),
+            "request arguments stay out of diagnostics: {records:#?}"
+        );
+        Ok(())
+    }
+
+    /// The root span's `request_id` is what a printed line and the failure window group
+    /// records of one request by. The `mcp.forward` records after the send, and its close
+    /// record, carry `server_id`, the `request_id` of the server's `mcp.request` span, so
+    /// the proxy's lines and the server's join one request group.
+    fn assert_forward_joins_server_request(
+        records: &[rift_tracing::LogRecord],
+        server_id: &str,
+    ) -> TestResult {
+        assert_eq!(
+            forward_request_id(records, "forwarded request completed").as_deref(),
+            Some(server_id),
+            "the forward's record after the answer carries the server's request id"
+        );
+        let forward = records
+            .iter()
+            .filter_map(|record| {
+                serde_json::from_str::<serde_json::Value>(record.fields())
+                    .ok()
+                    .filter(|fields| {
+                        record.message() == "mcp.forward" && fields["span"] == "closed"
+                    })
+            })
+            .find(|fields| fields["tool"] == "search")
+            .ok_or_else(|| format!("the proxy closes the forwarding span: {records:#?}"))?;
+        assert_eq!(
+            forward["request_id"], server_id,
+            "the forwarding span closes under the server's request id: {forward}"
         );
         assert!(
-            records
-                .lines()
-                .any(|line| line.contains("tool request completed")
-                    && line.contains("is_error=true"))
-        );
-        assert!(
-            !records.contains("zzdiagnosticsecret"),
-            "request arguments stay out of diagnostics: {records}"
+            records.iter().any(|record| {
+                record.message() == "tool request completed"
+                    && emitted_in(record, "mcp.request", server_id)
+            }),
+            "the server's request span carries the id the forwarding span carries: \
+             {records:#?}"
         );
         Ok(())
     }
@@ -2529,9 +3049,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let proxy = RiftProxy::new(directory.path(), test_identity(), output);
         let (upstream_client_half, upstream_server_half) = tokio::io::duplex(64 * 1024);
+        // Each rmcp handshake future is about 4,900 bytes on aarch64; boxed, the three of
+        // them stay out of every test that awaits this fixture.
         let (running, upstream) = tokio::join!(
-            ().serve(upstream_client_half),
-            StructuredUpstream.serve(upstream_server_half)
+            Box::pin(().serve(upstream_client_half)),
+            Box::pin(StructuredUpstream.serve(upstream_server_half))
         );
         {
             let mut slot = proxy.upstream.lock().await;
@@ -2544,7 +3066,7 @@ mod tests {
         let (proxy_half, client_half) = tokio::io::duplex(64 * 1024);
         let connection = tokio::spawn(serve_connection(proxy, proxy_half));
         Ok(ProxiedClient {
-            client: ().serve(client_half).await?,
+            client: Box::pin(().serve(client_half)).await?,
             _upstream: upstream?,
             _connection: connection,
             _directory: directory,
@@ -2570,6 +3092,83 @@ mod tests {
         assert_eq!(result.structured_content, None);
         assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
         assert_eq!(result.is_error, Some(false));
+        Ok(())
+    }
+
+    /// Every request the proxy forwards lands in `mcp.client.operation.duration`: a tool
+    /// answered with `isError` as `tool_error`, an upstream JSON-RPC refusal under its code.
+    #[tokio::test]
+    async fn each_forwarded_request_records_its_client_operation_duration() -> TestResult {
+        use crate::metrics::tests::recorded;
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        proxied.client.list_all_tools().await?;
+        proxied
+            .client
+            .call_tool(CallToolRequestParams::new("search"))
+            .await?;
+        let failing = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("failing"))
+            .await?;
+        assert_eq!(failing.is_error, Some(true));
+        let refused = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("unknown"))
+            .await;
+        assert!(refused.is_err(), "the upstream refuses an unknown tool");
+        proxied
+            .client
+            .read_resource(ReadResourceRequestParams::new(JSON_ONLY_URI))
+            .await?;
+
+        let snapshot = recorder.metrics();
+        let name = "mcp.client.operation.duration";
+        assert_eq!(
+            recorded(&snapshot, name, &[("mcp.method.name", "tools/list")]),
+            2,
+            "one per listed page: {snapshot:?}"
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("gen_ai.tool.name", "search")
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("error.type", "tool_error")
+                ],
+            ),
+            1,
+            "a tool outside the served tools names none"
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("error.type", "-32602"),
+                    ("rpc.response.status_code", "-32602"),
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            recorded(&snapshot, name, &[("mcp.method.name", "resources/read")]),
+            1
+        );
         Ok(())
     }
 
@@ -2734,5 +3333,489 @@ mod tests {
             CallToolResponse::Task(passed) => assert_eq!(passed, task),
             other => panic!("a task answer must pass through, got {other:?}"),
         }
+    }
+
+    /// A start window that closes on a held election with no document logs one record
+    /// naming the rounds it ran, the last presence of the workspace election, the last
+    /// repository miss, the time it took, and the refusal it returns. Repeated probes
+    /// with the same failed read log that read once.
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_start_window_records_what_it_last_saw() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let refusal = connect_upstream_with(directory.path(), &test_identity(), || {
+            std::future::ready(RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            }))
+        })
+        .await
+        .expect_err("a holder that never publishes must exhaust the start window");
+        drop(recorder);
+        let records = drain.queued_records();
+        let messages = |message: &str| {
+            records
+                .iter()
+                .filter(|record| record.message() == message)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            messages("election probe read failed").len(),
+            1,
+            "a failed read repeated every round logs once"
+        );
+        let closed = messages("start window closed without a server that answers");
+        assert_eq!(closed.len(), 1, "the window's close logs once");
+        assert_eq!(closed[0].level(), "info");
+        let fields: serde_json::Value = serde_json::from_str(closed[0].fields())?;
+        let rounds: u32 = fields["rounds"].as_str().ok_or("rounds")?.parse()?;
+        assert!(rounds > 1, "{fields}");
+        let elapsed_ms: u64 = fields["elapsed_ms"].as_str().ok_or("elapsed_ms")?.parse()?;
+        assert!(
+            elapsed_ms >= u64::try_from(crate::spawn::START_WAIT_MAX.as_millis())?,
+            "{fields}"
+        );
+        assert_eq!(fields["presence"], "Starting");
+        assert_eq!(fields["building"], "true");
+        assert_eq!(fields["wrote"], "false");
+        assert!(
+            fields["repository_miss"]
+                .as_str()
+                .is_some_and(|miss| miss.starts_with("NotAdopted {")),
+            "{fields}"
+        );
+        assert_eq!(fields["refusal"], refusal.message.as_ref());
+        Ok(())
+    }
+
+    /// A start window whose repository asks miss transiently, then terminally, asks
+    /// once per poll round until the terminal miss and never again, and its close names
+    /// that last miss.
+    #[tokio::test(start_paused = true)]
+    async fn a_repository_miss_turning_terminal_inside_the_start_window_ends_the_asking()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let not_serving = || RepositoryMiss::NotServing {
+            presence: "Absent".to_owned(),
+        };
+        let mut answers = vec![
+            RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            }),
+            RepositoryAsk::Transient(not_serving()),
+            RepositoryAsk::Transient(not_serving()),
+        ];
+        let mut asked = 0_u32;
+        let refusal = connect_upstream_with(directory.path(), &test_identity(), || {
+            asked += 1;
+            std::future::ready(
+                answers
+                    .pop()
+                    .unwrap_or(RepositoryAsk::Transient(not_serving())),
+            )
+        })
+        .await
+        .expect_err("a holder that never publishes must exhaust the start window");
+        drop(recorder);
+
+        assert_eq!(asked, 3, "the terminal third ask ends the asking");
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let records = drain.queued_records();
+        let closed = records
+            .iter()
+            .find(|record| record.message() == "start window closed without a server that answers")
+            .ok_or("the window's close is recorded")?;
+        let fields: serde_json::Value = serde_json::from_str(closed.fields())?;
+        let miss = fields["repository_miss"]
+            .as_str()
+            .ok_or("repository_miss")?;
+        assert!(miss.starts_with("NotAdopted {"), "{fields}");
+        Ok(())
+    }
+
+    /// Each repository miss logs one `info` record naming why the ask missed, except the
+    /// workspace that selects its own server, which is the ordinary case.
+    #[test]
+    fn each_repository_miss_but_a_workspace_server_logs_why_the_ask_missed() -> TestResult {
+        let misses = [
+            RepositoryMiss::NotRepository,
+            RepositoryMiss::SelectionRefused {
+                detail: "rift.toml failed validation".to_owned(),
+            },
+            RepositoryMiss::ElectionDirectory {
+                detail: "the identity did not serialize".to_owned(),
+            },
+            RepositoryMiss::NotServing {
+                presence: "Absent".to_owned(),
+            },
+            RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            },
+            RepositoryMiss::Unanswered {
+                pid: 4_242,
+                port: 47_000,
+                elapsed_ms: 5_000,
+                detail: "connect timed out after 5s".to_owned(),
+            },
+        ];
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        for miss in &misses {
+            miss.report();
+        }
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let messages: Vec<&str> = records
+            .iter()
+            .map(rift_tracing::LogRecord::message)
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "server configuration selection refused; polling the workspace election",
+                "repository election directory unavailable; polling the workspace election",
+                "repository server not serving; polling the workspace election",
+                "repository server not adopted; polling the workspace election",
+                "repository server did not answer; polling the workspace election",
+            ]
+        );
+        assert!(records.iter().all(|record| record.level() == "info"));
+        assert!(records[0].fields().contains("rift.toml failed validation"));
+        assert!(
+            records[1]
+                .fields()
+                .contains("the identity did not serialize")
+        );
+        Ok(())
+    }
+
+    /// A workspace whose configuration is refused misses the repository ask terminally,
+    /// carrying the refusal's message.
+    #[tokio::test]
+    async fn a_refused_workspace_configuration_misses_the_repository_ask_terminally() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("rift.toml"), "unknown = true\n")?;
+        let refused = crate::repository::select_server_configuration(directory.path(), None)
+            .expect_err("an unknown key refuses the configuration");
+
+        let asked = super::connect_repository_server(directory.path(), &test_identity()).await;
+
+        assert!(
+            matches!(
+                &asked,
+                RepositoryAsk::Terminal(RepositoryMiss::SelectionRefused { detail })
+                    if *detail == refused.message
+            ),
+            "{asked:?}"
+        );
+        Ok(())
+    }
+
+    /// Accepts each connection to `listener` and closes it at once: a port that answers a
+    /// connect and then serves nothing.
+    async fn close_each_connection(listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        loop {
+            drop(listener.accept().await?);
+        }
+    }
+
+    /// A committed repository whose election, for this test's identity, records the
+    /// serving server `lock` on a port that answers a connect and serves nothing.
+    struct RecordedRepositoryServer {
+        root: std::path::PathBuf,
+        port: u16,
+        _guard: crate::election::ElectionGuard,
+        _closing: tokio::task::JoinHandle<std::io::Result<()>>,
+        _directory: tempfile::TempDir,
+    }
+
+    async fn recorded_repository_server(
+        server: Option<rift_protocol::configuration::ServerConfiguration>,
+    ) -> TestResult<RecordedRepositoryServer> {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        rift_history::fixture::init(&root);
+        std::fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        rift_history::fixture::commit_all(&root, "add source");
+        let common =
+            crate::repository::discover_common_directory(&root).ok_or("a git directory")?;
+        let identity = test_identity();
+        let state = crate::repository::repository_election_directory(&common, &identity)?;
+        let guard = crate::election::claim_state_directory(&state)?;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        guard.publish(&ServerLock {
+            server,
+            ..recorded_lock(port)
+        })?;
+        Ok(RecordedRepositoryServer {
+            root,
+            port,
+            _guard: guard,
+            _closing: tokio::spawn(close_each_connection(listener)),
+            _directory: directory,
+        })
+    }
+
+    /// A repository server that records other settings than the workspace accepts is not
+    /// adopted, and the ask misses terminally without connecting.
+    #[tokio::test]
+    async fn a_repository_server_recording_other_settings_misses_the_ask_terminally() -> TestResult
+    {
+        let recorded = recorded_repository_server(None).await?;
+
+        let asked = super::connect_repository_server(&recorded.root, &test_identity()).await;
+
+        assert!(
+            matches!(
+                asked,
+                RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                    pid: 4_242,
+                    settings_match: false,
+                    identity_adopted: true,
+                })
+            ),
+            "{asked:?}"
+        );
+        Ok(())
+    }
+
+    /// A repository server this process adopts that does not answer the connect misses
+    /// the ask transiently, naming its port.
+    #[tokio::test]
+    async fn an_adopted_repository_server_that_does_not_answer_misses_the_ask_transiently()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let accepted = crate::validation::ConfigurationState::accept(directory.path());
+        let recorded = recorded_repository_server(Some(accepted.server_configuration())).await?;
+
+        let asked = super::connect_repository_server(&recorded.root, &test_identity()).await;
+
+        assert!(
+            matches!(
+                asked,
+                RepositoryAsk::Transient(RepositoryMiss::Unanswered { pid: 4_242, port, .. })
+                    if port == recorded.port
+            ),
+            "{asked:?}"
+        );
+        Ok(())
+    }
+
+    /// A recorded server whose port answers a connect but serves no MCP is treated as
+    /// stale, and the failed connect is recorded.
+    #[tokio::test]
+    async fn adopt_treats_a_recorded_server_that_serves_nothing_as_stale() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        guard.publish(&recorded_lock(listener.local_addr()?.port()))?;
+        let closing = tokio::spawn(close_each_connection(listener));
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let adopted = adopt_serving(
+            directory.path(),
+            &test_identity(),
+            &mut Replacement::default(),
+        )
+        .await?;
+        drop(recorder);
+
+        assert!(
+            adopted.is_none(),
+            "a server that serves nothing is not adopted"
+        );
+        let records = drain.queued_records();
+        let stale = records
+            .iter()
+            .find(|record| {
+                record.message() == "recorded server did not answer; treating the lock as stale"
+            })
+            .ok_or("the failed connect is recorded")?;
+        let fields = stale.fields();
+        assert!(fields.contains("\"detail\""), "{fields}");
+        closing.abort();
+        Ok(())
+    }
+
+    /// Answers each request read off `upstream` with `answer` of its method, as a
+    /// workspace server answering a request with a result of the kind it chose.
+    async fn answer_requests(
+        upstream: tokio::io::DuplexStream,
+        answer: fn(&str) -> serde_json::Value,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let (reading, mut writing) = tokio::io::split(upstream);
+        let mut lines = tokio::io::BufReader::new(reading).lines();
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            let request: serde_json::Value = serde_json::from_str(&line)?;
+            let result = answer(request["method"].as_str().unwrap_or_default());
+            let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+            writing
+                .write_all(format!("{response}\n").as_bytes())
+                .await?;
+        }
+    }
+
+    /// A downstream client declaring `client` of a proxy whose upstream answers through
+    /// [`answer_requests`]. The fields keep the connection tasks alive.
+    struct AnsweredClient {
+        client: RunningService<RoleClient, rmcp::model::ClientConfig>,
+        _answering: tokio::task::JoinHandle<std::io::Result<()>>,
+        _connection: tokio::task::JoinHandle<Result<(), rift_error::RiftError>>,
+        _directory: tempfile::TempDir,
+    }
+
+    async fn answered_client(
+        client: rmcp::model::ClientConfig,
+        answer: fn(&str) -> serde_json::Value,
+    ) -> TestResult<AnsweredClient> {
+        use rmcp::ServiceExt as _;
+        let directory = tempfile::tempdir()?;
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::All);
+        let (running, upstream) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let answering = tokio::spawn(answer_requests(upstream, answer));
+        let (proxy_half, client_half) = tokio::io::duplex(64 * 1024);
+        let connection = tokio::spawn(serve_connection(proxy, proxy_half));
+        Ok(AnsweredClient {
+            client: Box::pin(client.serve(client_half)).await?,
+            _answering: answering,
+            _connection: connection,
+            _directory: directory,
+        })
+    }
+
+    /// A client declaring no capability, at the default protocol version.
+    fn plain_client() -> rmcp::model::ClientConfig {
+        rmcp::model::ClientConfig::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("probe", "0.0.1"),
+        )
+    }
+
+    /// The task a server answers a tool call with.
+    fn working_task() -> CreateTaskResult {
+        CreateTaskResult::new(Task::new(
+            "task-1",
+            TaskStatus::Working,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+    }
+
+    /// An upstream that answers each request with a result of another kind than the
+    /// request reads: every forwarding handler refuses it as an unexpected response.
+    #[tokio::test]
+    async fn an_answer_of_another_kind_is_refused_by_every_forwarding_handler() -> TestResult {
+        let answered = answered_client(plain_client(), |method| match method {
+            "tools/list" => json!({"content": [{"type": "text", "text": "a tool result"}]}),
+            _ => json!({"tools": []}),
+        })
+        .await?;
+        let client = &answered.client;
+        let refusals = [
+            format!("{:?}", client.list_tools(None).await.err()),
+            format!(
+                "{:?}",
+                client
+                    .call_tool(CallToolRequestParams::new("search"))
+                    .await
+                    .err()
+            ),
+            format!("{:?}", client.list_resources(None).await.err()),
+            format!("{:?}", client.list_resource_templates(None).await.err()),
+            format!(
+                "{:?}",
+                client
+                    .read_resource(ReadResourceRequestParams::new(TWO_CONTENT_URI))
+                    .await
+                    .err()
+            ),
+        ];
+        for refusal in refusals {
+            assert!(
+                refusal.contains("failed the forwarded request"),
+                "every handler refuses an answer of another kind: {refusal}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A task the upstream answers a tool call with reaches a client that declared tasks
+    /// unchanged.
+    #[tokio::test]
+    async fn a_task_answer_passes_through_the_proxy_to_a_client_that_declared_tasks() -> TestResult
+    {
+        let client = rmcp::model::ClientConfig::new(
+            rmcp::model::ClientCapabilities::builder()
+                .enable_tasks()
+                .build(),
+            rmcp::model::Implementation::new("probe", "0.0.1"),
+        );
+        let answered = answered_client(client, |_method| {
+            serde_json::to_value(working_task()).unwrap_or_default()
+        })
+        .await?;
+
+        let response = answered
+            .client
+            .call_tool_once(CallToolRequestParams::new("search"))
+            .await?;
+
+        assert!(
+            matches!(&response, CallToolResponse::Task(task) if *task == working_task()),
+            "{response:?}"
+        );
+        Ok(())
+    }
+
+    /// An input request the upstream answers a tool call or a resource read with leaves
+    /// the proxy as an input request, which rmcp then refuses to a client that did not
+    /// negotiate the 2026-07-28 protocol, not as the proxy's own unexpected-response
+    /// refusal.
+    #[tokio::test]
+    async fn an_input_required_answer_leaves_the_proxy_as_an_input_request() -> TestResult {
+        let answered = answered_client(plain_client(), |_method| {
+            serde_json::to_value(InputRequiredResult::from_request_state("opaque"))
+                .unwrap_or_default()
+        })
+        .await?;
+        let client = &answered.client;
+
+        let called = client
+            .call_tool_once(CallToolRequestParams::new("search"))
+            .await;
+        let read = client
+            .read_resource_once(ReadResourceRequestParams::new(TWO_CONTENT_URI))
+            .await;
+
+        for refusal in [format!("{:?}", called.err()), format!("{:?}", read.err())] {
+            assert!(
+                refusal.contains("InputRequiredResult requires negotiated protocol version"),
+                "{refusal}"
+            );
+        }
+        Ok(())
     }
 }

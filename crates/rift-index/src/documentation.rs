@@ -88,7 +88,7 @@ pub(crate) fn build(
     chunk_bytes_max: usize,
     previous: Option<(&DocumentationCollection, &NotebookFiles)>,
 ) -> Result<(DocumentationCollection, NotebookFiles), RiftError> {
-    rift_core::traced!(
+    rift_tracing::traced!(
         component = "documentation",
         operation = "documentation.collect",
         sources = text_files.len(),

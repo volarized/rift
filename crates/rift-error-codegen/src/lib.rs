@@ -90,7 +90,12 @@ mod schema;
 mod validate;
 
 pub use crate::validate::CodegenError;
-use crate::{generate::generate, validate::validate};
+use std::collections::BTreeMap;
+
+use crate::{
+    generate::{generate, generate_module as render_module},
+    validate::validate,
+};
 
 /// Parses, validates, and formats one registry as Rust source.
 pub fn generate_source(source: &str) -> Result<String, CodegenError> {
@@ -99,39 +104,88 @@ pub fn generate_source(source: &str) -> Result<String, CodegenError> {
     generate(&registry)
 }
 
+/// One registry as a parent module file and one file per namespace.
+///
+/// A namespace is the first path segment after the registry namespace, such as
+/// `analysis` in `rift.analysis.context7_malformed`. The parent declares each
+/// namespace with `pub mod <namespace>;`, so the registry lays out as `<module>.rs`
+/// beside `<module>/<namespace>.rs`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedModule {
+    /// Registry constants and the `pub mod` declarations, in namespace order.
+    pub parent: String,
+    /// File content keyed by namespace, sorted by namespace.
+    pub namespaces: BTreeMap<String, String>,
+}
+
+/// Parses, validates, and formats one registry as a parent module and one file per namespace.
+pub fn generate_module(source: &str) -> Result<GeneratedModule, CodegenError> {
+    let registry = schema::parse(source)?;
+    let registry = validate(registry)?;
+    let module = render_module(&registry)?;
+    Ok(GeneratedModule {
+        parent: module.parent,
+        namespaces: module.namespaces,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::generate_source;
+    use super::{generate_module, generate_source};
 
     #[test]
-    fn emits_stable_nested_modules_and_required_setters() {
+    fn emits_compact_semantic_declarations() {
         let source = r#"
 [registry]
 namespace = "rift.cloud"
 schema = 1
 
 [error.auth.token_expired]
-message = "token expired for {subject}"
+message = "token \"expired\" for {subject} under C:\\keys"
 action = "renew token for {subject}"
-        fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true } }
+fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true }, internal = { type = "string", optional = true, display = false } }
 
 [error.auth.no_token]
 message = "token is missing"
 action = "provide a token"
 "#;
         let generated = generate_source(source).expect("generate source");
-        assert!(generated.contains("rift.cloud.auth.token_expired"));
-        assert!(generated.contains("REGISTERED_SLUGS"));
-        assert!(generated.contains("__rift_error_definition!"));
-        assert!(generated.contains("error token_expired;"));
-        assert!(generated.contains("optional[maybe_token]"));
-        assert!(generated.contains("states[State0]"));
-        assert!(generated.contains("complete[SetState]"));
-        assert!(generated.starts_with("pub use rift_error::{FieldSet, OptionalFieldSet};"));
-        assert!(!generated.contains("::rift_error::"));
-        assert!(!generated.contains("::std::"));
-        assert!(!generated.contains("allow(unused_imports)"));
-        assert!(generated.contains("error no_token;"));
+        let expected = r#"use rift_error::__rift_error_definition;
+
+#[doc(hidden)]
+pub const REGISTRY_NAMESPACE: &str = "rift.cloud";
+#[doc(hidden)]
+pub const REGISTERED_SLUGS: &[&str] = &[
+    "rift.cloud.auth.no_token",
+    "rift.cloud.auth.token_expired",
+];
+
+/// Registered errors under `rift.cloud.auth`.
+pub mod auth {
+    use super::__rift_error_definition;
+
+    __rift_error_definition!(
+        no_token,
+        slug = "rift.cloud.auth.no_token",
+        message = "token is missing",
+        action = "provide a token",
+        fields = {},
+    );
+
+    __rift_error_definition!(
+        token_expired,
+        slug = "rift.cloud.auth.token_expired",
+        message = "token \"expired\" for {subject} under C:\\keys",
+        action = "renew token for {subject}",
+        fields = {
+            internal: optional(string, hidden),
+            subject: required(string),
+            token: optional(bool, sensitive),
+        },
+    );
+}
+"#;
+        assert_eq!(generated, expected);
         assert_eq!(
             generated,
             generate_source(source).expect("generate same source")
@@ -139,82 +193,188 @@ action = "provide a token"
     }
 
     #[test]
-    fn committed_registry_stays_within_generated_line_bound() {
-        let generated = generate_source(include_str!("../../rift-error/errors.toml"))
+    fn committed_registry_files_stay_within_generated_line_bound() {
+        let module = generate_module(include_str!("../../rift-error/errors.toml"))
             .expect("generate committed registry");
+        for (name, file) in &module.namespaces {
+            assert!(
+                file.lines().count() <= 1_000,
+                "generated namespace file {name} exceeds 1,000 lines"
+            );
+        }
         assert!(
-            generated.lines().count() <= 10_000,
-            "generated source exceeds 10,000 lines"
+            module.parent.lines().count() <= 1_000,
+            "generated parent module exceeds 1,000 lines"
         );
     }
 
     #[test]
-    fn generated_imports_are_grouped_unique_and_ordered() {
-        use quote::ToTokens as _;
-        use syn::Item;
-
+    fn module_emits_one_file_per_namespace_in_sorted_order() {
         let source = r#"
 [registry]
-namespace = "rift.cloud"
+namespace = "rift"
 schema = 1
 
-[error.auth.token_expired]
-message = "token expired for {subject}"
-action = "renew token for {subject}"
-fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true }, pid = { type = "pid" }, port = { type = "port" } }
+[error.zeta.late]
+message = "late"
+action = "retry"
+
+[error.alpha.second]
+message = "second"
+action = "retry"
+
+[error.alpha.first]
+message = "first"
+action = "retry"
 "#;
-        let generated = generate_source(source).expect("generate source");
-        let file = syn::parse_file(&generated).expect("generated Rust parses");
-        let imports = file
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Use(item) if matches!(item.vis, syn::Visibility::Inherited) => {
-                    Some(item.to_token_stream().to_string())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let module = generate_module(source).expect("generate module");
         assert_eq!(
-            imports.len(),
-            2,
-            "one grouped import per namespace: {imports:?}"
+            module
+                .namespaces
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
         );
-        assert!(imports[0].starts_with("use rift_error"), "{imports:?}");
-        assert!(imports[1].starts_with("use std"), "{imports:?}");
-        let mut sorted = imports.clone();
-        sorted.sort();
-        assert_eq!(imports, sorted, "imports sort by namespace: {imports:?}");
-        let mut unique = imports.clone();
-        unique.dedup();
-        assert_eq!(imports, unique, "imports have no duplicates: {imports:?}");
-        assert!(imports[1].contains("borrow :: Borrow"), "{imports:?}");
-        fn contains_glob(tree: &syn::UseTree) -> bool {
-            match tree {
-                syn::UseTree::Glob(_) => true,
-                syn::UseTree::Group(group) => group.items.iter().any(contains_glob),
-                syn::UseTree::Path(path) => contains_glob(&path.tree),
-                syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
-            }
+        let expected_parent = r#"#[doc(hidden)]
+pub const REGISTRY_NAMESPACE: &str = "rift";
+#[doc(hidden)]
+pub const REGISTERED_SLUGS: &[&str] = &[
+    "rift.alpha.first",
+    "rift.alpha.second",
+    "rift.zeta.late",
+];
+
+/// Registered errors under `rift.alpha`.
+pub mod alpha;
+
+/// Registered errors under `rift.zeta`.
+pub mod zeta;
+"#;
+        assert_eq!(module.parent, expected_parent);
+        let expected_alpha = r#"use rift_error::__rift_error_definition;
+
+__rift_error_definition!(
+    first,
+    slug = "rift.alpha.first",
+    message = "first",
+    action = "retry",
+    fields = {},
+);
+
+__rift_error_definition!(
+    second,
+    slug = "rift.alpha.second",
+    message = "second",
+    action = "retry",
+    fields = {},
+);
+"#;
+        assert_eq!(module.namespaces["alpha"], expected_alpha);
+        assert_eq!(module, generate_module(source).expect("generate again"));
+    }
+
+    #[test]
+    fn module_declares_an_error_directly_under_the_registry_in_the_parent() {
+        let source = r#"
+[registry]
+namespace = "rift"
+schema = 1
+
+[error.stopped]
+message = "stopped"
+action = "restart"
+
+[error.alpha.first]
+message = "first"
+action = "retry"
+"#;
+        let module = generate_module(source).expect("generate module");
+        assert_eq!(
+            module
+                .namespaces
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["alpha"]
+        );
+        let expected_parent = r#"use rift_error::__rift_error_definition;
+
+#[doc(hidden)]
+pub const REGISTRY_NAMESPACE: &str = "rift";
+#[doc(hidden)]
+pub const REGISTERED_SLUGS: &[&str] = &[
+    "rift.alpha.first",
+    "rift.stopped",
+];
+
+/// Registered errors under `rift.alpha`.
+pub mod alpha;
+
+__rift_error_definition!(
+    stopped,
+    slug = "rift.stopped",
+    message = "stopped",
+    action = "restart",
+    fields = {},
+);
+"#;
+        assert_eq!(module.parent, expected_parent);
+    }
+
+    #[test]
+    fn module_files_are_rustfmt_stable() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let module = generate_module(include_str!("../../rift-error/errors.toml"))
+            .expect("generate committed registry");
+        for (name, file) in module
+            .namespaces
+            .iter()
+            .map(|(name, file)| (name.as_str(), file))
+            .chain([("parent", &module.parent)])
+        {
+            let mut rustfmt = Command::new("rustfmt")
+                .args(["--edition", "2024", "--emit", "stdout"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("run rustfmt");
+            rustfmt
+                .stdin
+                .take()
+                .expect("rustfmt stdin")
+                .write_all(file.as_bytes())
+                .expect("write generated source to rustfmt");
+            let output = rustfmt.wait_with_output().expect("wait for rustfmt");
+            assert!(output.status.success(), "rustfmt rejected {name}");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), *file, "{name}");
         }
-        fn assert_no_wildcard_imports(items: &[Item]) {
-            for item in items {
-                match item {
-                    Item::Use(item) => assert!(
-                        !contains_glob(&item.tree),
-                        "wildcard import: {}",
-                        item.to_token_stream()
-                    ),
-                    Item::Mod(item) => {
-                        if let Some((_, items)) = &item.content {
-                            assert_no_wildcard_imports(items);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert_no_wildcard_imports(&file.items);
+    }
+
+    #[test]
+    fn generated_registry_is_rustfmt_stable() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let generated = generate_source(include_str!("../../rift-error/errors.toml"))
+            .expect("generate committed registry");
+        let mut rustfmt = Command::new("rustfmt")
+            .args(["--edition", "2024", "--emit", "stdout"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("run rustfmt");
+        rustfmt
+            .stdin
+            .take()
+            .expect("rustfmt stdin")
+            .write_all(generated.as_bytes())
+            .expect("write generated source to rustfmt");
+        let output = rustfmt.wait_with_output().expect("wait for rustfmt");
+        assert!(output.status.success(), "rustfmt rejected generated source");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), generated);
     }
 
     #[test]

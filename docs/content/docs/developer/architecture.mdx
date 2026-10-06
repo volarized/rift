@@ -21,7 +21,7 @@ HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports).
 
 A foreground repository server can hold several workspaces from the same Git repository.
 `rift mcp` adopts it when the workspace accepts its settings; automatic startup continues to
-start a workspace server. Each workspace retains its own index, configuration, watcher, and database.
+start a workspace server. Each workspace retains its own index, configuration, watcher, and databases.
 
 The `rift server` coordinates source discovery and providers. Source
 resolvers identify project files, dependencies, and generated code. Providers analyze that source
@@ -139,7 +139,23 @@ including recovery after the tree returns to the publication's exact bytes.
 The server stops itself once no request remains active and the
 [`idle_timeout`](/docs/developer/configuration#server) span passes after the last response completes.
 `rift server stop` ends it sooner. The server removes its lock file on the way out, and the next
-`rift mcp` starts a fresh one. The database under `.rift` survives the exit.
+`rift mcp` starts a fresh one. The databases under `.rift` survive the exit.
+
+<VersionBadge version="v0.0.62" />
+
+A served workspace keeps three databases under `.rift`:
+
+- the index database, `.rift/index`, holds the lexical index `search` ranks from
+- the vectors database, `.rift/vectors`, holds the vector ranking's rows. The server creates it
+  at the first vector operation, and never while vector ranking is disabled
+- the metrics database, `.rift/metrics`, holds the server's own log records; under repository
+  serving, each workspace's metrics database holds the records that name that workspace, and a
+  record that names none reaches stderr alone
+
+Each database has its own connections and its own writes, so a long index write delays no log
+record and no other database's write. [`rift://logs`](/docs/mcp#resource-logs) and
+`rift server logs` read the metrics database alone, and answer while the index database is
+locked, missing, or refused.
 
 `rift server status` reports which of these states the workspace is in - a serving server with
 its port, pid, and version, a server still indexing, a stale `.rift/server.json`, or no server
@@ -484,8 +500,8 @@ The rebuild derives one unit per indexed symbol, and chunks from every bounded U
 a NUL byte whose effective language entry or
 [`[search.text].include`](/docs/developer/configuration#search) selects it. Visible Markdown, MDX,
 reStructuredText, and notebook documentation also enter collection. Syntax providers enrich files
-their effective language entry selects. The units persist in the workspace database at
-`.rift/db`, stamped with the tree revision that published them.
+their effective language entry selects. The units persist in the index database at
+`.rift/index`, stamped with the tree revision that published them.
 
 The rebuilt index becomes current as soon as its syntax index is built, and the units are written
 behind that publication. The store records which bytes each file's rows were derived from, so a
@@ -499,7 +515,8 @@ transaction that refuses leaves the previous rows and stamp intact and is record
 [`rift://logs`](/docs/mcp#resource-logs), and the next publication compares every file with
 what the store recorded rather than applying its change on top of rows the store missed.
 
-The vector ranking's vectors are not part of that transaction. Embedding one declaration can cost
+The vector ranking's vectors live in the vectors database and are not part of that transaction.
+Embedding one declaration can cost
 more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
 search whose vectors are still being written ranks lexically and reports the tier's readiness in
 `warnings`.

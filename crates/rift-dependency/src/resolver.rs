@@ -84,8 +84,9 @@ impl fmt::Display for ResolverName {
 ///
 /// The program is a bare name the inputs resolve on their own `PATH`; the pass never
 /// names an absolute executable. The run is bounded by the inputs' own wall-clock
-/// timeout, which the `[dependencies]` table's `command_timeout` sets, and by
-/// [`TOOLCHAIN_OUTPUT_BYTES_MAX`].
+/// timeout, which the `[dependencies]` table's `command_timeout` sets, by
+/// [`TOOLCHAIN_OUTPUT_BYTES_MAX`], and by the inputs' cancellation, which ends a run
+/// the server is stopping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolchainCommand {
     /// The program to run, resolved on the inputs' `PATH`.
@@ -200,7 +201,8 @@ pub trait ContextInputs: StaticInputs {
     /// # Errors
     ///
     /// Returns [`CommandFailure`] when the inputs run no program, when the program
-    /// cannot be started, overstays the timeout, or cannot be observed to its end.
+    /// cannot be started, overstays the timeout, is cut by the inputs' cancellation, or
+    /// cannot be observed to its end.
     fn run(&mut self, command: &ToolchainCommand) -> Result<CommandOutput, CommandFailure>;
 }
 

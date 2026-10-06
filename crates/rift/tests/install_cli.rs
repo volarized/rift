@@ -3,6 +3,9 @@
 //! `--user` scope writes under an overridden `HOME` and never touches the
 //! workspace directory the command runs in.
 
+// Names the test each spawned `rift` serves.
+mod test_case;
+
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -10,14 +13,19 @@ use std::process::{Command, Output};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-fn rift(root: &Path, arguments: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(
+/// A command running the compiled `rift` that carries the test's
+/// [`test_case::TEST_CASE_NAME_ATTRIBUTE`].
+fn rift_command() -> TestResult<Command> {
+    let mut command = Command::new(
         std::env::var_os("CARGO_BIN_EXE_rift")
             .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
-    )
-    .args(arguments)
-    .current_dir(root)
-    .output()?)
+    );
+    test_case::with_test_case_name(&mut command);
+    Ok(command)
+}
+
+fn rift(root: &Path, arguments: &[&str]) -> TestResult<Output> {
+    Ok(rift_command()?.args(arguments).current_dir(root).output()?)
 }
 
 fn require_success(output: &Output, what: &str) -> TestResult {
@@ -94,15 +102,12 @@ fn user_scope_writes_under_the_overridden_home_and_never_touches_the_workspace()
     let workspace = tempfile::tempdir()?;
     let home = tempfile::tempdir()?;
 
-    let output = Command::new(
-        std::env::var_os("CARGO_BIN_EXE_rift")
-            .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
-    )
-    .args(["install", "claude", "--user"])
-    .current_dir(workspace.path())
-    .env("HOME", home.path())
-    .env("USERPROFILE", home.path())
-    .output()?;
+    let output = rift_command()?
+        .args(["install", "claude", "--user"])
+        .current_dir(workspace.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()?;
     require_success(&output, "install claude --user")?;
 
     let user_skill_root = home.path().join(".claude").join("skills").join("rift");

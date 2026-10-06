@@ -14,13 +14,22 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import traceback
 import xml.etree.ElementTree as ET
-from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, NamedTuple, Self, TextIO, TypeAlias, cast
@@ -40,6 +49,9 @@ from rift_dev.commands import (
     owned_environment,
     termination_handler,
 )
+from rift_dev.log_records import Line, lines, newest_in_flight
+from rift_dev.machine import machine, machine_line
+from rift_dev.trace import Collector, nanoseconds
 
 # `list` and `dict` are invariant, so a `list[JsonObject]` an assertion builds is
 # not a `list[Json]` and cannot be passed where a JSON value is expected. The
@@ -50,6 +62,24 @@ Json: TypeAlias = (
 )
 JsonObject: TypeAlias = dict[str, Json]
 LOG_BYTES_MAX = 8 * 1024 * 1024
+# The filter every Rift child under test runs with. It is set, never inherited, so
+# an `RUST_LOG` in the developer's shell or the runner cannot change what a failed
+# run left on stderr.
+LOG_FILTER = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"
+# What a failure keeps of one stream: the newest bytes, inline. The whole stream is
+# in its file next to the report.
+EVIDENCE_TAIL_BYTES = 256 * 1024
+# Newest persisted records `rift server logs` prints. A stop writes its `database.close`
+# and `stop stage ended` records last, so they are among the newest; the corpus
+# configuration keeps `page_records = 5000`, the same count.
+RECORD_TAIL = 5000
+# The newest bytes of one records file. Older bytes are replaced by a line naming
+# how many were left out.
+RECORDS_FILE_BYTES = 1024 * 1024
+# The newest bytes of one record the window prints. A table of operations in flight
+# carries a JSON array of its open entries.
+WINDOW_RECORD_BYTES = 16 * 1024
+EVIDENCE_SECONDS = 10.0
 MESSAGE_BYTES_MAX = 16 * 1024 * 1024
 PAGE_COUNT_MAX = 32
 POLL_SECONDS = 0.05
@@ -131,11 +161,7 @@ def workspace_version() -> str:
 
 
 def verify_version(binary: Path, version: str) -> None:
-    """Require the supplied executable to report exactly the expected release version.
-
-    `rift --version` follows the version with `+` and the build it came from, which the
-    comparison leaves aside.
-    """
+    """Require the supplied executable to report exactly the expected release version."""
     expected = f"rift {version.removeprefix('v')}"
     observed = (
         Command(binary.resolve(), "--version")
@@ -143,8 +169,7 @@ def verify_version(binary: Path, version: str) -> None:
         .output()
         .strip()
     )
-    released, _, _build = observed.partition("+")
-    require(released == expected, f"expected {expected!r}, received {observed!r}")
+    require(observed == expected, f"expected {expected!r}, received {observed!r}")
 
 
 def remaining_seconds(seconds: float) -> float:
@@ -227,6 +252,269 @@ def write_junit(path: Path, name: str, seconds: float, failure: str | None) -> N
     ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
 
 
+# What opens the line a server's log drain writes to stderr when the log store refuses
+# a batch (`write_retained`, `crates/rift-tracing/src/drain.rs`), and the line a server
+# stderr holding it opens with: the store lacks the records the drain kept retrying.
+STORE_REFUSAL = "rift: the log store refused a batch"
+STORE_FALLBACK = (
+    f"[the log store refused writes (`{STORE_REFUSAL}`): the window falls back to this "
+    "stderr file for the records the store lacks]\n"
+)
+
+
+def cut_notice(stream: str, limit: int) -> str:
+    """The line a file ends with when its stream wrote past `limit` bytes."""
+    return f"[rift-dev: {stream} cut at {limit} bytes; later output was dropped]\n"
+
+
+def tail_text(
+    text: str, path: Path | None = None, limit: int = EVIDENCE_TAIL_BYTES
+) -> str:
+    """The newest `limit` bytes of `text`, naming `path` when older bytes are left out.
+
+    A stream held only in memory has no file, so it states the omitted count alone.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    kept = encoded[-limit:].decode("utf-8", errors="replace")
+    omitted = len(encoded) - limit
+    where = f"are in {path}" if path is not None else "were left out"
+    return f"[{omitted} earlier bytes {where}]\n{kept}"
+
+
+def utc_now() -> str:
+    """The current UTC time, to the millisecond, as ISO 8601."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+# Runs `rift server logs` with these arguments and returns its stdout.
+LogsReader: TypeAlias = Callable[[Sequence[str]], str]
+
+
+def logs_arguments(
+    until: str, *, since: str | None = None, tail: int = RECORD_TAIL
+) -> list[str]:
+    """The arguments of a `rift server logs` read of records recorded before `until`.
+
+    `since` and `until` are RFC 3339 instants, as `utc_now` prints them. `--since`
+    keeps records at or after the instant and `--until` keeps those before it.
+    """
+    arguments = ["server", "logs", "--tail", str(tail)]
+    if since is not None:
+        arguments += ["--since", since]
+    return [*arguments, "--until", until]
+
+
+def cut_record(text: str) -> str:
+    """One printed record cut to `WINDOW_RECORD_BYTES`, with the cut stated."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= WINDOW_RECORD_BYTES:
+        return text
+    kept = encoded[:WINDOW_RECORD_BYTES].decode("utf-8", errors="ignore")
+    return f"{kept} [{len(encoded) - WINDOW_RECORD_BYTES} later bytes were left out]"
+
+
+# Metric points and spans one failure window prints, the newest of the window.
+WINDOW_POINTS_MAX = 200
+WINDOW_SPANS_MAX = 100
+# The field a printed log record names its MCP request with (`REQUEST_LABEL` in
+# `crates/rift-tracing/src/render.rs`).
+RECORD_REQUEST_LABEL = "req"
+NO_POINTS = "no metric points received"
+NO_SPANS = "no spans received"
+
+
+def telemetry_notes(
+    collector: Collector,
+    *,
+    since: str | None,
+    until: str,
+    records: Sequence[Line] = (),
+) -> list[str]:
+    """What `collector` received inside a failure's window, as notes.
+
+    The window `[since, until)` is the only key metric points and log records share:
+    a point carries `time_unix_nano`, a record its recorded time. A point carries no
+    request. A span carrying `request_id` names the count of `records` whose `req` is
+    the same, so a span and the records of its request read together. Each part prints
+    `WINDOW_POINTS_MAX` or `WINDOW_SPANS_MAX` lines at most, the newest, oldest
+    first; a collector that received nothing says so in one line, and what its bounds
+    dropped is stated whenever anything was.
+    """
+    lower = None if since is None else nanoseconds(since)
+    upper = nanoseconds(until)
+    start = since or "the first point received"
+    notes: list[str] = []
+    if collector.metrics.received == 0:
+        notes.append(NO_POINTS)
+    else:
+        points = collector.metrics.between(lower, upper)
+        shown = points[-WINDOW_POINTS_MAX:]
+        heading = (
+            f"metric points from {start} until {until}, the newest "
+            f"{WINDOW_POINTS_MAX} at most"
+        )
+        body = (
+            "\n".join(cut_record(point.line()) for point in shown)
+            if shown
+            else (
+                f"(no metric points in the window; {collector.metrics.received} "
+                "received in all)"
+            )
+        )
+        cut = (
+            f"[{len(points) - len(shown)} older points of the window were left out]\n"
+            if len(points) > len(shown)
+            else ""
+        )
+        notes.append(f"{heading}:\n{cut}{body}")
+    if collector.spans.received == 0:
+        notes.append(NO_SPANS)
+    else:
+        requests: dict[str, int] = {}
+        for record in records:
+            request = record.label(RECORD_REQUEST_LABEL)
+            if request:
+                requests[request] = requests.get(request, 0) + 1
+        spans = collector.spans.between(lower, upper)
+        shown_spans = spans[-WINDOW_SPANS_MAX:]
+        heading = (
+            f"spans ending from {start} until {until}, the newest {WINDOW_SPANS_MAX} at "
+            "most; records= counts the window's log records of the span's request_id"
+        )
+        body = (
+            "\n".join(
+                cut_record(
+                    span.line(
+                        None
+                        if span.request_id is None
+                        else requests.get(span.request_id, 0)
+                    )
+                )
+                for span in shown_spans
+            )
+            if shown_spans
+            else f"(no spans in the window; {collector.spans.received} received in all)"
+        )
+        cut = (
+            f"[{len(spans) - len(shown_spans)} older spans of the window were left out]\n"
+            if len(spans) > len(shown_spans)
+            else ""
+        )
+        notes.append(f"{heading}:\n{cut}{body}")
+    dropped = collector.dropped()
+    if dropped.any():
+        counts = " ".join(
+            f"{reason}={count}" for reason, count in dropped.counts().items() if count
+        )
+        notes.append(f"the collector's bounds dropped: {counts}")
+    return notes
+
+
+def collector_counts(collector: Collector | None) -> JsonObject | None:
+    """What `collector` received and dropped; None when none started."""
+    if collector is None:
+        return None
+    return {
+        "points": collector.metrics.received,
+        "spans": collector.spans.received,
+        "dropped": dict(collector.dropped().counts()),
+    }
+
+
+# Where each runner keeps its server log, served workspace, and collector counts, in a
+# directory of its own; the CI job uploads this directory.
+INTEGRATION_DIRECTORY = REPOSITORY / "target" / "integration"
+
+
+def retained_directory(runner: str) -> Path:
+    """`target/integration/<runner>/`, created empty, kept after the runner ends."""
+    directory = INTEGRATION_DIRECTORY / runner
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True)
+    return directory
+
+
+def retain_collector(directory: Path, collector: Collector | None) -> None:
+    """Write `collector_counts` to `collector.json` in `directory`."""
+    (directory / "collector.json").write_text(
+        json.dumps(collector_counts(collector), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def collector_line(collector: Collector | None) -> str:
+    """The `collector` entry of a runner's report as one line."""
+    return "collector: " + json.dumps(collector_counts(collector), sort_keys=True)
+
+
+def failure_window(
+    read: LogsReader,
+    *,
+    since: str | None,
+    lower_bound: str,
+    until: str,
+    file: Path | None = None,
+    collector: Collector | None = None,
+) -> list[str]:
+    """The records of a failure's window, as notes for the failure to carry.
+
+    Two reads, each `RECORD_TAIL` records at most, each failing into a note and
+    never raising, so a pass cannot turn into a failure here and a failure keeps
+    its own error:
+
+    - the log records from `since` to `until`, in full, through `tail_text`; the
+      note states `lower_bound`, what `since` is, and when the read holds the newest
+      `RECORD_TAIL` records the older ones of the window are left out;
+    - the newest `operations in flight` record before `until`, wherever it was
+      recorded, when it is among the newest `RECORD_TAIL` records before `until`.
+
+    With a `collector`, the `telemetry_notes` of the same window follow.
+    """
+    heading = (
+        f"failure window: log records from {since or 'the oldest kept record'} "
+        f"({lower_bound}) "
+        f"until {until}, the newest {RECORD_TAIL} at most"
+    )
+    notes: list[str] = []
+    window: list[Line] = []
+    try:
+        text = read(logs_arguments(until, since=since))
+    except (OSError, RuntimeError, ValueError) as error:
+        notes.append(f"{heading}\nunavailable: {error}")
+    else:
+        window = list(lines(text))
+        cut = (
+            f"[the window holds {RECORD_TAIL} records; older records of the window "
+            "were left out]\n"
+            if len(window) >= RECORD_TAIL
+            else ""
+        )
+        body = tail_text(text, file) if text else "(no records in the window)\n"
+        notes.append(f"{heading}\n{cut}{body}")
+    try:
+        before = list(lines(read(logs_arguments(until))))
+    except (OSError, RuntimeError, ValueError) as error:
+        notes.append(f"newest operations in flight unavailable: {error}")
+    else:
+        flight = newest_in_flight(before)
+        notes.append(
+            "newest operations in flight record before "
+            f"{until}:\n"
+            + (
+                cut_record(flight.text)
+                if flight is not None
+                else f"(none among the newest {RECORD_TAIL} records)"
+            )
+        )
+    if collector is not None:
+        notes.extend(
+            telemetry_notes(collector, since=since, until=until, records=window)
+        )
+    return notes
+
+
 @contextmanager
 def stderr_log(
     path: Path | None = None, *, output: BinaryIO | None = None
@@ -251,7 +539,12 @@ def stderr_log(
             reader.join(timeout=STOP_SECONDS)
             require(not reader.is_alive(), "SDK stderr did not close within its bound")
             if path is not None:
-                path.write_bytes(drain.data[:LOG_BYTES_MAX])
+                notice = (
+                    cut_notice("SDK stderr", LOG_BYTES_MAX)
+                    if len(drain.data) > LOG_BYTES_MAX
+                    else ""
+                )
+                path.write_bytes(drain.data[:LOG_BYTES_MAX] + notice.encode("utf-8"))
         if drain.error is not None:
             raise RuntimeError("SDK stderr collection failed") from drain.error
 
@@ -260,6 +553,8 @@ FAILURE_TITLE = re.compile(r"([0-9]+) (errors?)")
 INDENT_UNIT = "\t"
 FAILURE_HEAD = re.compile(re.escape(INDENT_UNIT) + r"(\S+) · retry (\S+)")
 FAILURE_LIMIT = re.compile(r"limit (\S+): (\d+) over (\d+)")
+# The registered identity a registered failure writes last in its first entry.
+FAILURE_IDENTITY = re.compile(r"rift(?:\.[a-z0-9_]+){2,}")
 FAILURE_LINE_INDENT = INDENT_UNIT * 2
 FAILURE_ESCAPE = re.compile(r"\\(?:([nrt])|u\{([0-9A-Fa-f]+)\})")
 FAILURE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
@@ -286,6 +581,7 @@ class ToolFailure(Exception):
 
     `text` is the raw content. `diagnostics` keeps the lines of the first entry
     after its message and limit line as raw text, without the two-level indent.
+    `identity` is the registered identity a registered failure writes last, else empty.
     """
 
     def __init__(
@@ -298,6 +594,7 @@ class ToolFailure(Exception):
         limit: FailureLimit | None = None,
         causes: Sequence[FailureCause] = (),
         diagnostics: Sequence[str] = (),
+        identity: str = "",
     ) -> None:
         """Keep the parsed lines and the raw text."""
         super().__init__(f"{tool} failed: {text}")
@@ -309,6 +606,7 @@ class ToolFailure(Exception):
         self.limit = limit
         self.causes = list(causes)
         self.diagnostics = list(diagnostics)
+        self.identity = identity
 
 
 def unescape_message(line: str) -> str:
@@ -363,7 +661,9 @@ def parse_failure(tool: str, text: str) -> ToolFailure:
     code, retry, body = entries[0]
     limit: FailureLimit | None = None
     diagnostics: list[str] = []
-    for line in body[1:]:
+    rest = body[1:]
+    identity = rest.pop() if rest and FAILURE_IDENTITY.fullmatch(rest[-1]) else ""
+    for line in rest:
         if line.startswith("limit "):
             found = FAILURE_LIMIT.fullmatch(line)
             require(
@@ -384,7 +684,15 @@ def parse_failure(tool: str, text: str) -> ToolFailure:
             FailureCause(cause_code, unescape_message(cause_body[0]), cause_retry)
         )
     return ToolFailure(
-        tool, text, code, unescape_message(body[0]), retry, limit, causes, diagnostics
+        tool,
+        text,
+        code,
+        unescape_message(body[0]),
+        retry,
+        limit,
+        causes,
+        diagnostics,
+        identity,
     )
 
 
@@ -509,6 +817,9 @@ def process_alive(process: psutil.Process) -> bool:
 class Server:
     """Own a foreground server, its external log, and observed descendants."""
 
+    # UTC time the server was started at, as `utc_now` prints it; empty before `start`.
+    started_at: str = ""
+
     def __init__(
         self,
         binary: Path,
@@ -518,7 +829,11 @@ class Server:
         startup_seconds: float = 120.0,
         env: Mapping[str, str] | None = None,
         output: BinaryIO | None = None,
+        collector: Collector | None = None,
     ) -> None:
+        """`collector`, when given, receives the server's OTLP export: its
+        `environment()` is set below `env`, and the failure window prints what it
+        received."""
         outside_workspace(log_path, root)
         require(startup_seconds > 0, "startup timeout must be positive")
         self.binary = binary.resolve()
@@ -526,6 +841,10 @@ class Server:
         self.log_path = log_path
         self.startup_seconds = startup_seconds
         self.env = dict(os.environ)
+        self.env["RUST_LOG"] = LOG_FILTER
+        self.collector = collector
+        if collector is not None:
+            self.env.update(collector.environment())
         self.env.update(env or {})
         self.output = output
         self.process: Process
@@ -536,10 +855,13 @@ class Server:
         self._log_failure: BaseException | None = None
         self._descendants: list[psutil.Process] = []
         self._stopped = False
+        self._proxy_logs: list[Path] = []
+        self._output_cut = False
 
     def start(self, *, wait_for_publication: bool = True) -> Self:
         """Start once; callers may inspect output before awaiting publication."""
         require(self._reader is None, "server has already been started")
+        self.started_at = utc_now()
         require(
             not (self.root / ".rift" / "server.json").exists(),
             "workspace already has a server document; use a disposable workspace",
@@ -581,6 +903,9 @@ class Server:
                     )
                     if not chunk:
                         return
+                    if len(chunk) > remaining:
+                        self._output_cut = True
+                        log.write(cut_notice("server output", LOG_BYTES_MAX).encode())
                     require(
                         len(chunk) <= remaining,
                         f"server output exceeded {LOG_BYTES_MAX} bytes",
@@ -599,7 +924,141 @@ class Server:
         if not self.log_path.exists():
             return ""
         with self.log_path.open("rb") as log:
-            return log.read(LOG_BYTES_MAX).decode("utf-8", errors="replace")
+            text = log.read(LOG_BYTES_MAX).decode("utf-8", errors="replace")
+        if self._output_cut:
+            text += cut_notice("server output", LOG_BYTES_MAX)
+        return text
+
+    @property
+    def records_path(self) -> Path:
+        """Where `records` writes the persisted log records, beside the server log."""
+        return self.log_path.with_suffix(".records.log")
+
+    @property
+    def proxy_logs(self) -> tuple[Path, ...]:
+        """The stderr file of every `rift mcp` connection this server served."""
+        return tuple(self._proxy_logs)
+
+    @property
+    def output_cut(self) -> bool:
+        """Whether the server wrote past `LOG_BYTES_MAX` and its log stops there."""
+        return self._output_cut
+
+    def read_records(self) -> str:
+        """Read the persisted log records through `rift server logs` into `records_path`.
+
+        The records live in the workspace's `.rift/metrics`, which the CLI reads
+        without a server, so a stopped or killed server still answers. The file
+        keeps the newest `RECORDS_FILE_BYTES`, with a line naming the bytes left
+        out. Raises `OSError`, `RuntimeError`, or `ValueError` when the read fails.
+        """
+        text = (
+            Command(self.binary, "server", "logs", "--tail", str(RECORD_TAIL))
+            .with_cwd(self.root)
+            .with_environment(self.env)
+            .with_timeout(EVIDENCE_SECONDS)
+            .with_output_limit(LOG_BYTES_MAX)
+            .output()
+        )
+        self.records_path.write_bytes(
+            tail_text(text, None, RECORDS_FILE_BYTES).encode("utf-8")
+        )
+        return text
+
+    def records(self) -> str:
+        """`read_records` for evidence: bounded and never raising.
+
+        A failed read is reported as text so collecting evidence cannot replace
+        the failure it explains.
+        """
+        path = self.records_path
+        try:
+            text = self.read_records()
+        except (OSError, RuntimeError, ValueError) as error:
+            return f"persisted log records unavailable: {error}"
+        return f"persisted log records ({path}):\n{tail_text(text, path)}"
+
+    @property
+    def window_path(self) -> Path:
+        """Where `window` keeps the failure window, beside the server log."""
+        return self.log_path.with_suffix(".window.log")
+
+    def read_logs(self, arguments: Sequence[str]) -> str:
+        """`rift` with `arguments` in this workspace, its stdout bounded to `LOG_BYTES_MAX`."""
+        return (
+            Command(self.binary, *arguments)
+            .with_cwd(self.root)
+            .with_environment(self.env)
+            .with_timeout(EVIDENCE_SECONDS)
+            .with_output_limit(LOG_BYTES_MAX)
+            .output()
+        )
+
+    def window(
+        self, since: str | None = None, lower_bound: str | None = None
+    ) -> list[str]:
+        """The failure window of this server as notes, from `since` until now.
+
+        `since` defaults to the server's start, a lower bound the server's own
+        clock confirms. A caller that knows a later lower bound, such as the end
+        of the last action the runner recorded, passes it with a `lower_bound` that
+        says what it is. The whole first read is kept in `window_path` beside the
+        server log, bounded by `RECORDS_FILE_BYTES`; the note carries the newest
+        `EVIDENCE_TAIL_BYTES` of it.
+        """
+        first = since or self.started_at or None
+        until = utc_now()
+        kept: list[str] = []
+
+        def read(arguments: Sequence[str]) -> str:
+            text = self.read_logs(arguments)
+            if not kept:
+                kept.append(text)
+                self.window_path.write_bytes(
+                    tail_text(text, None, RECORDS_FILE_BYTES).encode("utf-8")
+                )
+            return text
+
+        return failure_window(
+            read,
+            since=first,
+            lower_bound=lower_bound or "the server's start",
+            until=until,
+            file=self.window_path,
+            collector=self.collector,
+        )
+
+    def evidence(
+        self, since: str | None = None, lower_bound: str | None = None
+    ) -> list[str]:
+        """What a failure keeps: server stderr, each proxy's stderr, the persisted
+        records, and the failure window.
+
+        Each part is one note; a stream longer than `EVIDENCE_TAIL_BYTES` keeps its
+        newest bytes and names the file holding the rest. A server stderr holding
+        `STORE_REFUSAL` opens with `STORE_FALLBACK`. The host facts of `machine_line`
+        close the notes, once. `since` and `lower_bound` are those of `window`.
+        """
+        server_log = self.read_log()
+        refused = any(
+            line.startswith(STORE_REFUSAL) for line in server_log.splitlines()
+        )
+        notes = [
+            f"server stderr ({self.log_path}):\n"
+            + (STORE_FALLBACK if refused else "")
+            + tail_text(server_log, self.log_path)
+        ]
+        for proxy in self._proxy_logs:
+            text = (
+                proxy.read_bytes().decode("utf-8", errors="replace")
+                if proxy.exists()
+                else ""
+            )
+            notes.append(f"rift mcp stderr ({proxy}):\n" + tail_text(text, proxy))
+        notes.append(self.records())
+        notes.extend(self.window(since, lower_bound))
+        notes.append(machine_line(machine()))
+        return notes
 
     def await_publication(self) -> int:
         """Wait at most startup_seconds, checking process ownership in server.json."""
@@ -653,6 +1112,7 @@ class Server:
         """
         proxy_log = log_path or self.log_path.with_suffix(".mcp.log")
         outside_workspace(proxy_log, self.root)
+        self._proxy_logs.append(proxy_log)
         with (
             stderr_log(proxy_log, output=self.output) as log,
             owned_environment(self.env) as environment,

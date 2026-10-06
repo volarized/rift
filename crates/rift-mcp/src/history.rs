@@ -200,7 +200,7 @@ impl OpenedStore {
                 .or_worktree(&root.join(RIFT_STATE_DIRECTORY));
             let store = HistoryStore::open(&location)
                 .map_err(|error| {
-                    tracing::warn!(
+                    rift_tracing::warn!(
                         component = "history",
                         operation = "history.open",
                         error = %error,
@@ -240,13 +240,13 @@ fn observed_plan(store: &HistoryStore, analysis: &HistoryAnalysis) -> Result<Fil
 fn open_failed(operation: &'static str, error: &RiftError) {
     let unversioned = error.slug() == errors::history::unversioned::SLUG;
     if unversioned {
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "history",
             operation,
             "the workspace has no git repository, so no history store opens"
         );
     } else {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "history",
             operation,
             error = %error,
@@ -264,7 +264,7 @@ fn record_fallback(store: &HistoryStore) {
     let refused = fallback.refused().display().to_string();
     let folder = store.location().folder().display().to_string();
     let cause = fallback.cause();
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "history",
         operation = "history.open",
         refused = refused.as_str(),
@@ -282,7 +282,7 @@ fn sweep(store: &HistoryStore) {
     match store.sweep() {
         Ok(swept) => {
             for failure in swept.failures() {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "history",
                     operation = "history.sweep",
                     error = %failure,
@@ -290,7 +290,7 @@ fn sweep(store: &HistoryStore) {
                 );
             }
         }
-        Err(error) => tracing::warn!(
+        Err(error) => rift_tracing::warn!(
             component = "history",
             operation = "history.sweep",
             error = %error,
@@ -356,7 +356,7 @@ impl HistoryTask {
         };
         let analysis = Arc::clone(&self.analysis);
         let planned = blocking(move || {
-            let plan = rift_core::traced!(component = "history", operation = "history.plan", {
+            let plan = rift_tracing::traced!(component = "history", operation = "history.plan", {
                 filler
                     .held()
                     .map_err(|error| error.to_string())
@@ -376,6 +376,18 @@ impl HistoryTask {
         self.record_releases(&plan);
         self.progress
             .record_plan(plan.keep().len(), plan.pending().len());
+        // A plan with nothing pending is the steady state of every later fill: only a fill
+        // with commits to write records its start, and `fill_planned` its end.
+        let pending = plan.pending().len();
+        if pending > 0 {
+            rift_tracing::info!(
+                component = "history",
+                operation = "history.fill",
+                pending,
+                phase = "start",
+                "history fill started"
+            );
+        }
         self.fill_planned(filler, &plan, cancellation).await
     }
 
@@ -426,22 +438,27 @@ impl HistoryTask {
                 return Some(filler);
             }
             let settled = self.activity.settled(self.bounds.idle_wait);
-            let stopped =
-                rift_core::traced_async!(component = "history", operation = "history.idle_wait", {
+            let stopped = rift_tracing::traced!(
+                component = "history",
+                operation = "history.idle_wait",
+                async move {
                     tokio::select! {
                         () = cancellation.cancelled() => true,
                         _ = settled => false,
                     }
-                })
-                .await;
+                }
+            )
+            .await;
             if stopped {
                 return Some(filler);
             }
             let first = carried.take();
             let remaining = &mut pending;
-            let batch =
-                rift_core::traced_async!(component = "history", operation = "history.batch", {
-                    tracing::debug!(
+            let batch = rift_tracing::traced!(
+                component = "history",
+                operation = "history.batch",
+                async move {
+                    rift_tracing::debug!(
                         component = "history",
                         operation = "history.batch",
                         phase = "start",
@@ -450,8 +467,9 @@ impl HistoryTask {
                     );
                     self.fill_batch(filler, first, remaining, cancellation)
                         .await
-                })
-                .await?;
+                }
+            )
+            .await?;
             filler = batch.filler;
             carried = batch.carried;
             match batch.outcome {
@@ -466,8 +484,16 @@ impl HistoryTask {
             (filler, trimmed)
         })
         .await?;
-        if let Err(error) = trimmed {
-            fill_failed(&error.to_string());
+        match trimmed {
+            Err(error) => fill_failed(&error.to_string()),
+            Ok(_) if !plan.pending().is_empty() => rift_tracing::info!(
+                component = "history",
+                operation = "history.fill",
+                written = plan.pending().len(),
+                outcome = "ok",
+                "history fill finished"
+            ),
+            Ok(_) => {}
         }
         Some(filler)
     }
@@ -492,10 +518,10 @@ impl HistoryTask {
         }
         let records: Vec<_> = batch.into_iter().map(AnalyzedCommit::into_record).collect();
         let written_commits = records.len();
-        let parent = tracing::Span::current();
+        let parent = rift_tracing::Span::current();
         let (filler, written) = blocking(move || {
             let mut filler = filler;
-            let written = rift_core::traced!(
+            let written = rift_tracing::traced!(
                 parent: &parent,
                 component = "history",
                 operation = "history.write",
@@ -565,12 +591,12 @@ impl HistoryTask {
         let pending = pending.clone();
         let stop = cancellation.clone();
         let gate = self.gate.clone();
-        let parent = tracing::Span::current();
+        let parent = rift_tracing::Span::current();
         let analyzed = blocking(move || {
             if let Some(gate) = gate {
                 gate();
             }
-            rift_core::traced!(
+            rift_tracing::traced!(
                 parent: &parent,
                 component = "history",
                 operation = "history.analyze",
@@ -603,7 +629,7 @@ impl HistoryTask {
             if !self.warned_tags.insert(tag.name.clone()) {
                 continue;
             }
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "history",
                 operation = "history.plan",
                 tag = tag.name.as_str(),
@@ -615,7 +641,7 @@ impl HistoryTask {
         let past_bound = plan.releases_past_bound();
         if past_bound > 0 && past_bound != self.warned_past_bound {
             self.warned_past_bound = past_bound;
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "history",
                 operation = "history.plan",
                 releases = past_bound,
@@ -646,9 +672,10 @@ enum BatchOutcome {
 
 /// Logs one failed fill step.
 fn fill_failed(error: &str) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "history",
         operation = "history.fill",
+        outcome = "error",
         error,
         "a history store fill stopped; the next fill plans again from what the store holds"
     );

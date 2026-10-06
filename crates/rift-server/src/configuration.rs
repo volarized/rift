@@ -103,7 +103,7 @@ fn accept_workspace(
         }
         return error.fail();
     }
-    if let Err(error) = tracing_subscriber::EnvFilter::try_new(&configuration.logs.capture) {
+    if let Err(error) = rift_tracing::validate_log_filter(&configuration.logs.capture) {
         let violation = ConfigurationViolation::LogCaptureInvalid {
             capture: configuration.logs.capture.clone(),
             detail: error.to_string(),

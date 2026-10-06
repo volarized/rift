@@ -30,6 +30,7 @@ use crate::http::{
     serve_repository_http,
 };
 use crate::identity::BuildCheckout;
+use crate::metrics::SCOPE;
 use crate::repository::repository_election_directory;
 use crate::storage::WorkspaceStorage;
 
@@ -38,6 +39,27 @@ use crate::storage::WorkspaceStorage;
 /// The protocol crate owns only `server.json`'s name; the election file is
 /// this module's implementation detail.
 const SERVER_ELECTION_FILE_NAME: &str = "server.lock";
+
+/// The lock the claim and each probe of `server.lock` are recorded under, through
+/// [`rift_tracing::lock`]: the claim in exclusive mode, held lifelong for the guard's life,
+/// and a probe in shared mode, held from its shared lock to that lock's release.
+const SERVER_ELECTION_LOCK: &str = "server.election";
+
+/// `lock.wait.duration`, declared as `rift-tracing` declares it: same name, unit, kind,
+/// label keys, and boundaries, so the OpenTelemetry SDK serves both declarations from one
+/// aggregation. A probe that finds the election held records here directly:
+/// `Lock::try_acquire` closes a `lock.wait` record for every refusal, and the lock
+/// builder has no option that records a refusal in the metric alone, so a poll of
+/// probes would write one record per round.
+static PROBE_WAIT_DURATION: rift_tracing::Histogram<3> = rift_tracing::Histogram::declare(
+    SCOPE,
+    "lock.wait.duration",
+    &["lock.name", "lock.mode", "error.type"],
+);
+/// The `lock.mode` of a probe's attempt.
+const PROBE_LOCK_MODE: &str = "shared";
+/// The `error.type` of a probe that found no free election.
+const PROBE_REFUSED: &str = "refused";
 
 /// Longest wait for a server that failed to publish to shut down again.
 const UNPUBLISHED_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
@@ -62,6 +84,11 @@ fn election_document_invalid(violation: &ServerLockViolation) -> RiftError {
 /// election file, and takes its exclusive advisory lock without blocking.
 /// The lock is held for the guard's lifetime and releases with the file
 /// handle, so a crashed holder never leaves a held election behind.
+///
+/// The attempt is recorded as the lock `server.election`: a wait that ends
+/// `acquired` and a lifelong hold, or a wait that ends `refused` beside a
+/// `workspace election refused` record naming the holder's `pid` when its
+/// `server.json` names one.
 ///
 /// # Errors
 ///
@@ -95,8 +122,11 @@ pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGu
                 .source(source)
                 .error()
         })?;
-    match election_file.try_lock() {
-        Ok(()) => {
+    let claimed = rift_tracing::lock(SERVER_ELECTION_LOCK)
+        .lifelong()
+        .try_acquire(|| election_file.try_lock().map(|()| election_file));
+    match claimed {
+        Ok(election_file) => {
             let guard = ElectionGuard {
                 election_file,
                 document_path: document_path_in(&state_directory),
@@ -106,9 +136,18 @@ pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGu
             // now, before serving starts, so a concurrent probe cannot pair
             // the previous holder's document with this holder's lock.
             guard.retire();
+            rift_tracing::info!(
+                component = "mcp",
+                operation = "server.start",
+                state_directory = %guard.state_directory.display(),
+                "workspace election claimed"
+            );
             Ok(guard)
         }
-        Err(TryLockError::WouldBlock) => errors::mcp::election_already_serving().fail(),
+        Err(TryLockError::WouldBlock) => {
+            record_refused_claim(&state_directory);
+            errors::mcp::election_already_serving().fail()
+        }
         Err(TryLockError::Error(source)) => errors::mcp::election_storage_failed()
             .operation("lock election file")
             .path(&election_path)
@@ -117,16 +156,42 @@ pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGu
     }
 }
 
+/// Records a claim refused because another process holds the election, with
+/// the holder's `pid` when the lock document names one.
+///
+/// The document is read without the probe's port check: a held election and
+/// a document that validates name the holder, apart from the moment between
+/// a new holder's claim and its scrub of the previous holder's document.
+fn record_refused_claim(state_directory: &Path) {
+    let pid = published_document_in(state_directory)
+        .ok()
+        .map(|lock| lock.pid);
+    rift_tracing::info!(
+        component = "mcp",
+        operation = "server.start",
+        pid,
+        "workspace election refused"
+    );
+}
+
 /// The held election: proof this process may publish and serve the
 /// workspace.
 ///
 /// The exclusive lock releases when the guard drops its file handle;
 /// dropping also retires the published document, best effort.
+///
+/// The guard holds the lock `server.election` lifelong. Each database
+/// thread holds a clone of the guard, so the hold ends in one of two ways:
+/// the last clone's drop closes the `lock.held` span and records `workspace
+/// election released`, or the process exits with a clone still held, and
+/// the hold ends unrecorded with the process: the table of operations in
+/// flight published at stop lists it with `lifelong: true`.
 #[derive(Debug)]
 #[must_use = "dropping the guard releases the election"]
 pub struct ElectionGuard {
-    /// Held open for the guard's whole life; the advisory lock lives on it.
-    election_file: std::fs::File,
+    /// Held open for the guard's whole life; the advisory lock lives on it,
+    /// recorded as the hold of the lock `server.election`.
+    election_file: rift_tracing::Held<std::fs::File>,
     state_directory: PathBuf,
     document_path: PathBuf,
 }
@@ -256,7 +321,7 @@ impl ElectionGuard {
         match std::fs::remove_file(&self.document_path) {
             Ok(()) => return,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => tracing::warn!(
+            Err(error) => rift_tracing::warn!(
                 component = "mcp",
                 path = %self.document_path.display(),
                 %error,
@@ -264,7 +329,7 @@ impl ElectionGuard {
             ),
         }
         if let Err(error) = std::fs::File::create(&self.document_path) {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "mcp",
                 path = %self.document_path.display(),
                 %error,
@@ -278,6 +343,12 @@ impl Drop for ElectionGuard {
     fn drop(&mut self) {
         self.retire();
         release_election_lock(&self.election_file);
+        rift_tracing::info!(
+            component = "mcp",
+            operation = "server.stop",
+            state_directory = %self.state_directory.display(),
+            "workspace election released"
+        );
     }
 }
 
@@ -290,7 +361,7 @@ impl Drop for ElectionGuard {
 /// process holds it, so every lock this module takes is released explicitly.
 fn release_election_lock(election_file: &std::fs::File) {
     if let Err(error) = election_file.unlock() {
-        tracing::debug!(component = "mcp", %error, "election lock release reported a failure");
+        rift_tracing::debug!(component = "mcp", %error, "election lock release reported a failure");
     }
 }
 
@@ -367,6 +438,13 @@ enum ElectionState {
 /// whose recorded port refuses is a server shutting down. A shared lock that
 /// succeeds is released immediately. The probe itself never waits and never
 /// polls; callers that need to wait poll this function.
+///
+/// Each probe counts under the lock `server.election` in shared mode: one
+/// that finds the election held, or whose attempt the platform fails,
+/// records `lock.wait.duration` with `error.type` `refused` and writes no
+/// record, so a poll of probes leaves one count per round and no line per
+/// round; a free election's shared hold, from its lock to its release,
+/// records through [`rift_tracing::lock`] into `lock.held.duration`.
 #[must_use]
 pub fn probe(root: &Path) -> ServerPresence {
     probe_state_directory(&root.join(RIFT_STATE_DIRECTORY))
@@ -376,20 +454,141 @@ pub fn probe(root: &Path) -> ServerPresence {
 #[must_use]
 #[doc(hidden)]
 pub fn probe_state_directory(state_directory: &Path) -> ServerPresence {
-    match (
-        election_state_in(state_directory),
-        published_document_in(state_directory),
-    ) {
-        (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => ServerPresence::Serving(lock),
-        (ElectionState::Held, Ok(lock)) => {
-            ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid })
+    observe_state_directory(state_directory).presence
+}
+
+/// One probe of the workspace at `root`, with the reads that decided it.
+#[must_use]
+pub(crate) fn observe(root: &Path) -> ElectionObservation {
+    observe_state_directory(&root.join(RIFT_STATE_DIRECTORY))
+}
+
+/// One probe of an election whose files live in `state_directory`, with the
+/// reads that decided it. [`probe_state_directory`] answers its presence.
+fn observe_state_directory(state_directory: &Path) -> ElectionObservation {
+    let (election, election_failure) = election_state_in(state_directory);
+    let (presence, document_failure) = match (election, published_document_in(state_directory)) {
+        (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => {
+            (ServerPresence::Serving(lock), None)
         }
-        (ElectionState::Held, Err(_)) => ServerPresence::Starting,
-        (ElectionState::Unheld, Ok(_)) => ServerPresence::Stale(StaleReason::ElectionUnheld),
-        (ElectionState::Unobservable, Ok(_)) => {
-            ServerPresence::Stale(StaleReason::ElectionUnobservable)
+        (ElectionState::Held, Ok(lock)) => (
+            ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid }),
+            None,
+        ),
+        (ElectionState::Held, Err(miss)) => (ServerPresence::Starting, miss.failure),
+        (ElectionState::Unheld, Ok(_)) => {
+            (ServerPresence::Stale(StaleReason::ElectionUnheld), None)
         }
-        (_, Err(presence)) => *presence,
+        (ElectionState::Unobservable, Ok(_)) => (
+            ServerPresence::Stale(StaleReason::ElectionUnobservable),
+            None,
+        ),
+        (_, Err(miss)) => (*miss.presence, miss.failure),
+    };
+    ElectionObservation {
+        presence,
+        reads: ProbeReads {
+            election,
+            election_failure,
+            document_failure,
+        },
+        document_path: document_path_in(state_directory),
+    }
+}
+
+/// One call that read the election file or the lock document and failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadFailure {
+    /// The call that failed, as `std` names it.
+    call: &'static str,
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+impl ReadFailure {
+    fn of(call: &'static str, error: &io::Error) -> Self {
+        Self {
+            call,
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+/// What the reads of one probe found: the election state, and each read that
+/// failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeReads {
+    election: ElectionState,
+    election_failure: Option<ReadFailure>,
+    document_failure: Option<ReadFailure>,
+}
+
+/// One probe's presence and the reads that decided it.
+#[derive(Debug)]
+pub(crate) struct ElectionObservation {
+    pub(crate) presence: ServerPresence,
+    reads: ProbeReads,
+    document_path: PathBuf,
+}
+
+impl ElectionObservation {
+    /// The observation of a probe that did not finish: its election state
+    /// could not be observed, and it read nothing.
+    pub(crate) fn unobservable(root: &Path) -> Self {
+        Self {
+            presence: ServerPresence::Stale(StaleReason::ElectionUnobservable),
+            reads: ProbeReads {
+                election: ElectionState::Unobservable,
+                election_failure: None,
+                document_failure: None,
+            },
+            document_path: document_path(root),
+        }
+    }
+
+    /// Logs the reads that failed when they differ from the reads `reported`
+    /// holds, so a poll of repeated probes logs each change once, not once
+    /// per poll round. Reads that all succeeded log nothing.
+    pub(crate) fn report_change(&self, reported: &mut Option<ProbeReads>) {
+        if *reported == Some(self.reads) {
+            return;
+        }
+        *reported = Some(self.reads);
+        let ProbeReads {
+            election,
+            election_failure,
+            document_failure,
+        } = self.reads;
+        if election_failure.is_none() && document_failure.is_none() {
+            return;
+        }
+        // The kind's `Debug` name (`NotFound`), recorded only for a read that failed.
+        let kind = |failure: ReadFailure| format!("{:?}", failure.kind);
+        rift_tracing::info!(
+            component = "mcp",
+            path = %self.document_path.display(),
+            election = ?election,
+            presence = %presence_field(&self.presence),
+            election_call = election_failure.map(|failure| failure.call),
+            election_error_kind = election_failure.map(kind),
+            election_raw_os_error = election_failure.and_then(|failure| failure.raw_os_error),
+            document_call = document_failure.map(|failure| failure.call),
+            document_error_kind = document_failure.map(kind),
+            document_raw_os_error = document_failure.and_then(|failure| failure.raw_os_error),
+            "election probe read failed"
+        );
+    }
+}
+
+/// `presence` as a record field: the variant and its reason, never the
+/// document's token.
+pub(crate) fn presence_field(presence: &ServerPresence) -> String {
+    match presence {
+        ServerPresence::Serving(lock) => {
+            format!("Serving {{ pid: {}, port: {} }}", lock.pid, lock.port)
+        }
+        other => format!("{other:?}"),
     }
 }
 
@@ -411,30 +610,55 @@ pub(crate) fn document_path_in(state_directory: &Path) -> PathBuf {
     state_directory.join(SERVER_LOCK_FILE_NAME)
 }
 
+/// Why one read of the lock document found none that validates.
+struct DocumentMiss {
+    /// What the miss says about a serving process.
+    presence: Box<ServerPresence>,
+    /// The read call that failed, when one did.
+    failure: Option<ReadFailure>,
+}
+
+impl DocumentMiss {
+    fn stale(reason: StaleReason) -> Self {
+        Self {
+            presence: Box::new(ServerPresence::Stale(reason)),
+            failure: None,
+        }
+    }
+}
+
 /// The published document when it exists, parses, and validates.
-fn published_document_in(state_directory: &Path) -> Result<ServerLock, Box<ServerPresence>> {
-    let bytes = match std::fs::read(document_path_in(state_directory)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(Box::new(ServerPresence::Absent));
-        }
-        Err(_) => {
-            return Err(Box::new(ServerPresence::Stale(
-                StaleReason::DocumentUnreadable,
-            )));
-        }
-    };
+///
+/// Reads through the calls `std::fs::read` makes, so a failure names the
+/// one that failed.
+fn published_document_in(state_directory: &Path) -> Result<ServerLock, DocumentMiss> {
+    let bytes = read_document_in(state_directory).map_err(|failure| DocumentMiss {
+        presence: Box::new(if failure.kind == io::ErrorKind::NotFound {
+            ServerPresence::Absent
+        } else {
+            ServerPresence::Stale(StaleReason::DocumentUnreadable)
+        }),
+        failure: Some(failure),
+    })?;
     let Ok(lock) = serde_json::from_slice::<ServerLock>(&bytes) else {
-        return Err(Box::new(ServerPresence::Stale(
-            StaleReason::DocumentMalformed,
-        )));
+        return Err(DocumentMiss::stale(StaleReason::DocumentMalformed));
     };
     match lock.validate() {
         Ok(()) => Ok(lock),
-        Err(violation) => Err(Box::new(ServerPresence::Stale(
-            StaleReason::DocumentInvalid(violation),
-        ))),
+        Err(violation) => Err(DocumentMiss::stale(StaleReason::DocumentInvalid(violation))),
     }
+}
+
+/// The lock document's bytes, or the read call that failed.
+fn read_document_in(state_directory: &Path) -> Result<Vec<u8>, ReadFailure> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(document_path_in(state_directory))
+        .map_err(|error| ReadFailure::of("File::open", &error))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ReadFailure::of("Read::read_to_end", &error))?;
+    Ok(bytes)
 }
 
 /// Restricts the staged document to its owner before the token is written.
@@ -454,23 +678,63 @@ fn restrict_to_owner(_file: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-fn election_state_in(state_directory: &Path) -> ElectionState {
+/// The election file's state, with the read call that failed when one did.
+fn election_state_in(state_directory: &Path) -> (ElectionState, Option<ReadFailure>) {
     let election_path = state_directory.join(SERVER_ELECTION_FILE_NAME);
     let election_file = match OpenOptions::new().read(true).open(&election_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return ElectionState::Unheld,
-        Err(_) => return ElectionState::Unobservable,
-    };
-    match election_file.try_lock_shared() {
-        // Nothing holds the exclusive lock. The probe releases its shared
-        // lock at once, ahead of the handle's close.
-        Ok(()) => {
-            release_election_lock(&election_file);
-            ElectionState::Unheld
+        Err(error) => {
+            let state = if error.kind() == io::ErrorKind::NotFound {
+                ElectionState::Unheld
+            } else {
+                ElectionState::Unobservable
+            };
+            return (state, Some(ReadFailure::of("File::open", &error)));
         }
-        Err(TryLockError::WouldBlock) => ElectionState::Held,
-        Err(TryLockError::Error(_)) => ElectionState::Unobservable,
+    };
+    let Ok((attempt, measurement)) =
+        rift_tracing::measure_elapsed!("server.election", election_file.try_lock_shared())
+    else {
+        // A clock that ran backwards lost the attempt's answer: a shared lock it may have
+        // taken is released ahead of the handle's close.
+        release_election_lock(&election_file);
+        return (ElectionState::Unobservable, None);
+    };
+    match attempt {
+        Ok(()) => {
+            release_free_probe(&election_file);
+            (ElectionState::Unheld, None)
+        }
+        Err(TryLockError::WouldBlock) => {
+            record_refused_probe(measurement.elapsed());
+            (ElectionState::Held, None)
+        }
+        Err(TryLockError::Error(error)) => {
+            record_refused_probe(measurement.elapsed());
+            (
+                ElectionState::Unobservable,
+                Some(ReadFailure::of("File::try_lock_shared", &error)),
+            )
+        }
     }
+}
+
+/// Records a free election's shared probe lock as a hold of the lock `server.election`,
+/// then releases it ahead of the handle's close; dropping the hold records its time.
+fn release_free_probe(election_file: &std::fs::File) {
+    let Ok(shared) = rift_tracing::lock(SERVER_ELECTION_LOCK)
+        .shared()
+        .try_acquire(|| Ok::<_, std::convert::Infallible>(election_file));
+    release_election_lock(&shared);
+    drop(shared);
+}
+
+/// Counts one probe that found no free election into `lock.wait.duration` as a `shared`
+/// wait of `server.election` ending `refused`, and writes no record.
+fn record_refused_probe(waited: Duration) {
+    PROBE_WAIT_DURATION
+        .labeled([SERVER_ELECTION_LOCK, PROBE_LOCK_MODE, PROBE_REFUSED])
+        .record(waited);
 }
 
 /// The serving server's published document, when one is live.
@@ -659,7 +923,7 @@ pub(crate) async fn serve_elected_at(
 /// Records why this process will not serve, before the caller exits on it.
 fn record_start_failure(error: &RiftError) {
     if error.slug() == errors::mcp::election_already_serving::SLUG {
-        tracing::info!(
+        rift_tracing::info!(
             component = "mcp",
             operation = "server.start",
             "another rift server already serves this workspace; this process exits"
@@ -667,7 +931,7 @@ fn record_start_failure(error: &RiftError) {
         return;
     }
     let causes = causes(error).join(": ");
-    tracing::error!(
+    rift_tracing::error!(
         component = "mcp",
         operation = "server.start",
         error = %error,
@@ -728,7 +992,7 @@ async fn shut_down_unpublished(
     serving_stop.cancel();
     let (_deadline, outcome) = server.stopped(UNPUBLISHED_SHUTDOWN_DEADLINE).await;
     if let Err(error) = outcome {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "mcp",
             %error,
             "unpublished server reported a shutdown failure"
@@ -774,23 +1038,28 @@ impl ElectedServer {
         self,
         budget: Duration,
     ) -> (Arc<ElectionGuard>, Instant, Result<(), RiftError>) {
-        let (guard, deadline, stopped, database) = self.stopped_before_database(budget).await;
+        let (guard, deadline, stopped, database) =
+            self.stopped_before_database(budget, Duration::ZERO).await;
         let database = database.shutdown(deadline).await;
         (guard, deadline, stopped.and(database))
     }
 
-    /// Stops serving before SQLite close, for a caller with final store writes.
+    /// Stops serving before SQLite close, for a caller with final store writes; the
+    /// stages here end by `reserve` before the returned deadline, which the caller keeps
+    /// for its database close and log flush.
     #[doc(hidden)]
     pub async fn stopped_before_database(
         self,
         budget: Duration,
+        reserve: Duration,
     ) -> (
         Arc<ElectionGuard>,
         Instant,
         Result<(), RiftError>,
         DeferredDatabaseShutdown,
     ) {
-        let (deadline, outcome, database) = self.server.stopped_before_database(budget).await;
+        let (deadline, outcome, database) =
+            self.server.stopped_before_database(budget, reserve).await;
         (self.guard, deadline, outcome, database)
     }
 }
@@ -809,10 +1078,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::http::TokenCheck;
+    use crate::metrics::tests::recorded;
 
     use super::{
-        SERVER_ELECTION_FILE_NAME, ServerPresence, StaleReason, claim, probe, read_serving,
-        serve_elected, serve_elected_at, serve_http, served_document, shut_down_unpublished,
+        SERVER_ELECTION_FILE_NAME, SERVER_ELECTION_LOCK, ServerPresence, StaleReason, claim, probe,
+        read_serving, serve_elected, serve_elected_at, serve_http, served_document,
+        shut_down_unpublished,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -929,6 +1200,135 @@ mod tests {
         assert_eq!(refused.slug(), errors::mcp::election_already_serving::SLUG);
         drop(first);
         let _reclaimed = claim(directory.path())?;
+        Ok(())
+    }
+
+    /// The fields of every record named `message` whose lock is `server.election`.
+    fn election_lock_records(
+        records: &[rift_tracing::LogRecord],
+        message: &str,
+    ) -> TestResult<Vec<serde_json::Value>> {
+        let mut found = Vec::new();
+        for record in records.iter().filter(|record| record.message() == message) {
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            if fields["lock.name"] == SERVER_ELECTION_LOCK {
+                found.push(fields);
+            }
+        }
+        Ok(found)
+    }
+
+    #[test]
+    fn a_refused_claim_records_its_wait_refused_and_the_holder_pid() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let holder = claim(directory.path())?;
+        holder.publish(&valid_document())?;
+        let refused = claim(directory.path()).expect_err("a held election refuses");
+        assert_eq!(refused.slug(), errors::mcp::election_already_serving::SLUG);
+        drop(holder);
+        let metrics = recorder.metrics();
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let waits = election_lock_records(&records, "lock.wait")?;
+        assert_eq!(waits.len(), 1, "only the refused claim waited: {waits:?}");
+        assert_eq!(waits[0]["outcome"], "refused");
+        assert_eq!(waits[0]["lock.mode"], "exclusive");
+        let refusals: Vec<serde_json::Value> = records
+            .iter()
+            .filter(|record| record.message() == "workspace election refused")
+            .map(|record| serde_json::from_str(record.fields()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0]["pid"], valid_document().pid.to_string());
+        let holds = election_lock_records(&records, "lock.held")?;
+        assert_eq!(
+            holds.len(),
+            1,
+            "the claim held until its guard dropped: {holds:?}"
+        );
+        assert_eq!(holds[0]["lifelong"], "true");
+        let refused_waits = &[
+            ("lock.name", SERVER_ELECTION_LOCK),
+            ("lock.mode", "exclusive"),
+            ("error.type", "refused"),
+        ];
+        assert_eq!(recorded(&metrics, "lock.wait.duration", refused_waits), 1);
+        let held = &[
+            ("lock.name", SERVER_ELECTION_LOCK),
+            ("lock.mode", "exclusive"),
+        ];
+        assert_eq!(recorded(&metrics, "lock.held.duration", held), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_claim_of_an_unpublished_election_names_no_pid() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let holder = claim(directory.path())?;
+        claim(directory.path()).expect_err("a held election refuses");
+        drop(holder);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let refusal = records
+            .iter()
+            .find(|record| record.message() == "workspace election refused")
+            .ok_or("the refusal is recorded")?;
+        let fields: serde_json::Value = serde_json::from_str(refusal.fields())?;
+        assert!(fields.get("pid").is_none(), "{fields}");
+        Ok(())
+    }
+
+    /// Probes polled against a held election, as a start window or a stop wait polls.
+    const HELD_PROBE_COUNT: u64 = 3;
+
+    #[test]
+    fn probes_of_a_held_election_count_in_the_metric_and_write_no_record() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let holder = claim(directory.path())?;
+        let claimed = drain.queued_records();
+        assert!(
+            claimed
+                .iter()
+                .any(|record| record.message() == "workspace election claimed"),
+            "{claimed:?}"
+        );
+        for _ in 0..HELD_PROBE_COUNT {
+            assert!(probe(directory.path()).election_held());
+        }
+        let probed = drain.queued_records();
+        drop(holder);
+        assert!(!probe(directory.path()).election_held());
+        let metrics = recorder.metrics();
+        drop(recorder);
+
+        assert!(
+            probed.is_empty(),
+            "a held probe writes no record: {probed:?}"
+        );
+        let refused_probes = &[
+            ("lock.name", SERVER_ELECTION_LOCK),
+            ("lock.mode", "shared"),
+            ("error.type", "refused"),
+        ];
+        assert_eq!(
+            recorded(&metrics, "lock.wait.duration", refused_probes),
+            HELD_PROBE_COUNT,
+            "each probe that met the holder counts"
+        );
+        let shared = &[("lock.name", SERVER_ELECTION_LOCK), ("lock.mode", "shared")];
+        assert_eq!(recorded(&metrics, "lock.held.duration", shared), 1);
+        let records = drain.queued_records();
+        assert!(election_lock_records(&records, "lock.wait")?.is_empty());
+        let holds = election_lock_records(&records, "lock.held")?;
+        assert!(
+            holds.iter().any(|hold| hold["lock.mode"] == "shared"),
+            "the free probe's hold closes: {holds:?}"
+        );
         Ok(())
     }
 
@@ -1281,22 +1681,48 @@ mod tests {
     /// refusal, at `INFO`, and the process still exits on it.
     #[test]
     fn a_lost_election_is_recorded_at_info() {
-        use tracing_subscriber::layer::SubscriberExt as _;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        super::record_start_failure(&errors::mcp::election_already_serving().error());
+        drop(recorder);
+        let records = drain.queued_records();
+        let only = records.first().expect("the lost election is recorded");
+        assert_eq!(only.level(), "info");
+        assert_eq!(only.operation(), "server.start");
+        assert_eq!(records.len(), 1, "one record, no error event");
+    }
 
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        tracing::subscriber::with_default(subscriber, || {
-            super::record_start_failure(&errors::mcp::election_already_serving().error());
-        });
-        let recorded = drain
-            .try_recv_record()
-            .expect("the lost election is recorded");
-        assert_eq!(recorded.level(), "info");
-        assert_eq!(recorded.operation(), "server.start");
-        assert!(
-            drain.try_recv_record().is_err(),
-            "one record, no error event"
-        );
+    /// A claim records the election claimed, and the guard's drop records it released,
+    /// each naming the state directory.
+    #[test]
+    fn a_claim_and_its_release_are_each_recorded() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let guard = claim(directory.path())?;
+        drop(guard);
+        drop(recorder);
+        let records = drain.queued_records();
+        let state_directory = directory
+            .path()
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY)
+            .display()
+            .to_string();
+        for (message, operation) in [
+            ("workspace election claimed", "server.start"),
+            ("workspace election released", "server.stop"),
+        ] {
+            let record = records
+                .iter()
+                .find(|record| record.message() == message)
+                .ok_or(message)?;
+            assert_eq!(record.level(), "info");
+            assert_eq!(record.component(), "mcp");
+            assert_eq!(record.operation(), operation);
+            let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+            assert_eq!(fields["state_directory"], state_directory.as_str());
+        }
+        Ok(())
     }
 
     #[test]
@@ -1483,6 +1909,46 @@ mod tests {
         Ok(())
     }
 
+    /// An unpublished server whose stop fails is recorded as a `warn`, and the caller
+    /// still receives the publish failure. A repository idle watch that never ends holds
+    /// the stop past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unpublished_server_whose_stop_fails_records_it_and_returns_the_publish_failure()
+    -> TestResult {
+        let serving_stop = CancellationToken::new();
+        let server = crate::http::HttpServer {
+            port: SERVER_PORT_MIN,
+            token: "a".repeat(SERVER_TOKEN_LENGTH),
+            identity: valid_document().identity,
+            server_configuration: rift_protocol::configuration::ServerConfiguration::default(),
+            stop: serving_stop.clone(),
+            serving: tokio::spawn(std::future::ready(Ok::<(), std::io::Error>(()))),
+            idle_watch: tokio::spawn(std::future::ready(())),
+            repository_idle_watch: Some(tokio::spawn(std::future::pending::<()>())),
+            supervisor: None,
+            engines: None,
+            search_index: None,
+            logs: None,
+            repository_workspaces: None,
+        };
+        let failure = errors::mcp::election_already_serving().error();
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let returned = shut_down_unpublished(server, &serving_stop, failure).await;
+        drop(recorder);
+
+        assert_eq!(returned.slug(), errors::mcp::election_already_serving::SLUG);
+        let records = drain.queued_records();
+        let failed = records
+            .iter()
+            .find(|record| record.message() == "unpublished server reported a shutdown failure")
+            .ok_or("the failed stop is recorded")?;
+        assert_eq!(failed.level(), "warn");
+        let fields = failed.fields();
+        assert!(fields.contains("workspace idle watch task"), "{fields}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn supplied_storage_requires_its_own_election_before_serving() -> TestResult {
         let requested = tempfile::tempdir()?;
@@ -1506,7 +1972,12 @@ mod tests {
                 .any(|(key, value)| key == "operation" && value == "validate workspace storage")
         );
         assert!(!document_path(requested.path()).exists());
-        assert!(!requested.path().join(".rift/db").exists());
+        for name in ["index", "metrics", "vectors"] {
+            assert!(
+                !requested.path().join(".rift").join(name).exists(),
+                "{name}"
+            );
+        }
         Ok(())
     }
 
@@ -1518,7 +1989,12 @@ mod tests {
             .await
             .expect_err("a competing owner refuses the start");
         assert_eq!(error.slug(), errors::mcp::election_already_serving::SLUG);
-        assert!(!directory.path().join(".rift/db").exists());
+        for name in ["index", "metrics", "vectors"] {
+            assert!(
+                !directory.path().join(".rift").join(name).exists(),
+                "{name}"
+            );
+        }
         Ok(())
     }
 
@@ -1564,6 +2040,59 @@ mod tests {
             !document.exists(),
             "the caller's retire removes the document"
         );
+        Ok(())
+    }
+
+    /// A held election whose document is absent logs the failed read once - the call,
+    /// the OS error, the election state it paired with, and the path - however many
+    /// probes repeat it. A read that succeeds logs nothing, and the next failure after
+    /// it logs again.
+    #[test]
+    fn a_failed_document_read_is_recorded_once_per_change() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        let mut document = valid_document();
+        document.port = dead_port()?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let mut presences = Vec::new();
+        let mut reported = None;
+        for _ in 0..3 {
+            let observation = super::observe(directory.path());
+            observation.report_change(&mut reported);
+            presences.push(observation.presence);
+        }
+        guard.publish(&document)?;
+        super::observe(directory.path()).report_change(&mut reported);
+        guard.retire();
+        super::observe(directory.path()).report_change(&mut reported);
+        drop(recorder);
+        assert!(
+            presences
+                .iter()
+                .all(|presence| matches!(presence, ServerPresence::Starting)),
+            "{presences:?}"
+        );
+        let records = drain.queued_records();
+        assert_eq!(records.len(), 2, "one record per change of failed reads");
+        let record = &records[0];
+        assert_eq!(record.level(), "info");
+        assert_eq!(record.component(), "mcp");
+        assert_eq!(record.message(), "election probe read failed");
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert_eq!(fields["document_call"], "File::open");
+        assert_eq!(fields["document_error_kind"], "NotFound");
+        assert_eq!(fields["election"], "Held");
+        assert_eq!(fields["presence"], "Starting");
+        assert_eq!(
+            fields["path"],
+            document_path(directory.path()).display().to_string()
+        );
+        assert!(
+            fields["document_raw_os_error"].is_string(),
+            "the OS error code rides the record: {fields}"
+        );
+        assert!(fields.get("election_call").is_none(), "{fields}");
+        assert_eq!(records[1].fields(), record.fields());
         Ok(())
     }
 }

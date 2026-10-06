@@ -4,6 +4,9 @@
 //! `crates/rift/src/steer.rs`; this proves the process-level wiring: reading
 //! stdin, probing the real filesystem, and writing the marker.
 
+// Names the test each spawned `rift` serves.
+mod test_case;
+
 use std::error::Error;
 use std::fs;
 use std::io::Write as _;
@@ -21,7 +24,7 @@ fn run_steer(root: &Path, stdin: &str, env: &[(&str, &str)]) -> TestResult<Outpu
         std::env::var_os("CARGO_BIN_EXE_rift")
             .ok_or("test runner must provide CARGO_BIN_EXE_rift")?,
     );
-    command
+    test_case::with_test_case_name(&mut command)
         .arg("steer")
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -91,7 +94,7 @@ fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
 
 fn indexed_workspace(root: &Path) -> TestResult {
     fs::create_dir_all(root.join(".rift"))?;
-    fs::write(root.join(".rift").join("db"), b"")?;
+    fs::write(root.join(".rift").join("index"), b"")?;
     fs::create_dir(root.join(".git"))?;
     Ok(())
 }

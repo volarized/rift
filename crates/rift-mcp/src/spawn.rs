@@ -9,9 +9,8 @@
 
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{self, Read, Seek as _, SeekFrom, Write};
+use std::io::{self, Read, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 mod process;
@@ -19,7 +18,6 @@ use process::{Child, Command, Stdio, detached_command_for, spawn_detached};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
-use tracing_subscriber::fmt::MakeWriter;
 
 /// Bytes of a detached server's startup stderr kept verbatim; the rest is
 /// only counted, the same split [`CapturedStream`] reports for captured streams.
@@ -28,17 +26,6 @@ const STARTUP_STDERR_CAPTURE_BYTES: usize = 8 << 10;
 /// The file under `.rift`, beside `server.json`, that holds the standard
 /// error of the server `rift server start` spawns. Each start truncates it.
 pub const SERVER_STDERR_FILE_NAME: &str = "server.stderr";
-/// Bytes of traced diagnostics a server writes to its standard error before
-/// it stops writing there, when that stream is not a terminal.
-///
-/// The file is what a crashed server leaves behind: it holds the start, and
-/// a panic's own report reaches it through the default panic hook past this
-/// bound. The diagnostics of a long life go to `rift server logs`.
-pub const SERVER_STDERR_BYTES_MAX: u64 = 1 << 20;
-/// The line the writer prints once, as the last thing, when the bound is reached.
-const SERVER_STDERR_BOUND_NOTICE: &str =
-    "rift: standard error reached its byte bound; later diagnostics are under `rift server logs`\n";
-
 /// Pause between presence probes while waiting on a workspace's server.
 pub const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Longest wait for a spawned server to publish its lock document.
@@ -108,12 +95,39 @@ fn detached_command(root: &Path) -> Result<Command, io::Error> {
 /// child's stderr is discarded, so a full or read-only `.rift` never stops
 /// a start.
 pub fn spawn_detached_server(root: &Path) -> Result<SpawnedServer, io::Error> {
-    let mut command = detached_command(root)?;
+    spawn_with_stderr_file(detached_command(root)?, root)
+}
+
+/// Spawns `command` detached, with its stderr on the workspace's
+/// [`SERVER_STDERR_FILE_NAME`] below `root`, or discarded when that file
+/// cannot be created.
+fn spawn_with_stderr_file(mut command: Command, root: &Path) -> Result<SpawnedServer, io::Error> {
     let destination = stderr_destination(root);
     let stderr = destination.is_some().then(|| stderr_file_path(root));
     command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
     let child = spawn_detached(&mut command)?;
+    record_spawn(child.id(), if stderr.is_some() { "file" } else { "null" });
     Ok(SpawnedServer { child, stderr })
+}
+
+/// Records one detached server this process spawned: its process identifier and where
+/// each standard stream goes. The child inherits none of this process's streams: stdin
+/// and stdout are null, and stderr is `file`, `piped`, or `null`.
+fn record_spawn(pid: u32, stderr: &'static str) {
+    rift_tracing::info!(
+        component = "mcp",
+        pid,
+        stdin = "null",
+        stdout = "null",
+        stderr,
+        "detached server spawned"
+    );
+}
+
+/// Records that the detached server `pid` exited, with its exit code when this process
+/// waited for it and the platform reported one.
+fn record_exit(pid: Option<u32>, exit_code: Option<i32>) {
+    rift_tracing::info!(component = "mcp", pid, exit_code, "spawned server exited");
 }
 
 /// The path of the detached server's standard error file below `root`.
@@ -129,7 +143,7 @@ fn stderr_destination(root: &Path) -> Option<File> {
     match stderr_file(root) {
         Ok(file) => Some(file),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "mcp",
                 path = %stderr_file_path(root).display(),
                 %error,
@@ -175,62 +189,6 @@ impl SpawnedServer {
     }
 }
 
-/// Standard error of a server whose stream is a file, cut at
-/// [`SERVER_STDERR_BYTES_MAX`].
-///
-/// The file `rift server start` hands its server would otherwise grow for
-/// the server's whole life. Past the bound the writer prints one notice and
-/// drops what it is handed afterwards; the diagnostics recorded under
-/// `rift server logs` are unaffected.
-#[derive(Debug, Default)]
-pub struct BoundedStderr {
-    written: AtomicU64,
-}
-
-impl<'a> MakeWriter<'a> for BoundedStderr {
-    type Writer = BoundedWriter<'a, io::Stderr>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        BoundedWriter::new(&self.written, io::stderr())
-    }
-}
-
-/// One writer over a shared byte count: writes pass through until the count
-/// reaches [`SERVER_STDERR_BYTES_MAX`], the crossing write is followed by
-/// the notice, and later writes are counted and dropped.
-#[derive(Debug)]
-pub struct BoundedWriter<'a, Sink: Write> {
-    written: &'a AtomicU64,
-    sink: Sink,
-}
-
-impl<'a, Sink: Write> BoundedWriter<'a, Sink> {
-    /// A writer over `sink` sharing `written` with every sibling writer.
-    pub fn new(written: &'a AtomicU64, sink: Sink) -> Self {
-        Self { written, sink }
-    }
-}
-
-impl<Sink: Write> Write for BoundedWriter<'_, Sink> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let before = self
-            .written
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if before >= SERVER_STDERR_BYTES_MAX {
-            return Ok(bytes.len());
-        }
-        self.sink.write_all(bytes)?;
-        if before + bytes.len() as u64 >= SERVER_STDERR_BYTES_MAX {
-            self.sink.write_all(SERVER_STDERR_BOUND_NOTICE.as_bytes())?;
-        }
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.sink.flush()
-    }
-}
-
 /// Spawns `rift server start --foreground` for `root`, fully detached,
 /// with its startup stderr captured on a background thread.
 ///
@@ -249,12 +207,15 @@ pub(crate) fn spawn_detached_server_with_captured_stderr(
     let mut command = detached_command(root)?;
     command.stderr(Stdio::piped());
     let mut child = spawn_detached(&mut command)?;
+    record_spawn(child.id(), "piped");
     let Some(stderr) = child.stderr.take() else {
         return Err(io::Error::other(
             "the spawned server's stderr pipe was not handed over",
         ));
     };
-    Ok(StartupCapture::spawn(stderr))
+    let mut capture = StartupCapture::spawn(stderr);
+    capture.pid = Some(child.id());
+    Ok(capture)
 }
 
 /// A spawned server's captured standard error, read on a background
@@ -279,6 +240,8 @@ pub(crate) fn spawn_detached_server_with_captured_stderr(
 #[derive(Debug)]
 pub(crate) struct StartupCapture {
     drain: Option<std::thread::JoinHandle<CapturedStream>>,
+    /// The spawned server's process identifier, when a spawn started the capture.
+    pid: Option<u32>,
 }
 
 impl StartupCapture {
@@ -288,6 +251,7 @@ impl StartupCapture {
             drain: Some(std::thread::spawn(move || {
                 drain_until_closed(stream, STARTUP_STDERR_CAPTURE_BYTES)
             })),
+            pid: None,
         }
     }
 
@@ -391,6 +355,7 @@ impl StartedServer for StartupCapture {
     /// The capture's end-of-file is the exit: the server closed its stderr.
     fn observed_exit(&mut self) -> Option<StartExit<CapturedStream>> {
         let capture = self.exited()?;
+        record_exit(self.pid, None);
         Some(StartExit::classified(capture.text.clone(), capture))
     }
 }
@@ -402,9 +367,12 @@ impl StartedServer for SpawnedServer {
     /// The child's exit status is the exit, and the tail of the stderr file
     /// this start truncated for it names the cause.
     fn observed_exit(&mut self) -> Option<StartExit<u32>> {
-        if self.is_running() {
-            return None;
-        }
+        let exit_code = match self.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status.code(),
+            Err(_) => None,
+        };
+        record_exit(Some(self.pid()), exit_code);
         let stderr = self.stderr.as_deref().map(stderr_tail).unwrap_or_default();
         Some(StartExit::classified(stderr, self.pid()))
     }
@@ -549,7 +517,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) if self.is_spent() => {
                 let spawn_count = self.spawn_count;
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     spawn_count,
                     "the spawn count is spent; the start window passes as a wait"
@@ -557,7 +525,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                 SpawnPollOutcome::Waiting
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) => {
-                tracing::info!(
+                rift_tracing::info!(
                     component = "mcp",
                     "no process holds the election the spawned server lost; spawning again"
                 );
@@ -574,7 +542,7 @@ impl<Spawned: StartedServer> SpawnWatch<Spawned> {
     /// printed.
     fn observed(exit: StartExit<Spawned::Failure>) -> Self {
         if let StartExit::LostElection { stderr } = &exit {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 stderr = %stderr,
                 "the spawned server lost the start election"
@@ -590,23 +558,18 @@ impl StartSpawns<StartupCapture> {
     /// server its chance.
     pub(crate) fn spawn_captured(&mut self, root: &Path) {
         if let Err(error) = self.spawn(|| spawn_detached_server_with_captured_stderr(root)) {
-            tracing::warn!(component = "mcp", %error, "detached server spawn failed");
+            rift_tracing::warn!(component = "mcp", %error, "detached server spawn failed");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-    #[cfg(unix)]
-    use std::process::Stdio;
-    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::time::Duration;
 
     use super::{
-        BoundedWriter, CapturedStream, EXIT_STDERR_TAIL_BYTES, PRESENCE_POLL_INTERVAL,
-        SERVER_STDERR_BOUND_NOTICE, SERVER_STDERR_BYTES_MAX, START_POLL_ATTEMPT_COUNT,
+        CapturedStream, EXIT_STDERR_TAIL_BYTES, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
         START_SPAWN_COUNT_MAX, START_WAIT_MAX, STARTUP_STDERR_CAPTURE_BYTES, SpawnPollOutcome,
         SpawnWatch, StartExit, StartSpawns, StartupCapture, lost_start_election, stderr_file_path,
         stderr_tail,
@@ -624,14 +587,8 @@ mod tests {
     /// workspace's stderr file.
     #[cfg(unix)]
     fn spawn_detached_script(root: &std::path::Path, script: &str) -> TestResult<SpawnedServer> {
-        let mut command = super::detached_command_for("sh", ["-c", script], root);
-        let destination = super::stderr_destination(root);
-        let stderr = destination.is_some().then(|| stderr_file_path(root));
-        command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
-        Ok(SpawnedServer {
-            child: super::spawn_detached(&mut command)?,
-            stderr,
-        })
+        let command = super::detached_command_for("sh", ["-c", script], root);
+        Ok(super::spawn_with_stderr_file(command, root)?)
     }
 
     /// Runs `script` as [`spawn_detached_script`] does and waits for it to exit.
@@ -667,6 +624,37 @@ mod tests {
         Ok(())
     }
 
+    /// A spawn records the child's process identifier and where each of its standard
+    /// streams goes, and its observed exit records the same identifier and its exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_child_records_its_spawn_and_its_exit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let mut spawned = run_detached_script(directory.path(), "exit 3")?;
+        assert!(spawned.observed_exit().is_some(), "the script exited");
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let fields_of = |message: &str| -> TestResult<serde_json::Value> {
+            let mut found = records.iter().filter(|record| record.message() == message);
+            let record = found.next().ok_or(format!("{message}: {records:?}"))?;
+            assert!(found.next().is_none(), "one {message} record");
+            assert_eq!(record.level(), "info");
+            Ok(serde_json::from_str(record.fields())?)
+        };
+        let pid = spawned.pid().to_string();
+        let spawn = fields_of("detached server spawned")?;
+        assert_eq!(spawn["pid"], pid, "{spawn}");
+        assert_eq!(spawn["stdin"], "null", "{spawn}");
+        assert_eq!(spawn["stdout"], "null", "{spawn}");
+        assert_eq!(spawn["stderr"], "file", "{spawn}");
+        let exit = fields_of("spawned server exited")?;
+        assert_eq!(exit["pid"], pid, "{exit}");
+        assert_eq!(exit["exit_code"], "3", "{exit}");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_unwritable_state_directory_discards_the_child_stderr_and_still_spawns() -> TestResult {
@@ -678,39 +666,6 @@ mod tests {
             matches!(discarded.observed_exit(), Some(StartExit::Failed(_))),
             "an exit with no stderr file to read is a failure, never a lost election"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn a_bounded_writer_passes_the_crossing_write_then_drops() -> TestResult {
-        let written = AtomicU64::new(0);
-        let mut sink = Vec::new();
-        let head = vec![b'a'; usize::try_from(SERVER_STDERR_BYTES_MAX)? - 4];
-        {
-            let mut writer = BoundedWriter::new(&written, &mut sink);
-            writer.write_all(&head)?;
-            writer.write_all(b"crossing")?;
-            writer.write_all(b"dropped")?;
-            writer.flush()?;
-        }
-        let expected_length = head.len() + "crossing".len() + SERVER_STDERR_BOUND_NOTICE.len();
-        assert_eq!(sink.len(), expected_length);
-        assert!(sink.ends_with(SERVER_STDERR_BOUND_NOTICE.as_bytes()));
-        assert!(!sink.windows(7).any(|window| window == b"dropped"));
-        assert_eq!(
-            written.load(std::sync::atomic::Ordering::Relaxed),
-            (head.len() + "crossing".len() + "dropped".len()) as u64,
-            "dropped bytes are still counted"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_bounded_writer_shares_its_count_between_writers() -> TestResult {
-        let written = AtomicU64::new(SERVER_STDERR_BYTES_MAX);
-        let mut sink = Vec::new();
-        BoundedWriter::new(&written, &mut sink).write_all(b"late")?;
-        assert!(sink.is_empty(), "a writer past the bound writes nothing");
         Ok(())
     }
 
@@ -985,27 +940,27 @@ mod tests {
     /// spent and waits; it neither asks for another spawn nor announces one.
     #[test]
     fn a_spent_spawn_count_waits_without_announcing_another_spawn() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let mut spawns = StartSpawns::<StartupCapture> {
             latest: SpawnWatch::Exited(StartExit::LostElection {
                 stderr: String::new(),
             }),
             spawn_count: START_SPAWN_COUNT_MAX,
         };
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let outcome =
-            tracing::subscriber::with_default(subscriber, || spawns.poll::<u32>(None, false));
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let outcome = spawns.poll::<u32>(None, false);
+        drop(recorder);
 
         assert!(
             matches!(outcome, SpawnPollOutcome::Waiting),
             "a spent count asks for no spawn: {outcome:?}"
         );
-        let mut messages = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            messages.push(record.message().to_owned());
-        }
+        let messages: Vec<String> = drain
+            .queued_records()
+            .iter()
+            .map(|record| record.message().to_owned())
+            .collect();
         assert_eq!(
             messages,
             ["the spawn count is spent; the start window passes as a wait"],

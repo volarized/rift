@@ -27,8 +27,12 @@ and database cases force queue exhaustion, cancellation, publication ordering, a
 resource cases verify published paging without recapturing every source file.
 
 Background validation tests force elapsed deadlines under continuous events and recover edits
-without watcher reports. Git lock cases verify bounded waits, retained-lock expiration, linked
-worktree control paths, and publication equal to a cold build.
+without watcher reports. Supervisor tests hold one capture under a paused clock, supersede it,
+and read the order from the paths each later capture names: the owed rebuild runs before a due
+check, and a check one interval late runs first.
+
+Git lock cases verify bounded waits, retained-lock expiration, linked worktree control paths, and
+publication equal to a cold build.
 
 A failed rebuild followed by byte-identical restoration must recover without a watcher event,
 retain its read service, and equal the cold digests and derived facts.
@@ -61,11 +65,34 @@ The test selection keeps those dependencies in the integration suite.
 Some suites start a server that binds the loopback port range, which is machine-global. Nextest
 runs each test in its own process, so those suites share one `election` test group that admits a
 single test at a time.
+
+`just test` runs nextest through `rift-dev`, which sets `RIFT_SCOPED_RECORDER_STREAM` in each
+test process. Each `ScopedRecorder` a test installs then streams its records to stderr as it
+records them, so the report of a failed test, or of one nextest ended at its timeout, carries
+them under `---- test output ----`. A recorder whose test panics prints its newest records, then
+the process's metric points, one line each naming its scope as `otel.scope.name` and
+`otel.scope.version`; a streaming recorder prints the metric points alone.
+`ScopedRecorderBuilder::clock` names the clock span timings and `measure_elapsed!` read on the
+recorder's thread, so a test advances time instead of sleeping.
+
+A failed binary test that opened a `FailureWindow` prints it to stderr. Its heading names the test
+with `NEXTEST_BINARY_ID`, `NEXTEST_TEST_NAME`, and `NEXTEST_ATTEMPT_ID`, then the window's bounds.
+A `T:` line states when the window ended, and a `machine:` line states the host's logical CPUs,
+system, and architecture; the harness reads no physical memory, so `memory_bytes` says so. When
+the window covers one workspace, each line a registered `rift mcp` child wrote to stderr merges
+into that workspace's records by timestamp, opening with `rift mcp <pid> | `. A stderr copy keeps
+at most 16 MiB and states the bytes it read and dropped past that bound. A server stderr file that
+holds `rift: the log store refused a batch` opens with a line saying the window falls back to that
+file for the records the store lacks.
+
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust.
 
 The remaining local checks cover formatting, generated files, crate boundaries, Clippy, Rust
-documentation, dependency policy, and developer tooling:
+documentation, dependency policy, and developer tooling. The crate boundary check,
+`rift-dev rust-architecture`, also counts the crates whose shipped source declares an
+instrumentation `SCOPE` or opens a `traced!` operation, and fails when they outnumber
+`SCOPES_MAX` in `crates/rift-tracing/src/metrics.rs`:
 
 ```sh
 just rust-gate
@@ -150,9 +177,11 @@ A repin must update the recorded measurements.
 
 Corpus checks cover search, symbol lookup, syntax reads, history, and shutdown. They also create
 and remove source files outside Rift, compare later reads with those bytes, and verify that
-unrelated persisted lexical rows remain unchanged. They serve the
-same source and dependency configuration used by a workspace. Embedding model downloads stay
-disabled for corpus runs, so repository checks measure source and lexical indexing.
+unrelated lexical rows in the index database at `.rift/index` remain unchanged. The report
+records the size of each database under `.rift` and its sidecar files before and after.
+
+The corpus checks serve the same source and dependency configuration used by a workspace.
+Embedding model downloads stay disabled for corpus runs, so repository checks measure source and lexical indexing.
 
 The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,
 and `nodes` read it. It runs at least 50 calls across those tools and requires at least two writes
@@ -185,6 +214,60 @@ report location. Nextest displays the foreground server and MCP proxy diagnostic
 corpus test completes. Action records stay in the JSON report. Logs and reports stay outside
 the served checkout.
 
+Each server a case starts keeps its standard error in a log file beside the report, cut at 8 MiB.
+When a case stops a server, the runner reads that server's persisted records with
+`rift server logs --tail 5000` after the stop and before the served checkout is removed, and keeps
+the newest 1 MiB beside the report as `<report>.server-<n>.records.log`, led by a line that counts
+the bytes left out. The `stops` list in the report holds one entry per stop with the log path, the
+records path, and the size in bytes of `index`, `metrics`, `vectors` and their `-wal` files. An
+absent file reads `"absent"`; `vectors` exists only after the first vector operation. A records
+read that fails sets `records` to null and states the error in `records_error`; the case
+continues. One case keeps at most three records files, 3 MiB.
+
+Each `stops` entry also carries the values the stop recorded, read from the records of that server
+alone. `database_close` lists the `busy`, `log`, and `checkpointed` values of each `database.close`
+record, one per database. `stop_stages` lists the `stage`, `remaining`, and `outcome` of each
+`stop stage ended` record. `lacks` names each of the two record kinds the records did not hold, and
+`records_lines` counts the records read; a count of 5000 means older records may be missing.
+
+The report also carries a `machine` section: `logical_cpus`, `cpu_model`, `memory_bytes`, `system`,
+`architecture`, and the runner values `runner_os`, `runner_arch`, `image_os`, `image_version` read
+from `RUNNER_OS`, `RUNNER_ARCH`, `ImageOS`, and `ImageVersion`. A fact the host does not give is
+null. The runner prints the same facts on one `machine:` line when the case starts.
+
+Each case starts an in-memory OTLP collector on `127.0.0.1` before its first server and stops it
+once the served tree is removed. Every server the case starts exports to it:
+`OTEL_EXPORTER_OTLP_ENDPOINT` names the collector, and `OTEL_METRIC_EXPORT_INTERVAL` and
+`OTEL_BSP_SCHEDULE_DELAY` set an export every 1000 ms. The report's `collector` entry counts the
+metric points and spans it received and what its bounds dropped.
+
+A failed case prints, for each server it started, the server's standard error, the standard error
+of each `rift mcp` proxy, the persisted records, and the failure window. The failure window is
+the records that `rift server logs --tail 5000 --since <start> --until <end>` selects. The output
+carries the newest 256 KiB of it, and the newest 1 MiB is kept beside the
+report as `<report>.server-<n>.window.log`. Its start is the end of the last action the report
+recorded, or the start of the server when that is later; the failing action began at or after it.
+Its end is the moment the runner began collecting evidence.
+
+The newest `operations in flight` record before the window's end follows the window. Then come
+what the collector received inside the same window, oldest first:
+
+- the newest 200 metric points, each with its time, kind, name, the `service.instance.id` of the
+  server that sent it, its instrumentation scope as `otel.scope.name` and `otel.scope.version`
+  when the point carries one, its attributes, and its value
+- the newest 100 spans, each at its end time with its name, attributes, and elapsed time; a span
+  that carries `request_id` adds `records=`, the count of the window's log records whose `req` is
+  the same, so the span and the records of its request read together
+
+A point carries no request, so the window's time bounds are the one key that joins a point to the
+log records. A collector that received nothing prints `no metric points received` or
+`no spans received`, and a bound that dropped anything is stated.
+
+Each note states a cut or a missing record instead of omitting it. The report names the files and
+the window bounds under `evidence`. A server stderr that holds `rift: the log store refused a
+batch` opens with the same fallback line the Rust window prints, and a `machine:` line with the
+host facts closes the notes. A pass prints none of this.
+
 ## Artifact and agent checks
 
 Artifact checks run the native release binary from a temporary workspace. Agent checks use the
@@ -204,6 +287,12 @@ The artifact and agent checks require reads to observe external filesystem write
 check also reads incoming references through the embedded Python engine and verifies the source
 stays unchanged. The integration suite runs upstream MCP conformance checks against the same binary.
 
+Both checks start the same in-memory OTLP collector and point their server at it. When an artifact
+or agent check fails, the runner attaches the same notes to the error: the server's standard error,
+the standard error of each proxy, the persisted records, and the failure window from the start of
+the server to the failure, with the collector's points and spans. Pass or fail, the runner prints
+one `collector:` line with the points and spans received and what the bounds dropped.
+
 ## Cold first use
 
 The cold check needs Docker and a Linux binary matching the container architecture:
@@ -217,27 +306,43 @@ workspace, then reads a newly created source file. After configuration selects a
 server, an incoming-reference request must report the launch failure while syntax reads remain
 available. CI runs this check with its compiled Linux artifact; a local macOS run needs a Linux binary.
 
+When the cold check fails, it prints the container's standard error, the persisted records, the
+proxy's standard error, and the failure window read through `docker exec` from just before the
+container was created. The container and its files are removed afterwards, so nothing is kept. The cold check starts no
+collector: the container runs with `--network none`, so the server inside cannot reach one.
+
 
 ## Local traces
 
-Rift times cold-start work through `tracing` spans, opened by the `traced!`/`traced_async!`
-macros in `rift-core`. Building with `--features otlp` adds an OTLP/HTTP export layer that sends
-those spans to a local collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one - the feature is
-off by default, so a plain build carries no OpenTelemetry stack.
+Rift times cold-start work through `tracing` spans, opened by the `traced!` macro of
+`rift-tracing`, and records its metrics through OpenTelemetry instruments. Every build carries an
+OTLP/HTTP export that sends both to a collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one;
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` alone exports the metrics. With neither set, a process
+builds no exporter.
 
-Start the collector, build with the feature, and point a run at it from a second terminal:
+Start the collector and point a run at it from a second terminal:
 
 ```sh
 just trace-collector
-cargo build --release -p rift --features otlp
+cargo build --release -p rift
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
 ```
 
-`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans on
-port 4318 and keeps them in memory. `RIFT_OTLP_FILTER` overrides the export layer's own filter;
-unset, it keeps Rift's own crates at `info`. Stop the collector with Ctrl-C once the run is done,
-and it prints one JSON line per operation: the span count, total duration, p50, p95, and max, in
-milliseconds.
+`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans at
+`/v1/traces` and the exported metric points at `/v1/metrics` on port 4318 and keeps them in
+memory. `RIFT_OTLP_FILTER` overrides the span export's own filter; unset, it keeps Rift's own
+crates at `info`. The server exports metric points every `OTEL_METRIC_EXPORT_INTERVAL`
+milliseconds, 60 s when unset, and once more as it stops.
+
+Stop the collector with Ctrl-C once the run is done, and it prints one JSON line per operation:
+the span count, total duration, p50, p95, and max, in milliseconds. It then prints one JSON line
+per metric name with its kind, unit, series count, data point count, and value; the value is the
+sum of the latest value of each series, and a histogram adds its recorded count.
+
+A request body is at most 8 MiB encoded and decoded. The collector keeps at most 512 metric names
+and 256 series per name for these lines, and the newest 32,768 metric points and 8,192 spans for
+a failure window. A last `dropped` line counts what these bounds refused or dropped, when they
+did.
 
 The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
 errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at

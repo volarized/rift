@@ -211,6 +211,15 @@ def live_tests(archive: ArchiveArgument = None) -> None:
     suites.live(archive)
 
 
+@test_app.command(
+    "nextest",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def nextest_tests(context: typer.Context) -> None:
+    """Run `cargo nextest` with the given arguments beside the OTLP collector."""
+    suites.nextest(list(context.args))
+
+
 @test_app.command("corpus")
 def corpus_tests(
     name: Annotated[CorpusName, typer.Argument()],

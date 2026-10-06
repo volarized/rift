@@ -262,7 +262,7 @@ impl EnginePool {
         }
         while let Some(ended) = ending.join_next().await {
             if let Err(error) = ended {
-                tracing::warn!(component = "engine", %error, "an engine shutdown task failed");
+                rift_tracing::warn!(component = "engine", %error, "an engine shutdown task failed");
             }
         }
     }
@@ -283,6 +283,10 @@ impl EnginePool {
         }
     }
 }
+
+/// The name the slot lock's waits and holds are recorded under: a request holds it for
+/// its whole exchange, and a stop holds it across the engine's shutdown.
+const ENGINE_SLOT_LOCK: &str = "engine.slot";
 
 /// One accepted LSP process definition and the session state behind it.
 #[derive(Debug)]
@@ -765,25 +769,40 @@ impl EngineSlot {
         )
     }
 
+    /// Takes the slot's lock, recording the wait and the hold as `engine.slot`.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up its place in the lock's queue.
+    async fn hold(&self) -> rift_tracing::Held<tokio::sync::MutexGuard<'_, SlotState>> {
+        rift_tracing::lock(ENGINE_SLOT_LOCK)
+            .acquire(self.state.lock())
+            .await
+    }
+
     /// Ends the running session under the slot's lock and reports the slot stopped.
     ///
     /// A start still in flight is aborted, and a start that already finished is shut
     /// down as a running session is.
     async fn end_session(self: Arc<Self>) {
-        let mut held = self.state.lock().await;
+        let mut held = self.hold().await;
+        // Both shutdowns are boxed: `EngineSession::shutdown` owns the session and its
+        // bounded `shutdown` exchange (9,920 bytes on aarch64), and a request that
+        // replaces a pool awaits this stop through `EnginePool::shutdown_replaced_by`.
+        // One allocation per stopped session.
         if let Some(start) = held.starting.take() {
             start.abort();
             if let Ok(Ok(started)) = start.await {
-                started.shutdown().await;
+                Box::pin(started.shutdown()).await;
             }
         }
         let Some(session) = held.session.take() else {
             return;
         };
-        let stderr = session.shutdown().await;
+        let stderr = Box::pin(session.shutdown()).await;
         self.report_state(LspState::Stopped);
         let engine = self.name();
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "engine",
             engine,
             stderr_bytes = stderr.total_bytes,
@@ -1121,7 +1140,7 @@ impl EngineSlot {
         mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
     ) -> Result<T, RiftError> {
         let retry = self.configuration.retry;
-        let mut held = self.state.lock().await;
+        let mut held = self.hold().await;
         let mut guarded = RequestSessionGuard {
             state: &mut held,
             reported_state: &self.reported_state,
@@ -1245,7 +1264,7 @@ impl EngineSlot {
             Transient::Refused(refusal)
                 if walk && refusal.slug() == errors::lsp::engine_refused_retryable::SLUG =>
             {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1255,7 +1274,7 @@ impl EngineSlot {
                 errors::lsp::engine_analyzing().attempts(attempts).fail()
             }
             Transient::Analyzing | Transient::Unready => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1264,7 +1283,7 @@ impl EngineSlot {
                 errors::lsp::engine_analyzing().attempts(attempts).fail()
             }
             Transient::Refused(refusal) => {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1273,7 +1292,7 @@ impl EngineSlot {
                 Err(refusal)
             }
             Transient::AnsweredNothing(answer) => {
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "engine",
                     engine,
                     attempts,
@@ -1324,7 +1343,7 @@ impl EngineSlot {
                     .as_ref()
                     .map_or_else(String::new, ToString::to_string);
                 let cause = reported.as_ref().map_or_else(String::new, start_cause);
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "engine",
                     engine,
                     program = self.program(),
@@ -1378,11 +1397,13 @@ impl EngineSlot {
         ) {
             (Some(engine), _) => {
                 let launch = self.embedded_launch(engine);
-                tokio::spawn(async move { crate::embedded::started_session(launch, &root).await })
+                tokio::spawn(async move {
+                    Box::pin(crate::embedded::started_session(launch, &root)).await
+                })
             }
             (None, Some(command)) => {
                 let launch = self.launch(command);
-                tokio::spawn(async move { EngineSession::start(launch, &root).await })
+                tokio::spawn(async move { Box::pin(EngineSession::start(launch, &root)).await })
             }
             (None, None) => {
                 unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
@@ -1412,7 +1433,7 @@ impl EngineSlot {
     /// `launch_failed` and left the workspace log holding nothing that says
     /// which program was missing.
     fn record_start_failure(&self, failure: &RiftError, retrying: bool) {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "engine",
             engine = self.name(),
             program = self.program(),
@@ -1495,17 +1516,19 @@ impl EngineSlot {
     /// reads every file from disk.
     async fn reap(&self, replaced: EngineSession) {
         let ended = replaced.is_ended();
-        let stderr = replaced.shutdown().await;
+        // Boxed for the reason `end_session` boxes it: the shutdown future is 9,920 bytes
+        // on aarch64. One allocation per replaced session.
+        let stderr = Box::pin(replaced.shutdown()).await;
         let engine = self.name();
         if ended {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "engine",
                 engine,
                 stderr = %stderr.text,
                 "language engine ended and was reaped"
             );
         } else {
-            tracing::info!(
+            rift_tracing::info!(
                 component = "engine",
                 engine,
                 owed_changes_max = OWED_CHANGES_MAX,
@@ -1520,60 +1543,27 @@ mod tests {
     use super::*;
     use rift_protocol::configuration::{ByteSize, CommandInput, Duration as ConfiguredDuration};
     use rift_protocol::retry::RetryPolicy;
+    use rift_tracing::LogRecord;
 
-    /// Collects the records one test's engine start emits, so a test reads what
-    /// `rift://logs` would carry without opening a store.
-    #[derive(Clone, Default)]
-    struct RecordedEvents(Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl RecordedEvents {
-        /// The records emitted so far, one rendered line each.
-        fn lines(&self) -> Vec<String> {
-            self.0.lock().expect("the recorder is not poisoned").clone()
-        }
-
-        /// The one record whose message matches, or a panic naming everything seen.
-        fn naming(&self, message: &str) -> String {
-            let lines = self.lines();
-            lines
-                .iter()
-                .find(|line| line.contains(message))
-                .unwrap_or_else(|| panic!("no record says {message:?}: {lines:#?}"))
-                .clone()
-        }
+    /// The one record whose message says `message`, or a panic naming every message seen.
+    fn naming<'records>(records: &'records [LogRecord], message: &str) -> &'records LogRecord {
+        records
+            .iter()
+            .find(|record| record.message().contains(message))
+            .unwrap_or_else(|| {
+                let messages: Vec<&str> = records.iter().map(LogRecord::message).collect();
+                panic!("no record says {message:?}: {messages:#?}")
+            })
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedEvents {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct Rendered(String);
-            impl tracing::field::Visit for Rendered {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    use std::fmt::Write as _;
-                    let _ = write!(self.0, " {}={value:?}", field.name());
-                }
-            }
-            let mut rendered = Rendered(event.metadata().level().to_string());
-            event.record(&mut rendered);
-            self.0
-                .lock()
-                .expect("the recorder is not poisoned")
-                .push(rendered.0);
-        }
+    /// The fields `record` carried, as the JSON object the store holds.
+    fn fields(record: &LogRecord) -> serde_json::Value {
+        serde_json::from_str(record.fields()).expect("a record's fields are a JSON object")
     }
 
     /// Serves one slot whose configured program is `command`, and returns the refusal
     /// a request earns beside every record the attempt emitted.
-    async fn start_refusal(command: &str, attempts: u64) -> (RiftError, RecordedEvents) {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
+    async fn start_refusal(command: &str, attempts: u64) -> (RiftError, Vec<LogRecord>) {
         let directory = tempfile::tempdir().expect("workspace");
         let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
             "command": [command], "restart": { "attempts": attempts }
@@ -1586,17 +1576,16 @@ mod tests {
             BTreeMap::from([("rust".to_owned(), key.clone())]),
         );
         let slot = pool.engine_by_key(&key).expect("slot");
-        let recorded = RecordedEvents::default();
-        let failure = {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(recorded.clone()),
-            );
-            slot.request(|session| Box::pin(async move { Ok(session.document_version()) }))
-                .await
-                .expect_err("a program that cannot start answers nothing")
-        };
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let failure = slot
+            .request(|session| Box::pin(async move { Ok(session.document_version()) }))
+            .await
+            .expect_err("a program that cannot start answers nothing");
+        drop(recorder);
         pool.shutdown().await;
-        (failure, recorded)
+        (failure, drain.queued_records())
     }
 
     /// An embedded engine is named by the program it stands for. It has no command line, and
@@ -1634,6 +1623,68 @@ mod tests {
             )
     }
 
+    /// A stop that finds the slot taken records its wait on `engine.slot`, names the
+    /// operation holding the slot, and records the time it then held the slot.
+    #[tokio::test]
+    async fn a_stop_waiting_for_the_slot_records_the_wait_and_the_holder() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let configuration: LspConfiguration =
+            serde_json::from_value(serde_json::json!({ "embedded": "ty" })).expect("configuration");
+        let key = LspProcessKey::named("python");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        let slot = pool.engines.get(&key).expect("slot");
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let holding =
+            rift_tracing::traced!(component = "engine", operation = "search.request", async {
+                slot.hold().await
+            })
+            .await;
+        let mut stop = Box::pin(Arc::clone(slot).end_session());
+        let waiting = tokio::select! {
+            biased;
+            () = &mut stop => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(waiting, "the stop waits while the slot is held");
+        drop(holding);
+        stop.await;
+        let metrics = recorder.metrics();
+        drop(recorder);
+        pool.shutdown().await;
+
+        let count = |name: &str, labels: &[(&str, &str)]| match metrics
+            .find(name, labels)
+            .map(rift_tracing::MetricSeries::value)
+        {
+            Some(rift_tracing::SeriesValue::Buckets { count, .. }) => *count,
+            _ => 0,
+        };
+        let slot_lock = [("lock.name", ENGINE_SLOT_LOCK), ("lock.mode", "exclusive")];
+        assert_eq!(
+            count("lock.wait.duration", &slot_lock),
+            2,
+            "two acquisitions"
+        );
+        assert_eq!(count("lock.held.duration", &slot_lock), 2, "both released");
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| {
+                record.message() == "lock.wait" && record.fields().contains("\"span\":\"closed\"")
+            })
+            .expect("the contended stop opened a wait span");
+        let wait = fields(wait);
+        assert_eq!(wait["lock.name"], ENGINE_SLOT_LOCK, "{wait}");
+        assert_eq!(wait["outcome"], "acquired", "{wait}");
+        assert_eq!(wait["holder"], "search.request", "{wait}");
+    }
+
     /// A configured program that does not exist reaches the caller as `launch_failed`, and
     /// the workspace log names the program and the operating error behind it. Cold first use
     /// read `rift://logs/component/engine` after exactly this refusal and found it empty.
@@ -1644,13 +1695,13 @@ mod tests {
             failure.slug() == errors::lsp::engine_launch_failed::SLUG,
             "a missing program answers launch_failed: {failure:?}"
         );
-        let record = recorded.naming("language engine did not start");
-        assert!(record.starts_with("WARN"), "{record}");
+        let record = naming(&recorded, "language engine did not start");
+        assert_eq!(record.level(), "warn", "{record:?}");
+        assert_eq!(record.component(), "engine", "{record:?}");
+        assert_eq!(fields(record)["program"], MISSING_PROGRAM, "{record:?}");
         assert!(
-            record.contains("component=\"engine\"")
-                && record.contains(&format!("program=\"{MISSING_PROGRAM}\""))
-                && record.contains(&missing_program_cause()),
-            "the record names the component, the program and the cause: {record}"
+            record.fields().contains(&missing_program_cause()),
+            "the record names the cause: {record:?}"
         );
     }
 
@@ -1659,11 +1710,11 @@ mod tests {
     #[tokio::test]
     async fn the_spent_restart_budget_names_the_failure_it_surfaces() {
         let (_, recorded) = start_refusal(MISSING_PROGRAM, 1).await;
-        let record = recorded.naming("restart budget is spent");
+        let record = naming(&recorded, "restart budget is spent");
+        assert_eq!(fields(record)["program"], MISSING_PROGRAM, "{record:?}");
         assert!(
-            record.contains(&format!("program=\"{MISSING_PROGRAM}\""))
-                && record.contains(&missing_program_cause()),
-            "the budget record carries the cause: {record}"
+            record.fields().contains(&missing_program_cause()),
+            "the budget record carries the cause: {record:?}"
         );
     }
 
@@ -1676,19 +1727,15 @@ mod tests {
             !restart_may_help(&failure),
             "an absolute program is refused without spending a restart: {failure:?}"
         );
-        let record = recorded.naming("language engine did not start");
-        assert!(
-            record.contains("retrying=false")
-                && record.contains("program=\"/rift-engine-absolute\""),
-            "the record names the program and that no restart follows: {record}"
-        );
+        let record = naming(&recorded, "language engine did not start");
+        let carried = fields(record);
+        assert_eq!(carried["retrying"], "false", "{record:?}");
+        assert_eq!(carried["program"], "/rift-engine-absolute", "{record:?}");
         assert!(
             !recorded
-                .lines()
                 .iter()
-                .any(|line| line.contains("restart budget is spent")),
-            "the budget is untouched: {:#?}",
-            recorded.lines()
+                .any(|record| record.message().contains("restart budget is spent")),
+            "the budget is untouched: {recorded:#?}"
         );
     }
 

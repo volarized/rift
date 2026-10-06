@@ -14,7 +14,8 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::{any, post};
 use rift_error::{RiftError, errors};
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::configuration::ServerConfiguration;
+use rift_protocol::configuration::{SERVER_WORKSPACES_MAX, ServerConfiguration};
+use rift_tracing::RunningLogDrain;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, Semaphore};
@@ -42,6 +43,34 @@ const IDLE_EVICTION_TICK: Duration = Duration::from_secs(1);
 
 /// Wall-clock bound one workspace stop spends on its engines, supervisor, and database.
 const WORKSPACE_STOP_BOUND: Duration = Duration::from_secs(4);
+
+/// Time one workspace stop keeps for its log consumer's final flush: the engines, index
+/// supervisor, and index and vectors databases stop by this long before the flush's own
+/// bound, so the flush writes their close records.
+const WORKSPACE_LOG_FLUSH_RESERVE: Duration = Duration::from_millis(500);
+
+/// Time one workspace stop keeps for its metrics database's close, its last step: the log
+/// consumer's final flush ends this long before the stop's deadline.
+const WORKSPACE_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
+
+// Both reserves leave the index sequence a share of the bound one idle workspace stop
+// keeps.
+const _: () = assert!(
+    WORKSPACE_LOG_FLUSH_RESERVE.as_millis() + WORKSPACE_DATABASE_STOP_RESERVE.as_millis()
+        < WORKSPACE_STOP_BOUND.as_millis()
+);
+
+// Every workspace a repository process retains gets a log consumer of its own.
+const _: () = assert!(RunningLogDrain::WORKSPACE_CONSUMERS_MAX as u64 >= SERVER_WORKSPACES_MAX);
+
+/// The lock a repository request's admission is recorded under, waits and holds alike.
+const REPOSITORY_ADMISSION_LOCK: &str = "repository.admission";
+
+/// The lock a workspace build's turn at the repository's build gate is recorded under.
+const REPOSITORY_BUILD_GATE_LOCK: &str = "repository.build_gate";
+
+/// One request's admission, recorded as [`REPOSITORY_ADMISSION_LOCK`].
+type RepositoryAdmission = rift_tracing::Held<tokio::sync::OwnedSemaphorePermit>;
 
 /// Serves one repository's workspaces through a process-wide bounded executor.
 ///
@@ -114,10 +143,11 @@ pub(crate) async fn serve_repository_http(
     ));
     let repository_idle_watch =
         tokio::spawn(watch_repository_idle(Arc::clone(&registry), stop.clone()));
-    tracing::info!(
+    rift_tracing::info!(
         component = "mcp",
         transport = "http",
         port,
+        outcome = "ok",
         "MCP server ready"
     );
     Ok(HttpServer {
@@ -132,6 +162,7 @@ pub(crate) async fn serve_repository_http(
         supervisor: None,
         engines: None,
         search_index: None,
+        logs: None,
         repository_workspaces: Some(registry),
     })
 }
@@ -142,6 +173,11 @@ struct RepositoryWorkspace {
     supervisor: IndexSupervisor,
     engines: Arc<EngineHold>,
     database: Option<Arc<rift_index::WorkspaceDatabase>>,
+    vectors: Option<Arc<rift_index::LazyDatabase>>,
+    logs: Option<Arc<rift_tracing::LogStore>>,
+    /// The consumer writing the records that name this workspace into `logs`, when the
+    /// process runs a routing log drain.
+    log_consumer: AsyncMutex<Option<RunningLogDrain>>,
     stop: CancellationToken,
     activity: Arc<IdleTracker>,
     lease: AsyncMutex<Option<Arc<ElectionGuard>>>,
@@ -284,15 +320,33 @@ impl RepositoryWorkspaceRegistry {
         if self.stop.is_cancelled() {
             return Err(Self::stopping());
         }
+        let started = Instant::now();
         let _admission = self.admit().await?;
         self.validate_workspace_settings(root.clone()).await?;
         let cell = self.workspace_cell(&root).await?;
         let workspace = cell
             .get_or_try_init(|| self.build_workspace(root.clone()))
             .await;
+        let elapsed_ms = started.elapsed().as_millis();
         match workspace {
-            Ok(_) => self.active_service(&root, &cell).await,
+            Ok(_) => {
+                rift_tracing::info!(
+                    component = "mcp",
+                    root = %root.display(),
+                    elapsed_ms,
+                    "repository workspace ready for its first request"
+                );
+                self.active_service(&root, &cell).await
+            }
             Err(error) => {
+                rift_tracing::warn!(
+                    component = "mcp",
+                    root = %root.display(),
+                    elapsed_ms,
+                    status = %error.0,
+                    refusal = error.1,
+                    "repository workspace build refused"
+                );
                 self.remove_failed_cell(&root, &cell).await;
                 Err(error)
             }
@@ -311,20 +365,31 @@ impl RepositoryWorkspaceRegistry {
         }
     }
 
-    async fn admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, &'static str)> {
+    /// Waits for one of the repository's admissions by `[server] worker_queue_timeout`, or
+    /// until the server stops.
+    ///
+    /// The wait is recorded as the lock [`REPOSITORY_ADMISSION_LOCK`], so a contended wait
+    /// names the waiting operation and the one holding the oldest admission.
+    async fn admit(&self) -> Result<RepositoryAdmission, (StatusCode, &'static str)> {
         let timeout = Duration::from_millis(
             self.server_configuration
                 .worker_queue_timeout
                 .milliseconds(),
         );
+        let admissions = Arc::clone(&self.admissions);
+        let waiting = rift_tracing::lock(REPOSITORY_ADMISSION_LOCK).acquire_fallible(async move {
+            match tokio::time::timeout(timeout, admissions.acquire_owned()).await {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_closed)) => Err(rift_tracing::Refusal::Refused(())),
+                Err(_) => Err(rift_tracing::Refusal::Timeout(())),
+            }
+        });
         tokio::select! {
             () = self.stop.cancelled() => Err(Self::stopping()),
-            acquired = tokio::time::timeout(timeout, Arc::clone(&self.admissions).acquire_owned()) => {
-                acquired.ok().and_then(Result::ok).ok_or((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "repository admission timed out",
-                ))
-            }
+            acquired = waiting => acquired.map_err(|()| (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repository admission timed out",
+            )),
         }
     }
 
@@ -394,7 +459,8 @@ impl RepositoryWorkspaceRegistry {
         );
         let _build = tokio::select! {
             () = self.stop.cancelled() => return Err(Self::stopping()),
-            acquired = tokio::time::timeout(timeout, self.build_gate.lock()) => acquired.map_err(|_| {
+            acquired = rift_tracing::lock(REPOSITORY_BUILD_GATE_LOCK)
+                .acquire_within(timeout, self.build_gate.lock()) => acquired.map_err(|_| {
                 (StatusCode::SERVICE_UNAVAILABLE, "workspace build admission timed out")
             })?,
         };
@@ -418,6 +484,8 @@ impl RepositoryWorkspaceRegistry {
         let lease = Arc::new(lease);
         let storage = WorkspaceStorage::open_with_owner(&root, Some(Arc::clone(&lease))).await;
         let database = storage.database();
+        let vectors = storage.vectors();
+        let logs = storage.logs();
         let server = RiftMcp::build_with_storage_and_executor(
             &root,
             self.limits,
@@ -440,11 +508,19 @@ impl RepositoryWorkspaceRegistry {
                 .with_json_response(true)
                 .with_cancellation_token(service_stop.clone()),
         );
+        // The consumer starts once the workspace serves: no record names a workspace before
+        // its first request.
+        let log_consumer = logs.as_ref().and_then(|store| {
+            RunningLogDrain::for_workspace(&root.display().to_string(), Arc::clone(store))
+        });
         let workspace = RepositoryWorkspace {
             service,
             supervisor,
             engines,
             database,
+            vectors,
+            logs,
+            log_consumer: AsyncMutex::new(log_consumer),
             stop: service_stop,
             activity,
             lease: AsyncMutex::new(Some(lease)),
@@ -454,7 +530,7 @@ impl RepositoryWorkspaceRegistry {
             if let Err(error) =
                 stop_repository_workspace(&workspace, Instant::now() + WORKSPACE_STOP_BOUND).await
             {
-                tracing::warn!(component = "mcp", %error, "changed workspace settings shutdown failed");
+                rift_tracing::warn!(component = "mcp", %error, "changed workspace settings shutdown failed");
             }
         }
         Ok(workspace)
@@ -493,9 +569,20 @@ impl RepositoryWorkspaceRegistry {
 
     /// Stops every retained workspace before the repository server leaves.
     ///
+    /// Every workspace stops at once, each by the shared `deadline`: one workspace's
+    /// database close never spends the bound of the workspaces after it. Each stop runs in
+    /// a `server.stop` span naming its `root` and its `workspace`, opened as the root of
+    /// its own trace: the routing log drain reads a record's workspace from its own field,
+    /// the span it was emitted in, and the outermost span, so the close records of the
+    /// workspace's databases reach its own store.
+    ///
     /// # Errors
     ///
     /// Returns a workspace shutdown failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future aborts the workspace stops still running.
     pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), RiftError> {
         let workspaces = std::mem::take(&mut *self.workspaces.lock().await);
         for cell in workspaces.values() {
@@ -503,16 +590,40 @@ impl RepositoryWorkspaceRegistry {
                 workspace.stop.cancel();
             }
         }
-        let mut outcome = Ok(());
-        for (_, cell) in workspaces {
-            let Some(workspace) = cell.get() else {
+        let mut stopping = tokio::task::JoinSet::new();
+        for (root, cell) in workspaces {
+            if cell.get().is_none() {
                 continue;
-            };
-            if let Err(error) = stop_repository_workspace(workspace, deadline).await {
+            }
+            let root = root.display().to_string();
+            let workspace = root.clone();
+            let stop = rift_tracing::traced!(
+                component = "mcp",
+                operation = "server.stop",
+                root = root,
+                workspace = workspace,
+                async move {
+                    let outcome = match cell.get() {
+                        Some(workspace) => stop_repository_workspace(workspace, deadline).await,
+                        None => Ok(()),
+                    };
+                    drop(tokio::task::spawn_blocking(move || drop(cell)));
+                    outcome
+                }
+            );
+            stopping.spawn(stop);
+        }
+        let mut outcome = Ok(());
+        while let Some(joined) = stopping.join_next().await {
+            let stopped = joined.unwrap_or_else(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("repository workspace shutdown")
+                    .source(error)
+                    .fail()
+            });
+            if let Err(error) = stopped {
                 outcome = Err(error);
             }
-            let retired = cell;
-            drop(tokio::task::spawn_blocking(move || drop(retired)));
         }
         outcome
     }
@@ -555,13 +666,13 @@ impl RepositoryWorkspaceRegistry {
             drop(workspaces);
             let started = Instant::now();
             let deadline = started + WORKSPACE_STOP_BOUND;
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 root = %root.display(),
                 "idle workspace shutdown started"
             );
             if let Err(error) = stop_repository_workspace(workspace, deadline).await {
-                tracing::warn!(
+                rift_tracing::warn!(
                     component = "mcp",
                     %error,
                     root = %root.display(),
@@ -571,7 +682,7 @@ impl RepositoryWorkspaceRegistry {
                 continue;
             }
             self.workspaces.lock().await.remove(&root);
-            tracing::info!(
+            rift_tracing::info!(
                 component = "mcp",
                 root = %root.display(),
                 elapsed_ms = started.elapsed().as_millis(),
@@ -582,11 +693,49 @@ impl RepositoryWorkspaceRegistry {
     }
 }
 
+/// Stops one workspace's engines, index supervisor, databases, and log consumer by
+/// `deadline`.
+///
+/// The steps keep the order of a workspace server's stop. The engines, the supervisor,
+/// then the index and vectors databases stop by [`WORKSPACE_LOG_FLUSH_RESERVE`] and
+/// [`WORKSPACE_DATABASE_STOP_RESERVE`] before `deadline`; the index closes after the
+/// supervisor, since the supervisor writes it. The log consumer's final flush follows, by
+/// [`WORKSPACE_DATABASE_STOP_RESERVE`] before `deadline`, writing the records of those
+/// closes; the metrics database closes last, by `deadline`. No close runs a checkpoint, so
+/// each costs its connection's close; an index worker held past its own bound leaves the
+/// flush and the metrics close their reserves.
 async fn stop_repository_workspace(
     workspace: &RepositoryWorkspace,
     deadline: Instant,
 ) -> Result<(), RiftError> {
     workspace.stop.cancel();
+    let flush_deadline = reserved_before(deadline, WORKSPACE_DATABASE_STOP_RESERVE);
+    let indexing_deadline = reserved_before(flush_deadline, WORKSPACE_LOG_FLUSH_RESERVE);
+    let indexing = stop_workspace_indexing(workspace, indexing_deadline).await;
+    let log_consumer = workspace.log_consumer.lock().await.take();
+    if let Some(consumer) = log_consumer {
+        consumer.stop(flush_deadline).await;
+    }
+    let logs = crate::http::close_logs(workspace.logs.as_deref(), deadline).await;
+    let outcome = indexing.and(logs);
+    if outcome.is_ok() {
+        drop(workspace.lease.lock().await.take());
+    }
+    outcome
+}
+
+/// The instant `reserve` before `deadline`, or `deadline` itself where the clock cannot
+/// represent the earlier instant.
+fn reserved_before(deadline: Instant, reserve: Duration) -> Instant {
+    deadline.checked_sub(reserve).unwrap_or(deadline)
+}
+
+/// Stops one workspace's engines and index supervisor, then closes its index and vectors
+/// databases, by `deadline`.
+async fn stop_workspace_indexing(
+    workspace: &RepositoryWorkspace,
+    deadline: Instant,
+) -> Result<(), RiftError> {
     let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
         .await
         .map_err(|error| {
@@ -596,21 +745,27 @@ async fn stop_repository_workspace(
                 .error()
         });
     let supervisor = workspace.supervisor.shutdown(deadline).await;
-    let database = if let Some(database) = workspace.database.as_ref() {
-        database.shutdown(deadline).await.map_err(|error| {
-            errors::mcp::http_serve_failed()
-                .operation("SQLite worker shutdown")
-                .cause(error)
-                .error()
-        })
-    } else {
-        Ok(())
-    };
-    let outcome = engines.and(supervisor).and(database);
-    if outcome.is_ok() {
-        drop(workspace.lease.lock().await.take());
-    }
-    outcome
+    let (index, vectors) = tokio::join!(
+        async {
+            match workspace.database.as_ref() {
+                Some(database) => database.shutdown(deadline).await,
+                None => Ok(()),
+            }
+        },
+        async {
+            match workspace.vectors.as_ref() {
+                Some(vectors) => vectors.shutdown(deadline).await,
+                None => Ok(()),
+            }
+        }
+    );
+    let database = index.and(vectors).map_err(|error| {
+        errors::mcp::http_serve_failed()
+            .operation("SQLite worker shutdown")
+            .cause(error)
+            .error()
+    });
+    engines.and(supervisor).and(database)
 }
 
 async fn watch_repository_idle(
@@ -685,16 +840,12 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    /// Writes `rift_mcp::repository_http` events at `info` to the test output: a failed test
-    /// shows idle evictions.
-    fn diagnostic_log() -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_env_filter("rift_mcp::repository_http=info")
-                .with_ansi(false)
-                .with_test_writer()
-                .finish(),
-        )
+    /// Captures `rift_mcp::repository_http` at `info`: a failed test prints idle eviction records.
+    fn diagnostic_log() -> Result<rift_tracing::ScopedRecorder, rift_tracing::LogFilterError> {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp::repository_http=info")
+            .install()?;
+        Ok(recorder)
     }
 
     /// The retained workspace roots, and each one's idle state for the release bound failure,
@@ -749,7 +900,7 @@ mod tests {
             + registry.idle_timeout
             + super::IDLE_EVICTION_TICK
             + super::WORKSPACE_STOP_BOUND * expired_roots;
-        tracing::info!("keep-alive requests started");
+        rift_tracing::info!("keep-alive requests started");
         loop {
             let _ = repository_symbol(server, kept, symbol).await?;
             let (retained_roots, states) = retained_workspaces(registry).await;
@@ -908,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn repository_http_routes_each_workspace_root() -> Result<(), Box<dyn std::error::Error>>
     {
-        let _log = diagnostic_log();
+        let _log = diagnostic_log()?;
         let directory = tempfile::tempdir()?;
         let authority = directory.path();
         let idle_configuration = "[server]\nidle_timeout = \"10s\"\n";
@@ -992,6 +1143,471 @@ mod tests {
         stopped?;
         let lease = crate::election::claim(&roots[3])?;
         drop(lease);
+        Ok(())
+    }
+
+    /// Failure bound on one step; never a way to order two events.
+    const STEP_MAX: Duration = Duration::from_secs(10);
+
+    /// A workspace at `root` holding one committed source file, and its canonical root.
+    fn committed_workspace(root: &Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let root = std::fs::canonicalize(root)?;
+        crate::server::hermetic_workspace(&root, "")?;
+        std::fs::write(root.join("lib.rs"), "pub fn amber() {}\n")?;
+        rift_history::fixture::init(&root);
+        rift_history::fixture::commit_all(&root, "add workspace source");
+        Ok(root)
+    }
+
+    /// The registry a repository server on `root` builds, with no server around it, so no
+    /// idle watch evicts a workspace on its own.
+    fn unserved_registry(
+        root: &Path,
+    ) -> Result<super::RepositoryWorkspaceRegistry, Box<dyn std::error::Error>> {
+        let server_configuration =
+            crate::validation::ConfigurationState::accept(root).server_configuration();
+        Ok(super::RepositoryWorkspaceRegistry {
+            authority_root: root.to_path_buf(),
+            common_directory: root.to_path_buf(),
+            blocking: crate::server::BlockingExecutor::for_configuration(&server_configuration)?,
+            idle_timeout: Duration::from_millis(server_configuration.idle_timeout.milliseconds()),
+            admissions: Arc::new(tokio::sync::Semaphore::new(1)),
+            workspaces_max: 1,
+            server_configuration,
+            limits: WorkspaceIndexLimits::default(),
+            checkout: BuildCheckout::Unversioned,
+            stop: CancellationToken::new(),
+            build_gate: tokio::sync::Mutex::new(()),
+            workspaces: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+        })
+    }
+
+    /// The fields of the one `lock.wait` record among `records`.
+    fn lock_wait(
+        records: &[rift_tracing::LogRecord],
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut waits = records
+            .iter()
+            .filter(|record| record.message() == "lock.wait");
+        let wait = waits.next().ok_or("the wait closed with a record")?;
+        assert!(waits.next().is_none(), "one wait, one record");
+        Ok(serde_json::from_str(wait.fields())?)
+    }
+
+    /// A request waiting for the repository's only admission names itself and the
+    /// operation that holds it, and acquires it once that operation releases it.
+    #[tokio::test]
+    async fn an_admission_wait_names_the_request_holding_the_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        let holder = rift_tracing::traced!("index.build", async { registry.admit().await })
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let mut waiter = std::pin::pin!(rift_tracing::traced!(
+            component = "mcp",
+            operation = "tools/call",
+            async { registry.admit().await.map(drop) }
+        ));
+        let pending = tokio::select! {
+            biased;
+            _ = waiter.as_mut() => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(pending, "the holder keeps the only admission");
+        drop(holder);
+        waiter.await.map_err(|error| format!("{error:?}"))?;
+        drop(recorder);
+
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_ADMISSION_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["waiter"], "tools/call", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "acquired", "{wait}");
+        Ok(())
+    }
+
+    /// A request that finds the repository's admissions closed ends its wait `refused`,
+    /// records no hold, and is refused as a timed-out admission is.
+    #[tokio::test]
+    async fn a_closed_admission_semaphore_ends_the_wait_refused_and_holds_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        registry.admissions.close();
+        let refusal = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            registry.admit().await.map(drop)
+        })
+        .await
+        .expect_err("a closed semaphore admits nothing");
+        assert_eq!(refusal.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = lock_wait(&records)?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_ADMISSION_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["outcome"], "refused", "{wait}");
+        assert!(
+            records.iter().all(|record| record.message() != "lock.held"),
+            "a refused wait records no hold"
+        );
+        Ok(())
+    }
+
+    /// A workspace build waiting at the build gate when the server stops names itself and
+    /// the build holding the gate, and its wait ends cancelled.
+    #[tokio::test]
+    async fn a_build_gate_wait_the_stop_ends_names_the_build_holding_the_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        let gate = rift_tracing::traced!("index.build", async {
+            rift_tracing::lock(super::REPOSITORY_BUILD_GATE_LOCK)
+                .acquire(registry.build_gate.lock())
+                .await
+        })
+        .await;
+        let mut waiter = std::pin::pin!(rift_tracing::traced!(
+            component = "mcp",
+            operation = "tools/call",
+            async {
+                registry
+                    .build_workspace(directory.path().to_path_buf())
+                    .await
+                    .map(drop)
+            }
+        ));
+        let pending = tokio::select! {
+            biased;
+            _ = waiter.as_mut() => false,
+            () = std::future::ready(()) => true,
+        };
+        assert!(pending, "the holder keeps the build gate");
+        registry.stop.cancel();
+        let refusal = waiter.await.expect_err("a stopping server builds nothing");
+        assert_eq!(refusal, super::RepositoryWorkspaceRegistry::stopping());
+        drop(gate);
+        drop(recorder);
+
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_BUILD_GATE_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["waiter"], "tools/call", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "cancelled", "{wait}");
+        Ok(())
+    }
+
+    /// A workspace whose index database was refused has no database to stop, and its stop
+    /// still succeeds and releases the store lease.
+    #[tokio::test]
+    async fn a_workspace_without_an_index_database_stops_and_releases_its_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let state_directory = root.join(".rift");
+        std::fs::create_dir_all(rift_index::DatabaseName::Index.path(&state_directory))?;
+        let registry = unserved_registry(&root)?;
+        let workspace = registry
+            .build_workspace(root.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(
+            workspace.database.is_none(),
+            "a directory is not a database"
+        );
+
+        let deadline = tokio::time::Instant::now() + STEP_MAX;
+        super::stop_repository_workspace(&workspace, deadline).await?;
+
+        assert!(
+            workspace.lease.lock().await.is_none(),
+            "a stop that succeeded releases the store lease"
+        );
+        Ok(())
+    }
+
+    /// A stop whose vectors database is still in its first open when the deadline passes
+    /// fails as a SQLite worker shutdown, and keeps the store lease. The open is polled once
+    /// and never again, and the test holds the migration lock it waits on, so the open stays
+    /// in flight past the deadline on every run.
+    #[tokio::test]
+    async fn a_workspace_stop_that_outlasts_the_vectors_first_open_keeps_the_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::task::{Context, Waker};
+
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let registry = unserved_registry(&root)?;
+        let workspace = registry
+            .build_workspace(root.clone())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let supervisor_deadline = tokio::time::Instant::now() + STEP_MAX;
+        workspace.supervisor.shutdown(supervisor_deadline).await?;
+        let lock_path = rift_index::DatabaseName::Vectors.migration_lock_path(&root.join(".rift"));
+        let migration_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        migration_lock.try_lock()?;
+        let vectors = workspace
+            .vectors
+            .as_ref()
+            .ok_or("the vectors handle exists")?;
+        let mut opening = Box::pin(vectors.resolve(rift_index::DatabasePool::new(4, 60_000)));
+        let first_poll =
+            std::future::Future::poll(opening.as_mut(), &mut Context::from_waker(Waker::noop()));
+        assert!(
+            first_poll.is_pending(),
+            "the held migration lock keeps the open waiting"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let refusal = super::stop_repository_workspace(&workspace, deadline)
+            .await
+            .expect_err("an open in flight outlasts the stop deadline");
+
+        assert_eq!(
+            refusal.slug(),
+            rift_error::errors::mcp::http_serve_failed::SLUG
+        );
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("SQLite worker shutdown"), "{rendered}");
+        assert!(
+            workspace.lease.lock().await.is_some(),
+            "a failed stop keeps the store lease"
+        );
+        drop(opening);
+        drop(migration_lock);
+        Ok(())
+    }
+
+    /// An idle workspace whose stop fails stays retained, keeps its store lease, and
+    /// records the failure. A task that never finishes is parked where the supervisor's
+    /// own task runs, so the supervisor misses the stop deadline on every run; the paused
+    /// clock carries the workspace past its idle deadline and the stop past its own.
+    #[tokio::test]
+    async fn an_idle_workspace_whose_stop_fails_stays_retained_and_records_the_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let registry = unserved_registry(&root)?;
+        let cell = registry
+            .workspace_cell(&root)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let workspace = cell
+            .get_or_try_init(|| registry.build_workspace(root.clone()))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let validation = &workspace.supervisor.validation;
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        let supervisor_task = validation.task.lock().await.replace(stuck);
+        let supervisor_task = supervisor_task.ok_or("the built workspace runs its supervisor")?;
+        validation.cancellation.cancel();
+        tokio::time::timeout(STEP_MAX, supervisor_task).await??;
+        let idle_deadline = workspace
+            .activity
+            .idle_deadline(registry.idle_timeout)
+            .ok_or("no request is active")?;
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        tokio::time::pause();
+        tokio::time::advance(idle_deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
+        registry.evict_idle().await;
+
+        assert!(
+            registry.workspaces.lock().await.contains_key(&root),
+            "a workspace whose stop failed stays retained"
+        );
+        assert!(
+            workspace.lease.lock().await.is_some(),
+            "a workspace whose stop failed keeps its store lease"
+        );
+        let mut failures = Vec::new();
+        let mut released = false;
+        for record in drain.queued_records() {
+            match record.message() {
+                "idle workspace shutdown failed" => failures.push(record),
+                "idle workspace released" => released = true,
+                _ => {}
+            }
+        }
+        assert!(!released, "a workspace whose stop failed is not released");
+        assert_eq!(failures.len(), 1, "one failed stop records one failure");
+        assert_eq!(failures[0].level(), "warn");
+        let fields = failures[0].fields();
+        assert!(
+            fields.contains("index supervisor shutdown"),
+            "the record names the stage that failed: {fields}"
+        );
+        Ok(())
+    }
+
+    /// A repository shutdown stops every workspace at once: a workspace whose supervisor has
+    /// not joined yet does not hold back the stop of a workspace after it. The held
+    /// supervisor is released only once the other workspace has released its store lease,
+    /// which a shutdown that stops workspaces one after another never reaches.
+    #[tokio::test]
+    async fn a_repository_shutdown_stops_every_workspace_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let held_root = directory.path().join("a-held");
+        let ready_root = directory.path().join("b-ready");
+        std::fs::create_dir_all(&held_root)?;
+        std::fs::create_dir_all(&ready_root)?;
+        let held_root = committed_workspace(&held_root)?;
+        let ready_root = committed_workspace(&ready_root)?;
+        let mut registry = unserved_registry(&held_root)?;
+        registry.workspaces_max = 2;
+        let mut cells = Vec::new();
+        for root in [&held_root, &ready_root] {
+            let cell = registry
+                .workspace_cell(root)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            cell.get_or_try_init(|| registry.build_workspace(root.clone()))
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            cells.push(cell);
+        }
+        let held = cells[0].get().ok_or("the held workspace is built")?;
+        let ready = cells[1].get().ok_or("the ready workspace is built")?;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let holding = tokio::spawn(async move {
+            let _ = released.await;
+        });
+        let validation = &held.supervisor.validation;
+        let supervisor_task = validation.task.lock().await.replace(holding);
+        let supervisor_task = supervisor_task.ok_or("the built workspace runs its supervisor")?;
+        validation.cancellation.cancel();
+        tokio::time::timeout(STEP_MAX, supervisor_task).await??;
+
+        let deadline = tokio::time::Instant::now() + STEP_MAX;
+        let (stopped, ready_released) = tokio::join!(registry.shutdown(deadline), async {
+            let released_by = tokio::time::Instant::now() + STEP_MAX;
+            let mut ready_released = false;
+            while tokio::time::Instant::now() < released_by {
+                if ready.lease.lock().await.is_none() {
+                    ready_released = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(release);
+            ready_released
+        });
+
+        assert!(
+            ready_released,
+            "the ready workspace stops while the held one waits"
+        );
+        stopped?;
+        assert!(
+            held.lease.lock().await.is_none(),
+            "the held workspace stops once released"
+        );
+        Ok(())
+    }
+
+    /// A request that waits for the repository's only admission past `[server]
+    /// worker_queue_timeout` ends its wait `timeout` and is refused as a timed-out
+    /// admission.
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_wait_past_the_worker_queue_timeout_ends_timed_out_and_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let registry = unserved_registry(directory.path())?;
+        let holder = registry
+            .admit()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let refusal = rift_tracing::traced!(component = "mcp", operation = "tools/call", async {
+            registry.admit().await.map(drop)
+        })
+        .await
+        .expect_err("the holder keeps the only admission past the queue timeout");
+        drop(holder);
+        drop(recorder);
+
+        assert_eq!(
+            refusal,
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "repository admission timed out"
+            )
+        );
+        let wait = lock_wait(&drain.queued_records())?;
+        assert_eq!(
+            wait["lock.name"],
+            super::REPOSITORY_ADMISSION_LOCK,
+            "{wait}"
+        );
+        assert_eq!(wait["outcome"], "timeout", "{wait}");
+        Ok(())
+    }
+
+    /// A workspace whose build is refused, here because another process holds its
+    /// election, answers the refusal, records it as a `warn`, and leaves no workspace
+    /// registered for the root.
+    #[tokio::test]
+    async fn a_refused_workspace_build_is_recorded_and_leaves_no_workspace_registered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = committed_workspace(directory.path())?;
+        let mut registry = unserved_registry(&root)?;
+        registry.common_directory = std::fs::canonicalize(root.join(".git"))?;
+        let held = crate::election::claim(&root)?;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+        let refusal = registry
+            .service_for(&root)
+            .await
+            .map(drop)
+            .expect_err("a held election refuses the build");
+        drop(recorder);
+
+        assert_eq!(
+            refusal,
+            (
+                axum::http::StatusCode::CONFLICT,
+                "workspace already has a serving process"
+            )
+        );
+        assert!(
+            !registry.workspaces.lock().await.contains_key(&root),
+            "a refused build leaves no workspace registered"
+        );
+        let records = drain.queued_records();
+        let refused = records
+            .iter()
+            .find(|record| record.message() == "repository workspace build refused")
+            .ok_or("the refused build is recorded")?;
+        assert_eq!(refused.level(), "warn");
+        let fields: serde_json::Value = serde_json::from_str(refused.fields())?;
+        assert_eq!(
+            fields["refusal"], "workspace already has a serving process",
+            "{fields}"
+        );
+        drop(held);
         Ok(())
     }
 }

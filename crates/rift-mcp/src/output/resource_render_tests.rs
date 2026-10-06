@@ -3,10 +3,10 @@
 use rift_protocol::dependencies::PackageAvailability;
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::workspace::WorkspaceResourcePage;
+use rift_tracing::LogRecord;
 use serde_json::{Map, Value, json};
 
 use super::facts::{CANONICAL_AVAILABILITY, package_text, wire_name};
-use super::logs::utc_time;
 use super::{LogFields, LogLine, LogsPage, Render, text_of};
 use crate::output::text::{OutputOverflow, TextError, TextWriter};
 
@@ -386,32 +386,34 @@ fn a_workspace_page_writes_its_warnings_after_the_last_section() {
     );
 }
 
-/// One record with the given labels and fields.
-fn line<'a>(
+/// One record of `rift_mcp::server` with the given labels and fields text.
+fn record(
     recorded_at_ms: i64,
-    (level, component, operation): (&'a str, &'a str, &'a str),
-    message: &'a str,
-    fields: LogFields<'a>,
-) -> LogLine<'a> {
-    LogLine {
-        identity: 1,
+    (level, component, operation): (&str, &str, &str),
+    message: &str,
+    fields: &str,
+) -> LogRecord {
+    LogRecord::new(
         recorded_at_ms,
         level,
-        target: "rift_mcp::server",
+        "rift_mcp::server",
         component,
         operation,
         message,
         fields,
-    }
+    )
 }
 
-fn object(text: &str) -> LogFields<'_> {
-    LogFields::parse(text)
-}
-
-fn page(records: Vec<LogLine<'_>>) -> LogsPage<'_> {
+/// The page of `records`, in the order given.
+fn page(records: &[LogRecord]) -> LogsPage<'_> {
     LogsPage {
-        records,
+        records: records
+            .iter()
+            .map(|record| LogLine {
+                identity: 1,
+                record,
+            })
+            .collect(),
         unavailable: None,
     }
 }
@@ -424,12 +426,13 @@ fn no_line_of_a_resource_text_starts_with_a_space() {
         "source": [{"path": "src/view.tsx", "digest": "8a4d20bc", "language": "typescript:tsx"}],
         "pagination": {"page_index": 0, "total_pages": 1}
     }));
-    let logs = page(vec![line(
+    let records = [record(
         1_791_110_527_120,
         ("warn", "index", "index.reconcile"),
         "the capture disagreed",
-        object(r#"{"epoch":"4"}"#),
-    )]);
+        r#"{"epoch":"4"}"#,
+    )];
+    let logs = page(&records);
     for text in [
         rendered(&authored_map()),
         rendered(&workspace),
@@ -444,98 +447,100 @@ fn no_line_of_a_resource_text_starts_with_a_space() {
     }
 }
 
+/// Each record is the line `LogLines::stored_page` prints, indented by one level, in the order
+/// of the page: newest first.
 #[test]
 fn logs_render_one_line_per_record_with_object_fields() {
-    let logs = page(vec![
-        line(
+    let records = [
+        record(
             1_791_110_527_120,
             ("warn", "index", "index.reconcile"),
             "the capture disagreed",
-            object(r#"{"epoch":"4"}"#),
+            r#"{"epoch":"4"}"#,
         ),
-        line(
+        record(
             1_791_110_526_004,
             ("info", "search", "search.query"),
             "",
-            object(r#"{"elapsed_ms":12}"#),
+            r#"{"elapsed_ms":12}"#,
         ),
-        line(
+        record(
             1_791_110_526_000,
             ("debug", "engine", "engine.start"),
             "ready",
-            object("{}"),
+            "{}",
         ),
-    ]);
+    ];
     golden(
-        &logs,
+        &page(&records),
         &[
             "3 records",
-            "\t2026-10-04 10:42:07.120 warn index index.reconcile: the capture disagreed · epoch 4",
-            "\t2026-10-04 10:42:06.004 info search search.query · elapsed_ms 12",
-            "\t2026-10-04 10:42:06.000 debug engine engine.start: ready",
+            "\t2026-10-04 10:42:07.120Z WARN  rift_mcp::server   component=index operation=index.reconcile epoch=4      the capture disagreed",
+            "\t2026-10-04 10:42:06.004Z INFO  rift_mcp::server   component=search operation=search.query elapsed_ms=12",
+            "\t2026-10-04 10:42:06.000Z DEBUG rift_mcp::server   component=engine operation=engine.start                ready",
         ],
     );
 }
 
 #[test]
 fn logs_write_non_object_fields_as_text_and_values_compactly() {
-    let logs = page(vec![
-        line(0, ("error", "mcp", "mcp.read"), "plain", object("not json")),
-        line(0, ("error", "mcp", "mcp.read"), "list", object("[1,2]")),
-        line(0, ("error", "mcp", "mcp.read"), "none", object("")),
-        line(
+    let records = [
+        record(0, ("error", "mcp", "mcp.read"), "plain", "not json"),
+        record(0, ("error", "mcp", "mcp.read"), "list", "[1,2]"),
+        record(0, ("error", "mcp", "mcp.read"), "none", ""),
+        record(
             0,
             ("error", "mcp", "mcp.read"),
             "mixed",
-            object(r#"{"a":true,"b":null,"c":[1,"x"],"d":{"e":1},"f":"","g":"two words"}"#),
+            r#"{"a":true,"b":null,"c":[1,"x"],"d":{"e":1},"f":"","g":"two words"}"#,
         ),
-    ]);
+    ];
     golden(
-        &logs,
+        &page(&records),
         &[
             "4 records",
-            "\t1970-01-01 00:00:00.000 error mcp mcp.read: plain · not json",
-            "\t1970-01-01 00:00:00.000 error mcp mcp.read: list · [1,2]",
-            "\t1970-01-01 00:00:00.000 error mcp mcp.read: none",
-            "\t1970-01-01 00:00:00.000 error mcp mcp.read: mixed · a true · b null · c [1,\"x\"] · d {\"e\":1} · f \"\" · g two words",
+            "\t1970-01-01 00:00:00.000Z ERROR rift_mcp::server   component=mcp operation=mcp.read                                                   plain not json",
+            "\t1970-01-01 00:00:00.000Z ERROR rift_mcp::server   component=mcp operation=mcp.read                                                   list [1,2]",
+            "\t1970-01-01 00:00:00.000Z ERROR rift_mcp::server   component=mcp operation=mcp.read                                                   none",
+            "\t1970-01-01 00:00:00.000Z ERROR rift_mcp::server   component=mcp operation=mcp.read a=true b=null c=[1,\"x\"] d={\"e\":1} f= g=two words  mixed",
         ],
     );
 }
 
 #[test]
-fn logs_mark_a_missing_component_and_operation_and_hide_control_characters() {
-    let logs = page(vec![line(
+fn logs_leave_out_a_missing_component_and_operation_and_escape_control_characters() {
+    let records = [record(
         0,
         ("info", "", ""),
         "two\nlines\tand a tab",
-        object(r#"{"path":"a\nb"}"#),
-    )]);
+        r#"{"path":"a\nb"}"#,
+    )];
     golden(
-        &logs,
+        &page(&records),
         &[
             "1 record",
-            "\t1970-01-01 00:00:00.000 info - -: two\\nlines\\tand a tab · path a\\nb",
+            "\t1970-01-01 00:00:00.000Z INFO  rift_mcp::server   path=a\\nb  two\\nlines\\tand a tab",
         ],
     );
 }
 
 #[test]
 fn logs_quote_a_message_or_value_that_holds_a_delimiter() {
-    let logs = page(vec![
-        line(
+    let records = [
+        record(
             0,
             ("warn", "mcp", "mcp.read"),
             "read failed: a \"b\" · c\\d",
-            object(r#"{"note":"k: v","path":"a · b","plain":"a:b"}"#),
+            r#"{"note":"k: v","path":"a · b","plain":"a:b"}"#,
         ),
-        line(0, ("warn", "mcp", "mcp.read"), "plain", object("x · y")),
-    ]);
+        record(0, ("warn", "mcp", "mcp.read"), "plain", "x · y"),
+    ];
     golden(
-        &logs,
+        &page(&records),
         &[
             "2 records",
-            "\t1970-01-01 00:00:00.000 warn mcp mcp.read: \"read failed: a \\\"b\\\" · c\\\\d\" · note \"k: v\" · path \"a · b\" · plain a:b",
-            "\t1970-01-01 00:00:00.000 warn mcp mcp.read: plain · \"x · y\"",
+            "\t1970-01-01 00:00:00.000Z WARN  rift_mcp::server   component=mcp operation=mcp.read note=\"k: v\" path=\"a · b\" plain=a:b  \"read failed: a \\\"b\\\" · c\\\\d\"",
+            "\t1970-01-01 00:00:00.000Z WARN  rift_mcp::server   component=mcp operation=mcp.read                                     plain \"x · y\"",
         ],
     );
     let unavailable = LogsPage {
@@ -548,6 +553,39 @@ fn logs_quote_a_message_or_value_that_holds_a_delimiter() {
             "0 records",
             "1 warning",
             "\tunavailable: \"open failed: denied\"",
+        ],
+    );
+}
+
+/// Two groups, a request and a record outside every span, are separated by one empty line,
+/// with no indent.
+#[test]
+fn logs_separate_two_groups_by_an_empty_line() {
+    let request = json!({
+        "name": "mcp.request",
+        "fields": {"component": "mcp", "operation": "tools/call", "request_id": "11", "tool": "nodes"},
+    });
+    let records = [
+        record(
+            2,
+            ("info", "mcp", "tools/call"),
+            "answered",
+            &json!({"root_span": request}).to_string(),
+        ),
+        record(
+            1,
+            ("info", "mcp", ""),
+            "MCP server starting",
+            r#"{"transport":"http"}"#,
+        ),
+    ];
+    golden(
+        &page(&records),
+        &[
+            "2 records",
+            "\t1970-01-01 00:00:00.002Z INFO  rift_mcp::server   component=mcp operation=tools/call req=11 tool=nodes  answered",
+            "",
+            "\t1970-01-01 00:00:00.001Z INFO  rift_mcp::server   component=mcp transport=http  MCP server starting",
         ],
     );
 }
@@ -570,7 +608,7 @@ fn an_unavailable_store_is_zero_records_and_one_warning_with_its_reason() {
 
 #[test]
 fn zero_records_are_the_header_alone() {
-    golden(&page(Vec::new()), &["0 records"]);
+    golden(&page(&[]), &["0 records"]);
 }
 
 #[test]
@@ -582,29 +620,6 @@ fn log_fields_keep_the_object_and_the_text_the_wire_carries() {
     assert_eq!(parsed.to_json(), json!({"epoch": "4"}));
     assert_eq!(LogFields::parse("[1]").to_json(), json!("[1]"));
     assert_eq!(LogFields::parse("").to_json(), json!(""));
-}
-
-#[test]
-fn time_is_utc_with_milliseconds() {
-    assert_eq!(utc_time(0), "1970-01-01 00:00:00.000");
-    assert_eq!(utc_time(999), "1970-01-01 00:00:00.999");
-    assert_eq!(utc_time(1_709_210_096_789), "2024-02-29 12:34:56.789");
-    assert_eq!(utc_time(1_704_067_199_999), "2023-12-31 23:59:59.999");
-    assert_eq!(utc_time(1_704_067_200_000), "2024-01-01 00:00:00.000");
-    assert_eq!(utc_time(951_782_400_000), "2000-02-29 00:00:00.000");
-    assert_eq!(utc_time(4_107_542_399_000), "2100-02-28 23:59:59.000");
-    assert_eq!(utc_time(4_107_542_400_000), "2100-03-01 00:00:00.000");
-    assert_eq!(utc_time(253_402_207_200_000), "9999-12-30 22:00:00.000");
-    assert_eq!(utc_time(-1), "1969-12-31 23:59:59.999");
-}
-
-#[test]
-fn a_time_outside_the_range_of_a_jiff_timestamp_is_the_count() {
-    assert_eq!(utc_time(253_402_207_200_001), "253402207200001");
-    assert_eq!(utc_time(253_402_300_799_999), "253402300799999");
-    assert_eq!(utc_time(-377_705_023_201_001), "-377705023201001");
-    assert_eq!(utc_time(i64::MIN), i64::MIN.to_string());
-    assert_eq!(utc_time(i64::MAX), i64::MAX.to_string());
 }
 
 #[test]

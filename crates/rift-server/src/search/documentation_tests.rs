@@ -23,8 +23,10 @@ fn service(root: &std::path::Path) -> TestResult<ReadService> {
 }
 
 async fn stored(root: &std::path::Path, service: &ReadService) -> TestResult<SearchIndex> {
+    let state = root.join("search.db");
+    std::fs::create_dir_all(&state)?;
     let store = SearchIndex::open(
-        &root.join("search.db"),
+        &state,
         SearchIndexLimits::builder(LexicalIndexLimits::default())
             .disable_vector()
             .build(),
@@ -44,8 +46,10 @@ async fn stored_without_documentation(
     root: &std::path::Path,
     service: &ReadService,
 ) -> TestResult<SearchIndex> {
+    let state = root.join("baseline.db");
+    std::fs::create_dir_all(&state)?;
     let store = SearchIndex::open(
-        &root.join("baseline.db"),
+        &state,
         SearchIndexLimits::builder(LexicalIndexLimits::default())
             .disable_vector()
             .build(),

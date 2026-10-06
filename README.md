@@ -87,7 +87,7 @@ Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 | --- | --- |
 | `just format` | Rust formatting |
 | `just generate-check` | Generated protocol drift |
-| `just check` | Lock freshness, crate edges, and binary ownership |
+| `just check` | Lock freshness, crate edges, binary ownership, and tracing backend ownership |
 | `just clippy` | Strict Clippy policy |
 | `just docs` | Warning-free Rust documentation |
 | `just audit` | Advisory, license, ban, and source policy |

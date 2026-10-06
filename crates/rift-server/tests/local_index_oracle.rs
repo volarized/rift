@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use rift_core::{SourceVisibility, SymbolId, TextFileInclusion, symbol_identity};
+use rift_index::DatabaseName;
 use rift_index::{
     DatabasePool, LexicalIndexLimits, LexicalSearchIndex, LexicalStamp, PathChanges,
     WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits, capture_digests,
@@ -374,7 +375,12 @@ fn stored_facts(path: &Path) -> TestResult<StoredFacts> {
 /// Reopens the actual store and applies only differences derived by the read service.
 async fn persist_service(service: &ReadService, database_path: &Path) -> TestResult {
     const DERIVATION: &str = "local-index-oracle";
-    let database = WorkspaceDatabase::open(database_path, DatabasePool::new(2, 1_000)).await?;
+    let database = WorkspaceDatabase::open(
+        database_path,
+        DatabaseName::Index,
+        DatabasePool::new(2, 1_000),
+    )
+    .await?;
     let store = LexicalSearchIndex::attached(
         std::sync::Arc::clone(&database),
         LexicalIndexLimits::default(),

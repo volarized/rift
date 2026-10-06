@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 type TestResult = Result<(), serde_json::Error>;
 
 /// Recursively asserts `value` carries no `null` member and no empty array or object: the
-/// D1 wire contract states absence, never an explicit empty collection or a null.
+/// wire contract states absence, never an explicit empty collection or a null.
 fn assert_no_null_or_empty(value: &Value, context: &str) {
     match value {
         Value::Null => panic!("{context} must carry no null member: {value:#}"),
@@ -55,8 +55,8 @@ fn assert_examples_carry_no_null_or_empty(schema: &Value, type_name: &str) {
     }
 }
 
-/// The D1 conformance gate: every response model's authored wire example carries no
-/// `null` member and no empty array or object. A field that can legitimately be absent
+/// Every response model's authored wire example carries no `null` member and no empty
+/// array or object. A field that can legitimately be absent
 /// is absent in its example, never present with an empty value.
 #[test]
 fn response_model_examples_carry_no_null_or_empty_collection() {

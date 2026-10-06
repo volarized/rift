@@ -1048,6 +1048,7 @@ pub fn declare_server_ranges(schema: &mut Schema) {
 pub fn declare_search_ranges(schema: &mut Schema) {
     use crate::configuration::{
         ByteSize, Duration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_BUSY_TIMEOUT_MS_MIN,
+        SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX, SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN,
         SEARCH_PATTERN_COMPILED_BYTES_MAX, SEARCH_PATTERN_COMPILED_BYTES_MIN,
         SEARCH_PATTERN_VERIFIED_BYTES_MAX, SEARCH_PATTERN_VERIFIED_BYTES_MIN, SearchConfiguration,
     };
@@ -1058,6 +1059,15 @@ pub fn declare_search_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MIN),
             &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(SearchConfiguration, journal_size_limit),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN),
+            &ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX),
         ),
     );
     annotate_property(
@@ -1203,6 +1213,36 @@ pub fn declare_dependencies_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN),
             &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX),
+        ),
+    );
+}
+
+/// A [`LogsConfiguration`](crate::configuration::LogsConfiguration) states its
+/// `Duration` and `ByteSize` floors and ceilings as `rift:range` on `stall_delay` and
+/// `stderr_limit`: schema validation alone cannot compare `"1s"` or
+/// `"1mb"` against a bound, so the server enforces them at load and the schema carries
+/// them for readers.
+pub fn declare_logs_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, Duration, LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN,
+        LOGS_STDERR_BYTES_MAX, LOGS_STDERR_BYTES_MIN, LogsConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(LogsConfiguration, stall_delay),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(LOGS_STALL_DELAY_MS_MIN),
+            &Duration::from_millis(LOGS_STALL_DELAY_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(LogsConfiguration, stderr_limit),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(LOGS_STDERR_BYTES_MIN),
+            &ByteSize::from_bytes(LOGS_STDERR_BYTES_MAX),
         ),
     );
 }
@@ -2269,6 +2309,55 @@ mod tests {
             json!({ "min": "1kb", "max": "16mb" }),
             "max_chunk must state its accepted range"
         );
+    }
+
+    #[test]
+    fn logs_configuration_schema_states_range_and_default_on_stall_delay() {
+        use crate::configuration::{
+            Duration, LOGS_STALL_DELAY_MS_DEFAULT, LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN,
+        };
+        let schema = serde_json::to_value(schema_for!(crate::configuration::LogsConfiguration))
+            .expect("schema");
+        let delay = &schema["properties"]["stall_delay"];
+        assert_eq!(
+            delay[RIFT_RANGE],
+            json!({
+                "min": Duration::from_millis(LOGS_STALL_DELAY_MS_MIN),
+                "max": Duration::from_millis(LOGS_STALL_DELAY_MS_MAX),
+            }),
+            "stall_delay must state the range acceptance enforces"
+        );
+        assert_eq!(delay[RIFT_RANGE], json!({ "min": "1s", "max": "1h" }));
+        assert_eq!(
+            delay[keyword::DEFAULT],
+            json!(Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT)),
+            "stall_delay must advertise the model's default"
+        );
+    }
+
+    #[test]
+    fn logs_configuration_schema_states_range_and_default_on_stderr_limit() {
+        use crate::configuration::{
+            ByteSize, LOGS_STDERR_BYTES_DEFAULT, LOGS_STDERR_BYTES_MAX, LOGS_STDERR_BYTES_MIN,
+        };
+        let schema = serde_json::to_value(schema_for!(crate::configuration::LogsConfiguration))
+            .expect("schema");
+        let limit = &schema["properties"]["stderr_limit"];
+        assert_eq!(
+            limit[RIFT_RANGE],
+            json!({
+                "min": ByteSize::from_bytes(LOGS_STDERR_BYTES_MIN),
+                "max": ByteSize::from_bytes(LOGS_STDERR_BYTES_MAX),
+            }),
+            "stderr_limit must state the range acceptance enforces"
+        );
+        assert_eq!(limit[RIFT_RANGE], json!({ "min": "1kb", "max": "1gb" }));
+        assert_eq!(
+            limit[keyword::DEFAULT],
+            json!(ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT)),
+            "stderr_limit must advertise the model's default"
+        );
+        assert_eq!(limit[keyword::DEFAULT], json!("1mb"));
     }
 
     #[test]

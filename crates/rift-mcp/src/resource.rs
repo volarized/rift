@@ -9,9 +9,9 @@
 //! because the case that needs the logs most is the one where the workspace
 //! reads refuse.
 
-use rift_index::{LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::workspace::WorkspaceResourcePage;
+use rift_tracing::{LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 use serde_json::{Value, json};
@@ -250,44 +250,28 @@ fn logs_json(uri: &str, page: &LogsPage<'_>) -> Value {
     body
 }
 
-/// One stored record as the view the text and the JSON are both made from. `fields` is the
-/// object it was rendered from when it parses, and the text when it does not, so a reader never
-/// has to unquote JSON out of a string.
+/// One stored record as the view the text and the JSON are both made from.
 fn log_line(stored: &StoredLogRecord) -> LogLine<'_> {
-    let record = stored.record();
     LogLine {
         identity: stored.identity(),
-        recorded_at_ms: record.recorded_at_ms(),
-        level: record.level(),
-        target: record.target(),
-        component: record.component(),
-        operation: record.operation(),
-        message: record.message(),
-        fields: LogFields::parse(record.fields()),
+        record: stored.record(),
     }
 }
 
-/// One record of the view as the JSON wire carries it.
+/// One record of the view as the JSON wire carries it. `fields` is the object it was rendered
+/// from when it parses, and the text when it does not, so a reader never has to unquote JSON out
+/// of a string.
 fn record_json(line: &LogLine<'_>) -> Value {
-    let LogLine {
-        identity,
-        recorded_at_ms,
-        level,
-        target,
-        component,
-        operation,
-        message,
-        fields,
-    } = line;
+    let LogLine { identity, record } = line;
     json!({
         "identity": identity,
-        "recorded_at_ms": recorded_at_ms,
-        "level": level,
-        "target": target,
-        "component": component,
-        "operation": operation,
-        "message": message,
-        "fields": fields.to_json(),
+        "recorded_at_ms": record.recorded_at_ms(),
+        "level": record.level(),
+        "target": record.target(),
+        "component": record.component(),
+        "operation": record.operation(),
+        "message": record.message(),
+        "fields": LogFields::parse(record.fields()).to_json(),
     })
 }
 
@@ -299,10 +283,10 @@ mod tests {
         logs_unavailable, rendered_logs, rendered_map, rendered_workspace, workspace_page_index,
     };
     use crate::output::resource_text;
-    use rift_index::{LOG_PAGE_RECORDS_MAX, LogRecord, LogStore, StoredLogRecord};
     use rift_protocol::map::WorkspaceMap;
     use rift_protocol::read::{Digest, Pagination};
     use rift_protocol::workspace::WorkspaceResourcePage;
+    use rift_tracing::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, LogStore, StoredLogRecord};
     use rmcp::model::{ReadResourceResult, ResourceContents};
     use serde_json::{Value, json};
 
@@ -411,16 +395,12 @@ mod tests {
     /// Two stored records, the older one with object fields and the newer one with text.
     async fn stored_records() -> Vec<StoredLogRecord> {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        let database = rift_index::WorkspaceDatabase::open(
-            &directory.path().join("db"),
-            rift_index::DatabasePool::new(2, 1_000),
-        )
-        .await
-        .expect("the database opens");
-        let store = LogStore::attached(database);
+        let store = LogStore::open(&directory.path().join("metrics"), None)
+            .await
+            .expect("the metrics database opens");
         store
             .append(
-                &[
+                [
                     LogRecord::new(
                         7,
                         "WARN",
@@ -445,8 +425,9 @@ mod tests {
             .await
             .expect("the records land");
         store
-            .recent(&rift_index::LogQuery::newest(10))
-            .await
+            .reader()
+            .connect()
+            .and_then(|reads| reads.recent(&LogQuery::newest(10)))
             .expect("the read answers")
     }
 
@@ -510,8 +491,9 @@ mod tests {
         assert_eq!(
             contents(&rendered, LOGS_URI).0,
             "2 records\n\
-             \t2026-10-04 10:42:07.120 info - - · not an object\n\
-             \t1970-01-01 00:00:00.007 warn index index.reconcile: the capture disagreed · epoch 4\n"
+             \t2026-10-04 10:42:07.120Z INFO  rift_mcp::server   not an object\n\
+             \t1970-01-01 00:00:00.007Z WARN  rift_mcp::server   component=index \
+             operation=index.reconcile epoch=4  the capture disagreed\n"
         );
     }
 

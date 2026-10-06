@@ -12,13 +12,12 @@ use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::read::CommitAuthor;
 use rift_server::FillProgress;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{AnalysisGate, FillBounds, HistoryLane, HistoryTask, OpenedStore, store_revision};
 use crate::http::IdleTracker;
-use crate::logs::{LogDrain, log_capture};
 use crate::validation::ConfigurationState;
 use crate::validation::tests::{ANALYZER_A, ANALYZER_B};
+use rift_tracing::LogDrain;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -111,27 +110,27 @@ fn execute_on_store(task: &HistoryTask, statements: &str) -> TestResult {
     Ok(())
 }
 
-/// The message and fields of each record `drain` holds at `operation`.
+/// The message and fields of each warning or error `drain` holds at `operation`; the
+/// `INFO` records of a fill's start and end are left out.
 fn records_at(drain: &mut LogDrain, operation: &str) -> Vec<(String, String)> {
-    let mut records = Vec::new();
-    while let Ok(record) = drain.try_recv_record() {
-        if record.operation() == operation {
-            records.push((record.message().to_owned(), record.fields().to_owned()));
-        }
-    }
-    records
+    drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| {
+            record.operation() == operation && matches!(record.level(), "warn" | "error")
+        })
+        .map(|record| (record.message().to_owned(), record.fields().to_owned()))
+        .collect()
 }
 
 /// The store the lane over `root` opens, opened under a log capture.
-fn opened_under_capture(root: &Path) -> (Option<OpenedStore>, LogDrain) {
+fn opened_under_capture(root: &Path) -> TestResult<(Option<OpenedStore>, LogDrain)> {
     let configuration = ConfigurationState::accept(root);
     let history = configuration.history_configuration();
-    let (sink, drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
-    let opened = tracing::subscriber::with_default(subscriber, || {
-        OpenedStore::open(root, &configuration, &history, ANALYZER_A)()
-    });
-    (opened, drain)
+    let (recorder, drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let opened = OpenedStore::open(root, &configuration, &history, ANALYZER_A)();
+    drop(recorder);
+    Ok((opened, drain))
 }
 
 async fn start(
@@ -307,13 +306,10 @@ async fn the_fill_runs_a_batch_after_its_bounded_wait_while_requests_overlap() -
 
 #[tokio::test]
 async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> TestResult {
-    use tracing_subscriber::layer::SubscriberExt as _;
-
     let directory = committed_workspace("")?;
     let root = directory.path();
     let head = head_of(root)?;
-    let (sink, mut drain) = crate::logs::log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let cancellation = CancellationToken::new();
     let activity = Arc::new(IdleTracker::new());
 
@@ -321,20 +317,24 @@ async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> Tes
     wait_until_held(root, ANALYZER_A, &head).await?;
     cancellation.cancel();
 
-    let mut starts = Vec::new();
-    while let Ok(record) = drain.try_recv_record() {
-        if record.message() == "history batch started" {
-            starts.push(record);
-        }
-    }
+    let starts: Vec<_> = drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| record.message() == "history batch started")
+        .collect();
     let first = starts.first().ok_or("no batch start was recorded")?;
     assert_eq!(first.level(), "debug");
     assert_eq!(first.component(), "history");
     assert_eq!(first.operation(), "history.batch");
     assert_eq!(
         first.fields(),
-        r#"{"phase":"start","pending":"2"}"#,
-        "the first batch starts with both commits of the fixture pending"
+        concat!(
+            r#"{"code.function.name":"rift_mcp::history::HistoryTask::fill_planned","#,
+            r#""phase":"start","pending":"2","root_span":{"name":"history.batch","#,
+            r#""fields":{"component":"history","operation":"history.batch","#,
+            r#""code.function.name":"rift_mcp::history::HistoryTask::fill_planned"}}}"#,
+        ),
+        "the first batch starts inside its span with both commits of the fixture pending"
     );
     Ok(())
 }
@@ -362,7 +362,6 @@ async fn a_settled_wait_ends_at_its_bound_or_when_the_last_request_completes() {
 #[test]
 fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree_and_warns_once() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     let directory = committed_workspace("")?;
     let root = directory.path();
@@ -370,21 +369,21 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree_and_warns_on
     let configuration = ConfigurationState::accept(root);
     let history = configuration.history_configuration();
     fs::set_permissions(root.join(".git"), fs::Permissions::from_mode(0o555))?;
-    let (sink, mut drain) = crate::logs::log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
-    let opened = tracing::subscriber::with_default(subscriber, || {
-        OpenedStore::open(root, &configuration, &history, ANALYZER_A)()
-    });
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let opened = OpenedStore::open(root, &configuration, &history, ANALYZER_A)();
+    drop(recorder);
     fs::set_permissions(root.join(".git"), fs::Permissions::from_mode(0o755))?;
 
     let opened = opened.ok_or("the worktree's state directory takes the store")?;
     assert_eq!(opened.store.location().folder(), root.join(".rift"));
     assert!(!root.join(".git").join(STORE_FOLDER_NAME).exists());
-    let recorded = drain.try_recv_record().map_err(|error| error.to_string())?;
-    assert_eq!(recorded.level(), "warn");
-    assert_eq!(recorded.operation(), "history.open");
-    assert!(
-        drain.try_recv_record().is_err(),
+    let records = drain.queued_records();
+    let first = records.first().ok_or("no record was captured")?;
+    assert_eq!(first.level(), "warn");
+    assert_eq!(first.operation(), "history.open");
+    assert_eq!(
+        records.len(),
+        1,
         "the fallback is recorded once, when the server opens its store"
     );
     Ok(())
@@ -444,13 +443,40 @@ fn a_store_folder_the_filesystem_cannot_create_leaves_the_lane_off_and_warns() -
         b"a file where the folder goes\n",
     )?;
 
-    let (opened, mut drain) = opened_under_capture(root);
+    let (opened, mut drain) = opened_under_capture(root)?;
 
     assert!(opened.is_none());
     let records = records_at(&mut drain, "history.open");
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].0, STORE_NOT_OPENED);
     assert!(records[0].1.contains("create store folder"), "{records:?}");
+    Ok(())
+}
+
+/// A workspace removed after its configuration was accepted and before its store opens
+/// cannot be read as a repository: that refusal is not the unversioned case, so the
+/// lane stays off and warns.
+#[test]
+fn a_workspace_removed_before_its_store_opens_leaves_the_lane_off_and_warns() -> TestResult {
+    let directory = committed_workspace("")?;
+    let root = directory.path().to_path_buf();
+    let configuration = ConfigurationState::accept(&root);
+    let history = configuration.history_configuration();
+    let opening = OpenedStore::open(&root, &configuration, &history, ANALYZER_A);
+    fs::remove_dir_all(&root)?;
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    let opened = opening();
+    drop(recorder);
+
+    assert!(opened.is_none());
+    let records = records_at(&mut drain, "history.open");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, STORE_NOT_OPENED);
+    assert!(
+        records[0].1.contains("canonicalize workspace root"),
+        "{records:?}"
+    );
     Ok(())
 }
 
@@ -505,7 +531,7 @@ fn a_released_store_file_the_sweep_cannot_delete_is_logged_and_the_lane_opens() 
     fs::create_dir_all(folder.join("store-released.db"))?;
     fs::write(folder.join("store-released.live.lock"), b"")?;
 
-    let (opened, mut drain) = opened_under_capture(root);
+    let (opened, mut drain) = opened_under_capture(root)?;
 
     assert!(opened.is_some());
     let records = records_at(&mut drain, "history.sweep");
@@ -529,7 +555,7 @@ fn a_store_folder_the_sweep_cannot_list_is_logged_and_the_lane_opens() -> TestRe
     // Creating and opening files in the folder needs write and search access alone;
     // listing it needs read access.
     fs::set_permissions(&folder, fs::Permissions::from_mode(0o300))?;
-    let (opened, mut drain) = opened_under_capture(root);
+    let (opened, mut drain) = opened_under_capture(root)?;
     fs::set_permissions(&folder, fs::Permissions::from_mode(0o755))?;
 
     assert!(opened.is_some());
@@ -545,8 +571,7 @@ async fn a_plan_that_fails_is_logged_whether_the_task_fills_or_observes() -> Tes
     let root = directory.path();
     // Every plan reads the shallow file, and a folder in its place refuses the read.
     fs::create_dir(root.join(".git/shallow"))?;
-    let (sink, mut drain) = log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let mut task = history_task(root, None)?;
     let cancellation = CancellationToken::new();
 
@@ -571,8 +596,7 @@ async fn a_plan_that_fails_is_logged_whether_the_task_fills_or_observes() -> Tes
 #[tokio::test]
 async fn a_fill_lock_the_filesystem_refuses_is_logged_and_the_task_observes() -> TestResult {
     let directory = committed_workspace("")?;
-    let (sink, mut drain) = log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let mut task = history_task(directory.path(), None)?;
     fs::create_dir(store_file(&task, ".fill.lock"))?;
 
@@ -602,6 +626,37 @@ async fn a_commit_past_the_batch_bound_opens_the_next_batch() -> TestResult {
     assert_eq!(held(&task)?, 2, "each commit is a batch of its own");
     let counts = task.progress.counts().ok_or("the plan is recorded")?;
     assert_eq!((counts.analyzed(), counts.total()), (2, 2));
+    Ok(())
+}
+
+/// A fill with commits pending records its start with the pending count, and its end with
+/// the commits it wrote; a later fill with nothing pending records neither.
+#[tokio::test]
+async fn a_fill_with_pending_commits_records_its_start_and_its_end() -> TestResult {
+    let directory = committed_workspace("")?;
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let mut task = history_task(directory.path(), None)?;
+
+    let filler = task.fill(None, &CancellationToken::new()).await;
+    let filler = task.fill(filler, &CancellationToken::new()).await;
+
+    assert!(filler.is_some());
+    let records: Vec<_> = drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| record.message().starts_with("history fill "))
+        .collect();
+    let messages: Vec<_> = records
+        .iter()
+        .map(rift_tracing::LogRecord::message)
+        .collect();
+    assert_eq!(messages, ["history fill started", "history fill finished"]);
+    let started: serde_json::Value = serde_json::from_str(records[0].fields())?;
+    assert_eq!(started["pending"], "2", "{started}");
+    assert_eq!(started["phase"], "start", "{started}");
+    let finished: serde_json::Value = serde_json::from_str(records[1].fields())?;
+    assert_eq!(finished["written"], "2", "{finished}");
+    assert_eq!(finished["outcome"], "ok", "{finished}");
     Ok(())
 }
 
@@ -643,8 +698,7 @@ async fn a_stop_during_the_wait_for_an_idle_server_writes_nothing() -> TestResul
 #[tokio::test]
 async fn a_batch_the_store_refuses_is_logged_and_writes_nothing() -> TestResult {
     let directory = committed_workspace("")?;
-    let (sink, mut drain) = log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let mut task = history_task(directory.path(), None)?;
     execute_on_store(
         &task,
@@ -688,8 +742,7 @@ fn unselected_commit() -> CommitRecord {
 #[tokio::test]
 async fn a_trim_the_store_refuses_is_logged_and_keeps_the_commit() -> TestResult {
     let directory = committed_workspace("")?;
-    let (sink, mut drain) = log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let mut task = history_task(directory.path(), None)?;
     let mut filler = task.store.filler()?.ok_or("no other filler runs")?;
     filler.write_batch(&[unselected_commit()])?;
@@ -723,8 +776,7 @@ async fn a_commit_whose_analysis_fails_ends_the_fill_and_is_logged() -> TestResu
     let root = directory.path();
     // `main` moves to a commit whose tree names a folder the object store lacks.
     commit_missing_subtree(root, "refs/heads/main");
-    let (sink, mut drain) = log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let mut task = history_task(root, None)?;
 
     let filler = task.fill(None, &CancellationToken::new()).await;
@@ -740,8 +792,7 @@ async fn a_commit_whose_analysis_fails_ends_the_fill_and_is_logged() -> TestResu
 #[tokio::test]
 async fn a_panicking_analysis_ends_the_fill_and_is_logged() -> TestResult {
     let directory = committed_workspace("")?;
-    let (sink, mut drain) = log_capture();
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
     let gate: AnalysisGate = Arc::new(|| panic!("the analysis thread panics"));
     let mut task = history_task(directory.path(), Some(gate))?;
 
@@ -768,16 +819,13 @@ fn an_unversioned_release_tag_warns_once_and_the_bound_warns_when_its_count_chan
     git(root, &["tag", "v1.0.0", "HEAD~1"]);
     git(root, &["tag", "v2.0.0", "HEAD"]);
     git(root, &["tag", "vnext", "HEAD"]);
-    let (sink, mut drain) = log_capture();
-    let subscriber = tracing_subscriber::registry().with(sink);
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
-    tracing::subscriber::with_default(subscriber, || -> TestResult {
-        let mut task = history_task(root, None)?;
-        let plan = task.analysis.plan(&HashMap::new())?;
-        task.record_releases(&plan);
-        task.record_releases(&plan);
-        Ok(())
-    })?;
+    let mut task = history_task(root, None)?;
+    let plan = task.analysis.plan(&HashMap::new())?;
+    task.record_releases(&plan);
+    task.record_releases(&plan);
+    drop(recorder);
 
     let records = records_at(&mut drain, "history.plan");
     let messages: Vec<&str> = records

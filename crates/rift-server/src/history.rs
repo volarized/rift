@@ -224,7 +224,7 @@ impl std::fmt::Debug for StoredHistory {
 /// Per-request timeline composition over one served revision.
 #[derive(Debug)]
 pub(crate) struct SymbolTimelines {
-    _span: tracing::Span,
+    _span: rift_tracing::Span,
     source: TimelineSource,
 }
 
@@ -269,13 +269,13 @@ impl SymbolTimelines {
         }?;
         let revisions_max =
             usize::try_from(history.max_revisions.min(HISTORY_REVISIONS_MAX)).unwrap_or(usize::MAX);
-        let span = tracing::debug_span!(
+        let span = rift_tracing::debug_span!(
             "get_symbol",
             component = "index",
             operation = "get_symbol",
             phase = "history"
         );
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "get_symbol",
             phase = "start",

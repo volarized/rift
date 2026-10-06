@@ -12,21 +12,29 @@ from rift_dev.corpus_assertions import PROBE_PATH, PROBE_SOURCE
 from rift_dev.corpus_cache import git, pins
 from rift_dev.rift_test_client import Server, object_value
 
-STARTUP = 'INFO index snapshot published operation="index.publish" trigger="startup" epoch=0\n'
-BATCH_SPAN = 'history.batch{component="history" operation="history.batch"}'
+# Lines in the shape a foreground server prints on stderr.
+STARTUP = (
+    "2026-10-05 10:27:15.020Z INFO  rift_mcp::server::BlockingExecutor::run   "
+    "component=worker operation=worker.run work=initial index preparation  "
+    "index snapshot published component=index operation=index.publish epoch=0 "
+    "trigger=startup\n"
+)
 BATCH_CLOSE = (
-    f"INFO {BATCH_SPAN}: rift_mcp::history: close time.busy=1ms time.idle=2s\n"
+    "2026-10-05 10:27:14.913Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+    "component=history operation=history.batch  close ✓ busy=17.0ms idle=7.08µs\n"
 )
 ANALYZE_CLOSE = (
-    f'INFO {BATCH_SPAN}:history.analyze{{component="history" operation="history.analyze"}}:'
-    " rift_mcp::history: close time.busy=1ms\n"
+    "2026-10-05 10:27:14.898Z INFO  rift_mcp::history::HistoryTask::fill_planned   "
+    "component=history operation=history.batch  ↳ history.analyze component=history "
+    "operation=history.analyze close ✓ busy=2.01ms idle=4.10µs\n"
 )
 
 
 def batch_start(pending: int) -> str:
     return (
-        f"DEBUG {BATCH_SPAN}: rift_mcp::history: history batch started "
-        f'component="history" operation="history.batch" phase="start" pending={pending}\n'
+        "2026-10-05 10:27:14.892Z DEBUG rift_mcp::history::HistoryTask::fill_planned   "
+        "component=history operation=history.batch  → history batch started "
+        f"pending={pending} phase=start\n"
     )
 
 
@@ -37,7 +45,12 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
     """The stop observer cannot start a replacement server through its proxy (#505)."""
 
     async def exercise() -> None:
-        started = 'DEBUG index capture started component="index" operation="index.build" phase="start" epoch=1\n'
+        started = (
+            "2026-10-05 10:27:17.470Z DEBUG rift_mcp::validation::run_index_supervisor_with"
+            "   component=index epoch=1 trigger=filesystem  ↳ worker.run component=worker "
+            "operation=worker.run work=filesystem index rebuild → index capture started "
+            "component=index operation=index.build epoch=1 phase=start\n"
+        )
         observed = False
 
         def read_log() -> str:
@@ -48,13 +61,22 @@ def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
             observed = True
             output = STARTUP + started
             if completed:
-                output += "INFO index.build{epoch=1}: rift_mcp::validation: close\n"
+                output += (
+                    "2026-10-05 10:27:17.487Z INFO  "
+                    "rift_mcp::validation::run_index_supervisor_with   component=index "
+                    "epoch=1 trigger=filesystem  ↳ index.build component=index "
+                    "outcome=ok close ✓ busy=18.0ms idle=19.3µs\n"
+                )
             return output
 
         def stop() -> None:
             assert observed, "the rebuild must be observed before stop"
 
         server = MagicMock(spec=Server)
+        server.started_at = ""
+        server.read_records.return_value = ""
+        server.root = Path("workspace")
+        server.log_path = Path("server.log")
         server.__enter__.return_value = server
         server.connect.side_effect = AssertionError(
             "a rebuild stop needs no proxy request"
@@ -94,6 +116,10 @@ def fill_server(tmp_path: Path, outputs: list[str]) -> MagicMock:
         return current
 
     server = MagicMock(spec=Server)
+    server.started_at = ""
+    server.read_records.return_value = ""
+    server.root = Path("workspace")
+    server.log_path = Path("server.log")
     server.__enter__.return_value = server
     server.connect.side_effect = AssertionError("a history fill needs no request")
     server.read_log.side_effect = read_log

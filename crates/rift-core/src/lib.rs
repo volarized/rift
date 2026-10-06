@@ -6,20 +6,12 @@ mod configuration;
 mod digest;
 mod identity;
 mod limits;
-mod measurement;
 mod name;
 mod path;
 mod semantic;
-mod trace;
 
 pub mod constants;
 pub mod line;
-
-/// Re-exported so [`traced!`](crate::traced!) and [`traced_async!`](crate::traced_async!)
-/// can reach `tracing`'s own span macros and types (`span!`, `Level`, `Instrument`)
-/// through `$crate::tracing`, without requiring every crate that calls either macro to
-/// import `tracing` under that exact name itself.
-pub use tracing;
 
 pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{
@@ -34,9 +26,6 @@ pub use identity::{
     encode_path, parse_symbol_identity, symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
-pub use measurement::{
-    ClockRegression, MonotonicClock, PerformanceMeasurement, SystemMonotonicClock,
-};
 pub use name::is_canonical_ascii_name;
 pub use path::{PathKind, PathViolation, ProjectPath, SourcePath};
 pub use semantic::{
@@ -68,19 +57,5 @@ macro_rules! bounded_for {
             }
             ::core::result::Result::Ok(())
         }
-    }};
-}
-
-/// Evaluates a block once and returns its value with elapsed monotonic time.
-#[macro_export]
-macro_rules! measure_elapsed {
-    ($clock:expr, $operation:expr, $body:block) => {{
-        let __rift_clock = &$clock;
-        let __rift_operation = $operation;
-        let __rift_started = $crate::MonotonicClock::now(__rift_clock);
-        let __rift_value = $body;
-        let __rift_finished = $crate::MonotonicClock::now(__rift_clock);
-        $crate::PerformanceMeasurement::between(__rift_operation, __rift_started, __rift_finished)
-            .map(|__rift_measurement| (__rift_value, __rift_measurement))
     }};
 }

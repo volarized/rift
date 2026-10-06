@@ -8,7 +8,7 @@ use std::time::Duration;
 use candle_core::{DType, Device, Tensor};
 use rift_core::ProjectPath;
 use rift_error::{RiftError, errors};
-use rift_index::{DatabasePool, WorkspaceDatabase};
+use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
 use rift_index::{LexicalIndexLimits, LexicalSearchIndex, StoredVector, VectorStore};
 use rift_ranking::{
     DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IndexDocument,
@@ -231,8 +231,10 @@ fn lexical_only_limits() -> SearchIndexLimits {
         .build()
 }
 
-fn database(root: &Path) -> PathBuf {
-    root.join("search.db")
+/// The file of database `name` in the workspace root, the state directory these suites
+/// open both databases in.
+fn database(root: &Path, name: DatabaseName) -> PathBuf {
+    name.path(root)
 }
 
 fn model_source(root: &Path, name: &str) -> Fallible<ModelSource> {
@@ -292,7 +294,7 @@ fn acquisition_limits() -> AcquisitionLimits {
 }
 
 async fn opened(root: &Path, limits: SearchIndexLimits) -> Fallible<SearchIndex> {
-    Ok(SearchIndex::open(&database(root), limits).await?)
+    Ok(SearchIndex::open(root, limits).await?)
 }
 
 /// One index with its encoder loaded from the workspace's own model.
@@ -352,7 +354,12 @@ fn digest_of(declaration: &Declaration<'_>) -> String {
 }
 
 async fn store(root: &Path) -> Fallible<VectorStore> {
-    let database = WorkspaceDatabase::open(&database(root), database_pool()).await?;
+    let database = WorkspaceDatabase::open(
+        &database(root, DatabaseName::Vectors),
+        DatabaseName::Vectors,
+        database_pool(),
+    )
+    .await?;
     Ok(VectorStore::attached(database))
 }
 
@@ -401,7 +408,12 @@ async fn drop_stored_vectors(root: &Path, name: &str) -> TestResult {
 /// handle on the same database.
 async fn lexical_order(root: &Path, query: &str, limit: u32) -> Fallible<Vec<String>> {
     let index = LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database(root), database_pool()).await?,
+        WorkspaceDatabase::open(
+            &database(root, DatabaseName::Index),
+            DatabaseName::Index,
+            database_pool(),
+        )
+        .await?,
         LexicalIndexLimits::default(),
     );
     let parsed = ParsedQuery::parse(query)?;
@@ -809,6 +821,93 @@ async fn a_disabled_tier_holds_no_model_it_is_handed() -> TestResult {
         VectorReadiness::Disabled,
         "a tier the workspace turned off reports that, not a wait that never ends"
     );
+    Ok(())
+}
+
+/// With the vector ranking off, nothing opens the vectors database: a handed model, an
+/// acquisition, a whole pass, and a search leave no file and no migration lock behind.
+#[tokio::test]
+async fn a_disabled_tier_creates_no_vectors_database() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let (models, space) = local_models(root.path(), "model")?;
+    index.hold_models(models, space).await?;
+    index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    let _ranking = ranked(&index, "load config", 10).await?;
+    index
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await?;
+
+    assert!(database(root.path(), DatabaseName::Index).exists());
+    assert!(!database(root.path(), DatabaseName::Vectors).exists());
+    assert!(
+        !DatabaseName::Vectors
+            .migration_lock_path(root.path())
+            .exists()
+    );
+    Ok(())
+}
+
+/// With the vector ranking on, opening the index and writing the lexical set create no
+/// vectors database; the first vector operation creates it, and a search answers from
+/// the full-text tier before it.
+#[tokio::test]
+async fn the_first_vector_operation_creates_the_vectors_database() -> TestResult {
+    let root = workspace()?;
+    let vectors = database(root.path(), DatabaseName::Vectors);
+    let index = opened(root.path(), limits()).await?;
+    let fixture = two()?;
+    index.replace_lexical(fixture.documents(), REVISION).await?;
+    let before = ranked(&index, "load config", 10).await?;
+    assert!(input(&before, RankingInputKind::Lexical).is_ok());
+    assert!(!vectors.exists(), "no vector operation ran yet");
+
+    index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await?;
+    assert!(
+        vectors.exists(),
+        "holding a model opened the vectors database"
+    );
+    index
+        .embed_described(&fixture.described(), Embedding::Every, REVISION)
+        .await?;
+    assert_eq!(stored(root.path(), "model").await?.len(), 2);
+    index
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await?;
+    Ok(())
+}
+
+/// A vectors database that refuses to open leaves the next vector operation to open it,
+/// and the full-text tier answers meanwhile.
+#[tokio::test]
+async fn a_refused_vectors_database_opens_at_the_next_vector_operation() -> TestResult {
+    let root = workspace()?;
+    let vectors = database(root.path(), DatabaseName::Vectors);
+    std::fs::create_dir(&vectors)?;
+    let index = opened(root.path(), limits()).await?;
+    let fixture = two()?;
+    index.replace_lexical(fixture.documents(), REVISION).await?;
+
+    let refused = index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await
+        .expect_err("a directory at the vectors path refuses the open");
+    assert_eq!(refused.slug(), errors::index::database_failed::SLUG);
+    let answered = ranked(&index, "load config", 10).await?;
+    assert!(input(&answered, RankingInputKind::Lexical).is_ok());
+
+    std::fs::remove_dir(&vectors)?;
+    index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    assert_eq!(stored(root.path(), "model").await?.len(), 2);
     Ok(())
 }
 
@@ -1485,10 +1584,11 @@ async fn a_store_bound_keeps_its_registry_identity_and_its_limit_evidence() -> T
 #[tokio::test]
 async fn opening_a_store_that_cannot_be_created_is_refused() -> TestResult {
     let root = tempfile::tempdir()?;
+    std::fs::create_dir(database(root.path(), DatabaseName::Index))?;
     let error = SearchIndex::open(root.path(), limits())
         .await
         .expect_err("a directory is not a database file");
-    assert_eq!(error.slug(), errors::index::lexical_storage::SLUG);
+    assert_eq!(error.slug(), errors::index::database_failed::SLUG);
     Ok(())
 }
 
@@ -1515,8 +1615,22 @@ async fn a_rank_for_a_tree_the_store_moved_past_names_the_stored_revision() -> T
 async fn a_rank_that_meets_a_held_pool_names_the_missing_connection() -> TestResult {
     let root = workspace()?;
     let one_slot = DatabasePool::new(1, 100);
-    let database = WorkspaceDatabase::open(&database(root.path()), one_slot).await?;
-    let index = SearchIndex::attached(std::sync::Arc::clone(&database), lexical_only_limits())?;
+    let database = WorkspaceDatabase::open(
+        &database(root.path(), DatabaseName::Index),
+        DatabaseName::Index,
+        one_slot,
+    )
+    .await?;
+    let vectors = LazyDatabase::new(
+        &DatabaseName::Vectors.path(root.path()),
+        DatabaseName::Vectors,
+        None,
+    );
+    let index = SearchIndex::attached(
+        std::sync::Arc::clone(&database),
+        std::sync::Arc::new(vectors),
+        lexical_only_limits(),
+    )?;
     let held = database.hold_connection().await?;
 
     let parsed = ParsedQuery::parse("load config")?;
@@ -1524,7 +1638,16 @@ async fn a_rank_that_meets_a_held_pool_names_the_missing_connection() -> TestRes
         .rank(REVISION, &parsed, QueryPhase::Precise, 10)
         .await
         .expect_err("a rank that meets no free slot refuses");
-    assert_eq!(refused.slug(), errors::index::lexical_storage::SLUG);
+    assert_eq!(refused.slug(), errors::index::database_failed::SLUG);
+    assert_eq!(
+        refused
+            .context()
+            .find(|(key, _)| *key == "database")
+            .map(|(_, value)| value)
+            .as_deref(),
+        Some("index"),
+        "the refused checkout names its database"
+    );
     assert!(std::error::Error::source(&refused).is_some());
 
     drop(held);
@@ -1751,4 +1874,22 @@ async fn the_full_text_ranking_reports_the_bound_it_stopped_at() -> TestResult {
         "every match was ranked, so nothing was cut"
     );
     Ok(())
+}
+
+/// The vector tier attaches to the vectors database alone; a handle on another database
+/// is a programming error, and the panic names the database the handle opens.
+#[tokio::test]
+#[should_panic(expected = "the vector tier attaches to the vectors database: name=Index")]
+async fn a_vector_tier_attached_to_another_database_panics_naming_it() {
+    let root = workspace().expect("a workspace");
+    let path = database(root.path(), DatabaseName::Index);
+    let opened = WorkspaceDatabase::open(&path, DatabaseName::Index, database_pool()).await;
+    let database = opened.expect("the index database opens");
+    let wrong = LazyDatabase::new(&path, DatabaseName::Index, None);
+
+    drop(SearchIndex::attached(
+        database,
+        std::sync::Arc::new(wrong),
+        lexical_only_limits(),
+    ));
 }

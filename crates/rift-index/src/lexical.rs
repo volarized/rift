@@ -53,16 +53,17 @@ use toasty::migration::{MigrationFile, MigrationSet};
 use toasty::stmt::{IntoInsert, Type, Value};
 
 use crate::change_set::{FileDigest, WorkspaceDigests};
-use crate::database::WorkspaceDatabase;
+use crate::database::{DatabaseName, WorkspaceDatabase};
 use crate::trigram_store::{PatternCandidates, TrigramBatch};
 
-/// Returns whether one lexical storage error failed to obtain a pooled connection.
+/// Returns whether one storage error failed to obtain a pooled connection: a checkout
+/// refusal names its database through `index.database_failed`.
 ///
 /// Other storage errors remain refusals. Callers may skip this read only when the
 /// connection pool itself could not serve it.
 #[must_use]
 pub fn is_connection_unavailable(error: &RiftError) -> bool {
-    if error.slug() != errors::index::lexical_storage::SLUG {
+    if error.slug() != errors::index::database_failed::SLUG {
         return false;
     }
     std::error::Error::source(error)
@@ -90,168 +91,14 @@ const LEXICAL_INSERT_ROWS_MAX: usize = 64;
 /// Primary key of the single `lexical_index_state` row this adapter maintains.
 const LEXICAL_INDEX_STATE_ID: i64 = 1;
 
-const MIGRATION_FILES: &[MigrationFile] = &[
-    MigrationFile::new(
-        1,
-        "lexical_schema",
-        "CREATE TABLE lexical_units(
-        identity TEXT PRIMARY KEY NOT NULL,
-        path TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        name TEXT,
-        byte_length BIGINT NOT NULL,
-        content TEXT NOT NULL
-    )
--- #[toasty::breakpoint]
-CREATE TABLE lexical_index_state(
-        id BIGINT PRIMARY KEY NOT NULL,
-        tree_revision TEXT NOT NULL
-    )
--- #[toasty::breakpoint]
-CREATE VIRTUAL TABLE lexical_units_fts USING fts5(identity UNINDEXED, name, content)",
-    ),
-    MigrationFile::new(
-        2,
-        "semantic_vectors",
-        "CREATE TABLE semantic_vectors(
-        identity TEXT PRIMARY KEY NOT NULL,
-        model TEXT NOT NULL,
-        digest TEXT NOT NULL,
-        dimension BIGINT NOT NULL,
-        vector BLOB NOT NULL
-    )
--- #[toasty::breakpoint]
-CREATE INDEX semantic_vectors_model ON semantic_vectors(model)",
-    ),
-    MigrationFile::new(
-        3,
-        "lexical_units_path",
-        "CREATE INDEX lexical_units_path ON lexical_units(path)",
-    ),
-    MigrationFile::new(
-        4,
-        "log_records",
-        "CREATE TABLE log_records(
-        id BIGINT PRIMARY KEY NOT NULL,
-        recorded_at BIGINT NOT NULL,
-        level TEXT NOT NULL,
-        target TEXT NOT NULL,
-        component TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        message TEXT NOT NULL,
-        fields TEXT NOT NULL
-    )
--- #[toasty::breakpoint]
-CREATE INDEX log_records_level ON log_records(level)
--- #[toasty::breakpoint]
-CREATE INDEX log_records_component ON log_records(component)",
-    ),
-    MigrationFile::new(
-        5,
-        "lexical_documents",
-        "DROP TABLE lexical_units_fts
--- #[toasty::breakpoint]
-DROP TABLE lexical_units
--- #[toasty::breakpoint]
-CREATE TABLE lexical_documents(
-        identity TEXT PRIMARY KEY NOT NULL,
-        path TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        digest TEXT NOT NULL,
-        byte_length BIGINT NOT NULL,
-        name TEXT,
-        qualified_name TEXT,
-        identifier_terms TEXT,
-        signature TEXT,
-        documentation TEXT,
-        declaration_source TEXT,
-        file_content TEXT
-    )
--- #[toasty::breakpoint]
-CREATE INDEX lexical_documents_path ON lexical_documents(path)
--- #[toasty::breakpoint]
-CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(identity UNINDEXED, name, \
-qualified_name, identifier_terms, signature, documentation, declaration_source, \
-file_content, tokenize='unicode61 remove_diacritics 0')
--- #[toasty::breakpoint]
-ALTER TABLE lexical_index_state ADD COLUMN corpus_revision TEXT NOT NULL DEFAULT ''",
-    ),
-    MigrationFile::new(
-        6,
-        "documentation_metadata",
-        "CREATE TABLE documentation_manifest(id BIGINT PRIMARY KEY NOT NULL, payload TEXT NOT NULL)
--- #[toasty::breakpoint]
-CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL, position BIGINT NOT NULL)
--- #[toasty::breakpoint]
-CREATE INDEX documentation_references_target ON documentation_references(target)",
-    ),
-    MigrationFile::new(
-        7,
-        "lexical_rows",
-        "DROP TABLE lexical_documents_fts
--- #[toasty::breakpoint]
-DROP TABLE lexical_documents
--- #[toasty::breakpoint]
-DROP TABLE lexical_index_state
--- #[toasty::breakpoint]
-CREATE TABLE lexical_documents(
-        id INTEGER PRIMARY KEY,
-        identity TEXT NOT NULL UNIQUE,
-        path TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        digest TEXT NOT NULL,
-        byte_length BIGINT NOT NULL,
-        name TEXT,
-        qualified_name TEXT,
-        identifier_terms TEXT,
-        signature TEXT,
-        documentation TEXT,
-        declaration_source TEXT,
-        file_content TEXT
-    )
--- #[toasty::breakpoint]
-CREATE INDEX lexical_documents_path ON lexical_documents(path)
--- #[toasty::breakpoint]
-CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(name, qualified_name, identifier_terms, \
-signature, documentation, declaration_source, file_content, content='lexical_documents', \
-content_rowid='id', tokenize='unicode61 remove_diacritics 0')
--- #[toasty::breakpoint]
-CREATE TABLE lexical_files(path TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)
--- #[toasty::breakpoint]
-CREATE TABLE lexical_index_state(
-        id BIGINT PRIMARY KEY NOT NULL,
-        tree_revision TEXT,
-        corpus_revision TEXT NOT NULL,
-        derivation_revision TEXT NOT NULL
-    )",
-    ),
-    MigrationFile::new(
-        8,
-        "documentation_sources",
-        "DROP TABLE documentation_references
--- #[toasty::breakpoint]
-DELETE FROM documentation_manifest
--- #[toasty::breakpoint]
-CREATE TABLE documentation_sources(identity TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, payload TEXT NOT NULL)
--- #[toasty::breakpoint]
-CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL)
--- #[toasty::breakpoint]
-CREATE INDEX documentation_references_target ON documentation_references(target)
--- #[toasty::breakpoint]
-CREATE INDEX documentation_references_source ON documentation_references(source)",
-    ),
-    MigrationFile::new(
-        9,
-        "lexical_one_copy",
-        "DROP TABLE lexical_documents_fts
--- #[toasty::breakpoint]
-DROP TABLE lexical_documents
--- #[toasty::breakpoint]
-DELETE FROM lexical_files
--- #[toasty::breakpoint]
-DELETE FROM lexical_index_state
--- #[toasty::breakpoint]
-CREATE TABLE lexical_documents(
+/// The schema of the index database, from its first migration.
+///
+/// The index database is a file of its own: the vector rows live in the vectors database
+/// and the log records in the metrics database, each with a migration record of its own.
+const INDEX_MIGRATION_FILES: &[MigrationFile] = &[MigrationFile::new(
+    1,
+    "index_schema",
+    "CREATE TABLE lexical_documents(
         id INTEGER PRIMARY KEY,
         identity TEXT NOT NULL UNIQUE,
         path TEXT NOT NULL,
@@ -275,25 +122,36 @@ CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(name, qualified_name, iden
 signature, documentation, file_content, content='lexical_documents', content_rowid='id', \
 tokenize='unicode61 remove_diacritics 0')
 -- #[toasty::breakpoint]
-CREATE VIRTUAL TABLE lexical_documents_vocabulary USING fts5vocab('lexical_documents_fts', 'col')",
-    ),
-    MigrationFile::new(
-        10,
-        "trigram_index",
-        "CREATE VIRTUAL TABLE lexical_documents_trigram USING fts5(file_content, \
+CREATE VIRTUAL TABLE lexical_documents_vocabulary USING fts5vocab('lexical_documents_fts', 'col')
+-- #[toasty::breakpoint]
+CREATE VIRTUAL TABLE lexical_documents_trigram USING fts5(file_content, \
 content='lexical_documents', content_rowid='id', tokenize='trigram', detail='none', \
 columnsize=0)
 -- #[toasty::breakpoint]
-INSERT INTO lexical_documents_trigram(rowid, file_content) \
-SELECT id, file_content FROM lexical_documents WHERE file_content IS NOT NULL",
-    ),
-    MigrationFile::new(
-        11,
-        "trigram_pending",
-        "CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)",
-    ),
-];
-pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
+CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_files(path TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_index_state(
+        id BIGINT PRIMARY KEY NOT NULL,
+        tree_revision TEXT,
+        corpus_revision TEXT NOT NULL,
+        derivation_revision TEXT NOT NULL
+    )
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_manifest(id BIGINT PRIMARY KEY NOT NULL, payload TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_sources(identity TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, payload TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_target ON documentation_references(target)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_source ON documentation_references(source)",
+)];
+/// The index database's migration set; Toasty records it in the file's own
+/// `__toasty_migrations` table.
+pub(crate) const INDEX_MIGRATIONS: MigrationSet = MigrationSet::new(INDEX_MIGRATION_FILES);
 
 /// What one revision-qualified read of the store found.
 ///
@@ -1240,9 +1098,9 @@ async fn ranked_rows(
 ///
 /// One `bm25` call ranks the row and one more per column proves which columns
 /// carried a member. FTS5 evaluates an auxiliary function per candidate row,
-/// so the answer costs eight evaluations where it used to cost one; the
-/// `matches_max` bound is what keeps that bounded, and what it buys is a
-/// `matched_by` a reader can act on.
+/// so each candidate row costs one `bm25` evaluation for its rank and one per
+/// column of `SearchableField::ALL`; the `matches_max` bound keeps that
+/// bounded, and what it buys is a `matched_by` a reader can act on.
 fn lexical_search_sql() -> String {
     let ranked = rank_weights();
     let mut isolated = String::new();
@@ -1570,13 +1428,19 @@ pub struct LexicalSearchIndex {
 }
 
 impl LexicalSearchIndex {
-    /// Attaches the lexical tier to one already-open workspace database.
+    /// Attaches the lexical tier to the open index database.
     ///
-    /// The pool is shared with every other store in the file, because `SQLite`
-    /// serializes writers per file: a second pool would only add a connection
+    /// The pool is shared with the documentation and trigram stores in the file, because
+    /// `SQLite` serializes writers per file: a second pool would only add a connection
     /// that loses the same write lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `database` is not the index database: its file holds no lexical table.
     #[must_use]
+    #[track_caller]
     pub fn attached(database: Arc<WorkspaceDatabase>, limits: LexicalIndexLimits) -> Self {
+        database.name().assert_is(DatabaseName::Index);
         Self { database, limits }
     }
 
@@ -1788,34 +1652,39 @@ impl LexicalSearchIndex {
         documentation: DocumentationWrite,
     ) -> Result<(), RiftError> {
         let limits = self.limits;
-        rift_core::traced_async!(
+        let mode = units.mode();
+        let documents = units.inserted().len();
+        rift_tracing::traced!(
             component = "lexical",
             operation = "lexical.commit",
-            mode = units.mode(),
-            {
-                let mut access = rift_core::traced_async!(
+            open = true,
+            mode = mode,
+            async move {
+                let mut access = rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.write_turn",
-                    { self.database.writing().await }
+                    async move { self.database.writing().await }
                 )
                 .await?;
                 let mut transaction = access.transaction().await?;
 
                 let executor = &mut transaction;
-                rift_core::traced_async!(
+                rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.documents",
-                    documents = units.inserted().len(),
-                    { units.write(executor, limits).await }
+                    documents = documents,
+                    async move { units.write(executor, limits).await }
                 )
                 .await?;
 
                 if let DocumentationWrite::Replaced(metadata) = documentation {
                     let executor = &mut transaction;
-                    rift_core::traced_async!(
+                    rift_tracing::traced!(
                         component = "lexical",
                         operation = "lexical.documentation",
-                        { crate::documentation_store::replace(executor, metadata.as_ref()).await }
+                        async move {
+                            crate::documentation_store::replace(executor, metadata.as_ref()).await
+                        }
                     )
                     .await?;
                 }
@@ -1902,15 +1771,16 @@ impl LexicalSearchIndex {
         // One row past the bound tells whether the store holds a match the bound cuts.
         let probe_limit = i64::from(bound) + 1;
 
-        rift_core::traced_async!(
+        let phase_label = phase.label();
+        rift_tracing::traced!(
             component = "lexical",
             operation = "lexical.search",
-            phase = phase.label(),
-            {
-                let mut connection = rift_core::traced_async!(
+            phase = phase_label,
+            async move {
+                let mut connection = rift_tracing::traced!(
                     component = "lexical",
                     operation = "lexical.connection",
-                    { self.database.connection().await }
+                    async move { self.database.connection().await }
                 )
                 .await?;
                 let mut transaction = connection
@@ -1918,11 +1788,12 @@ impl LexicalSearchIndex {
                     .await
                     .map_err(|source| errors::index::lexical_storage().source(source).error())?;
                 let stamp_reader = &mut transaction;
-                let stored =
-                    rift_core::traced_async!(component = "lexical", operation = "lexical.stamp", {
-                        stored_stamp(stamp_reader).await
-                    })
-                    .await?;
+                let stored = rift_tracing::traced!(
+                    component = "lexical",
+                    operation = "lexical.stamp",
+                    async move { stored_stamp(stamp_reader).await }
+                )
+                .await?;
                 if let Some(scoped) = stamp_scope(stored, tree_revision) {
                     return Ok(scoped);
                 }
@@ -1933,11 +1804,12 @@ impl LexicalSearchIndex {
                     )));
                 };
                 let query_reader = &mut transaction;
-                let matches =
-                    rift_core::traced_async!(component = "lexical", operation = "lexical.query", {
-                        ranked_rows(query_reader, expression, probe_limit).await
-                    })
-                    .await?;
+                let matches = rift_tracing::traced!(
+                    component = "lexical",
+                    operation = "lexical.query",
+                    async move { ranked_rows(query_reader, expression, probe_limit).await }
+                )
+                .await?;
                 Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
                     matches, bound,
                 )))
@@ -2050,17 +1922,22 @@ impl LexicalSearchIndex {
     pub async fn index_trigrams(&self) -> Result<TrigramBatch, RiftError> {
         let rows_max = self.limits.transaction_units_max();
         let bytes_max = u64::try_from(self.limits.transaction_bytes_max()).unwrap_or(u64::MAX);
-        rift_core::traced_async!(component = "lexical", operation = "lexical.trigrams", {
-            let mut access = self.database.writing().await?;
-            let mut transaction = access.transaction().await?;
-            let batch =
-                crate::trigram_store::index_batch(&mut transaction, rows_max, bytes_max).await?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-            Ok(batch)
-        })
+        rift_tracing::traced!(
+            component = "lexical",
+            operation = "lexical.trigrams",
+            async move {
+                let mut access = self.database.writing().await?;
+                let mut transaction = access.transaction().await?;
+                let batch =
+                    crate::trigram_store::index_batch(&mut transaction, rows_max, bytes_max)
+                        .await?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+                Ok(batch)
+            }
+        )
         .await
     }
 
@@ -2245,12 +2122,13 @@ impl IndexReader for PublishedIndex<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexLimits,
-        LexicalIndexStateRecord, LexicalMatch, LexicalRanking, LexicalSearchIndex, MIGRATION_FILES,
-        checked_byte_length, checked_byte_offset, decode_document, decode_lexical_match,
-        decode_recorded, is_connection_unavailable, isolated_weights, lexical_search_column_types,
-        lexical_search_sql, matched_fields, project_location, rank_weights, require_pragma_row,
-        searchable_columns, validate_indexed_count, validate_lexical_units,
+        INDEX_MIGRATION_FILES, LexicalChange, LexicalDocumentRecord, LexicalFileRecord,
+        LexicalIndexLimits, LexicalIndexStateRecord, LexicalMatch, LexicalRanking,
+        LexicalSearchIndex, checked_byte_length, checked_byte_offset, decode_document,
+        decode_lexical_match, decode_recorded, is_connection_unavailable, isolated_weights,
+        lexical_search_column_types, lexical_search_sql, matched_fields, project_location,
+        rank_weights, require_pragma_row, searchable_columns, validate_indexed_count,
+        validate_lexical_units,
     };
     use crate::trigram_store::TRIGRAM_ROWS;
     use rift_core::{ProjectPath, SourceUnitId};
@@ -2519,17 +2397,26 @@ mod tests {
 
     #[test]
     fn connection_unavailable_requires_toasty_pool_error() {
-        let pooled = errors::index::lexical_storage()
+        let path = std::path::Path::new(".rift/index");
+        let pooled = crate::DatabaseName::Index.failed(
+            path,
+            toasty::Error::connection_pool(std::io::Error::other("pool exhausted")),
+        );
+        assert!(is_connection_unavailable(&pooled));
+
+        let storage =
+            crate::DatabaseName::Index.failed(path, std::io::Error::other("disk unavailable"));
+        assert!(!is_connection_unavailable(&storage));
+
+        let lexical = errors::index::lexical_storage()
             .source(toasty::Error::connection_pool(std::io::Error::other(
                 "pool exhausted",
             )))
             .error();
-        assert!(is_connection_unavailable(&pooled));
-
-        let storage = errors::index::lexical_storage()
-            .source(std::io::Error::other("disk unavailable"))
-            .error();
-        assert!(!is_connection_unavailable(&storage));
+        assert!(
+            !is_connection_unavailable(&lexical),
+            "a pool checkout names its database; lexical code raises no pool refusal"
+        );
     }
 
     #[test]
@@ -2544,7 +2431,7 @@ mod tests {
 
     #[test]
     fn test_the_corpus_migration_declares_the_columns_in_the_order_bm25_weighs_them() {
-        let sql = rows_migration_sql();
+        let sql = index_statement("CREATE VIRTUAL TABLE lexical_documents_fts ");
         // `bm25`'s weights are positional, and the weight list is generated from
         // `SearchableField::ALL` while this declaration is written by hand. Asserting
         // that each name appears somewhere would pass on a reordered declaration,
@@ -2576,7 +2463,7 @@ mod tests {
 
     #[test]
     fn test_the_typed_table_holds_every_column_the_index_reads_by_name() {
-        let sql = rows_migration_sql();
+        let sql = index_statement("CREATE TABLE lexical_documents(");
         let typed = sql
             .split_once("CREATE TABLE lexical_documents(")
             .and_then(|(_, rest)| rest.split_once(')'))
@@ -2603,27 +2490,29 @@ mod tests {
         );
     }
 
-    /// The migration that declares the current rowid-addressed corpus, as one line.
-    fn rows_migration_sql() -> String {
-        MIGRATION_FILES
-            .iter()
-            .find(|file| file.name() == "lexical_one_copy")
-            .expect("the corpus migration must exist")
+    /// The index migration's one statement that starts with `prefix`, as one line.
+    fn index_statement(prefix: &str) -> String {
+        let [migration] = INDEX_MIGRATION_FILES else {
+            panic!("the index database has one migration");
+        };
+        let statements: Vec<&str> = migration
             .sql()
-            .replace('\n', " ")
+            .split("-- #[toasty::breakpoint]")
+            .map(str::trim)
+            .filter(|statement| statement.starts_with(prefix))
+            .collect();
+        let [statement] = statements.as_slice() else {
+            panic!("one statement must start with {prefix}: {statements:?}");
+        };
+        statement.replace('\n', " ")
     }
 
     /// The trigram index is declared over the file text alone, under the tokenizer the
-    /// prefilter's trigram rule ports, and the migration fills it from exactly the rows
-    /// every later write indexes.
+    /// prefilter's trigram rule ports, and the file-row index selects exactly the rows
+    /// every write indexes.
     #[test]
-    fn test_the_trigram_migration_indexes_the_file_rows_under_the_ported_tokenizer() {
-        let sql = MIGRATION_FILES
-            .iter()
-            .find(|file| file.name() == "trigram_index")
-            .expect("the trigram migration must exist")
-            .sql()
-            .replace('\n', " ");
+    fn test_the_trigram_index_holds_the_file_rows_under_the_ported_tokenizer() {
+        let sql = index_statement("CREATE VIRTUAL TABLE lexical_documents_trigram ");
         let declared = sql
             .split_once("USING fts5(")
             .and_then(|(_, rest)| rest.split_once(')'))
@@ -2639,23 +2528,19 @@ mod tests {
         ] {
             assert!(declared.contains(&clause), "{clause} in {declared}");
         }
+        let file_rows = index_statement("CREATE INDEX lexical_documents_file_rows ");
         assert!(
-            sql.ends_with(&format!("WHERE {TRIGRAM_ROWS}")),
-            "the fill selects the rows every write indexes: {sql}"
+            file_rows.ends_with(&format!("WHERE {TRIGRAM_ROWS}")),
+            "the file-row index selects the rows every write indexes: {file_rows}"
         );
     }
 
     /// The rows the trigram index lacks are filed by id alone, so a row id is all the
     /// pending set records and the typed row keeps the only copy of its text.
     #[test]
-    fn test_the_pending_migration_files_rows_by_id_alone() {
-        let sql = MIGRATION_FILES
-            .iter()
-            .find(|file| file.name() == "trigram_pending")
-            .expect("the pending migration must exist")
-            .sql();
+    fn test_the_pending_table_files_rows_by_id_alone() {
         assert_eq!(
-            sql,
+            index_statement("CREATE TABLE lexical_trigram_pending("),
             "CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)"
         );
     }
@@ -2956,6 +2841,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;

@@ -6,6 +6,7 @@ import difflib
 import json
 import pathlib
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from rift_dev.commands import CargoCommand
@@ -24,11 +25,14 @@ EXPECTED_EDGES = {
     "rift -> rift-search",
     "rift -> rift-server",
     "rift -> rift-syntax",
+    "rift -> rift-tracing",
     "rift-cloud-client -> rift-core",
     "rift-cloud-client -> rift-protocol",
     "rift-cloud-client -> rift-ranking",
+    "rift-cloud-client -> rift-tracing",
     "rift-core -> rift-protocol",
     "rift-core -> rift-error",
+    "rift-error -> rift-error-macros",
     "rift-error-codegen -> rift-error",
     "rift-dependency -> rift-core",
     "rift-dependency -> rift-protocol",
@@ -38,6 +42,7 @@ EXPECTED_EDGES = {
     "rift-history-store -> rift-error",
     "rift-history-store -> rift-protocol",
     "rift-history-store -> rift-ranking",
+    "rift-history-store -> rift-tracing",
     "rift-analysis -> rift-core",
     "rift-analysis -> rift-error",
     "rift-cloud-client -> rift-analysis",
@@ -53,6 +58,7 @@ EXPECTED_EDGES = {
     "rift-index -> rift-ranking",
     "rift-index -> rift-syntax",
     "rift-index -> rift-error",
+    "rift-index -> rift-tracing",
     "rift-lsp -> rift-core",
     "rift-lsp -> rift-error",
     "rift-lsp -> rift-provider",
@@ -68,6 +74,7 @@ EXPECTED_EDGES = {
     "rift-mcp -> rift-ranking",
     "rift-mcp -> rift-search",
     "rift-mcp -> rift-server",
+    "rift-mcp -> rift-tracing",
     "rift-provider -> rift-core",
     "rift-provider -> rift-error",
     "rift-provider -> rift-protocol",
@@ -77,6 +84,7 @@ EXPECTED_EDGES = {
     "rift-search -> rift-index",
     "rift-search -> rift-ranking",
     "rift-search -> rift-error",
+    "rift-search -> rift-tracing",
     "rift-schema-export -> rift-analysis",
     "rift-schema-export -> rift-cloud-client",
     "rift-schema-export -> rift-core",
@@ -94,10 +102,16 @@ EXPECTED_EDGES = {
     "rift-server -> rift-ranking",
     "rift-server -> rift-search",
     "rift-server -> rift-syntax",
+    "rift-server -> rift-tracing",
     "rift-syntax -> rift-core",
     "rift-syntax -> rift-error",
     "rift-syntax -> rift-protocol",
     "rift-syntax -> rift-provider",
+    "rift-syntax -> rift-tracing",
+    "rift-tracing -> rift-error",
+    "rift-tracing -> rift-tracing-macros",
+    # Development edge only: the attribute's suite compiles against rift-tracing renamed.
+    "rift-tracing-macros -> rift-tracing",
 }
 
 
@@ -236,8 +250,514 @@ def fail_storage_independence() -> None:
         )
 
 
+# The ownership check names who may import a tracing, logging, metrics, or
+# resource-sampling backend. Only `rift-tracing` may; every other workspace
+# package reaches those libraries through it. A library is identified by the
+# package name Cargo resolves, so a renamed dependency (`rename` in the
+# metadata) and a domain module that happens to be called `log` are told apart
+# from the backend. A declaration counts on its own, even with no import, so a
+# backend line left in a manifest fails the check as well.
+TRACING_OWNER = "rift-tracing"
+TRACING_FIXTURES = "fixtures"
+BACKEND_PACKAGES = frozenset(
+    {
+        "tracing",
+        "log",
+        "tracing-subscriber",
+        "tracing-opentelemetry",
+        "tracing-appender",
+        "tracing-log",
+        "env_logger",
+        "metrics",
+        "prometheus",
+        "sysinfo",
+        "tokio-metrics",
+    }
+)
+BACKEND_PREFIXES = ("opentelemetry",)
+FACADE_ALIAS = re.compile(r"\brift_tracing\b[^;{}]*?\bas\s+(tracing|log)\b")
+# `rift_tracing::__private` and the `__rift_*` helper macros are what the exported
+# macros expand to; a caller naming them directly depends on expansion details.
+FACADE_HIDDEN = re.compile(r"\brift_tracing\s*::\s*(?:\{[^;]*?)?\b(__\w+)")
+CODE_FENCE = re.compile(r"^\s*//[/!]\s*```")
+DEPENDENCY_SECTION = re.compile(
+    r"^\[(?:target\.(?:'[^']*'|\"[^\"]*\"|[^.\]]+)\.)?"
+    r"(dependencies|dev-dependencies|build-dependencies)(?:\.([^\]]+))?\]\s*$"
+)
+SECTION_KINDS = {
+    "dependencies": None,
+    "dev-dependencies": "dev",
+    "build-dependencies": "build",
+}
+INSTEAD = {
+    "tracing": (
+        "use the rift_tracing facade: traced!, measure_elapsed!, info_span!, "
+        "debug_span!, Span, and trace! through error!"
+    ),
+    "tracing-subscriber": (
+        "install through rift_tracing::TracingRuntime, and capture in tests "
+        "through rift_tracing::ScopedRecorder"
+    ),
+    "rift-tracing alias": "import rift_tracing under its own name",
+}
+INSTEAD_OPENTELEMETRY = "export through rift-tracing, which owns the OTLP export"
+INSTEAD_OTHER = "reach the library through rift-tracing"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnershipFinding:
+    """One line outside `rift-tracing` that reaches a backend library."""
+
+    package: str
+    library: str
+    path: str
+    line: int
+    text: str
+
+
+def is_backend(package_name: str) -> bool:
+    """Whether Cargo package `package_name` is a backend library the facade owns."""
+    return package_name in BACKEND_PACKAGES or package_name.startswith(BACKEND_PREFIXES)
+
+
+def instead(library: str) -> str:
+    """What a package outside `rift-tracing` uses in place of `library`."""
+    if library.startswith(BACKEND_PREFIXES):
+        return INSTEAD_OPENTELEMETRY
+    return INSTEAD.get(library, INSTEAD_OTHER)
+
+
+def backend_names(package: dict[str, Any]) -> dict[str, str]:
+    """Map each local identifier a package imports a backend by to the library behind it.
+
+    A dependency of any kind (normal, development, build, optional, target
+    conditional) counts, and `rename` is the identifier the source uses, so
+    `tracing_crate = { package = "tracing" }` is found under `tracing_crate`.
+    """
+    names: dict[str, str] = {}
+    for dependency in package["dependencies"]:
+        if is_backend(dependency["name"]):
+            local = (dependency.get("rename") or dependency["name"]).replace("-", "_")
+            names[local] = dependency["name"]
+    return names
+
+
+def rust_code_lines(text: str) -> list[tuple[int, str]]:
+    """Return the lines that are code, with doctest bodies and without prose comments.
+
+    A plain comment and doc prose never import anything. A doc comment's fenced
+    block is a doctest that compiles, so its lines count.
+    """
+    lines: list[tuple[int, str]] = []
+    fenced = False
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith(("///", "//!")):
+            if CODE_FENCE.match(line):
+                fenced = not fenced
+            elif fenced:
+                lines.append((number, stripped[3:]))
+        elif stripped.startswith("//"):
+            continue
+        else:
+            fenced = False
+            lines.append((number, line))
+    return lines
+
+
+def rust_sources(package: dict[str, Any]) -> list[pathlib.Path]:
+    """Return every Rust file under one package's directory, build output excluded."""
+    root = pathlib.Path(package["manifest_path"]).parent
+    return [
+        path
+        for path in sorted(root.rglob("*.rs"))
+        if path.relative_to(root).parts[0] != "target"
+    ]
+
+
+def hidden_facade_findings(
+    package: dict[str, Any], path: pathlib.Path, code: list[tuple[int, str]]
+) -> list[OwnershipFinding]:
+    """List each path into `rift-tracing`'s expansion machinery.
+
+    The code lines are searched as one text, so a `use rift_tracing::{...}` group
+    spanning several lines is found at the line naming the hidden item.
+    """
+    joined = "\n".join(line for _, line in code)
+    starts = [0]
+    for _, line in code:
+        starts.append(starts[-1] + len(line) + 1)
+    findings = []
+    for match in FACADE_HIDDEN.finditer(joined):
+        index = max(
+            position for position, start in enumerate(starts) if start <= match.start(1)
+        )
+        number, line = code[index]
+        findings.append(
+            OwnershipFinding(
+                package["name"],
+                f"rift_tracing::{match.group(1)}",
+                str(path),
+                number,
+                line.strip(),
+            )
+        )
+    return findings
+
+
+def package_findings(package: dict[str, Any]) -> list[OwnershipFinding]:
+    """List every backend import in the Rust files under one package's directory."""
+    names = backend_names(package)
+    patterns = [
+        (
+            library,
+            re.compile(
+                rf"(?<![\w:.]){re.escape(local)}\b(?=\s*::|\s*;|\s+as\b)"
+                rf"|\bextern\s+crate\s+{re.escape(local)}\b"
+            ),
+        )
+        for local, library in names.items()
+    ]
+    findings: list[OwnershipFinding] = []
+    for path in rust_sources(package):
+        code = rust_code_lines(path.read_text(encoding="utf-8"))
+        for number, line in code:
+            hits = {library for library, pattern in patterns if pattern.search(line)}
+            if FACADE_ALIAS.search(line):
+                hits.add("rift-tracing alias")
+            findings.extend(
+                OwnershipFinding(
+                    package["name"], library, str(path), number, line.strip()
+                )
+                for library in sorted(hits)
+            )
+        findings.extend(hidden_facade_findings(package, path, code))
+    return findings
+
+
+def ownership_findings(packages: list[dict[str, Any]]) -> list[OwnershipFinding]:
+    """List backend imports in every workspace package except `rift-tracing`."""
+    return [
+        finding
+        for package in packages
+        if package["name"] != TRACING_OWNER
+        for finding in package_findings(package)
+    ]
+
+
+def manifest_line(manifest: str, kind: str | None, key: str) -> tuple[int, str]:
+    """Locate the line declaring dependency `key` in a section of `kind`.
+
+    Both spellings count: `key = ...` or `key.workspace = true` under a
+    `[dependencies]`-shaped header, and a `[dependencies.key]` table header.
+    Returns `(0, "")` when no line matches.
+    """
+    entry = re.compile(rf"^\s*\"?{re.escape(key)}\"?\s*(?:=|\.)")
+    inside = False
+    for number, line in enumerate(manifest.splitlines(), 1):
+        header = DEPENDENCY_SECTION.match(line.strip())
+        if header:
+            matches_kind = SECTION_KINDS[header.group(1)] == kind
+            if matches_kind and header.group(2) == key:
+                return (number, line.strip())
+            inside = matches_kind and header.group(2) is None
+        elif line.lstrip().startswith("["):
+            inside = False
+        elif inside and entry.match(line):
+            return (number, line.strip())
+    return (0, "")
+
+
+def section_name(dependency: dict[str, Any]) -> str:
+    """The manifest table a dependency is declared in, as Cargo spells it."""
+    table = {
+        None: "dependencies",
+        "dev": "dev-dependencies",
+        "build": "build-dependencies",
+    }[dependency["kind"]]
+    if dependency.get("target"):
+        return f"target.'{dependency['target']}'.{table}"
+    return table
+
+
+def declaration_findings(package: dict[str, Any]) -> list[OwnershipFinding]:
+    """List each backend dependency a package declares, in any table, used or not."""
+    manifest_path = pathlib.Path(package["manifest_path"])
+    manifest = manifest_path.read_text(encoding="utf-8")
+    findings = []
+    for dependency in package["dependencies"]:
+        if not is_backend(dependency["name"]):
+            continue
+        key = dependency.get("rename") or dependency["name"]
+        number, line = manifest_line(manifest, dependency["kind"], key)
+        findings.append(
+            OwnershipFinding(
+                package["name"],
+                dependency["name"],
+                str(manifest_path),
+                number,
+                line or f"[{section_name(dependency)}] {key}",
+            )
+        )
+    return findings
+
+
+def fixtures_findings(package: dict[str, Any]) -> list[OwnershipFinding]:
+    """List each manifest entry that enables `rift-tracing`'s test recorder outside tests.
+
+    A `[dev-dependencies]` edge is the only place the `fixtures` feature belongs. A
+    normal or build edge carrying it, or a feature of the package forwarding to it,
+    compiles the recorder into a release build.
+    """
+    manifest_path = pathlib.Path(package["manifest_path"])
+    manifest = manifest_path.read_text(encoding="utf-8")
+    findings = []
+    local = TRACING_OWNER
+    for dependency in package["dependencies"]:
+        if dependency["name"] != TRACING_OWNER:
+            continue
+        key = dependency.get("rename") or dependency["name"]
+        if dependency["kind"] == "dev":
+            continue
+        local = key
+        if TRACING_FIXTURES in dependency["features"]:
+            number, line = manifest_line(manifest, dependency["kind"], key)
+            findings.append(
+                OwnershipFinding(
+                    package["name"],
+                    f"{TRACING_OWNER} {TRACING_FIXTURES} feature",
+                    str(manifest_path),
+                    number,
+                    line or f"[{section_name(dependency)}] {key}",
+                )
+            )
+    forwarded = {f"{local}/{TRACING_FIXTURES}", f"{local}?/{TRACING_FIXTURES}"}
+    for feature, enables in sorted(package.get("features", {}).items()):
+        if forwarded & set(enables):
+            entry = re.compile(rf"^\s*\"?{re.escape(feature)}\"?\s*=")
+            number, line = next(
+                (
+                    (number, line.strip())
+                    for number, line in enumerate(manifest.splitlines(), 1)
+                    if entry.match(line) and TRACING_FIXTURES in line
+                ),
+                (0, f"[features] {feature}"),
+            )
+            findings.append(
+                OwnershipFinding(
+                    package["name"],
+                    f"{TRACING_OWNER} {TRACING_FIXTURES} feature",
+                    str(manifest_path),
+                    number,
+                    line,
+                )
+            )
+    return findings
+
+
+def resolved_fixtures() -> str:
+    """Return the inverted normal and build graph of `rift-tracing` on every target.
+
+    The manifest check reads one package at a time; the resolved graph also shows
+    a `fixtures` feature that reaches `rift-tracing` through another crate's feature.
+    """
+    return CargoCommand(
+        "tree",
+        "--workspace",
+        "--target",
+        "all",
+        "--edges",
+        "normal,build,features",
+        "--invert",
+        TRACING_OWNER,
+    ).output()
+
+
+def ownership_complaints(packages: list[dict[str, Any]], resolved: str) -> list[str]:
+    """Name each finding the ownership check refuses, with what to use instead."""
+    complaints = []
+    consumers = [package for package in packages if package["name"] != TRACING_OWNER]
+    for finding in ownership_findings(packages):
+        location = f"{finding.package}: {finding.path}:{finding.line}: {finding.text}"
+        if finding.library.startswith("rift_tracing::__"):
+            complaints.append(
+                f"{location}: names {finding.library}, which only the "
+                "rift-tracing macros expand to; call the exported macros"
+            )
+        else:
+            complaints.append(
+                f"{location}: imports {finding.library}; {instead(finding.library)}"
+            )
+    for package in consumers:
+        for finding in declaration_findings(package):
+            complaints.append(
+                f"{finding.package}: {finding.path}:{finding.line}: {finding.text}: "
+                f"declares {finding.library}; remove the line and "
+                f"{instead(finding.library)}"
+            )
+        for finding in fixtures_findings(package):
+            complaints.append(
+                f"{finding.package}: {finding.path}:{finding.line}: {finding.text}: "
+                f"enables the {TRACING_OWNER} {TRACING_FIXTURES} feature outside "
+                f"[dev-dependencies]; enable it from [dev-dependencies] only"
+            )
+    marker = f'{TRACING_OWNER} feature "{TRACING_FIXTURES}"'
+    if marker in resolved:
+        complaints.append(
+            f"the normal or build graph resolves {marker}, so a release build carries "
+            "the test recorder; enable it from [dev-dependencies] only:\n" + resolved
+        )
+    return complaints
+
+
+def fail_ownership(packages: list[dict[str, Any]]) -> None:
+    """Refuse a backend import, a backend declaration, or a leaked test recorder."""
+    complaints = ownership_complaints(packages, resolved_fixtures())
+    if complaints:
+        raise RuntimeError(
+            f"Backend libraries are owned by {TRACING_OWNER}:\n" + "\n".join(complaints)
+        )
+
+
+# A clock read outside `rift-tracing`: a monotonic or wall-clock `now`, the Unix epoch,
+# and an elapsed read. Telemetry reads them only through `rift-tracing`; a domain
+# deadline, retry, expiry, or pacing decision keeps its own read, and it is listed here.
+CLOCK_READ = re.compile(
+    r"\b(?:Instant|SystemTime|Timestamp|Zoned)\s*::\s*now\b"
+    r"|\bUNIX_EPOCH\b"
+    r"|\.elapsed\s*\(\)"
+)
+# The reviewed inventory: path under `crates/` -> the domain decision that owns the reads.
+# Files under a `tests` directory and `tests.rs` files prove deadline and pacing
+# behavior and are allowed by path (`clock_allowed`).
+CLOCK_INVENTORY = {
+    "rift-mcp/src/server.rs": "reconciliation capture time; request admission subtracts it",
+    "rift-mcp/src/history.rs": "analysis time that enforces the configured CPU share",
+    "rift-mcp/src/election.rs": "election deadlines",
+    "rift-mcp/src/proxy.rs": "proxy startup deadlines",
+    "rift-lsp/src/session.rs": "language server readiness and idle expiry",
+    "rift-server/src/process.rs": "child-process wait deadlines",
+    "rift-cloud-client/src/lib.rs": "cache expiry and the request deadline",
+    "rift/src/update.rs": "updater cleanup deadlines",
+    "rift-index/src/database_thread.rs": (
+        "startup, queue, shutdown, and connection-reaping timers"
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ClockFinding:
+    """One clock read in a file the inventory does not list."""
+
+    package: str
+    path: str
+    line: int
+    text: str
+
+
+def is_test_source(relative: pathlib.PurePath) -> bool:
+    """Whether a path under a package is a test suite: under `tests` or named `tests.rs`."""
+    return "tests" in relative.parts[:-1] or relative.name == "tests.rs"
+
+
+def clock_allowed(package: str, relative: pathlib.PurePath) -> bool:
+    """Whether the inventory lists a file, or the file is a test suite."""
+    return f"{package}/{relative.as_posix()}" in CLOCK_INVENTORY or is_test_source(
+        relative
+    )
+
+
+def clock_findings(packages: list[dict[str, Any]]) -> list[ClockFinding]:
+    """List each clock read outside `rift-tracing` in a file the inventory omits."""
+    findings: list[ClockFinding] = []
+    for package in packages:
+        if package["name"] == TRACING_OWNER:
+            continue
+        root = pathlib.Path(package["manifest_path"]).parent
+        for path in rust_sources(package):
+            if clock_allowed(package["name"], path.relative_to(root)):
+                continue
+            code = rust_code_lines(path.read_text(encoding="utf-8"))
+            findings.extend(
+                ClockFinding(package["name"], str(path), number, line.strip())
+                for number, line in code
+                if CLOCK_READ.search(line)
+            )
+    return findings
+
+
+def fail_clocks(packages: list[dict[str, Any]]) -> None:
+    """Refuse a clock read in a file the reviewed inventory does not list."""
+    findings = clock_findings(packages)
+    if findings:
+        raise RuntimeError(
+            f"Clock reads belong to {TRACING_OWNER} or to a file listed in "
+            "CLOCK_INVENTORY:\n"
+            + "\n".join(f"{f.path}:{f.line}: {f.text}" for f in findings)
+        )
+
+
+def clock_main() -> int:
+    """Check the clock inventory over the workspace's Rust files."""
+    fail_clocks(rift_packages(cargo_metadata()))
+    return 0
+
+
+# A crate emits instruments when its shipped source declares a `const SCOPE` of type
+# `InstrumentScope` or opens an operation through `traced!` or the `#[traced]` attribute,
+# whose expansion builds the scope through `__rift_instrument_scope!`.
+SCOPE_DECLARATION = re.compile(r"\bconst\s+SCOPE\s*:[^=;]*\bInstrumentScope\b")
+SCOPE_EXPANSION = re.compile(r"\btraced\s*!\s*[({\[]|#\[\s*(?:\w+\s*::\s*)*traced\b")
+SCOPES_MAX_DECLARATION = re.compile(
+    r"\bpub\s+const\s+SCOPES_MAX\s*:\s*usize\s*=\s*(\d+)\s*;"
+)
+SCOPES_MAX_FILE = pathlib.PurePath("src/metrics.rs")
+
+
+def scopes_max(packages: list[dict[str, Any]]) -> int:
+    """Read `SCOPES_MAX` from the `rift-tracing` source that declares it."""
+    owner = next(package for package in packages if package["name"] == TRACING_OWNER)
+    path = pathlib.Path(owner["manifest_path"]).parent / SCOPES_MAX_FILE
+    match = SCOPES_MAX_DECLARATION.search(path.read_text(encoding="utf-8"))
+    if match is None:
+        raise RuntimeError(f"{path} declares no `pub const SCOPES_MAX: usize`")
+    return int(match.group(1))
+
+
+def emitting_crates(packages: list[dict[str, Any]]) -> list[str]:
+    """List the packages whose shipped Rust source defines an instrumentation scope.
+
+    A procedural macro crate writes `traced!` into the code it expands to and emits
+    nothing itself, so it is skipped.
+    """
+    emitting = []
+    for package in packages:
+        if any("proc-macro" in target["kind"] for target in package.get("targets", [])):
+            continue
+        root = pathlib.Path(package["manifest_path"]).parent
+        if any(
+            SCOPE_DECLARATION.search(line) or SCOPE_EXPANSION.search(line)
+            for path in rust_sources(package)
+            if not is_test_source(path.relative_to(root))
+            for _, line in rust_code_lines(path.read_text(encoding="utf-8"))
+        ):
+            emitting.append(package["name"])
+    return emitting
+
+
+def fail_scopes(packages: list[dict[str, Any]]) -> None:
+    """Refuse more emitting crates than `SCOPES_MAX`, the meters one process builds."""
+    bound = scopes_max(packages)
+    emitting = emitting_crates(packages)
+    if len(emitting) > bound:
+        raise RuntimeError(
+            f"{len(emitting)} crates define an instrumentation scope, past "
+            f"SCOPES_MAX = {bound}: {', '.join(emitting)}"
+        )
+
+
 def main() -> int:
-    """Check exact internal edges and binary targets."""
+    """Check exact internal edges, binary targets, and backend ownership."""
     packages = rift_packages(cargo_metadata())
     edges = dependency_edges(packages)
     if edges != EXPECTED_EDGES:
@@ -264,4 +784,6 @@ def main() -> int:
 
     fail_test_targets(packages)
     fail_storage_independence()
+    fail_ownership(packages)
+    fail_scopes(packages)
     return 0

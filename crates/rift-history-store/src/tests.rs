@@ -757,3 +757,287 @@ fn a_store_error_names_its_operation_and_the_drivers_text() -> TestResult {
     );
     Ok(())
 }
+
+/// The count of the histogram series `name` with `labels` that `recorder` holds.
+fn recorded(recorder: &rift_tracing::ScopedRecorder, name: &str, labels: &[(&str, &str)]) -> u64 {
+    match recorder
+        .metrics()
+        .find(name, labels)
+        .map(rift_tracing::MetricSeries::value)
+    {
+        Some(rift_tracing::SeriesValue::Buckets { count, .. }) => *count,
+        _ => 0,
+    }
+}
+
+/// The fields of every closed `lock.wait` span `records` hold, parsed.
+fn closed_waits(
+    records: &[rift_tracing::LogRecord],
+) -> Result<Vec<serde_json::Value>, serde_json::Error> {
+    records
+        .iter()
+        .filter(|record| {
+            record.message() == "lock.wait" && record.fields().contains("\"span\":\"closed\"")
+        })
+        .map(|record| serde_json::from_str(record.fields()))
+        .collect()
+}
+
+const SHARED_LIVE: [(&str, &str); 2] = [("lock.name", "history.live"), ("lock.mode", "shared")];
+
+#[test]
+fn an_open_store_records_its_live_lock_wait_and_holds_it_until_dropped() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+
+    assert_eq!(
+        recorded(&recorder, "lock.wait.duration", &SHARED_LIVE),
+        1,
+        "one acquisition"
+    );
+    assert_eq!(
+        recorded(&recorder, "lock.held.duration", &SHARED_LIVE),
+        0,
+        "the store still holds the lock"
+    );
+    drop(store);
+    assert_eq!(recorded(&recorder, "lock.held.duration", &SHARED_LIVE), 1);
+    Ok(())
+}
+
+#[test]
+fn a_refused_filler_records_the_refusal_and_names_the_holder() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let location = StoreLocation::new(folder.path(), "aa");
+    let first = HistoryStore::open(&location)?;
+    let second = HistoryStore::open(&location)?;
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let filler = rift_tracing::traced!(component = "history", operation = "history.fill", {
+        first.filler()
+    })?
+    .ok_or("the first filler takes the lock")?;
+
+    assert!(second.filler()?.is_none(), "one filler at a time");
+    let refused = [
+        ("lock.name", "history.fill"),
+        ("lock.mode", "exclusive"),
+        ("error.type", "refused"),
+    ];
+    assert_eq!(recorded(&recorder, "lock.wait.duration", &refused), 1);
+    drop(filler);
+    let held = [("lock.name", "history.fill"), ("lock.mode", "exclusive")];
+    assert_eq!(recorded(&recorder, "lock.held.duration", &held), 1);
+    drop(recorder);
+
+    let waits = closed_waits(&drain.queued_records())?;
+    assert_eq!(waits.len(), 1, "only the refused attempt opens a wait span");
+    assert_eq!(waits[0]["lock.name"], "history.fill");
+    assert_eq!(waits[0]["outcome"], "refused");
+    assert_eq!(
+        waits[0]["holder"], "history.fill",
+        "the operation that took the lock holds it"
+    );
+    Ok(())
+}
+
+/// The holds a server keeps while it runs, its shared live lock and its fill lock, are
+/// listed lifelong in the table of operations in flight, and neither keeps the operation
+/// that took it in flight.
+#[test]
+fn a_servers_live_and_fill_holds_are_listed_lifelong() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+    let store = rift_tracing::traced!(component = "history", operation = "history.open", {
+        HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))
+    })?;
+    let filler = rift_tracing::traced!(component = "history", operation = "history.fill", {
+        store.filler()
+    })?
+    .ok_or("the first filler takes the lock")?;
+    rift_tracing::publish_in_flight("stop");
+    drop(filler);
+    drop(store);
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let published = records
+        .iter()
+        .find(|record| record.message() == "operations in flight")
+        .ok_or("the table was published")?;
+    let fields: serde_json::Value = serde_json::from_str(published.fields())?;
+    let listed: Vec<serde_json::Value> =
+        serde_json::from_str(fields["operations"].as_str().ok_or("operations is text")?)?;
+    assert_eq!(listed.len(), 2, "the two holds alone: {listed:?}");
+    for (lock, parent) in [
+        ("history.live", "history.open"),
+        ("history.fill", "history.fill"),
+    ] {
+        let hold = listed
+            .iter()
+            .find(|entry| entry["lock.name"] == lock)
+            .ok_or(lock)?;
+        assert_eq!(hold["kind"], "held", "{lock}");
+        assert_eq!(hold["lifelong"], true, "{lock}");
+        assert_eq!(hold["parent"], parent, "{lock}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_sweep_records_the_live_lock_it_skips_and_the_one_it_takes() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let held = HistoryStore::open(&StoreLocation::new(folder.path(), "bb"))?;
+    drop(HistoryStore::open(&StoreLocation::new(
+        folder.path(),
+        "aa",
+    ))?);
+    let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    assert_eq!(current.sweep()?.deleted(), ["aa"]);
+
+    let exclusive = [("lock.name", "history.live"), ("lock.mode", "exclusive")];
+    let skipped = [
+        ("lock.name", "history.live"),
+        ("lock.mode", "exclusive"),
+        ("error.type", "refused"),
+    ];
+    assert_eq!(
+        recorded(&recorder, "lock.wait.duration", &skipped),
+        1,
+        "bb is held"
+    );
+    assert_eq!(
+        recorded(&recorder, "lock.wait.duration", &exclusive),
+        1,
+        "aa is taken"
+    );
+    assert_eq!(recorded(&recorder, "lock.held.duration", &exclusive), 1);
+    drop(held);
+    Ok(())
+}
+
+#[test]
+fn a_written_batch_records_its_write_lock_wait_commit_and_transaction() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    filler.write_batch(&[commit("c1", None, 10, "Add lexical search")])?;
+    assert_eq!(filler.trim(&BTreeSet::new())?, 1);
+
+    let history = [("db.namespace", "history")];
+    assert_eq!(
+        recorded(&recorder, "sqlite.write_lock.wait.duration", &history),
+        2
+    );
+    assert_eq!(recorded(&recorder, "sqlite.commit.duration", &history), 2);
+    let committed = [
+        ("db.namespace", "history"),
+        ("sqlite.transaction.result", "commit"),
+    ];
+    assert_eq!(
+        recorded(&recorder, "sqlite.transaction.duration", &committed),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_batch_records_a_rolled_back_transaction() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    filler
+        .connection()
+        .execute_batch("DROP TABLE changed_paths")?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    filler
+        .write_batch(&[commit("c1", None, 10, "Add lexical search")])
+        .expect_err("a batch whose table is gone writes nothing");
+
+    let rolled_back = [
+        ("db.namespace", "history"),
+        ("sqlite.transaction.result", "rollback"),
+    ];
+    assert_eq!(
+        recorded(&recorder, "sqlite.transaction.duration", &rolled_back),
+        1
+    );
+    let history = [("db.namespace", "history")];
+    assert_eq!(recorded(&recorder, "sqlite.commit.duration", &history), 0);
+    Ok(())
+}
+
+#[test]
+fn a_batch_whose_commit_fails_rolls_back_and_names_the_commit() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    // A deferred foreign key is checked at `COMMIT`, so every statement of the batch
+    // succeeds and only the commit fails.
+    filler.connection().execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER orphan AFTER INSERT ON commits BEGIN INSERT INTO child VALUES (1); END;",
+    )?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    let error = filler
+        .write_batch(&[commit("c1", None, 10, "Add lexical search")])
+        .expect_err("the deferred foreign key refuses the commit");
+
+    let source = sqlite_refusal(&error, "commit batch");
+    assert_eq!(
+        source.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ConstraintViolation)
+    );
+    assert_eq!(
+        stored_row_counts(filler.connection())?,
+        [0, 0, 0, 0, 0],
+        "the failed commit wrote nothing"
+    );
+    let rolled_back = [
+        ("db.namespace", "history"),
+        ("sqlite.transaction.result", "rollback"),
+    ];
+    assert_eq!(
+        recorded(&recorder, "sqlite.transaction.duration", &rolled_back),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn a_batch_refused_the_write_lock_records_the_busy_code() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    let other = rusqlite::Connection::open(store.location().database())?;
+    other.execute_batch("BEGIN IMMEDIATE")?;
+    let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+
+    filler
+        .write_batch(&[commit("c1", None, 10, "Add lexical search")])
+        .expect_err("another connection keeps the write lock past the busy timeout");
+    other.execute_batch("ROLLBACK")?;
+
+    let busy = [("db.namespace", "history"), ("error.type", "5")];
+    assert_eq!(
+        recorded(&recorder, "sqlite.write_lock.wait.duration", &busy),
+        1
+    );
+    assert!(
+        recorder
+            .metrics()
+            .series()
+            .iter()
+            .all(|series| series.name() != "sqlite.transaction.duration"),
+        "no transaction began"
+    );
+    Ok(())
+}

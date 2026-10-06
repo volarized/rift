@@ -1,23 +1,20 @@
-//! Text of the `rift://logs` resource: one line per recorded diagnostic, newest first.
+//! Text of the `rift://logs` resource: the records a read selected, newest first, as the lines
+//! `rift-tracing`'s [`LogLines`] prints for a stored page.
 //!
 //! [`LogsPage`] borrows the records a read selected. The resource builds its JSON body from the
 //! same page, so the text and the JSON state the same records.
 
-use jiff::Timestamp;
+use rift_tracing::{LogLines, LogRecord};
 use serde_json::{Map, Value};
 
-use super::facts::{DETAIL_SEPARATOR, FACT_SEPARATOR, quoted_value};
+use super::facts::{DETAIL_SEPARATOR, quoted_value};
 use super::{layout, warning};
 use crate::output::text::{TextError, TextWriter};
 
-/// `YYYY-MM-DD HH:MM:SS.mmm`, in jiff's `strftime` directives.
-const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
-/// Written for a component or an operation a record did not carry.
-const NO_LABEL: &str = "-";
 /// Noun counted by the title of the records section.
 const RECORD_NOUN: &str = "record";
 
-/// The extra fields of one record.
+/// The extra fields of one record, as the JSON body carries them.
 #[derive(Debug, PartialEq)]
 pub(crate) enum LogFields<'a> {
     /// The fields rendered as a JSON object, parsed once.
@@ -46,20 +43,8 @@ impl<'a> LogFields<'a> {
 pub(crate) struct LogLine<'a> {
     /// The store's own ascending number for the record.
     pub(crate) identity: i64,
-    /// Milliseconds since the Unix epoch at which the record was emitted.
-    pub(crate) recorded_at_ms: i64,
-    /// Severity in lower case.
-    pub(crate) level: &'a str,
-    /// The emitting module path.
-    pub(crate) target: &'a str,
-    /// The emitting component, empty when the record named none.
-    pub(crate) component: &'a str,
-    /// The emitting operation, empty when the record named none.
-    pub(crate) operation: &'a str,
-    /// The record's message.
-    pub(crate) message: &'a str,
-    /// The record's remaining fields.
-    pub(crate) fields: LogFields<'a>,
+    /// The record itself.
+    pub(crate) record: &'a LogRecord,
 }
 
 /// The records one read selected, or the reason the store holds none.
@@ -72,90 +57,26 @@ pub(crate) struct LogsPage<'a> {
 }
 
 /// Writes the records section, then a warnings section that holds the unavailable reason.
+///
+/// The records section holds the lines [`LogLines::stored_page`] prints for the records, in the
+/// order of the page, each indented by one level; the blank line between two groups stays empty.
 pub(super) fn answer(out: &mut TextWriter, page: &LogsPage<'_>) -> Result<(), TextError> {
     let LogsPage {
         records,
         unavailable,
     } = page;
     layout::title(out, records.len(), RECORD_NOUN, None)?;
-    for record in records {
-        layout::entry(out, 0, &line(record))?;
+    let lines = LogLines::stored_page().lines(records.iter().map(|line| line.record));
+    for line in lines.lines() {
+        if line.is_empty() {
+            out.blank_line()?;
+        } else {
+            layout::entry(out, 0, line)?;
+        }
     }
     let reasons: Vec<String> = unavailable
         .iter()
         .map(|reason| format!("unavailable{DETAIL_SEPARATOR}{}", quoted_value(reason)))
         .collect();
     warning::lines_section(out, &reasons)
-}
-
-/// `time level component operation[: message][ · key value]...`.
-///
-/// A message or a field value that holds ` · ` or `: ` is quoted, with `"` and `\` escaped
-/// inside the quotes.
-fn line(record: &LogLine<'_>) -> String {
-    let LogLine {
-        identity: _,
-        recorded_at_ms,
-        level,
-        target: _,
-        component,
-        operation,
-        message,
-        fields,
-    } = record;
-    let mut text = format!(
-        "{} {level} {} {}",
-        utc_time(*recorded_at_ms),
-        label(component),
-        label(operation)
-    );
-    if !message.is_empty() {
-        text.push_str(DETAIL_SEPARATOR);
-        text.push_str(&quoted_value(message));
-    }
-    push_fields(&mut text, fields);
-    text
-}
-
-/// The label a record carried, or `-` when it carried none.
-fn label(value: &str) -> &str {
-    if value.is_empty() { NO_LABEL } else { value }
-}
-
-/// Appends each entry of an object as ` · key value`, or non-empty text as ` · text`.
-fn push_fields(text: &mut String, fields: &LogFields<'_>) {
-    match fields {
-        LogFields::Object(object) => {
-            for (key, value) in object {
-                text.push_str(FACT_SEPARATOR);
-                text.push_str(key);
-                text.push(' ');
-                text.push_str(&quoted_value(&value_text(value)));
-            }
-        }
-        LogFields::Text(rest) if !rest.is_empty() => {
-            text.push_str(FACT_SEPARATOR);
-            text.push_str(&quoted_value(rest));
-        }
-        LogFields::Text(_) => {}
-    }
-}
-
-/// A string as it is, an empty string as `""`, any other value as compact JSON.
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) if text.is_empty() => "\"\"".to_owned(),
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// `YYYY-MM-DD HH:MM:SS.mmm` in UTC.
-///
-/// A count outside the range of [`Timestamp`] is written as the count itself.
-pub(super) fn utc_time(recorded_at_ms: i64) -> String {
-    Timestamp::from_millisecond(recorded_at_ms).map_or_else(
-        |_| recorded_at_ms.to_string(),
-        |timestamp| timestamp.strftime(TIME_FORMAT).to_string(),
-    )
 }

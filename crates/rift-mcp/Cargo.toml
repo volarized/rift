@@ -36,6 +36,7 @@ rift-dependency.workspace = true
 rift-history.workspace = true
 rift-history-store.workspace = true
 rift-index.workspace = true
+rift-tracing.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-search.workspace = true
@@ -51,19 +52,17 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "net"] }
 tokio-util.workspace = true
 tower-service = "0.3.3"
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-spawn.workspace = true
 
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
+rift-tracing = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
 rusqlite.workspace = true
 strum.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber.workspace = true
 
 [[test]]
 name = "body_matches"

@@ -39,12 +39,22 @@ from rift_dev.corpus_assertions import (
     probe_units,
     records,
     sample_symbols,
+    startup_published,
+    stop_sizes,
     token_past_chunk,
     warnings,
 )
 from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
+from rift_dev.log_records import (
+    DATABASE_CLOSE,
+    STAGE_ENDED,
+    instant,
+    stop_measurements,
+)
+from rift_dev.machine import machine, machine_line
 from rift_dev.rift_test_client import (
+    LOG_FILTER,
     Client,
     FailureLimit,
     Json,
@@ -52,11 +62,18 @@ from rift_dev.rift_test_client import (
     Server,
     ToolFailure,
     array_value,
+    collector_counts,
     gate_deadline,
     object_value,
     require,
     string_value,
+    utc_now,
 )
+from rift_dev.trace import TEST_CASE_KEY, Collector, collector, resource_attribute
+
+# The OpenTelemetry specification's "Disable the SDK for all signals"; any value other than
+# "true" leaves the export enabled.
+SDK_DISABLED = "OTEL_SDK_DISABLED"
 
 # The budgets bounding one corpus case each stand strictly inside the one outside them,
 # so a breach fails naming the action that ran long instead of tearing down whatever the
@@ -104,7 +121,7 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
-STARTUP_PUBLICATION = 'operation="index.publish" trigger="startup"'
+STARTUP_PUBLICATION = "the startup index publication"
 CONFIGURATION = (
     f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
     "[search.vector]\ndisabled = true\n"
@@ -152,30 +169,65 @@ class Corpus:
         self.binary = binary.resolve()
         self.report = report.resolve()
         self.actions: list[Json] = []
+        self.servers: list[Server] = []
+        self.evidence: list[Json] = []
+        self.stops: list[JsonObject] = []
         self.root = Path()
         self.sequence = 0
         self.started = time.monotonic()
+        self.mark = utc_now()
+        # The action `mark` is the end of; None before the first one finishes.
+        self.last_action: str | None = None
+        # The OTLP collector every server of the case exports to; None outside `run`.
+        self.telemetry: Collector | None = None
 
     def record(self, action: str, **values: Json) -> None:
+        """Append one finished action.
+
+        `started_at` is when the previous action finished, or the case began, and
+        `ended_at` is now, both UTC: the interval holds everything the action did.
+        """
+        ended = utc_now()
         entry: JsonObject = {
             "action": action,
             **values,
+            "started_at": self.mark,
+            "ended_at": ended,
             "elapsed_seconds": time.monotonic() - self.started,
         }
+        self.mark = ended
+        self.last_action = action
         self.actions.append(entry)
 
     def server(self, root: Path | None = None) -> Server:
         self.sequence += 1
-        return Server(
+        server = Server(
             self.binary,
             root or self.root,
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
-            output=sys.stderr.buffer,
             env={
-                "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info",
+                "RUST_LOG": LOG_FILTER,
                 "NO_COLOR": "1",
+                "OTEL_RESOURCE_ATTRIBUTES": resource_attribute(
+                    TEST_CASE_KEY, self.test_case_name()
+                ),
+                # The nextest runner disables export in every test process; the server
+                # this case starts exports to the case's collector.
+                SDK_DISABLED: "false",
             },
+            collector=self.telemetry,
+        )
+        self.servers.append(server)
+        return server
+
+    def test_case_name(self) -> str:
+        """The `test.case.name` every server of this case carries: the nextest attempt
+        that runs the case, as the nextest runner files telemetry under it, else the
+        repository and case."""
+        return (
+            os.environ.get("NEXTEST_ATTEMPT_ID")
+            or f"corpus:{self.pin.name}:{self.case}"
         )
 
     def work_seconds(self) -> float:
@@ -190,18 +242,29 @@ class Corpus:
         return max(self.pin.seconds - CLEANUP_RESERVE_SECONDS, 1.0)
 
     async def run(self) -> None:
-        """A timeout fails the suite after server cleanup writes its evidence."""
+        """A timeout fails the suite after server cleanup writes its evidence.
+
+        The OTLP collector starts before the first server and stops after the served
+        tree, and with it the last server, is gone.
+        """
         started = time.monotonic()
         self.started = started
+        self.mark = utc_now()
         status = "failed"
         failure = ""
         budget = self.work_seconds()
         self.report.parent.mkdir(parents=True, exist_ok=True)
+        facts = machine()
+        print(machine_line(facts), flush=True)
         try:
             async with asyncio.timeout(budget):
-                with tempfile.TemporaryDirectory(
-                    prefix=f"rift-corpus-{self.pin.name}-"
-                ) as directory:
+                with (
+                    collector() as telemetry,
+                    tempfile.TemporaryDirectory(
+                        prefix=f"rift-corpus-{self.pin.name}-"
+                    ) as directory,
+                ):
+                    self.telemetry = telemetry
                     await self.tree(Path(directory).resolve())
                 elapsed = time.monotonic() - started
                 require(
@@ -220,8 +283,12 @@ class Corpus:
                         "case": self.case,
                         "commit": self.pin.commit,
                         "seed": SEED,
+                        "machine": facts,
                         "status": status,
                         "failure": failure,
+                        "evidence": self.evidence,
+                        "stops": self.stops,
+                        "collector": self.collector_counts(),
                         "elapsed_seconds": time.monotonic() - started,
                         "actions": self.actions,
                     },
@@ -231,7 +298,88 @@ class Corpus:
                 encoding="utf-8",
             )
 
+    def collector_counts(self) -> JsonObject | None:
+        """What the case's collector received and dropped; None before it started."""
+        return collector_counts(self.telemetry)
+
     async def tree(self, directory: Path) -> None:
+        """Run the case; on failure keep each server's evidence before the tree goes."""
+        try:
+            await self.cases(directory)
+        except BaseException:
+            self.collect_evidence()
+            raise
+
+    def stop(self, server: Server) -> None:
+        """Stop `server`, then keep its database sizes and persisted records.
+
+        The served tree still exists here. The report's `stops` entry names the
+        records file, or the error of a records read that failed; a failed read
+        never fails the case. From the records of this server alone it also carries
+        the `database.close` values (`database_close`: `busy`, `log`, and
+        `checkpointed` per database) and the `stop stage ended` values (`stop_stages`:
+        `stage`, `remaining`, `outcome`). `lacks` names each kind the records did
+        not hold, and `records_lines` counts the records read.
+        """
+        server.stop()
+        entry: JsonObject = {
+            "stderr": str(server.log_path),
+            "sizes": stop_sizes(server.root),
+            "records": str(server.records_path),
+        }
+        try:
+            text = server.read_records()
+        except (OSError, RuntimeError, ValueError) as error:
+            entry["records"] = None
+            entry["records_error"] = str(error)
+            entry["lacks"] = [DATABASE_CLOSE, STAGE_ENDED]
+        else:
+            measured = stop_measurements(text, instant(server.started_at))
+            entry["records_lines"] = measured["records_lines"]
+            entry["database_close"] = list(measured["database_close"])
+            entry["stop_stages"] = list(measured["stop_stages"])
+            entry["lacks"] = list(measured["lacks"])
+        self.stops.append(entry)
+
+    def collect_evidence(self) -> None:
+        """Keep every server's stderr, proxy stderr, and persisted records of a failed case.
+
+        The files sit beside the report. The report names them, and the newest part of
+        each stream is written to stderr, which a pass never receives. The served
+        tree still exists here, so `rift server logs` can read its `.rift/metrics`.
+        """
+        previous = self.last_action
+        lower_bound = (
+            f"the end of the last recorded action, {previous}; the failing action "
+            "began at or after it"
+            if previous is not None
+            else "the start of the case; no action had finished"
+        )
+        for index, server in enumerate(self.servers, 1):
+            since = max(self.mark, server.started_at)
+            bound = (
+                lower_bound
+                if since == self.mark
+                else "the start of this server, later than the last recorded action"
+            )
+            for note in server.evidence(since, bound):
+                sys.stderr.write(note if note.endswith("\n") else note + "\n")
+            self.evidence.append(
+                {
+                    "server": index,
+                    "root": str(server.root),
+                    "stderr": str(server.log_path),
+                    "stderr_cut": server.output_cut,
+                    "proxy_stderr": [str(path) for path in server.proxy_logs],
+                    "records": str(server.records_path),
+                    "window": str(server.window_path),
+                    "window_since": since,
+                    "window_lower_bound": bound,
+                }
+            )
+        sys.stderr.flush()
+
+    async def cases(self, directory: Path) -> None:
         self.root = directory / "workspace"
         self.pin.checkout(self.root)
         self.configure()
@@ -301,7 +449,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
             self.record(
                 "stop", state="idle", process_gone=server.process.poll() is not None
             )
@@ -658,20 +806,23 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
             self.record("stop", state="after_churn", process_gone=True)
 
     async def churn(self, client: Client) -> None:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / PROBE_PATH
         sources: list[str] = []
+        written: list[float] = []
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
         overlaps = 0
+        converging = False
 
         def write(edit: int) -> None:
             source = f"pub fn corpus_probe() {{ let value = {edit}; }}\n"
             path.write_text(source, encoding="utf-8")
             sources.append(source.rstrip("\n"))
+            written.append(time.monotonic())
 
         async def writer() -> None:
             for edit in range(1, int(self.work_seconds()) // 2):
@@ -722,6 +873,11 @@ class Corpus:
                     writes=changed,
                     source_revision=revision,
                     source_revision_at_start=before - 1,
+                    # The age of the newest write when the read began, and the loop the
+                    # read ran in: a read that outlasts its deadline leaves no answer, so
+                    # these say which write the server still owed a publication for.
+                    seconds_since_write=started - written[before - 1],
+                    convergence=converging,
                     warning_codes=codes,
                 )
 
@@ -747,6 +903,7 @@ class Corpus:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             final = [sources[-1]]
+            converging = True
             convergence = time.monotonic()
             async with gate_deadline("churn final source", CONVERGENCE_SECONDS):
                 for name in CHURN_REQUESTS:
@@ -805,7 +962,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
         self.record("symlink_root", reads=True)
 
     async def shallow(self, root: Path) -> None:
@@ -829,7 +986,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
         self.record("shallow_history", complete=False, depth=1)
 
     async def source_bound(self) -> None:
@@ -897,7 +1054,7 @@ class Corpus:
                         ),
                     )
                 server.check_running()
-                server.stop()
+                self.stop(server)
                 self.record(
                     "source_bound", field="source.files", observed=20001, maximum=20000
                 )
@@ -936,7 +1093,7 @@ class Corpus:
                     ),
                     "lexical overflow removed symbol reads",
                 )
-            server.stop()
+            self.stop(server)
         self.configure()
         self.record(
             "lexical_bound",
@@ -952,7 +1109,7 @@ class Corpus:
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))
                 )
-            server.stop()
+            self.stop(server)
         self.record("stop", state="idle", process_gone=True)
         await self.stop_during_rebuild()
         await self.stop_during_history_fill()
@@ -960,7 +1117,9 @@ class Corpus:
     async def stop_during_rebuild(self) -> None:
         """Observe filesystem rebuild output without a proxy that restarts a stopped server."""
         with self.server() as server:
-            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
+            startup = await observed_state(
+                server, 0, STARTUP_PUBLICATION, startup_published
+            )
             (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
             output = await observed_output(
                 server, len(startup), "index capture started"
@@ -994,7 +1153,7 @@ class Corpus:
     async def stop_observed(self, server: Server, operation: str, output: str) -> None:
         """Stop once `output` shows the operation started and not finished."""
         evidence = active_stdout(output, operation, None)
-        await asyncio.to_thread(server.stop)
+        await asyncio.to_thread(self.stop, server)
         self.record(
             "stop", state=f"mid_{operation}", stderr=evidence, process_gone=True
         )

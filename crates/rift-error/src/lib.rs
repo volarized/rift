@@ -2,8 +2,8 @@
 
 extern crate self as rift_error;
 
+mod definition;
 mod evidence;
-mod generated_support;
 mod representation;
 mod runtime;
 
@@ -11,15 +11,15 @@ mod runtime;
 pub mod ctx;
 
 /// Generated error builders, grouped by registry namespace.
-pub mod errors {
-    include!("generated.rs");
-}
+pub mod errors;
 
 pub use evidence::EvidenceFor;
 pub use representation::IntoRiftError;
+#[doc(hidden)]
+pub use rift_error_macros::paste as __rift_paste;
 pub use runtime::{
     BuilderCore, CAUSE_DEPTH_MAX, ErrorContext, ErrorSlug, ErrorValue, FieldSet, IntoInteger,
-    IntoUnsigned, OptionalFieldSet, RiftError, Set, SourceView, Unset, causes,
+    IntoUnsigned, RiftError, Set, SourceView, Unset, causes,
 };
 
 #[doc(hidden)]

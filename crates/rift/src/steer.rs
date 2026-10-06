@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use bash::{BashSearch, bash_search};
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
+use rift_core::constants::{INDEX_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use suggestion::{GrepPath, GrepRequest};
@@ -273,7 +273,7 @@ struct KernelInput<'a> {
 )]
 #[derive(Debug, Clone, Copy)]
 struct EnvironmentFacts {
-    /// The workspace root holds `.rift/db`.
+    /// The workspace root holds `.rift/index`.
     index_present: bool,
     /// The workspace root holds `.git`.
     vcs_present: bool,
@@ -408,7 +408,7 @@ fn probe_environment(workspace_root: Option<&Path>, session_id: Option<&str>) ->
     EnvironmentFacts {
         index_present: root
             .join(RIFT_STATE_DIRECTORY)
-            .join(WORKSPACE_DATABASE_FILE_NAME)
+            .join(INDEX_DATABASE_FILE_NAME)
             .exists(),
         vcs_present: root.join(".git").exists(),
         session_already_steered: session_id.is_some_and(|id| marker_path(root, id).exists()),

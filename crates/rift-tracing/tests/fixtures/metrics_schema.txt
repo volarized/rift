@@ -1,0 +1,24 @@
+type: table
+name: log_records
+tbl_name: log_records
+sql: CREATE TABLE log_records(
+         id INTEGER PRIMARY KEY,
+         kind TEXT NOT NULL,
+         recorded_at INTEGER NOT NULL,
+         level TEXT NOT NULL,
+         target TEXT NOT NULL,
+         component TEXT NOT NULL,
+         operation TEXT NOT NULL,
+         message TEXT NOT NULL,
+         fields TEXT NOT NULL
+     )
+
+type: index
+name: log_records_component
+tbl_name: log_records
+sql: CREATE INDEX log_records_component ON log_records(component)
+
+type: index
+name: log_records_level
+tbl_name: log_records
+sql: CREATE INDEX log_records_level ON log_records(level)

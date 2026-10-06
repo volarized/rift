@@ -32,6 +32,7 @@ mod engine_fixture;
 mod harness;
 mod live_engine_gate;
 mod rust_engine;
+mod test_case;
 
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -42,11 +43,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use harness::{
-    FIXTURE_READINESS_TIMEOUT, FIXTURE_WORKER_QUEUE_TIMEOUT, LIBRARY, PROXIED_CALL_MAX,
-    PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, await_workspace_ready,
-    await_workspace_text, laid_out_workspace, proxied_call, proxied_engine_call, proxied_result,
-    proxy_client, proxy_client_with, relayed_proxy_client, require_success, resource_json,
-    resource_text, run_rift, rust_engine_workspace, tool_failure, within, workspace,
+    FIXTURE_READINESS_TIMEOUT, FIXTURE_WORKER_QUEUE_TIMEOUT, FailureWindow, LIBRARY,
+    PROXIED_CALL_MAX, PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments,
+    await_workspace_ready, await_workspace_text, laid_out_workspace, proxied_call,
+    proxied_engine_call, proxied_result, proxy_client, proxy_client_with, relayed_proxy_client,
+    require_success, resource_json, resource_text, run_rift, rust_engine_workspace, tool_failure,
+    within, workspace,
 };
 use rift_mcp::{
     BuildCheckout, ElectionGuard, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim,
@@ -195,15 +197,22 @@ async fn repository_foreground(
     root: &Path,
     state_directory: &Path,
 ) -> TestResult<(RepositoryForeground, ServerLock)> {
+    let mut command = Command::new(harness::rift_binary());
     let mut child = RepositoryForeground(
-        Command::new(harness::rift_binary())
+        harness::with_child_log_variables(&mut command)
             .args(["server", "start", "--foreground", "--repository"])
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?,
     );
+    // The relay thread copies the stream onto the test's stderr, as the inherited stream
+    // did, and into the window's copy, until the stream closes; nothing joins it.
+    drop(harness::relayed_child_stderr(
+        &mut child.0,
+        "rift server start --foreground --repository",
+    )?);
     let serving = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "repository foreground startup",
@@ -231,6 +240,7 @@ async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForegroun
     require_success(&stopped, "repository foreground stop")?;
     loop {
         if let Some(status) = child.0.try_wait()? {
+            harness::record_exit(child.0.id(), status);
             assert!(
                 status.success(),
                 "repository foreground exits cleanly: {status:?}"
@@ -358,7 +368,11 @@ async fn a_competing_foreground_start_preserves_repository_logs(
         "a repository owns this workspace"
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(stderr.contains("server_already_serving"), "{stderr}");
+    assert!(
+        stderr.contains("server_already_serving"),
+        "{}",
+        harness::bounded_tail(&stderr)
+    );
     let after = within(
         "repository logs after competing start",
         client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://logs")),
@@ -537,6 +551,12 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         .ok_or("fixture repository has a common Git directory")?;
     let state_directory =
         rift_mcp::repository::repository_election_directory(&common, &rift_binary_identity()?)?;
+    // Each workspace keeps its own store, so the window reads all four. The expected
+    // failure of #530 returns without `passed`, so its window prints too: the proxy's
+    // `start window closed without a server that answers` record, relayed above it, names
+    // the last repository miss, and the stores show what the repository server reached.
+    let failure_window =
+        FailureWindow::begin_over(&roots.iter().map(PathBuf::as_path).collect::<Vec<_>>());
     // The linked workspace starts first; authority still comes from the main worktree.
     let (mut child, before) = repository_foreground(&roots[3], &state_directory).await?;
     let mut clients: Vec<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> = Vec::new();
@@ -595,6 +615,7 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         2
     );
     stop_repository_foreground(&roots[1], &mut reopened).await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -625,6 +646,7 @@ async fn warm_start_adopts_the_running_server() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let started = run_rift(root, &["server", "start"]).await?;
     require_success(&started, "server start before the proxy")?;
@@ -638,6 +660,7 @@ async fn warm_start_adopts_the_running_server() -> TestResult {
         "the proxy must adopt the running server, not replace it"
     );
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -646,6 +669,7 @@ async fn concurrent_proxies_share_one_elected_server() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let (first, second) = tokio::join!(proxy_client(root), proxy_client(root));
     let (first, second) = (first?, second?);
@@ -672,6 +696,7 @@ async fn concurrent_proxies_share_one_elected_server() -> TestResult {
         survivor.pid, serving.pid,
         "exactly one server pid throughout"
     );
+    failure_window.passed();
     Ok(())
 }
 
@@ -747,12 +772,14 @@ async fn text_output_proxy_lists_no_output_schema_and_returns_no_structured_cont
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client_with(root, &["--output=text"]).await?;
     let tools = listed_tools(&client).await?;
     let result = beacon_result(&client).await?;
     assert_text_shape(&tools, &result);
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -761,12 +788,14 @@ async fn default_proxy_lists_output_schemas_and_returns_structured_content() -> 
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client(root).await?;
     let tools = listed_tools(&client).await?;
     let result = beacon_result(&client).await?;
     assert_all_shape(&tools, &result);
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -776,6 +805,7 @@ async fn text_output_proxy_returns_the_map_as_one_text_content() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client_with(root, &["--output=text"]).await?;
     await_workspace_text(&client).await?;
@@ -796,6 +826,7 @@ async fn text_output_proxy_returns_the_map_as_one_text_content() -> TestResult {
     assert_eq!(mime_type.as_deref(), Some("text/plain"), "{content:?}");
     assert!(text.starts_with("map "), "{text}");
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -805,6 +836,7 @@ async fn default_proxy_returns_the_map_as_text_then_json() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client_with(root, &[]).await?;
     await_workspace_ready(&client).await?;
@@ -819,6 +851,7 @@ async fn default_proxy_returns_the_map_as_text_then_json() -> TestResult {
     let body = resource_json(&answer, "rift://map")?;
     assert!(body["revision"].is_string(), "{body}");
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -827,6 +860,7 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let (all, text) = tokio::join!(
         proxy_client_with(root, &["--output", "all"]),
@@ -847,6 +881,7 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
         survivor.pid, serving.pid,
         "exactly one server pid throughout"
     );
+    failure_window.passed();
     Ok(())
 }
 
@@ -941,6 +976,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let (all, text) = tokio::join!(
         proxy_client_with(root, &["--output", "all"]),
@@ -985,6 +1021,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
 
     all.cancel().await?;
     text.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -997,6 +1034,7 @@ async fn a_failing_tool_call_returns_the_same_error_text_through_both_proxies() 
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let request = json!({"query": ""});
 
     let (all, text) = tokio::join!(
@@ -1028,6 +1066,7 @@ async fn a_failing_tool_call_returns_the_same_error_text_through_both_proxies() 
 
     all.cancel().await?;
     text.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1053,6 +1092,7 @@ async fn proxy_session_reconnects_after_a_server_restart() -> TestResult {
     let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client(root).await?;
     assert_beacon(&beacon_lookup(&client).await?);
@@ -1065,6 +1105,7 @@ async fn proxy_session_reconnects_after_a_server_restart() -> TestResult {
         "the same session must be served by a freshly elected process"
     );
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1074,6 +1115,7 @@ async fn text_proxy_session_keeps_its_output_after_a_server_restart() -> TestRes
     let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client_with(root, &["--output=text"]).await?;
     let tools = listed_tools(&client).await?;
@@ -1090,6 +1132,7 @@ async fn text_proxy_session_keeps_its_output_after_a_server_restart() -> TestRes
         "the same session must be served by a freshly elected process"
     );
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1098,6 +1141,7 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     fs::create_dir_all(root.join(".rift"))?;
     let stale = ServerLock {
@@ -1118,6 +1162,7 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
     let serving = serving_document(root).ok_or("a fresh server must replace the stale lock")?;
     assert_ne!(serving.pid, 1, "the stale pid must be replaced");
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1141,6 +1186,7 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     fs::create_dir_all(root.join(".rift"))?;
     let lingering = fs::OpenOptions::new()
         .create(true)
@@ -1163,10 +1209,12 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
             },
         )
         .await;
-        assert!(
-            !root.join(".rift/db").exists(),
-            "a refused child cannot open the held workspace database"
-        );
+        for name in ["index", "metrics", "vectors"] {
+            assert!(
+                !root.join(".rift").join(name).exists(),
+                "a refused child opens no database: {name}"
+            );
+        }
         lingering.unlock()?;
         drop(lingering);
         lost.map(|_stderr| ())
@@ -1176,6 +1224,7 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     assert_beacon(&lookup?);
     serving_document(root).ok_or("a spawn after the lost election must serve")?;
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1320,6 +1369,7 @@ async fn an_older_server_is_replaced_and_the_request_served() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let older = RecordedServer::start(root, "0.0.1").await?;
 
     let client = proxy_client(root).await?;
@@ -1333,6 +1383,7 @@ async fn an_older_server_is_replaced_and_the_request_served() -> TestResult {
     assert_eq!(serving.identity, rift_binary_identity()?);
     assert_ne!(serving.pid, std::process::id());
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1344,6 +1395,7 @@ async fn a_stop_reset_by_a_leaving_older_server_still_ends_with_a_new_server() -
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let older = RecordedServer::start_resetting_stop(root, "0.0.1").await?;
 
     let client = proxy_client(root).await?;
@@ -1358,6 +1410,7 @@ async fn a_stop_reset_by_a_leaving_older_server_still_ends_with_a_new_server() -
     assert_eq!(serving.identity, rift_binary_identity()?);
     assert_ne!(serving.pid, std::process::id());
     client.cancel().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1368,6 +1421,7 @@ async fn assert_refused_without_a_stop(version: &str) -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let recorded = RecordedServer::start(root, version).await?;
 
     let client = proxy_client(root).await?;
@@ -1398,6 +1452,7 @@ async fn assert_refused_without_a_stop(version: &str) -> TestResult {
     assert_eq!(recorded.accepted(), 0, "the server is never asked to stop");
     client.cancel().await?;
     recorded.stopped().await?;
+    failure_window.passed();
     Ok(())
 }
 
@@ -1427,6 +1482,7 @@ async fn two_proxies_replacing_one_older_server_end_with_one_new_server() -> Tes
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let older = RecordedServer::start(root, "0.0.1").await?;
 
     let (first, second) = tokio::join!(relayed_proxy_client(root), relayed_proxy_client(root));
@@ -1451,9 +1507,11 @@ async fn two_proxies_replacing_one_older_server_end_with_one_new_server() -> Tes
         assert_eq!(
             connected,
             [serving.pid],
-            "each proxy connects to the one elected server: {stderr}"
+            "each proxy connects to the one elected server: {}",
+            harness::bounded_tail(&stderr)
         );
     }
+    failure_window.passed();
     Ok(())
 }
 
@@ -1483,6 +1541,7 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let guard = claim(root)?;
     guard.publish(&ServerLock {
@@ -1527,13 +1586,16 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     let stderr = stderr.text().await?;
     assert!(
         stderr.contains("recorded server did not answer"),
-        "the stale server must be diagnosed: {stderr}"
+        "the stale server must be diagnosed: {}",
+        harness::bounded_tail(&stderr)
     );
     assert!(
         stderr.contains("upstream warmup did not connect"),
-        "{stderr}"
+        "{}",
+        harness::bounded_tail(&stderr)
     );
     drop(guard);
+    failure_window.passed();
     Ok(())
 }
 
@@ -1553,6 +1615,7 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr
     let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], &format!("port = {port}\n"))?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let client = proxy_client(root).await?;
     let refusal = within(
@@ -1590,6 +1653,7 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr
 
     client.cancel().await?;
     drop(held);
+    failure_window.passed();
     Ok(())
 }
 
@@ -1598,6 +1662,7 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
 
     let (client, stderr) = relayed_proxy_client(root).await?;
     assert_beacon(&beacon_lookup(&client).await?);
@@ -1607,17 +1672,23 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
     client.cancel().await?;
 
     let stderr = stderr.text().await?;
-    assert!(stderr.contains("MCP proxy starting"), "{stderr}");
-    assert!(stderr.contains("MCP proxy ready"), "{stderr}");
-    assert!(stderr.contains("MCP proxy stopped"), "{stderr}");
+    for line in ["MCP proxy starting", "MCP proxy ready", "MCP proxy stopped"] {
+        assert!(
+            stderr.contains(line),
+            "{line}: {}",
+            harness::bounded_tail(&stderr)
+        );
+    }
     assert!(
         !stderr.contains(&token),
         "the bearer token must never reach stderr"
     );
     assert!(
         !stderr.contains(&root.display().to_string()),
-        "tracing exposed the workspace root: {stderr}"
+        "tracing exposed the workspace root: {}",
+        harness::bounded_tail(&stderr)
     );
+    failure_window.passed();
     Ok(())
 }
 
@@ -1631,6 +1702,7 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let root = directory.path();
     rust_engine::require_rust_analyzer(root);
     let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
     let declaration = proxied_call(&client, "get_symbol", &json!({"name": "beacon"})).await?;
@@ -1681,5 +1753,6 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         &run_rift(root, &["server", "stop"]).await?,
         "stop after reference read",
     )?;
+    failure_window.passed();
     Ok(())
 }

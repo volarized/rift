@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 from urllib.parse import unquote
 
+from rift_dev.log_records import Line, closes_span, parse_line
 from rift_dev.rift_test_client import (
     Json,
     JsonObject,
@@ -52,12 +53,14 @@ HELD_UNPARSED_RECORD = "file held unparsed in the index"
 # The record the history task writes as each store batch starts, with `pending`, the
 # commits its fill plan has not analyzed yet. A span reaches server output only when it
 # closes, so this record is what shows a batch in flight.
-HISTORY_BATCH_STARTED = (
-    'history batch started component="history" operation="history.batch" phase="start"'
-)
-HISTORY_BATCH_CLOSED = re.compile(
-    r"history\.batch\{[^}]*\}: rift_mcp::history: close\b"
-)
+HISTORY_BATCH_STARTED = "history batch started"
+HISTORY_BATCH = "history.batch"
+# The record each index capture writes as it starts, under the `index.build` operation.
+INDEX_CAPTURE_STARTED = "index capture started"
+INDEX_BUILD = "index.build"
+INDEX_PUBLISH = "index.publish"
+# The record each index publication writes, under the `index.publish` operation.
+INDEX_PUBLISHED = "index snapshot published"
 
 
 def map_paths(answer: JsonObject) -> set[str]:
@@ -360,7 +363,11 @@ def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
 
 
 def active_stdout(output: str, operation: str, epoch: str | None) -> str:
-    """Require synchronous start without a later matching completion record."""
+    """Require synchronous start without a later matching close record.
+
+    A close under `✗` ends the operation as a close under `✓` does: a build that failed
+    before the stop is not in flight at the stop.
+    """
     require(
         output.endswith("\n"), f"{operation}: stderr ends with an incomplete record"
     )
@@ -372,13 +379,14 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
             )
         return batch
     rows = output.splitlines()
-    marker = (
-        'index capture started component="index" operation="index.build" phase="start"'
-    )
-    started = [index for index, row in enumerate(rows) if marker in row]
+    started = [
+        index
+        for index, row in enumerate(rows)
+        if starts_phase(parse_line(row), "index", INDEX_BUILD, INDEX_CAPTURE_STARTED)
+    ]
     require(bool(started), f"{operation}: synchronous start record is absent")
     start = started[-1]
-    captured = re.search(r"\bepoch=(\d+)(?:[ }]|$)", rows[start])
+    captured = re.search(r"\bepoch=(\d+)(?: |$)", rows[start])
     if captured is None:
         raise AssertionError("rebuild start has no epoch")
     observed_epoch = captured.group(1)
@@ -386,14 +394,42 @@ def active_stdout(output: str, operation: str, epoch: str | None) -> str:
         observed_epoch != "0" and (epoch is None or observed_epoch == epoch),
         "rebuild start must name the current epoch after startup",
     )
-    epoch_pattern = rf"\bepoch={re.escape(observed_epoch)}(?:[ }}]|$)"
+    epoch_pattern = rf"\bepoch={re.escape(observed_epoch)}(?: |$)"
     for row in rows[start + 1 :]:
-        closed = "index.build{" in row and "rift_mcp::validation: close" in row
+        record = parse_line(row)
+        if record is None:
+            continue
+        closed = closes_span(record, INDEX_BUILD)
         completed = (
-            closed and re.search(epoch_pattern, row) is not None
-        ) or 'operation="index.publish"' in row
+            closed and re.search(epoch_pattern, record.text) is not None
+        ) or record.operation == INDEX_PUBLISH
         require(not completed, f"{operation} completed before stop on stderr: {row}")
     return rows[start]
+
+
+def starts_phase(
+    record: Line | None, component: str, operation: str, message: str
+) -> bool:
+    """Whether `record` is the `phase=start` record `message` of `component`'s
+    `operation`."""
+    return (
+        record is not None
+        and record.component == component
+        and record.operation == operation
+        and record.is_message(message)
+        and record.fields(message).get("phase") == "start"
+    )
+
+
+def startup_published(output: str) -> bool:
+    """Whether `output` holds the index publication the startup triggered."""
+    return any(
+        record.operation == INDEX_PUBLISH
+        and record.is_message(INDEX_PUBLISHED)
+        and record.fields(INDEX_PUBLISHED).get("trigger") == "startup"
+        for record in map(parse_line, output.splitlines())
+        if record is not None
+    )
 
 
 def open_history_batch(output: str) -> str | None:
@@ -403,15 +439,23 @@ def open_history_batch(output: str) -> str | None:
     start closes that batch. A batch that starts with no pending commit analyzes none.
     """
     rows = output.splitlines()
-    started = [index for index, row in enumerate(rows) if HISTORY_BATCH_STARTED in row]
+    started = [
+        index
+        for index, row in enumerate(rows)
+        if starts_phase(
+            parse_line(row), "history", HISTORY_BATCH, HISTORY_BATCH_STARTED
+        )
+    ]
     if not started:
         return None
     start = started[-1]
     pending = re.search(r"\bpending=(\d+)(?: |$)", rows[start])
     if pending is None or int(pending.group(1)) == 0:
         return None
-    if any(HISTORY_BATCH_CLOSED.search(row) for row in rows[start + 1 :]):
-        return None
+    for row in rows[start + 1 :]:
+        record = parse_line(row)
+        if record is not None and closes_span(record, HISTORY_BATCH):
+            return None
     return rows[start]
 
 
@@ -427,13 +471,13 @@ class LexicalContent:
 def lexical_content(root: Path) -> LexicalContent:
     """Hash every ranking column of the ordered document rows.
 
-    The schema is owned by rift-index/src/lexical.rs, whose fifth migration replaced
-    `lexical_units` with `lexical_documents`. Diagnostics and the revision row change on
+    The schema is owned by rift-index/src/lexical.rs, whose index database migration
+    creates `lexical_documents` in `.rift/index`. Diagnostics and the revision row change on
     each publication; unrelated document rows must not.
     """
     digest = hashlib.sha256()
     count = size = 0
-    database = root / ".rift" / "db"
+    database = root / ".rift" / "index"
     with closing(
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
@@ -463,17 +507,45 @@ def lexical_content(root: Path) -> LexicalContent:
     return LexicalContent(count, size, digest.hexdigest())
 
 
+DATABASE_FILES = tuple(
+    f"{database}{suffix}"
+    for database in ("index", "metrics", "vectors")
+    for suffix in ("", "-wal", "-shm")
+)
+"""Each workspace database below `.rift` and the sidecar files SQLite keeps beside it."""
+
+
 def database_bytes(root: Path) -> JsonObject:
+    """Size each workspace database and its sidecar files; an absent file is left out."""
     return {
         name: path.stat().st_size
-        for name in ("db", "db-wal", "db-shm")
+        for name in DATABASE_FILES
         if (path := root / ".rift" / name).is_file()
+    }
+
+
+STOP_SIZE_FILES = tuple(
+    f"{database}{suffix}"
+    for database in ("index", "metrics", "vectors")
+    for suffix in ("", "-wal")
+)
+"""The files whose size a stop records; `vectors` exists after the first vector operation."""
+
+ABSENT = "absent"
+
+
+def stop_sizes(root: Path) -> JsonObject:
+    """Size each `STOP_SIZE_FILES` entry below `.rift`; a missing file reads `"absent"`."""
+    return {
+        name: path.stat().st_size if path.is_file() else ABSENT
+        for name in STOP_SIZE_FILES
+        for path in (root / ".rift" / name,)
     }
 
 
 def probe_units(root: Path) -> int:
     """Count only the probe's persisted units after the lexical lane commits."""
-    database = root / ".rift" / "db"
+    database = root / ".rift" / "index"
     with closing(
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:

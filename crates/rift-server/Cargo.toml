@@ -33,14 +33,13 @@ rift-provider.workspace = true
 rift-ranking.workspace = true
 rift-search.workspace = true
 rift-syntax.workspace = true
+rift-tracing.workspace = true
 semver.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 rayon.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 url.workspace = true
 which.workspace = true
 
@@ -53,9 +52,15 @@ ty_python_core.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 
+# A dependency probe's child runs inside a Job object of its own, created with the child,
+# so a cancellation or a timeout ends every process the child started.
+[target.'cfg(windows)'.dependencies]
+windows-spawn.workspace = true
+
 [dev-dependencies]
 ignore.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
+rift-tracing = { workspace = true, features = ["fixtures"] }
 rusqlite.workspace = true
 schemars.workspace = true
 serde_json.workspace = true

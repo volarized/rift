@@ -10,9 +10,8 @@ use rift_error::{RiftError, errors};
 #[cfg(test)]
 use rift_index::capture_digests_with_languages;
 use rift_index::{
-    ChangeSet, LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-    is_connection_unavailable,
+    ChangeSet, LastCapture, LexicalIndexLimits, PathChange, PathChanges, WorkspaceDigests,
+    WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy, is_connection_unavailable,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -41,6 +40,7 @@ use rift_server::{
     CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadService,
     StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
+use rift_tracing::LogStore;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::model::{
@@ -52,7 +52,6 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::global::{
@@ -62,16 +61,20 @@ use crate::global::{
 use crate::history::{AnalysisGate, HistoryLane};
 use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
+use crate::metrics::{
+    Ending, INITIALIZE, MCP_SERVER_OPERATION_DURATION, McpRequest, PING, RESOURCE_TEMPLATES_LIST,
+    RESOURCES_LIST, RESOURCES_READ, SCOPE, TOOLS_CALL, TOOLS_LIST,
+};
 use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationFingerprint, ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState,
-    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalLane,
-    LexicalWrite, PopulationLane, PublishedWorkspace, WatchWorkspace, capture_prepared_workspace,
-    configuration_fingerprint, empty_workspace_preparation, run_index_supervisor,
-    workspace_watcher,
+    IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitReport,
+    LexicalCommitState, LexicalLane, LexicalWrite, PopulationLane, PublishedWorkspace,
+    WatchWorkspace, capture_prepared_workspace, configuration_fingerprint,
+    empty_workspace_preparation, read_published, run_index_supervisor, workspace_watcher,
 };
 
 /// Vector candidates one file may contribute to a fused ranking.
@@ -106,6 +109,57 @@ const MODEL_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// download's own `download_timeout` is the budget an operator tunes.
 const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 
+/// The lock a blocking operation's worker permit is recorded under, waits and holds alike.
+pub(crate) const WORKER_PERMIT_LOCK: &str = "worker.permit";
+
+/// One admitted blocking operation's worker permit, recorded as [`WORKER_PERMIT_LOCK`].
+type WorkerPermit = rift_tracing::Held<tokio::sync::OwnedSemaphorePermit>;
+
+/// Why a worker permit wait ended without the permit: the semaphore closed, which records
+/// the wait `refused`, or the queue timeout passed, which records it `timeout`.
+enum WorkerAdmission {
+    Closed(tokio::sync::AcquireError),
+    TimedOut,
+}
+
+/// `worker_pool.permit.count`: the blocking pool's worker permits, by
+/// `worker_pool.permit.state` = `available` or `used`, read when the meter collects.
+static WORKER_PERMIT_COUNT: rift_tracing::ObservableUpDownCounter<1> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        SCOPE,
+        "worker_pool.permit.count",
+        "{permit}",
+        &["worker_pool.permit.state"],
+    );
+
+// Each retained workspace owns three databases whose sizes and queues are observed (index,
+// vectors, metrics) and one executor; the observation bound holds them all.
+const _: () = assert!(
+    rift_tracing::OBSERVATIONS_MAX as u64
+        >= 3 * rift_protocol::configuration::SERVER_WORKSPACES_MAX
+);
+
+/// Reports [`WORKER_PERMIT_COUNT`] of `operations`, a semaphore of `permits` permits, while
+/// the executor that holds the returned guard lives: one atomic load of the semaphore per
+/// collection. The read holds the semaphore weakly.
+fn permit_readings(
+    operations: &Arc<Semaphore>,
+    permits: usize,
+) -> Option<Arc<rift_tracing::ObservationGuard>> {
+    let operations = Arc::downgrade(operations);
+    WORKER_PERMIT_COUNT
+        .observe(move |observation| {
+            if let Some(operations) = operations.upgrade() {
+                let available = operations.available_permits();
+                let used = permits.saturating_sub(available);
+                for (state, count) in [("available", available), ("used", used)] {
+                    observation.observe([state], u64::try_from(count).unwrap_or(u64::MAX));
+                }
+            }
+        })
+        .map(Arc::new)
+}
+
 /// Bounded Tokio acceptance for blocking filesystem and parser work.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockingExecutor {
@@ -113,6 +167,8 @@ pub(crate) struct BlockingExecutor {
     pub(crate) queue_timeout_ms: u64,
     rayon_pool: Arc<ThreadPool>,
     content_cache: rift_index::WorkspaceContentCache,
+    /// Keeps the permit counts reported while a clone of the executor lives.
+    _permit_readings: Option<Arc<rift_tracing::ObservationGuard>>,
 }
 
 impl BlockingExecutor {
@@ -134,8 +190,10 @@ impl BlockingExecutor {
                     .detail(error.to_string())
                     .error()
             })?;
+        let operations = Arc::new(Semaphore::new(workers));
         Ok(Self {
-            operations: Arc::new(Semaphore::new(workers)),
+            _permit_readings: permit_readings(&operations, workers),
+            operations,
             queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
             rayon_pool: Arc::new(rayon_pool),
             content_cache: rift_index::WorkspaceContentCache::default(),
@@ -158,8 +216,10 @@ impl BlockingExecutor {
             .thread_name(|index| format!("rift-index-{index}"))
             .build()
             .expect("test worker pool must build");
+        let operations = Arc::new(Semaphore::new(operations_max));
         Self {
-            operations: Arc::new(Semaphore::new(operations_max)),
+            _permit_readings: permit_readings(&operations, operations_max),
+            operations,
             queue_timeout_ms,
             rayon_pool: Arc::new(rayon_pool),
             content_cache: rift_index::WorkspaceContentCache::default(),
@@ -183,6 +243,67 @@ impl BlockingExecutor {
             .await
     }
 
+    /// Waits for one worker permit for `operation`, by the queue timeout, or until
+    /// `cancellation`.
+    ///
+    /// The wait is recorded as the lock [`WORKER_PERMIT_LOCK`] from the calling operation,
+    /// so a contended wait names that operation and the operation that holds the oldest
+    /// permit, and a held permit stays in the table of operations in flight until it drops.
+    /// A wait that reaches the queue timeout also publishes that table, which lists the
+    /// operations holding every permit. The `worker.queue` span covers the semaphore wait
+    /// alone; both spans of a blocking operation sit at debug, since an info filter would
+    /// print two closing lines per request and per build.
+    async fn admitted(
+        &self,
+        operation: &'static str,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkerPermit, RiftError> {
+        let queue_timeout_ms = self.queue_timeout_ms;
+        let queue = rift_tracing::debug_span!(
+            "worker.queue",
+            component = "worker",
+            operation = "worker.queue",
+            work = operation
+        );
+        queue.in_scope(|| {
+            rift_tracing::debug!(
+                work = operation,
+                queue_timeout_ms,
+                "worker admission started"
+            );
+        });
+        let operations = Arc::clone(&self.operations);
+        let waiting = rift_tracing::lock(WORKER_PERMIT_LOCK).acquire_fallible(async move {
+            match tokio::time::timeout(
+                Duration::from_millis(queue_timeout_ms),
+                queue.instrument(operations.acquire_owned()),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(closed)) => Err(rift_tracing::Refusal::Refused(WorkerAdmission::Closed(
+                    closed,
+                ))),
+                Err(_) => Err(rift_tracing::Refusal::Timeout(WorkerAdmission::TimedOut)),
+            }
+        });
+        let permit = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return errors::server::read_cancelled().fail(),
+            waited = waiting => waited.map_err(|admission| match admission {
+                WorkerAdmission::Closed(error) => errors::server::read_task()
+                    .operation(operation)
+                    .detail(error.to_string())
+                    .error(),
+                WorkerAdmission::TimedOut => {
+                    rift_tracing::publish_in_flight("worker_queue_timeout");
+                    errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error()
+                }
+            })?,
+        };
+        Ok(permit)
+    }
+
     /// Runs blocking work with the same token the async caller uses to cancel queue
     /// admission and bounded phase or file work.
     pub(crate) async fn run_with_cancellation<Output>(
@@ -194,31 +315,11 @@ impl BlockingExecutor {
     where
         Output: Send + 'static,
     {
-        // Both spans wrap every blocking operation, so they sit at debug: an info filter
-        // would print two closing lines per request and per build.
-        let acquire = Arc::clone(&self.operations).acquire_owned();
-        let queue_timeout_ms = self.queue_timeout_ms;
-        let permit_result = async {
-            tracing::debug!(work = operation, queue_timeout_ms, "worker admission started");
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => errors::server::read_cancelled().fail(),
-                result = tokio::time::timeout(Duration::from_millis(queue_timeout_ms), acquire) => {
-                    result
-                        .map_err(|_| errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error())?
-                        .map_err(|error| errors::server::read_task().operation(operation).detail(error.to_string()).error())
-                }
-            }
-        }
-        .instrument(tracing::debug_span!(
-            "worker.queue",
-            component = "worker",
-            operation = "worker.queue",
-            work = operation
-        ))
-        .await;
-        let permit = permit_result?;
-        tracing::debug!(
+        // The admission's timer and lock records, and the held permit the run carries, live
+        // on the heap: every blocking operation awaits this body, and its callers' futures
+        // sit near `clippy::large_futures`.
+        let permit = Box::pin(self.admitted(operation, &cancellation)).await?;
+        rift_tracing::debug!(
             component = "worker",
             operation = "worker.queue",
             work = operation,
@@ -229,28 +330,31 @@ impl BlockingExecutor {
             return errors::server::read_cancelled().fail();
         }
         let rayon_pool = Arc::clone(&self.rayon_pool);
-        async move {
-            // The blocking thread has no ambient span, so the work's own spans attach to
-            // the current one explicitly rather than opening a disconnected trace.
-            let parent = tracing::Span::current();
-            tokio::task::spawn_blocking(move || {
-                let result = rayon_pool.install(move || {
-                    let _entered = parent.enter();
-                    tracing::debug!(work = operation, "worker execution started");
-                    work(&cancellation)
-                });
-                // Explicit success-path release; unwinding also drops the owned permit.
-                drop(permit);
-                result
-            })
-            .await
-        }
-        .instrument(tracing::debug_span!(
-            "worker.run",
-            component = "worker",
-            operation = "worker.run",
-            work = operation
-        ))
+        Box::pin(
+            rift_tracing::debug_span!(
+                "worker.run",
+                component = "worker",
+                operation = "worker.run",
+                work = operation
+            )
+            .instrument(async move {
+                // The blocking thread has no ambient span, so the work's own spans attach to
+                // the current one explicitly rather than opening a disconnected trace.
+                let parent = rift_tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    let result = rayon_pool.install(move || {
+                        parent.in_scope(|| {
+                            rift_tracing::debug!(work = operation, "worker execution started");
+                            work(&cancellation)
+                        })
+                    });
+                    // Explicit success-path release; unwinding also drops the owned permit.
+                    drop(permit);
+                    result
+                })
+                .await
+            }),
+        )
         .await
         .map_err(|error| {
             errors::server::read_task()
@@ -427,7 +531,7 @@ fn model_acquisition(
     match resolved {
         Ok(selection) => Some(selection),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.prepare",
                 model = embedding_model(&vector.embedding),
@@ -464,7 +568,7 @@ fn remote_selection(
     api_key: Option<&str>,
 ) -> Option<EmbeddingSelection> {
     let Some(api_key) = api_key else {
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "search",
             operation = "search.prepare",
             api_key_env = embedding.api_key_env,
@@ -588,23 +692,26 @@ fn ranking_weights(search: &SearchConfiguration) -> RankingWeights {
     .unwrap_or_else(|error| unreachable!("accepted ranking shares must fuse: error={error}"))
 }
 
-/// Attaches the search tiers to the process's one workspace database.
+/// Attaches the search tiers to the process's index database and vectors database handle.
 ///
-/// [`WorkspaceStorage`] opens the database once for every store in the process. The server
-/// serves identifier search alone when the database did not open.
+/// [`WorkspaceStorage`] opens the index database once for every store in the process, and
+/// holds the handle the vector tier opens the vectors database through at its first
+/// vector operation. The server serves identifier search alone when the index database
+/// did not open.
 fn open_search_index(
     storage: &WorkspaceStorage,
     limits: SearchIndexLimits,
 ) -> Option<Arc<SearchIndex>> {
     let database = storage.database()?;
-    match SearchIndex::attached(database, limits) {
+    let vectors = storage.vectors()?;
+    match SearchIndex::attached(database, vectors, limits) {
         Ok(index) => Some(Arc::new(index)),
         Err(error) => {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.open",
                 error = %error,
-                "the search tiers could not attach to the workspace database; the server \
+                "the search tiers could not attach to the index database; the server \
                  starts without the search index"
             );
             None
@@ -635,7 +742,7 @@ fn spawn_vector_preparation(
         };
         match prepared {
             Ok(()) => embed_prepared(&published, &population).await,
-            Err(error) => tracing::warn!(
+            Err(error) => rift_tracing::warn!(
                 component = "search",
                 operation = "search.prepare",
                 error = %error,
@@ -709,12 +816,12 @@ async fn held_model(index: &SearchIndex, selection: &EmbeddingSelection) -> Resu
 /// ranking. The lane runs that pass rather than this task, so a pass a change or the
 /// supervisor already asked for is never run twice over.
 async fn embed_prepared(published: &RwLock<IndexState>, population: &PopulationLane) {
-    tracing::info!(
+    rift_tracing::info!(
         component = "search",
         operation = "search.prepare",
         "the vector ranking is prepared"
     );
-    let (current, _) = published.read().await.snapshot();
+    let (current, _) = read_published(published).await.snapshot();
     population.request(current);
 }
 
@@ -840,7 +947,7 @@ const STALE_INDEX_PATHS_MAX: usize = 5;
 enum ReadWait {
     /// The first capture checks content even when observations are ahead.
     Capture,
-    /// Changed source waits for publication, or for a successful capture superseded after
+    /// Changed source waits for publication, or for an index capture superseded after
     /// the read's last capture began.
     Rebuild {
         /// The latest superseded epoch recorded before that capture began.
@@ -909,10 +1016,10 @@ impl PreviousCapture {
 enum StaleIndexReason<'a> {
     /// The rebuild recorded past that publication failed.
     RebuildFailed(&'a RecordedRebuildFailure),
-    /// A successful capture was superseded while the request's own captures found the
-    /// tree moving.
+    /// An index capture was superseded, while it ran or at publication, while the
+    /// request's own captures found the tree moving.
     RebuildSuperseded {
-        /// The successful candidate's filesystem epoch.
+        /// The superseded capture's filesystem epoch.
         epoch: u64,
         /// What this request's exact capture found ahead of the publication.
         changes: &'a PathChanges,
@@ -943,7 +1050,7 @@ impl StaleIndexReason<'_> {
                     |named| format!("{named} moved"),
                 );
                 format!(
-                    "a successful index capture at epoch {epoch} was superseded before \
+                    "an index capture at epoch {epoch} was superseded before \
                      publication; the request-time capture found {found}{served}; \
                      the index supervisor keeps rebuilding the changed files"
                 )
@@ -1502,7 +1609,7 @@ enum StoreReadFailure {
 impl From<RiftError> for StoreReadFailure {
     fn from(error: RiftError) -> Self {
         if is_connection_unavailable(&error) {
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "search",
                 operation = "search.store",
                 %error,
@@ -1952,9 +2059,9 @@ impl RiftMcp {
                 spawn_lexical(index, blocking.clone(), cancellation, analyzer_revision)
             },
         );
-        // The log store shares the database owner without depending on index readiness. Its
-        // reads use committed WAL snapshots, so `rift://logs` can answer while a rebuild is
-        // still preparing the next publication.
+        // The log store is a database of its own and waits on no index readiness. Each read
+        // opens a connection of its own on the last committed WAL snapshot, so `rift://logs`
+        // answers while a rebuild holds the index database.
         let logs = storage.logs();
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
@@ -2056,16 +2163,15 @@ impl RiftMcp {
     ) -> Result<notify::RecommendedWatcher, RiftError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
-        blocking
-            .run("workspace watch setup", move || {
-                watch(&watch_root, &watch_validation)
-            })
-            .instrument(tracing::info_span!(
-                "index.watch",
-                component = "index",
-                operation = "watch.setup"
-            ))
-            .await
+        rift_tracing::info_span!(
+            "index.watch",
+            component = "index",
+            operation = "watch.setup"
+        )
+        .instrument(blocking.run("workspace watch setup", move || {
+            watch(&watch_root, &watch_validation)
+        }))
+        .await
     }
 
     /// Opens the search tier over `storage` and hands the lexical lane the initial write.
@@ -2147,8 +2253,7 @@ impl RiftMcp {
     /// The `[server]` table from the currently published acceptance, or the
     /// default table while `rift.toml` is invalid.
     pub(crate) async fn server_configuration(&self) -> ServerConfiguration {
-        self.published
-            .read()
+        read_published(&self.published)
             .await
             .current
             .configuration
@@ -2266,9 +2371,11 @@ impl RiftMcp {
             return self.change_search(params, change).await;
         }
         let Some(rev) = params.rev.clone() else {
-            return rift_core::traced_async!(component = "search", operation = "search.request", {
-                self.current_tree_search(params).await
-            })
+            return rift_tracing::traced!(
+                component = "search",
+                operation = "search.request",
+                async move { self.current_tree_search(params).await }
+            )
             .await;
         };
         // The search index only ever holds the current tree, so a revision-addressed
@@ -2398,11 +2505,11 @@ impl RiftMcp {
         let requested = &params;
         let (resolved, ranking, mut references) = tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(rift_core::traced_async!(
+            Box::pin(rift_tracing::traced!(
                 component = "search",
                 operation = "search.references",
-                {
-                    tracing::debug!("search references started");
+                async move {
+                    rift_tracing::debug!("search references started");
                     self.current_tree_references(resolved, ranking, requested, deadline)
                         .await
                 }
@@ -2614,13 +2721,17 @@ impl RiftMcp {
         references: Arc<EngineReferences>,
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let include_local_preparation = params.scope != SearchScope::Global;
-        rift_core::traced_async!(component = "search", operation = "search.read", {
-            tracing::debug!("search read started");
-            self.current_tree_read(resolved, include_local_preparation, move |reads| {
-                reads.search_with_references(&params, &answer, &references)
-            })
-            .await
-        })
+        rift_tracing::traced!(
+            component = "search",
+            operation = "search.read",
+            async move {
+                rift_tracing::debug!("search read started");
+                self.current_tree_read(resolved, include_local_preparation, move |reads| {
+                    reads.search_with_references(&params, &answer, &references)
+                })
+                .await
+            }
+        )
         .await
     }
 
@@ -2842,12 +2953,16 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
-            tracing::debug!("search store read started");
-            self.store_answer(index, tree_revision, &parsed).await
-        })
+        let stored = rift_tracing::traced!(
+            component = "search",
+            operation = "search.store",
+            async move {
+                rift_tracing::debug!("search store read started");
+                self.store_answer(index, tree_revision, &parsed).await
+            }
+        )
         .await;
-        let (searched, commit_state) = match stored {
+        let (searched, commit) = match stored {
             Ok(stored) => stored,
             Err(StoreReadFailure::ConnectionUnavailable) => {
                 return Ok(Some(SearchRanking::unavailable(
@@ -2857,11 +2972,16 @@ impl RiftMcp {
             }
             Err(StoreReadFailure::Refused(refusal)) => return refusal.fail(),
         };
+        // A matched store ranks whatever the lane holds; any other answer ranks nothing
+        // while a commit is held, running, or owed, and the record says which.
+        if !matches!(searched, RevisionScoped::Matched(_)) {
+            commit.record_unranked(tree_revision);
+        }
         Ok(ranking_of(
             searched,
             published.reads.file_count(),
             tree_revision,
-            commit_state,
+            commit.state,
             self.ranking_weights,
         ))
     }
@@ -2904,13 +3024,16 @@ impl RiftMcp {
         let line_bound = pattern.is_line_bound();
         let tree_revision = published.reads.tree_revision();
         let rows_max = self.pattern_bounds.candidate_rows_max();
-        let scoped =
-            rift_core::traced_async!(component = "search", operation = "search.pattern", {
+        let scoped = rift_tracing::traced!(
+            component = "search",
+            operation = "search.pattern",
+            async move {
                 index
                     .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
                     .await
-            })
-            .await;
+            }
+        )
+        .await;
         let selected = match scoped.map_err(StoreReadFailure::from) {
             Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
             Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
@@ -3008,7 +3131,7 @@ impl RiftMcp {
         query: &ParsedQuery,
         phase: QueryPhase,
     ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "search",
             operation = "search.rank",
             phase = phase.label(),
@@ -3037,19 +3160,19 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
-        let searched = rift_core::traced_async!(
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitReport), StoreReadFailure> {
+        let searched = rift_tracing::traced!(
             component = "search",
             operation = "search.read_store",
             attempt = 1_u8,
-            { self.read_store(index, tree_revision, query).await }
+            async move { self.read_store(index, tree_revision, query).await }
         )
         .await?;
         let Some(lane) = self.lexical.as_ref() else {
-            return Ok((searched, LexicalCommitState::Settled));
+            return Ok((searched, LexicalCommitReport::settled()));
         };
-        let commit_state = lane.commit_state(tree_revision);
-        Ok((searched, commit_state))
+        let commit = lane.commit_report(tree_revision);
+        Ok((searched, commit))
     }
 
     /// How deep the search index is read for one request: the same `results_max` bound
@@ -3294,12 +3417,13 @@ impl RiftMcp {
             tokio::time::timeout_at(deadline.at(), self.reconcile_workspace(phase)).await
         else {
             let detail = self.readiness_stall(deadline.budget()).await;
-            tracing::warn!(
+            rift_tracing::warn!(
                 component = "index",
                 operation = "index.readiness",
                 detail = detail.as_str(),
                 "a request spent its whole readiness budget"
             );
+            rift_tracing::publish_in_flight("readiness_timeout");
             return errors::server::read_unavailable()
                 .operation("current workspace read")
                 .detail(detail)
@@ -3320,7 +3444,7 @@ impl RiftMcp {
     async fn readiness_stall(&self, timeout: Duration) -> String {
         let observed = self.validation.observed_epoch();
         let published = {
-            let state = self.published.read().await;
+            let state = read_published(&self.published).await;
             let (current, _failure) = state.snapshot();
             current.epoch
         };
@@ -3349,14 +3473,14 @@ impl RiftMcp {
     /// not, since a deadline this call needs before validation can even
     /// begin cannot itself wait on that validation.
     async fn readiness_timeout(&self) -> Duration {
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.readiness",
             "reading request readiness budget"
         );
-        let state = self.published.read().await;
+        let state = read_published(&self.published).await;
         let (current, _failure) = state.snapshot();
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.readiness",
             timeout_ms = current
@@ -3403,8 +3527,9 @@ impl RiftMcp {
     /// publication before the next capture; the last capture refuses if its configuration
     /// moved.
     ///
-    /// A successful capture superseded after the read's last capture began wakes the read
-    /// before that publication, and the read captures again. A capture that differs from
+    /// An index capture superseded after the read's last capture began, while it ran or
+    /// at publication, wakes the read before that publication, and the read captures
+    /// again. A capture that differs from
     /// the previous one proves the tree moved during the read, so the read answers stale
     /// with the superseded epoch, which keeps a workspace under back-to-back rebuilds
     /// readable.
@@ -3459,7 +3584,7 @@ impl RiftMcp {
                 previous.awaits_publication(&current, &capture.tree, capture.configuration)
             });
             if configuration_matches && owed_publication {
-                tracing::debug!(
+                rift_tracing::debug!(
                     component = "index",
                     operation = "index.reconcile",
                     attempts,
@@ -3535,7 +3660,7 @@ impl RiftMcp {
         let reads = Arc::clone(&current.reads);
         self.blocking
             .run("project environment", move || {
-                Ok(rift_core::traced!(
+                Ok(rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.environment",
                     { reads.project_environment_moved() }
@@ -3574,10 +3699,10 @@ impl RiftMcp {
         let capture_started = tokio::time::Instant::now();
         let (digests, configuration) = self.capture_read(current, phase).await?;
         let capture_elapsed = capture_started.elapsed();
-        let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+        let tree = rift_tracing::traced!(component = "index", operation = "fingerprint.fold", {
             digests.fingerprint()
         });
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.reconcile",
             attempts,
@@ -3620,7 +3745,7 @@ impl RiftMcp {
             self.validation.observe_whole_workspace()
         };
         let requested_epoch = observed.map_err(|error| error.mcp().tool_failure(phase))?;
-        tracing::debug!(
+        rift_tracing::debug!(
             component = "index",
             operation = "index.reconcile",
             attempts,
@@ -3695,8 +3820,16 @@ impl RiftMcp {
         let languages = current.configuration.language_file_selections();
         let last_capture = Arc::clone(&self.last_capture);
         let cancellation = self.validation.cancellation.clone();
-        self.blocking
-            .run_with_cancellation("workspace fingerprint", cancellation, move |cancellation| {
+        rift_tracing::debug_span!(
+            "index.reconcile",
+            component = "index",
+            operation = "fingerprint.capture",
+            epoch = current.epoch
+        )
+        .instrument(self.blocking.run_with_cancellation(
+            "workspace fingerprint",
+            cancellation,
+            move |cancellation| {
                 let last = Arc::clone(
                     &last_capture
                         .lock()
@@ -3714,20 +3847,15 @@ impl RiftMcp {
                 *last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-                let configuration = rift_core::traced!(
+                let configuration = rift_tracing::traced!(
                     component = "index",
                     operation = "fingerprint.configuration",
                     { configuration_fingerprint(&root) }
                 );
                 Ok((digests, configuration))
-            })
-            .instrument(tracing::debug_span!(
-                "index.reconcile",
-                component = "index",
-                operation = "fingerprint.capture",
-                epoch = current.epoch
-            ))
-            .await
+            },
+        ))
+        .await
     }
 
     /// Validates only the selected paths represented by this immutable partial publication.
@@ -3767,7 +3895,7 @@ impl RiftMcp {
     /// carries the failure.
     ///
     /// A read's first capture compares content even when observations are ahead. Changed
-    /// source then waits for publication, unless a successful capture was superseded after
+    /// source then waits for publication, unless an index capture was superseded after
     /// the current publication and after the read's last capture began. The read then
     /// captures again rather than wait for a publication a moving tree keeps superseding,
     /// and that capture decides whether the tree moved. A supersession recorded before the
@@ -3788,14 +3916,14 @@ impl RiftMcp {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let observed_epoch = self.validation.observed_epoch();
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.readiness",
                 ?wait,
                 observed_epoch,
                 "request reading publication"
             );
-            let state = self.published.read().await;
+            let state = read_published(&self.published).await;
             let (current, failure) = state.snapshot();
             drop(state);
             if self.validation.watch_failed.load(Ordering::Acquire) {
@@ -3848,7 +3976,7 @@ impl RiftMcp {
             if capture {
                 return Ok((current, None));
             }
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.readiness",
                 ?wait,
@@ -3858,7 +3986,7 @@ impl RiftMcp {
                 "request waiting for publication"
             );
             changed.as_mut().await;
-            tracing::debug!(
+            rift_tracing::debug!(
                 component = "index",
                 operation = "index.readiness",
                 "publication wait notified"
@@ -3877,26 +4005,34 @@ impl RiftMcp {
     /// table, or the default table while `rift.toml` is invalid.
     async fn read_logs(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_records = {
-            let state = self.published.read().await;
+            let state = read_published(&self.published).await;
             let (current, _failure) = state.snapshot();
             current.configuration.logs_configuration().page_records
         };
         let query = resource::log_query(uri, page_records)?;
         // The drain writes on a timer, so a read taken right after the request that produced a
-        // record would answer without it. This waits for the lane to reach what it has taken.
-        crate::logs::settle_for_read().await;
+        // record would answer without it. This waits for the lane, and for this workspace's
+        // consumer when one process serves several, to reach what they have taken.
+        rift_tracing::settle_for_read(&self.root.display().to_string()).await;
         let Some(store) = self.logs.as_ref() else {
             return resource::logs_unavailable(
                 uri,
                 "the workspace log store could not be opened, so this run recorded nothing",
             );
         };
-        match store.recent(&query).await {
-            Ok(records) => resource::rendered_logs(uri, &records),
-            Err(error) => {
+        let reader = store.reader();
+        let read = tokio::task::spawn_blocking(move || reader.connect()?.recent(&query)).await;
+        match read {
+            Ok(Ok(records)) => resource::rendered_logs(uri, &records),
+            Ok(Err(error)) => {
                 ErrorData::internal_error(format!("the log store refused the read: {error}"), None)
                     .fail()
             }
+            Err(error) => ErrorData::internal_error(
+                format!("the log read stopped before it answered: {error}"),
+                None,
+            )
+            .fail(),
         }
     }
 
@@ -3904,7 +4040,7 @@ impl RiftMcp {
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_index = resource::workspace_page_index(uri)?;
         self.ensure_workspace_root().await?;
-        let current = Arc::clone(&self.published.read().await.current);
+        let current = Arc::clone(&read_published(&self.published).await.current);
         let configuration = current
             .configuration
             .accepted
@@ -3968,7 +4104,7 @@ impl RiftMcp {
     /// recomputation - the map is rebuilt once per publication.
     async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         self.ensure_workspace_root().await?;
-        let current = Arc::clone(&self.published.read().await.current);
+        let current = Arc::clone(&read_published(&self.published).await.current);
         resource::rendered_map(uri, &current.map)
     }
 
@@ -4019,32 +4155,46 @@ impl ServerHandler for RiftMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let span = tracing::info_span!(
+        let measured =
+            McpRequest::tool_call(&request.name).served(context.protocol_version().as_ref());
+        // `workspace` routes every record inside the request to this workspace's log store
+        // when one process serves several workspaces.
+        let span = rift_tracing::info_span!(
             "mcp.request",
             component = "mcp",
             operation = "tools/call",
             request_id = %context.id,
-            tool = %request.name
+            tool = %request.name,
+            mcp.method.name = TOOLS_CALL,
+            gen_ai.tool.name = %request.name,
+            workspace = %self.root.display()
         );
-        async {
-            tracing::debug!("tool request started");
-            let routed = ToolCallContext::new(self, request, context);
-            let result = match self.tool_router.call(routed).await {
-                Err(error) => ToolFailure::from(error).into_call_tool_result(),
-                Ok(response) => Ok(response),
-            };
-            // A tool's registered failure completes as a result with `isError`, so the
-            // record reads the completed result, not the router's.
-            let is_error = match &result {
-                Ok(CallToolResponse::Complete(done)) => done.is_error == Some(true),
-                Ok(_) => false,
-                Err(_) => true,
-            };
-            tracing::debug!(is_error, "tool request completed");
-            result
-        }
-        .instrument(span)
-        .await
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("tools/call", {
+            answered = span
+                .instrument(async {
+                    rift_tracing::debug!("tool request started");
+                    let routed = ToolCallContext::new(self, request, context);
+                    let result = match self.tool_router.call(routed).await {
+                        Err(error) => ToolFailure::from(error).into_call_tool_result(),
+                        Ok(response) => Ok(response),
+                    };
+                    rift_tracing::debug!(
+                        is_error = Ending::of_tool_call(&result) != Ending::Answered,
+                        "tool request completed"
+                    );
+                    result
+                })
+                .await;
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        measured.record(
+            &MCP_SERVER_OPERATION_DURATION,
+            elapsed,
+            Ending::of_tool_call(&answered),
+        );
+        answered
     }
 
     fn list_tools(
@@ -4055,9 +4205,18 @@ impl ServerHandler for RiftMcp {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let tools;
+        let elapsed = rift_tracing::measure_elapsed!("tools/list", {
+            tools = self.tool_router.list_all();
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(TOOLS_LIST)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
         std::future::ready(Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
-            tools: self.tool_router.list_all(),
+            tools,
             meta: None,
             next_cursor: None,
             ttl_ms: supports_cache_hints.then_some(0),
@@ -4068,37 +4227,102 @@ impl ServerHandler for RiftMcp {
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> {
-        std::future::ready(Ok(ListResourcesResult::with_all_items(
-            resource::declared_resources(),
-        )))
+        let resources;
+        let elapsed = rift_tracing::measure_elapsed!("resources/list", {
+            resources = resource::declared_resources();
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_LIST)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
+        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
     }
 
     fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> {
-        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
-            resource::declared_templates(),
-        )))
+        let templates;
+        let elapsed = rift_tracing::measure_elapsed!("resources/templates/list", {
+            templates = resource::declared_templates();
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCE_TEMPLATES_LIST)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if resource::is_workspace_uri(&request.uri) {
-            Box::pin(self.read_workspace(&request.uri))
-                .await
-                .map(Into::into)
-        } else if request.uri == resource::MAP_URI {
-            self.read_map(&request.uri).await.map(Into::into)
-        } else {
-            self.read_logs(&request.uri).await.map(Into::into)
-        }
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("resources/read", {
+            answered = if resource::is_workspace_uri(&request.uri) {
+                Box::pin(self.read_workspace(&request.uri))
+                    .await
+                    .map(Into::into)
+            } else if request.uri == resource::MAP_URI {
+                self.read_map(&request.uri).await.map(Into::into)
+            } else {
+                self.read_logs(&request.uri).await.map(Into::into)
+            };
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(RESOURCES_READ)
+            .served(context.protocol_version().as_ref())
+            .record(
+                &MCP_SERVER_OPERATION_DURATION,
+                elapsed,
+                Ending::of(&answered),
+            );
+        answered
+    }
+
+    /// Answers as rmcp's default does: keeps the client's parameters as the peer's and
+    /// negotiates the protocol version; records the request's duration.
+    fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::InitializeResult, ErrorData>> {
+        let answered;
+        let elapsed = rift_tracing::measure_elapsed!("initialize", {
+            context.peer.set_peer_info(request.clone());
+            answered = self.negotiate_initialize(&request);
+        })
+        .ok()
+        .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(INITIALIZE)
+            .served(context.protocol_version().as_ref())
+            .record(
+                &MCP_SERVER_OPERATION_DURATION,
+                elapsed,
+                Ending::of(&answered),
+            );
+        std::future::ready(answered)
+    }
+
+    /// Answers as rmcp's default does; records the request's duration.
+    fn ping(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> {
+        let elapsed = rift_tracing::measure_elapsed!("ping", {})
+            .ok()
+            .map(|((), measurement)| measurement.elapsed());
+        McpRequest::method(PING)
+            .served(context.protocol_version().as_ref())
+            .record(&MCP_SERVER_OPERATION_DURATION, elapsed, Ending::Answered);
+        std::future::ready(Ok(()))
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -4236,7 +4460,7 @@ impl RiftMcp {
     /// unchanged reuses the running sessions, and one whose tables differ
     /// replaces the pool and shuts the old engines down.
     pub async fn engine_pool(&self) -> Arc<EnginePool> {
-        let published = Arc::clone(&self.published.read().await.current);
+        let published = Arc::clone(&read_published(&self.published).await.current);
         self.engine_pool_for(&published).await
     }
 
@@ -5712,7 +5936,7 @@ done
             &RebuildRequest::initial(epoch),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
-            WorkspaceCandidate::ConfigurationChanged => {
+            WorkspaceCandidate::ConfigurationChanged | WorkspaceCandidate::Superseded => {
                 Err("fixture configuration must remain stable".into())
             }
         }
@@ -6297,6 +6521,112 @@ done
             .expect("timed-out waiter must leave capacity reusable");
     }
 
+    /// A blocking operation that waits past the queue timeout for the only worker permit
+    /// names itself and the operation holding the permit, and the timeout publishes the
+    /// table of operations in flight with that holder in it.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_timeout_names_the_operation_holding_the_worker_permit() -> TestResult {
+        const QUEUE_TIMEOUT_MS: u64 = 25;
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(1, QUEUE_TIMEOUT_MS);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let held_executor = executor.clone();
+        let held = tokio::spawn(rift_tracing::traced!(
+            component = "index",
+            operation = "index.build",
+            async move {
+                held_executor
+                    .run("held operation", move || {
+                        let _ = started_sender.send(());
+                        release_receiver
+                            .recv()
+                            .map_err(|_| errors::server::read_cancelled().error())
+                    })
+                    .await
+            }
+        ));
+        started_receiver.await?;
+        let queued_executor = executor.clone();
+        let (queued_ready_sender, queued_ready_receiver) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(rift_tracing::traced!(
+            component = "search",
+            operation = "search.read",
+            async move {
+                let _ = queued_ready_sender.send(());
+                queued_executor.run("queued operation", || Ok(())).await
+            }
+        ));
+        queued_ready_receiver.await?;
+        tokio::time::advance(Duration::from_millis(QUEUE_TIMEOUT_MS + 1)).await;
+        let refusal = queued
+            .await?
+            .expect_err("the queue wait passed its timeout");
+        assert_eq!(refusal.slug(), errors::server::read_capacity_timeout::SLUG);
+        release_sender.send(())?;
+        held.await??;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| record.message() == "lock.wait")
+            .ok_or("the wait closed with a record")?;
+        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
+        assert_eq!(wait["lock.name"], super::WORKER_PERMIT_LOCK, "{wait}");
+        assert_eq!(wait["waiter"], "search.read", "{wait}");
+        assert_eq!(wait["holder"], "index.build", "{wait}");
+        assert_eq!(wait["outcome"], "timeout", "{wait}");
+        let table = records
+            .iter()
+            .find(|record| record.message() == "operations in flight")
+            .ok_or("the timeout published the table")?;
+        let table: serde_json::Value = serde_json::from_str(table.fields())?;
+        assert_eq!(table["reason"], "worker_queue_timeout", "{table}");
+        let listed: serde_json::Value =
+            serde_json::from_str(table["operations"].as_str().ok_or("operations")?)?;
+        assert!(
+            listed.as_array().into_iter().flatten().any(|entry| {
+                entry["kind"] == "held"
+                    && entry["lock.name"] == super::WORKER_PERMIT_LOCK
+                    && entry["parent"] == "index.build"
+            }),
+            "{table}"
+        );
+        Ok(())
+    }
+
+    /// A blocking operation that finds the worker semaphore closed ends its wait `refused`
+    /// and records no hold, and the caller gets the read task error rather than a timeout.
+    #[tokio::test]
+    async fn a_closed_worker_semaphore_ends_the_wait_refused_and_holds_nothing() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(1, 1_000);
+        executor.operations.close();
+        let refusal =
+            rift_tracing::traced!(component = "search", operation = "search.read", async {
+                executor.run("closed operation", || Ok(())).await
+            })
+            .await
+            .expect_err("a closed semaphore admits nothing");
+        assert_eq!(refusal.slug(), errors::server::read_task::SLUG);
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let wait = records
+            .iter()
+            .find(|record| record.message() == "lock.wait")
+            .ok_or("the wait closed with a record")?;
+        let wait: serde_json::Value = serde_json::from_str(wait.fields())?;
+        assert_eq!(wait["lock.name"], super::WORKER_PERMIT_LOCK, "{wait}");
+        assert_eq!(wait["outcome"], "refused", "{wait}");
+        assert!(
+            records.iter().all(|record| record.message() != "lock.held"),
+            "a refused wait records no hold"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn blocking_executor_preserves_work_error() {
         let executor = BlockingExecutor::isolated(1, 1_000);
@@ -6388,6 +6718,220 @@ done
             .await
             .expect_err("closed semaphore must fail acceptance");
         assert_eq!(error.slug(), errors::server::read_task::SLUG);
+    }
+
+    /// A collection reads the blocking pool's available and used permits, until the
+    /// executor drops.
+    #[tokio::test]
+    async fn a_collection_reads_the_worker_permits() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let executor = BlockingExecutor::isolated(2, 1_000);
+        let held = Arc::clone(&executor.operations).acquire_owned().await?;
+        let snapshot = recorder.metrics();
+        let permits = |state| {
+            snapshot
+                .find(
+                    "worker_pool.permit.count",
+                    &[("worker_pool.permit.state", state)],
+                )
+                .map(|series| series.value().clone())
+        };
+        assert_eq!(
+            permits("available"),
+            Some(rift_tracing::SeriesValue::Sum(1.0))
+        );
+        assert_eq!(permits("used"), Some(rift_tracing::SeriesValue::Sum(1.0)));
+        drop(held);
+        drop(executor);
+        assert!(
+            recorder
+                .metrics()
+                .find(
+                    "worker_pool.permit.count",
+                    &[("worker_pool.permit.state", "available")],
+                )
+                .is_none(),
+            "a dropped executor reports no permit"
+        );
+        Ok(())
+    }
+
+    /// A tool call's `mcp.request` span carries the MCP method, the tool, and the
+    /// workspace root, so every record inside it names, through its `root_span`, the
+    /// workspace the routing log drain files it under.
+    #[tokio::test]
+    async fn a_tool_call_request_span_names_its_method_tool_and_workspace() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (directory, server) = Box::pin(fixture()).await?;
+        let root = super::absolute_root(directory.path())?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await?;
+        client.cancel().await?;
+        server_task.await?;
+        drop(recorder);
+
+        let records = drain.queued_records();
+        let completed = records
+            .iter()
+            .find(|record| record.message() == "tool request completed")
+            .ok_or("the event inside the request span is captured")?;
+        let fields: serde_json::Value = serde_json::from_str(completed.fields())?;
+        let request = &fields["root_span"];
+        assert_eq!(request["name"], "mcp.request", "{fields}");
+        assert_eq!(
+            request["fields"]["mcp.method.name"], "tools/call",
+            "{fields}"
+        );
+        assert_eq!(
+            request["fields"]["gen_ai.tool.name"], "get_symbol",
+            "{fields}"
+        );
+        assert_eq!(
+            request["fields"]["workspace"],
+            root.display().to_string(),
+            "{fields}"
+        );
+        Ok(())
+    }
+
+    /// Every request the server answers lands in `mcp.server.operation.duration` under its
+    /// method, its tool, and how it ended: a tool answered with `isError` as `tool_error`,
+    /// a refused read under its JSON-RPC code. Each names the session's protocol version and
+    /// the TCP transport.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one session drives every recorded method before the snapshot is read"
+    )]
+    async fn each_answered_request_records_its_server_operation_duration() -> TestResult {
+        use crate::metrics::tests::recorded;
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let (_directory, server) = Box::pin(fixture()).await?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server must initialize");
+            service.waiting().await.expect("server must stop cleanly");
+        });
+        let client = ().serve(client_transport).await?;
+        client.list_all_tools().await?;
+        client.list_all_resources().await?;
+        client.list_all_resource_templates().await?;
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await?;
+        let refused = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": ""}))?),
+            )
+            .await?;
+        assert_eq!(refused.is_error, Some(true));
+        let unpublished = client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(
+                "rift://unpublished",
+            ))
+            .await;
+        assert!(unpublished.is_err(), "an unpublished URI is refused");
+        client
+            .send_request(rmcp::model::ClientRequest::PingRequest(
+                rmcp::model::PingRequest {
+                    method: rmcp::model::PingRequestMethod,
+                    extensions: rmcp::model::Extensions::default(),
+                },
+            ))
+            .await?;
+        client.cancel().await?;
+        server_task.await?;
+
+        let snapshot = recorder.metrics();
+        let name = "mcp.server.operation.duration";
+        let version = (
+            "mcp.protocol.version",
+            rmcp::model::ProtocolVersion::LATEST.as_str(),
+        );
+        let transport = ("network.transport", "tcp");
+        for method in [
+            "initialize",
+            "ping",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+        ] {
+            assert_eq!(
+                recorded(
+                    &snapshot,
+                    name,
+                    &[("mcp.method.name", method), version, transport]
+                ),
+                1,
+                "{method}: {snapshot:?}"
+            );
+        }
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("gen_ai.tool.name", "get_symbol"),
+                    version,
+                    transport,
+                ],
+            ),
+            1
+        );
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "tools/call"),
+                    ("gen_ai.tool.name", "search"),
+                    ("error.type", "tool_error"),
+                    version,
+                    transport,
+                ],
+            ),
+            1
+        );
+        let refused_reads: u64 = snapshot
+            .series()
+            .iter()
+            .filter(|series| {
+                let labels = series.labels();
+                series.name() == name
+                    && labels.contains(&("mcp.method.name", "resources/read"))
+                    && labels.iter().any(|(key, _)| *key == "error.type")
+                    && labels.contains(&version)
+                    && labels.contains(&transport)
+            })
+            .map(|series| match series.value() {
+                rift_tracing::SeriesValue::Buckets { count, .. } => *count,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(refused_reads, 1, "{snapshot:?}");
+        Ok(())
     }
 
     #[tokio::test]
@@ -6610,14 +7154,15 @@ done
     }
 
     /// Corrupt bytes fail `SQLite`'s file-format check deterministically. The server starts
-    /// without database-backed search or logs and leaves those bytes in place for recovery.
+    /// without database-backed search, keeps its logs in the metrics database, and leaves
+    /// those bytes in place for recovery.
     #[tokio::test]
     async fn build_preserves_a_corrupt_database_and_serves_without_it() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
-        let database_path = state_directory.join("db");
+        let database_path = state_directory.join("index");
         let corrupt = b"not a sqlite database";
         fs::write(&database_path, corrupt)?;
         super::hermetic_workspace(directory.path(), "")?;
@@ -6627,13 +7172,111 @@ done
             .map_err(|error| format!("corrupt database must not fail startup: {error:?}"))?;
 
         assert!(server.search_index.is_none());
+        assert!(
+            server.logs.is_some(),
+            "the metrics database opens on its own"
+        );
+        let answer = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
+        assert!(!answer.contains("could not be opened"), "{answer}");
+        assert_eq!(fs::read(database_path)?, corrupt);
+        Ok(())
+    }
+
+    /// A corrupt metrics database leaves the run unrecorded: `rift://logs` answers an empty
+    /// set with the reason, search keeps its database, and the bytes stay for recovery.
+    #[tokio::test]
+    async fn build_preserves_a_corrupt_metrics_database_and_answers_why_logs_are_empty()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let state_directory = directory.path().join(".rift");
+        fs::create_dir_all(&state_directory)?;
+        let metrics_path = state_directory.join("metrics");
+        let corrupt = b"not a sqlite database";
+        fs::write(&metrics_path, corrupt)?;
+        super::hermetic_workspace(directory.path(), "")?;
+
+        let server = RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .map_err(|error| format!("corrupt metrics must not fail startup: {error:?}"))?;
+
+        assert!(server.search_index.is_some());
         assert!(server.logs.is_none());
         let unavailable = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
         assert!(
             unavailable.contains("the workspace log store could not be opened"),
             "{unavailable}"
         );
-        assert_eq!(fs::read(database_path)?, corrupt);
+        assert_eq!(fs::read(metrics_path)?, corrupt);
+        Ok(())
+    }
+
+    /// A metrics file of a schema version the reader does not read answers a `rift://logs`
+    /// read with an internal error that names the refusal.
+    #[tokio::test]
+    async fn a_log_read_the_store_refuses_answers_an_internal_error() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let server =
+            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(
+            server.logs.is_some(),
+            "the metrics database opens on its own"
+        );
+        let metrics = directory.path().join(".rift").join("metrics");
+        rusqlite::Connection::open(metrics)?.pragma_update(None, "user_version", 7)?;
+
+        let refusal = server
+            .read_logs("rift://logs")
+            .await
+            .expect_err("a reader refuses a schema it does not read");
+
+        assert_eq!(refusal.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            refusal.message.contains("the log store refused the read"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
+    /// Logs record and answer while the index database is refused: `rift://logs`
+    /// returns the `database.open` warning the refusal produced.
+    #[tokio::test]
+    async fn a_refused_index_database_is_recorded_in_the_logs() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .capture(&capture)
+            .install()?;
+
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage
+            .logs()
+            .ok_or("the metrics database opens on its own")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server = RiftMcp::build_settled_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
+        assert!(server.search_index.is_none());
+
+        let logs = server.read_logs("rift://logs/component/storage").await?;
+        let text = resource_json_text(&logs, "rift://logs/component/storage")?;
+        assert!(
+            text.contains("database.open") && text.contains("the index database failed to open"),
+            "the refusal is recorded: {text}"
+        );
+        cancellation.cancel();
+        drain_task.await?;
         Ok(())
     }
 
@@ -7882,8 +8525,8 @@ done
         Ok(())
     }
 
-    /// The same condition on `search`: the answer carries the publication's own rows and
-    /// the warning, rather than the refusal the spent bound used to raise.
+    /// The same condition on `search`: once the reconciliation bound is spent, the answer
+    /// carries the publication's own rows and the warning, and no refusal.
     #[tokio::test]
     async fn a_search_whose_tree_keeps_moving_answers_stale() -> TestResult {
         let (directory, server) = fixture().await?;
@@ -8216,6 +8859,157 @@ done
         Ok(())
     }
 
+    /// A capture stopped while it runs by an observation of what the read already
+    /// captured proves no movement, exactly as one superseded at publication does: the
+    /// read captures again, finds its previous tree, and keeps waiting for its rebuild.
+    #[tokio::test]
+    async fn a_capture_stopped_by_a_late_report_leaves_the_read_waiting() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "lantern"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+
+        let validation = Arc::clone(&server.validation);
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                validation.observe_whole_workspace()?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                assert!(
+                    matches!(candidate, WorkspaceCandidate::Superseded),
+                    "the capture stops before it builds a candidate"
+                );
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "a stopped capture that moved nothing must not answer the read"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the stopped capture woke the read"
+        );
+        assert_eq!(
+            server.validation.observed_epoch(),
+            2,
+            "a capture that matches the read's previous one asks for nothing again"
+        );
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "the publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the edited source answers: {fresh:?}");
+        assert!(
+            stale_index_of(&fresh.warnings).is_err(),
+            "the read answers from a current publication: {:?}",
+            fresh.warnings
+        );
+        Ok(())
+    }
+
+    /// A capture stopped while it runs wakes a waiting read. The tree that read captures
+    /// next differs from its previous capture, so it answers from the published index
+    /// with `stale_index`.
+    #[tokio::test]
+    async fn a_capture_stopped_by_moved_bytes_wakes_a_read_that_answers_stale() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern0() {}\n")?;
+        server
+            .validation
+            .observe_paths([CoreProjectPath::new("lib.rs")?])?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "beacon"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+        let (published, _) = server.published.read().await.snapshot();
+
+        let validation = Arc::clone(&server.validation);
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                fs::write(root.join("other.rs"), "pub fn other() {}\n")
+                    .expect("the later source must land");
+                let path = CoreProjectPath::new("other.rs").expect("fixture path is valid");
+                validation.observe_paths([path])?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                assert!(
+                    matches!(candidate, WorkspaceCandidate::Superseded),
+                    "the capture stops before it builds a candidate"
+                );
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+        assert_eq!(server.published.read().await.current.epoch, published.epoch);
+
+        let stale = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "a stopped capture must wake the waiting read")??;
+        assert_eq!(stale.hits.len(), 1);
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the woken read captured the tree that moved during it"
+        );
+        let (index, captured_revision, detail) = stale_index_of(&stale.warnings)?;
+        assert_eq!(index, published.reads.tree_revision());
+        assert_ne!(index, captured_revision);
+        assert!(detail.contains("other.rs"), "{detail}");
+        assert!(detail.contains("superseded before publication"), "{detail}");
+        Ok(())
+    }
+
     /// Changed content waits while no successful superseded capture proves movement.
     #[tokio::test]
     async fn a_read_waits_for_a_pending_edit_without_a_superseded_capture() -> TestResult {
@@ -8435,7 +9229,19 @@ done
         )
         .await?;
         let server = assembled.supervised().await;
-        double.calls_within_bound(1).await?;
+        // The first write is a whole one, and a store holding nothing it can keep is cleared
+        // before a whole write lands. The double runs the clear through the store at once,
+        // on the one pooled connection; the apply that follows waits at the gate before it
+        // checks a connection out. So the slot is free once the apply follows the clear.
+        let revision = current_publication(&server)
+            .await
+            .reads
+            .tree_revision()
+            .to_owned();
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![("clear", String::new()), ("apply", revision)]
+        );
         Ok((server, double, database))
     }
 
@@ -8515,7 +9321,7 @@ done
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(server.search_index.is_none());
@@ -8912,13 +9718,9 @@ done
     /// whole budget the request was given.
     #[tokio::test]
     async fn a_publication_wait_ends_at_the_deadline_the_request_carries() -> TestResult {
-        let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .with_writer(log.reopen()?)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         // The tree moves past the publication, so the read waits for a rebuild that the
@@ -8951,26 +9753,28 @@ done
                 .contains(&format!("{}ms", STALLED_PUBLICATION_BUDGET.as_millis())),
             "the refusal names the whole budget the request was given: {error:?}"
         );
-        let records = fs::read_to_string(log.path())?;
+        let records = drain.queued_records();
         for event in [
             "request capture compared with publication",
             "request capture requested a rebuild",
             "request waiting for publication",
             "a request spent its whole readiness budget",
+            "operations in flight",
         ] {
             assert!(
-                records.contains(event),
-                "the wait records its active stage: {event}\n{records}"
+                records.iter().any(|record| record.message() == event),
+                "the wait records its active stage: {event}\n{records:#?}"
             );
         }
         let waiting = records
-            .lines()
-            .find(|line| line.contains("request waiting for publication"))
+            .iter()
+            .find(|record| record.message() == "request waiting for publication")
             .ok_or("the request records its publication wait before the deadline")?;
-        assert!(waiting.contains("published_epoch=0"), "{waiting}");
+        let fields: serde_json::Value = serde_json::from_str(waiting.fields())?;
+        assert_eq!(fields["published_epoch"], "0", "{waiting:?}");
         assert!(
-            waiting.contains("observed_epoch=") && waiting.contains("superseded_epoch="),
-            "{waiting}"
+            fields.get("observed_epoch").is_some() && fields.get("superseded_epoch").is_some(),
+            "{waiting:?}"
         );
         Ok(())
     }
@@ -9243,20 +10047,20 @@ done
     /// filter a served workspace records under.
     #[tokio::test]
     async fn a_file_past_a_syntax_bound_is_named_in_the_logs_and_the_rest_serves() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("src/deep.rs"), deep_source())?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = crate::logs::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
-        tracing::subscriber::set_global_default(subscriber)?;
+        // The runtime falls back to its default targets on a filter it cannot parse; the
+        // test refuses one instead.
+        rift_tracing::validate_log_filter(&capture)?;
+        let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
+            .capture(&capture)
+            .install()?;
+        let drain = drain.ok_or("a capture filter returns a drain")?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
@@ -9312,9 +10116,6 @@ done
     /// the same bound, so only the requested source path receives the warning.
     #[tokio::test]
     async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
@@ -9326,11 +10127,14 @@ done
             "[providers.syntax]\nmax_file = \"128b\"\n",
         )?;
 
-        let (sink, drain) = crate::logs::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
-        tracing::subscriber::set_global_default(subscriber)?;
+        // The runtime falls back to its default targets on a filter it cannot parse; the
+        // test refuses one instead.
+        rift_tracing::validate_log_filter(&capture)?;
+        let (_runtime, drain) = rift_tracing::TracingRuntime::builder()
+            .capture(&capture)
+            .install()?;
+        let drain = drain.ok_or("a capture filter returns a drain")?;
 
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
@@ -9404,20 +10208,15 @@ done
     /// lane its own thread records into, never the one built last.
     #[tokio::test]
     async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = crate::logs::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(sink.with_filter(filter)),
-        );
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .capture(&capture)
+            .install()?;
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -9429,9 +10228,9 @@ done
             crate::identity::BuildCheckout::Unversioned,
         )
         .await?;
-        let (_other_sink, _other_drain) = crate::logs::log_capture();
+        let (_other_sink, _other_drain) = rift_tracing::log_capture();
 
-        tracing::warn!(component = "engine", "the beacon engine did not start");
+        rift_tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
         let text = resource_json_text(&logs, "rift://logs/component/engine")?;
         let answered = text.clone();
@@ -9451,9 +10250,6 @@ done
     /// own words stay out of the store.
     #[tokio::test]
     async fn a_ranked_phase_records_the_query_shape_and_not_its_text() -> TestResult {
-        use tracing_subscriber::Layer as _;
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         /// A term no fixture source carries, so finding it in the store would mean
         /// the record carried the caller's text.
         const SECRET_TERM: &str = "zzquixotic";
@@ -9463,11 +10259,9 @@ done
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
 
-        let (sink, drain) = crate::logs::log_capture();
-        let filter = tracing_subscriber::EnvFilter::try_new("rift_mcp=debug")?;
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(sink.with_filter(filter)),
-        );
+        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=debug")
+            .install()?;
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -9511,8 +10305,6 @@ done
     #[tokio::test]
     async fn a_file_row_as_large_as_max_chunk_answers_search_and_its_declaration_serves()
     -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
@@ -9522,8 +10314,7 @@ done
         );
         fs::write(directory.path().join("src/blob.rs"), blob)?;
         super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"2mb\"\n")?;
-        let (sink, mut drain) = crate::logs::log_capture();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
@@ -9545,7 +10336,7 @@ done
         );
         let symbol = get_symbol(&server, "BLOB").await?;
         assert_eq!(symbol.hits.len(), 1, "{symbol:?}");
-        while let Ok(record) = drain.try_recv_record() {
+        for record in drain.queued_records() {
             assert!(
                 !record.message().contains("lexical unit left out"),
                 "no unit is left out: {}",
@@ -9708,11 +10499,7 @@ done
 
     #[tokio::test]
     async fn traced_read_reconciles_under_an_active_subscriber() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let (_directory, server) = fixture().await?;
         let result = get_symbol(&server, "beacon")
             .await
@@ -9723,11 +10510,7 @@ done
 
     #[tokio::test]
     async fn build_disables_search_index_when_rift_state_path_is_a_file() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A regular file already occupies `.rift`, so `create_dir_all` cannot make the
@@ -9745,17 +10528,13 @@ done
 
     #[tokio::test]
     async fn build_disables_search_index_when_database_path_is_a_directory() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // A directory at the database path makes SQLite reject the open without changing
         // the unexpected filesystem entry.
         super::hermetic_workspace(directory.path(), "")?;
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(
@@ -9921,11 +10700,9 @@ done
 
     #[test]
     fn an_openai_compatible_embedding_without_its_credential_leaves_the_tier_off() {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
         assert!(
             super::remote_selection(&remote_embedding(), None).is_none(),
             "an unset credential variable leaves the vector ranking off"
@@ -9952,11 +10729,7 @@ done
 
     #[tokio::test]
     async fn a_model_the_source_refuses_leaves_the_tier_off_and_full_text_serving() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         // Acceptance's path rule allows an empty segment; `ModelSource` refuses one, so this
         // value passes the first gate and fails the second.
         let refused = vector_with(EmbeddingConfiguration::Directory {
@@ -10004,11 +10777,7 @@ done
 
     #[tokio::test]
     async fn an_invalid_configuration_holds_the_acquisition_back() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // The table naming the model is the very part acceptance could not read.
@@ -10031,11 +10800,7 @@ done
     #[tokio::test]
     async fn a_model_directory_without_weights_ends_preparation_and_the_answer_says_so()
     -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         // An empty directory holds none of the three files an encoder loads, so acquisition
@@ -10368,11 +11133,7 @@ done
 
     #[tokio::test]
     async fn a_revision_search_never_consults_the_search_index() -> TestResult {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::sink)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         rift_history::fixture::init(directory.path());
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -10380,7 +11141,7 @@ done
         super::hermetic_workspace(directory.path(), "")?;
         // A directory at the database path exhausts the open retry, so the handle is absent
         // and a current-tree search says so. A revision search must stay silent about it.
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(server.search_index.is_none());
@@ -10607,8 +11368,8 @@ done
         Ok(())
     }
 
-    /// `fetch_limit` no longer scales with the requested `limit`, so `total_pages` reflects
-    /// the same candidate pool whatever page size the caller asks for: a `limit: 1` request
+    /// `fetch_limit` reads `results_max` whatever the requested `limit`, so `total_pages`
+    /// reflects the same candidate pool whatever page size the caller asks for: a `limit: 1` request
     /// reports as many pages as the pool a `limit` wide enough to fit it all serves on one
     /// page.
     #[tokio::test]

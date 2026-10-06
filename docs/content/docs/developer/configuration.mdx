@@ -109,9 +109,11 @@ version_control_timeout = "3s"
 workspaces = 16
 ```
 
-- `validation_interval` bounds the interval between background filesystem checks, 1s to 1h.
-  Requests and filesystem events do not reset the deadline; an unchanged check without a recorded
-  failure queues no rebuild.
+- `validation_interval` sets the deadline of each background filesystem check, 1s to 1h.
+  Requests and filesystem events do not reset the deadline. A due check waits behind the rebuild
+  that follows a superseded one, so it starts at most one interval after its deadline, plus the
+  rebuild running when that interval ends. An unchanged check without a recorded failure queues
+  no rebuild.
 - `version_control_timeout` bounds the wait for the worktree's Git `index.lock`, 1ms to 30s.
   A lock retained past the bound is passed and named in the log; the server leaves the lock in place.
 - `workspaces` caps the workspaces retained by one repository process, 1 to 64.
@@ -130,7 +132,7 @@ also selects a workspace server. Existing connections retain their startup setti
 <VersionBadge version="v0.0.22" />
 
 `logs` bounds what the server records about itself. Diagnostics admitted by `capture` enter a
-bounded queue and land in the workspace database, where the `rift://logs` resource reads them
+bounded queue and land in the metrics database at `.rift/metrics`, where the `rift://logs` resource reads them
 back for an agent and `rift server logs` reads the same records for an operator - so a refusal an
 agent meets can be explained without an operator reading the server's terminal:
 
@@ -139,6 +141,8 @@ agent meets can be explained without an operator reading the server's terminal:
 retention_records = 50000
 page_records = 500
 capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
+stall_delay = "10s"
+stderr_limit = "1mb"
 ```
 
 - `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
@@ -147,10 +151,21 @@ capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
 - `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
   `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
   excludes never reaches the store, whatever the terminal shows
+- `stall_delay` <VersionBadge version="v0.0.62" inline /> is how long an operation, lock wait, or held lock stays open before the server
+  reports it, 1s to 1h. The server checks every quarter of the delay, and at least every 5s, and
+  reports each such entry once, in one record of the operations in flight with their age, so a
+  request that runs out its deadline leaves the work it waited on in the store. A lock the server
+  keeps for as long as it runs is never reported
+- `stderr_limit` <VersionBadge version="v0.0.62" inline /> is how many bytes a foreground server writes to a standard error that
+  is not a terminal, 1kb to 1gb. Past it the server prints one notice there and discards the
+  rest, counting the discarded bytes in `log.stderr.discarded`; the store keeps every record
+  `capture` admits either way. The server's stop records the count as
+  `standard error bytes discarded`
 
 The server reads this table at startup, so a change applies on the next start. The records
-outlive the process that wrote them: they live beside the search index in `.rift/db`, and a
-workspace whose index will not settle still answers `rift://logs`.
+outlive the process that wrote them. The metrics database is a file apart from the search
+index, so a workspace whose index will not settle, or whose index database another process
+holds locked, still answers `rift://logs`.
 
 ## Source
 
@@ -638,8 +653,10 @@ in `warnings` naming the two tree revision digests.
 <VersionBadge version="v0.0.9" />
 
 [`search`](/docs/mcp#tool-search) runs on a lexical index. `[search.text]` selects the
-plain-text files that join it through `include` and bounds their chunks. `pool_slots` bounds
-pooled connections shared by search and stored logs; writes wait for one process-wide turn.
+plain-text files that join it through `include` and bounds their chunks. The lexical index
+lives in the index database at `.rift/index`, and the vector ranking's rows in the vectors
+database at `.rift/vectors`. `pool_slots`, `busy_timeout`, and `journal_size_limit` bound each
+of the two on its own, and writes to one wait for that database's turn alone.
 
 <VersionBadge version="v0.0.25" />
 
@@ -656,6 +673,7 @@ max_chunk = "1mb"
 [search]
 pool_slots = 4
 busy_timeout = "5s"
+journal_size_limit = "64mb"
 ```
 
 - `include` selects text files from the visible paths no language entry claimed, at most 64
@@ -663,10 +681,15 @@ busy_timeout = "5s"
   empty list leaves only language-selected files and required documentation sources
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
-- `pool_slots` bounds SQLite connections the workspace database may hold open at once, 1 to 16
+- `pool_slots` bounds SQLite connections the index database may hold open at once, and
+  separately the vectors database, 1 to 16
 - `busy_timeout` bounds how long a read or write waits for one of those connections to come
   free, and how long a connection waits for a database lock held by another process before
   failing with `SQLITE_BUSY`, 100ms to 30s
+- `journal_size_limit` <VersionBadge version="v0.0.62" inline /> bounds the size the write-ahead log of the index database, and
+  separately of the vectors database, is cut back to at the commit that restarts it after a
+  checkpoint, 0b to 64gb, default `64mb`. A transaction larger than the limit still grows the
+  log past it until that commit
 
 <VersionBadge version="v0.0.46" />
 
@@ -833,8 +856,9 @@ max_in_flight = 4
   repeats an index, omits one, or names one past the request's own length: any of those
   would attach a vector to the wrong declaration
 
-`disabled` keeps the workspace lexical without emptying the rest of the table. Set it where
-the workspace must not fetch model weights:
+`disabled` keeps the workspace lexical without emptying the rest of the table, and no
+vectors database is created. With vector ranking enabled, `.rift/vectors` appears at the first
+vector operation. Set `disabled` where the workspace must not fetch model weights:
 
 ```toml
 [search.vector]
@@ -873,10 +897,12 @@ documentation alone; its text lives in its file's chunks.
 
 <VersionBadge version="v0.0.46" />
 
-`mmap_size` sets how much of the workspace database each connection reads through a memory map,
+`mmap_size` sets how much of the index database each connection reads through a memory map,
 0b to 2147418112b, the most the bundled SQLite maps; the default `1gb` maps the whole store of a
 workspace the size of the Bun or Next.js repositories. `0b` reads through SQLite's page cache
 alone. Every pooled connection maps the file on its own, so resident memory counts the mapped
 pages once per open connection, and an I/O error on the mapped file ends the server with a
 signal rather than an error; [SQLite's memory-map page](https://www.sqlite.org/mmap.html) states
 both costs.
+
+Connections of the vectors database map nothing and read through the page cache alone.

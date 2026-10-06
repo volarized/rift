@@ -1,8 +1,10 @@
 //! One index over both search tiers, and how far the vector ranking has got.
 //!
-//! [`SearchIndex`] owns the lexical index and the vector store against one
-//! database file, so a caller drives search through it and never opens either
-//! store itself. One `search` runs both tiers and fuses what they returned.
+//! [`SearchIndex`] owns the lexical index on the index database and the vector
+//! store on the vectors database, so a caller drives search through it and never
+//! opens either store itself. The vectors database opens at the first vector
+//! operation, so a workspace whose vector ranking never runs holds no such file.
+//! One `search` runs both tiers and fuses what they returned.
 //!
 //! Nothing here knows what a server is. The caller drives
 //! [`SearchIndex::prepare`], [`SearchIndex::replace_lexical`], and
@@ -22,7 +24,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rift_core::ProjectPath;
-use rift_index::{DatabasePool, WorkspaceDatabase};
+use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalSearchIndex, PatternCandidates, RevisionScoped,
     StoredVector, TrigramBatch, VectorStore,
@@ -448,7 +450,8 @@ struct HeldCorpus {
     vectors: Corpus,
 }
 
-/// Both search tiers over one database file.
+/// Both search tiers: the lexical tier over the index database, the vector tier over
+/// the vectors database it opens at its first vector operation.
 ///
 /// The vector store keys on the digest of the text a declaration was embedded
 /// from and the lexical store keys on a unit identity, so neither of them can
@@ -469,7 +472,7 @@ struct HeldCorpus {
 pub struct SearchIndex {
     database: Arc<WorkspaceDatabase>,
     lexical: LexicalSearchIndex,
-    vectors: VectorStore,
+    vectors: Arc<LazyDatabase>,
     model: Mutex<Option<Arc<LoadedModel>>>,
     pass: Mutex<PassOutcome>,
     held: Mutex<Option<Arc<HeldCorpus>>>,
@@ -505,41 +508,66 @@ struct ScannedCorpus {
 }
 
 impl SearchIndex {
-    /// Opens the workspace database and attaches both tiers to its one pool.
-    ///
-    /// The tiers share the pool rather than opening one each: `SQLite`
-    /// serializes writers per file, so a second pool adds connections that lose
-    /// the same lock, never throughput.
+    /// Opens the index database below `state_directory` and attaches both tiers: the
+    /// lexical tier at once, the vector tier through a handle on the vectors database
+    /// that its first vector operation opens.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] when the database cannot be opened or migrated.
+    /// Returns [`RiftError`] when the index database cannot be opened or migrated.
     ///
     /// # Cancel safety
     ///
     /// Cancellation may leave the database file created without its schema
     /// applied. Opening again retries safely: the migrations are idempotent.
-    pub async fn open(database_path: &Path, limits: SearchIndexLimits) -> Result<Self, RiftError> {
+    pub async fn open(
+        state_directory: &Path,
+        limits: SearchIndexLimits,
+    ) -> Result<Self, RiftError> {
         let lexical_limits = limits.lexical();
         let pool = DatabasePool::new(
             lexical_limits.pool_slots(),
             lexical_limits.busy_timeout_ms(),
         );
-        let database = WorkspaceDatabase::open(database_path, pool).await?;
-        Self::attached(database, limits)
+        let database = WorkspaceDatabase::open(
+            &DatabaseName::Index.path(state_directory),
+            DatabaseName::Index,
+            pool,
+        )
+        .await?;
+        let vectors = LazyDatabase::new(
+            &DatabaseName::Vectors.path(state_directory),
+            DatabaseName::Vectors,
+            None,
+        );
+        Self::attached(database, Arc::new(vectors), limits)
     }
 
-    /// Attaches both tiers to one already-open workspace database.
+    /// Attaches both tiers: the lexical tier to the open index database, the vector
+    /// tier to the vectors database handle, which opens under the index database's pool
+    /// bounds at the first vector operation.
     ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when a tier refuses the database.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `database` is not the index database or `vectors` does not open the
+    /// vectors database.
+    #[track_caller]
     pub fn attached(
         database: Arc<WorkspaceDatabase>,
+        vectors: Arc<LazyDatabase>,
         limits: SearchIndexLimits,
     ) -> Result<Self, RiftError> {
+        assert_eq!(
+            vectors.name(),
+            DatabaseName::Vectors,
+            "the vector tier attaches to the vectors database: name={:?}",
+            vectors.name()
+        );
         let lexical = LexicalSearchIndex::attached(Arc::clone(&database), limits.lexical());
-        let vectors = VectorStore::attached(Arc::clone(&database));
         Ok(Self {
             database,
             lexical,
@@ -554,13 +582,28 @@ impl SearchIndex {
         })
     }
 
-    /// Stops the workspace database worker by the shared shutdown deadline.
+    /// Stops the index database's worker, and the vectors database's when it opened,
+    /// by the shared shutdown deadline. The two stop together; a vectors database not
+    /// yet opened refuses any later open.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] if the worker fails or cannot stop before the deadline.
+    /// Returns [`RiftError`] if either worker fails or cannot stop before the deadline.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
-        self.database.shutdown(deadline).await
+        let (index, vectors) = tokio::join!(
+            self.database.shutdown(deadline),
+            self.vectors.shutdown(deadline)
+        );
+        index.and(vectors)
+    }
+
+    /// The vector store, opening the vectors database when this is its first use.
+    ///
+    /// The open reads the index database's pool bounds at this call. A failed open
+    /// leaves the next vector operation to try again; the lexical tier serves meanwhile.
+    async fn vector_store(&self) -> Result<VectorStore, RiftError> {
+        let database = self.vectors.resolve(self.database.pool()).await?;
+        Ok(VectorStore::attached(database))
     }
 
     /// Loads the encoder, so the vector ranking can answer.
@@ -962,7 +1005,8 @@ impl SearchIndex {
     /// back under the model held here.
     async fn hold(&self, model: LoadedModel) -> Result<(), RiftError> {
         let _dropped = self
-            .vectors
+            .vector_store()
+            .await?
             .prune_other_models(&model.space.identity())
             .await?;
         self.publish_held(None);
@@ -993,15 +1037,13 @@ impl SearchIndex {
     ) -> Result<(), RiftError> {
         let total = as_count(described.len());
         let documents = documents(described, as_usize(total.min(self.limits.max_vectors)));
-        let stored = self.vectors.digests(&model.space.identity()).await?;
-        self.embed_batches(model, &selected(&documents, &stored, embedding))
+        let vectors = self.vector_store().await?;
+        let stored = vectors.digests(&model.space.identity()).await?;
+        self.embed_batches(&vectors, model, &selected(&documents, &stored, embedding))
             .await?;
         let live: BTreeSet<String> = documents.iter().map(|one| one.digest.clone()).collect();
-        let _pruned = self
-            .vectors
-            .prune_absent(&model.space.identity(), &live)
-            .await?;
-        let corpus = self.read_corpus(model).await?;
+        let _pruned = vectors.prune_absent(&model.space.identity(), &live).await?;
+        let corpus = self.read_corpus(&vectors, model).await?;
         self.publish(&documents, corpus, tree_revision);
         self.set_pass(reached(as_count(documents.len()), total), total);
         Ok(())
@@ -1016,8 +1058,12 @@ impl SearchIndex {
     /// just ran already left the store at that ceiling, so the cut answers
     /// only a store another index wrote to under a wider one: it drops the
     /// tail of the digest order rather than refusing the pass.
-    async fn read_corpus(&self, model: &LoadedModel) -> Result<Corpus, RiftError> {
-        self.vectors
+    async fn read_corpus(
+        &self,
+        vectors: &VectorStore,
+        model: &LoadedModel,
+    ) -> Result<Corpus, RiftError> {
+        vectors
             .vectors(
                 &model.space.identity(),
                 model.space.dimensions(),
@@ -1042,6 +1088,7 @@ impl SearchIndex {
     /// next pass embeds it again.
     async fn embed_batches(
         &self,
+        store: &VectorStore,
         model: &Arc<LoadedModel>,
         wanted: &[&UnitDocument],
     ) -> Result<(), RiftError> {
@@ -1057,7 +1104,7 @@ impl SearchIndex {
             let texts: Vec<String> = chunk.iter().map(|one| one.text.clone()).collect();
             let embedded = model.models.embed_documents(texts, schedule).await?;
             let vectors = paired(chunk, embedded);
-            self.vectors
+            store
                 .store(&model.space.identity(), model.space.dimensions(), &vectors)
                 .await?;
         }
@@ -1606,7 +1653,9 @@ mod tests {
 mod store_error_tests {
     use rift_core::ProjectPath;
     use rift_error::{RiftError, errors};
-    use rift_index::{DatabasePool, LexicalIndexLimits, LexicalSearchIndex, WorkspaceDatabase};
+    use rift_index::{
+        DatabaseName, DatabasePool, LexicalIndexLimits, LexicalSearchIndex, WorkspaceDatabase,
+    };
     use rift_ranking::{
         DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
         SearchableField,
@@ -1641,9 +1690,12 @@ mod store_error_tests {
 
     async fn refusal() -> Result<RiftError, Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let database =
-            WorkspaceDatabase::open(&directory.path().join("db"), DatabasePool::new(4, 1_000))
-                .await?;
+        let database = WorkspaceDatabase::open(
+            &directory.path().join("db"),
+            DatabaseName::Index,
+            DatabasePool::new(4, 1_000),
+        )
+        .await?;
         let index = LexicalSearchIndex::attached(database, one_unit_limits());
         let documents = [
             symbol(

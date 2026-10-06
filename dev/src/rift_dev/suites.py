@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from rift_dev import nextest_run
 from rift_dev.commands import REPOSITORY, CargoCommand
 from rift_dev.config import CorpusName
 
@@ -70,7 +71,7 @@ def unit(archive: Path | None) -> None:
     downloads.
     """
     coverage_target()
-    CargoCommand(
+    command = CargoCommand(
         "llvm-cov",
         "nextest",
         *archive_selection(
@@ -87,7 +88,8 @@ def unit(archive: Path | None) -> None:
         "lcov.info",
         "--fail-under-lines",
         COVERAGE_FLOOR,
-    ).run()
+    )
+    nextest_run.run(command)
 
 
 def live(archive: Path | None) -> None:
@@ -115,9 +117,11 @@ def live(archive: Path | None) -> None:
             "--workspace-remap",
             ".",
         ]
-    CargoCommand(
-        "nextest", "run", "--profile", "live", "--no-tests", "fail", *selection
-    ).with_env(RIFT_ENGINE_LIVE="1", RIFT_LIVE_SEARCH="1").run()
+    nextest_run.run(
+        CargoCommand(
+            "nextest", "run", "--profile", "live", "--no-tests", "fail", *selection
+        ).with_env(RIFT_ENGINE_LIVE="1", RIFT_LIVE_SEARCH="1")
+    )
 
 
 def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> None:
@@ -154,4 +158,9 @@ def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> Non
     )
     if test_name:
         command.with_args("--", "--exact", test_name)
-    command.run()
+    nextest_run.run(command)
+
+
+def nextest(arguments: list[str]) -> None:
+    """Runs `cargo nextest` with `arguments` beside the collector, as every other suite."""
+    nextest_run.run(CargoCommand("nextest", *arguments))

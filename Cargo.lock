@@ -3522,6 +3522,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3664,6 +3673,25 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.20",
  "validator",
+]
+
+[[package]]
+name = "objc2-core-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
+dependencies = [
+ "bitflags 2.13.1",
+]
+
+[[package]]
+name = "objc2-io-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+dependencies = [
+ "libc",
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -4483,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "axum",
  "clap",
@@ -4495,9 +4523,6 @@ dependencies = [
  "jsonschema",
  "mimalloc",
  "nix",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
  "regex-syntax",
  "reqwest",
  "rift-core",
@@ -4509,7 +4534,9 @@ dependencies = [
  "rift-search",
  "rift-server",
  "rift-syntax",
+ "rift-tracing",
  "rmcp",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",
@@ -4518,9 +4545,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
  "unicode-width",
  "waitpid-any",
  "windows-sys 0.59.0",
@@ -4529,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "flate2",
  "ignore",
@@ -4556,7 +4580,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "anyhow",
  "axum",
@@ -4571,19 +4595,19 @@ dependencies = [
  "rift-core",
  "rift-protocol",
  "rift-ranking",
+ "rift-tracing",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_with",
  "tempfile",
  "tokio",
- "tracing",
  "validator",
 ]
 
 [[package]]
 name = "rift-core"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "percent-encoding",
  "rift-error",
@@ -4594,16 +4618,13 @@ dependencies = [
  "serde_path_to_error",
  "sha2",
  "strum",
- "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
  "unicode-normalization",
 ]
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "ignore",
  "rift-core",
@@ -4617,15 +4638,15 @@ dependencies = [
 
 [[package]]
 name = "rift-error"
-version = "0.0.47"
+version = "0.0.62"
+dependencies = [
+ "rift-error-macros",
+]
 
 [[package]]
 name = "rift-error-codegen"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
- "prettyplease",
- "proc-macro2",
- "quote",
  "rift-error",
  "serde",
  "syn 2.0.119",
@@ -4634,8 +4655,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-error-macros"
+version = "0.0.62"
+
+[[package]]
 name = "rift-history"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "gix",
  "rift-core",
@@ -4648,12 +4673,13 @@ dependencies = [
 
 [[package]]
 name = "rift-history-store"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "rift-core",
  "rift-error",
  "rift-protocol",
  "rift-ranking",
+ "rift-tracing",
  "rusqlite",
  "same-file",
  "serde_json",
@@ -4662,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "async-trait",
  "ignore",
@@ -4677,6 +4703,7 @@ dependencies = [
  "rift-provider",
  "rift-ranking",
  "rift-syntax",
+ "rift-tracing",
  "rusqlite",
  "same-file",
  "serde",
@@ -4689,12 +4716,11 @@ dependencies = [
  "toasty-driver-sqlite",
  "tokio",
  "toml",
- "tracing",
 ]
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4710,7 +4736,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4733,6 +4759,7 @@ dependencies = [
  "rift-ranking",
  "rift-search",
  "rift-server",
+ "rift-tracing",
  "rmcp",
  "rusqlite",
  "schemars 1.2.2",
@@ -4746,14 +4773,12 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-service",
- "tracing",
- "tracing-subscriber",
  "windows-spawn",
 ]
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
@@ -4767,7 +4792,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4778,7 +4803,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "data-encoding",
  "regex",
@@ -4792,7 +4817,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "jsonschema",
  "rift-analysis",
@@ -4806,7 +4831,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "axum",
  "candle-core",
@@ -4819,6 +4844,7 @@ dependencies = [
  "rift-error",
  "rift-index",
  "rift-ranking",
+ "rift-tracing",
  "rig-core",
  "serde",
  "serde_json",
@@ -4826,12 +4852,11 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "rift-server"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "globset",
  "ignore",
@@ -4850,6 +4875,7 @@ dependencies = [
  "rift-ranking",
  "rift-search",
  "rift-syntax",
+ "rift-tracing",
  "ruff_db",
  "ruff_notebook",
  "ruff_text_size",
@@ -4862,23 +4888,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
  "ty_ide",
  "ty_project",
  "ty_python_core",
  "url",
  "which",
+ "windows-spawn",
 ]
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "rift-core",
  "rift-error",
  "rift-protocol",
  "rift-provider",
+ "rift-tracing",
  "serde",
  "strum",
  "tree-sitter",
@@ -4890,6 +4916,41 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+]
+
+[[package]]
+name = "rift-tracing"
+version = "0.0.62"
+dependencies = [
+ "getrandom 0.4.3",
+ "jiff",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "pin-project-lite",
+ "rift-error",
+ "rift-tracing-macros",
+ "rusqlite",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rift-tracing-macros"
+version = "0.0.62"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "rift-tracing",
+ "syn 2.0.119",
+ "tokio",
 ]
 
 [[package]]
@@ -5914,6 +5975,20 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "walkdir",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.39.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows",
 ]
 
 [[package]]
@@ -7145,6 +7220,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7152,6 +7243,12 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"
@@ -7470,7 +7567,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.47"
+version = "0.0.62"
 dependencies = [
  "rift-error-codegen",
  "tempfile",

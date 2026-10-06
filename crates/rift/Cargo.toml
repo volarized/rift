@@ -13,17 +13,6 @@ description = "Persistent filesystem projections and validated source transactio
 # uses it.
 autotests = false
 
-[features]
-# Off by default so a release artifact carries no OpenTelemetry export stack. With it
-# compiled in, `initialize_tracing` still installs no exporter until an operator sets
-# `OTEL_EXPORTER_OTLP_ENDPOINT`.
-otlp = [
-    "dep:opentelemetry",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry_sdk",
-    "dep:tracing-opentelemetry",
-]
-
 [lints]
 workspace = true
 
@@ -33,9 +22,6 @@ fs4.workspace = true
 ignore.workspace = true
 indicatif.workspace = true
 jiff.workspace = true
-opentelemetry = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
 regex-syntax.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
@@ -46,6 +32,7 @@ sha2.workspace = true
 rift-error.workspace = true
 rift-core.workspace = true
 rift-index.workspace = true
+rift-tracing.workspace = true
 rift-mcp.workspace = true
 rift-protocol.workspace = true
 rift-search.workspace = true
@@ -55,9 +42,6 @@ rift-syntax.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
-tracing.workspace = true
-tracing-opentelemetry = { workspace = true, optional = true }
-tracing-subscriber.workspace = true
 waitpid-any.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -73,9 +57,11 @@ windows-sys.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+rift-tracing = { workspace = true, features = ["fixtures"] }
 axum.workspace = true
 jsonschema.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+rusqlite.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 unicode-width.workspace = true

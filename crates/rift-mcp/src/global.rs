@@ -1323,19 +1323,19 @@ impl RouteState {
 
 fn log_service_transition(state: RouteState) {
     match state {
-        RouteState::Disabled => tracing::info!(
+        RouteState::Disabled => rift_tracing::info!(
             component = "global",
             operation = "global.state",
             state = "not_configured",
             "global service state changed"
         ),
-        RouteState::Available => tracing::info!(
+        RouteState::Available => rift_tracing::info!(
             component = "global",
             operation = "global.state",
             state = "available",
             "global service state changed"
         ),
-        RouteState::Unavailable { class, .. } => tracing::warn!(
+        RouteState::Unavailable { class, .. } => rift_tracing::warn!(
             component = "global",
             operation = "global.state",
             state = "unavailable",
@@ -1517,8 +1517,6 @@ fn failure_state(error: &ClientError) -> RouteState {
 mod tests {
     use std::error::Error as _;
     use std::sync::{Arc, Mutex};
-
-    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
         DocumentIdentity, FailureKind, GlobalRoute, RouteState, SearchHit, SearchHitTarget,
@@ -2215,8 +2213,6 @@ mod tests {
 
     #[test]
     fn service_state_transition_is_logged_once_and_redacted() {
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
         let observation = Arc::new(Mutex::new(None::<ServiceState>));
         let route = GlobalRoute::unanswered(
             &Arc::new(DependencyContext::default()),
@@ -2227,12 +2223,14 @@ mod tests {
             observation,
         );
 
-        tracing::subscriber::with_default(subscriber, || {
-            route.record_observation();
-            route.record_observation();
-        });
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        route.record_observation();
+        route.record_observation();
+        drop(recorder);
 
-        let records = std::iter::from_fn(|| drain.try_recv_record().ok()).collect::<Vec<_>>();
+        let records = drain.queued_records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation(), "global.state");
         assert!(records[0].fields().contains("unavailable"));

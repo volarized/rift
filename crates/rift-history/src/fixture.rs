@@ -1,8 +1,9 @@
 //! Deterministic git fixtures for tests across Rift crates.
 //!
-//! Every command runs with a fixed identity and clock and with signing off,
-//! so fixture repositories hash identically across machines and never touch
-//! the developer's gpg configuration.
+//! Every command runs with a fixed identity and clock, with signing off, and
+//! with automatic maintenance off, so fixture repositories hash identically
+//! across machines, never touch the developer's gpg configuration, and leave
+//! no background git process behind.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -28,6 +29,12 @@ fn command(root: &Path) -> Command {
             "commit.gpgsign=false",
             "-c",
             "tag.gpgsign=false",
+            // A write such as `commit` otherwise starts a detached `git maintenance
+            // run --auto`. Its `worktree-prune` task removes a worktree directory
+            // that has no `gitdir` file yet, so a later `git worktree add` could
+            // lose the directory it just created.
+            "-c",
+            "maintenance.auto=false",
         ]);
     command
 }

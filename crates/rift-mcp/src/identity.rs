@@ -81,18 +81,6 @@ impl BuildCheckout {
             }
         }
     }
-
-    /// The version without the executable's metadata: what `rift --version` prints for a
-    /// dirty build whose executable cannot be read. A lock never carries it; the product
-    /// identity refuses the case instead.
-    #[must_use]
-    pub fn version_without_stamp(self) -> String {
-        match self {
-            Self::Unversioned => PACKAGE_VERSION.to_owned(),
-            Self::Clean(commit) => format!("{PACKAGE_VERSION}+{commit}"),
-            Self::Dirty(commit) => format!("{PACKAGE_VERSION}+{commit}.{DIRTY_MARK}"),
-        }
-    }
 }
 
 /// The file metadata that tells one build of a dirty checkout from the next.
@@ -337,22 +325,6 @@ mod tests {
             assert!(ExecutableStamp::read(&executable).is_err());
         }
         Ok(())
-    }
-
-    #[test]
-    fn the_version_without_a_stamp_keeps_the_dirty_mark() {
-        assert_eq!(
-            BuildCheckout::Dirty(COMMIT).version_without_stamp(),
-            format!("{PACKAGE_VERSION}+{COMMIT}.dirty")
-        );
-        assert_eq!(
-            BuildCheckout::Clean(COMMIT).version_without_stamp(),
-            format!("{PACKAGE_VERSION}+{COMMIT}")
-        );
-        assert_eq!(
-            BuildCheckout::Unversioned.version_without_stamp(),
-            PACKAGE_VERSION
-        );
     }
 
     /// The async identity reads the running executable, and equals what the synchronous

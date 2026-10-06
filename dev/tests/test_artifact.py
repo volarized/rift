@@ -173,3 +173,26 @@ def test_preparing_artifact_reads_keep_one_inherited_deadline(
         assert client.call.await_count == 1
     else:
         assert client.call.await_count > 1
+
+
+@pytest.mark.parametrize("runner", ["artifact", "agent"])
+def test_a_failed_run_keeps_the_servers_evidence_as_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
+) -> None:
+    from unittest.mock import MagicMock
+
+    from rift_dev import check_agent, check_artifact
+
+    module = check_artifact if runner == "artifact" else check_agent
+    server = MagicMock()
+    server.__enter__.return_value = server
+    server.evidence.return_value = ["server stderr:\nboom\n", "records:\nERROR\n"]
+    server.connect.side_effect = RuntimeError("connect failed")
+    monkeypatch.setattr(module, "Server", lambda *args, **kwargs: server)
+    monkeypatch.setattr(module, "verify_version", lambda *_: None)
+    entry = getattr(module, f"check_{runner}")
+    with pytest.raises(RuntimeError, match="connect failed") as raised:
+        asyncio.run(entry(tmp_path / "rift", "0.0.0"))
+    *evidence, entry_line = raised.value.__notes__
+    assert evidence == ["server stderr:\nboom\n", "records:\nERROR\n"]
+    assert entry_line.startswith("collector: ")

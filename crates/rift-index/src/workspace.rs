@@ -1023,7 +1023,7 @@ impl<File> IndexRead<File> {
 
 /// Records one file left out of the index, once, at the build that left it out.
 fn log_left_out(warning: &WorkspaceIndexWarning) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         path = warning.path().as_str(),
@@ -1035,7 +1035,7 @@ fn log_left_out(warning: &WorkspaceIndexWarning) {
 /// Records one file the index holds as text its provider did not parse, once, at the
 /// build that read it, with the fields a left-out file's record carries.
 fn log_held_unparsed(warning: &WorkspaceIndexWarning) {
-    tracing::warn!(
+    rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         path = warning.path().as_str(),
@@ -2216,9 +2216,10 @@ impl WorkspaceIndex {
     ) -> Result<Self, RiftError> {
         check_cancelled(cancelled)?;
         let composition = composition()?;
-        let classified = rift_core::traced!(component = "index", operation = "index.discover", {
-            discover_cancellable(&root, limits, visibility, &language, cancelled)
-        })?;
+        let classified =
+            rift_tracing::traced!(component = "index", operation = "index.discover", {
+                discover_cancellable(&root, limits, visibility, &language, cancelled)
+            })?;
         let BuiltContents {
             files,
             text_files,
@@ -2226,7 +2227,7 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = rift_core::traced!(component = "index", operation = "index.parse", {
+        } = rift_tracing::traced!(component = "index", operation = "index.parse", {
             let mut workspace_bytes = 0_usize;
             let mut contents = IndexContents::default();
             contents.hold_parsed_sources(
@@ -2260,7 +2261,7 @@ impl WorkspaceIndex {
                 previous.map(|index| index.semantics.graph()),
             )
         })?;
-        let declarations = crate::documentation::declarations(&files, &semantics);
+        let declarations = accepted_declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -2321,7 +2322,13 @@ impl WorkspaceIndex {
         self.rebuilt_cancellable(changes, &|| false)
     }
 
-    /// Builds the named-path index, checking `cancelled` between paths.
+    /// Builds the named-path index, checking `cancelled` between paths and at each phase
+    /// boundary after them: before the semantics graph, before the declarations, before
+    /// the documentation collection, and before the symbol documents.
+    ///
+    /// The phases after the named paths cover every held file, so they are where a
+    /// one-path rebuild spends its time, and a caller that no longer wants the result
+    /// stops it between two of them.
     ///
     /// # Errors
     ///
@@ -2352,7 +2359,9 @@ impl WorkspaceIndex {
             self.limits.declarations_max(),
             Some(self.semantics.graph()),
         )?;
-        let declarations = crate::documentation::declarations(&files, &semantics);
+        check_cancelled(cancelled)?;
+        let declarations = accepted_declarations(&files, &semantics);
+        check_cancelled(cancelled)?;
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -2361,6 +2370,7 @@ impl WorkspaceIndex {
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
             Some((&self.documentation, &self.notebooks)),
         )?;
+        check_cancelled(cancelled)?;
         let symbol_documents = carried_symbol_documents(Some(self), &files, self.limits.syntax());
         Ok(Self {
             root: self.root.clone(),
@@ -2470,7 +2480,7 @@ impl WorkspaceIndex {
             limits.declarations_max(),
             previous.map(|index| index.semantics.graph()),
         )?;
-        let declarations = crate::documentation::declarations(&files, &semantics);
+        let declarations = accepted_declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -2547,7 +2557,7 @@ impl WorkspaceIndex {
     pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &RiftError> {
         self.documentation_layer
             .get_or_init(|| {
-                rift_core::traced!(
+                rift_tracing::traced!(
                     component = "documentation",
                     operation = "documentation.layer",
                     corpus = "project",
@@ -2713,7 +2723,7 @@ impl WorkspaceIndex {
     /// covers source units read for one request, not the persistent lexical index.
     #[must_use]
     pub fn index_documents(&self) -> Vec<IndexDocument> {
-        rift_core::traced!(
+        rift_tracing::traced!(
             component = "index",
             operation = "index.lexical_units",
             files = self.files.len(),
@@ -3527,64 +3537,85 @@ fn built_contents(
 ) -> Result<BuiltContents, RiftError> {
     let passes_max = contents.files.len().saturating_add(1);
     let mut passes = 0_usize;
-    loop {
-        let fingerprint = WorkspaceFingerprint::from_files(
-            &contents.files,
-            &contents.text_files,
-            &contents.left_out,
-        );
-        let built = WorkspaceSemantics::build_project_facts(
-            contents
-                .files
-                .values()
-                .map(|file| (file.syntax(), file.path())),
-            declarations_max,
-            fingerprint.revision_number(),
-            previous,
-        );
-        match built {
-            Ok(BuiltSemantics {
-                semantics,
-                beyond_declaration_bound,
-                refused_contributions,
-            }) => {
-                if !beyond_declaration_bound.is_empty() || !refused_contributions.is_empty() {
-                    passes = passes.saturating_add(1);
-                    leave_out_refused_contributions(
-                        &mut contents,
+    rift_tracing::traced!(
+        component = "index",
+        operation = "index.semantics",
+        files = contents.files.len(),
+        {
+            loop {
+                let fingerprint = WorkspaceFingerprint::from_files(
+                    &contents.files,
+                    &contents.text_files,
+                    &contents.left_out,
+                );
+                let built = WorkspaceSemantics::build_project_facts(
+                    contents
+                        .files
+                        .values()
+                        .map(|file| (file.syntax(), file.path())),
+                    declarations_max,
+                    fingerprint.revision_number(),
+                    previous,
+                );
+                match built {
+                    Ok(BuiltSemantics {
+                        semantics,
+                        beyond_declaration_bound,
                         refused_contributions,
-                        passes < passes_max,
-                    )?;
-                    leave_out_beyond_declaration_bound(
-                        &mut contents,
-                        &beyond_declaration_bound,
-                        passes < passes_max,
-                    )?;
-                    continue;
+                    }) => {
+                        if !beyond_declaration_bound.is_empty() || !refused_contributions.is_empty()
+                        {
+                            passes = passes.saturating_add(1);
+                            leave_out_refused_contributions(
+                                &mut contents,
+                                refused_contributions,
+                                passes < passes_max,
+                            )?;
+                            leave_out_beyond_declaration_bound(
+                                &mut contents,
+                                &beyond_declaration_bound,
+                                passes < passes_max,
+                            )?;
+                            continue;
+                        }
+                        let IndexContents {
+                            files,
+                            text_files,
+                            left_out,
+                            warnings,
+                        } = contents;
+                        return Ok(BuiltContents {
+                            files,
+                            text_files,
+                            left_out,
+                            warnings,
+                            fingerprint,
+                            semantics,
+                        });
+                    }
+                    Err(error) => {
+                        return error
+                            .with(ctx::operation("index.build"))
+                            .with(ctx::workspace(root))
+                            .fail();
+                    }
                 }
-                let IndexContents {
-                    files,
-                    text_files,
-                    left_out,
-                    warnings,
-                } = contents;
-                return Ok(BuiltContents {
-                    files,
-                    text_files,
-                    left_out,
-                    warnings,
-                    fingerprint,
-                    semantics,
-                });
-            }
-            Err(error) => {
-                return error
-                    .with(ctx::operation("index.build"))
-                    .with(ctx::workspace(root))
-                    .fail();
             }
         }
-    }
+    )
+}
+
+/// Collects the declarations the semantics graph accepted, as one stage of an index build.
+fn accepted_declarations(
+    files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    semantics: &WorkspaceSemantics,
+) -> Vec<crate::documentation::DeclarationFacts> {
+    rift_tracing::traced!(
+        component = "documentation",
+        operation = "documentation.declarations",
+        files = files.len(),
+        { crate::documentation::declarations(files, semantics) }
+    )
 }
 
 /// Leaves every document whose Contribution the syntax publication refused out in one pass.
@@ -4010,7 +4041,7 @@ fn capture_path_lists_with_boundary(
         .into_iter()
         .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
     let text = capture.path_class(other)?;
-    tracing::debug!(
+    rift_tracing::debug!(
         component = "index",
         operation = "fingerprint.bytes",
         bytes = workspace_bytes,
@@ -4171,43 +4202,66 @@ pub fn capture_visible_digests_with_languages_cancellable(
                 last,
                 cancelled,
             )?;
-            let policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
-                &root,
-                limits,
-                visibility,
-                text_inclusion,
-                languages,
-                cancelled,
+            let policy = rift_tracing::traced!(
+                component = "index",
+                operation = "fingerprint.source_policy",
+                {
+                    WorkspaceSourcePolicy::build_with_languages_cancellable(
+                        &root,
+                        limits,
+                        visibility,
+                        text_inclusion,
+                        languages,
+                        cancelled,
+                    )
+                }
             )?;
-            let paths = policy.visible_paths_cancellable(cancelled)?;
+            let paths = rift_tracing::traced!(
+                component = "index",
+                operation = "fingerprint.visible_paths",
+                { policy.visible_paths_cancellable(cancelled) }
+            )?;
             let boundary = next.boundary();
             let root_identity = next.root_identity();
             let mut visible = Vec::with_capacity(paths.len());
-            for batch in paths.chunks(SOURCE_BATCH_FILES) {
-                check_cancelled(cancelled)?;
-                let read: Vec<Result<(PathBuf, CapturedPath, bool), RiftError>> = batch
-                    .par_iter()
-                    .map(|path| {
+            rift_tracing::traced!(
+                component = "index",
+                operation = "fingerprint.visible_read",
+                paths = paths.len(),
+                {
+                    for batch in paths.chunks(SOURCE_BATCH_FILES) {
                         check_cancelled(cancelled)?;
-                        let absolute = root.join(path.as_str());
-                        let (capture, was_read) = match next.captured(&absolute) {
-                            Some(capture) => (capture, false),
-                            None => capture_path(&absolute, limits, last, boundary, root_identity)?,
-                        };
-                        Ok((absolute, capture, was_read))
-                    })
-                    .collect();
-                for (path, capture) in batch.iter().zip(read) {
-                    check_cancelled(cancelled)?;
-                    let (absolute, capture, was_read) = capture?;
-                    if next.captured(&absolute).is_none() {
-                        next.record(&absolute, capture, was_read);
-                    }
-                    if let Some((_, digest)) = capture.content() {
-                        visible.push((path.clone(), digest));
+                        let read: Vec<Result<(PathBuf, CapturedPath, bool), RiftError>> = batch
+                            .par_iter()
+                            .map(|path| {
+                                check_cancelled(cancelled)?;
+                                let absolute = root.join(path.as_str());
+                                let (capture, was_read) = match next.captured(&absolute) {
+                                    Some(capture) => (capture, false),
+                                    None => capture_path(
+                                        &absolute,
+                                        limits,
+                                        last,
+                                        boundary,
+                                        root_identity,
+                                    )?,
+                                };
+                                Ok((absolute, capture, was_read))
+                            })
+                            .collect();
+                        for (path, capture) in batch.iter().zip(read) {
+                            check_cancelled(cancelled)?;
+                            let (absolute, capture, was_read) = capture?;
+                            if next.captured(&absolute).is_none() {
+                                next.record(&absolute, capture, was_read);
+                            }
+                            if let Some((_, digest)) = capture.content() {
+                                visible.push((path.clone(), digest));
+                            }
+                        }
                     }
                 }
-            }
+            );
             Ok((indexed, WorkspaceDigests::new(visible), next))
         })();
         match result {
@@ -4290,18 +4344,18 @@ fn capture_digests_attempt(
     let root = canonical_root(root)?;
     let boundary = CaptureBoundary::create(&root);
     let root_identity = root_identity(&root);
-    let language = rift_core::traced!(
+    let language = rift_tracing::traced!(
         component = "index",
         operation = "fingerprint.language_policy",
         { WorkspaceLanguagePolicy::build(&root, languages, text_inclusion) }
     )?;
     let classified =
-        rift_core::traced!(component = "index", operation = "fingerprint.discover", {
+        rift_tracing::traced!(component = "index", operation = "fingerprint.discover", {
             discover_cancellable(&root, limits, visibility, &language, cancelled)
         })?;
     let source = classified.source.len();
     let text = classified.text.len() + classified.lockfiles.len();
-    rift_core::traced!(
+    rift_tracing::traced!(
         component = "index",
         operation = "fingerprint.read",
         source = source,
@@ -5278,7 +5332,7 @@ impl LeftOut {
         let Some((path, error)) = self.first.as_ref() else {
             return;
         };
-        tracing::warn!(
+        rift_tracing::warn!(
             component = "index",
             operation = "index.build",
             left_out = self.count,
@@ -10254,6 +10308,31 @@ mod tests {
         );
     }
 
+    /// A semantics build the publication refuses fails the index build, naming the
+    /// operation and the workspace root. A zero declaration bound is the refusal here:
+    /// `WorkspaceIndexLimits` refuses one before any build, so only this entry passes it.
+    #[test]
+    fn a_refused_semantics_build_names_the_index_build_and_the_workspace() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let error = built_contents(root.path(), IndexContents::default(), 0, None)
+            .err()
+            .expect("a zero declaration bound refuses the publication");
+        assert_eq!(error.slug(), errors::provider::publication_zero_limit::SLUG);
+        let context: Vec<(String, String)> = error
+            .context()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect();
+        let workspace = root.path().display().to_string();
+        assert!(
+            context.contains(&("operation".to_owned(), "index.build".to_owned())),
+            "{context:?}"
+        );
+        assert!(
+            context.contains(&("workspace".to_owned(), workspace)),
+            "{context:?}"
+        );
+    }
+
     #[test]
     fn test_a_path_the_wire_can_address_publishes_a_document() {
         // The document shape's address ceiling is the wire's own, so a path at the
@@ -10826,6 +10905,92 @@ mod tests {
         assert_eq!(error_path(&error), Some(sealed.clone()));
     }
 
+    /// A visible capture reads the files no language or text rule selects, so one the
+    /// process cannot read fails it, naming the file, while the indexed capture never
+    /// opens that file.
+    #[cfg(unix)]
+    #[test]
+    fn test_visible_capture_refuses_an_unselected_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, _) = two_file_workspace();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let sealed = root.join("sealed.bin");
+        fs::write(&sealed, b"sealed\0bytes").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024);
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let indexed =
+            capture_digests_with_languages(&root, limits, &visibility, &text, &languages, &last);
+        let visible = capture_visible_digests_with_languages_cancellable(
+            &root,
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &last,
+            &|| false,
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore read");
+        indexed.expect("the indexed capture never opens an unselected file");
+        let error = visible.expect_err("a read this process cannot make fails the visible capture");
+        assert_eq!(error.slug(), errors::index::workspace_filesystem::SLUG);
+        assert_eq!(error_path(&error), Some(sealed.clone()));
+    }
+
+    /// Every cancellation check a visible capture makes refuses it as cancelled: the
+    /// indexed capture's, the source policy's, and each visible read's.
+    #[test]
+    fn test_visible_capture_stops_when_cancelled_at_each_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let checks = AtomicUsize::new(0);
+        let counted = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        capture_visible_digests_with_languages_cancellable(
+            root,
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            &last,
+            &counted,
+        )
+        .expect("an uncancelled visible capture completes");
+        let made = checks.load(Ordering::SeqCst);
+        for passed in 0..made {
+            let checks = AtomicUsize::new(0);
+            let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= passed;
+            let error = capture_visible_digests_with_languages_cancellable(
+                root,
+                limits,
+                &visibility,
+                &text,
+                &languages,
+                &last,
+                &cancelled,
+            )
+            .expect_err("a cancelled visible capture refuses");
+            assert_eq!(
+                error.slug(),
+                errors::index::workspace_cancelled::SLUG,
+                "the check after {passed} passed checks"
+            );
+        }
+    }
+
     #[test]
     fn test_capture_reads_again_a_path_whose_modification_time_moved() {
         let (directory, modified) = two_file_workspace();
@@ -11118,6 +11283,49 @@ mod tests {
             checks.load(Ordering::SeqCst),
             2,
             "second path observes cancellation"
+        );
+    }
+
+    #[test]
+    fn test_workspace_rebuild_stops_when_cancelled_at_each_phase_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("a.rs"), "pub fn first() {}\n").expect("source");
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        fs::write(directory.path().join("a.rs"), "pub fn changed_first() {}\n")
+            .expect("changed source");
+        let changes = resolved(&index, directory.path(), &["a.rs"]);
+        assert_eq!(changes.len(), 1, "the named path needs replacement");
+        // One changed path is checked before its read and once after the loop. The three
+        // checks after those stand before the declarations, the documentation collection,
+        // and the symbol documents.
+        for passed in 2..=4_usize {
+            let checks = AtomicUsize::new(0);
+            let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= passed;
+            let error = index
+                .rebuilt_cancellable(&changes, &cancelled)
+                .expect_err("cancelled rebuild must stop at the phase boundary");
+            assert_eq!(error.slug(), errors::index::workspace_cancelled::SLUG);
+            assert_eq!(
+                checks.load(Ordering::SeqCst),
+                passed + 1,
+                "the boundary after {passed} passed checks observes cancellation"
+            );
+        }
+        let checks = AtomicUsize::new(0);
+        let counted = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let rebuilt = index
+            .rebuilt_cancellable(&changes, &counted)
+            .expect("an uncancelled rebuild completes");
+        assert_eq!(rebuilt.file_count(), 1);
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            5,
+            "one changed path meets five checks"
         );
     }
 

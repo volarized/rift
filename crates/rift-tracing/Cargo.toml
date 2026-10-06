@@ -1,0 +1,46 @@
+[package]
+name = "rift-tracing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The metrics database and the instrumentation Rift crates emit through"
+
+[features]
+# The scoped recorder for dependent crates' tests; never a production feature. Enable it
+# from `[dev-dependencies]` only, so a release build carries no recorder. Its metric reads
+# come from the SDK's in-memory exporter.
+fixtures = ["opentelemetry_sdk/testing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The OTLP export of every build: `TracingRuntimeBuilder::install` installs no exporter until
+# an operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` or, for metrics alone,
+# `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, or, for log records alone,
+# `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. The service instance identifier is random.
+getrandom.workspace = true
+jiff.workspace = true
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+pin-project-lite.workspace = true
+rift-error.workspace = true
+rift-tracing-macros.workspace = true
+rusqlite.workspace = true
+# `preserve_order` backs `serde_json::Map` with an `IndexMap`, so a record's fields serialize
+# in the order the capture inserts them, whichever other crate the build carries.
+serde_json = { workspace = true, features = ["preserve_order"] }
+sysinfo.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

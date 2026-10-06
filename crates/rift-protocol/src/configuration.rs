@@ -66,6 +66,20 @@ pub const LOGS_CAPTURE_BYTES_MAX: usize = 512;
 /// stderr diagnostics carry, and the index's own warnings, which name each
 /// file a build left out.
 const LOGS_CAPTURE_DEFAULT: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+/// Milliseconds an operation stays open before the server reports it, at least: one
+/// second.
+pub const LOGS_STALL_DELAY_MS_MIN: u64 = 1_000;
+/// Milliseconds an operation stays open before the server reports it, at most: one hour.
+pub const LOGS_STALL_DELAY_MS_MAX: u64 = 3_600_000;
+/// Milliseconds `logs.stall_delay` holds when the key is absent.
+pub const LOGS_STALL_DELAY_MS_DEFAULT: u64 = 10_000;
+/// Bytes a server's standard error passes before it discards, at least: room for the
+/// start's own lines.
+pub const LOGS_STDERR_BYTES_MIN: u64 = 1 << 10;
+/// Bytes a server's standard error passes before it discards, at most.
+pub const LOGS_STDERR_BYTES_MAX: u64 = 1 << 30;
+/// Bytes `logs.stderr_limit` holds when the key is absent.
+pub const LOGS_STDERR_BYTES_DEFAULT: u64 = 1 << 20;
 
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -465,7 +479,7 @@ pub struct WorkspaceConfiguration {
     /// one probe may take, and which packages the context carries beside the ones the
     /// workspace's manifests and lockfiles state.
     pub dependencies: DependenciesConfiguration,
-    /// The server's own log records: how many the workspace database keeps,
+    /// The server's own log records: how many the metrics database keeps,
     /// how many one read returns, and which targets are captured.
     pub logs: LogsConfiguration,
 
@@ -858,13 +872,15 @@ impl PortRange {
     }
 }
 
-/// The `[logs]` table. The server records its own diagnostics in the workspace
-/// database, where `rift://logs` reads them back, and this table bounds how
-/// many records the store keeps, how many one read returns, and which targets
-/// are captured at all. The server reads the table at startup, so a change
-/// applies on the next start.
+/// The `[logs]` table. The server records its own diagnostics in the metrics
+/// database at `.rift/metrics`, where `rift://logs` reads them back, and this
+/// table bounds how many records the store keeps, how many one read returns,
+/// which targets are captured at all, when an operation still open is reported,
+/// and how much it writes to a standard error that is not a terminal. The server
+/// reads the table at startup, so a change applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_logs_ranges)]
 pub struct LogsConfiguration {
     /// Records the store keeps before the oldest are dropped, 100 to 1000000.
     #[schemars(range(min = 100, max = 1_000_000))]
@@ -877,6 +893,13 @@ pub struct LogsConfiguration {
     /// never reaches the store, whatever the stderr diagnostics carry.
     #[schemars(length(max = 512))]
     pub capture: String,
+    /// Age past which an operation, lock wait, or held lock still open is reported
+    /// once, as a record of the operations in flight, 1s to 1h.
+    pub stall_delay: Duration,
+    /// Bytes the server's standard error passes, when it is not a terminal, before it
+    /// prints one notice and discards the rest, 1kb to 1gb. The log drain's stop records
+    /// the bytes discarded.
+    pub stderr_limit: ByteSize,
 }
 
 impl Default for LogsConfiguration {
@@ -885,6 +908,8 @@ impl Default for LogsConfiguration {
             retention_records: LOGS_RETENTION_RECORDS_DEFAULT,
             page_records: LOGS_PAGE_RECORDS_DEFAULT,
             capture: LOGS_CAPTURE_DEFAULT.to_owned(),
+            stall_delay: Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT),
+            stderr_limit: ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT),
         }
     }
 }
@@ -907,6 +932,22 @@ impl LogsConfiguration {
             ),
         ])
         .or_else(|| self.capture_violation())
+        .or_else(|| {
+            first_out_of_range([
+                (
+                    "logs.stall_delay",
+                    self.stall_delay.milliseconds(),
+                    LOGS_STALL_DELAY_MS_MIN,
+                    LOGS_STALL_DELAY_MS_MAX,
+                ),
+                (
+                    "logs.stderr_limit",
+                    self.stderr_limit.bytes(),
+                    LOGS_STDERR_BYTES_MIN,
+                    LOGS_STDERR_BYTES_MAX,
+                ),
+            ])
+        })
     }
 
     /// The capture filter's own bound, checked after the numeric rows.
@@ -1195,9 +1236,9 @@ impl ExecutionConfiguration {
 /// The `[search]` table. `ranking` weighs the ranking inputs against each
 /// other, `lexical` and `vector` bound the two indexed rankings, `text`
 /// bounds the lexical chunks derived from visible text files,
-/// `pool_slots` and `busy_timeout` bound the shared `SQLite` connections
-/// behind search and logs, and the `pattern_` keys bound one regex
-/// `pattern` search.
+/// `pool_slots`, `busy_timeout`, and `journal_size_limit` bound the `SQLite`
+/// connections of the index database and of the vectors database, and the
+/// `pattern_` keys bound one regex `pattern` search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -1211,8 +1252,8 @@ pub struct SearchConfiguration {
     /// The embedding model that adds vector ranking, and the bounds its
     /// preparation runs under.
     pub vector: VectorSearchConfiguration,
-    /// Pooled `SQLite` connections the workspace database may open at once,
-    /// 1 to 16. Search reads and stored logs share this pool.
+    /// Pooled `SQLite` connections the index database may open at once, and
+    /// separately the vectors database, 1 to 16.
     #[schemars(range(min = 1, max = 16))]
     #[serde(default = "default_search_pool_slots")]
     pub pool_slots: u64,
@@ -1221,6 +1262,11 @@ pub struct SearchConfiguration {
     /// before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
+    /// Size the write-ahead log of `.rift/index`, and separately of
+    /// `.rift/vectors`, is cut back to at the commit that restarts it after a
+    /// checkpoint, 0b to 64gb. A transaction larger than this still grows the
+    /// log past it until that commit.
+    pub journal_size_limit: ByteSize,
     /// Most bytes the matcher one search `pattern` compiles to may take, 64kb to
     /// 64mb. A pattern whose matcher compiles past it is refused naming this key.
     pub pattern_compiled_size: ByteSize,
@@ -1253,6 +1299,7 @@ impl Default for SearchConfiguration {
             vector: VectorSearchConfiguration::default(),
             pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
             busy_timeout: default_search_busy_timeout(),
+            journal_size_limit: ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT),
             pattern_compiled_size: ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_DEFAULT),
             pattern_candidate_rows: SEARCH_PATTERN_CANDIDATE_ROWS_DEFAULT,
             pattern_verified_size: ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_DEFAULT),
@@ -1284,6 +1331,12 @@ impl SearchConfiguration {
                         self.busy_timeout.milliseconds(),
                         SEARCH_BUSY_TIMEOUT_MS_MIN,
                         SEARCH_BUSY_TIMEOUT_MS_MAX,
+                    ),
+                    (
+                        "search.journal_size_limit",
+                        self.journal_size_limit.bytes(),
+                        SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN,
+                        SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX,
                     ),
                     (
                         "search.pattern_compiled_size",
@@ -1326,6 +1379,14 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
 const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+/// Bytes `search.journal_size_limit` may hold, at least: `0b` cuts the log to its
+/// smallest size at each restart.
+pub const SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN: u64 = 0;
+/// Bytes `search.journal_size_limit` may hold, at most: the most text `[source]
+/// workspace_size` lets a workspace hold.
+pub const SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX: u64 = crate::source::SOURCE_WORKSPACE_BYTES_MAX;
+/// Bytes `search.journal_size_limit` holds when the key is absent.
+const SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT: u64 = 64 << 20;
 /// Bytes `search.pattern_compiled_size` may hold, at least: room for a pattern of a few
 /// Unicode word classes, the largest the text-search evaluation compiled at 51,116 bytes.
 pub const SEARCH_PATTERN_COMPILED_BYTES_MIN: u64 = 64 << 10;
@@ -1470,7 +1531,7 @@ pub struct LexicalSearchConfiguration {
     /// Most content one lexical transaction writes, 1mb to 1gb, counted and
     /// applied the way `transaction_units` is.
     pub transaction_size: ByteSize,
-    /// How much of the workspace database each connection reads through a
+    /// How much of the index database each connection reads through a
     /// memory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page
     /// cache alone. Every connection maps the file on its own, so resident
     /// memory counts the mapped pages once per open connection.
@@ -3956,6 +4017,65 @@ mod tests {
     }
 
     #[test]
+    fn test_logs_stderr_limit_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        assert_eq!(
+            configuration.logs.stderr_limit,
+            ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT)
+        );
+        assert_eq!(LOGS_STDERR_BYTES_DEFAULT, 1 << 20, "the default is 1mb");
+        for value in [0, LOGS_STDERR_BYTES_MIN - 1, LOGS_STDERR_BYTES_MAX + 1] {
+            configuration.logs.stderr_limit = ByteSize::from_bytes(value);
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "logs.stderr_limit",
+                    ..
+                })
+            ));
+        }
+        for value in [LOGS_STDERR_BYTES_MIN, LOGS_STDERR_BYTES_MAX] {
+            configuration.logs.stderr_limit = ByteSize::from_bytes(value);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_logs_stderr_limit_reads_a_byte_size() {
+        let parsed: LogsConfiguration =
+            serde_json::from_value(json!({"stderr_limit": "8mb"})).expect("a byte size parses");
+        assert_eq!(parsed.stderr_limit, ByteSize::from_bytes(8 << 20));
+        assert!(
+            serde_json::from_value::<LogsConfiguration>(json!({"stderr_limit": 1_048_576}))
+                .is_err(),
+            "a bare number names no unit"
+        );
+    }
+
+    #[test]
+    fn test_logs_stall_delay_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        assert_eq!(
+            configuration.logs.stall_delay,
+            Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT)
+        );
+        for value in [0, LOGS_STALL_DELAY_MS_MIN - 1, LOGS_STALL_DELAY_MS_MAX + 1] {
+            configuration.logs.stall_delay = Duration::from_millis(value);
+            assert!(matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "logs.stall_delay",
+                    ..
+                })
+            ));
+        }
+        for value in [LOGS_STALL_DELAY_MS_MIN, LOGS_STALL_DELAY_MS_MAX] {
+            configuration.logs.stall_delay = Duration::from_millis(value);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
     fn test_background_validation_and_version_control_bounds_are_enforced() {
         let mut configuration = WorkspaceConfiguration::default();
         for value in [
@@ -5274,6 +5394,61 @@ mod tests {
         assert_eq!(
             schema["$defs"]["TextSearchConfiguration"]["properties"]["large_files"]["default"],
             json!("split")
+        );
+    }
+
+    #[test]
+    fn test_search_journal_size_limit_defaults_bounds_and_advertises_its_range() {
+        assert_eq!(
+            SearchConfiguration::default().journal_size_limit,
+            ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT)
+        );
+        let mut configuration = WorkspaceConfiguration::default();
+        for bytes in [
+            SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN,
+            SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX,
+        ] {
+            configuration.search.journal_size_limit = ByteSize::from_bytes(bytes);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "journal_size_limit {bytes}"
+            );
+        }
+        configuration.search.journal_size_limit =
+            ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX + 1);
+        assert!(
+            matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "search.journal_size_limit",
+                    ..
+                })
+            ),
+            "a limit past the maximum must be refused naming the key"
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let property = &schema["$defs"]["SearchConfiguration"]["properties"]["journal_size_limit"];
+        assert_eq!(
+            property["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN),
+                "max": ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX),
+            })
+        );
+        assert_eq!(
+            property["default"],
+            json!(ByteSize::from_bytes(
+                SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT
+            ))
+        );
+        let written = json!({ "search": { "journal_size_limit": "16mb" } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the journal size limit deserializes");
+        assert_eq!(
+            configuration.search.journal_size_limit,
+            ByteSize::from_bytes(16 << 20)
         );
     }
 
