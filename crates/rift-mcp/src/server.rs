@@ -4029,12 +4029,19 @@ impl ServerHandler for RiftMcp {
         async {
             tracing::debug!("tool request started");
             let routed = ToolCallContext::new(self, request, context);
-            let result = self.tool_router.call(routed).await;
-            tracing::debug!(is_error = result.is_err(), "tool request completed");
-            match result {
+            let result = match self.tool_router.call(routed).await {
                 Err(error) => ToolFailure::from(error).into_call_tool_result(),
                 Ok(response) => Ok(response),
-            }
+            };
+            // A tool's registered failure completes as a result with `isError`, so the
+            // record reads the completed result, not the router's.
+            let is_error = match &result {
+                Ok(CallToolResponse::Complete(done)) => done.is_error == Some(true),
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            tracing::debug!(is_error, "tool request completed");
+            result
         }
         .instrument(span)
         .await
