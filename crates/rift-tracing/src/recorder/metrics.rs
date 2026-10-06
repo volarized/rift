@@ -1,67 +1,95 @@
-//! What a test reads back from the instruments: the OpenTelemetry SDK's own export of the
-//! process's meter, kept in memory.
+//! What a test reads back from the instruments: the OpenTelemetry SDK's current collection
+//! of the process's meter.
 //!
-//! The first recorder a process installs builds one meter provider whose reader exports
-//! into the SDK's `InMemoryMetricExporter`, with cumulative temporality, and installs it. The provider bounds each instrument at [`CARDINALITY_LIMIT`](crate::CARDINALITY_LIMIT)
-//! series, as the OTLP export's provider does. A read flushes the provider and takes the
-//! newest export: every series the SDK aggregated since the meter was installed. Nothing here aggregates; a series is one
-//! exported point, its labels and value as the SDK reported them.
+//! The first recorder a process installs builds one meter provider and retains its reader.
+//! With an OTLP reader, a read flushes its collection for export, then collects current
+//! points from that reader for assertions. These are two SDK collections. Without an OTLP
+//! reader, a read directly collects once. The provider bounds each instrument at
+//! [`CARDINALITY_LIMIT`](crate::CARDINALITY_LIMIT) series. Nothing here aggregates; a series
+//! is one point, its labels and value as the SDK reported them.
 
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
-/// The meter provider every recorder of the process reads, and the exporter it exports
-/// into.
+/// The meter provider and reader every recorder of the process reads.
 struct RecorderMeters {
     provider: SdkMeterProvider,
-    exporter: InMemoryMetricExporter,
+    reader: Arc<dyn MetricReader>,
+    exporter: Option<InMemoryMetricExporter>,
 }
 
 static RECORDER_METERS: OnceLock<RecorderMeters> = OnceLock::new();
 
-/// Installs the recorder's local reader beside its OTLP reader when configured.
-pub(crate) fn install(provider: Option<SdkMeterProvider>, exporter: InMemoryMetricExporter) {
+/// Installs the recorder's meter provider and reader when configured.
+pub(crate) fn install(provider: Option<SdkMeterProvider>, reader: Option<Arc<dyn MetricReader>>) {
     let _ = RECORDER_METERS.get_or_init(|| {
-        let provider = provider.unwrap_or_else(|| local_provider(exporter.clone()));
+        let (provider, reader, exporter) = match (provider, reader) {
+            (Some(provider), Some(reader)) => (provider, reader, None),
+            _ => local_provider(),
+        };
         crate::metrics::install_meter(provider.clone());
-        RecorderMeters { provider, exporter }
+        RecorderMeters {
+            provider,
+            reader,
+            exporter,
+        }
     });
 }
 
 fn meters() -> &'static RecorderMeters {
     RECORDER_METERS.get_or_init(|| {
-        let exporter = InMemoryMetricExporter::default();
-        let provider = local_provider(exporter.clone());
+        let (provider, reader, exporter) = local_provider();
         crate::metrics::install_meter(provider.clone());
-        RecorderMeters { provider, exporter }
+        RecorderMeters {
+            provider,
+            reader,
+            exporter,
+        }
     })
 }
 
-fn local_provider(exporter: InMemoryMetricExporter) -> SdkMeterProvider {
-    SdkMeterProvider::builder()
-        .with_reader(PeriodicReader::builder(exporter).build())
+fn local_provider() -> (
+    SdkMeterProvider,
+    Arc<dyn MetricReader>,
+    Option<InMemoryMetricExporter>,
+) {
+    let exporter = InMemoryMetricExporter::default();
+    let reader = PeriodicReader::builder(exporter.clone()).build();
+    let reader_handle: Arc<dyn MetricReader> = Arc::new(reader.clone());
+    let provider = SdkMeterProvider::builder()
+        .with_reader(reader)
         .with_view(crate::metrics::cardinality_view(
             crate::metrics::CARDINALITY_LIMIT,
         ))
-        .build()
+        .build();
+    (provider, reader_handle, Some(exporter))
 }
 
-/// Every series the SDK exports now; empty when nothing was recorded.
+/// Every series in the current SDK collection; empty when nothing is recorded.
 pub(crate) fn snapshot() -> MetricSnapshot {
     let meters = meters();
-    meters.exporter.reset();
-    if meters.provider.force_flush().is_err() {
+    let has_otlp_reader = meters.exporter.is_none();
+    if has_otlp_reader && meters.provider.force_flush().is_err() {
+        if let Some(exporter) = &meters.exporter {
+            exporter.reset();
+        }
         return MetricSnapshot::default();
     }
-    meters
-        .exporter
-        .get_finished_metrics()
-        .ok()
-        .and_then(|exported| exported.last().map(MetricSnapshot::of))
-        .unwrap_or_default()
+    let mut exported = ResourceMetrics::default();
+    if meters.reader.collect(&mut exported).is_err() {
+        if let Some(exporter) = &meters.exporter {
+            exporter.reset();
+        }
+        return MetricSnapshot::default();
+    }
+    if let Some(exporter) = &meters.exporter {
+        exporter.reset();
+    }
+    MetricSnapshot::of(&exported)
 }
 
 /// Every series one export of the process's instruments holds, ordered by instrument

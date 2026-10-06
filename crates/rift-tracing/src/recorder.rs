@@ -382,15 +382,16 @@ impl ScopedRecorderBuilder {
         });
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
-        let local_metrics = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
         let runtime = TestOtlpRuntime::when_configured();
         let (otlp_layer, export) = if let Some(runtime) = &runtime {
             let _entered = runtime.handle.enter();
-            otlp::recorder_layer(filter.clone(), local_metrics.clone())
+            otlp::recorder_layer(filter.clone())
         } else {
-            otlp::recorder_layer(filter.clone(), local_metrics.clone())
+            otlp::recorder_layer(filter.clone())
         };
-        metrics::install(export.recorder_meter_provider(), local_metrics);
+        let meter_provider = export.recorder_meter_provider();
+        let metric_reader = export.recorder_metric_reader();
+        metrics::install(meter_provider, metric_reader);
         let flights = Arc::new(FlightTable::default());
         let in_flight = observe_active(&flights);
         let span_context = self

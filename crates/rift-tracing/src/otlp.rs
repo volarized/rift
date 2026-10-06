@@ -12,9 +12,12 @@
 //! servers tells them apart.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, feature = "fixtures"))]
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+#[cfg(any(test, feature = "fixtures"))]
+use std::time::Instant;
+use std::time::{Duration, UNIX_EPOCH};
 
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
 use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
@@ -23,16 +26,23 @@ use opentelemetry_otlp::{
     LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig as _,
 };
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+use opentelemetry_sdk::error::OTelSdkError;
+#[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor;
-use opentelemetry_sdk::logs::{LogBatch, LogProcessor, SdkLogRecord, SdkLogger, SdkLoggerProvider};
+#[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_sdk::logs::{LogBatch, LogProcessor, SdkLogRecord};
+use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+#[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
+use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
-use opentelemetry_sdk::trace::{
-    BatchConfig, BatchConfigBuilder, SdkTracerProvider, Span, SpanData, SpanProcessor,
-};
+use opentelemetry_sdk::trace::{BatchConfig, BatchConfigBuilder, SdkTracerProvider};
+#[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_sdk::trace::{Span, SpanData, SpanProcessor};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{FilterExt as _, LevelFilter, Targets};
 use tracing_subscriber::layer::Context;
@@ -524,6 +534,7 @@ struct Providers {
     tracer: Option<SdkTracerProvider>,
     meters: Option<SdkMeterProvider>,
     logs: Option<LoggerExport>,
+    recorder_metric_reader: Option<Arc<dyn MetricReader>>,
 }
 
 /// The logger provider and the gate the log record layer emits through.
@@ -602,8 +613,27 @@ impl OtlpExport {
                 tracer,
                 meters,
                 logs,
+                recorder_metric_reader: None,
             }))),
         }
+    }
+
+    fn holding_with_recorder_metric_reader(
+        tracer: Option<SdkTracerProvider>,
+        meters: Option<SdkMeterProvider>,
+        logs: Option<LoggerExport>,
+        recorder_metric_reader: Option<Arc<dyn MetricReader>>,
+    ) -> Self {
+        let export = Self::holding(tracer, meters, logs);
+        if let Some(providers) = export
+            .providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            providers.recorder_metric_reader = recorder_metric_reader;
+        }
+        export
     }
 
     /// Makes the meter provider the one every instrument's scope builds its meter from, when
@@ -627,6 +657,15 @@ impl OtlpExport {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .and_then(|providers| providers.meters.clone())
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn recorder_metric_reader(&self) -> Option<Arc<dyn MetricReader>> {
+        self.providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|providers| providers.recorder_metric_reader.clone())
     }
 
     /// Flushes buffered spans, log records, and the final metric points, and shuts every
@@ -658,6 +697,7 @@ impl OtlpExport {
             tracer,
             meters,
             logs,
+            ..
         }) = taken
         else {
             return Ok(());
@@ -834,7 +874,12 @@ pub(crate) fn layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(log_filter, meter_provider, false)
+    layer_inner(
+        log_filter,
+        |exporter, resource| (meter_provider(exporter, resource), None),
+        false,
+        false,
+    )
 }
 
 /// The test process's raw log and span exporters, without SDK batch delays.
@@ -845,32 +890,42 @@ pub(crate) fn test_process_layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(log_filter, meter_provider, true)
+    layer_inner(
+        log_filter,
+        |exporter, resource| (meter_provider(exporter, resource), None),
+        true,
+        false,
+    )
 }
 
-/// The recorder's OTLP layer, with an in-memory reader on its meter provider so local
-/// metric assertions continue to read the SDK's points.
+/// The recorder's OTLP layer, with a handle for local metric assertions to collect from its
+/// SDK reader.
 #[cfg(any(test, feature = "fixtures"))]
 pub(crate) fn recorder_layer<S>(
     log_filter: tracing_subscriber::EnvFilter,
-    local_metrics: opentelemetry_sdk::metrics::InMemoryMetricExporter,
 ) -> (impl Layer<S> + Send + Sync, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
     layer_inner(
         log_filter,
-        move |exporter, resource| {
-            meter_provider_with_local_reader(exporter, resource, local_metrics)
+        |exporter, resource| {
+            let (provider, reader) = meter_provider_with_recorder_reader(exporter, resource);
+            (provider, Some(reader))
         },
         false,
+        true,
     )
 }
 
 fn layer_inner<S>(
     log_filter: tracing_subscriber::EnvFilter,
-    make_meter_provider: impl FnOnce(MetricExporter, Resource) -> SdkMeterProvider,
+    make_meter_provider: impl FnOnce(
+        MetricExporter,
+        Resource,
+    ) -> (SdkMeterProvider, Option<Arc<dyn MetricReader>>),
     test_process: bool,
+    cumulative_recorder_metrics: bool,
 ) -> (impl Layer<S> + Send + Sync, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
@@ -898,23 +953,30 @@ where
     } else {
         None
     };
-    let meters = if METRIC_ENDPOINT_VARS
+    let (meters, recorder_metric_reader) = if METRIC_ENDPOINT_VARS
         .iter()
         .any(|variable| configured(variable))
     {
-        match MetricExporter::builder()
+        let builder = MetricExporter::builder()
             .with_http()
-            .with_protocol(Protocol::HttpBinary)
-            .build()
-        {
-            Ok(exporter) => Some(make_meter_provider(exporter, resource.clone())),
+            .with_protocol(Protocol::HttpBinary);
+        let builder = if cumulative_recorder_metrics {
+            builder.with_temporality(opentelemetry_sdk::metrics::Temporality::Cumulative)
+        } else {
+            builder
+        };
+        match builder.build() {
+            Ok(exporter) => {
+                let (provider, reader) = make_meter_provider(exporter, resource.clone());
+                (Some(provider), reader)
+            }
             Err(error) => {
                 eprintln!("rift: warning: otlp metric exporter did not build: {error}");
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
     let tracer = if configured("OTEL_EXPORTER_OTLP_ENDPOINT") {
         match SpanExporter::builder()
@@ -947,7 +1009,12 @@ where
     // still holds the span's trace and span identifiers.
     (
         Layer::<S>::and_then(log_layer, span_layer),
-        OtlpExport::holding(tracer, meters, logs),
+        OtlpExport::holding_with_recorder_metric_reader(
+            tracer,
+            meters,
+            logs,
+            recorder_metric_reader,
+        ),
     )
 }
 
@@ -1200,15 +1267,14 @@ where
         .build()
 }
 
-/// The recorder meter provider with an additional in-memory reader for local assertions.
+/// The recorder meter provider and a handle for local SDK metric assertions.
 #[cfg(any(test, feature = "fixtures"))]
-fn meter_provider_with_local_reader<E>(
+fn meter_provider_with_recorder_reader<E>(
     exporter: E,
     resource: Resource,
-    local_metrics: opentelemetry_sdk::metrics::InMemoryMetricExporter,
-) -> SdkMeterProvider
+) -> (SdkMeterProvider, Arc<dyn MetricReader>)
 where
-    E: opentelemetry_sdk::metrics::exporter::PushMetricExporter,
+    E: PushMetricExporter,
 {
     let reader = PeriodicReader::builder(exporter, runtime::Tokio);
     let reader = if configured(METRIC_EXPORT_TIMEOUT_VAR) {
@@ -1216,14 +1282,16 @@ where
     } else {
         reader.with_timeout(OTLP_EXPORT_TIMEOUT)
     };
-    SdkMeterProvider::builder()
+    let reader = reader.build();
+    let local_reader: Arc<dyn MetricReader> = Arc::new(reader.clone());
+    let provider = SdkMeterProvider::builder()
         .with_resource(resource)
-        .with_reader(opentelemetry_sdk::metrics::PeriodicReader::builder(local_metrics).build())
-        .with_reader(reader.build())
+        .with_reader(reader)
         .with_view(crate::metrics::cardinality_view(
             crate::metrics::CARDINALITY_LIMIT,
         ))
-        .build()
+        .build();
+    (provider, local_reader)
 }
 
 /// The tracer provider that batches every ended span into `exporter` under `batch`.
