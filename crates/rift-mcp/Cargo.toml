@@ -57,6 +57,7 @@ tower-service = "0.3.3"
 windows-spawn.workspace = true
 
 [dev-dependencies]
+stats_alloc = "=0.1.10"
 rift-history = { workspace = true, features = ["fixtures"] }
 rift-tracing = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
