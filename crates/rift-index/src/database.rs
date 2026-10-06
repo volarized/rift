@@ -735,12 +735,15 @@ impl WorkspaceDatabase {
     ///
     /// Dropping the returned future gives up the wait; no slot is held.
     pub async fn hold_connection(&self) -> Result<HeldConnection, RiftError> {
+        let checked_out = rift_tracing::debug_span!(
+            "database.checkout",
+            component = "database",
+            operation = "database.checkout"
+        )
+        .instrument(self.database.connection())
+        .await;
         Ok(HeldConnection {
-            _connection: self
-                .database
-                .connection()
-                .await
-                .map_err(|source| self.failed(source))?,
+            _connection: checked_out.map_err(|source| self.failed(source))?,
         })
     }
 
