@@ -1,6 +1,6 @@
 //! Background filesystem validation and bounded Git index-lock waits.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -284,13 +284,12 @@ impl VersionControlHold {
             let present = context.blocking.run_with_cancellation(
                 "Git index lock validation",
                 context.validation.cancellation.clone(),
-                move |_| match std::fs::symlink_metadata(&path) {
-                    Ok(_) => Ok(true),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(error) => errors::server::read_unavailable()
-                        .operation("Git index lock validation")
-                        .detail(error.to_string())
-                        .fail(),
+                move |_| {
+                    lock_presence(
+                        &path,
+                        |path| std::fs::symlink_metadata(path).map(|_| ()),
+                        listed_in_directory,
+                    )
                 },
             );
             let present = tokio::select! {
@@ -363,9 +362,123 @@ fn report_wait(lock: &std::path::Path, sighted: Option<Instant>, outcome: &'stat
     );
 }
 
+/// Most entries [`listed_in_directory`] reads from the lock's directory.
+const LOCK_DIRECTORY_ENTRIES_MAX: usize = 4096;
+
+/// Whether the Git index lock at `path` is present: `metadata` reads it, and after an
+/// access-denied answer `listed` decides once, from whether its name is still in its
+/// directory.
+///
+/// On Windows a file in deletion answers access denied. The `DeleteFile` documentation:
+/// "The `DeleteFile` function marks a file for deletion on close. Therefore, the file
+/// deletion does not occur until the last handle to the file is closed. Subsequent calls
+/// to `CreateFile` to open the file fail with `ERROR_ACCESS_DENIED`." Rust's `remove_file`
+/// calls `DeleteFileW`, and `symlink_metadata` opens the file with `CreateFileW`, so a
+/// read between the mark and the last handle's close meets access denied. The name
+/// leaves the directory at that close: an access-denied answer whose name is no longer
+/// listed is an absent lock. An access-denied answer whose name is still listed, a
+/// listing that fails, and every other failure are an unavailable read.
+fn lock_presence(
+    path: &Path,
+    metadata: impl FnOnce(&Path) -> std::io::Result<()>,
+    listed: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Result<bool, RiftError> {
+    let unavailable = |error: &std::io::Error| {
+        errors::server::read_unavailable()
+            .operation("Git index lock validation")
+            .detail(error.to_string())
+            .fail()
+    };
+    match metadata(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => match listed(path) {
+            Ok(false) => Ok(false),
+            Ok(true) | Err(_) => unavailable(&error),
+        },
+        Err(error) => unavailable(&error),
+    }
+}
+
+/// Whether `path`'s name is among the entries of its directory, read without opening
+/// the file; at most [`LOCK_DIRECTORY_ENTRIES_MAX`] entries.
+fn listed_in_directory(path: &Path) -> std::io::Result<bool> {
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(std::io::Error::other(
+            "the lock path names no file in a directory",
+        ));
+    };
+    for (count, entry) in std::fs::read_dir(directory)?.enumerate() {
+        if count >= LOCK_DIRECTORY_ENTRIES_MAX {
+            return Err(std::io::Error::other(
+                "the lock's directory has more entries than its bound",
+            ));
+        }
+        if entry?.file_name() == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn denied(_: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    /// A lock in deletion on Windows answers access denied, then leaves its directory:
+    /// that answer is an absent lock, decided by one listing.
+    #[test]
+    fn an_access_denied_lock_whose_name_left_its_directory_is_absent() {
+        let mut listings = 0;
+        let present = lock_presence(Path::new("/repository/.git/index.lock"), denied, |_| {
+            listings += 1;
+            Ok(false)
+        });
+        assert_eq!(present.ok(), Some(false));
+        assert_eq!(listings, 1);
+    }
+
+    #[test]
+    fn an_access_denied_lock_still_listed_or_unlisted_is_an_unavailable_read() {
+        let path = Path::new("/repository/.git/index.lock");
+        let listed = lock_presence(path, denied, |_| Ok(true)).expect_err("still listed");
+        assert_eq!(listed.slug(), errors::server::read_unavailable::SLUG);
+        let unreadable = lock_presence(path, denied, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("the directory is unreadable");
+        assert_eq!(unreadable.slug(), errors::server::read_unavailable::SLUG);
+    }
+
+    #[test]
+    fn a_read_lock_is_present_and_a_missing_one_absent_without_a_listing() {
+        let path = Path::new("/repository/.git/index.lock");
+        let unlisted = |_: &Path| -> std::io::Result<bool> { panic!("no listing") };
+        assert_eq!(lock_presence(path, |_| Ok(()), unlisted).ok(), Some(true));
+        assert_eq!(
+            lock_presence(
+                path,
+                |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                unlisted
+            )
+            .ok(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_listing_finds_a_name_in_its_directory() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let lock = directory.path().join("index.lock");
+        assert!(!listed_in_directory(&lock)?);
+        std::fs::write(&lock, "")?;
+        assert!(listed_in_directory(&lock)?);
+        Ok(())
+    }
 
     fn stable_context(
         root: &std::path::Path,
