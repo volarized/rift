@@ -1499,7 +1499,17 @@ fn logs_query(
         TailCount::All => LOG_PAGE_RECORDS_MAX,
         TailCount::Newest(count) => usize::try_from(count).unwrap_or(LOG_PAGE_RECORDS_MAX),
     };
-    let mut query = LogQuery::newest(limit);
+    restricted_query(LogQuery::newest(limit), window, level, component)
+}
+
+/// `query` restricted to `level`, `component`, and `window`; an age bound counts back from
+/// the clock reading `query` already holds, or else reads the tracing clock.
+fn restricted_query(
+    mut query: LogQuery,
+    window: LogsWindow,
+    level: Option<LogLevel>,
+    component: Option<&str>,
+) -> LogQuery {
     if let Some(level) = level {
         query = query.at_level(level.label());
     }
@@ -1667,8 +1677,8 @@ mod tests {
         await_election_released, await_election_released_with_probe, await_serving,
         await_serving_with_probe, await_stopped, await_stopped_with_probe, discard_stale_document,
         export_stage_end_reserve, foreground_refused, later_stages_reserve, log_flush_end_reserve,
-        logs_mode, logs_query, print_logs, request_stop, stale_reason_phrase, start_detached,
-        start_mode, status, stop, stop_log_drain, token_check,
+        logs_mode, logs_query, print_logs, request_stop, restricted_query, stale_reason_phrase,
+        start_detached, start_mode, status, stop, stop_log_drain, token_check,
     };
     use rift_error::errors;
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
@@ -1678,9 +1688,6 @@ mod tests {
     };
     use std::path::Path;
     use std::time::Duration;
-
-    /// Milliseconds in one hour, for fixture instants only.
-    const MILLISECONDS_PER_HOUR: i64 = 3_600_000;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -3151,10 +3158,19 @@ mod tests {
         );
     }
 
-    /// The system clock in milliseconds since the Unix epoch: the clock a record is stamped
-    /// on and [`LogQuery::since_age`] counts back from.
-    fn wall_clock_ms() -> i64 {
-        jiff::Timestamp::now().as_millisecond()
+    /// The tracing clock's reading, in milliseconds since the Unix epoch, every age cutoff
+    /// of the logs tests counts back from.
+    const CLOCK_MS: i64 = 10_000_000;
+
+    /// A logs read as `rift server logs` builds it, with the tracing clock fixed at
+    /// [`CLOCK_MS`].
+    fn logs_query_at_fixed_clock(window: LogsWindow) -> LogQuery {
+        restricted_query(
+            LogQuery::newest(LOG_PAGE_RECORDS_MAX).at_clock_ms(CLOCK_MS),
+            window,
+            None,
+            None,
+        )
     }
 
     /// An `info` record of `index.build` at `recorded_at_ms` carrying `message`.
@@ -3178,17 +3194,20 @@ mod tests {
             .collect()
     }
 
-    /// `--since 10m` counts back from the tracing clock: a record an hour old is left out.
+    /// `--since 10m` selects `recorded_at >= clock - 600_000`: a record at the cutoff is
+    /// answered, one a millisecond before it is not.
     #[tokio::test]
-    async fn a_logs_since_age_selects_only_records_inside_its_window() -> TestResult {
+    async fn a_logs_since_age_includes_its_cutoff_and_excludes_one_millisecond_before() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let now = wall_clock_ms();
+        let cutoff = CLOCK_MS - 600_000;
         store
             .append(
                 [
-                    build_record(now - MILLISECONDS_PER_HOUR, "old"),
-                    build_record(now, "fresh"),
+                    build_record(cutoff - 1, "outside"),
+                    build_record(cutoff, "at cutoff"),
+                    build_record(cutoff + 1, "inside"),
                 ],
                 1_000,
             )
@@ -3201,29 +3220,61 @@ mod tests {
             since: Some(LogsBound::Age(since)),
             ..LogsWindow::default()
         };
-        let read =
-            store
-                .reader()
-                .connect()?
-                .following(&logs_query(TailCount::All, window, None, None))?;
+        let read = store
+            .reader()
+            .connect()?
+            .following(&logs_query_at_fixed_clock(window))?;
 
-        assert_eq!(messages(&read), ["fresh"]);
+        assert_eq!(messages(&read), ["at cutoff", "inside"]);
         Ok(())
     }
 
-    /// `--since 2h --until 30m` counts both ages back from one clock reading: the record an
-    /// hour old is inside, the one three hours old and the one a minute old are outside.
+    /// `--until 30m` selects `recorded_at < clock - 1_800_000`: a record at the cutoff is
+    /// not answered, one a millisecond before it is.
+    #[tokio::test]
+    async fn a_logs_until_age_excludes_its_cutoff_and_includes_one_millisecond_before() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let store = log_store(&directory).await?;
+        let cutoff = CLOCK_MS - 1_800_000;
+        store
+            .append(
+                [
+                    build_record(cutoff - 1, "inside"),
+                    build_record(cutoff, "at cutoff"),
+                    build_record(cutoff + 1, "outside"),
+                ],
+                1_000,
+            )
+            .await?;
+        let window = LogsWindow {
+            until: Some(LogsBound::parse("30m")?),
+            ..LogsWindow::default()
+        };
+        let read = store
+            .reader()
+            .connect()?
+            .following(&logs_query_at_fixed_clock(window))?;
+
+        assert_eq!(messages(&read), ["inside"]);
+        Ok(())
+    }
+
+    /// `--since 2h --until 30m` counts both ages back from one clock reading: the window is
+    /// `clock - 7_200_000 <= recorded_at < clock - 1_800_000`, exact at both ends.
     #[tokio::test]
     async fn a_logs_since_and_until_age_select_the_window_between_them() -> TestResult {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let now = wall_clock_ms();
+        let since = CLOCK_MS - 7_200_000;
+        let until = CLOCK_MS - 1_800_000;
         store
             .append(
                 [
-                    build_record(now - 3 * MILLISECONDS_PER_HOUR, "too old"),
-                    build_record(now - MILLISECONDS_PER_HOUR, "inside"),
-                    build_record(now - 60_000, "too new"),
+                    build_record(since - 1, "before since"),
+                    build_record(since, "at since"),
+                    build_record(until - 1, "before until"),
+                    build_record(until, "at until"),
                 ],
                 1_000,
             )
@@ -3233,30 +3284,31 @@ mod tests {
             until: Some(LogsBound::parse("30m")?),
         };
 
-        let read =
-            store
-                .reader()
-                .connect()?
-                .following(&logs_query(TailCount::All, window, None, None))?;
+        let read = store
+            .reader()
+            .connect()?
+            .following(&logs_query_at_fixed_clock(window))?;
 
-        assert_eq!(messages(&read), ["inside"]);
+        assert_eq!(messages(&read), ["at since", "before until"]);
         Ok(())
     }
 
     /// A follow read takes each later page with `after`, and the age cutoff the query
-    /// resolved when it was built still holds: a record appended after the first page, older
-    /// than the cutoff, stays out; one inside it prints.
+    /// resolved when it was built still holds: a record appended after the first page, one
+    /// millisecond before the cutoff, stays out; one at the cutoff prints.
     #[tokio::test]
     async fn a_logs_follow_page_keeps_the_age_cutoff_of_its_query() -> TestResult {
         let directory = tempfile::tempdir()?;
         let store = log_store(&directory).await?;
-        let now = wall_clock_ms();
-        store.append([build_record(now, "first")], 1_000).await?;
+        let cutoff = CLOCK_MS - 600_000;
+        store
+            .append([build_record(cutoff + 1, "first")], 1_000)
+            .await?;
         let window = LogsWindow {
             since: Some(LogsBound::parse("10m")?),
             ..LogsWindow::default()
         };
-        let query = logs_query(TailCount::All, window, None, None);
+        let query = logs_query_at_fixed_clock(window);
         let reads = store.reader().connect()?;
         let first = reads.following(&query)?;
         assert_eq!(messages(&first), ["first"]);
@@ -3267,8 +3319,8 @@ mod tests {
         store
             .append(
                 [
-                    build_record(now - MILLISECONDS_PER_HOUR, "late but old"),
-                    build_record(now, "late"),
+                    build_record(cutoff - 1, "late but old"),
+                    build_record(cutoff, "late"),
                 ],
                 1_000,
             )
