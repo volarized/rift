@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
-use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
 use opentelemetry::{Key, KeyValue};
 use opentelemetry_otlp::{
@@ -202,15 +201,15 @@ impl OtlpExport {
         }
     }
 
-    /// Makes the meter provider's meter the one every instrument records into, when one
-    /// exports. The runtime calls it once its subscriber is installed.
+    /// Makes the meter provider the one every instrument's scope builds its meter from, when
+    /// one exports. The runtime calls it once its subscriber is installed.
     pub(crate) fn install_meter(&self) {
         let providers = self
             .providers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(meters) = providers.as_ref().and_then(|held| held.meters.as_ref()) {
-            crate::metrics::install_meter(meters.meter_with_scope(crate::metrics::scope()));
+            crate::metrics::install_meter(meters.clone());
         }
     }
 

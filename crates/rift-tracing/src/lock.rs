@@ -17,17 +17,18 @@ use tokio::time::error::Elapsed;
 
 use crate::flight::{LOCK_HELD_SPAN, LOCK_WAIT_SPAN, with_table};
 use crate::measurement::monotonic_now;
-use crate::metrics::Histogram;
+use crate::metrics::{Histogram, SCOPE};
 
 /// `lock.wait.duration`: one wait, by lock, mode, and `error.type` when it ended without
 /// the lock.
 static LOCK_WAIT_DURATION: Histogram<3> = Histogram::declare(
+    SCOPE,
     "lock.wait.duration",
     &["lock.name", "lock.mode", "error.type"],
 );
 /// `lock.held.duration`: the time one acquisition kept its lock, by lock and mode.
 static LOCK_HELD_DURATION: Histogram<2> =
-    Histogram::declare("lock.held.duration", &["lock.name", "lock.mode"]);
+    Histogram::declare(SCOPE, "lock.held.duration", &["lock.name", "lock.mode"]);
 
 /// Starts recording waits for and holds of the lock `name`, a literal from a closed set
 /// such as `index.write`, in exclusive mode.

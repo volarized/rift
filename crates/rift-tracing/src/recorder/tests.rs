@@ -172,11 +172,18 @@ fn a_recorder_prints_its_records_and_metric_points_when_its_test_panics() {
         points.contains(" metric points printed, 0 left out\n"),
         "{printed}"
     );
+    let version = env!("CARGO_PKG_VERSION");
     for line in [
-        "traces.span.metrics.calls   span.kind=Internal span.name=test.printed \
-         status.code=Ok  value=1 unit={call}",
-        "traces.span.metrics.duration   span.kind=Internal span.name=test.printed \
-         status.code=Ok  count=1 sum=0.25 buckets=<=0.25:1 unit=s",
+        format!(
+            "traces.span.metrics.calls   otel.scope.name=rift-tracing \
+             otel.scope.version={version}  span.kind=Internal span.name=test.printed \
+             status.code=Ok  value=1 unit={{call}}"
+        ),
+        format!(
+            "traces.span.metrics.duration   otel.scope.name=rift-tracing \
+             otel.scope.version={version}  span.kind=Internal span.name=test.printed \
+             status.code=Ok  count=1 sum=0.25 buckets=<=0.25:1 unit=s"
+        ),
     ] {
         assert!(
             points.lines().any(|printed| printed == line),
@@ -206,8 +213,12 @@ fn a_streaming_recorder_prints_only_its_metric_points_when_its_test_panics() {
 /// header counts those left out.
 #[test]
 fn the_print_keeps_the_metric_points_up_to_the_byte_bound() -> TestResult {
-    static PRINTED: Counter<1> =
-        Counter::declare("test.printed.points", "{point}", &["test.point"]);
+    static PRINTED: Counter<1> = Counter::declare(
+        crate::metrics::SCOPE,
+        "test.printed.points",
+        "{point}",
+        &["test.point"],
+    );
     let (recorder, _drain) = ScopedRecorder::builder().install()?;
     let points = 2 * SCOPED_RECORDER_PRINT_BYTES_MAX / 64;
     for index in 0..points {

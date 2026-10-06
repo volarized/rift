@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use tracing::instrument::{Instrument as _, Instrumented};
 
 use crate::Span;
-use crate::metrics::{Completion, future_completion};
+use crate::metrics::{Completion, InstrumentScope, future_completion};
 
 pin_project_lite::pin_project! {
     /// Where an awaited operation is: not yet polled, running under its span, or done.
@@ -26,7 +26,7 @@ pin_project_lite::pin_project! {
     #[project = StageProjection]
     #[project_replace = StageReplacement]
     enum Stage<Work, Open> {
-        Waiting { operation: &'static str, work: Work, open: Open },
+        Waiting { scope: InstrumentScope, operation: &'static str, work: Work, open: Open },
         Running { completion: Completion, #[pin] work: Instrumented<Work> },
         Spent,
     }
@@ -71,13 +71,14 @@ where
         let mut stage = self.project().stage;
         if let StageProjection::Waiting { .. } = stage.as_mut().project()
             && let StageReplacement::Waiting {
+                scope,
                 operation,
                 work,
                 open,
             } = stage.as_mut().project_replace(Stage::Spent)
         {
             let work = work.instrument(open());
-            let completion = future_completion(operation).of_span(work.span().id());
+            let completion = future_completion(scope, operation).of_span(work.span().id());
             stage.set(Stage::Running { completion, work });
         }
         let StageProjection::Running {
@@ -94,10 +95,11 @@ where
     }
 }
 
-/// Wraps `work` so the span `open` builds, and the completion of `operation`, start on
-/// the first poll.
+/// Wraps `work` so the span `open` builds, and the completion of `operation` under the
+/// instrumentation scope `scope`, start on the first poll.
 #[doc(hidden)]
 pub fn traced_future<Work, Open>(
+    scope: InstrumentScope,
     operation: &'static str,
     work: Work,
     open: Open,
@@ -108,6 +110,7 @@ where
 {
     TracedFuture {
         stage: Stage::Waiting {
+            scope,
             operation,
             work,
             open,
@@ -235,7 +238,9 @@ pub fn parent_span(parent: &Span) -> Span {
 /// # Completion metrics
 ///
 /// Every operation records `traces.span.metrics.calls` and
-/// `traces.span.metrics.duration`, in seconds, labeled with the operation literal as
+/// `traces.span.metrics.duration`, in seconds, under the instrumentation scope of the crate
+/// the macro expands in, its `CARGO_PKG_NAME` and `CARGO_PKG_VERSION`, labeled with the
+/// operation literal as
 /// `span.name`, `span.kind` `Internal`, the kind its exported span carries, and its outcome
 /// as `status.code`: `Ok` when the work finished, by any path
 /// out of a block or by returning from a future, and `Error` with `error.type` `panic` or
@@ -378,11 +383,28 @@ macro_rules! __rift_traced_block {
         .entered();
         // Declared after the entered span, the completion drops first, while the span is
         // still open and holds what it recorded.
-        let __rift_completion =
-            $crate::__private::completion($operation).of_span(__rift_entered.id());
+        let __rift_completion = $crate::__private::completion(
+            $crate::__rift_instrument_scope!(),
+            $operation,
+        )
+        .of_span(__rift_entered.id());
         $($crate::__rift_traced_opened!($open);)?
         $work
     }};
+}
+
+/// The instrumentation scope of the crate the macro expands in: its `CARGO_PKG_NAME` and
+/// `CARGO_PKG_VERSION`, read where `traced!` expands, as `tracing`'s `span!` reads the
+/// caller's `module_path!()` for its target.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rift_instrument_scope {
+    () => {
+        $crate::InstrumentScope::new(
+            ::core::env!("CARGO_PKG_NAME"),
+            ::core::env!("CARGO_PKG_VERSION"),
+        )
+    };
 }
 
 /// The record an operation declared with `open = true` emits inside its span as it opens.
@@ -403,7 +425,7 @@ macro_rules! __rift_traced_future {
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
         $(let __rift_parent = $crate::__private::parent_span($parent);)?
-        $crate::__private::traced_future($operation, $work, move || {
+        $crate::__private::traced_future($crate::__rift_instrument_scope!(), $operation, $work, move || {
             let __rift_span = $crate::__rift_traced_span!(
                 [$(__rift_parent $parent)?] [$($component)?] $operation [$($field = $value),*]
             );

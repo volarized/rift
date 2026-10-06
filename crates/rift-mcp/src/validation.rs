@@ -51,6 +51,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
+use crate::metrics::SCOPE;
 use crate::server::{BlockingExecutor, EngineHold};
 
 /// Filesystem events coalesced while one rebuild is pending.
@@ -519,7 +520,7 @@ fn publication_map(
 /// observed, recorded where each one moves. An observed epoch running ahead of the
 /// published one is an index behind the tree.
 static INDEX_EPOCH: rift_tracing::Gauge<u64, 1> =
-    rift_tracing::Gauge::declare("index.epoch", "{epoch}", &["index.epoch.kind"]);
+    rift_tracing::Gauge::declare(SCOPE, "index.epoch", "{epoch}", &["index.epoch.kind"]);
 /// The `index.epoch.kind` of the epoch a publication installs.
 const INDEX_EPOCH_PUBLISHED: &str = "published";
 /// The `index.epoch.kind` of the epoch an observation reaches.
@@ -531,11 +532,12 @@ const INDEX_EPOCH_OBSERVED: &str = "observed";
 /// work on the turn one signal starts, so a refused signal loses no work: the count is the
 /// observations that joined a turn already announced. No record is written per refusal.
 static INDEX_INVALIDATION_DROPPED: rift_tracing::Counter<1> =
-    rift_tracing::Counter::declare("index.invalidation.dropped", "{event}", &["event"]);
+    rift_tracing::Counter::declare(SCOPE, "index.invalidation.dropped", "{event}", &["event"]);
 
 /// `watch.events`: native watch events, by `watch.event.kind`, notify's spelling of the
 /// event's kind, and `watch.event.route`, the [`WatchImpact`] it took.
 static WATCH_EVENTS: rift_tracing::Counter<2> = rift_tracing::Counter::declare(
+    SCOPE,
     "watch.events",
     "{event}",
     &["watch.event.kind", "watch.event.route"],
@@ -550,6 +552,7 @@ const WATCH_ROUTE_WHOLE_WORKSPACE: &str = "whole_workspace";
 /// `index.rebuilds`: rebuilds by `index.rebuild.trigger`, and by `error.type` for one that
 /// ended without an outcome: the failure's registered identity, or `cancelled`.
 static INDEX_REBUILDS: rift_tracing::Counter<2> = rift_tracing::Counter::declare(
+    SCOPE,
     "index.rebuilds",
     "{rebuild}",
     &["index.rebuild.trigger", "error.type"],

@@ -1,17 +1,19 @@
 //! Typed metric instruments over the OpenTelemetry metrics API: counters, gauges, and
 //! histograms a declaration fixes once.
 //!
-//! A declaration is a `static` naming an instrument, its unit, and the label keys it
-//! accepts. A caller records into the declared handle; it never registers an instrument or
-//! builds a label map. Label values are `&'static str`, so a value comes from a closed set
-//! the code spells out, and a path, a query, or an error message cannot become a label.
+//! A declaration is a `static` naming the crate that declares it, an instrument, its unit,
+//! and the label keys it accepts. A caller records into the declared handle; it never
+//! registers an instrument or builds a label map. Label values are `&'static str`, so a
+//! value comes from a closed set the code spells out, and a path, a query, or an error
+//! message cannot become a label.
 //!
 //! A recording hands the value and its labels to the OpenTelemetry instrument the
-//! declaration holds, built from the process's meter on the first recording after one was
-//! installed. The OpenTelemetry SDK aggregates, bounds the series, and exports; this
-//! module holds no value. The process installs at most one meter: the OTLP export when an
-//! endpoint is configured, or a test's `ScopedRecorder`. Before that, and in a process that
-//! installs none, a recording reads two atomics and records nothing.
+//! declaration holds, built on the first recording after a meter provider was installed,
+//! from the provider's meter for the declaring crate's [`InstrumentScope`]. The OpenTelemetry
+//! SDK aggregates, bounds the series, and exports; this module holds no value. The process
+//! installs at most one meter provider: the OTLP export's when an endpoint is configured, or
+//! a test's `ScopedRecorder`'s. Before that, and in a process that installs none, a
+//! recording reads two atomics and records nothing.
 //!
 //! A quantity its owner holds, such as a file's size or a queue's length, is an
 //! [`ObservableUpDownCounter`]: the owner registers a read that runs each time the SDK's
@@ -21,8 +23,8 @@
 //! that callback runs the instrument's own list of at most [`OBSERVATIONS_MAX`] reads.
 //!
 //! A meter obtained from `opentelemetry::global` before a provider is set stays a no-op for
-//! good, so the meter is never taken from there: the installer hands it over once, and
-//! each declaration builds its instrument from it lazily.
+//! good, so no meter is taken from there: the installer hands the provider over once, and
+//! each scope's meter is built from it on that scope's first instrument.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,7 +32,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{AsyncInstrument, Meter};
+use opentelemetry::metrics::{AsyncInstrument, Meter, MeterProvider as _};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 
 use crate::capture::{span_completed, span_failure};
 use crate::measurement::monotonic_now;
@@ -41,15 +44,92 @@ pub const DURATION_BOUNDARIES_SECONDS: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
 
-/// The meter every declaration builds its instrument from, installed at most once.
-static METER: OnceLock<Meter> = OnceLock::new();
+/// The instrumentation scope an instrument's points carry: the crate that emits them, by
+/// its Cargo package name and version.
+///
+/// Each emitting crate holds one, built from its own `CARGO_PKG_NAME` and
+/// `CARGO_PKG_VERSION`, and passes it to every declaration it makes; `traced!` builds the
+/// one of the crate it expands in.
+///
+/// ```
+/// const SCOPE: rift_tracing::InstrumentScope =
+///     rift_tracing::InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+/// static CALLS: rift_tracing::Counter<0> =
+///     rift_tracing::Counter::declare(SCOPE, "test.calls", "{call}", &[]);
+/// assert_eq!(SCOPE.name(), "rift-tracing");
+/// CALLS.add(1);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstrumentScope {
+    name: &'static str,
+    version: &'static str,
+}
 
-/// The instrumentation scope of every Rift instrument: `rift-tracing` and its version,
-/// because every instrument is declared through this crate.
-pub(crate) fn scope() -> opentelemetry::InstrumentationScope {
-    opentelemetry::InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
-        .with_version(env!("CARGO_PKG_VERSION"))
-        .build()
+impl InstrumentScope {
+    /// The scope of the crate named `name`, at `version`.
+    #[must_use]
+    pub const fn new(name: &'static str, version: &'static str) -> Self {
+        Self { name, version }
+    }
+
+    /// The emitting crate's Cargo package name.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The emitting crate's Cargo package version.
+    #[must_use]
+    pub const fn version(&self) -> &'static str {
+        self.version
+    }
+
+    /// The OpenTelemetry scope a meter is built with.
+    pub(crate) fn instrumentation_scope(self) -> opentelemetry::InstrumentationScope {
+        opentelemetry::InstrumentationScope::builder(self.name)
+            .with_version(self.version)
+            .build()
+    }
+}
+
+/// The instrumentation scope of the instruments `rift-tracing` declares and of the readings
+/// it registers on the process's behalf.
+pub(crate) const SCOPE: InstrumentScope =
+    InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
+/// Instrumentation scopes, and so meters, one process builds, at most: one per emitting
+/// crate. `rift-tracing`, `rift-index`, `rift-history-store`, and `rift-mcp` declare
+/// instruments; `rift-server` and `rift-cloud-client` emit the span metrics of their
+/// `traced!` operations. An instrument whose scope arrives past the bound records nothing,
+/// and the first such refusal is recorded once as a `WARN` record naming the scope.
+pub const SCOPES_MAX: usize = 6;
+
+const _: () = assert!(
+    SCOPES_MAX >= 1,
+    "the install builds the meter of `rift-tracing`'s own scope first"
+);
+
+/// The meter provider every scope's meter is built from, installed at most once.
+static PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
+
+/// The meter of each scope built so far, filled in order from the first slot.
+static METERS: [OnceLock<ScopeMeter>; SCOPES_MAX] = [const { OnceLock::new() }; SCOPES_MAX];
+
+/// Held while a scope takes the next free slot of [`METERS`], so two threads building the
+/// same scope's first instrument fill one slot.
+static METERS_CLAIM: Mutex<()> = Mutex::new(());
+
+/// Whether a scope past [`SCOPES_MAX`] was refused and recorded.
+static SCOPE_REFUSAL_RECORDED: AtomicBool = AtomicBool::new(false);
+
+/// One scope's meter, and the span metrics of the `traced!` operations its crate runs.
+struct ScopeMeter {
+    scope: InstrumentScope,
+    meter: Meter,
+    /// `traces.span.metrics.duration` of this scope.
+    operation_duration: Histogram<4>,
+    /// `traces.span.metrics.calls` of this scope.
+    operation_calls: Counter<4>,
 }
 
 /// Series one instrument aggregates, at most: the explicit cardinality bound every Rift
@@ -79,35 +159,107 @@ pub(crate) fn cardinality_view(
     }
 }
 
-/// Makes `meter` the one every declaration builds its instrument from; a meter installed
-/// before stays, and `meter` is dropped.
+/// Makes `provider` the one every scope's meter is built from; a provider installed before
+/// stays, and `provider` is dropped.
+///
+/// The process holds the provider for good, as it holds the meters built from it: the OTLP
+/// export ends it through its own `shutdown`, never through a drop.
 ///
 /// It then builds the counters a `tracing` layer records into, which record through
-/// [`Counter::add_built`] alone: `log.queue.dropped` and `operation.untracked`.
-pub(crate) fn install_meter(meter: Meter) {
-    let _ = METER.set(meter);
+/// [`Counter::add_built`] alone: `log.queue.dropped` and `operation.untracked`. Their
+/// scope, `rift-tracing`'s, takes the first slot of [`METERS`].
+pub(crate) fn install_meter(provider: SdkMeterProvider) {
+    let _ = PROVIDER.set(provider);
     crate::capture::LOG_QUEUE_DROPPED.build();
     crate::flight::OPERATION_UNTRACKED.build();
 }
 
-/// Whether a meter is installed, so a recording reaches an instrument.
+/// Whether a meter provider is installed, so a recording reaches an instrument.
 pub(crate) fn meter_installed() -> bool {
-    METER.get().is_some()
+    PROVIDER.get().is_some()
 }
 
-/// Runs `register` against the installed meter; answers whether a meter was installed.
+/// Runs `register` against the meter of `rift-tracing`'s own scope; answers whether a meter
+/// provider was installed.
 pub(crate) fn with_meter(register: impl FnOnce(&Meter)) -> bool {
-    METER.get().map(register).is_some()
+    scope_meter(SCOPE)
+        .map(|scoped| register(&scoped.meter))
+        .is_some()
 }
 
-/// The instrument `cell` holds, built by `build` from the installed meter on first use;
-/// `None` while no meter is installed, so a later install still builds it.
-fn built<Handle>(cell: &OnceLock<Handle>, build: impl FnOnce(&Meter) -> Handle) -> Option<&Handle> {
+/// The meter of `scope`, built from the installed provider on the scope's first use.
+///
+/// `None` while no provider is installed, and for a scope past [`SCOPES_MAX`]: the first
+/// such refusal is recorded once as a `WARN` record. A lookup reads at most
+/// [`SCOPES_MAX`] slots; the first use of a scope takes [`METERS_CLAIM`] once.
+fn scope_meter(scope: InstrumentScope) -> Option<&'static ScopeMeter> {
+    let provider = PROVIDER.get()?;
+    if let Some(found) = held_scope_meter(scope) {
+        return Some(found);
+    }
+    let claim = METERS_CLAIM.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = held_scope_meter(scope) {
+        return Some(found);
+    }
+    let Some(slot) = METERS.iter().find(|slot| slot.get().is_none()) else {
+        drop(claim);
+        if !SCOPE_REFUSAL_RECORDED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "rift_tracing::metrics",
+                scope = scope.name,
+                scopes_max = SCOPES_MAX,
+                "meter refused an instrumentation scope past its bound"
+            );
+        }
+        return None;
+    };
+    let scoped = slot.get_or_init(|| ScopeMeter {
+        scope,
+        meter: provider.meter_with_scope(scope.instrumentation_scope()),
+        operation_duration: Histogram::declare(
+            scope,
+            OPERATION_DURATION_NAME,
+            &OPERATION_LABEL_KEYS,
+        ),
+        operation_calls: Counter::declare(
+            scope,
+            OPERATION_CALLS_NAME,
+            OPERATION_CALLS_UNIT,
+            &OPERATION_LABEL_KEYS,
+        ),
+    });
+    drop(claim);
+    Some(scoped)
+}
+
+/// The slot already holding `scope`'s meter; the slots fill in order, so the first empty
+/// slot ends the search.
+fn held_scope_meter(scope: InstrumentScope) -> Option<&'static ScopeMeter> {
+    METERS
+        .iter()
+        .map_while(OnceLock::get)
+        .find(|scoped| scoped.scope == scope)
+}
+
+/// The scopes whose meter is built.
+#[cfg(test)]
+pub(crate) fn scopes_built() -> usize {
+    METERS.iter().map_while(OnceLock::get).count()
+}
+
+/// The instrument `cell` holds, built by `build` from the meter of `scope` on first use;
+/// `None` while no meter provider is installed or the scope was refused, so a later install
+/// still builds it.
+fn built<Handle>(
+    cell: &OnceLock<Handle>,
+    scope: InstrumentScope,
+    build: impl FnOnce(&Meter) -> Handle,
+) -> Option<&Handle> {
     if let Some(handle) = cell.get() {
         return Some(handle);
     }
-    let meter = METER.get()?;
-    Some(cell.get_or_init(|| build(meter)))
+    let scoped = scope_meter(scope)?;
+    Some(cell.get_or_init(|| build(&scoped.meter)))
 }
 
 /// The attributes the label `values` name, in declaration order, and how many lead the
@@ -134,6 +286,7 @@ fn attributes<const LABELS: usize>(
 /// A sum that only grows: the count of something that happened.
 #[derive(Debug)]
 pub struct Counter<const LABELS: usize> {
+    scope: InstrumentScope,
     name: &'static str,
     unit: &'static str,
     label_keys: &'static [&'static str; LABELS],
@@ -141,14 +294,17 @@ pub struct Counter<const LABELS: usize> {
 }
 
 impl<const LABELS: usize> Counter<LABELS> {
-    /// Declares a counter named `name`, in `unit`, whose values name the `label_keys`.
+    /// Declares a counter of `scope` named `name`, in `unit`, whose values name the
+    /// `label_keys`.
     #[must_use]
     pub const fn declare(
+        scope: InstrumentScope,
         name: &'static str,
         unit: &'static str,
         label_keys: &'static [&'static str; LABELS],
     ) -> Self {
         Self {
+            scope,
             name,
             unit,
             label_keys,
@@ -166,7 +322,7 @@ impl<const LABELS: usize> Counter<LABELS> {
 
     /// The instrument, built from the installed meter on first use.
     fn instrument(&self) -> Option<&opentelemetry::metrics::Counter<f64>> {
-        built(&self.instrument, |meter| {
+        built(&self.instrument, self.scope, |meter| {
             meter.f64_counter(self.name).with_unit(self.unit).build()
         })
     }
@@ -327,6 +483,7 @@ mod private {
 /// The latest value of a quantity, such as resident memory in bytes.
 #[derive(Debug)]
 pub struct Gauge<Value: GaugeValue, const LABELS: usize> {
+    scope: InstrumentScope,
     name: &'static str,
     unit: &'static str,
     label_keys: &'static [&'static str; LABELS],
@@ -335,14 +492,17 @@ pub struct Gauge<Value: GaugeValue, const LABELS: usize> {
 }
 
 impl<Value: GaugeValue, const LABELS: usize> Gauge<Value, LABELS> {
-    /// Declares a gauge named `name`, in `unit`, whose values name the `label_keys`.
+    /// Declares a gauge of `scope` named `name`, in `unit`, whose values name the
+    /// `label_keys`.
     #[must_use]
     pub const fn declare(
+        scope: InstrumentScope,
         name: &'static str,
         unit: &'static str,
         label_keys: &'static [&'static str; LABELS],
     ) -> Self {
         Self {
+            scope,
             name,
             unit,
             label_keys,
@@ -391,7 +551,7 @@ impl<Value: GaugeValue, const LABELS: usize> GaugeSelection<'_, Value, LABELS> {
         let Some(measured) = self.value.measured() else {
             return;
         };
-        let built = built(&gauge.instrument, |meter| {
+        let built = built(&gauge.instrument, gauge.scope, |meter| {
             meter.f64_gauge(gauge.name).with_unit(gauge.unit).build()
         });
         if let Some(instrument) = built {
@@ -405,6 +565,7 @@ impl<Value: GaugeValue, const LABELS: usize> GaugeSelection<'_, Value, LABELS> {
 /// or counts, such as the statements one transaction ran.
 #[derive(Debug)]
 pub struct Histogram<const LABELS: usize, Value: HistogramValue = Duration> {
+    scope: InstrumentScope,
     name: &'static str,
     unit: &'static str,
     label_keys: &'static [&'static str; LABELS],
@@ -413,11 +574,16 @@ pub struct Histogram<const LABELS: usize, Value: HistogramValue = Duration> {
 }
 
 impl<const LABELS: usize> Histogram<LABELS> {
-    /// Declares a duration histogram named `name`, in seconds, whose values name the
-    /// `label_keys`, bucketed at [`DURATION_BOUNDARIES_SECONDS`].
+    /// Declares a duration histogram of `scope` named `name`, in seconds, whose values name
+    /// the `label_keys`, bucketed at [`DURATION_BOUNDARIES_SECONDS`].
     #[must_use]
-    pub const fn declare(name: &'static str, label_keys: &'static [&'static str; LABELS]) -> Self {
+    pub const fn declare(
+        scope: InstrumentScope,
+        name: &'static str,
+        label_keys: &'static [&'static str; LABELS],
+    ) -> Self {
         Self {
+            scope,
             name,
             unit: "s",
             label_keys,
@@ -428,16 +594,18 @@ impl<const LABELS: usize> Histogram<LABELS> {
 }
 
 impl<const LABELS: usize> Histogram<LABELS, u64> {
-    /// Declares a histogram of counts named `name`, in `unit`, whose values name the
-    /// `label_keys`, bucketed at the ascending upper bounds `boundaries`.
+    /// Declares a histogram of counts of `scope` named `name`, in `unit`, whose values name
+    /// the `label_keys`, bucketed at the ascending upper bounds `boundaries`.
     #[must_use]
     pub const fn declare_count(
+        scope: InstrumentScope,
         name: &'static str,
         unit: &'static str,
         label_keys: &'static [&'static str; LABELS],
         boundaries: &'static [f64],
     ) -> Self {
         Self {
+            scope,
             name,
             unit,
             label_keys,
@@ -486,7 +654,7 @@ impl<const LABELS: usize, Value: HistogramValue> HistogramSelection<'_, LABELS, 
     /// Records one value into the selected series.
     pub fn record(self, value: Value) {
         let histogram = self.histogram;
-        let built = built(&histogram.instrument, |meter| {
+        let built = built(&histogram.instrument, histogram.scope, |meter| {
             Value::histogram(meter, histogram.name, histogram.unit, histogram.boundaries)
         });
         if let Some(instrument) = built {
@@ -516,6 +684,7 @@ type Read<const LABELS: usize> = dyn Fn(&Observation<'_, LABELS>) + Send + Sync;
 /// installed. A collection takes the list's lock to copy out its reads, at most
 /// [`OBSERVATIONS_MAX`] `Arc` clones, and runs them with the lock released.
 pub struct ObservableUpDownCounter<const LABELS: usize> {
+    scope: InstrumentScope,
     name: &'static str,
     unit: &'static str,
     label_keys: &'static [&'static str; LABELS],
@@ -541,14 +710,17 @@ impl<const LABELS: usize> std::fmt::Debug for ObservableUpDownCounter<LABELS> {
 }
 
 impl<const LABELS: usize> ObservableUpDownCounter<LABELS> {
-    /// Declares a quantity named `name`, in `unit`, whose values name the `label_keys`.
+    /// Declares a quantity of `scope` named `name`, in `unit`, whose values name the
+    /// `label_keys`.
     #[must_use]
     pub const fn declare(
+        scope: InstrumentScope,
         name: &'static str,
         unit: &'static str,
         label_keys: &'static [&'static str; LABELS],
     ) -> Self {
         Self {
+            scope,
             name,
             unit,
             label_keys,
@@ -573,8 +745,10 @@ impl<const LABELS: usize> ObservableUpDownCounter<LABELS> {
     /// owner weakly.
     ///
     /// ```
+    /// const SCOPE: rift_tracing::InstrumentScope =
+    ///     rift_tracing::InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     /// static QUEUED: rift_tracing::ObservableUpDownCounter<1> =
-    ///     rift_tracing::ObservableUpDownCounter::declare("test.queue.length", "{task}", &["queue"]);
+    ///     rift_tracing::ObservableUpDownCounter::declare(SCOPE, "test.queue.length", "{task}", &["queue"]);
     /// // `None` in a process that installed no meter.
     /// let guard = QUEUED.observe(|observation| observation.observe(["parse"], 3));
     /// drop(guard);
@@ -605,13 +779,14 @@ impl<const LABELS: usize> ObservableUpDownCounter<LABELS> {
             identity
         };
         self.callback.get_or_init(|| {
-            with_meter(|meter| {
-                let _instrument = meter
+            if let Some(scoped) = scope_meter(self.scope) {
+                let _instrument = scoped
+                    .meter
                     .i64_observable_up_down_counter(self.name)
                     .with_unit(self.unit)
                     .with_callback(move |instrument| self.collect(instrument))
                     .build();
-            });
+            }
         });
         Some(ObservationGuard {
             instrument: self,
@@ -711,17 +886,15 @@ impl Drop for ObservationGuard {
 }
 
 /// The duration of every `traced!` operation, the name the OpenTelemetry Collector's span
-/// metrics connector derives from spans.
-pub(crate) static OPERATION_DURATION: Histogram<4> = Histogram::declare(
-    "traces.span.metrics.duration",
-    &["span.name", "span.kind", "status.code", "error.type"],
-);
-/// The count of every `traced!` operation, beside [`OPERATION_DURATION`].
-pub(crate) static OPERATION_CALLS: Counter<4> = Counter::declare(
-    "traces.span.metrics.calls",
-    "{call}",
-    &["span.name", "span.kind", "status.code", "error.type"],
-);
+/// metrics connector derives from spans. Each scope's meter holds its own instrument, under
+/// the scope of the crate the operation's `traced!` expanded in.
+const OPERATION_DURATION_NAME: &str = "traces.span.metrics.duration";
+/// The count of every `traced!` operation, beside [`OPERATION_DURATION_NAME`].
+const OPERATION_CALLS_NAME: &str = "traces.span.metrics.calls";
+/// The unit of [`OPERATION_CALLS_NAME`].
+const OPERATION_CALLS_UNIT: &str = "{call}";
+/// The label keys of both span metrics.
+const OPERATION_LABEL_KEYS: [&str; 4] = ["span.name", "span.kind", "status.code", "error.type"];
 
 /// The `span.kind` of every `traced!` operation: no operation states `otel.kind`, so the
 /// span it exports takes the SDK's default kind, `SpanKind::Internal`, and the metrics name
@@ -763,6 +936,7 @@ enum Ending {
 #[derive(Debug)]
 #[must_use = "the completion records when it drops"]
 pub struct Completion {
+    scope: InstrumentScope,
     operation: &'static str,
     records: bool,
     /// The clock reading at the start of an operation with no span to time it.
@@ -824,29 +998,35 @@ impl Drop for Completion {
                 },
             }
         };
+        let Some(scoped) = scope_meter(self.scope) else {
+            return;
+        };
         let labels = [self.operation, SPAN_KIND_INTERNAL, status, error];
-        OPERATION_CALLS.labeled(labels).add(1);
+        scoped.operation_calls.labeled(labels).add(1);
         if let Some(elapsed) = elapsed {
-            OPERATION_DURATION.labeled(labels).record(elapsed);
+            scoped.operation_duration.labeled(labels).record(elapsed);
         }
     }
 }
 
-/// Starts the completion guard of a `traced!` block: it ends when the block is left.
+/// Starts the completion guard of a `traced!` block of the crate `scope` names: it ends
+/// when the block is left.
 #[doc(hidden)]
-pub fn completion(operation: &'static str) -> Completion {
-    started(operation, Ending::Finished)
+pub fn completion(scope: InstrumentScope, operation: &'static str) -> Completion {
+    started(scope, operation, Ending::Finished)
 }
 
-/// Starts the completion guard of an awaited `traced!` operation at its first poll: it
-/// counts as cancelled unless [`Completion::finished`] runs before it drops.
-pub(crate) fn future_completion(operation: &'static str) -> Completion {
-    started(operation, Ending::Cancelled)
+/// Starts the completion guard of an awaited `traced!` operation of the crate `scope` names
+/// at its first poll: it counts as cancelled unless [`Completion::finished`] runs before it
+/// drops.
+pub(crate) fn future_completion(scope: InstrumentScope, operation: &'static str) -> Completion {
+    started(scope, operation, Ending::Cancelled)
 }
 
 /// A completion guard of `operation` that ends as `ending` unless told otherwise.
-fn started(operation: &'static str, ending: Ending) -> Completion {
+fn started(scope: InstrumentScope, operation: &'static str, ending: Ending) -> Completion {
     Completion {
+        scope,
         operation,
         records: meter_installed(),
         started: None,

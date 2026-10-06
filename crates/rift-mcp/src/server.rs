@@ -63,7 +63,7 @@ use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
 use crate::metrics::{
     Ending, INITIALIZE, MCP_SERVER_OPERATION_DURATION, McpRequest, PING, RESOURCE_TEMPLATES_LIST,
-    RESOURCES_LIST, RESOURCES_READ, TOOLS_CALL, TOOLS_LIST,
+    RESOURCES_LIST, RESOURCES_READ, SCOPE, TOOLS_CALL, TOOLS_LIST,
 };
 use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
@@ -126,6 +126,7 @@ enum WorkerAdmission {
 /// `worker_pool.permit.state` = `available` or `used`, read when the meter collects.
 static WORKER_PERMIT_COUNT: rift_tracing::ObservableUpDownCounter<1> =
     rift_tracing::ObservableUpDownCounter::declare(
+        SCOPE,
         "worker_pool.permit.count",
         "{permit}",
         &["worker_pool.permit.state"],

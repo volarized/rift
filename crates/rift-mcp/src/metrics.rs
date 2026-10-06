@@ -17,6 +17,11 @@ use rmcp::model::{CallToolResponse, ErrorCode, ProtocolVersion};
 
 use crate::failure::RIFT_ERROR_CODE;
 
+/// The instrumentation scope of every instrument this crate declares: its Cargo package
+/// name and version.
+pub(crate) const SCOPE: rift_tracing::InstrumentScope =
+    rift_tracing::InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
 /// The `mcp.method.name` of the session's opening request.
 pub(crate) const INITIALIZE: &str = "initialize";
 /// The `mcp.method.name` of a liveness request.
@@ -69,6 +74,7 @@ const MCP_DURATION_BOUNDARIES_SECONDS: [f64; 14] = [
 /// `mcp.server.operation.duration`: one request `RiftMcp` answered, from the handler's
 /// start to its answer.
 pub(crate) static MCP_SERVER_OPERATION_DURATION: Histogram<6> = Histogram::declare(
+    SCOPE,
     "mcp.server.operation.duration",
     &[
         "mcp.method.name",
@@ -84,6 +90,7 @@ pub(crate) static MCP_SERVER_OPERATION_DURATION: Histogram<6> = Histogram::decla
 /// `mcp.client.operation.duration`: one request `rift mcp` forwarded, from the downstream
 /// handler's start to the answer it relays, a reconnect included.
 pub(crate) static MCP_CLIENT_OPERATION_DURATION: Histogram<6> = Histogram::declare(
+    SCOPE,
     "mcp.client.operation.duration",
     &[
         "mcp.method.name",
@@ -238,6 +245,44 @@ pub(crate) mod tests {
             Some(SeriesValue::Buckets { count, .. }) => *count,
             _ => 0,
         }
+    }
+
+    /// A `traced!` operation in this crate and an instrument it declares export under the
+    /// scope `rift-mcp`, at this crate's version.
+    #[test]
+    fn a_span_metric_and_a_declaration_export_under_the_crate_scope() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        rift_tracing::traced!("test.mcp.scoped", {});
+        McpRequest::method(RESOURCES_READ).record(
+            &MCP_SERVER_OPERATION_DURATION,
+            Some(Duration::from_millis(1)),
+            Ending::Answered,
+        );
+        let snapshot = recorder.metrics();
+        let calls = snapshot
+            .find(
+                "traces.span.metrics.calls",
+                &[
+                    ("span.name", "test.mcp.scoped"),
+                    ("span.kind", "Internal"),
+                    ("status.code", "Ok"),
+                ],
+            )
+            .ok_or("the span metric is exported")?;
+        let served = snapshot
+            .find(
+                "mcp.server.operation.duration",
+                &[("mcp.method.name", RESOURCES_READ)],
+            )
+            .ok_or("the request duration is exported")?;
+        for series in [calls, served] {
+            assert_eq!(
+                (series.scope_name(), series.scope_version()),
+                ("rift-mcp", env!("CARGO_PKG_VERSION")),
+                "{series}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

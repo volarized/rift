@@ -18,7 +18,9 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
 
-use crate::metrics::{Counter, Histogram, ObservableUpDownCounter, Observation, ObservationGuard};
+use crate::metrics::{
+    Counter, Histogram, ObservableUpDownCounter, Observation, ObservationGuard, SCOPE,
+};
 use crate::pages::{PAGE_STATE_FREE, PAGE_STATE_USED, PageCounts};
 use crate::reads::LogReader;
 use crate::record::{LOG_BATCH_RECORDS_MAX, LOG_KIND, LogRecord};
@@ -58,31 +60,35 @@ const DB_NAMESPACE: &str = "metrics";
 const APPEND_OPERATION: &str = "append";
 /// `sqlite.queue.wait.duration`: one append from its send to the writer's dequeue.
 static QUEUE_WAIT: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.queue.wait.duration",
     &["db.namespace", "db.operation.name"],
 );
 /// `sqlite.queue.length`: commands sent to the writer and not yet received, read when the
 /// meter collects.
 static QUEUE_LENGTH: ObservableUpDownCounter<1> =
-    ObservableUpDownCounter::declare("sqlite.queue.length", "{command}", &["db.namespace"]);
+    ObservableUpDownCounter::declare(SCOPE, "sqlite.queue.length", "{command}", &["db.namespace"]);
 /// `sqlite.write_lock.wait.duration`: one `BEGIN IMMEDIATE` of an append, with the result
 /// code as `error.type` when it failed.
 static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.write_lock.wait.duration",
     &["db.namespace", "error.type"],
 );
 /// `sqlite.transaction.duration`: one append transaction from its begin to its commit or
 /// rollback, by `sqlite.transaction.result`.
 static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.transaction.duration",
     &["db.namespace", "sqlite.transaction.result"],
 );
 /// `sqlite.commit.duration`: one append's `COMMIT`, a checkpoint it runs included.
 static COMMIT_DURATION: Histogram<1> =
-    Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+    Histogram::declare(SCOPE, "sqlite.commit.duration", &["db.namespace"]);
 /// `sqlite.file.size`: the size of the metrics database file and of its write-ahead log,
 /// read when the meter collects.
 static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
+    SCOPE,
     "sqlite.file.size",
     "By",
     &["db.namespace", "sqlite.file.type"],
@@ -90,6 +96,7 @@ static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
 /// `sqlite.page.count`: the pages of the metrics database file in use and on its freelist,
 /// read from the file's header when the meter collects.
 static PAGE_COUNT: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
+    SCOPE,
     "sqlite.page.count",
     "{page}",
     &["db.namespace", "sqlite.page.state"],
@@ -98,6 +105,7 @@ static PAGE_COUNT: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare
 /// `sqlite.transaction.statement.count`: the statements one append transaction ran, its
 /// begin and its end left out.
 static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
+    SCOPE,
     "sqlite.transaction.statement.count",
     "{statement}",
     &["db.namespace"],
@@ -115,6 +123,7 @@ pub const STATEMENT_BOUNDARIES: [f64; 13] = [
 /// `db.operation.name`; a failed one adds `error.type` `_OTHER`, and the busy or locked
 /// result code as `db.response.status_code`.
 static OPERATION_DURATION: Histogram<5> = Histogram::declare(
+    SCOPE,
     "db.client.operation.duration",
     &[
         "db.system.name",
@@ -127,7 +136,7 @@ static OPERATION_DURATION: Histogram<5> = Histogram::declare(
 /// `sqlite.busy.retries`: calls of the writer connection's busy handler, each one a lock
 /// another connection held when the writer asked for it.
 static BUSY_RETRIES: Counter<1> =
-    Counter::declare("sqlite.busy.retries", "{retry}", &["db.namespace"]);
+    Counter::declare(SCOPE, "sqlite.busy.retries", "{retry}", &["db.namespace"]);
 /// The sleep before each retry of one busy wait, in milliseconds, by the count of earlier
 /// calls for the same lock: `sqliteDefaultBusyCallback`'s `delays` table in the bundled
 /// `SQLite` 3.53.2, the handler `sqlite3_busy_timeout` installs. A call past the table

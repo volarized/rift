@@ -30,6 +30,7 @@ use crate::http::{
     serve_repository_http,
 };
 use crate::identity::BuildCheckout;
+use crate::metrics::SCOPE;
 use crate::repository::repository_election_directory;
 use crate::storage::WorkspaceStorage;
 
@@ -51,6 +52,7 @@ const SERVER_ELECTION_LOCK: &str = "server.election";
 /// builder has no option that records a refusal in the metric alone, so a poll of
 /// probes would write one record per round.
 static PROBE_WAIT_DURATION: rift_tracing::Histogram<3> = rift_tracing::Histogram::declare(
+    SCOPE,
     "lock.wait.duration",
     &["lock.name", "lock.mode", "error.type"],
 );

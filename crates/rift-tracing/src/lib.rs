@@ -77,8 +77,8 @@ pub use lock::{Acquire, Held, Lock, Refusal, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};
 pub use metrics::{
     CARDINALITY_LIMIT, Counter, CounterSelection, DURATION_BOUNDARIES_SECONDS, Gauge,
-    GaugeSelection, GaugeValue, Histogram, HistogramSelection, HistogramValue, OBSERVATIONS_MAX,
-    ObservableUpDownCounter, Observation, ObservationGuard,
+    GaugeSelection, GaugeValue, Histogram, HistogramSelection, HistogramValue, InstrumentScope,
+    OBSERVATIONS_MAX, ObservableUpDownCounter, Observation, ObservationGuard, SCOPES_MAX,
 };
 pub use otlp::{ExportShutdownError, OtlpExport};
 pub use pages::{PAGE_STATE_FREE, PAGE_STATE_USED, PageCounts};

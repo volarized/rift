@@ -6,24 +6,26 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::{
-    CARDINALITY_LIMIT, Counter, DURATION_BOUNDARIES_SECONDS, Gauge, Histogram,
-    ObservableUpDownCounter, completion, meter_installed,
+    CARDINALITY_LIMIT, Counter, DURATION_BOUNDARIES_SECONDS, Gauge, Histogram, InstrumentScope,
+    ObservableUpDownCounter, SCOPE, SCOPES_MAX, completion, meter_installed, scopes_built,
 };
 use crate::{MetricSnapshot, ScopedRecorder, SeriesValue};
 
-static DROPS: Counter<1> = Counter::declare("test.dropped", "{record}", &["error.type"]);
-static PLAIN: Counter<0> = Counter::declare("test.plain", "{event}", &[]);
-static QUEUE: Gauge<u64, 0> = Gauge::declare("test.queue.length", "{task}", &[]);
-static RATIO: Gauge<f64, 0> = Gauge::declare("test.ratio", "1", &[]);
+static DROPS: Counter<1> = Counter::declare(SCOPE, "test.dropped", "{record}", &["error.type"]);
+static PLAIN: Counter<0> = Counter::declare(SCOPE, "test.plain", "{event}", &[]);
+static QUEUE: Gauge<u64, 0> = Gauge::declare(SCOPE, "test.queue.length", "{task}", &[]);
+static RATIO: Gauge<f64, 0> = Gauge::declare(SCOPE, "test.ratio", "1", &[]);
 static HELD: ObservableUpDownCounter<1> =
-    ObservableUpDownCounter::declare("test.held", "{item}", &["test.kind"]);
+    ObservableUpDownCounter::declare(SCOPE, "test.held", "{item}", &["test.kind"]);
 static CHURNED: ObservableUpDownCounter<0> =
-    ObservableUpDownCounter::declare("test.churned", "{item}", &[]);
+    ObservableUpDownCounter::declare(SCOPE, "test.churned", "{item}", &[]);
 static BOUNDED: ObservableUpDownCounter<0> =
-    ObservableUpDownCounter::declare("test.bounded", "{item}", &[]);
-static WAIT: Histogram<0> = Histogram::declare("test.wait.duration", &[]);
-static SHORT: Histogram<0> = Histogram::declare("test.short.duration", &[]).boundaries(&[0.1, 1.0]);
+    ObservableUpDownCounter::declare(SCOPE, "test.bounded", "{item}", &[]);
+static WAIT: Histogram<0> = Histogram::declare(SCOPE, "test.wait.duration", &[]);
+static SHORT: Histogram<0> =
+    Histogram::declare(SCOPE, "test.short.duration", &[]).boundaries(&[0.1, 1.0]);
 static STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
+    SCOPE,
     "test.statement.count",
     "{statement}",
     &["db.namespace"],
@@ -93,7 +95,7 @@ fn a_recording_before_any_meter_records_nothing() {
     PLAIN.add(1);
     QUEUE.value(3).record();
     WAIT.record(Duration::from_millis(1));
-    let guard = completion("test.unrecorded");
+    let guard = completion(SCOPE, "test.unrecorded");
     assert!(!guard.records(), "no metric is recorded without a meter");
     drop(guard);
 
@@ -491,6 +493,13 @@ fn every_operation_instrument_names_the_span_metrics_connector_spelling() {
         .expect("the call is recorded");
     assert_eq!(duration.unit(), "s");
     assert_eq!(calls.unit(), "{call}");
+    for series in [duration, calls] {
+        assert_eq!(
+            (series.scope_name(), series.scope_version()),
+            ("rift-tracing", env!("CARGO_PKG_VERSION")),
+            "a `traced!` operation exports under the scope of the crate it expands in"
+        );
+    }
     assert_eq!(
         calls.labels(),
         [
@@ -502,11 +511,109 @@ fn every_operation_instrument_names_the_span_metrics_connector_spelling() {
     );
 }
 
+/// A declaration exports under the scope it names: the crate's name and version.
+#[test]
+fn a_declaration_exports_under_the_scope_it_names() {
+    let recorder = recorder();
+    let other = Counter::<0>::declare(
+        InstrumentScope::new("test-emitter", "1.2.3"),
+        "test.scoped",
+        "{event}",
+        &[],
+    );
+    other.add(1);
+    PLAIN.add(1);
+    let snapshot = recorder.metrics();
+    let scoped = snapshot
+        .find("test.scoped", &[])
+        .expect("the scoped counter is exported");
+    assert_eq!(
+        (scoped.scope_name(), scoped.scope_version()),
+        ("test-emitter", "1.2.3")
+    );
+    let plain = snapshot
+        .find("test.plain", &[])
+        .expect("the plain counter is exported");
+    assert_eq!(
+        (plain.scope_name(), plain.scope_version()),
+        (SCOPE.name(), SCOPE.version())
+    );
+    assert!(
+        scoped
+            .to_string()
+            .contains("otel.scope.name=test-emitter otel.scope.version=1.2.3"),
+        "the printed line names the scope: {scoped}"
+    );
+}
+
+/// Past `SCOPES_MAX` scopes the process builds no meter for the next one: its instruments
+/// record nothing, the refusal is recorded once however many follow, and the scopes built
+/// before keep recording.
+#[test]
+fn a_scope_past_the_bound_is_refused_and_recorded_once() -> Result<(), Box<dyn std::error::Error>> {
+    const NAMES: [&str; SCOPES_MAX + 1] = [
+        "test-scope-0",
+        "test-scope-1",
+        "test-scope-2",
+        "test-scope-3",
+        "test-scope-4",
+        "test-scope-5",
+        "test-scope-6",
+    ];
+    let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+    assert_eq!(
+        scopes_built(),
+        1,
+        "the install builds `rift-tracing`'s scope"
+    );
+    let counters = NAMES.map(|name| {
+        Counter::<0>::declare(
+            InstrumentScope::new(name, "0.0.0"),
+            "test.bounded.scope",
+            "{event}",
+            &[],
+        )
+    });
+    for counter in &counters {
+        counter.add(1);
+    }
+    counters[SCOPES_MAX].add(1);
+    assert_eq!(scopes_built(), SCOPES_MAX, "the table holds the bound");
+    let snapshot = recorder.metrics();
+    let exported: Vec<&str> = snapshot
+        .series()
+        .iter()
+        .filter(|series| series.name() == "test.bounded.scope")
+        .map(crate::MetricSeries::scope_name)
+        .collect();
+    assert_eq!(
+        exported,
+        NAMES[..SCOPES_MAX - 1],
+        "every scope under the bound exports; the scopes past it record nothing"
+    );
+    let refusals = drain
+        .queued_records()
+        .into_iter()
+        .filter(|record| {
+            record.message() == "meter refused an instrumentation scope past its bound"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(refusals.len(), 1, "the refusal is recorded once");
+    assert_eq!(refusals[0].level(), "warn");
+    assert!(refusals[0].fields().contains("test-scope-5"));
+    PLAIN.add(1);
+    assert!(
+        recorder.metrics().find("test.plain", &[]).is_some(),
+        "a scope built before the bound keeps recording"
+    );
+    Ok(())
+}
+
 /// An instrument aggregates at most [`CARDINALITY_LIMIT`] series; one more label set
 /// records into the series the SDK labels `otel.metric.overflow`.
 #[test]
 fn an_instrument_past_its_cardinality_limit_records_into_the_overflow_series() {
-    static WIDE: Counter<1> = Counter::declare("test.wide", "{event}", &["test.key"]);
+    static WIDE: Counter<1> = Counter::declare(SCOPE, "test.wide", "{event}", &["test.key"]);
     let recorder = recorder();
     for index in 0..=CARDINALITY_LIMIT {
         let value: &'static str = Box::leak(index.to_string().into_boxed_str());
@@ -545,7 +652,7 @@ fn the_cardinality_view_bounds_each_instrument_at_its_limit() {
         .with_reader(PeriodicReader::builder(exporter.clone()).build())
         .with_view(super::cardinality_view(2))
         .build();
-    let meter = provider.meter_with_scope(super::scope());
+    let meter = provider.meter_with_scope(SCOPE.instrumentation_scope());
     let counter = meter.u64_counter("test.view").with_unit("{event}").build();
     let histogram = meter
         .f64_histogram("test.view.duration")
@@ -600,7 +707,7 @@ fn the_cardinality_view_bounds_each_instrument_at_its_limit() {
 /// [`Counter::add_built`] records only once [`Counter::build`] built the instrument.
 #[test]
 fn a_counter_records_through_add_built_only_once_built() {
-    static LATE: Counter<0> = Counter::declare("test.late", "{event}", &[]);
+    static LATE: Counter<0> = Counter::declare(SCOPE, "test.late", "{event}", &[]);
     let recorder = recorder();
     LATE.add_built([], 1);
     assert_eq!(value(&recorder.metrics(), "test.late", &[]), None);
@@ -629,11 +736,13 @@ fn record_path_cost() {
     const RECORDS: u32 = 1_000_000;
     const RUNS: u32 = 5;
     static CALLS: Counter<3> = Counter::declare(
+        SCOPE,
         "test.cost.calls",
         "{call}",
         &["span.name", "status.code", "error.type"],
     );
     static DURATION: Histogram<3> = Histogram::declare(
+        SCOPE,
         "test.cost.duration",
         &["db.namespace", "db.operation.name", "error.type"],
     );

@@ -12,7 +12,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::capture::{closed_record, event_record};
-use crate::metrics::Counter;
+use crate::metrics::{Counter, SCOPE};
 use crate::record::LogRecord;
 use crate::render::{LevelColor, LiveLine, LogLines};
 
@@ -86,7 +86,8 @@ const SERVER_STDERR_BOUND_NOTICE: &str =
     "rift: standard error reached its byte bound; later diagnostics are under `rift server logs`\n";
 /// `log.stderr.discarded`: the bytes the bounded standard error discarded past
 /// `[logs] stderr_limit`.
-static LOG_STDERR_DISCARDED: Counter<0> = Counter::declare("log.stderr.discarded", "By", &[]);
+static LOG_STDERR_DISCARDED: Counter<0> =
+    Counter::declare(SCOPE, "log.stderr.discarded", "By", &[]);
 
 /// The byte bound of a server's standard error, and what passed and was discarded at it.
 ///

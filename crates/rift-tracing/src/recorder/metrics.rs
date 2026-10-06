@@ -2,8 +2,7 @@
 //! process's meter, kept in memory.
 //!
 //! The first recorder a process installs builds one meter provider whose reader exports
-//! into the SDK's `InMemoryMetricExporter`, with cumulative temporality, and installs its
-//! meter. The provider bounds each instrument at [`CARDINALITY_LIMIT`](crate::CARDINALITY_LIMIT)
+//! into the SDK's `InMemoryMetricExporter`, with cumulative temporality, and installs it. The provider bounds each instrument at [`CARDINALITY_LIMIT`](crate::CARDINALITY_LIMIT)
 //! series, as the OTLP export's provider does. A read flushes the provider and takes the
 //! newest export: every series the SDK aggregated since the meter was installed. Nothing here aggregates; a series is one
 //! exported point, its labels and value as the SDK reported them.
@@ -11,7 +10,6 @@
 use std::fmt;
 use std::sync::OnceLock;
 
-use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
@@ -24,7 +22,7 @@ struct RecorderMeters {
 
 static RECORDER_METERS: OnceLock<RecorderMeters> = OnceLock::new();
 
-/// Installs the recorders' meter provider unless the process already has a meter: a meter
+/// Installs the recorders' meter provider unless the process already has one: a provider
 /// installed first, such as the `otlp` export's, stays and the reads see none of its
 /// values.
 pub(crate) fn install() {
@@ -40,7 +38,7 @@ fn meters() -> &'static RecorderMeters {
                 crate::metrics::CARDINALITY_LIMIT,
             ))
             .build();
-        crate::metrics::install_meter(provider.meter_with_scope(crate::metrics::scope()));
+        crate::metrics::install_meter(provider.clone());
         RecorderMeters { provider, exporter }
     })
 }
@@ -61,7 +59,7 @@ pub(crate) fn snapshot() -> MetricSnapshot {
 }
 
 /// Every series one export of the process's instruments holds, ordered by instrument
-/// name, then labels.
+/// name, then labels, then instrumentation scope.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MetricSnapshot {
     series: Vec<MetricSeries>,
@@ -71,9 +69,13 @@ impl MetricSnapshot {
     fn of(exported: &ResourceMetrics) -> Self {
         let mut series = Vec::new();
         for scope in exported.scope_metrics() {
+            let scope_name = scope.scope().name();
+            let scope_version = scope.scope().version().unwrap_or_default();
             for metric in scope.metrics() {
                 let mut push = |labels, value| {
                     series.push(MetricSeries {
+                        scope_name: scope_name.to_owned(),
+                        scope_version: scope_version.to_owned(),
                         name: metric.name().to_owned(),
                         unit: metric.unit().to_owned(),
                         labels,
@@ -88,7 +90,11 @@ impl MetricSnapshot {
             }
         }
         series.sort_by(|first, second| {
-            (&first.name, &first.labels).cmp(&(&second.name, &second.labels))
+            (&first.name, &first.labels, &first.scope_name).cmp(&(
+                &second.name,
+                &second.labels,
+                &second.scope_name,
+            ))
         });
         Self { series }
     }
@@ -205,6 +211,8 @@ fn points<Value: Exported>(
 /// One exported series: an instrument, the labels that select it, and what it holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricSeries {
+    scope_name: String,
+    scope_version: String,
     name: String,
     unit: String,
     labels: Vec<(String, String)>,
@@ -212,6 +220,19 @@ pub struct MetricSeries {
 }
 
 impl MetricSeries {
+    /// The name of the instrumentation scope the series was exported under: the Cargo
+    /// package name of the crate that emits it.
+    #[must_use]
+    pub fn scope_name(&self) -> &str {
+        &self.scope_name
+    }
+
+    /// The version of the instrumentation scope: the emitting crate's Cargo version.
+    #[must_use]
+    pub fn scope_version(&self) -> &str {
+        &self.scope_version
+    }
+
     /// The instrument's name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -242,12 +263,17 @@ impl MetricSeries {
 
 /// One line per series, in the layout the developer collector prints a metric point
 /// (`dev/src/rift_dev/trace.py`, `MetricPoint.line`) without its time and sending process:
-/// the instrument's name, its labels as `key=value`, then `value=` for a sum or a gauge, or
+/// the instrument's name, its instrumentation scope as `otel.scope.name=` and
+/// `otel.scope.version=`, its labels as `key=value`, then `value=` for a sum or a gauge, or
 /// `count=`, `sum=`, and the nonempty buckets as `<=bound:count`, the last `>bound:count`,
 /// for a histogram, then `unit=` when the instrument names one.
 impl fmt::Display for MetricSeries {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}   ", self.name)?;
+        write!(
+            formatter,
+            "{}   otel.scope.name={} otel.scope.version={}  ",
+            self.name, self.scope_name, self.scope_version
+        )?;
         for (key, value) in &self.labels {
             write!(formatter, "{key}={value} ")?;
         }

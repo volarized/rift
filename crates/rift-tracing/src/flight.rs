@@ -28,7 +28,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::capture::now_ms;
 use crate::measurement::monotonic_now;
-use crate::metrics::{Counter, ObservableUpDownCounter, ObservationGuard};
+use crate::metrics::{Counter, ObservableUpDownCounter, ObservationGuard, SCOPE};
 use crate::record::{LOG_LABEL_BYTES_MAX, bounded};
 
 /// Entries the table of operations in flight holds, at most. An operation that opens while
@@ -40,10 +40,10 @@ const OPERATIONS_LISTED_BYTES_MAX: usize = 4 << 10;
 /// `operation.active`: the entries the table holds open now, by `span.name`, read each time
 /// the meter collects.
 static OPERATION_ACTIVE: ObservableUpDownCounter<1> =
-    ObservableUpDownCounter::declare("operation.active", "{operation}", &["span.name"]);
+    ObservableUpDownCounter::declare(SCOPE, "operation.active", "{operation}", &["span.name"]);
 /// `operation.untracked`: the entries the table refused at [`OPERATIONS_IN_FLIGHT_MAX`].
 pub(crate) static OPERATION_UNTRACKED: Counter<0> =
-    Counter::declare("operation.untracked", "{operation}", &[]);
+    Counter::declare(SCOPE, "operation.untracked", "{operation}", &[]);
 /// The name of the span a contended lock wait opens.
 pub(crate) const LOCK_WAIT_SPAN: &str = "lock.wait";
 /// The name of the span a held lock keeps open until its guard drops.

@@ -281,26 +281,34 @@ impl StoreFiller {
     }
 }
 
+/// The instrumentation scope of every instrument this crate declares: its Cargo package
+/// name and version.
+const SCOPE: rift_tracing::InstrumentScope =
+    rift_tracing::InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
 /// The store's name as every signal of its database carries it, `db.namespace`.
 const DB_NAMESPACE: &str = "history";
 /// `sqlite.write_lock.wait.duration`: how long `BEGIN IMMEDIATE` waited for the write
 /// lock, with the result code as `error.type` when it failed.
 static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.write_lock.wait.duration",
     &["db.namespace", "error.type"],
 );
 /// `sqlite.transaction.duration`: one write transaction from its begin to its commit or
 /// rollback, by `sqlite.transaction.result`.
 static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.transaction.duration",
     &["db.namespace", "sqlite.transaction.result"],
 );
 /// `sqlite.commit.duration`: one `COMMIT`, a checkpoint it runs included.
 static COMMIT_DURATION: Histogram<1> =
-    Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+    Histogram::declare(SCOPE, "sqlite.commit.duration", &["db.namespace"]);
 /// `sqlite.transaction.statement.count`: the statements one write transaction ran, its
 /// begin and its end left out.
 static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
+    SCOPE,
     "sqlite.transaction.statement.count",
     "{statement}",
     &["db.namespace"],
@@ -310,6 +318,7 @@ static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
 /// `db.operation.name`; a failed one adds `error.type` `_OTHER`, and the busy or locked
 /// result code as `db.response.status_code`.
 static OPERATION_DURATION: Histogram<5> = Histogram::declare(
+    SCOPE,
     "db.client.operation.duration",
     &[
         "db.system.name",
@@ -332,6 +341,7 @@ const QUERY_OPERATION: &str = "query";
 /// `sqlite.file.size`: the size of the store's database file and of its write-ahead log,
 /// read when the meter collects.
 static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
+    SCOPE,
     "sqlite.file.size",
     "By",
     &["db.namespace", "sqlite.file.type"],

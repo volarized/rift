@@ -19,11 +19,17 @@ use tokio::time::{Instant, interval, timeout_at};
 
 use crate::database::DatabaseName;
 
+/// The instrumentation scope of every instrument this crate declares: its Cargo package
+/// name and version.
+pub(crate) const SCOPE: rift_tracing::InstrumentScope =
+    rift_tracing::InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
 const CONNECTION_REAP_SPAN: Duration = Duration::from_millis(100);
 
 /// `db.client.operation.duration`: one driver operation's execution on the worker, its
 /// time in the queue left out.
 static OPERATION_DURATION: Histogram<5> = Histogram::declare(
+    SCOPE,
     "db.client.operation.duration",
     &[
         "db.system.name",
@@ -64,6 +70,7 @@ fn operation_name(operation: &Operation) -> &'static str {
 /// meter collects.
 static QUEUE_LENGTH: rift_tracing::ObservableUpDownCounter<1> =
     rift_tracing::ObservableUpDownCounter::declare(
+        SCOPE,
         "sqlite.queue.length",
         "{command}",
         &["db.namespace"],
@@ -71,12 +78,14 @@ static QUEUE_LENGTH: rift_tracing::ObservableUpDownCounter<1> =
 /// `sqlite.transaction.duration`: one transaction from its begin's answer to its commit's
 /// or rollback's answer, by `sqlite.transaction.result`.
 static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.transaction.duration",
     &["db.namespace", "sqlite.transaction.result"],
 );
 /// `sqlite.transaction.statement.count`: the statements one transaction ran, its begin,
 /// its savepoints, and its end left out.
 static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
+    SCOPE,
     "sqlite.transaction.statement.count",
     "{statement}",
     &["db.namespace"],
@@ -85,15 +94,21 @@ static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
 /// `sqlite.queue.wait.duration`: one driver operation's round trip to the worker less its
 /// execution there: the wait to enter the queue, the wait in it, and the reply.
 static QUEUE_WAIT: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.queue.wait.duration",
     &["db.namespace", "db.operation.name"],
 );
 /// `sqlite.queue.timeouts`: requests the full queue refused once the busy timeout passed.
-static QUEUE_TIMEOUTS: Counter<1> =
-    Counter::declare("sqlite.queue.timeouts", "{timeout}", &["db.namespace"]);
+static QUEUE_TIMEOUTS: Counter<1> = Counter::declare(
+    SCOPE,
+    "sqlite.queue.timeouts",
+    "{timeout}",
+    &["db.namespace"],
+);
 /// `sqlite.write_lock.wait.duration`: one `BEGIN IMMEDIATE` on the worker, the wait for
 /// another connection's write lock inside `SQLite` included.
 static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
+    SCOPE,
     "sqlite.write_lock.wait.duration",
     &["db.namespace", "error.type"],
 );
@@ -101,6 +116,7 @@ static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
 /// when the meter collects.
 static TRANSACTION_ACTIVE: rift_tracing::ObservableUpDownCounter<1> =
     rift_tracing::ObservableUpDownCounter::declare(
+        SCOPE,
         "sqlite.transaction.active",
         "{transaction}",
         &["db.namespace"],
@@ -108,6 +124,7 @@ static TRANSACTION_ACTIVE: rift_tracing::ObservableUpDownCounter<1> =
 /// `sqlite.connection.refusals`: connection requests the worker refused because it held
 /// its bound of connections.
 static CONNECTION_REFUSALS: Counter<1> = Counter::declare(
+    SCOPE,
     "sqlite.connection.refusals",
     "{connection}",
     &["db.namespace"],
@@ -115,13 +132,14 @@ static CONNECTION_REFUSALS: Counter<1> = Counter::declare(
 /// `sqlite.connection.reaped`: connections the worker removed because their driver
 /// connection dropped and no close command removed them first.
 static CONNECTION_REAPED: Counter<1> = Counter::declare(
+    SCOPE,
     "sqlite.connection.reaped",
     "{connection}",
     &["db.namespace"],
 );
 /// `sqlite.commit.duration`: one `COMMIT` on the worker, a checkpoint it runs included.
 static COMMIT_DURATION: Histogram<1> =
-    Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+    Histogram::declare(SCOPE, "sqlite.commit.duration", &["db.namespace"]);
 
 /// The `error.type` of a failed driver operation; its `SQLite` result code, when it has
 /// one, is the `db.response.status_code` beside it.

@@ -25,7 +25,7 @@ use tracing_subscriber::{Layer, Registry};
 
 use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
 use crate::measurement::process_monotonic_now;
-use crate::metrics::Counter;
+use crate::metrics::{Counter, SCOPE};
 use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
 
 /// Records the queue holds before a send drops one. The queue exists to absorb a burst
@@ -35,7 +35,7 @@ pub const LOG_QUEUE_RECORDS: usize = 4_096;
 /// `log.queue.dropped`: records lost before the store, by `error.type`: `queue_full` for a
 /// record the full queue refused, `unwritten` for one a stopped drain never wrote.
 pub(crate) static LOG_QUEUE_DROPPED: Counter<1> =
-    Counter::declare("log.queue.dropped", "{record}", &["error.type"]);
+    Counter::declare(SCOPE, "log.queue.dropped", "{record}", &["error.type"]);
 /// The `error.type` of a record the full queue refused.
 pub(crate) const QUEUE_FULL: &str = "queue_full";
 /// The `error.type` of a record a drain aborted at its stop deadline never wrote.

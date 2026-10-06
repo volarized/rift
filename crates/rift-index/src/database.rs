@@ -39,7 +39,7 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::database_thread::{DatabaseThread, ShutdownFailure, SqliteThreadDriver};
+use crate::database_thread::{DatabaseThread, SCOPE, ShutdownFailure, SqliteThreadDriver};
 use crate::documentation_store::{
     DocumentationManifestRecord, DocumentationReferenceRecord, DocumentationSourceRecord,
 };
@@ -49,6 +49,7 @@ use crate::vector::{VECTORS_MIGRATIONS, VectorRecord};
 
 /// `db.client.connection.count`: the pool's connections, by `idle` or `used`.
 static CONNECTION_COUNT: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::declare(
+    SCOPE,
     "db.client.connection.count",
     "{connection}",
     &[
@@ -58,12 +59,14 @@ static CONNECTION_COUNT: rift_tracing::Gauge<u64, 2> = rift_tracing::Gauge::decl
 );
 /// `db.client.connection.max`: the most connections the pool opens.
 static CONNECTION_MAX: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+    SCOPE,
     "db.client.connection.max",
     "{connection}",
     &["db.client.connection.pool.name"],
 );
 /// `db.client.connection.pending_requests`: checkouts waiting for a free connection.
 static CONNECTION_PENDING: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::declare(
+    SCOPE,
     "db.client.connection.pending_requests",
     "{request}",
     &["db.client.connection.pool.name"],
@@ -71,11 +74,13 @@ static CONNECTION_PENDING: rift_tracing::Gauge<u64, 1> = rift_tracing::Gauge::de
 /// `db.client.connection.wait_time`: one checkout, from its request to a connection or a
 /// refusal.
 static CONNECTION_WAIT: rift_tracing::Histogram<1> = rift_tracing::Histogram::declare(
+    SCOPE,
     "db.client.connection.wait_time",
     &["db.client.connection.pool.name"],
 );
 /// `db.client.connection.timeouts`: checkouts the pool refused once its wait bound passed.
 static CONNECTION_TIMEOUTS: rift_tracing::Counter<1> = rift_tracing::Counter::declare(
+    SCOPE,
     "db.client.connection.timeouts",
     "{timeout}",
     &["db.client.connection.pool.name"],
@@ -84,6 +89,7 @@ static CONNECTION_TIMEOUTS: rift_tracing::Counter<1> = rift_tracing::Counter::de
 /// the meter collects.
 static FILE_SIZE: rift_tracing::ObservableUpDownCounter<2> =
     rift_tracing::ObservableUpDownCounter::declare(
+        SCOPE,
         "sqlite.file.size",
         "By",
         &["db.namespace", "sqlite.file.type"],
@@ -92,6 +98,7 @@ static FILE_SIZE: rift_tracing::ObservableUpDownCounter<2> =
 /// the file's header when the meter collects.
 static PAGE_COUNT: rift_tracing::ObservableUpDownCounter<2> =
     rift_tracing::ObservableUpDownCounter::declare(
+        SCOPE,
         "sqlite.page.count",
         "{page}",
         &["db.namespace", "sqlite.page.state"],
@@ -1716,6 +1723,11 @@ mod tests {
         let per_operation = [system, vectors, ("db.operation.name", "transaction")];
         let operation = series(&metrics, "db.client.operation.duration", &per_operation)?;
         assert_eq!(operation.unit(), "s");
+        assert_eq!(
+            (operation.scope_name(), operation.scope_version()),
+            ("rift-index", env!("CARGO_PKG_VERSION")),
+            "a point of an instrument `rift-index` declares carries its scope"
+        );
         assert!(
             observations(operation) >= 2,
             "begin and commit are operations"
