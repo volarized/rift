@@ -1,4 +1,9 @@
-//! Wire projection of operating failures served on tool results.
+//! Wire projection of operating failures.
+//!
+//! A tool path returns an operating failure as a JSON-RPC error object, and `RiftMcp::call_tool`
+//! converts it into a completed tool result with `isError` and compact text. The JSON-RPC form
+//! remains the reply to a failure raised outside a tool call, such as the proxy or the transport
+//! guard.
 
 use rift_error::{RiftError, errors};
 use rift_protocol::error as wire;
@@ -6,20 +11,26 @@ use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
 use std::fmt;
 
-/// JSON-RPC error code every Rift operating failure travels under: the
+use crate::output::ToolFailure;
+
+/// JSON-RPC error code of the error object that carries a Rift operating failure: the
 /// first code of the server-defined range (-32000 to -32099), which rmcp
 /// exports no constant for - its constants name only MCP-defined codes. The
 /// machine-readable classification is the [`wire::ErrorData`] in `data`.
+/// `RiftMcp::call_tool` reads this code to complete a tool-path failure as a result with
+/// `isError`; a failure raised outside a tool call is served under this code as the error
+/// object.
 pub(crate) const RIFT_ERROR_CODE: ErrorCode = ErrorCode(-32000);
 
 /// Most `causes` entries one wire error carries, matching the advertised
 /// schema bound.
 pub(crate) const ERROR_CAUSES_MAX: usize = 8;
 
-/// Boundary view of a read failure: the projection a tool handler serves as
-/// the JSON-RPC error object the design documents - code `-32000`, the
-/// rendered failure line as `message`, and the typed [`wire::ErrorData`] as
-/// `data`.
+/// Boundary view of a read failure: the JSON-RPC error object a tool path
+/// returns - code `-32000`, the rendered failure line as `message`, and the
+/// typed [`wire::ErrorData`] as `data`. `RiftMcp::call_tool` completes that
+/// object as a tool result with `isError`; a failure raised outside a tool
+/// call is served as the object itself.
 pub(crate) trait WireFailure {
     /// The JSON-RPC error object for this failure, naming the phase it
     /// stopped in.
@@ -70,6 +81,17 @@ impl McpFailure {
     pub fn wire_code(&self) -> String {
         wire_code_for_error(&self.error).unwrap_or_else(|| self.error.slug().as_str().to_owned())
     }
+
+    /// The registered error this failure carries.
+    pub(crate) const fn registered(&self) -> &RiftError {
+        &self.error
+    }
+
+    /// The failure of a tool call that stopped in `phase`, carrying this registered error to
+    /// the text of the completed result.
+    pub(crate) const fn tool_failure(self, phase: wire::ErrorPhase) -> ToolFailure {
+        ToolFailure::Registered(self, phase)
+    }
 }
 
 rift_error::format! {
@@ -77,6 +99,8 @@ rift_error::format! {
 }
 
 impl McpErrorFailExt for ErrorData {}
+
+impl McpErrorFailExt for ToolFailure {}
 
 impl WireFailure for McpFailure {
     fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
@@ -299,6 +323,8 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.lsp.position_offset_inside_line_ending",
                 "rift.lsp.position_offset_misaligned",
                 "rift.lsp.position_offset_out_of_range",
+                "rift.mcp.answer_structure_failed",
+                "rift.mcp.answer_text_failed",
                 "rift.mcp.election_already_serving",
                 "rift.mcp.election_document_invalid",
                 "rift.mcp.http_serve_failed",
@@ -409,6 +435,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.lsp.correlation_pending_requests_exceeded",
                 "rift.lsp.framing_header_too_long",
                 "rift.lsp.framing_message_too_long",
+                "rift.mcp.answer_text_limit",
                 "rift.provider.cache_too_many_keys",
                 "rift.search.model_download_too_large",
                 "rift.search.text_limit",

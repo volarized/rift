@@ -798,8 +798,9 @@ impl ElectedServer {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read as _;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use rift_error::errors;
     use rift_protocol::lock::{
@@ -850,6 +851,53 @@ mod tests {
 
     fn document_path(root: &std::path::Path) -> std::path::PathBuf {
         root.join(".rift").join(SERVER_LOCK_FILE_NAME)
+    }
+
+    /// Publish calls the atomicity test's writer started and finished.
+    ///
+    /// `started` above `finished` means a `publish` call is running.
+    #[derive(Debug, Default)]
+    struct PublishProgress {
+        started: AtomicUsize,
+        finished: AtomicUsize,
+    }
+
+    impl PublishProgress {
+        /// The `(started, finished)` counts right now.
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.started.load(Ordering::Acquire),
+                self.finished.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    /// Reads the document through the calls `fs::read` makes, naming the one that failed.
+    fn read_document(path: &std::path::Path) -> Result<Vec<u8>, (&'static str, std::io::Error)> {
+        let mut file = fs::File::open(path).map_err(|error| ("File::open", error))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| ("Read::read_to_end", error))?;
+        Ok(bytes)
+    }
+
+    /// The names and byte lengths `state_directory` lists right now.
+    fn state_directory_listing(state_directory: &std::path::Path) -> String {
+        match fs::read_dir(state_directory) {
+            Ok(entries) => entries
+                .map(|entry| match entry {
+                    Ok(entry) => match entry.metadata() {
+                        Ok(metadata) => {
+                            format!("{:?} ({} bytes)", entry.file_name(), metadata.len())
+                        }
+                        Err(error) => format!("{:?} (length unread: {error:?})", entry.file_name()),
+                    },
+                    Err(error) => format!("unlisted entry: {error:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(error) => format!("unlisted: {error:?}"),
+        }
     }
 
     #[test]
@@ -1137,15 +1185,38 @@ mod tests {
         let guard = claim(directory.path())?;
         guard.publish(&valid_document())?;
         let path = document_path(directory.path());
+        let state_directory = directory.path().join(".rift");
         let writer_done = Arc::new(AtomicBool::new(false));
         let reader_stop = Arc::clone(&writer_done);
+        let progress = Arc::new(PublishProgress::default());
+        let reader_progress = Arc::clone(&progress);
         let reader = std::thread::spawn(move || {
             let mut observed = 0_usize;
-            for _ in 0..READ_ATTEMPT_COUNT_MAX {
+            let mut after_previous_read = reader_progress.counts();
+            for attempt in 0..READ_ATTEMPT_COUNT_MAX {
                 if reader_stop.load(Ordering::Acquire) {
                     break;
                 }
-                let bytes = fs::read(&path).expect("the published document must always exist");
+                let before_read = reader_progress.counts();
+                let bytes = match read_document(&path) {
+                    Ok(bytes) => bytes,
+                    Err((call, error)) => {
+                        let at_failure = reader_progress.counts();
+                        let second_open = fs::File::open(&path).map(drop);
+                        let listing = state_directory_listing(&state_directory);
+                        panic!(
+                            "the published document must always exist: {call} returned \
+                             {error:?} (raw OS error {:?}) on read attempt {attempt}, after \
+                             {observed} documents; publish calls (started, finished) were \
+                             {after_previous_read:?} once the previous read closed its handle, \
+                             {before_read:?} before this read, {at_failure:?} at the failure; \
+                             a second open returned {second_open:?}; the state directory then \
+                             listed [{listing}]",
+                            error.raw_os_error()
+                        );
+                    }
+                };
+                after_previous_read = reader_progress.counts();
                 let lock: ServerLock = serde_json::from_slice(&bytes)
                     .expect("a reader must never observe a partial document");
                 lock.validate()
@@ -1155,7 +1226,10 @@ mod tests {
             observed
         });
         for _ in 0..PUBLISH_ROUND_COUNT {
-            guard.publish(&valid_document())?;
+            progress.started.fetch_add(1, Ordering::AcqRel);
+            let published = guard.publish(&valid_document());
+            progress.finished.fetch_add(1, Ordering::AcqRel);
+            published?;
         }
         writer_done.store(true, Ordering::Release);
         let observed = reader.join().map_err(|_panic| "reader panicked")?;

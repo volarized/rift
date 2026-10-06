@@ -14,9 +14,12 @@ use std::fs;
 use rift_history::fixture::{commit_all, git, init};
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
+use rift_protocol::error::ErrorCode;
 use rmcp::ServiceExt as _;
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_root, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, failed_call, served_root, tool_request,
+};
 
 /// The baseline revision, tagged `baseline`: one declaration that stays, one that a later
 /// revision removes, and one whose signature a later revision widens.
@@ -252,41 +255,34 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
     let refusals = [
         (
             json!({"change": {"base": "baseline"}, "rev": "main"}),
-            "invalid_request",
+            ErrorCode::InvalidRequest,
         ),
         (
             json!({"change": {"base": "baseline"}, "query": "kept"}),
-            "invalid_request",
+            ErrorCode::InvalidRequest,
         ),
         (
             json!({
                 "change": {"base": "baseline"},
                 "traversal": {"seed": "rift://symbol/rust/src/kept.rs/kept"}
             }),
-            "capability_unavailable",
+            ErrorCode::CapabilityUnavailable,
         ),
         (
             json!({"change": {"base": "baseline"}, "scope": "all"}),
-            "invalid_request",
+            ErrorCode::InvalidRequest,
         ),
         (
             json!({"change": {"base": "no-such-branch"}}),
-            "resource_not_found",
+            ErrorCode::ResourceNotFound,
         ),
     ];
 
     for (arguments, code) in refusals {
-        let error = client
-            .call_tool(tool_request("search", &arguments))
-            .await
-            .expect_err("the server must refuse this comparison");
-        let rmcp::ServiceError::McpError(error) = error else {
-            panic!("the refusal must arrive as an MCP error: {error}");
-        };
+        let failure = failed_call(client.call_tool(tool_request("search", &arguments)).await)?;
         assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!(code)),
-            "arguments={arguments}, error={error:?}"
+            failure.code, code,
+            "arguments={arguments}, failure={failure:?}"
         );
     }
 
@@ -312,20 +308,18 @@ async fn search_change_refuses_a_workspace_with_history_disabled() -> TestResult
     git(directory.path(), &["tag", "baseline"]);
     let (client, _server_task) = served_root(directory.path()).await?;
 
-    let error = client
-        .call_tool(tool_request(
-            "search",
-            &json!({"change": {"base": "baseline"}}),
-        ))
-        .await
-        .expect_err("a workspace with history disabled must refuse");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
+    let failure = failed_call(
+        client
+            .call_tool(tool_request(
+                "search",
+                &json!({"change": {"base": "baseline"}}),
+            ))
+            .await,
+    )?;
     assert_eq!(
-        error.data.as_ref().and_then(|data| data.get("code")),
-        Some(&json!("capability_unavailable")),
-        "{error:?}"
+        failure.code,
+        ErrorCode::CapabilityUnavailable,
+        "{failure:?}"
     );
 
     client.cancel().await?;
@@ -353,17 +347,15 @@ async fn search_change_refuses_a_workspace_with_no_repository() -> TestResult {
     });
     let client = ().serve(client_transport).await?;
 
-    let error = client
-        .call_tool(tool_request("search", &json!({"change": {"base": "main"}})))
-        .await
-        .expect_err("a workspace with no repository must refuse");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
+    let failure = failed_call(
+        client
+            .call_tool(tool_request("search", &json!({"change": {"base": "main"}})))
+            .await,
+    )?;
     assert_eq!(
-        error.data.as_ref().and_then(|data| data.get("code")),
-        Some(&json!("capability_unavailable")),
-        "{error:?}"
+        failure.code,
+        ErrorCode::CapabilityUnavailable,
+        "{failure:?}"
     );
 
     client.cancel().await?;

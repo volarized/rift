@@ -144,6 +144,9 @@
   ::selection {
     @apply bg-foreground text-background;
   }
+  pre {
+    tab-size: 4;
+  }
   h1,
   h2,
   h3,

@@ -1,7 +1,7 @@
-//! The served wire errors, validated against the advertised `ErrorData`
-//! schema through a live client. Registry-wire agreement needs no test here:
-//! the registry composes the wire `ErrorCode` enum directly, so the two
-//! cannot name different code sets.
+//! The served tool failures, read as completed error results through a live
+//! client. Registry-wire agreement needs no test here: the registry composes
+//! the wire `ErrorCode` enum directly, so the two cannot name different code
+//! sets.
 
 mod hermetic_search;
 #[allow(dead_code)]
@@ -12,16 +12,16 @@ use std::fs;
 
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
-use rift_protocol::error::ErrorData;
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
-use schemars::schema_for;
 use serde_json::json;
+use workspace_client::{ToolFailure, failed_call};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[tokio::test]
-async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResult {
+async fn served_tool_failures_are_completed_error_results() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
@@ -39,8 +39,6 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
     });
     let client = ().serve(client_transport).await?;
     workspace_client::await_workspace_ready(&client).await?;
-    let schema = serde_json::to_value(schema_for!(ErrorData))?;
-    let validator = jsonschema::validator_for(&schema)?;
 
     let failing_requests = [
         ("search", json!({ "query": "" })),
@@ -66,27 +64,15 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
             .as_object()
             .cloned()
             .ok_or("request must be an object")?;
-        let error = client
-            .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
-            .await
-            .expect_err("the request must be rejected");
-        let rmcp::ServiceError::McpError(data) = error else {
-            panic!("expected protocol-level McpError, got {error:?}");
-        };
-        let wire = data.data.ok_or("wire error data must be present")?;
-        let failures: Vec<String> = validator
-            .iter_errors(&wire)
-            .map(|failure| failure.to_string())
-            .collect();
+        let failure = failed_call(
+            client
+                .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
+                .await,
+        )?;
         assert!(
-            failures.is_empty(),
-            "{tool} wire error must validate against the ErrorData schema: \
-             {failures:#?}\ninstance: {wire:#}"
-        );
-        let parsed: ErrorData = serde_json::from_value(wire)?;
-        assert!(
-            !parsed.message.is_empty(),
-            "wire error message must not be empty"
+            !failure.message.is_empty(),
+            "{tool} failure message must not be empty: {}",
+            failure.text
         );
     }
 
@@ -95,12 +81,12 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
     Ok(())
 }
 
-/// One tool call expected to fail, returning its wire `ErrorData` payload.
-async fn failing_wire_error(
+/// One tool call expected to complete with an error result, returning its facts.
+async fn failing_tool_error(
     root: &std::path::Path,
     tool: &'static str,
     request: serde_json::Value,
-) -> TestResult<serde_json::Value> {
+) -> TestResult<ToolFailure> {
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server_task = tokio::spawn(async move {
@@ -115,16 +101,12 @@ async fn failing_wire_error(
         .as_object()
         .cloned()
         .ok_or("request must be an object")?;
-    let error = client
+    let outcome = client
         .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
-        .await
-        .expect_err("the request must be rejected");
+        .await;
     client.cancel().await?;
     server_task.await?;
-    let rmcp::ServiceError::McpError(data) = error else {
-        panic!("expected protocol-level McpError, got {error:?}");
-    };
-    Ok(data.data.ok_or("wire error data must be present")?)
+    failed_call(outcome)
 }
 
 #[tokio::test]
@@ -135,15 +117,15 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let wire = failing_wire_error(
+    let failure = failing_tool_error(
         directory.path(),
         "get_symbol",
         json!({ "name": "beacon", "rev": "main" }),
     )
     .await?;
-    assert_eq!(wire["code"], json!("capability_unavailable"));
-    assert_eq!(wire["retry"], json!("operator_action"));
-    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
+    assert_eq!(failure.retry, RetryDirective::OperatorAction);
+    let message = &failure.message;
     assert!(
         message.contains("requires a git repository - run `git init`, or omit `rev`"),
         "the refusal must name the remedy: {message}"
@@ -159,15 +141,15 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let wire = failing_wire_error(
+    let failure = failing_tool_error(
         directory.path(),
         "get_symbol",
         json!({ "name": "beacon", "include": ["history"] }),
     )
     .await?;
-    assert_eq!(wire["code"], json!("capability_unavailable"));
-    assert_eq!(wire["retry"], json!("operator_action"));
-    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
+    assert_eq!(failure.retry, RetryDirective::OperatorAction);
+    let message = &failure.message;
     assert!(
         message.contains("requires a git repository - run `git init`"),
         "the refusal must name the remedy: {message}"
@@ -186,14 +168,14 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
             hermetic_search::HERMETIC_TABLES
         ),
     )?;
-    let wire = failing_wire_error(
+    let failure = failing_tool_error(
         directory.path(),
         "get_symbol",
         json!({ "name": "beacon", "include": ["history"] }),
     )
     .await?;
-    assert_eq!(wire["code"], json!("capability_unavailable"));
-    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
+    let message = &failure.message;
     assert!(
         message.contains("symbol history (providers.history disabled)"),
         "the refusal must name the disabling configuration: {message}"
@@ -212,14 +194,14 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
             hermetic_search::HERMETIC_TABLES
         ),
     )?;
-    let wire = failing_wire_error(
+    let failure = failing_tool_error(
         directory.path(),
         "get_symbol",
         json!({ "name": "beacon", "rev": "main" }),
     )
     .await?;
-    assert_eq!(wire["code"], json!("capability_unavailable"));
-    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
+    let message = &failure.message;
     assert!(
         message.contains("providers.history disabled"),
         "the refusal must name the disabling configuration: {message}"
@@ -238,11 +220,11 @@ async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let wire =
-        failing_wire_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;
-    assert_eq!(wire["code"], json!("invalid_request"));
-    assert_eq!(wire["retry"], json!("never"));
-    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    let failure =
+        failing_tool_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;
+    assert_eq!(failure.code, ErrorCode::InvalidRequest);
+    assert_eq!(failure.retry, RetryDirective::Never);
+    let message = &failure.message;
     assert!(
         message.contains("field query"),
         "the refusal must name the parameter at fault: {message}"

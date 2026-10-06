@@ -56,6 +56,8 @@ following server entry to `.mcp.json` in your project root:
 The `command` names the installed executable, and `args` selects its MCP mode. Your agent launches
 `rift mcp` from the project folder, so rift builds its local index from that project's codebase.
 
+If your agent only needs compact text, set `args` to `["mcp", "--output=text"]`; [Reading results](/docs/mcp#reads) explains the difference.
+
 For another MCP client, configure it to launch the same command from your project folder.
 If you're using Claude Code, [Usage](/docs/agentic-usage) explains how to install the Rift
 skill that teaches your agent which tool to call.

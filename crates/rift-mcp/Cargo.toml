@@ -19,6 +19,7 @@ workspace = true
 axum.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
+jiff.workspace = true
 notify.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
@@ -60,6 +61,7 @@ windows-spawn.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
 rusqlite.workspace = true
+strum.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 

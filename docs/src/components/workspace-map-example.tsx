@@ -6,11 +6,12 @@ import {
   MapTrifoldIcon,
   PackageIcon,
   PlayIcon,
+  TextAlignLeftIcon,
 } from "@phosphor-icons/react/ssr";
-import { Card } from "fumadocs-ui/components/card";
 import { ServerCodeBlock } from "fumadocs-ui/components/codeblock.rsc";
 import { Tab, Tabs, TabsList, TabsTrigger } from "fumadocs-ui/components/tabs";
 
+import { IconCard } from "@/components/icon-card";
 import { Badge } from "@/components/ui/badge";
 
 // Illustrative map for the guide's example project. Both views use these values.
@@ -47,7 +48,21 @@ const languageNames: Record<string, string> = {
   toml: "TOML",
 };
 
-const cardClass = "min-w-0 rounded-none shadow-none";
+// The compact text Rift writes for `exampleMap`, copied from its renderer.
+const exampleMapText = `map 3f9a1c2e
+languages:
+\tmarkdown · 1 file · 1 symbol
+\trust · 3 files · 8 symbols
+\ttoml · 2 files · 6 symbols
+modules:
+\tsrc · 3 files · 8 symbols
+entry points:
+\trift://symbol/rust/src/main.rs/main
+docs:
+\tREADME.md
+packages:
+\ttokio ^1.53.1 (cargo)
+\trust@1.98.1 (stdlib)`;
 
 export async function WorkspaceMapExample() {
   const json = await ServerCodeBlock({
@@ -61,12 +76,27 @@ export async function WorkspaceMapExample() {
     },
   });
 
+  const text = await ServerCodeBlock({
+    code: exampleMapText,
+    lang: "text",
+    codeblock: {
+      title: "rift://map",
+      className:
+        "m-0 rounded-none border-0 shadow-none [&_pre]:w-full [&_pre]:break-words [&_pre]:whitespace-pre-wrap",
+      viewportProps: { "aria-label": "Map text", className: "max-h-[32rem]" },
+    },
+  });
+
   return (
     <Tabs defaultValue="visualization" className="not-prose my-6 rounded-none">
       <TabsList aria-label="Example map view">
         <TabsTrigger value="visualization">
           <MapTrifoldIcon aria-hidden="true" />
           Visualization
+        </TabsTrigger>
+        <TabsTrigger value="text">
+          <TextAlignLeftIcon aria-hidden="true" />
+          Text
         </TabsTrigger>
         <TabsTrigger value="json">
           <BracketsCurlyIcon aria-hidden="true" />
@@ -89,13 +119,9 @@ export async function WorkspaceMapExample() {
           </figcaption>
           <div aria-hidden="true" className="mx-auto h-6 w-px bg-border" />
           <div className="grid gap-3 @min-[32rem]:grid-cols-2">
-            <Card
-              title="Directories"
-              icon={<FoldersIcon aria-hidden="true" />}
-              className={cardClass}
-            >
+            <IconCard icon={FoldersIcon} title="Directories">
               {exampleMap.modules.map((module) => (
-                <div key={module.path} className="mt-3 border-l pl-3">
+                <div key={module.path} className="mt-3">
                   <code className="text-foreground">{module.path}/</code>
                   <p className="mt-1 text-xs">
                     {module.files} {module.files === 1 ? "file" : "files"} · {module.symbols}{" "}
@@ -103,8 +129,8 @@ export async function WorkspaceMapExample() {
                   </p>
                 </div>
               ))}
-            </Card>
-            <Card title="Languages" icon={<CodeIcon aria-hidden="true" />} className={cardClass}>
+            </IconCard>
+            <IconCard icon={CodeIcon} title="Languages">
               <dl className="mt-3 space-y-2">
                 {exampleMap.languages.map((language) => (
                   <div
@@ -119,23 +145,15 @@ export async function WorkspaceMapExample() {
                   </div>
                 ))}
               </dl>
-            </Card>
-            <Card
-              title="Documentation"
-              icon={<FileTextIcon aria-hidden="true" />}
-              className={cardClass}
-            >
+            </IconCard>
+            <IconCard icon={FileTextIcon} title="Documentation">
               {exampleMap.docs.map((path) => (
                 <p key={path} className="mt-3 break-words font-mono text-foreground">
                   {path}
                 </p>
               ))}
-            </Card>
-            <Card
-              title="Dependencies"
-              icon={<PackageIcon aria-hidden="true" />}
-              className={cardClass}
-            >
+            </IconCard>
+            <IconCard icon={PackageIcon} title="Dependencies">
               {exampleMap.packages.map((pkg) => (
                 <div key={pkg.name} className="mt-3">
                   <div className="flex flex-wrap items-center gap-2">
@@ -150,20 +168,19 @@ export async function WorkspaceMapExample() {
                   </p>
                 </div>
               ))}
-            </Card>
-            <Card
-              title="Entry points"
-              icon={<PlayIcon aria-hidden="true" />}
-              className={`${cardClass} @min-[32rem]:col-span-2`}
-            >
+            </IconCard>
+            <IconCard icon={PlayIcon} title="Entry points" className="@min-[32rem]:col-span-2">
               {exampleMap.entry_points.map((symbol) => (
                 <p key={symbol} className="mt-3 break-all font-mono text-xs text-foreground">
                   {symbol}
                 </p>
               ))}
-            </Card>
+            </IconCard>
           </div>
         </figure>
+      </Tab>
+      <Tab value="text" className="rounded-none p-0 [&>figure:only-child]:m-0">
+        {text}
       </Tab>
       <Tab value="json" className="rounded-none p-0 [&>figure:only-child]:m-0">
         {json}

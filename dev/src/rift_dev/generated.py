@@ -21,7 +21,12 @@ CLI_HELP = REPOSITORY / "docs/public/cli-help.txt"
 BUILD_SECONDS_MAX = 1800.0
 
 # The commands whose help `docs/public/cli-help.txt` transcribes, in page order.
-HELP_COMMANDS = (("--help",), ("server", "--help"), ("server", "logs", "--help"))
+HELP_COMMANDS = (
+    ("--help",),
+    ("mcp", "--help"),
+    ("server", "--help"),
+    ("server", "logs", "--help"),
+)
 
 
 def schema_export(*arguments: str) -> CargoCommand:

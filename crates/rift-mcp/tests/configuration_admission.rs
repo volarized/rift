@@ -6,7 +6,9 @@ mod hermetic_search;
 #[allow(dead_code)]
 mod workspace_client;
 
-use workspace_client::{await_workspace_ready, call_retrying_acceptance, tool_request};
+use workspace_client::{
+    ToolFailure, await_workspace_ready, call_retrying_acceptance, failed_call, tool_request,
+};
 
 use std::error::Error;
 use std::fs;
@@ -14,6 +16,7 @@ use std::path::Path;
 
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
@@ -91,21 +94,17 @@ fn arguments(value: &serde_json::Value) -> TestResult<serde_json::Map<String, se
         .ok_or_else(|| "tool arguments must be an object".into())
 }
 
-/// Calls one tool and returns the typed wire error it must fail with.
+/// Calls one tool and returns the failure it must complete with.
 async fn refused_call(
     client: &RunningService<RoleClient, ()>,
     tool: &'static str,
     tool_arguments: serde_json::Value,
-) -> TestResult<serde_json::Value> {
-    let error = client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(&tool_arguments)?))
-        .await
-        .expect_err("the request must be refused while rift.toml is invalid");
-    let rmcp::ServiceError::McpError(data) = error else {
-        panic!("expected protocol-level McpError, got {error:?}");
-    };
-    data.data
-        .ok_or_else(|| "wire error data must be present".into())
+) -> TestResult<ToolFailure> {
+    failed_call(
+        client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(&tool_arguments)?))
+            .await,
+    )
 }
 
 #[tokio::test]
@@ -148,8 +147,15 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     );
     fs::write(directory.path().join("rift.toml"), contents)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    assert_eq!(refused["code"], json!("configuration_invalid"));
-    assert_eq!(refused["phase"], json!("read"));
+    assert_eq!(refused.code, ErrorCode::ConfigurationInvalid);
+    assert!(
+        refused
+            .text
+            .starts_with("1 error\n\tconfiguration_invalid · retry ")
+            && !refused.text.contains("phase"),
+        "{}",
+        refused.text
+    );
 
     client.cancel().await?;
     Ok(())
@@ -163,8 +169,8 @@ async fn retired_binding_table_fails_reads_typed() -> TestResult {
     let client = client_for(directory.path()).await?;
 
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    assert_eq!(refused["code"], json!("configuration_invalid"));
-    assert_eq!(refused["retry"], json!("operator_action"));
+    assert_eq!(refused.code, ErrorCode::ConfigurationInvalid);
+    assert_eq!(refused.retry, RetryDirective::OperatorAction);
 
     client.cancel().await?;
     Ok(())
@@ -190,11 +196,15 @@ async fn removed_dependencies_bound_keys_fail_reads_as_unknown_keys() -> TestRes
 
         let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
         assert_eq!(
-            read["code"],
-            json!("configuration_invalid"),
-            "{key}: {read:#}"
+            read.code,
+            ErrorCode::ConfigurationInvalid,
+            "{key}: {read:?}"
         );
-        assert_eq!(read["retry"], json!("operator_action"), "{key}: {read:#}");
+        assert_eq!(
+            read.retry,
+            RetryDirective::OperatorAction,
+            "{key}: {read:?}"
+        );
 
         client.cancel().await?;
     }
@@ -207,9 +217,9 @@ async fn invalid_search_text_configuration_fails_reads_typed() -> TestResult {
     let client = client_for(directory.path()).await?;
 
     let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    assert_eq!(read["code"], json!("configuration_invalid"));
-    assert_eq!(read["retry"], json!("operator_action"));
-    let message = read["message"].as_str().unwrap_or_default();
+    assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
+    assert_eq!(read.retry, RetryDirective::OperatorAction);
+    let message = &read.message;
     assert!(
         message.contains("search.text.max_chunk"),
         "the refusal must name the out-of-range field: {message}"
@@ -304,8 +314,8 @@ async fn out_of_range_global_values_refuse_with_exact_evidence() -> TestResult {
         let client = client_for(directory.path()).await?;
 
         let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-        assert_eq!(read["code"], json!("configuration_invalid"));
-        let message = read["message"].as_str().unwrap_or_default();
+        assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
+        let message = &read.message;
         assert!(
             message.contains(field) && message.contains(range),
             "the refusal for {key} must name {field} and {range}: {message}"
@@ -343,8 +353,8 @@ async fn out_of_range_source_files_fails_reads_naming_the_field() -> TestResult 
         let client = client_for(directory.path()).await?;
 
         let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-        assert_eq!(read["code"], json!("configuration_invalid"));
-        let message = read["message"].as_str().unwrap_or_default();
+        assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
+        let message = &read.message;
         assert!(
             message.contains("source.files") && message.contains("1000..=5000000"),
             "the refusal must name the field and its range: {message}"
@@ -365,8 +375,8 @@ async fn out_of_range_source_declarations_fails_reads_naming_the_field() -> Test
         let client = client_for(directory.path()).await?;
 
         let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-        assert_eq!(read["code"], json!("configuration_invalid"));
-        let message = read["message"].as_str().unwrap_or_default();
+        assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
+        let message = &read.message;
         assert!(
             message.contains("source.declarations") && message.contains("10000..=50000000"),
             "the refusal must name the field and its range: {message}"
@@ -410,8 +420,8 @@ async fn out_of_range_source_workspace_size_fails_reads_naming_the_field() -> Te
         let client = client_for(directory.path()).await?;
 
         let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-        assert_eq!(read["code"], json!("configuration_invalid"));
-        let message = read["message"].as_str().unwrap_or_default();
+        assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
+        let message = &read.message;
         assert!(
             message.contains("source.workspace_size") && message.contains("16777216..=68719476736"),
             "the refusal must name the field and its range: {message}"

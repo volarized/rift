@@ -44,8 +44,9 @@ use std::time::Duration;
 use harness::{
     FIXTURE_READINESS_TIMEOUT, FIXTURE_WORKER_QUEUE_TIMEOUT, LIBRARY, PROXIED_CALL_MAX,
     PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, await_workspace_ready,
-    laid_out_workspace, proxied_call, proxied_engine_call, proxy_client, relayed_proxy_client,
-    require_success, run_rift, rust_engine_workspace, within, workspace,
+    await_workspace_text, laid_out_workspace, proxied_call, proxied_engine_call, proxied_result,
+    proxy_client, proxy_client_with, relayed_proxy_client, require_success, resource_json,
+    resource_text, run_rift, rust_engine_workspace, tool_failure, within, workspace,
 };
 use rift_mcp::{
     BuildCheckout, ElectionGuard, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim,
@@ -53,12 +54,13 @@ use rift_mcp::{
 };
 use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::error as wire;
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
 };
 use rift_protocol::retry::RetryPolicy;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use serde_json::json;
 use tokio::sync::Notify;
 
@@ -317,12 +319,7 @@ async fn repository_workspace_resource_digest(
             client.read_resource(rmcp::model::ReadResourceRequestParams::new(uri)),
         )
         .await??;
-        let Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) =
-            answer.contents.first()
-        else {
-            return Err("repository resource carries text".into());
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let body = resource_json(&answer, uri)?;
         assert!(body.is_object(), "{uri}: {body}");
         if uri == "rift://workspace" {
             let source = body["source"]
@@ -368,7 +365,8 @@ async fn a_competing_foreground_start_preserves_repository_logs(
     )
     .await??;
     assert_eq!(
-        before.contents, after.contents,
+        resource_json(&before, "rift://logs")?,
+        resource_json(&after, "rift://logs")?,
         "a refused process cannot write diagnostics into the owner's database"
     );
     Ok(())
@@ -677,6 +675,376 @@ async fn concurrent_proxies_share_one_elected_server() -> TestResult {
     Ok(())
 }
 
+/// The beacon lookup's whole result, once the fixture workspace answers reads.
+///
+/// Readiness is read from the map text, which a `text` proxy returns without the JSON body.
+async fn beacon_result(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult<CallToolResult> {
+    await_workspace_text(client).await?;
+    proxied_result(client, "get_symbol", &json!({"name": "beacon"})).await
+}
+
+/// Every tool one proxy lists, within the proxied-call bound.
+async fn listed_tools(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult<Vec<Tool>> {
+    Ok(within("a tool listing", client.list_all_tools()).await??)
+}
+
+/// Content that is one non-empty text block; its wording is not asserted.
+fn assert_one_text_block(result: &CallToolResult) {
+    let [block] = result.content.as_slice() else {
+        panic!("content must be one block, got {:?}", result.content);
+    };
+    let text = block.as_text().map(|text| text.text.as_str());
+    assert!(
+        text.is_some_and(|text| !text.is_empty()),
+        "the block must be non-empty text, got {block:?}"
+    );
+}
+
+fn assert_text_shape(tools: &[Tool], result: &CallToolResult) {
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        SERVED_TOOL_NAMES
+    );
+    assert!(
+        tools.iter().all(|tool| tool.output_schema.is_none()),
+        "a text proxy must list no output schema: {tools:?}"
+    );
+    assert_one_text_block(result);
+    assert_eq!(result.structured_content, None, "{result:?}");
+}
+
+fn assert_all_shape(tools: &[Tool], result: &CallToolResult) {
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        SERVED_TOOL_NAMES
+    );
+    assert!(
+        tools.iter().all(|tool| tool.output_schema.is_some()),
+        "an all proxy must list the output schema of every tool: {tools:?}"
+    );
+    assert_one_text_block(result);
+    assert_beacon(
+        result
+            .structured_content
+            .as_ref()
+            .expect("an all proxy must return structured content"),
+    );
+}
+
+#[tokio::test]
+async fn text_output_proxy_lists_no_output_schema_and_returns_no_structured_content() -> TestResult
+{
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client_with(root, &["--output=text"]).await?;
+    let tools = listed_tools(&client).await?;
+    let result = beacon_result(&client).await?;
+    assert_text_shape(&tools, &result);
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_proxy_lists_output_schemas_and_returns_structured_content() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client(root).await?;
+    let tools = listed_tools(&client).await?;
+    let result = beacon_result(&client).await?;
+    assert_all_shape(&tools, &result);
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A `rift://map` read through a `text` proxy returns the compact text alone.
+#[tokio::test]
+async fn text_output_proxy_returns_the_map_as_one_text_content() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client_with(root, &["--output=text"]).await?;
+    await_workspace_text(&client).await?;
+    let answer = within(
+        "map resource",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    )
+    .await??;
+    let [content] = answer.contents.as_slice() else {
+        return Err(format!("a text proxy answers one content: {:?}", answer.contents).into());
+    };
+    let rmcp::model::ResourceContents::TextResourceContents {
+        mime_type, text, ..
+    } = content
+    else {
+        return Err(format!("the content must be text: {content:?}").into());
+    };
+    assert_eq!(mime_type.as_deref(), Some("text/plain"), "{content:?}");
+    assert!(text.starts_with("map "), "{text}");
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The same read through the default proxy returns the compact text, then the JSON body.
+#[tokio::test]
+async fn default_proxy_returns_the_map_as_text_then_json() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client_with(root, &[]).await?;
+    await_workspace_ready(&client).await?;
+    let answer = within(
+        "map resource",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+    )
+    .await??;
+    assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
+    let text = resource_text(&answer, "rift://map")?;
+    assert!(text.starts_with("map "), "{text}");
+    let body = resource_json(&answer, "rift://map")?;
+    assert!(body["revision"].is_string(), "{body}");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let (all, text) = tokio::join!(
+        proxy_client_with(root, &["--output", "all"]),
+        proxy_client_with(root, &["--output", "text"]),
+    );
+    let (all, text) = (all?, text?);
+    let (all_tools, text_tools) = (listed_tools(&all).await?, listed_tools(&text).await?);
+    let (all_result, text_result) = tokio::join!(beacon_result(&all), beacon_result(&text));
+    let (all_result, text_result) = (all_result?, text_result?);
+    assert_all_shape(&all_tools, &all_result);
+    assert_text_shape(&text_tools, &text_result);
+
+    let serving = serving_document(root).ok_or("one elected server must serve both")?;
+    all.cancel().await?;
+    text.cancel().await?;
+    let survivor = serving_document(root).ok_or("the shared server must outlive both")?;
+    assert_eq!(
+        survivor.pid, serving.pid,
+        "exactly one server pid throughout"
+    );
+    Ok(())
+}
+
+/// One request per tool: a search naming `source` and `score`, a `get_symbol` with source, and
+/// a `nodes` read, all against the fixture's `beacon` declaration.
+fn representative_requests() -> [(&'static str, serde_json::Value); 3] {
+    [
+        (
+            "search",
+            json!({"query": "beacon", "target": "symbol", "include": ["source", "score"]}),
+        ),
+        (
+            "get_symbol",
+            json!({"name": "beacon", "include": ["source"]}),
+        ),
+        ("nodes", json!({"path": "lib.rs", "position": 8})),
+    ]
+}
+
+/// Most polls of a search before the lexical population pass has landed.
+const SEARCH_POPULATION_POLLS_MAX: usize = 60;
+
+/// Calls `search` until its warnings no longer report a lexical pass still catching up, so
+/// two later calls answer from one settled index.
+async fn await_search_population(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    request: &serde_json::Value,
+) -> TestResult {
+    for _poll in 0..SEARCH_POPULATION_POLLS_MAX {
+        let answer = proxied_call(client, "search", request).await?;
+        let pending = answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| {
+                matches!(
+                    warning["code"].as_str(),
+                    Some("lexical_ranking_unavailable" | "stale_index")
+                )
+            });
+        if !pending {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err("the lexical pass never settled for the search".into())
+}
+
+/// The identities the text of a request must state: the symbol ids of the `search` and
+/// `get_symbol` hits, and the node ids of the `nodes` answer.
+///
+/// The layout leaves other identities, such as file ids, to the structured content.
+fn stated_identities<'value>(
+    name: &str,
+    structured: &'value serde_json::Value,
+) -> Vec<&'value str> {
+    let (key, pointer) = match name {
+        "search" => ("results", "/hit/symbol/id"),
+        "get_symbol" => ("hits", "/symbol/id"),
+        _ => ("nodes", "/id"),
+    };
+    structured
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.pointer(pointer)?.as_str())
+        .collect()
+}
+
+/// The text of a result that is one text block.
+fn text_of(result: &CallToolResult) -> TestResult<&str> {
+    let [block] = result.content.as_slice() else {
+        return Err(format!("content must be one block, got {:?}", result.content).into());
+    };
+    Ok(block
+        .as_text()
+        .ok_or("the block must be text")?
+        .text
+        .as_str())
+}
+
+/// The text block is the same through the `all` and the `text` proxy of one server, the `text`
+/// result carries no structured content, and the text states the identity of each symbol hit
+/// and each node of the `all` result's structured content as a bare token.
+///
+/// The text-against-structured checks of `rift-mcp` (`crates/rift-mcp/tests/text_complete`) live
+/// in that crate's test binary and are not shared here: they run over the whole surface corpus
+/// there.
+#[tokio::test]
+async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let (all, text) = tokio::join!(
+        proxy_client_with(root, &["--output", "all"]),
+        proxy_client_with(root, &["--output", "text"]),
+    );
+    let (all, text) = (all?, text?);
+    await_workspace_ready(&all).await?;
+    for (name, request) in representative_requests() {
+        if name == "search" {
+            await_search_population(&all, &request).await?;
+        }
+        let (all_result, text_result) = tokio::join!(
+            proxied_result(&all, name, &request),
+            proxied_result(&text, name, &request),
+        );
+        let (all_result, text_result) = (all_result?, text_result?);
+        assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
+        assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
+        assert_eq!(
+            text_result.structured_content, None,
+            "{name}: {text_result:?}"
+        );
+        let all_text = text_of(&all_result)?;
+        assert_eq!(all_text, text_of(&text_result)?, "{name}: texts differ");
+
+        let structured = all_result
+            .structured_content
+            .as_ref()
+            .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
+        let identities = stated_identities(name, structured);
+        assert!(
+            !identities.is_empty(),
+            "{name}: no identity to state: {structured}"
+        );
+        for identity in identities {
+            assert!(
+                all_text.split_whitespace().any(|token| token == identity),
+                "{name}: identity {identity} is no bare token of the text:\n{all_text}"
+            );
+        }
+    }
+
+    all.cancel().await?;
+    text.cancel().await?;
+    Ok(())
+}
+
+/// A failing tool call completes as an error result through both proxies: `is_error`, one
+/// text block, the same text in both, and no structured content, which the `text` proxy
+/// has none to strip. An empty `query` is the `invalid_request` the `error_contract` suite
+/// of `rift-mcp` provokes.
+#[tokio::test]
+async fn a_failing_tool_call_returns_the_same_error_text_through_both_proxies() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let request = json!({"query": ""});
+
+    let (all, text) = tokio::join!(
+        proxy_client_with(root, &["--output", "all"]),
+        proxy_client_with(root, &["--output", "text"]),
+    );
+    let (all, text) = (all?, text?);
+    await_workspace_ready(&all).await?;
+    let (all_result, text_result) = tokio::join!(
+        proxied_result(&all, "search", &request),
+        proxied_result(&text, "search", &request),
+    );
+    let (all_result, text_result) = (all_result?, text_result?);
+
+    for result in [&all_result, &text_result] {
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert!(result.structured_content.is_none(), "{result:?}");
+    }
+    let (all_failure, text_failure) = (tool_failure(&all_result)?, tool_failure(&text_result)?);
+    assert_eq!(
+        all_failure.code,
+        ErrorCode::InvalidRequest,
+        "{all_failure:?}"
+    );
+    assert_eq!(all_failure.retry, RetryDirective::Never, "{all_failure:?}");
+    assert!(!all_failure.message.is_empty(), "{all_failure:?}");
+    assert_eq!(all_failure.text, text_failure.text);
+    assert_eq!(all_failure.message, text_failure.message);
+
+    all.cancel().await?;
+    text.cancel().await?;
+    Ok(())
+}
+
+/// Stops the serving server mid-session and returns its document once it has left.
+async fn stop_serving_server(root: &Path) -> TestResult<ServerLock> {
+    let first = serving_document(root).ok_or("the first server must serve")?;
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "server stop mid-session")?;
+    wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server to leave",
+        || serving_document(root).is_none().then_some(()),
+    )
+    .await?;
+    Ok(first)
+}
+
 /// The fixture keeps the default serving range: a second server is elected in the
 /// same workspace, and the range lets it bind whether or not the first server's
 /// port is free yet.
@@ -688,18 +1056,34 @@ async fn proxy_session_reconnects_after_a_server_restart() -> TestResult {
 
     let client = proxy_client(root).await?;
     assert_beacon(&beacon_lookup(&client).await?);
-    let first = serving_document(root).ok_or("the first server must serve")?;
-
-    let stopped = run_rift(root, &["server", "stop"]).await?;
-    require_success(&stopped, "server stop mid-session")?;
-    wait_for(
-        GONE_POLL_ATTEMPT_COUNT,
-        "the stopped server to leave",
-        || serving_document(root).is_none().then_some(()),
-    )
-    .await?;
+    let first = stop_serving_server(root).await?;
 
     assert_beacon(&beacon_lookup(&client).await?);
+    let second = serving_document(root).ok_or("the reconnect must elect a server")?;
+    assert_ne!(
+        second.pid, first.pid,
+        "the same session must be served by a freshly elected process"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The same restart on a text proxy: the reconnected session keeps its output selection.
+#[tokio::test]
+async fn text_proxy_session_keeps_its_output_after_a_server_restart() -> TestResult {
+    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let client = proxy_client_with(root, &["--output=text"]).await?;
+    let tools = listed_tools(&client).await?;
+    let result = beacon_result(&client).await?;
+    assert_text_shape(&tools, &result);
+    let first = stop_serving_server(root).await?;
+
+    let tools = listed_tools(&client).await?;
+    let result = beacon_result(&client).await?;
+    assert_text_shape(&tools, &result);
     let second = serving_document(root).ok_or("the reconnect must elect a server")?;
     assert_ne!(
         second.pid, first.pid,
@@ -1280,12 +1664,7 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         )),
     )
     .await??;
-    let Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) =
-        workspace.contents.first()
-    else {
-        return Err("workspace must return text content".into());
-    };
-    let configuration: serde_json::Value = serde_json::from_str(text)?;
+    let configuration = resource_json(&workspace, "rift://workspace")?;
     let rust = configuration["languages"]
         .as_array()
         .ok_or("workspace must list languages")?

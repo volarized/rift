@@ -459,11 +459,26 @@ fn search_request_with_timeout(
 }
 
 fn symbol_request(port: u16, token: &str, name: &str) -> TestResult<String> {
+    mcp_request(
+        port,
+        token,
+        "tools/call",
+        &serde_json::json!({"name": "get_symbol", "arguments": {"name": name}}),
+    )
+}
+
+/// One authorized JSON-RPC `method` over the served MCP path, as the raw HTTP answer.
+fn mcp_request(
+    port: u16,
+    token: &str,
+    method: &str,
+    params: &serde_json::Value,
+) -> TestResult<String> {
     let body = serde_json::to_vec(&serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "tools/call",
-        "params": {"name": "get_symbol", "arguments": {"name": name}},
+        "method": method,
+        "params": params,
     }))?;
     let head = format!(
         "POST /api/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
@@ -480,6 +495,15 @@ fn symbol_request(port: u16, token: &str, name: &str) -> TestResult<String> {
     let mut answer = String::new();
     stream.read_to_string(&mut answer)?;
     Ok(answer)
+}
+
+/// The JSON body of one raw HTTP answer.
+fn answer_body(answer: &str) -> TestResult<serde_json::Value> {
+    let body = answer
+        .split_once("\r\n\r\n")
+        .ok_or("the MCP response must contain an HTTP body")?
+        .1;
+    Ok(serde_json::from_str(body)?)
 }
 
 fn lexical_content_hit(answer: &str, path: &str) -> TestResult<serde_json::Value> {
@@ -682,6 +706,44 @@ fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
         stdout_of(&stopped_again).contains("no rift server is running for this workspace"),
         "{:?}",
         stdout_of(&stopped_again)
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_http_stays_all_with_text_content_structured_content_and_output_schemas() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let started = rift(root, &["server", "start"])?;
+    require_success(&started, "start before the direct HTTP calls")?;
+    let serving = serving_document(root).ok_or("the started server must publish its document")?;
+
+    let listed = answer_body(&mcp_request(
+        serving.port,
+        &serving.token,
+        "tools/list",
+        &serde_json::json!({}),
+    )?)?;
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .ok_or("tools/list must carry a tools array")?;
+    assert!(!tools.is_empty(), "{listed}");
+    assert!(
+        tools.iter().all(|tool| tool["outputSchema"].is_object()),
+        "direct HTTP must list the output schema of every tool: {listed}"
+    );
+
+    let result = wait_for(START_POLL_ATTEMPT_COUNT, "a completed symbol read", || {
+        let answer = symbol_request(serving.port, &serving.token, "beacon").ok()?;
+        let result = answer_body(&answer).ok()?["result"].clone();
+        result["structuredContent"].is_object().then_some(result)
+    })?;
+    let text = result["content"][0]["text"].as_str();
+    assert!(
+        text.is_some_and(|text| !text.is_empty()),
+        "direct HTTP must return a non-empty text block: {result}"
     );
     Ok(())
 }
@@ -1454,21 +1516,29 @@ fn background_start_keeps_listening_and_reads_report_source_file_limit() -> Test
             .ok_or("the MCP response must contain an HTTP body")?
             .1;
         let response: serde_json::Value = serde_json::from_str(body)?;
-        let data = &response["error"]["data"];
-        if data["code"] == "limit_exceeded" {
-            refusal = Some(data.clone());
+        let result = &response["result"];
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        if result["isError"] == true && text.starts_with("1 error\n\tlimit_exceeded · retry ") {
+            refusal = Some((result.clone(), text.to_owned()));
             break;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    let refusal = refusal.ok_or("background discovery must report the files limit")?;
-    assert_eq!(refusal["phase"], "read", "{refusal}");
-    assert_eq!(refusal["limit"]["field"], "source.files", "{refusal}");
-    assert_eq!(refusal["limit"]["limit"], SOURCE_FILES_MAX, "{refusal}");
+    let (result, text) = refusal.ok_or("background discovery must report the files limit")?;
+    assert!(result.get("structuredContent").is_none(), "{result}");
     assert_eq!(
-        refusal["limit"]["required"],
-        SOURCE_FILES_MAX + 1,
-        "{refusal}"
+        result["content"].as_array().map(Vec::len),
+        Some(1),
+        "{result}"
+    );
+    assert!(!text.contains("phase"), "{text}");
+    assert!(
+        text.lines().any(|line| line
+            == format!(
+                "\t\tlimit source.files: {} over {SOURCE_FILES_MAX}",
+                SOURCE_FILES_MAX + 1
+            )),
+        "{text}"
     );
     Ok(())
 }

@@ -148,3 +148,30 @@ def test_preparation_shares_one_deadline_and_cancels_blocked_reads(
         assert client.call.await_count == 1
     else:
         assert client.call.await_count > 1
+
+
+def test_settled_local_bounds_preparation_by_its_own_budget() -> None:
+    client = AsyncMock(spec=Client)
+    request: JsonObject = {"query": "test"}
+    with patch.object(
+        check_corpus, "read_settled_local", new_callable=AsyncMock
+    ) as read:
+        read.return_value = {}
+        asyncio.run(settled_local(cast(Client, client), "search", request))
+    read.assert_awaited_once_with(
+        client,
+        "search",
+        request,
+        seconds=check_corpus.LOCAL_PREPARATION_SECONDS,
+        poll_seconds=check_corpus.POLL_SECONDS,
+    )
+    assert check_corpus.LOCAL_PREPARATION_SECONDS != check_corpus.OBSERVATION_SECONDS
+    assert check_corpus.LOCAL_PREPARATION_SECONDS >= 2 * 59.12
+
+
+def test_preparation_bound_stands_inside_every_case_work_budget(
+    tmp_path: Path,
+) -> None:
+    for pin in pins().values():
+        corpus = Corpus(pin, tmp_path / "rift", tmp_path / "report.json")
+        assert check_corpus.LOCAL_PREPARATION_SECONDS < corpus.work_seconds(), pin.name

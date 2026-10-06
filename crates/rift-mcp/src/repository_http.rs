@@ -37,6 +37,12 @@ use crate::validation::IndexSupervisor;
 /// Maximum workspace root bytes accepted from one request.
 const WORKSPACE_ROOT_BYTES_MAX: usize = 4_096;
 
+/// Interval between idle workspace eviction passes.
+const IDLE_EVICTION_TICK: Duration = Duration::from_secs(1);
+
+/// Wall-clock bound one workspace stop spends on its engines, supervisor, and database.
+const WORKSPACE_STOP_BOUND: Duration = Duration::from_secs(4);
+
 /// Serves one repository's workspaces through a process-wide bounded executor.
 ///
 /// Each admitted workspace retains its own server and mutable stores.
@@ -446,7 +452,7 @@ impl RepositoryWorkspaceRegistry {
         if settings_changed {
             // Keep the store lease until the workspace's workers stop, even if shutdown fails.
             if let Err(error) =
-                stop_repository_workspace(&workspace, Instant::now() + Duration::from_secs(4)).await
+                stop_repository_workspace(&workspace, Instant::now() + WORKSPACE_STOP_BOUND).await
             {
                 tracing::warn!(component = "mcp", %error, "changed workspace settings shutdown failed");
             }
@@ -547,12 +553,30 @@ impl RepositoryWorkspaceRegistry {
             }
             workspace.stop.cancel();
             drop(workspaces);
-            let deadline = Instant::now() + Duration::from_secs(4);
+            let started = Instant::now();
+            let deadline = started + WORKSPACE_STOP_BOUND;
+            tracing::info!(
+                component = "mcp",
+                root = %root.display(),
+                "idle workspace shutdown started"
+            );
             if let Err(error) = stop_repository_workspace(workspace, deadline).await {
-                tracing::warn!(component = "mcp", %error, "idle workspace shutdown failed");
+                tracing::warn!(
+                    component = "mcp",
+                    %error,
+                    root = %root.display(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "idle workspace shutdown failed"
+                );
                 continue;
             }
             self.workspaces.lock().await.remove(&root);
+            tracing::info!(
+                component = "mcp",
+                root = %root.display(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "idle workspace released"
+            );
             drop(tokio::task::spawn_blocking(move || drop(cell)));
         }
     }
@@ -593,7 +617,7 @@ async fn watch_repository_idle(
     registry: Arc<RepositoryWorkspaceRegistry>,
     stop: CancellationToken,
 ) {
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(IDLE_EVICTION_TICK);
     loop {
         tokio::select! {
             () = stop.cancelled() => return,
@@ -660,6 +684,89 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    /// Writes `rift_mcp::repository_http` events at `info` to the test output: a failed test
+    /// shows idle evictions.
+    fn diagnostic_log() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_env_filter("rift_mcp::repository_http=info")
+                .with_ansi(false)
+                .with_test_writer()
+                .finish(),
+        )
+    }
+
+    /// The retained workspace roots, and each one's idle state for the release bound failure,
+    /// read under one registry lock.
+    async fn retained_workspaces(
+        registry: &super::RepositoryWorkspaceRegistry,
+    ) -> (Vec<std::path::PathBuf>, String) {
+        let now = tokio::time::Instant::now();
+        let workspaces = registry.workspaces.lock().await;
+        let roots = workspaces.keys().cloned().collect::<Vec<_>>();
+        let states = workspaces
+            .iter()
+            .map(|(root, cell)| match cell.get() {
+                None => format!("{}: no workspace in the cell", root.display()),
+                Some(workspace) => {
+                    let deadline = workspace.activity.idle_deadline(registry.idle_timeout);
+                    format!(
+                        "{}: request active {}, stop cancelled {}, idle deadline passed by {:?}, \
+                         idle deadline ahead by {:?}",
+                        root.display(),
+                        deadline.is_none(),
+                        workspace.stop.is_cancelled(),
+                        deadline.and_then(|deadline| now.checked_duration_since(deadline)),
+                        deadline.and_then(|deadline| deadline.checked_duration_since(now)),
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (roots, states)
+    }
+
+    /// Keeps `kept` active until it is the only retained workspace and has outlived its own
+    /// idle deadline by one eviction tick. Fails once the release bound passes: after the
+    /// last answer from an expired root, the idle timeout, one eviction tick, and one stop
+    /// bound per expired root.
+    async fn keep_one_until_others_release(
+        server: &HttpServer,
+        kept: &Path,
+        symbol: &str,
+        expired_roots: u32,
+        others_answered: tokio::time::Instant,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = server
+            .repository_workspaces
+            .as_ref()
+            .ok_or("repository server must retain its workspace registry")?;
+        let kept_root = std::fs::canonicalize(kept)?;
+        let kept_outlived =
+            tokio::time::Instant::now() + registry.idle_timeout + super::IDLE_EVICTION_TICK;
+        let released_by = others_answered
+            + registry.idle_timeout
+            + super::IDLE_EVICTION_TICK
+            + super::WORKSPACE_STOP_BOUND * expired_roots;
+        tracing::info!("keep-alive requests started");
+        loop {
+            let _ = repository_symbol(server, kept, symbol).await?;
+            let (retained_roots, states) = retained_workspaces(registry).await;
+            let now = tokio::time::Instant::now();
+            if retained_roots.as_slice() == std::slice::from_ref(&kept_root) && now >= kept_outlived
+            {
+                return Ok(());
+            }
+            if now >= released_by.max(kept_outlived) {
+                return Err(format!(
+                    "retained {retained_roots:?} past the release bound\n{states}"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
 
     async fn repository_symbol(
         server: &HttpServer,
@@ -801,6 +908,7 @@ mod tests {
     #[tokio::test]
     async fn repository_http_routes_each_workspace_root() -> Result<(), Box<dyn std::error::Error>>
     {
+        let _log = diagnostic_log();
         let directory = tempfile::tempdir()?;
         let authority = directory.path();
         let idle_configuration = "[server]\nidle_timeout = \"10s\"\n";
@@ -842,28 +950,15 @@ mod tests {
         );
         let cedar = repository_symbol(&server, &roots[1], "cedar").await?;
         let indigo = repository_symbol(&server, &roots[2], "indigo").await?;
+        let others_answered = tokio::time::Instant::now();
         let quartz = repository_symbol(&server, &roots[3], "quartz").await?;
         assert_eq!(amber["hits"][0]["symbol"]["name"], "amber", "{amber}");
         assert_eq!(cedar["hits"][0]["symbol"]["name"], "cedar", "{cedar}");
         assert_eq!(indigo["hits"][0]["symbol"]["name"], "indigo", "{indigo}");
         assert_eq!(quartz["hits"][0]["symbol"]["name"], "quartz", "{quartz}");
-        let keep_alive_until = tokio::time::Instant::now() + Duration::from_secs(11);
-        while tokio::time::Instant::now() < keep_alive_until {
-            let _ = repository_symbol(&server, &roots[3], "quartz").await?;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-        let registry = server
-            .repository_workspaces
-            .as_ref()
-            .ok_or("repository server must retain its workspace registry")?;
-        let retained_roots = registry
-            .workspaces
-            .lock()
-            .await
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(retained_roots, vec![std::fs::canonicalize(&roots[3])?]);
+        let expired_roots = u32::try_from(roots.len() - 1)?;
+        keep_one_until_others_release(&server, &roots[3], "quartz", expired_roots, others_answered)
+            .await?;
         let released_lease = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(lease) = crate::election::claim(&roots[0]) {

@@ -377,7 +377,7 @@ export function McpTool({ name }: { name: string }) {
   const tool = mcpDocument.tools.find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`MCP schema has no tool named ${name}`);
 
-  const since = tool.input_schema["rift:since"];
+  const planned = tool.input_schema["rift:since"] === undefined;
   return (
     <section
       id={`tool-${tool.name}`}
@@ -386,12 +386,14 @@ export function McpTool({ name }: { name: string }) {
       <header className="mb-4">
         <div className="flex flex-wrap items-center gap-2">
           <h3 className="m-0 font-mono text-lg font-medium tracking-tight">{tool.name}</h3>
-          <Badge
-            variant="outline"
-            className="font-mono text-[0.625rem] uppercase tracking-[0.12em]"
-          >
-            {since ? `Since ${since}` : "Planned"}
-          </Badge>
+          {planned ? (
+            <Badge
+              variant="outline"
+              className="font-mono text-[0.625rem] uppercase tracking-[0.12em]"
+            >
+              Planned
+            </Badge>
+          ) : null}
         </div>
         <p className="mt-2 max-w-3xl whitespace-pre-line text-sm leading-relaxed text-muted-foreground">
           {tool.description}

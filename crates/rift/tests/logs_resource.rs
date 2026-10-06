@@ -49,8 +49,7 @@ const REPORT_TAIL_RECORDS: &str = "40";
 const NOTHING_RECORDED: &str = "no server diagnostics recorded for this workspace yet";
 
 /// The records one read answered with, as the wire carried them.
-fn records(text: &str) -> TestResult<Vec<Value>> {
-    let body: Value = serde_json::from_str(text)?;
+fn records(body: &Value) -> TestResult<Vec<Value>> {
     Ok(body["records"]
         .as_array()
         .ok_or("a log read must answer with a records array")?
@@ -91,14 +90,14 @@ async fn recorded(
             history.stalled = true;
             break;
         };
-        let text = read?;
-        let found = records(&text)?;
+        let body = read?;
+        let found = records(&body)?;
         if !found.is_empty() {
             return Ok(found);
         }
         history.answered_empty += 1;
         history.longest_read = history.longest_read.max(started.elapsed());
-        history.last_answer = Some(text);
+        history.last_answer = Some(body.to_string());
         if tokio::time::Instant::now() + RECORD_POLL_INTERVAL >= deadline {
             break;
         }
@@ -158,15 +157,19 @@ async fn stored_records(root: &Path) -> String {
     }
 }
 
-/// One resource read through the proxy, returning its single text content.
-async fn read_resource(client: &RunningService<RoleClient, ()>, uri: &str) -> TestResult<String> {
+/// One resource read through the proxy, returning its JSON body.
+///
+/// The first content is the compact text, whose header counts the records.
+async fn read_resource(client: &RunningService<RoleClient, ()>, uri: &str) -> TestResult<Value> {
     let answer = client
         .read_resource(ReadResourceRequestParams::new(uri.to_owned()))
         .await?;
-    match answer.contents.first() {
-        Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) => Ok(text.clone()),
-        other => Err(format!("a log read answers with text, not {other:?}").into()),
+    let text = harness::resource_text(&answer, uri)?;
+    let header = text.lines().next().unwrap_or_default();
+    if !(header.ends_with(" record") || header.ends_with(" records")) {
+        return Err(format!("{uri}: the text header must count records: {text}").into());
     }
+    harness::resource_json(&answer, uri)
 }
 
 /// The lines one run printed on stdout.

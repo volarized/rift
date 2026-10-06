@@ -11,11 +11,14 @@ mod hermetic_search;
 #[allow(dead_code)]
 mod workspace_client;
 
-use rmcp::model::{ReadResourceRequestParams, ResourceContents};
+use rmcp::model::ReadResourceRequestParams;
 use serde_json::Value;
-use workspace_client::{TestResult, served_prepared_workspace, served_root, served_workspace};
+use workspace_client::{
+    TestResult, resource_json, resource_text, served_prepared_workspace, served_root,
+    served_workspace,
+};
 
-/// Reads one resource URI through the client and returns its text body.
+/// Reads one resource URI through the client and returns its JSON body.
 async fn resource_body(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     uri: &str,
@@ -23,14 +26,30 @@ async fn resource_body(
     let answer = client
         .read_resource(ReadResourceRequestParams::new(uri.to_owned()))
         .await?;
-    let ResourceContents::TextResourceContents { text, .. } = answer
-        .contents
-        .first()
-        .ok_or("a resource read answers with one content")?
-    else {
-        return Err("a workspace read answers with text".into());
-    };
-    Ok(serde_json::from_str(text)?)
+    resource_json(&answer, uri)
+}
+
+/// A read answers two contents for the requested URI: the compact text first, then the
+/// JSON body.
+#[tokio::test]
+async fn the_workspace_resource_answers_compact_text_then_json() -> TestResult {
+    let (_directory, client, server_task) =
+        served_workspace(&[("lib.rs", "pub fn beacon() {}\n")], None).await?;
+
+    let answer = client
+        .read_resource(ReadResourceRequestParams::new(
+            "rift://workspace".to_owned(),
+        ))
+        .await?;
+    assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
+    let text = resource_text(&answer, "rift://workspace")?;
+    assert!(text.starts_with("workspace "), "{text}");
+    let body = resource_json(&answer, "rift://workspace")?;
+    assert!(body.is_object(), "{body}");
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
 }
 
 #[tokio::test]

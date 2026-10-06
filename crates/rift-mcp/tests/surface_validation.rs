@@ -11,6 +11,9 @@ mod hermetic_search;
 // This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
+// The text checks of `nodes`, `search`, and `get_symbol` results, and their own tests; this
+// binary alone declares it.
+mod text_complete;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -20,6 +23,7 @@ use global_api::{GlobalFixture, SymbolFixture};
 use jsonschema::Validator;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
@@ -932,8 +936,8 @@ fn tool_validators(
 /// Most attempts one corpus request retries before giving up on acceptance.
 const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
-/// Calls one tool, retrying the refusal the server advertises as
-/// `retry: same_request`: the refusal reports movement between one
+/// Calls one tool, retrying the failure the server advertises as
+/// `retry: same_request`: the failure reports movement between one
 /// request's snapshot and its acceptance, and the wire contract answers
 /// that race with a bounded retry rather than a failure.
 async fn call_tool_retrying_acceptance(
@@ -941,14 +945,13 @@ async fn call_tool_retrying_acceptance(
     params: CallToolRequestParams,
 ) -> TestResult<rmcp::model::CallToolResult> {
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
-        match client.call_tool(params.clone()).await {
-            Ok(result) => return Ok(result),
-            Err(rmcp::ServiceError::McpError(error))
-                if error
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
-            Err(error) => return Err(error.into()),
+        let result = client.call_tool(params.clone()).await?;
+        if result.is_error != Some(true) {
+            return Ok(result);
+        }
+        let failure = workspace_client::tool_failure(&result)?;
+        if failure.retry != RetryDirective::SameRequest {
+            return Err(format!("the tool failed: {}", failure.text).into());
         }
     }
     Err("the server kept refusing a retryable corpus request".into())
@@ -990,6 +993,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 CallToolRequestParams::new(name).with_arguments(arguments(&request)?),
             )
             .await?;
+            text_complete::assert_text_states(name, &result);
             let structured = result
                 .structured_content
                 .ok_or_else(|| format!("{name} must return structured content"))?;
@@ -1094,23 +1098,23 @@ enum InputSchema {
 /// beside `rev` or `change` refuses; the relationship graph serves the project alone, so a
 /// walk under `scope: "global"` refuses; and call hierarchy names calls alone, so an
 /// outgoing walk asking for `references` alone has no lane.
-fn traversal_refusal_corpus() -> Vec<(Value, InputSchema, &'static str)> {
+fn traversal_refusal_corpus() -> Vec<(Value, InputSchema, ErrorCode)> {
     let outgoing = json!({ "seed": TRAVERSAL_CALLER, "direction": "outgoing" });
     vec![
         (
             json!({ "rev": "main", "traversal": { "seed": TRAVERSAL_CALLEE } }),
             InputSchema::Admits,
-            "capability_unavailable",
+            ErrorCode::CapabilityUnavailable,
         ),
         (
             json!({ "rev": "main", "traversal": outgoing }),
             InputSchema::Admits,
-            "capability_unavailable",
+            ErrorCode::CapabilityUnavailable,
         ),
         (
             json!({ "scope": "global", "traversal": outgoing }),
             InputSchema::Admits,
-            "invalid_request",
+            ErrorCode::InvalidRequest,
         ),
         (
             json!({
@@ -1121,12 +1125,12 @@ fn traversal_refusal_corpus() -> Vec<(Value, InputSchema, &'static str)> {
                 }
             }),
             InputSchema::Admits,
-            "capability_unavailable",
+            ErrorCode::CapabilityUnavailable,
         ),
         (
             json!({ "change": { "base": "baseline", "head": "HEAD" }, "traversal": outgoing }),
             InputSchema::Refuses,
-            "capability_unavailable",
+            ErrorCode::CapabilityUnavailable,
         ),
     ]
 }
@@ -1147,18 +1151,12 @@ async fn every_refused_traversal_carries_its_code_and_the_schema_verdict() -> Te
             verdict == InputSchema::Admits,
             "the served input schema's verdict on {request:#}"
         );
-        let error = client
-            .call_tool(tools_call_request("search", &request)?)
-            .await
-            .expect_err("the server refuses this walk");
-        let rmcp::ServiceError::McpError(error) = error else {
-            return Err(format!("expected an McpError, found {error:?}").into());
-        };
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!(code)),
-            "{request:#} {error:?}"
-        );
+        let failure = workspace_client::failed_call(
+            client
+                .call_tool(tools_call_request("search", &request)?)
+                .await,
+        )?;
+        assert_eq!(failure.code, code, "{request:#} {failure:?}");
     }
 
     client.cancel().await?;
@@ -1197,19 +1195,17 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         &unprepared,
         "an outgoing walk from a struct",
     );
-    let error = client
-        .call_tool(tools_call_request("search", &unprepared)?)
-        .await
-        .expect_err("the ready engine prepares no call hierarchy item at a struct");
-    let rmcp::ServiceError::McpError(error) = error else {
-        return Err(format!("expected an McpError, found {error:?}").into());
-    };
+    let failure = workspace_client::failed_call(
+        client
+            .call_tool(tools_call_request("search", &unprepared)?)
+            .await,
+    )?;
     assert_eq!(
-        error.data.as_ref().and_then(|data| data.get("code")),
-        Some(&json!("capability_unavailable")),
-        "{error:?}"
+        failure.code,
+        ErrorCode::CapabilityUnavailable,
+        "{failure:?}"
     );
-    assert!(error.message.contains("of kind `struct`"), "{error:?}");
+    assert!(failure.message.contains("of kind `struct`"), "{failure:?}");
     client.cancel().await?;
 
     let (_engine, (_directory, client, _server_task)) = fake_engine::scripted_calls_workspace(
@@ -1335,23 +1331,19 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
             .get(name)
             .ok_or_else(|| format!("{name} is advertised"))?;
         assert_validates(input_validator, &request, &format!("{name} request"));
-        let error = client
-            .call_tool(tools_call_request(name, &request)?)
-            .await
-            .expect_err("the argument has nothing to change on this read");
-        let rmcp::ServiceError::McpError(error) = error else {
-            return Err(format!("expected an McpError, found {error:?}").into());
-        };
-        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        let failure = workspace_client::failed_call(
+            client.call_tool(tools_call_request(name, &request)?).await,
+        )?;
         assert_eq!(
-            wire["code"],
-            json!("invalid_request"),
-            "{request}: {wire:#}"
+            failure.code,
+            ErrorCode::InvalidRequest,
+            "{request}: {}",
+            failure.text
         );
         assert!(
-            error.message.contains("field packages"),
+            failure.message.contains("field packages"),
             "the refusal names the field: {request}: {}",
-            error.message
+            failure.message
         );
     }
 
@@ -1370,32 +1362,26 @@ async fn search_pattern_refusals_carry_their_codes() -> TestResult {
     let refused = [
         (
             json!({ "pattern": "beacon", "query": "beacon" }),
-            "invalid_request",
+            ErrorCode::InvalidRequest,
         ),
         (
             json!({ "pattern": "beacon", "rev": "main" }),
-            "invalid_request",
+            ErrorCode::InvalidRequest,
         ),
-        (json!({ "pattern": "beacon(" }), "invalid_request"),
-        (json!({ "pattern": r"\w{2000}" }), "invalid_request"),
+        (json!({ "pattern": "beacon(" }), ErrorCode::InvalidRequest),
+        (json!({ "pattern": r"\w{2000}" }), ErrorCode::InvalidRequest),
         (
             json!({ "pattern": "beacon", "target": "documentation" }),
-            "capability_unavailable",
+            ErrorCode::CapabilityUnavailable,
         ),
     ];
     for (arguments, code) in refused {
-        let error = client
-            .call_tool(tools_call_request("search", &arguments)?)
-            .await
-            .expect_err("the pattern request must be refused");
-        let rmcp::ServiceError::McpError(error) = error else {
-            return Err(format!("expected an McpError, found {error:?}").into());
-        };
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!(code)),
-            "{arguments}: {error:?}"
-        );
+        let failure = workspace_client::failed_call(
+            client
+                .call_tool(tools_call_request("search", &arguments)?)
+                .await,
+        )?;
+        assert_eq!(failure.code, code, "{arguments}: {failure:?}");
     }
 
     client.cancel().await?;
@@ -1424,6 +1410,7 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
     let structured = loop {
         let result =
             call_tool_retrying_acceptance(&client, tools_call_request("search", &request)?).await?;
+        text_complete::assert_text_states("search", &result);
         let structured = result
             .structured_content
             .ok_or("search must return structured content")?;
@@ -1478,23 +1465,21 @@ async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field()
         ),
     ];
     for (name, arguments, field) in refused {
-        let error = client
-            .call_tool(tools_call_request(name, &arguments)?)
-            .await
-            .expect_err("the spelling must be refused");
-        let rmcp::ServiceError::McpError(error) = error else {
-            return Err(format!("expected an McpError, found {error:?}").into());
-        };
-        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        let failure = workspace_client::failed_call(
+            client
+                .call_tool(tools_call_request(name, &arguments)?)
+                .await,
+        )?;
         assert_eq!(
-            wire["code"],
-            json!("invalid_request"),
-            "{arguments}: {wire:#}"
+            failure.code,
+            ErrorCode::InvalidRequest,
+            "{arguments}: {}",
+            failure.text
         );
         assert!(
-            error.message.contains(field),
+            failure.message.contains(field),
             "{arguments}: {}",
-            error.message
+            failure.message
         );
     }
 
@@ -1527,23 +1512,21 @@ async fn search_commit_refusals_name_the_field() -> TestResult {
         if let (Some(arguments), Some(extra)) = (arguments.as_object_mut(), extra.as_object()) {
             arguments.extend(extra.clone());
         }
-        let error = client
-            .call_tool(tools_call_request("search", &arguments)?)
-            .await
-            .expect_err("the commit search must be refused");
-        let rmcp::ServiceError::McpError(error) = error else {
-            return Err(format!("expected an McpError, found {error:?}").into());
-        };
-        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        let failure = workspace_client::failed_call(
+            client
+                .call_tool(tools_call_request("search", &arguments)?)
+                .await,
+        )?;
         assert_eq!(
-            wire["code"],
-            json!("invalid_request"),
-            "{arguments}: {wire:#}"
+            failure.code,
+            ErrorCode::InvalidRequest,
+            "{arguments}: {}",
+            failure.text
         );
         assert!(
-            error.message.contains(&format!("field {field}")),
+            failure.message.contains(&format!("field {field}")),
             "the refusal names {field}: {arguments}: {}",
-            error.message
+            failure.message
         );
     }
 
@@ -1562,19 +1545,16 @@ fn tools_call_request(name: &'static str, value: &Value) -> TestResult<CallToolR
 async fn nodes_on_an_unparsed_visible_path_names_the_extension() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
 
-    let error = client
-        .call_tool(
-            CallToolRequestParams::new("nodes")
-                .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
-        )
-        .await
-        .expect_err("an unparsed extension must be rejected");
-    let rmcp::ServiceError::McpError(data) = error else {
-        panic!("expected protocol-level McpError, got {error:?}");
-    };
-    let wire = data.data.ok_or("wire error data must be present")?;
-    assert_eq!(wire["code"], json!("capability_unavailable"));
-    let message = wire["message"].as_str().ok_or("message must be a string")?;
+    let failure = workspace_client::failed_call(
+        client
+            .call_tool(
+                CallToolRequestParams::new("nodes")
+                    .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
+            )
+            .await,
+    )?;
+    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
+    let message = &failure.message;
     assert!(
         message.contains("files with no extension"),
         "the refusal must name what governs the missing provider: {message}"

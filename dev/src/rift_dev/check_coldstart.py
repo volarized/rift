@@ -15,12 +15,12 @@ from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.shared.exceptions import MCPError
 
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.commands import DockerCommand, owned_environment
 from rift_dev.rift_test_client import (
     Client,
+    ToolFailure,
     array_value,
     current_deadline,
     gate_deadline,
@@ -28,7 +28,6 @@ from rift_dev.rift_test_client import (
     remaining_seconds,
     require,
     stderr_log,
-    string_value,
 )
 
 COLDSTART_SECONDS = 240.0
@@ -134,28 +133,21 @@ async def check_missing_executable(client: Client, name: str) -> None:
     hit = await symbol_hit(client, "beacon_cold")
     try:
         await incoming_references(client, symbol_id(hit))
-    except MCPError as launch_error:
-        detail = object_value(launch_error.error.data, "engine error")
+    except ToolFailure as launch_error:
         require(
-            detail.get("code") == "capability_unavailable",
-            f"unexpected engine error: {detail}",
+            launch_error.code == "capability_unavailable",
+            f"unexpected engine error: {launch_error}",
         )
-        cause_values = detail.get("causes", [])
         require(
-            isinstance(cause_values, list) and bool(cause_values),
-            f"engine failure lost launch cause: {detail}",
+            bool(launch_error.causes),
+            f"engine failure lost launch cause: {launch_error}",
         )
-        causes = array_value(cause_values, "engine error causes")
         require(
             any(
-                "No such file or directory"
-                in string_value(
-                    object_value(cause, "engine error cause").get("message"),
-                    "engine error cause message",
-                )
-                for cause in causes
+                "No such file or directory" in cause.message
+                for cause in launch_error.causes
             ),
-            f"engine failure lost launch source: {detail}",
+            f"engine failure lost launch source: {launch_error}",
         )
     else:
         raise AssertionError("missing configured engine answered references")

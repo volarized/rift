@@ -42,14 +42,14 @@ use rift_server::{
     StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
     ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -62,6 +62,7 @@ use crate::global::{
 use crate::history::{AnalysisGate, HistoryLane};
 use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
+use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -767,7 +768,7 @@ impl ResolvedWorkspace {
         reason: &StaleIndexReason<'_>,
         phase: wire::ErrorPhase,
         capture_elapsed: Duration,
-    ) -> Result<Self, ErrorData> {
+    ) -> Result<Self, ToolFailure> {
         published.configuration.accepted(phase)?;
         let stale = moved.map(|moved| stale_index_warning(&published, captured, moved, reason));
         Ok(Self {
@@ -969,7 +970,7 @@ fn finish_reconciliation(
     wait: ReadWait,
     spent: Option<SpentCapture>,
     phase: wire::ErrorPhase,
-) -> Result<ResolvedWorkspace, ErrorData> {
+) -> Result<ResolvedWorkspace, ToolFailure> {
     if matches!(wait, ReadWait::Rebuild { .. })
         && let Some(spent) = spent
     {
@@ -989,7 +990,7 @@ fn finish_reconciliation(
         .operation("current workspace read")
         .detail("workspace changed across bounded reconciliation attempts")
         .mcp()
-        .tool_error(phase)
+        .tool_failure(phase)
         .fail()
 }
 
@@ -1495,7 +1496,7 @@ enum StoreReadFailure {
     /// ranks without it.
     ConnectionUnavailable,
     /// The store refused, and the request refuses with it.
-    Refused(ErrorData),
+    Refused(ToolFailure),
 }
 
 impl From<RiftError> for StoreReadFailure {
@@ -1509,7 +1510,7 @@ impl From<RiftError> for StoreReadFailure {
             );
             return Self::ConnectionUnavailable;
         }
-        Self::Refused(error.mcp().tool_error(wire::ErrorPhase::Read))
+        Self::Refused(error.mcp().tool_failure(wire::ErrorPhase::Read))
     }
 }
 
@@ -2168,7 +2169,7 @@ impl RiftMcp {
     async fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
-    ) -> Result<Json<GetSymbolResult>, ErrorData> {
+    ) -> Result<Json<GetSymbolResult>, ToolFailure> {
         if params.rev.is_none() && params.scope != SearchScope::Local {
             return self.current_tree_get_symbol(params).await;
         }
@@ -2188,9 +2189,9 @@ impl RiftMcp {
     async fn current_tree_get_symbol(
         &self,
         params: GetSymbolParams,
-    ) -> Result<Json<GetSymbolResult>, ErrorData> {
+    ) -> Result<Json<GetSymbolResult>, ToolFailure> {
         let limit = rift_server::accepted_limit(params.limit)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
@@ -2212,7 +2213,7 @@ impl RiftMcp {
             params.rev.as_ref(),
             &params.packages,
         )
-        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let (route, remote) = self
@@ -2225,7 +2226,7 @@ impl RiftMcp {
             warnings: mut remote_warnings,
         } = remote;
         let mut answer = merge_symbols(&params, limit, local, remote)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         answer.warnings.append(&mut remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
@@ -2257,7 +2258,7 @@ impl RiftMcp {
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
-    ) -> Result<Json<SearchResult>, ErrorData> {
+    ) -> Result<Json<SearchResult>, ToolFailure> {
         if params.target == rift_protocol::read::SearchParamsTarget::Commit {
             return self.commit_search(params).await;
         }
@@ -2281,7 +2282,7 @@ impl RiftMcp {
     /// Answers a commit search from the history store the server opened, behind the
     /// acceptance gate every request passes. The answer reads no published tree, so it
     /// carries no `stale_index`.
-    async fn commit_search(&self, params: SearchParams) -> Result<Json<SearchResult>, ErrorData> {
+    async fn commit_search(&self, params: SearchParams) -> Result<Json<SearchResult>, ToolFailure> {
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
@@ -2298,7 +2299,7 @@ impl RiftMcp {
             .run("commit search", move || reads.search_commits(&params))
             .await
             .map(Json)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
     }
 
     /// Compares the committed revision `change` names against another revision or the
@@ -2315,7 +2316,7 @@ impl RiftMcp {
         &self,
         params: SearchParams,
         change: rift_protocol::read::SearchChange,
-    ) -> Result<Json<SearchResult>, ErrorData> {
+    ) -> Result<Json<SearchResult>, ToolFailure> {
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
@@ -2350,7 +2351,7 @@ impl RiftMcp {
                 )
             })
             .await
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         answer.warnings.extend(stale);
         Ok(Json(answer))
     }
@@ -2377,7 +2378,7 @@ impl RiftMcp {
     async fn current_tree_search(
         &self,
         params: SearchParams,
-    ) -> Result<Json<SearchResult>, ErrorData> {
+    ) -> Result<Json<SearchResult>, ToolFailure> {
         let deadline = self.request_deadline().await;
         let mut resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
@@ -2413,7 +2414,7 @@ impl RiftMcp {
                 .operation("engine references")
                 .detail("request deadline exceeded")
                 .mcp()
-                .tool_error(wire::ErrorPhase::Read)
+                .tool_failure(wire::ErrorPhase::Read)
         })??;
         let callee_warnings = self
             .name_package_callees(&resolved, &mut references, deadline)
@@ -2451,7 +2452,7 @@ impl RiftMcp {
         warnings: Vec<ReadWarning>,
         references: EngineReferences,
         deadline: RequestDeadline,
-    ) -> Result<Json<SearchResult>, ErrorData> {
+    ) -> Result<Json<SearchResult>, ToolFailure> {
         let references = Arc::new(references);
         if params.pattern.is_some() && params.scope != SearchScope::Local {
             return self
@@ -2474,7 +2475,7 @@ impl RiftMcp {
         };
 
         let limit = rift_server::search_page_limit(&params)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
 
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
@@ -2490,7 +2491,7 @@ impl RiftMcp {
             params.rev.as_ref(),
             &params.packages,
         )
-        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
@@ -2506,7 +2507,7 @@ impl RiftMcp {
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
         let mut answer = merge_search(&params, limit, local, remote)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
@@ -2525,9 +2526,9 @@ impl RiftMcp {
         warnings: Vec<ReadWarning>,
         references: Arc<EngineReferences>,
         deadline: RequestDeadline,
-    ) -> Result<Json<SearchResult>, ErrorData> {
+    ) -> Result<Json<SearchResult>, ToolFailure> {
         let limit = rift_server::search_page_limit(&params)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
@@ -2542,7 +2543,7 @@ impl RiftMcp {
             params.rev.as_ref(),
             &params.packages,
         )
-        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let (route, remote) = self
@@ -2611,7 +2612,7 @@ impl RiftMcp {
         params: SearchParams,
         answer: StoreAnswer,
         references: Arc<EngineReferences>,
-    ) -> Result<Json<SearchResult>, ErrorData> {
+    ) -> Result<Json<SearchResult>, ToolFailure> {
         let include_local_preparation = params.scope != SearchScope::Global;
         rift_core::traced_async!(component = "search", operation = "search.read", {
             tracing::debug!("search read started");
@@ -2633,7 +2634,7 @@ impl RiftMcp {
         mut ranking: Option<SearchRanking>,
         params: &SearchParams,
         deadline: RequestDeadline,
-    ) -> Result<(ResolvedWorkspace, Option<SearchRanking>, EngineReferences), ErrorData> {
+    ) -> Result<(ResolvedWorkspace, Option<SearchRanking>, EngineReferences), ToolFailure> {
         for attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
             if let Some(references) = self.engine_references(&resolved, params, deadline).await? {
                 return Ok((resolved, ranking, references));
@@ -2649,7 +2650,7 @@ impl RiftMcp {
             .operation("engine references")
             .detail("source or configuration kept changing during the bounded reference reads")
             .mcp()
-            .tool_error(wire::ErrorPhase::Read)
+            .tool_failure(wire::ErrorPhase::Read)
             .fail()
     }
 
@@ -2674,14 +2675,14 @@ impl RiftMcp {
         resolved: &ResolvedWorkspace,
         params: &SearchParams,
         deadline: RequestDeadline,
-    ) -> Result<Option<EngineReferences>, ErrorData> {
+    ) -> Result<Option<EngineReferences>, ToolFailure> {
         if params.traversal.is_none() || resolved.stale.is_some() {
             return Ok(Some(EngineReferences::default()));
         }
         let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
         let engines = self.engine_pool_for(&resolved.published).await;
         if !uses_engine_references(&resolved.published.reads, &engines, params)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?
         {
             return Ok(Some(EngineReferences::default()));
         }
@@ -2695,7 +2696,7 @@ impl RiftMcp {
             (walk_deadline, &roots),
         ))
         .await
-        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         if self.engine_tree_matches(&resolved.published).await? {
             Ok(Some(references))
         } else {
@@ -2710,7 +2711,7 @@ impl RiftMcp {
         published: &PublishedWorkspace,
         engines: &Arc<EnginePool>,
         params: &SearchParams,
-    ) -> Result<CalleeRoots, ErrorData> {
+    ) -> Result<CalleeRoots, ToolFailure> {
         let outgoing = params
             .traversal
             .as_ref()
@@ -2725,7 +2726,7 @@ impl RiftMcp {
                 Ok(CalleeRoots::read(&reads, &engines))
             })
             .await
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
     }
 
     /// Names the declaration of each callee an outgoing walk found in a package file, in
@@ -2782,11 +2783,11 @@ impl RiftMcp {
     async fn engine_tree_matches(
         &self,
         published: &Arc<PublishedWorkspace>,
-    ) -> Result<bool, ErrorData> {
+    ) -> Result<bool, ToolFailure> {
         let (digests, configuration) = self
             .capture_tree(published)
             .await
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         Ok(digests.fingerprint() == published.fingerprint
             && configuration == published.configuration.fingerprint)
     }
@@ -2806,7 +2807,7 @@ impl RiftMcp {
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
-    ) -> Result<Option<SearchRanking>, ErrorData> {
+    ) -> Result<Option<SearchRanking>, ToolFailure> {
         if params.pattern.is_some() {
             return self.pattern_ranking(params, published).await.map(Some);
         }
@@ -2882,7 +2883,7 @@ impl RiftMcp {
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
-    ) -> Result<SearchRanking, ErrorData> {
+    ) -> Result<SearchRanking, ToolFailure> {
         let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
         if published.preparation.is_some() {
             return Ok(SearchRanking::unranked(answer));
@@ -3074,7 +3075,7 @@ impl RiftMcp {
     async fn nodes(
         &self,
         Parameters(params): Parameters<NodesParams>,
-    ) -> Result<Json<NodesResult>, ErrorData> {
+    ) -> Result<Json<NodesResult>, ToolFailure> {
         let rev = params.rev.clone();
         if rev.is_some() {
             return self.read_at(rev, move |reads| reads.nodes(params)).await;
@@ -3090,7 +3091,7 @@ impl RiftMcp {
                 .violation(error.detail())
                 .cause(error)
                 .mcp()
-                .tool_error(wire::ErrorPhase::Read)
+                .tool_failure(wire::ErrorPhase::Read)
         })?;
         if preparation.is_some_and(|preparation| preparation.total.is_none()) {
             return Ok(Json(nodes_preparing_answer(&resolved)));
@@ -3125,7 +3126,7 @@ impl RiftMcp {
         &self,
         rev: Option<rift_protocol::read::RevisionId>,
         operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
-    ) -> Result<Json<Answer>, ErrorData>
+    ) -> Result<Json<Answer>, ToolFailure>
     where
         Answer: ReadAnswer + Send + 'static,
     {
@@ -3163,7 +3164,7 @@ impl RiftMcp {
             })
             .await
             .map(Json)
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
     }
 
     /// The workspace policy one read of committed source applies, derived once from the
@@ -3173,13 +3174,13 @@ impl RiftMcp {
     ///
     /// Committed source is what `[providers.history]` gates, so a workspace that turns the
     /// table off refuses here, before any revision is resolved.
-    fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ErrorData> {
+    fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ToolFailure> {
         let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
             return errors::server::read_unsupported()
                 .capability("revision reads (providers.history disabled)")
                 .mcp()
-                .tool_error(wire::ErrorPhase::Read)
+                .tool_failure(wire::ErrorPhase::Read)
                 .fail();
         }
         Ok(RevisionRead {
@@ -3187,7 +3188,7 @@ impl RiftMcp {
             limits: published
                 .configuration
                 .index_limits(self.limits)
-                .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?,
+                .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?,
             visibility: SourceVisibility::from(&configuration.source),
             text_inclusion: rift_core::TextFileInclusion::from(&configuration),
             languages: rift_core::LanguageFileSelections::from(&configuration),
@@ -3206,7 +3207,7 @@ impl RiftMcp {
         resolved: &ResolvedWorkspace,
         include_local_preparation: bool,
         operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
-    ) -> Result<Json<Answer>, ErrorData>
+    ) -> Result<Json<Answer>, ToolFailure>
     where
         Answer: ReadAnswer + Send + 'static,
     {
@@ -3222,7 +3223,7 @@ impl RiftMcp {
             .blocking
             .run("current workspace read", move || operation(&reads))
             .await
-            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?;
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         if let Some(stale) = resolved.stale.clone() {
             answer.warnings_mut().push(stale);
         }
@@ -3245,7 +3246,7 @@ impl RiftMcp {
         resolved: &ResolvedWorkspace,
         deadline: RequestDeadline,
         operation: impl FnOnce(&ReadService) -> Result<NodesResult, RiftError> + Send + 'static,
-    ) -> Result<Json<NodesResult>, ErrorData> {
+    ) -> Result<Json<NodesResult>, ToolFailure> {
         resolved
             .published
             .configuration
@@ -3268,7 +3269,7 @@ impl RiftMcp {
                 answer.warnings.extend(nodes_preparing_warnings(resolved));
                 Ok(Json(answer))
             }
-            Ok(Err(error)) => error.mcp().tool_error(wire::ErrorPhase::Read).fail(),
+            Ok(Err(error)) => error.mcp().tool_failure(wire::ErrorPhase::Read).fail(),
             Err(_) => {
                 timed_cancellation.cancel();
                 Ok(Json(nodes_preparing_answer(resolved)))
@@ -3288,7 +3289,7 @@ impl RiftMcp {
         &self,
         phase: wire::ErrorPhase,
         deadline: RequestDeadline,
-    ) -> Result<ResolvedWorkspace, ErrorData> {
+    ) -> Result<ResolvedWorkspace, ToolFailure> {
         let Ok(result) =
             tokio::time::timeout_at(deadline.at(), self.reconcile_workspace(phase)).await
         else {
@@ -3303,7 +3304,7 @@ impl RiftMcp {
                 .operation("current workspace read")
                 .detail(detail)
                 .mcp()
-                .tool_error(phase)
+                .tool_failure(phase)
                 .fail();
         };
         result
@@ -3416,7 +3417,7 @@ impl RiftMcp {
     async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
-    ) -> Result<ResolvedWorkspace, ErrorData> {
+    ) -> Result<ResolvedWorkspace, ToolFailure> {
         let mut spent: Option<SpentCapture> = None;
         let mut wait = ReadWait::Capture;
         let mut previous: Option<PreviousCapture> = None;
@@ -3426,7 +3427,7 @@ impl RiftMcp {
             if current.preparation.is_some()
                 && let Some(failure) = rebuild_failure.as_ref()
             {
-                return (&failure.error).mcp().tool_error(phase).fail();
+                return (&failure.error).mcp().tool_failure(phase).fail();
             }
             let superseded_seen = self.validation.superseded_epoch();
             let capture = self
@@ -3527,7 +3528,7 @@ impl RiftMcp {
         &self,
         current: &PublishedWorkspace,
         phase: wire::ErrorPhase,
-    ) -> Result<bool, ErrorData> {
+    ) -> Result<bool, ToolFailure> {
         if current.preparation.is_some() || !current.reads.observes_project_environment() {
             return Ok(false);
         }
@@ -3541,7 +3542,7 @@ impl RiftMcp {
                 ))
             })
             .await
-            .map_err(|error| error.mcp().tool_error(phase))
+            .map_err(|error| error.mcp().tool_failure(phase))
     }
 
     /// Captures the tree one reconciliation attempt compares with `current`.
@@ -3552,12 +3553,12 @@ impl RiftMcp {
         &self,
         current: &Arc<PublishedWorkspace>,
         phase: wire::ErrorPhase,
-    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ErrorData> {
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ToolFailure> {
         self.capture_tree(current).await.map_err(|error| {
             if error.slug() != errors::server::read_cancelled::SLUG {
                 let _ = self.validation.observe_whole_workspace();
             }
-            error.mcp().tool_error(phase)
+            error.mcp().tool_failure(phase)
         })
     }
 
@@ -3569,7 +3570,7 @@ impl RiftMcp {
         phase: wire::ErrorPhase,
         attempts: usize,
         superseded_seen: u64,
-    ) -> Result<ReconciliationCapture, ErrorData> {
+    ) -> Result<ReconciliationCapture, ToolFailure> {
         let capture_started = tokio::time::Instant::now();
         let (digests, configuration) = self.capture_read(current, phase).await?;
         let capture_elapsed = capture_started.elapsed();
@@ -3607,7 +3608,7 @@ impl RiftMcp {
         configuration_matches: bool,
         phase: wire::ErrorPhase,
         attempts: usize,
-    ) -> Result<u64, ErrorData> {
+    ) -> Result<u64, ToolFailure> {
         let observed = if configuration_matches
             && self
                 .rebuild_reaches_capture(current, changes, phase)
@@ -3618,7 +3619,7 @@ impl RiftMcp {
         } else {
             self.validation.observe_whole_workspace()
         };
-        let requested_epoch = observed.map_err(|error| error.mcp().tool_error(phase))?;
+        let requested_epoch = observed.map_err(|error| error.mcp().tool_failure(phase))?;
         tracing::debug!(
             component = "index",
             operation = "index.reconcile",
@@ -3650,7 +3651,7 @@ impl RiftMcp {
         current: &Arc<PublishedWorkspace>,
         changes: &PathChanges,
         phase: wire::ErrorPhase,
-    ) -> Result<bool, ErrorData> {
+    ) -> Result<bool, ToolFailure> {
         let added_or_removed: BTreeSet<rift_core::ProjectPath> = changes
             .iter()
             .filter(|(_, change)| !matches!(change, PathChange::Modified))
@@ -3666,7 +3667,7 @@ impl RiftMcp {
                 Ok(published.rebuild_moves_every(&root, &added_or_removed))
             })
             .await
-            .map_err(|error| error.mcp().tool_error(phase))
+            .map_err(|error| error.mcp().tool_failure(phase))
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
@@ -3781,7 +3782,7 @@ impl RiftMcp {
         &self,
         phase: wire::ErrorPhase,
         wait: ReadWait,
-    ) -> Result<(Arc<PublishedWorkspace>, Option<RecordedRebuildFailure>), ErrorData> {
+    ) -> Result<(Arc<PublishedWorkspace>, Option<RecordedRebuildFailure>), ToolFailure> {
         loop {
             let changed = self.validation.changed.notified();
             tokio::pin!(changed);
@@ -3802,7 +3803,7 @@ impl RiftMcp {
                     .operation("current workspace read")
                     .detail("filesystem watcher failed")
                     .mcp()
-                    .tool_error(phase)
+                    .tool_failure(phase)
                     .fail();
             }
             if current.epoch == observed_epoch {
@@ -3823,7 +3824,7 @@ impl RiftMcp {
                         published = current.epoch,
                     ))
                     .mcp()
-                    .tool_error(phase)
+                    .tool_failure(phase)
                     .fail();
             }
             if let Some((failed_epoch, error)) = failure
@@ -3885,13 +3886,13 @@ impl RiftMcp {
         // record would answer without it. This waits for the lane to reach what it has taken.
         crate::logs::settle_for_read().await;
         let Some(store) = self.logs.as_ref() else {
-            return Ok(resource::logs_unavailable(
+            return resource::logs_unavailable(
                 uri,
                 "the workspace log store could not be opened, so this run recorded nothing",
-            ));
+            );
         };
         match store.recent(&query).await {
-            Ok(records) => Ok(resource::rendered_logs(uri, &records)),
+            Ok(records) => resource::rendered_logs(uri, &records),
             Err(error) => {
                 ErrorData::internal_error(format!("the log store refused the read: {error}"), None)
                     .fail()
@@ -3959,7 +3960,7 @@ impl RiftMcp {
                 total_pages: u64::try_from(total_pages).unwrap_or(u64::MAX),
             },
         };
-        Ok(resource::rendered_workspace(uri, &page))
+        resource::rendered_workspace(uri, &page)
     }
 
     /// Answers the `rift://map` read from the current publication's cached snapshot: a
@@ -3968,7 +3969,7 @@ impl RiftMcp {
     async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         self.ensure_workspace_root().await?;
         let current = Arc::clone(&self.published.read().await.current);
-        Ok(resource::rendered_map(uri, &current.map))
+        resource::rendered_map(uri, &current.map)
     }
 
     /// Refuses cached workspace resources after their root disappears.
@@ -4009,6 +4010,10 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
+    /// Routes the call as the generated `call_tool` does, then completes a Rift operating
+    /// failure, including a refused parameter, as an `isError` result.
+    ///
+    /// Any other error stays the JSON-RPC error the router returned.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -4023,9 +4028,19 @@ impl ServerHandler for RiftMcp {
         );
         async {
             tracing::debug!("tool request started");
-            let tcc = ToolCallContext::new(self, request, context);
-            let result = self.tool_router.call(tcc).await;
-            tracing::debug!(is_error = result.is_err(), "tool request completed");
+            let routed = ToolCallContext::new(self, request, context);
+            let result = match self.tool_router.call(routed).await {
+                Err(error) => ToolFailure::from(error).into_call_tool_result(),
+                Ok(response) => Ok(response),
+            };
+            // A tool's registered failure completes as a result with `isError`, so the
+            // record reads the completed result, not the router's.
+            let is_error = match &result {
+                Ok(CallToolResponse::Complete(done)) => done.is_error == Some(true),
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            tracing::debug!(is_error, "tool request completed");
             result
         }
         .instrument(span)
@@ -4617,14 +4632,8 @@ done
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         let languages = body["languages"]
             .as_array()
             .expect("workspace languages are an array");
@@ -4687,7 +4696,7 @@ done
 
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
-    use rmcp::model::{CallToolRequestParams, ErrorCode};
+    use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorCode};
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
 
@@ -4730,12 +4739,65 @@ done
         let answer = client
             .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.to_owned()))
             .await?;
-        let Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) =
-            answer.contents.first()
-        else {
-            return Err("resource must contain its serialized publication".into());
-        };
-        Ok(serde_json::from_str(text)?)
+        Ok(serde_json::from_str(&resource_json_text(&answer, uri)?)?)
+    }
+
+    /// The text of the one `application/json` content of a resource read.
+    ///
+    /// A read answers the compact `text/plain` content first and the JSON body second; every
+    /// content carries the requested `uri`.
+    fn resource_json_text(
+        answer: &rmcp::model::ReadResourceResult,
+        uri: &str,
+    ) -> TestResult<String> {
+        let mut json = None;
+        for content in &answer.contents {
+            let rmcp::model::ResourceContents::TextResourceContents {
+                uri: found,
+                mime_type,
+                text,
+                ..
+            } = content
+            else {
+                return Err(format!("{uri}: every content must be text: {content:?}").into());
+            };
+            assert_eq!(found, uri, "every content carries the requested uri");
+            match mime_type.as_deref() {
+                Some("application/json") => {
+                    assert!(
+                        json.replace(text.clone()).is_none(),
+                        "{uri}: one JSON content"
+                    );
+                }
+                Some("text/plain") => {}
+                other => return Err(format!("{uri}: unexpected media type {other:?}").into()),
+            }
+        }
+        json.ok_or_else(|| format!("{uri}: no application/json content").into())
+    }
+
+    /// The compact text of a resource read: its first content, non-empty `text/plain`.
+    fn resource_compact_text(
+        answer: &rmcp::model::ReadResourceResult,
+        uri: &str,
+    ) -> TestResult<String> {
+        match answer.contents.first() {
+            Some(rmcp::model::ResourceContents::TextResourceContents {
+                uri: found,
+                mime_type,
+                text,
+                ..
+            }) if found == uri
+                && mime_type.as_deref() == Some("text/plain")
+                && !text.is_empty() =>
+            {
+                Ok(text.clone())
+            }
+            other => Err(format!(
+                "{uri}: the first content must be non-empty text/plain: {other:?}"
+            )
+            .into()),
+        }
     }
 
     async fn served_nodes(
@@ -4812,30 +4874,18 @@ done
                 CallToolRequestParams::new("nodes")
                     .with_arguments(arguments(&json!({"path": "../outside.rs", "position": 8}))?),
             )
-            .await
-            .expect_err("a parent path must remain a typed refusal");
-        let ServiceError::McpError(data) = invalid else {
-            return Err("invalid path must return an MCP error".into());
-        };
-        assert_eq!(data.code, ErrorCode(-32000));
-        assert_eq!(
-            data.message,
-            "the request does not match the documented form: field path, \
-             violation project path contains a dot segment: cause project path contains a dot segment; \
-             use a workspace-relative path with `/` separators and no `.` or `..` components; \
-             correct the reported field and resend the request"
+            .await?;
+        let text = assert_error_result(&invalid, "invalid_request")?;
+        assert!(
+            text.contains("the request does not match the documented form: field path"),
+            "{text}"
         );
-        let wire = data.data.ok_or("invalid path carries wire error data")?;
-        assert_eq!(wire["code"], "invalid_request");
-        assert_eq!(wire["retry"], "never");
-        assert_eq!(wire["phase"], "read");
-        assert!(wire["causes"].as_array().is_some_and(|causes| {
-            causes.iter().any(|cause| {
-                cause["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("project path contains a dot segment"))
-            })
-        }));
+        assert!(
+            text.lines().any(|line| {
+                line.starts_with("\t\t") && line.contains("project path contains a dot segment")
+            }),
+            "{text}"
+        );
         Ok(())
     }
 
@@ -5122,7 +5172,7 @@ done
             .err()
             .ok_or("the complete index must refuse a path beyond its declaration bound")?;
         assert_eq!(
-            error.data.ok_or("typed refusal")?["code"],
+            rmcp::ErrorData::from(error).data.ok_or("typed refusal")?["code"],
             "content_unavailable"
         );
         let published = Arc::clone(&assembled.server.published.read().await.current);
@@ -5633,6 +5683,7 @@ done
             .get_symbol(Parameters(params))
             .await
             .map(|result| result.0)
+            .map_err(rmcp::ErrorData::from)
     }
 
     async fn run_search(server: &RiftMcp, query: &str) -> Result<SearchResult, rmcp::ErrorData> {
@@ -5642,6 +5693,7 @@ done
             .search(Parameters(params))
             .await
             .map(|result| result.0)
+            .map_err(rmcp::ErrorData::from)
     }
 
     fn arguments(
@@ -6651,8 +6703,29 @@ done
         Ok(())
     }
 
-    /// Calls one tool expecting a Rift wire error and returns the JSON-RPC
-    /// error object.
+    /// Asserts a completed tool error: `isError`, no structured content, and one text
+    /// block whose title counts the errors and whose first entry head names `code`.
+    /// Returns that text.
+    fn assert_error_result(result: &CallToolResult, code: &str) -> TestResult<String> {
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, None);
+        let [block] = result.content.as_slice() else {
+            return Err("a completed error carries one content block".into());
+        };
+        let text = block.as_text().ok_or("the block is text")?.text.clone();
+        let mut lines = text.lines();
+        let title = lines.next().ok_or("the error text is empty")?;
+        assert!(title == "1 error" || title.ends_with(" errors"), "{text}");
+        assert_eq!(
+            lines.next(),
+            Some(format!("\t{code} · retry never").as_str()),
+            "{text}"
+        );
+        assert!(!text.contains("phase"), "{text}");
+        Ok(text)
+    }
+
+    /// Calls one tool through a client and returns the completed result.
     ///
     /// The population lane's first pass is waited for before the call, so a refusal is
     /// read from a server whose store already holds the served tree rather than from one
@@ -6661,7 +6734,7 @@ done
     async fn failing_call(
         arguments_value: &serde_json::Value,
         tool: &'static str,
-    ) -> TestResult<rmcp::ErrorData> {
+    ) -> TestResult<CallToolResult> {
         let (_directory, server) = Box::pin(fixture()).await?;
         search_after_population(&server, "beacon").await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
@@ -6673,54 +6746,40 @@ done
             service.waiting().await.expect("server must stop cleanly");
         });
         let client = ().serve(client_transport).await?;
-        let error = client
+        let result = client
             .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(arguments_value)?))
-            .await
-            .expect_err("the request must be rejected");
+            .await;
         client.cancel().await?;
         server_task.await?;
-        let ServiceError::McpError(data) = error else {
-            panic!("expected protocol-level McpError, got {error:?}");
-        };
-        Ok(data)
+        Ok(result?)
     }
 
     #[tokio::test]
     async fn client_rejects_empty_search_query_with_typed_wire_error() -> TestResult {
-        let data = failing_call(&json!({"query": ""}), "search").await?;
-        assert_eq!(data.code, ErrorCode(-32000));
+        let result = failing_call(&json!({"query": ""}), "search").await?;
+        let text = assert_error_result(&result, "invalid_request")?;
         assert_eq!(
-            data.message.as_ref(),
-            "the request does not match the documented form: field query, \
-             violation empty; correct the reported field and resend the request"
-        );
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
-        assert_eq!(wire["phase"], json!("read"));
-        assert!(
-            wire.get("causes").is_none(),
-            "a failure with no causal chain must omit causes"
+            text,
+            "1 error\n\tinvalid_request · retry never\n\
+             \t\tthe request does not match the documented form: field query, \
+             violation empty; \
+             correct the reported field and resend the request\n\
+             \t\trift.server.read_invalid\n"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn client_rejects_zero_result_limit_as_invalid_request() -> TestResult {
-        let data = failing_call(&json!({"name": "beacon", "limit": 0}), "get_symbol").await?;
-        assert_eq!(data.code, ErrorCode(-32000));
+        let result = failing_call(&json!({"name": "beacon", "limit": 0}), "get_symbol").await?;
+        let text = assert_error_result(&result, "invalid_request")?;
         assert_eq!(
-            data.message.as_ref(),
-            "the request does not match the documented form: field limit, \
-             violation zero; correct the reported field and resend the request"
-        );
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
-        assert_eq!(wire["phase"], json!("read"));
-        assert!(
-            wire.get("causes").is_none(),
-            "a failure with no causal chain must omit causes"
+            text,
+            "1 error\n\tinvalid_request · retry never\n\
+             \t\tthe request does not match the documented form: field limit, \
+             violation zero; \
+             correct the reported field and resend the request\n\
+             \t\trift.server.read_invalid\n"
         );
         Ok(())
     }
@@ -6734,22 +6793,21 @@ done
     /// back verbatim.
     #[tokio::test]
     async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
-        let data = failing_call(
+        let result = failing_call(
             &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
             "search",
         )
         .await?;
-        assert_eq!(data.code, ErrorCode(-32000));
-        assert_eq!(
-            data.message.as_ref(),
-            "tool arguments do not match the served schema: accepted exclude, force_include, \
-             include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
-             field paths, tool search; \
-             correct the reported field and resend the request"
+        let text = assert_error_result(&result, "invalid_request")?;
+        assert!(
+            text.contains(
+                "tool arguments do not match the served schema: accepted exclude, force_include, \
+                 include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
+                 field paths, tool search; \
+                 correct the reported field and resend the request"
+            ),
+            "{text}"
         );
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
         Ok(())
     }
 
@@ -6757,46 +6815,52 @@ done
     /// does, and an example of the whole request.
     #[tokio::test]
     async fn an_unserved_member_is_refused_by_naming_the_served_ones() -> TestResult {
-        let data =
+        let result =
             failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
-        let message = data.message.as_ref();
+        let text = assert_error_result(&result, "invalid_request")?;
         assert!(
-            message.starts_with("tool arguments do not match the served schema: accepted "),
-            "{message}"
+            text.contains("tool arguments do not match the served schema: accepted "),
+            "{text}"
         );
-        assert!(message.contains("tool search"), "{message}");
-        assert!(message.contains("paths"), "{message}");
-        assert!(message.contains("example {"), "{message}");
+        assert!(text.contains("tool search"), "{text}");
+        assert!(text.contains("paths"), "{text}");
+        assert!(text.contains("example {"), "{text}");
         assert!(
-            !message.contains("unknown field") && !message.contains("struct"),
-            "a refusal never speaks serde's grammar: {message}"
+            !text.contains("unknown field") && !text.contains("struct"),
+            "a refusal never speaks serde's grammar: {text}"
         );
-        assert_eq!(data.code, ErrorCode(-32000));
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
         Ok(())
     }
 
     /// A closed set's member is refused by listing the values it takes.
     #[tokio::test]
     async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
-        let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
-        let message = data.message.as_ref();
+        let result = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let text = assert_error_result(&result, "invalid_request")?;
         assert!(
-            message.contains("accepted all, commit, documentation, file, symbol"),
-            "{message}"
+            text.contains("accepted all, commit, documentation, file, symbol"),
+            "{text}"
         );
-        assert!(message.contains("field target"), "{message}");
-        assert!(message.contains("tool search"), "{message}");
+        assert!(text.contains("field target"), "{text}");
+        assert!(text.contains("tool search"), "{text}");
         assert!(
-            !message.contains("unknown variant"),
-            "a refusal never speaks serde's grammar: {message}"
+            !text.contains("unknown variant"),
+            "a refusal never speaks serde's grammar: {text}"
         );
-        assert_eq!(data.code, ErrorCode(-32000));
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
+        Ok(())
+    }
+
+    /// A tool name the router does not hold is a protocol failure: the JSON-RPC error stays.
+    #[tokio::test]
+    async fn an_unknown_tool_stays_a_json_rpc_error() -> TestResult {
+        let error = failing_call(&json!({}), "no_such_tool")
+            .await
+            .expect_err("an unknown tool must be a protocol error");
+        let Some(ServiceError::McpError(data)) = error.downcast_ref::<ServiceError>() else {
+            return Err(format!("expected a JSON-RPC error, got {error:?}").into());
+        };
+        assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("tool not found"), "{data:?}");
         Ok(())
     }
 
@@ -8883,7 +8947,7 @@ done
         );
         assert!(
             error
-                .message
+                .to_string()
                 .contains(&format!("{}ms", STALLED_PUBLICATION_BUDGET.as_millis())),
             "the refusal names the whole budget the request was given: {error:?}"
         );
@@ -8988,18 +9052,26 @@ done
         Ok(())
     }
 
+    /// A read answers two contents for the requested URI: compact text, then the JSON body.
+    #[tokio::test]
+    async fn workspace_resource_answers_compact_text_then_json() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let answer = server.read_workspace("rift://workspace").await?;
+        assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
+        let compact = resource_compact_text(&answer, "rift://workspace")?;
+        assert!(compact.starts_with("workspace "), "{compact}");
+        let body: serde_json::Value =
+            serde_json::from_str(&resource_json_text(&answer, "rift://workspace")?)?;
+        assert!(body["languages"].is_array(), "{body}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn workspace_resource_reads_effective_languages_and_source() -> TestResult {
         let (_directory, server) = fixture().await?;
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         assert_eq!(
             body["configuration_revision"].as_str().map(str::len),
             Some(8),
@@ -9041,14 +9113,8 @@ done
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         let lock = body["source"]
             .as_array()
             .and_then(|source| {
@@ -9096,14 +9162,8 @@ done
         )?;
 
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         let source = body["source"]
             .as_array()
             .expect("workspace source is an array");
@@ -9150,14 +9210,8 @@ done
 
         // The read is the whole point of the resource: the request that just refused is
         // the one whose reason lives in these records.
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a log read answers with one content")
-        else {
-            unreachable!("a log read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://logs")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         assert!(body["records"].is_array(), "{text}");
         Ok(())
     }
@@ -9227,13 +9281,7 @@ done
         cancellation.cancel();
         drain_task.await?;
         let logs = server.read_logs("rift://logs").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
+        let text = resource_json_text(&logs, "rift://logs")?;
         assert!(
             text.contains("file left out of the index")
                 && text.contains("src/deep.rs")
@@ -9306,14 +9354,8 @@ done
         cancellation.cancel();
         drain_task.await?;
         let logs = server.read_logs("rift://logs/component/index").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
-        let page: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&logs, "rift://logs/component/index")?;
+        let page: serde_json::Value = serde_json::from_str(&text)?;
         let records = page["records"]
             .as_array()
             .ok_or("a log page carries records")?;
@@ -9391,13 +9433,7 @@ done
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
+        let text = resource_json_text(&logs, "rift://logs/component/engine")?;
         let answered = text.clone();
 
         cancellation.cancel();
@@ -9446,13 +9482,7 @@ done
 
         let _answered = run_search(&server, SECRET_TERM).await?;
         let logs = server.read_logs("rift://logs/component/search").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
+        let text = resource_json_text(&logs, "rift://logs/component/search")?;
         let answered = text.clone();
 
         cancellation.cancel();

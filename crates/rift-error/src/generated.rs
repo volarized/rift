@@ -226,6 +226,9 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.lsp.uri_root_not_unicode",
     "rift.lsp.uri_scheme_refused",
     "rift.lsp.uri_uri_malformed",
+    "rift.mcp.answer_structure_failed",
+    "rift.mcp.answer_text_failed",
+    "rift.mcp.answer_text_limit",
     "rift.mcp.arguments_not_object",
     "rift.mcp.election_already_serving",
     "rift.mcp.election_document_invalid",
@@ -3049,10 +3052,40 @@ pub mod lsp {
 #[allow(missing_docs)]
 pub mod mcp {
     use super::{
-        Borrow, Box, Display, Duration, Error, ErrorValue, IntoRiftError, Path, SetState,
-        __rift_error_definition,
+        Borrow, Box, Display, Duration, Error, ErrorValue, IntoRiftError, IntoUnsigned,
+        Path, SetState, __rift_error_definition,
     };
     pub use super::{FieldSet, OptionalFieldSet};
+    __rift_error_definition! {
+        error answer_structure_failed; imports { use super:: { Box, Error, ErrorValue,
+        SetState }; } metadata["rift.mcp.answer_structure_failed",
+        "answer could not be serialized into structured content: {source}",
+        "report this internal failure with its full context", 1usize]; builder Builder;
+        states[State0]; complete[SetState]; fields { source { imports { use super:: {
+        Box, Builder, Error, ErrorValue, SetState }; } output[SetState]; index 0u32; key
+        "source"; flags[true, false]; bound[Into < Box < dyn Error + Send + Sync +
+        'static >>]; value value => [ErrorValue::source(value)]; optional[]; } }
+    }
+    __rift_error_definition! {
+        error answer_text_failed; imports { use super:: { Box, Error, ErrorValue,
+        SetState }; } metadata["rift.mcp.answer_text_failed",
+        "answer text could not be written: {source}",
+        "report this internal failure with its full context", 1usize]; builder Builder;
+        states[State0]; complete[SetState]; fields { source { imports { use super:: {
+        Box, Builder, Error, ErrorValue, SetState }; } output[SetState]; index 0u32; key
+        "source"; flags[true, false]; bound[Into < Box < dyn Error + Send + Sync +
+        'static >>]; value value => [ErrorValue::source(value)]; optional[]; } }
+    }
+    __rift_error_definition! {
+        error answer_text_limit; imports { use super:: { ErrorValue, IntoUnsigned,
+        SetState }; } metadata["rift.mcp.answer_text_limit",
+        "answer text exceeds its accepted limit of {limit} bytes",
+        "narrow the request or lower `limit`, then resend the request", 1usize]; builder
+        Builder; states[State0]; complete[SetState]; fields { limit { imports { use
+        super:: { Builder, ErrorValue, IntoUnsigned, SetState }; } output[SetState];
+        index 0u32; key "limit"; flags[true, false]; bound[IntoUnsigned]; value value =>
+        [ErrorValue::unsigned(value)]; optional[]; } }
+    }
     __rift_error_definition! {
         error arguments_not_object; imports { use super:: { Display, ErrorValue, SetState
         }; } metadata["rift.mcp.arguments_not_object",

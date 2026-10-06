@@ -10,8 +10,8 @@ import {
   PencilSimpleIcon,
   TreeStructureIcon,
 } from "@phosphor-icons/react/ssr";
-import { Card } from "fumadocs-ui/components/card";
 
+import { IconCard } from "@/components/icon-card";
 import { Badge } from "@/components/ui/badge";
 
 const steps = [
@@ -104,15 +104,15 @@ export function AgentWorkflow() {
           aria-label="Dependency information source"
           className="@min-[40rem]:col-span-2 @min-[40rem]:col-start-2"
         >
-          <Card
+          <IconCard
             title="Global index"
             href="/docs/developer/protocol/mcp#get_symbol-scope"
-            icon={<GlobeHemisphereWestIcon aria-hidden="true" />}
-            className="rounded-none border-dashed shadow-none"
+            icon={GlobeHemisphereWestIcon}
+            className="border-dashed"
           >
             Public declarations and docs for project dependencies, supplied to Search and Symbols
             through rift.
-          </Card>
+          </IconCard>
           <div
             aria-hidden="true"
             className="relative hidden h-12 text-muted-foreground @min-[40rem]:block"
@@ -145,15 +145,11 @@ export function AgentWorkflow() {
         <ol className="m-0 grid list-none gap-8 p-0 @min-[40rem]:grid-cols-3">
           {steps.map((step) => (
             <li key={step.href} className={`relative min-w-0 ${step.position}`}>
-              <Card
+              <IconCard
                 href={step.href}
-                className={`group flex h-full min-h-40 flex-col rounded-none bg-background p-4 shadow-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring [&>div:last-child]:flex [&>div:last-child]:flex-1 [&>div:last-child]:flex-col ${step.owner === "Agent" ? "border-dashed" : ""}`}
-                title={
-                  <span className="flex items-start gap-2">
-                    <step.icon size={20} weight="light" aria-hidden="true" className="shrink-0" />
-                    <span className="min-w-0 flex-1 leading-5">{step.title}</span>
-                  </span>
-                }
+                icon={step.icon}
+                title={step.title}
+                className={`group flex h-full min-h-40 flex-col focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring [&>div:last-child]:flex [&>div:last-child]:flex-1 [&>div:last-child]:flex-col ${step.owner === "Agent" ? "border-dashed" : ""}`}
               >
                 <p className="mt-3 mb-4 flex-1 leading-relaxed">{step.description}</p>
                 <div className="flex flex-wrap items-center gap-2">
@@ -162,7 +158,7 @@ export function AgentWorkflow() {
                   </Badge>
                   <span className="font-mono text-xs text-foreground">{step.address}</span>
                 </div>
-              </Card>
+              </IconCard>
               <ArrowDownIcon
                 size={20}
                 weight="light"

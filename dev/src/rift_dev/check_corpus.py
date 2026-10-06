@@ -13,8 +13,6 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from mcp.shared.exceptions import MCPError
-
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
     CONTEXT_SPAN,
@@ -48,9 +46,11 @@ from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.rift_test_client import (
     Client,
+    FailureLimit,
     Json,
     JsonObject,
     Server,
+    ToolFailure,
     array_value,
     gate_deadline,
     object_value,
@@ -81,6 +81,22 @@ READ_SECONDS = READINESS_SECONDS + 10.0
 # well above that outlier and strictly inside the readiness budget, so a steady read that
 # starts waiting for the index fails the case instead of hiding in the first read's room.
 STEADY_READ_SECONDS = READINESS_SECONDS * 2 / 3
+# One `settled_local` call resends a read until the local index preparation warning
+# clears, so it spans the startup snapshot's publication, the wait for the next poll, the
+# server's answer, and the client's own handling of that answer. Over 17 passing runs of
+# the `nextjs` workspace case the interval from the first `search` to the return from
+# `settled_local` was 44.79 to 59.12 seconds: publication of the startup snapshot 41.68 to
+# 52.72 seconds after the first call, up to 3.36 seconds until the next poll, a server
+# answer of 1.35 to 1.63 seconds, and 1.16 to 2.34 seconds of client handling. A bound of
+# 60 seconds left 0.88 seconds at the closest, and job 111716521102 crossed it by at most
+# 0.53 seconds with the server's answer already sent at 58.47 seconds. The bound is twice
+# the longest passing interval, 59.12 seconds, rounded up. Callers are the `workspace`
+# case of `bun`, `nextjs`, and `fastapi` (the `shallow` read only for `fastapi`) and the
+# `nextjs` `churn` case, with work budgets of 510, 690, and 210 seconds (the pinned
+# 540, 720, and 240 less CLEANUP_RESERVE_SECONDS). The bound stands inside the smallest,
+# `fastapi` at 210. Reads of one case run in sequence, so a case where every read ran
+# to this bound would reach its work budget first and fail there, naming the action.
+LOCAL_PREPARATION_SECONDS = 120.0
 # Seconds a case keeps inside its own deadline for the served tree's removal,
 # the report write, and the process exit. Nextest allows the same grace after
 # it ends a corpus case, so the two bounds agree on what cleanup costs.
@@ -614,10 +630,9 @@ class Corpus:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
         try:
             await client.call("nodes", {"path": path, "position": 0})
-        except MCPError as error:
+        except ToolFailure as error:
             require(
-                object_value(error.error.data, "nodes refusal").get("code")
-                == "resource_not_found",
+                error.code == "resource_not_found",
                 f"symlink nodes wrong refusal: {error}",
             )
         else:
@@ -830,17 +845,13 @@ class Corpus:
                             answer = await client.call(
                                 "get_symbol", {"name": "corpus_probe"}
                             )
-                        except MCPError as error:
-                            refusal = object_value(error.error.data, "source refusal")
+                        except ToolFailure as error:
                             require(
-                                refusal.get("code") == "limit_exceeded"
-                                and refusal.get("phase") == "read"
-                                and refusal.get("retry") == "never",
-                                f"source bound wrong refusal: {refusal}",
+                                error.code == "limit_exceeded"
+                                and error.retry == "never",
+                                f"source bound wrong refusal: {error}",
                             )
-                            message = string_value(
-                                refusal.get("message"), "source refusal message"
-                            )
+                            message = error.message
                             prefix = (
                                 "workspace contains more files than its accepted limit of 20000: "
                                 "field source.files, observed 20001, path "
@@ -858,17 +869,14 @@ class Corpus:
                                 reported != root and reported.is_relative_to(root),
                                 f"source bound path is outside the workspace: {path}",
                             )
-                            limit = object_value(refusal.get("limit"), "source limit")
                             require(
-                                limit.get("field") == "source.files"
-                                and limit.get("required") == 20001
-                                and limit.get("limit") == 20000,
-                                f"source bound wrong limit: {limit}",
+                                error.limit
+                                == FailureLimit("source.files", 20001, 20000),
+                                f"source bound wrong limit: {error}",
                             )
-                            causes = refusal.get("causes", [])
                             require(
-                                causes == [],
-                                f"direct source bound has unexpected causes: {causes}",
+                                error.causes == [],
+                                f"direct source bound has unexpected causes: {error.causes}",
                             )
                             break
                         require(
@@ -1019,12 +1027,15 @@ async def observed_state(
 
 
 async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
-    """Resend partial local reads within the existing corpus observation budget."""
+    """Resend partial local reads until local index preparation completes.
+
+    The wait is bounded by `LOCAL_PREPARATION_SECONDS`.
+    """
     return await read_settled_local(
         client,
         name,
         request,
-        seconds=OBSERVATION_SECONDS,
+        seconds=LOCAL_PREPARATION_SECONDS,
         poll_seconds=POLL_SECONDS,
     )
 

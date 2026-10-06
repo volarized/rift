@@ -1,6 +1,9 @@
 //! The resources the server publishes, and how a resource URI is read.
 //!
-//! One family lives here: `rift://logs`, the server's own recorded diagnostics.
+//! One family lives here: `rift://logs`, the server's own recorded diagnostics. The workspace and
+//! map answers are built here too. Every read answers two contents for the requested URI: compact
+//! text first, then the JSON body.
+//!
 //! A tool answers a question about the workspace; this answers a question about
 //! the server that was supposed to answer it. The two never share a path,
 //! because the case that needs the logs most is the one where the workspace
@@ -11,7 +14,9 @@ use rift_protocol::map::WorkspaceMap;
 use rift_protocol::workspace::WorkspaceResourcePage;
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
+
+use crate::output::{LogFields, LogLine, LogsPage, resource_text};
 
 use crate::failure::McpErrorFailExt as _;
 
@@ -33,8 +38,10 @@ pub(crate) const WORKSPACE_URI: &str = "rift://workspace";
 pub(crate) const WORKSPACE_TEMPLATE: &str = "rift://workspace{?page_index}";
 /// The query prefix selecting one workspace resource page.
 const WORKSPACE_QUERY_PREFIX: &str = "rift://workspace?";
-/// The media type every resource read answers in.
+/// The media type of the JSON content of a resource read, and of every listed resource.
 const RESOURCE_MEDIA_TYPE: &str = "application/json";
+/// The media type of the compact text content of a resource read.
+const TEXT_MEDIA_TYPE: &str = "text/plain";
 
 /// The resources the server lists.
 pub(crate) fn declared_resources() -> Vec<Resource> {
@@ -158,66 +165,129 @@ pub(crate) fn workspace_page_index(uri: &str) -> Result<u64, ErrorData> {
 }
 
 /// The answer one log read returns: the records it selected, newest first.
-pub(crate) fn rendered_logs(uri: &str, records: &[StoredLogRecord]) -> ReadResourceResult {
-    let body = json!({
-        "uri": uri,
-        "records": records.iter().map(rendered_record).collect::<Vec<Value>>(),
-        "record_count": records.len(),
-    });
-    ReadResourceResult::new(vec![
-        ResourceContents::text(body.to_string(), uri).with_mime_type(RESOURCE_MEDIA_TYPE),
-    ])
+///
+/// # Errors
+///
+/// Returns the registered answer failure when the compact text crosses its byte limit.
+pub(crate) fn rendered_logs(
+    uri: &str,
+    records: &[StoredLogRecord],
+) -> Result<ReadResourceResult, ErrorData> {
+    let page = LogsPage {
+        records: records.iter().map(log_line).collect(),
+        unavailable: None,
+    };
+    logs_answer(uri, &page)
 }
 
 /// The answer a read earns when the store never opened: an empty set, and the
 /// reason it is empty. A refusal here would leave the caller unable to tell an
 /// unrecorded run from a quiet one.
-pub(crate) fn logs_unavailable(uri: &str, reason: &str) -> ReadResourceResult {
-    let body = json!({
-        "uri": uri,
-        "records": Vec::<Value>::new(),
-        "record_count": 0,
-        "unavailable": reason,
-    });
-    ReadResourceResult::new(vec![
-        ResourceContents::text(body.to_string(), uri).with_mime_type(RESOURCE_MEDIA_TYPE),
-    ])
+///
+/// # Errors
+///
+/// Returns the registered answer failure when the compact text cannot be written.
+pub(crate) fn logs_unavailable(uri: &str, reason: &str) -> Result<ReadResourceResult, ErrorData> {
+    let page = LogsPage {
+        records: Vec::new(),
+        unavailable: Some(reason),
+    };
+    logs_answer(uri, &page)
 }
 
 /// The typed answer one workspace resource read returns.
-pub(crate) fn rendered_workspace(uri: &str, page: &WorkspaceResourcePage) -> ReadResourceResult {
+///
+/// # Errors
+///
+/// Returns the registered answer failure when the compact text crosses its byte limit.
+pub(crate) fn rendered_workspace(
+    uri: &str,
+    page: &WorkspaceResourcePage,
+) -> Result<ReadResourceResult, ErrorData> {
     let body = serde_json::to_string(page)
         .unwrap_or_else(|error| unreachable!("workspace resource pages serialize: {error}"));
-    ReadResourceResult::new(vec![
-        ResourceContents::text(body, uri).with_mime_type(RESOURCE_MEDIA_TYPE),
-    ])
+    Ok(answer(uri, resource_text(page)?, body))
 }
 
-/// The typed answer one `rift://map` read returns: the cached snapshot, serialized as is.
-pub(crate) fn rendered_map(uri: &str, map: &WorkspaceMap) -> ReadResourceResult {
+/// The typed answer one `rift://map` read returns: the cached snapshot, as text and as JSON.
+///
+/// # Errors
+///
+/// Returns the registered answer failure when the compact text crosses its byte limit.
+pub(crate) fn rendered_map(uri: &str, map: &WorkspaceMap) -> Result<ReadResourceResult, ErrorData> {
     let body = serde_json::to_string(map)
         .unwrap_or_else(|error| unreachable!("the workspace map serializes: {error}"));
+    Ok(answer(uri, resource_text(map)?, body))
+}
+
+/// One read answer: the compact text first, then the JSON body, both for `uri`.
+fn answer(uri: &str, text: String, json: String) -> ReadResourceResult {
     ReadResourceResult::new(vec![
-        ResourceContents::text(body, uri).with_mime_type(RESOURCE_MEDIA_TYPE),
+        ResourceContents::text(text, uri).with_mime_type(TEXT_MEDIA_TYPE),
+        ResourceContents::text(json, uri).with_mime_type(RESOURCE_MEDIA_TYPE),
     ])
 }
 
-/// One stored record as the wire carries it. `fields` is embedded as the object
-/// it was rendered from when it parses, and as text when it does not, so a
-/// reader never has to unquote JSON out of a string.
-fn rendered_record(stored: &StoredLogRecord) -> Value {
+/// The text and the JSON body of one log page, both made from `page`.
+fn logs_answer(uri: &str, page: &LogsPage<'_>) -> Result<ReadResourceResult, ErrorData> {
+    Ok(answer(
+        uri,
+        resource_text(page)?,
+        logs_json(uri, page).to_string(),
+    ))
+}
+
+/// The JSON body of one log page.
+fn logs_json(uri: &str, page: &LogsPage<'_>) -> Value {
+    let mut body = json!({
+        "uri": uri,
+        "records": page.records.iter().map(record_json).collect::<Vec<Value>>(),
+        "record_count": page.records.len(),
+    });
+    if let Some(reason) = page.unavailable {
+        body["unavailable"] = json!(reason);
+    }
+    body
+}
+
+/// One stored record as the view the text and the JSON are both made from. `fields` is the
+/// object it was rendered from when it parses, and the text when it does not, so a reader never
+/// has to unquote JSON out of a string.
+fn log_line(stored: &StoredLogRecord) -> LogLine<'_> {
     let record = stored.record();
-    let fields = serde_json::from_str::<Map<String, Value>>(record.fields())
-        .map_or_else(|_| json!(record.fields()), Value::Object);
+    LogLine {
+        identity: stored.identity(),
+        recorded_at_ms: record.recorded_at_ms(),
+        level: record.level(),
+        target: record.target(),
+        component: record.component(),
+        operation: record.operation(),
+        message: record.message(),
+        fields: LogFields::parse(record.fields()),
+    }
+}
+
+/// One record of the view as the JSON wire carries it.
+fn record_json(line: &LogLine<'_>) -> Value {
+    let LogLine {
+        identity,
+        recorded_at_ms,
+        level,
+        target,
+        component,
+        operation,
+        message,
+        fields,
+    } = line;
     json!({
-        "identity": stored.identity(),
-        "recorded_at_ms": record.recorded_at_ms(),
-        "level": record.level(),
-        "target": record.target(),
-        "component": record.component(),
-        "operation": record.operation(),
-        "message": record.message(),
-        "fields": fields,
+        "identity": identity,
+        "recorded_at_ms": recorded_at_ms,
+        "level": level,
+        "target": target,
+        "component": component,
+        "operation": operation,
+        "message": message,
+        "fields": fields.to_json(),
     })
 }
 
@@ -228,23 +298,43 @@ mod tests {
         WORKSPACE_URI, declared_resources, declared_templates, is_workspace_uri, log_query,
         logs_unavailable, rendered_logs, rendered_map, rendered_workspace, workspace_page_index,
     };
+    use crate::output::resource_text;
     use rift_index::{LOG_PAGE_RECORDS_MAX, LogRecord, LogStore, StoredLogRecord};
     use rift_protocol::map::WorkspaceMap;
     use rift_protocol::read::{Digest, Pagination};
     use rift_protocol::workspace::WorkspaceResourcePage;
-    use rmcp::model::ResourceContents;
-    use serde_json::Value;
+    use rmcp::model::{ReadResourceResult, ResourceContents};
+    use serde_json::{Value, json};
 
     const PAGE: u64 = 100;
     /// The same page as the read bound it becomes.
     const PAGE_RECORDS: usize = 100;
 
-    /// The text one rendered answer carries.
-    fn text(result: &rmcp::model::ReadResourceResult) -> String {
-        match result.contents.first() {
-            Some(ResourceContents::TextResourceContents { text, .. }) => text.clone(),
-            other => unreachable!("a resource read answers with text, not {other:?}"),
-        }
+    /// The two contents one rendered answer carries, as compact text and as JSON.
+    ///
+    /// Asserts the order, the media types, and that both are for `uri`.
+    fn contents(result: &ReadResourceResult, uri: &str) -> (String, String) {
+        let [
+            ResourceContents::TextResourceContents {
+                uri: text_uri,
+                mime_type: text_mime,
+                text: compact,
+                ..
+            },
+            ResourceContents::TextResourceContents {
+                uri: json_uri,
+                mime_type: json_mime,
+                text: json,
+                ..
+            },
+        ] = &result.contents[..]
+        else {
+            unreachable!("a resource read answers two text contents: {result:?}");
+        };
+        assert_eq!((text_uri.as_str(), json_uri.as_str()), (uri, uri));
+        assert_eq!(text_mime.as_deref(), Some("text/plain"));
+        assert_eq!(json_mime.as_deref(), Some("application/json"));
+        (compact.clone(), json.clone())
     }
 
     /// Empty first workspace page under one accepted configuration revision.
@@ -318,8 +408,8 @@ mod tests {
         assert_eq!(query.limit(), LOG_PAGE_RECORDS_MAX);
     }
 
-    #[tokio::test]
-    async fn a_rendered_answer_carries_the_records_as_json() {
+    /// Two stored records, the older one with object fields and the newer one with text.
+    async fn stored_records() -> Vec<StoredLogRecord> {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let database = rift_index::WorkspaceDatabase::open(
             &directory.path().join("db"),
@@ -330,41 +420,148 @@ mod tests {
         let store = LogStore::attached(database);
         store
             .append(
-                &[LogRecord::new(
-                    7,
-                    "WARN",
-                    "rift_mcp::server",
-                    "index",
-                    "index.reconcile",
-                    "the capture disagreed",
-                    "{\"epoch\":\"4\"}",
-                )],
+                &[
+                    LogRecord::new(
+                        7,
+                        "WARN",
+                        "rift_mcp::server",
+                        "index",
+                        "index.reconcile",
+                        "the capture disagreed",
+                        "{\"epoch\":\"4\"}",
+                    ),
+                    LogRecord::new(
+                        1_791_110_527_120,
+                        "INFO",
+                        "rift_mcp::server",
+                        "",
+                        "",
+                        "",
+                        "not an object",
+                    ),
+                ],
                 100,
             )
             .await
-            .expect("the record lands");
-        let records: Vec<StoredLogRecord> = store
+            .expect("the records land");
+        store
             .recent(&rift_index::LogQuery::newest(10))
             .await
-            .expect("the read answers");
+            .expect("the read answers")
+    }
 
-        let rendered = rendered_logs(LOGS_URI, &records);
+    #[tokio::test]
+    async fn a_rendered_answer_carries_the_records_as_json() {
+        let records = stored_records().await;
 
-        let body: Value = serde_json::from_str(&text(&rendered)).expect("the body is JSON");
-        assert_eq!(body["record_count"], 1);
-        assert_eq!(body["records"][0]["level"], "warn");
-        assert_eq!(body["records"][0]["component"], "index");
-        assert_eq!(body["records"][0]["fields"]["epoch"], "4");
-        assert_eq!(body["records"][0]["message"], "the capture disagreed");
+        let rendered = rendered_logs(LOGS_URI, &records).expect("the text renders");
+
+        let (_, json_body) = contents(&rendered, LOGS_URI);
+        let body: Value = serde_json::from_str(&json_body).expect("the body is JSON");
+        assert_eq!(body["record_count"], 2);
+        assert_eq!(body["records"][1]["level"], "warn");
+        assert_eq!(body["records"][1]["component"], "index");
+        assert_eq!(body["records"][1]["fields"]["epoch"], "4");
+        assert_eq!(body["records"][1]["message"], "the capture disagreed");
+        assert_eq!(body["records"][0]["fields"], "not an object");
+    }
+
+    #[tokio::test]
+    async fn the_logs_json_is_the_body_the_read_returned_before_the_text_was_added() {
+        let records = stored_records().await;
+
+        let rendered = rendered_logs(LOGS_URI, &records).expect("the text renders");
+
+        let expected = json!({
+            "uri": LOGS_URI,
+            "records": [
+                {
+                    "identity": 2,
+                    "recorded_at_ms": 1_791_110_527_120_i64,
+                    "level": "info",
+                    "target": "rift_mcp::server",
+                    "component": "",
+                    "operation": "",
+                    "message": "",
+                    "fields": "not an object",
+                },
+                {
+                    "identity": 1,
+                    "recorded_at_ms": 7,
+                    "level": "warn",
+                    "target": "rift_mcp::server",
+                    "component": "index",
+                    "operation": "index.reconcile",
+                    "message": "the capture disagreed",
+                    "fields": {"epoch": "4"},
+                },
+            ],
+            "record_count": 2,
+        });
+        assert_eq!(contents(&rendered, LOGS_URI).1, expected.to_string());
+    }
+
+    #[tokio::test]
+    async fn the_logs_text_states_the_records_the_json_carries() {
+        let records = stored_records().await;
+
+        let rendered = rendered_logs(LOGS_URI, &records).expect("the text renders");
+
+        assert_eq!(
+            contents(&rendered, LOGS_URI).0,
+            "2 records\n\
+             \t2026-10-04 10:42:07.120 info - - · not an object\n\
+             \t1970-01-01 00:00:00.007 warn index index.reconcile: the capture disagreed · epoch 4\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_level_read_echoes_its_uri_in_both_contents() {
+        let records = stored_records().await;
+        let uri = format!("{LOGS_LEVEL_PREFIX}warn");
+
+        let rendered = rendered_logs(&uri, &records).expect("the text renders");
+
+        let (compact, json_body) = contents(&rendered, &uri);
+        assert!(compact.starts_with("2 records\n"), "{compact}");
+        assert!(json_body.contains("rift://logs/level/warn"), "{json_body}");
     }
 
     #[test]
     fn an_unavailable_store_answers_with_its_reason() {
-        let rendered = logs_unavailable(LOGS_URI, "the log store failed to open");
+        let rendered =
+            logs_unavailable(LOGS_URI, "the log store failed to open").expect("the text renders");
 
-        let body: Value = serde_json::from_str(&text(&rendered)).expect("the body is JSON");
+        let (compact, json_body) = contents(&rendered, LOGS_URI);
+        let body: Value = serde_json::from_str(&json_body).expect("the body is JSON");
         assert_eq!(body["record_count"], 0);
         assert_eq!(body["unavailable"], "the log store failed to open");
+        assert_eq!(
+            json_body,
+            json!({
+                "uri": LOGS_URI,
+                "records": [],
+                "record_count": 0,
+                "unavailable": "the log store failed to open",
+            })
+            .to_string()
+        );
+        assert_eq!(
+            compact,
+            "0 records\n1 warning\n\tunavailable: the log store failed to open\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_record_set_answers_the_header_and_the_empty_body() {
+        let rendered = rendered_logs(LOGS_URI, &[]).expect("the text renders");
+
+        let (compact, json_body) = contents(&rendered, LOGS_URI);
+        assert_eq!(compact, "0 records\n");
+        assert_eq!(
+            json_body,
+            json!({"uri": LOGS_URI, "records": [], "record_count": 0}).to_string()
+        );
     }
 
     #[test]
@@ -409,20 +606,38 @@ mod tests {
     }
 
     #[test]
-    fn rendered_workspace_answer_carries_typed_json() {
-        let rendered = rendered_workspace(WORKSPACE_URI, &workspace_page());
-        let body: Value = serde_json::from_str(&text(&rendered)).expect("the body is JSON");
+    fn rendered_workspace_answer_carries_compact_text_then_typed_json() {
+        let page = workspace_page();
+        let rendered = rendered_workspace(WORKSPACE_URI, &page).expect("the text renders");
 
+        let (compact, json_body) = contents(&rendered, WORKSPACE_URI);
+        let body: Value = serde_json::from_str(&json_body).expect("the body is JSON");
+        assert_eq!(
+            json_body,
+            serde_json::to_string(&page).expect("page serializes")
+        );
         assert_eq!(body["configuration_revision"], "3f9a1c2e");
-        assert_eq!(body["languages"], serde_json::json!([]));
-        assert_eq!(body["source"], serde_json::json!([]));
-        match rendered.contents.first() {
-            Some(ResourceContents::TextResourceContents { uri, mime_type, .. }) => {
-                assert_eq!(uri, WORKSPACE_URI);
-                assert_eq!(mime_type.as_deref(), Some("application/json"));
-            }
-            other => unreachable!("a workspace read answers with text, not {other:?}"),
-        }
+        assert_eq!(body["languages"], json!([]));
+        assert_eq!(body["source"], json!([]));
+        assert_eq!(compact, resource_text(&page).expect("page renders"));
+        assert_eq!(compact, "workspace 3f9a1c2e\n");
+    }
+
+    #[test]
+    fn a_workspace_page_read_names_its_uri_in_both_contents() {
+        let uri = "rift://workspace?page_index=2";
+        let mut page = workspace_page();
+        page.pagination = Pagination {
+            page_index: 2,
+            total_pages: 4,
+        };
+
+        let rendered = rendered_workspace(uri, &page).expect("the text renders");
+
+        assert_eq!(
+            contents(&rendered, uri).0,
+            "workspace 3f9a1c2e · page 3/4\n"
+        );
     }
 
     /// Empty map under one revision, computed by nothing this test builds.
@@ -445,22 +660,23 @@ mod tests {
     }
 
     #[test]
-    fn rendered_map_answer_carries_typed_json() {
-        let rendered = rendered_map(MAP_URI, &empty_map());
-        let body: Value = serde_json::from_str(&text(&rendered)).expect("the body is JSON");
+    fn rendered_map_answer_carries_compact_text_then_typed_json() {
+        let map = empty_map();
+        let rendered = rendered_map(MAP_URI, &map).expect("the text renders");
 
+        let (compact, json_body) = contents(&rendered, MAP_URI);
+        let body: Value = serde_json::from_str(&json_body).expect("the body is JSON");
+        assert_eq!(
+            json_body,
+            serde_json::to_string(&map).expect("map serializes")
+        );
         assert_eq!(body["revision"], "3f9a1c2e");
         assert!(
             body.get("languages").is_none(),
             "empty collections are omitted"
         );
-        match rendered.contents.first() {
-            Some(ResourceContents::TextResourceContents { uri, mime_type, .. }) => {
-                assert_eq!(uri, MAP_URI);
-                assert_eq!(mime_type.as_deref(), Some("application/json"));
-            }
-            other => unreachable!("a map read answers with text, not {other:?}"),
-        }
+        assert_eq!(compact, resource_text(&map).expect("map renders"));
+        assert_eq!(compact, "map 3f9a1c2e\n");
     }
 
     #[test]

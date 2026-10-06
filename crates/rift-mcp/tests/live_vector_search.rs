@@ -9,7 +9,8 @@
 //!
 //! The suite drives a live rmcp client and reads the tier's state the way a
 //! caller does, from a `search` result's own warnings: `local_index_preparing`
-//! while files prepare, then `vector_index_preparing` while declarations are embedded.
+//! while files prepare, `lexical_ranking_unavailable` while the lexical lane commits
+//! the published tree, then `vector_index_preparing` while declarations are embedded.
 //! Nothing here reads server internals, because nothing a caller cannot see is
 //! what this suite is for.
 //!
@@ -126,23 +127,34 @@ async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestRes
         .ok_or_else(|| "search must return structured content".into())
 }
 
-/// Whether local preparation or vector ranking still prevents a complete answer.
+/// Whether local preparation, the lexical commit, or vector ranking still prevents a
+/// complete answer.
 fn tier_is_waiting(answer: &Value) -> bool {
     answer["warnings"]
         .as_array()
         .is_some_and(|warnings| warnings.iter().any(is_preparation_warning))
 }
 
-/// Whether one warning reports unfinished local preparation or vector ranking.
+/// Whether one warning reports unfinished local preparation, a full-text tier that did
+/// not rank the answer, or unfinished vector ranking.
+///
+/// The vector ranking's readiness travels with the store's ranking. An answer carrying
+/// `lexical_ranking_unavailable` was ranked by identifier matching alone, so it carries no
+/// vector warning and states nothing about the vector ranking.
 fn is_preparation_warning(warning: &Value) -> bool {
     matches!(
         warning["code"].as_str(),
-        Some("local_index_preparing" | "vector_index_preparing" | "vector_ranking_unavailable")
+        Some(
+            "local_index_preparing"
+                | "lexical_ranking_unavailable"
+                | "vector_index_preparing"
+                | "vector_ranking_unavailable"
+        )
     )
 }
 
-/// Polls `query` until local and vector preparation finish, and returns
-/// the answer it settled on together with how long that took.
+/// Polls `query` until local preparation, the lexical commit, and vector preparation
+/// finish, and returns the answer it settled on together with how long that took.
 ///
 /// The loop runs at most `budget / READINESS_POLL` times, so a hub that never
 /// answers spends the budget and fails naming the last warnings it saw. It never
@@ -212,6 +224,23 @@ fn test_tier_is_waiting_for_empty_and_nonempty_local_preparation() {
 }
 
 #[test]
+fn test_tier_is_waiting_for_a_pending_lexical_commit() {
+    // A search that meets a pending lexical commit is ranked by identifier matching alone:
+    // the store ranked nothing, so the answer carries no vector warning either.
+    let answer = json!({
+        "results": [],
+        "warnings": [{
+            "code": "lexical_ranking_unavailable",
+            "detail": "the lexical index is still committing tree revision bb5939cd"
+        }]
+    });
+    assert!(
+        tier_is_waiting(&answer),
+        "the lexical commit remains: {answer:#}"
+    );
+}
+
+#[test]
 fn test_tier_is_waiting_preserves_vector_preparation_and_unavailable() {
     for code in ["vector_index_preparing", "vector_ranking_unavailable"] {
         let answer = json!({"warnings": [{"code": code}]});
@@ -243,8 +272,9 @@ async fn a_paraphrase_reaches_code_it_shares_no_word_with() -> TestResult {
     }
     assert_shares_no_token(PARAPHRASE, &workspace());
 
-    // Local preparation must finish before the disabled-vector control can prove
-    // that the same files do not answer the paraphrase through lexical ranking.
+    // Local preparation and the lexical commit must finish before the disabled-vector
+    // control can prove that the same files do not answer the paraphrase through lexical
+    // ranking.
     let (_off_directory, off, off_task) =
         served_configured_workspace(&workspace(), Some(VECTOR_DISABLED)).await?;
     let (lexical_only, _) = ready_answer(&off, PARAPHRASE, WARM_READY_MAX).await?;

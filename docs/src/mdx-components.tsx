@@ -1,7 +1,8 @@
-import { Tab } from "fumadocs-ui/components/tabs";
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
 import defaultMdxComponents from "fumadocs-ui/mdx";
 import type { MDXComponents } from "mdx/types";
 import { CliHelp } from "@/components/cli-help";
+import { ExampleTabs } from "@/components/example-tabs";
 import { McpTool } from "@/components/mcp-tool";
 import { PlatformTabs } from "@/components/platform-tabs";
 import { VersionBadge } from "@/components/version-badge";
@@ -18,9 +19,11 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     {
       ...defaultMdxComponents,
       CliHelp,
+      ExampleTabs,
       McpTool,
       PlatformTabs,
       Tab,
+      Tabs,
       VersionBadge,
     },
     components,
