@@ -1257,12 +1257,8 @@ fn a_dependency_span_without_labels_is_not_the_root() {
 /// the default stderr filter into `io::sink`, and the capture under the default capture
 /// filter into a queue a drain thread empties. 1,000,000 `traced!` block
 /// operations per run, split across 1 and 8 threads, then as many events inside one span.
-/// Prints the median nanoseconds per operation and per event over five runs of every
-/// thread. Run it alone in a release build:
-///
-/// ```text
-/// cargo test -p rift-tracing --release --lib -- --ignored --nocapture operation_record_cost
-/// ```
+/// Emits each worker sample after timed work. The Python collector computes medians from
+/// the retained logs.
 #[test]
 #[ignore = "a measurement, not a check; run it alone in a release build"]
 fn operation_record_cost() {
@@ -1305,14 +1301,10 @@ fn operation_record_cost() {
                 tracing_subscriber::EnvFilter::new(DEFAULT_TRACING_FILTER),
             )),
     );
-    let median = |mut samples: Vec<f64>| {
-        samples.sort_by(f64::total_cmp);
-        samples[samples.len() / 2]
-    };
+    crate::__private::stream_unscoped();
+    let mut samples = Vec::with_capacity((RUNS * 9) as usize);
     for threads in [1_u32, 8] {
         let per_thread = OPERATIONS / threads;
-        let mut operations = Vec::new();
-        let mut events = Vec::new();
         for _ in 0..RUNS {
             let start = Arc::new(Barrier::new(threads as usize));
             let workers: Vec<_> = (0..threads)
@@ -1350,13 +1342,17 @@ fn operation_record_cost() {
                 .collect();
             for worker in workers {
                 let (opened, emitted) = worker.join().expect("a worker finishes");
-                operations.push(opened.as_secs_f64() * 1e9 / f64::from(per_thread));
-                events.push(emitted.as_secs_f64() * 1e9 / f64::from(per_thread));
+                samples.push((
+                    threads,
+                    opened.as_secs_f64() * 1e9 / f64::from(per_thread),
+                    emitted.as_secs_f64() * 1e9 / f64::from(per_thread),
+                ));
             }
         }
-        let (operation, event) = (median(operations), median(events));
-        println!("threads={threads} operation_ns={operation:.1} event_ns={event:.1}");
     }
     draining.store(false, Ordering::Relaxed);
     drainer.join().expect("the drain thread finishes");
+    for (threads, operation_ns, event_ns) in samples {
+        crate::info!(threads, operation_ns, event_ns, "operation_record_cost");
+    }
 }

@@ -795,14 +795,9 @@ fn a_counter_records_through_add_built_only_once_built() {
 }
 
 /// The cost of one counter add and one histogram record from one thread, 1,000,000 of
-/// each, the median nanoseconds per record over five runs. With `RIFT_COST_METER=1` the
-/// process installs a meter first; without it no meter exists and every record is a
-/// no-op. Run it alone in a release build, once each way:
-///
-/// ```text
-/// cargo test -p rift-tracing --release --lib -- --ignored --nocapture record_path_cost
-/// RIFT_COST_METER=1 cargo test -p rift-tracing --release --lib -- --ignored --nocapture record_path_cost
-/// ```
+/// each, over five runs. `RIFT_COST_METER=1` installs a meter before timing; otherwise
+/// every timed record is a no-op. The test emits each sample after timing, and the Python
+/// collector computes medians from retained logs.
 #[test]
 #[ignore = "a measurement, not a check; run it alone in a release build"]
 fn record_path_cost() {
@@ -823,32 +818,36 @@ fn record_path_cost() {
     );
 
     let recorder = std::env::var_os("RIFT_COST_METER").map(|_| recorder());
-    let median = |mut samples: Vec<f64>| {
-        samples.sort_by(f64::total_cmp);
-        samples[samples.len() / 2]
-    };
-    let mut counter = Vec::new();
-    let mut histogram = Vec::new();
+    let mut samples = Vec::with_capacity(RUNS as usize);
     for _ in 0..RUNS {
         let counter_started = Instant::now();
         for _ in 0..RECORDS {
             CALLS.labeled(["lexical.commit", "Ok", ""]).add(1);
         }
-        counter.push(counter_started.elapsed().as_secs_f64() * 1e9 / f64::from(RECORDS));
+        let counter_ns_per_record =
+            counter_started.elapsed().as_secs_f64() * 1e9 / f64::from(RECORDS);
         let histogram_started = Instant::now();
         for _ in 0..RECORDS {
             DURATION
                 .labeled(["index", "exec", ""])
                 .record(Duration::from_micros(40));
         }
-        histogram.push(histogram_started.elapsed().as_secs_f64() * 1e9 / f64::from(RECORDS));
+        let histogram_ns_per_record =
+            histogram_started.elapsed().as_secs_f64() * 1e9 / f64::from(RECORDS);
+        samples.push((
+            meter_installed(),
+            counter_ns_per_record,
+            histogram_ns_per_record,
+        ));
     }
-    println!(
-        "meter={} counter_ns_per_record={:.1} histogram_ns_per_record={:.1}",
-        meter_installed(),
-        median(counter),
-        median(histogram)
-    );
+    for (meter, counter_ns_per_record, histogram_ns_per_record) in samples {
+        crate::info!(
+            meter,
+            counter_ns_per_record,
+            histogram_ns_per_record,
+            "record_path_cost"
+        );
+    }
     if let Some(recorder) = recorder {
         let calls = value(
             &recorder.metrics(),
