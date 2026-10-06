@@ -1,5 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::{
     PanicOutput, RetainedRecords, SCOPED_RECORDER_PRINT_BYTES_MAX,
@@ -119,6 +121,36 @@ fn a_recorder_prints_nothing_when_its_test_passes() -> TestResult {
     drop(recorder);
 
     assert_eq!(*printed.lock().map_err(|_| "not poisoned")?, "");
+    Ok(())
+}
+
+/// The clock a builder names is the one the recorder's thread reads, through
+/// `monotonic_now` and `measure_elapsed!`; another thread keeps the process clock.
+#[test]
+fn a_recorder_clock_is_read_on_its_thread_alone() -> TestResult {
+    let far = Duration::from_secs(1 << 40);
+    let clock = Arc::new(AtomicU64::new(0));
+    let reading = Arc::clone(&clock);
+    let (recorder, _drain) = ScopedRecorder::builder()
+        .clock(move || far + Duration::from_millis(reading.load(Ordering::Relaxed)))
+        .install()?;
+
+    let ((), measurement) = crate::measure_elapsed!("test.measured", {
+        clock.fetch_add(40, Ordering::Relaxed);
+    })?;
+    let here = crate::__private::monotonic_now();
+    let elsewhere = std::thread::spawn(crate::__private::monotonic_now)
+        .join()
+        .map_err(|_| "the thread does not panic")?;
+    drop(recorder);
+
+    assert_eq!(measurement.elapsed(), Duration::from_millis(40));
+    assert_eq!(here, far + Duration::from_millis(40));
+    assert!(elsewhere < far, "{elsewhere:?}");
+    assert!(
+        crate::__private::monotonic_now() < far,
+        "the clock ends with the recorder"
+    );
     Ok(())
 }
 

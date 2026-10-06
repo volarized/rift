@@ -1,10 +1,18 @@
+use std::future::Future as _;
+use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
 use tracing::field::Visit as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use super::{
     EVENT_SPAN_MEMBERS_BYTES_MAX, LOG_QUEUE_RECORDS, PANIC_PAYLOAD_BYTES_MAX, RecordedFields,
-    SPAN_FIELDS_BYTES_MAX, install_panic_hook, log_capture, panic_payload, quoted,
+    SPAN_FIELDS_BYTES_MAX, SpanContextLayer, install_panic_hook, log_capture, panic_payload,
+    quoted,
 };
 use crate::{LOG_LABEL_BYTES_MAX, LogDrain, LogRecord};
 
@@ -798,28 +806,48 @@ fn an_operation_and_an_event_record_the_function_that_made_them() {
 }
 
 /// A close record states how long its operation was entered and how long it waited,
-/// in nanoseconds: an awaited operation suspended on a timer is idle for the wait.
-#[tokio::test(start_paused = false)]
-async fn a_close_record_carries_busy_and_idle_time_across_a_suspension() {
+/// in nanoseconds, on the clock its subscriber's span context reads: an awaited operation
+/// suspended between two polls is idle for the wait.
+#[test]
+fn a_close_record_carries_busy_and_idle_time_across_a_suspension() {
+    let clock = Arc::new(AtomicU64::new(0));
+    let reading = Arc::clone(&clock);
     let (sink, mut drain) = log_capture();
-    let subscriber = crate::capture::registry().with(sink);
+    let subscriber = tracing_subscriber::registry()
+        .with(SpanContextLayer::with_clock(Arc::new(move || {
+            Duration::from_nanos(reading.load(Ordering::Relaxed))
+        })))
+        .with(sink);
     let _default = tracing::subscriber::set_default(subscriber);
 
-    crate::traced!("index.wait", async {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    })
-    .await;
+    let mut suspended = false;
+    let mut work = pin!(crate::traced!("index.wait", async {
+        clock.fetch_add(2_000_000, Ordering::Relaxed);
+        std::future::poll_fn(|context| {
+            if std::mem::replace(&mut suspended, true) {
+                return Poll::Ready(());
+            }
+            context.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+        clock.fetch_add(3_000_000, Ordering::Relaxed);
+    }));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(work.as_mut().poll(&mut context).is_pending());
+    clock.fetch_add(20_000_000, Ordering::Relaxed);
+    assert!(work.as_mut().poll(&mut context).is_ready());
 
     let fields = fields_of(&queued(&mut drain), "index.wait");
-    let nanoseconds = |member: &str| {
-        fields[member]
-            .as_str()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or_else(|| panic!("{member} is a count: {fields}"))
-    };
-    let (busy, idle) = (nanoseconds("busy_ns"), nanoseconds("idle_ns"));
-    assert!(idle >= 20_000_000, "the timer wait is idle: {fields}");
-    assert!(busy < idle, "polling is shorter than the wait: {fields}");
+    assert_eq!(
+        fields["busy_ns"], "5000000",
+        "two polls of the work: {fields}"
+    );
+    assert_eq!(
+        fields["idle_ns"], "20000000",
+        "the wait between them: {fields}"
+    );
+    assert_eq!(fields["elapsed_ms"], "25", "{fields}");
     assert_eq!(fields["status.code"], "Ok", "{fields}");
     assert!(fields.get("error.type").is_none(), "{fields}");
 }
@@ -868,9 +896,6 @@ fn a_close_record_states_a_panic_and_a_cancellation() {
 
 /// Runs one operation per way of ending, each recording how it ended on its own span.
 fn record_failures_on_spans() {
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
-
     let outcome = |name: &'static str, value: &'static str| {
         let span = crate::Span::current();
         span.record("outcome", value);

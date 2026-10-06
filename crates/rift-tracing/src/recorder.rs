@@ -15,16 +15,21 @@
 //!
 //! Metrics are the process's: the first recorder installs the process's meter, and
 //! [`ScopedRecorder::metrics`] reads what the OpenTelemetry SDK exports from it.
+//!
+//! Span timings and [`monotonic_now`](crate::__private::monotonic_now) on the recorder's
+//! thread read the clock [`ScopedRecorderBuilder::clock`] names, so a test moves time by
+//! hand instead of sleeping.
 
 mod metrics;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tracing_subscriber::layer::SubscriberExt as _;
 
-use crate::capture::log_capture;
+use crate::capture::{SpanContextLayer, log_capture};
 use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable, observe_active};
 use crate::metrics::ObservationGuard;
@@ -97,6 +102,7 @@ impl ScopedRecorder {
         ScopedRecorderBuilder {
             capture: None,
             stream: std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_some(),
+            clock: None,
         }
     }
 
@@ -139,12 +145,24 @@ impl Drop for ScopedRecorder {
 }
 
 /// The settings [`ScopedRecorderBuilder::install`] builds the recorder from.
-#[derive(Debug)]
 #[must_use = "a builder installs nothing until `install` runs"]
 pub struct ScopedRecorderBuilder {
     capture: Option<String>,
     /// Whether [`SCOPED_RECORDER_STREAM_VARIABLE`] was set when the builder was made.
     stream: bool,
+    /// The clock [`Self::clock`] named.
+    clock: Option<Arc<dyn Fn() -> Duration + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ScopedRecorderBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopedRecorderBuilder")
+            .field("capture", &self.capture)
+            .field("stream", &self.stream)
+            .field("clock", &self.clock.is_some())
+            .finish()
+    }
 }
 
 impl ScopedRecorderBuilder {
@@ -155,6 +173,37 @@ impl ScopedRecorderBuilder {
     /// them: the SDK reports each instrument it builds at `DEBUG`.
     pub fn capture(mut self, filter: &str) -> Self {
         self.capture = Some(filter.to_owned());
+        self
+    }
+
+    /// Reads `now` as the monotonic clock while the recorder is held: every span timing,
+    /// and with it each `traced!` operation's duration and its close record's
+    /// `elapsed_ms`, and every [`monotonic_now`](crate::__private::monotonic_now) read on
+    /// the recorder's thread, such as `measure_elapsed!`'s. `now` returns the time since
+    /// any fixed epoch; a test advances what it returns instead of sleeping. Without it
+    /// the recorder reads the process's monotonic clock. Other threads, and other
+    /// recorders, keep their own clock.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::time::Duration;
+    ///
+    /// let elapsed_ms = Arc::new(AtomicU64::new(0));
+    /// let clock = Arc::clone(&elapsed_ms);
+    /// let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+    ///     .clock(move || Duration::from_millis(clock.load(Ordering::Relaxed)))
+    ///     .install()?;
+    /// let ((), measurement) = rift_tracing::measure_elapsed!("index.parse", {
+    ///     elapsed_ms.fetch_add(250, Ordering::Relaxed);
+    /// })
+    /// .expect("the clock does not regress");
+    /// assert_eq!(measurement.elapsed(), Duration::from_millis(250));
+    /// drop(recorder);
+    /// # Ok::<(), rift_tracing::LogFilterError>(())
+    /// ```
+    pub fn clock(mut self, now: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
+        self.clock = Some(Arc::new(now));
         self
     }
 
@@ -188,7 +237,11 @@ impl ScopedRecorderBuilder {
         metrics::install();
         let flights = Arc::new(FlightTable::default());
         let in_flight = observe_active(&flights);
-        let subscriber = crate::capture::registry()
+        let span_context = self
+            .clock
+            .map_or_else(SpanContextLayer::default, SpanContextLayer::with_clock);
+        let subscriber = tracing_subscriber::registry()
+            .with(span_context)
             .with(FlightLayer::new(flights))
             .with(capture_layer(sink, filter));
         let recorder = ScopedRecorder {

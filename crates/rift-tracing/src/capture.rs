@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::{self, Sender, error::TrySendError};
 use tracing::field::{Field, Visit};
@@ -24,6 +24,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
 use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
+use crate::measurement::process_monotonic_now;
 use crate::metrics::Counter;
 use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
 
@@ -203,7 +204,7 @@ where
 /// [`SpanContextLayer`] first, so every span carries what its records need before any
 /// record layer runs.
 pub(crate) fn registry() -> Layered<SpanContextLayer, Registry> {
-    tracing_subscriber::registry().with(SpanContextLayer)
+    tracing_subscriber::registry().with(SpanContextLayer::default())
 }
 
 /// The `tracing` layer that keeps, for every span, what the records written inside it
@@ -219,8 +220,55 @@ pub(crate) fn registry() -> Layered<SpanContextLayer, Registry> {
 /// The busy and idle time follow `tracing-subscriber`'s own close timing
 /// (`fmt/fmt_layer.rs`, `on_enter`, `on_exit`, `on_close`): busy is the time the span was
 /// entered, idle the time it was not, both from its opening to its close.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SpanContextLayer;
+///
+/// The timings read the process's monotonic clock, or the clock a scoped recorder's builder
+/// named: one clock, so the close record and the operation metrics state one elapsed time.
+#[derive(Clone, Default)]
+pub(crate) struct SpanContextLayer {
+    /// The clock [`ScopedRecorderBuilder::clock`](crate::ScopedRecorderBuilder::clock)
+    /// named; `None` reads the process's monotonic clock.
+    #[cfg(any(test, feature = "fixtures"))]
+    clock: Option<Arc<dyn Fn() -> Duration + Send + Sync>>,
+}
+
+impl fmt::Debug for SpanContextLayer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpanContextLayer")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SpanContextLayer {
+    /// The layer whose timings read `clock` instead of the process's monotonic clock.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn with_clock(clock: Arc<dyn Fn() -> Duration + Send + Sync>) -> Self {
+        Self { clock: Some(clock) }
+    }
+
+    /// Reads the layer's clock.
+    fn now(&self) -> Duration {
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        process_monotonic_now()
+    }
+}
+
+/// The reading of the clock a scoped recorder named, when the thread's default subscriber
+/// carries one; `None` otherwise, and inside a subscriber callback, where `tracing` hands
+/// out no default.
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) fn scoped_now() -> Option<Duration> {
+    tracing::dispatcher::get_default(|dispatch| {
+        dispatch
+            .downcast_ref::<SpanContextLayer>()?
+            .clock
+            .as_ref()
+            .map(|clock| clock())
+    })
+}
 
 impl<S> Layer<S> for SpanContextLayer
 where
@@ -253,7 +301,7 @@ where
                 parent
             },
             node,
-            timings: Timings::opened(),
+            timings: Timings::opened(self.now()),
         });
     }
 
@@ -277,7 +325,7 @@ where
         if let Some(span) = context.span(id)
             && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
         {
-            entry.timings.entered();
+            entry.timings.entered(self.now());
         }
     }
 
@@ -285,7 +333,7 @@ where
         if let Some(span) = context.span(id)
             && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
         {
-            entry.timings.exited();
+            entry.timings.exited(self.now());
         }
     }
 
@@ -293,7 +341,7 @@ where
         if let Some(span) = context.span(&id)
             && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
         {
-            entry.timings.closed();
+            entry.timings.closed(self.now());
         }
     }
 
@@ -365,58 +413,86 @@ impl SpanEntry {
 }
 
 /// How long one span was busy and idle, in nanoseconds, as `tracing-subscriber`'s close
-/// timing counts them: busy while entered at least once, idle otherwise.
+/// timing counts them: busy while entered at least once, idle otherwise. Every reading
+/// comes from [`SpanContextLayer`]'s clock.
+///
+/// `completed` is the elapsed time from the opening to the end of the `traced!` operation
+/// the span times, read once when the operation's completion guard drops. The operation
+/// metrics and the close record's `elapsed_ms` both take it, so a clone of the span held
+/// past the operation lengthens neither.
 #[derive(Debug)]
 struct Timings {
     busy_ns: u64,
     idle_ns: u64,
-    last: Instant,
+    opened: Duration,
+    last: Duration,
     entered: u64,
+    completed: Option<Duration>,
 }
 
 impl Timings {
-    fn opened() -> Self {
+    const fn opened(now: Duration) -> Self {
         Self {
             busy_ns: 0,
             idle_ns: 0,
-            last: Instant::now(),
+            opened: now,
+            last: now,
             entered: 0,
+            completed: None,
         }
     }
 
-    /// Nanoseconds since the last change, the clock read once.
-    fn lap(&mut self) -> u64 {
-        let now = Instant::now();
-        let lap =
-            u64::try_from(now.saturating_duration_since(self.last).as_nanos()).unwrap_or(u64::MAX);
+    /// Nanoseconds since the last change, as of `now`.
+    fn lap(&mut self, now: Duration) -> u64 {
+        let lap = nanoseconds(now.saturating_sub(self.last));
         self.last = now;
         lap
     }
 
-    fn entered(&mut self) {
+    fn entered(&mut self, now: Duration) {
         if self.entered == 0 {
-            self.idle_ns = self.idle_ns.saturating_add(self.lap());
+            self.idle_ns = self.idle_ns.saturating_add(self.lap(now));
         }
         self.entered = self.entered.saturating_add(1);
     }
 
-    fn exited(&mut self) {
+    fn exited(&mut self, now: Duration) {
         self.entered = self.entered.saturating_sub(1);
         if self.entered == 0 {
-            self.busy_ns = self.busy_ns.saturating_add(self.lap());
+            self.busy_ns = self.busy_ns.saturating_add(self.lap(now));
         }
     }
 
     /// Ends the count at the close: the time since the last exit is idle, or busy for a
     /// span closed while entered.
-    fn closed(&mut self) {
-        let lap = self.lap();
+    fn closed(&mut self, now: Duration) {
+        let lap = self.lap(now);
         if self.entered == 0 {
             self.idle_ns = self.idle_ns.saturating_add(lap);
         } else {
             self.busy_ns = self.busy_ns.saturating_add(lap);
         }
     }
+
+    /// Keeps the elapsed time from the opening to `now` as the operation's own, and
+    /// returns it. `None`, and nothing kept, when `now` precedes the opening.
+    fn completed(&mut self, now: Duration) -> Option<Duration> {
+        let elapsed = now.checked_sub(self.opened)?;
+        self.completed = Some(elapsed);
+        Some(elapsed)
+    }
+
+    /// The nanoseconds the close record states as `elapsed_ms`: the operation's own
+    /// elapsed time when its completion kept one, else the span's busy and idle time.
+    fn elapsed_ns(&self) -> u64 {
+        self.completed
+            .map_or_else(|| self.busy_ns.saturating_add(self.idle_ns), nanoseconds)
+    }
+}
+
+/// `duration` in nanoseconds, saturating at `u64::MAX`.
+fn nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// One span as the records inside it see it: its labels and fields, the span it opened
@@ -498,6 +574,19 @@ pub(crate) fn span_failure(id: &tracing::span::Id) -> Option<&'static str> {
     })
 }
 
+/// Ends the `traced!` operation the open span `id` times: reads the clock of the thread's
+/// [`SpanContextLayer`] once and keeps the elapsed time since the span opened as the
+/// operation's own (see [`Timings`]). Returns that elapsed time; `None` when the thread's
+/// dispatcher keeps no entry for the span, or the clock reads before the opening.
+pub(crate) fn span_completed(id: &tracing::span::Id) -> Option<Duration> {
+    tracing::dispatcher::get_default(|dispatch| {
+        let now = dispatch.downcast_ref::<SpanContextLayer>()?.now();
+        let span = dispatch.downcast_ref::<Registry>()?.span(id)?;
+        let mut extensions = span.extensions_mut();
+        extensions.get_mut::<SpanEntry>()?.timings.completed(now)
+    })
+}
+
 /// The record of the span `id` closing: its name as the message, its own fields, then
 /// `span`, `elapsed_ms`, `busy_ns`, `idle_ns`, `status.code`, `error.type` when it did not
 /// complete, and, when it closes inside another span, `root_span` for the outermost span
@@ -522,7 +611,7 @@ where
     let Timings {
         busy_ns, idle_ns, ..
     } = entry.timings;
-    let elapsed_ms = busy_ns.saturating_add(idle_ns) / 1_000_000;
+    let elapsed_ms = entry.timings.elapsed_ns() / 1_000_000;
     if labels.fields.write_into(&mut fields) {
         fields.push(',');
     }

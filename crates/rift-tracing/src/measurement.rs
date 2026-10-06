@@ -4,13 +4,27 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Reads the process-local monotonic clock as the time since its first read.
+/// Reads the monotonic clock as the time since its first read.
 ///
 /// The epoch is fixed on the first read, so two readings subtract to the
-/// elapsed time between them.
+/// elapsed time between them. On a thread whose default subscriber is a
+/// [`ScopedRecorder`](crate::ScopedRecorder) built with
+/// [`clock`](crate::ScopedRecorderBuilder::clock), the reading is that clock's; a read
+/// made from inside a subscriber callback, where `tracing` hands out no default, reads
+/// the process clock.
 #[doc(hidden)]
 #[must_use]
 pub fn monotonic_now() -> Duration {
+    #[cfg(any(test, feature = "fixtures"))]
+    if let Some(now) = crate::capture::scoped_now() {
+        return now;
+    }
+    process_monotonic_now()
+}
+
+/// Reads the process-local monotonic clock as the time since its first read, whatever
+/// clock a scoped recorder named.
+pub(crate) fn process_monotonic_now() -> Duration {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed()
 }
@@ -87,7 +101,7 @@ impl PerformanceMeasurement {
 
 /// Evaluates an expression or block once and returns its value with the elapsed time.
 ///
-/// The macro reads the process-local monotonic clock before and after the
+/// The macro reads the monotonic clock before and after the
 /// body and returns `Result<(value, PerformanceMeasurement), ClockRegression>`.
 /// The operation name is a string literal. The body is inlined, so `?`,
 /// `return`, `break`, and `continue` inside it act on the enclosing function or

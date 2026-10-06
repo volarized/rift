@@ -1,5 +1,7 @@
 use std::future::Future;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -83,8 +85,8 @@ fn counter_adds_into_the_series_its_labels_select() {
     assert_eq!(series.labels(), [("error.type", "unwritten")]);
 }
 
-/// Before a meter is installed a recording reaches no instrument and a completion reads
-/// no clock; the instruments still build from the meter installed later.
+/// Before a meter is installed a recording reaches no instrument and a completion records
+/// nothing; the instruments still build from the meter installed later.
 #[test]
 fn a_recording_before_any_meter_records_nothing() {
     assert!(!meter_installed());
@@ -92,7 +94,7 @@ fn a_recording_before_any_meter_records_nothing() {
     QUEUE.value(3).record();
     WAIT.record(Duration::from_millis(1));
     let guard = completion("test.unrecorded");
-    assert!(!guard.records(), "no clock is read without a meter");
+    assert!(!guard.records(), "no metric is recorded without a meter");
     drop(guard);
 
     let recorder = recorder();
@@ -409,6 +411,56 @@ fn a_retained_span_clone_does_not_hold_the_completion_open() {
         "the call is recorded when the block ends, while its span is still held"
     );
     drop(retained);
+}
+
+/// A clock the test moves by hand, and the reading [`ScopedRecorderBuilder::clock`]
+/// takes from it: the nanoseconds added to it since its epoch.
+///
+/// [`ScopedRecorderBuilder::clock`]: crate::ScopedRecorderBuilder::clock
+fn manual_clock() -> (
+    Arc<AtomicU64>,
+    impl Fn() -> Duration + Send + Sync + 'static,
+) {
+    let nanoseconds = Arc::new(AtomicU64::new(0));
+    let reading = Arc::clone(&nanoseconds);
+    (nanoseconds, move || {
+        Duration::from_nanos(reading.load(Ordering::Relaxed))
+    })
+}
+
+/// The duration histogram records the elapsed time the operation's close record states as
+/// `elapsed_ms`: one reading at the end of the work. A clone of the span held past the
+/// work lengthens neither.
+#[test]
+fn the_duration_histogram_records_the_elapsed_time_of_the_close_record()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (clock, now) = manual_clock();
+    let (recorder, mut drain) = ScopedRecorder::builder().clock(now).install()?;
+    let retained = crate::traced!("test.timed", {
+        clock.fetch_add(250_000_000, Ordering::Relaxed);
+        crate::Span::current()
+    });
+    clock.fetch_add(4_000_000_000, Ordering::Relaxed);
+    drop(retained);
+    let snapshot = recorder.metrics();
+    drop(recorder);
+
+    let records = drain.queued_records();
+    let closed = records
+        .iter()
+        .find(|record| record.message() == "test.timed")
+        .ok_or("the operation's span wrote its close record")?;
+    let fields: serde_json::Value = serde_json::from_str(closed.fields())?;
+    assert_eq!(fields["elapsed_ms"], "250", "{fields}");
+    let mut labels = vec![("span.name", "test.timed"), ("span.kind", "Internal")];
+    labels.extend_from_slice(&OK);
+    let Some(SeriesValue::Buckets { count, sum, .. }) =
+        value(&snapshot, "traces.span.metrics.duration", &labels)
+    else {
+        return Err(format!("the duration histogram holds the operation: {snapshot:?}").into());
+    };
+    assert_eq!((count, sum), (1, 0.25), "250 ms, in seconds");
+    Ok(())
 }
 
 #[test]

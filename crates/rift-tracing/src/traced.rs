@@ -19,14 +19,15 @@ pin_project_lite::pin_project! {
     /// Where an awaited operation is: not yet polled, running under its span, or done.
     ///
     /// `Running` holds the operation's completion guard beside its work, so dropping
-    /// the future before the work returns records a cancelled operation. `Spent` holds
-    /// nothing: the operation completed, or its span constructor panicked while the work
-    /// moved into its span.
+    /// the future before the work returns records a cancelled operation. The guard is
+    /// declared first so it drops before the work, while the work's span is still open.
+    /// `Spent` holds nothing: the operation completed, or its span constructor panicked
+    /// while the work moved into its span.
     #[project = StageProjection]
     #[project_replace = StageReplacement]
     enum Stage<Work, Open> {
         Waiting { operation: &'static str, work: Work, open: Open },
-        Running { #[pin] work: Instrumented<Work>, completion: Completion },
+        Running { completion: Completion, #[pin] work: Instrumented<Work> },
         Spent,
     }
 }
@@ -76,12 +77,12 @@ where
             } = stage.as_mut().project_replace(Stage::Spent)
         {
             let work = work.instrument(open());
-            let completion = future_completion(operation);
-            stage.set(Stage::Running { work, completion });
+            let completion = future_completion(operation).of_span(work.span().id());
+            stage.set(Stage::Running { completion, work });
         }
         let StageProjection::Running {
-            mut work,
             completion,
+            mut work,
         } = stage.as_mut().project()
         else {
             panic!("a traced future was polled after it completed or its span constructor panicked")

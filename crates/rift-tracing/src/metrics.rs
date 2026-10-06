@@ -32,7 +32,7 @@ use std::time::Duration;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{AsyncInstrument, Meter};
 
-use crate::capture::span_failure;
+use crate::capture::{span_completed, span_failure};
 use crate::measurement::monotonic_now;
 
 /// Upper bucket boundaries, in seconds, of a duration histogram whose declaration names no
@@ -752,15 +752,20 @@ enum Ending {
 /// The completion of one `traced!` operation: its duration and its outcome, recorded once
 /// when the guard drops.
 ///
-/// The guard reads the monotonic clock only when a meter is installed, so a process that
-/// records no metrics pays one atomic read per operation. Retained clones of the
-/// operation's span do not lengthen the recorded duration: the guard drops when the work
-/// ends.
+/// The guard drops while the operation's span is open and ends the span's timing there
+/// (`capture::span_completed`): one clock read gives the elapsed time the histogram
+/// records and the span's close record states as `elapsed_ms`. Retained clones of the
+/// operation's span lengthen neither: the guard drops when the work ends. The guard
+/// records metrics only when a meter is installed. An operation with no span, under a
+/// thread that installed no subscriber or one that refused the span, has no span timing:
+/// its guard reads the monotonic clock as the operation starts and again as it drops.
 #[doc(hidden)]
 #[derive(Debug)]
 #[must_use = "the completion records when it drops"]
 pub struct Completion {
     operation: &'static str,
+    records: bool,
+    /// The clock reading at the start of an operation with no span to time it.
     started: Option<Duration>,
     ending: Ending,
     span: Option<tracing::span::Id>,
@@ -768,10 +773,13 @@ pub struct Completion {
 
 impl Completion {
     /// The guard of an operation whose open span `span` the guard reads, as it drops, for
-    /// a failure the span recorded: an `error.type`, or an `outcome` that is not a
-    /// completion. The guard drops before the span closes.
+    /// its elapsed time and for a failure the span recorded: an `error.type`, or an
+    /// `outcome` that is not a completion. The guard drops before the span closes.
     #[doc(hidden)]
     pub fn of_span(mut self, span: Option<tracing::span::Id>) -> Self {
+        if span.is_none() && self.records {
+            self.started = Some(monotonic_now());
+        }
         self.span = span;
         self
     }
@@ -779,26 +787,31 @@ impl Completion {
     /// Marks an awaited operation's work as returned, under `span`, still open: failed
     /// when the span recorded a failure, finished otherwise.
     pub(crate) fn finished(&mut self, span: &tracing::Span) {
-        self.ending = match self.started.and(span.id()).as_ref().and_then(span_failure) {
+        let failure = self.records.then(|| span.id()).flatten();
+        self.ending = match failure.as_ref().and_then(span_failure) {
             Some(label) => Ending::Failed(label),
             None => Ending::Finished,
         };
     }
 
-    /// Whether the guard reads the clock and records when it drops.
+    /// Whether the guard records metrics when it drops.
     #[cfg(test)]
     pub(crate) const fn records(&self) -> bool {
-        self.started.is_some()
+        self.records
     }
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
-        let Some(started) = self.started else {
-            return;
-        };
         // A clock that moved backwards gives no duration; the call still counts.
-        let elapsed = monotonic_now().checked_sub(started);
+        let elapsed = match (&self.span, self.started) {
+            (Some(span), _) => span_completed(span),
+            (None, Some(started)) => monotonic_now().checked_sub(started),
+            (None, None) => None,
+        };
+        if !self.records {
+            return;
+        }
         let (status, error) = if std::thread::panicking() {
             (STATUS_ERROR, ERROR_PANIC)
         } else {
@@ -835,7 +848,8 @@ pub(crate) fn future_completion(operation: &'static str) -> Completion {
 fn started(operation: &'static str, ending: Ending) -> Completion {
     Completion {
         operation,
-        started: meter_installed().then(monotonic_now),
+        records: meter_installed(),
+        started: None,
         ending,
         span: None,
     }
