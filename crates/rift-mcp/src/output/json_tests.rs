@@ -6,7 +6,7 @@ use rmcp::model::{CallToolResponse, CallToolResult};
 use serde::ser::Error as _;
 use serde::{Serialize, Serializer};
 
-use super::render::{Render, text_of};
+use super::render::{RegisteredFailure, Render, text_of};
 use super::text::{OutputOverflow, TextError, TextWriter};
 use super::{AnswerFault, Json, answer_error, resource_text};
 use crate::failure::{McpErrorExt as _, WireFailure as _};
@@ -94,7 +94,8 @@ fn overflow_is_limit_exceeded_with_retry_never_and_names_the_limit() {
     assert_eq!(
         text_of_failure(&result),
         "1 error\n\tlimit_exceeded · retry never\n\t\tanswer text exceeds its accepted limit of 64 \
-         bytes; narrow the request or lower `limit`, then resend the request\n",
+         bytes; narrow the request or lower `limit`, then resend the request\n\t\t\
+         rift.mcp.answer_text_limit\n",
         "the writer does not know the required size, so no limit line or causes"
     );
 }
@@ -105,8 +106,8 @@ fn another_render_failure_is_internal_error_with_the_writer_error_as_cause() {
     assert_eq!(
         text_of_failure(&result),
         "2 errors\n\tinternal_error · retry same_request\n\t\tanswer text could not be written: \
-         unsupported shape in text: bytes; report this internal failure with its full context\n\t\
-         internal_error · retry same_request\n\t\tunsupported shape in text: bytes\n"
+         unsupported shape in text: bytes; report this internal failure with its full context\n\t\t\
+         rift.mcp.answer_text_failed\n\tinternal_error · retry same_request\n\t\tunsupported shape in text: bytes\n"
     );
 }
 
@@ -117,15 +118,22 @@ fn a_serialization_failure_is_internal_error_with_the_serde_error_as_cause() {
         text_of_failure(&result),
         "2 errors\n\tinternal_error · retry same_request\n\t\tanswer could not be serialized into \
          structured content: no structured form; report this internal failure with its full \
-         context\n\tinternal_error · retry same_request\n\t\tno structured form\n"
+         context\n\t\trift.mcp.answer_structure_failed\n\tinternal_error · retry same_request\n\t\t\
+         no structured form\n"
     );
 }
 
 #[test]
-fn the_error_text_is_the_rendering_of_the_registered_error_as_wire_data() {
+fn the_error_text_is_the_rendering_of_the_registered_error_as_wire_data_with_its_identity() {
     let fault = AnswerFault::Text(TextError::Custom("boom".to_owned()));
-    let wire: WireErrorData = answer_error(fault).mcp().wire_error(ErrorPhase::Read);
-    let expected = text_of(&wire).expect("the wire error renders");
+    let error = answer_error(fault);
+    let identity = error.slug().as_str();
+    let wire: WireErrorData = error.mcp().wire_error(ErrorPhase::Read);
+    let expected = text_of(&RegisteredFailure {
+        identity,
+        error: &wire,
+    })
+    .expect("the registered failure renders");
     let result = failure_of(RefusedText(TextError::Custom("boom".to_owned())));
     assert_eq!(text_of_failure(&result), expected);
     assert_eq!(wire.retry, RetryDirective::SameRequest);

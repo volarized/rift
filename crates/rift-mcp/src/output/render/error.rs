@@ -3,17 +3,20 @@
 //! ```text
 //! 2 errors
 //!   limit_exceeded · retry never
-//!     the request crosses a limit
+//!     the request crosses a limit; narrow the request
 //!     limit source.files: 11 over 10
 //!     error[E0308] src/lib.rs:3:9: mismatched types
+//!     rift.index.workspace_too_many_files
 //!   storage_failure · retry same_request
 //!     the store refused
 //! ```
 //!
 //! The failure comes first, then the causes, outermost first. Every entry writes its code and
-//! retry directive, then its message. The failure adds its limit and its diagnostics. The phase is
-//! not written: `read` is the only phase. Every line is one line: control characters are made
-//! visible.
+//! retry directive, then its message. The failure adds its limit, its diagnostics, and, for a
+//! registered failure, its registered identity. The message of a registered failure is the
+//! registered message with its evidence, then its registered action when the registry defines
+//! one. The phase is not written: `read` is the only phase. Every line is one line: control
+//! characters are made visible.
 
 use rift_protocol::error::{ErrorCause, ErrorCode, ErrorData, LimitEvidence, RetryDirective};
 use rift_protocol::read::{Diagnostic, DiagnosticContext};
@@ -31,8 +34,36 @@ const HEAD_DEPTH: usize = 0;
 /// Depth of the lines under an entry head.
 const DETAIL_DEPTH: usize = 1;
 
-/// Writes the failure: the title, the failure entry, and one entry per cause.
+/// A registered failure as its text writes it: the typed wire error and the registered identity.
+pub(crate) struct RegisteredFailure<'a> {
+    /// The registered identity, such as `rift.index.workspace_too_many_files`.
+    pub(crate) identity: &'a str,
+    /// The typed wire error.
+    pub(crate) error: &'a ErrorData,
+}
+
+/// Writes the failure of a typed wire error: the title, the failure entry, and one entry per
+/// cause.
 pub(super) fn answer(out: &mut TextWriter, error: &ErrorData) -> Result<(), TextError> {
+    failure(out, error, None)
+}
+
+/// Writes a registered failure: the entries of its typed wire error, with the registered identity
+/// as the last line of the failure entry.
+pub(super) fn registered(
+    out: &mut TextWriter,
+    registered: &RegisteredFailure<'_>,
+) -> Result<(), TextError> {
+    let RegisteredFailure { identity, error } = registered;
+    failure(out, error, Some(identity))
+}
+
+/// Writes the title, the failure entry, and one entry per cause.
+fn failure(
+    out: &mut TextWriter,
+    error: &ErrorData,
+    identity: Option<&str>,
+) -> Result<(), TextError> {
     let ErrorData {
         code,
         message,
@@ -59,6 +90,9 @@ pub(super) fn answer(out: &mut TextWriter, error: &ErrorData) -> Result<(), Text
     }
     for context in diagnostics {
         layout::entry(out, DETAIL_DEPTH, &diagnostic_line(context)?)?;
+    }
+    if let Some(identity) = identity {
+        layout::entry(out, DETAIL_DEPTH, identity)?;
     }
     for ErrorCause {
         code,

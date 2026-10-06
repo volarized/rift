@@ -11,6 +11,8 @@ use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
 use std::fmt;
 
+use crate::output::ToolFailure;
+
 /// JSON-RPC error code of the error object that carries a Rift operating failure: the
 /// first code of the server-defined range (-32000 to -32099), which rmcp
 /// exports no constant for - its constants name only MCP-defined codes. The
@@ -79,6 +81,17 @@ impl McpFailure {
     pub fn wire_code(&self) -> String {
         wire_code_for_error(&self.error).unwrap_or_else(|| self.error.slug().as_str().to_owned())
     }
+
+    /// The registered error this failure carries.
+    pub(crate) const fn registered(&self) -> &RiftError {
+        &self.error
+    }
+
+    /// The failure of a tool call that stopped in `phase`, carrying this registered error to
+    /// the text of the completed result.
+    pub(crate) const fn tool_failure(self, phase: wire::ErrorPhase) -> ToolFailure {
+        ToolFailure::Registered(self, phase)
+    }
 }
 
 rift_error::format! {
@@ -86,6 +99,8 @@ rift_error::format! {
 }
 
 impl McpErrorFailExt for ErrorData {}
+
+impl McpErrorFailExt for ToolFailure {}
 
 impl WireFailure for McpFailure {
     fn tool_error(&self, phase: wire::ErrorPhase) -> ErrorData {
