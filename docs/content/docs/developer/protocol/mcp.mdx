@@ -2610,6 +2610,7 @@ The text of a failure is one section. Its title is `N errors`, or `1 error`, whe
 - below the head, at two levels, the `message` of the entry; an empty message writes no line
 - below the failure's message, `limit <field>: <required> over <limit>`, when the failure carries `limit`
 - then one line for each entry of `diagnostics`, as the `severity`, the code in brackets, the file of the span followed by `:line:column`, and `: <message>`, each part only when the diagnostic carries it
+- after the diagnostics, the registered identity on its own line, at two levels, for a registered failure
 
 Every entry writes its `code` and `retry`, also a cause whose `code` or `retry` equals the failure's.
 
@@ -2627,6 +2628,7 @@ The tabs below show execution failures as compact text, and the completed tool r
 1 error
 	invalid_request · retry never
 		the request does not match the documented form: field limit, violation zero; correct the reported field and resend the request
+		rift.server.read_invalid
 ```
 
 </Tab>
@@ -2639,7 +2641,7 @@ The tabs below show execution failures as compact text, and the completed tool r
 {
   "content": [
     {
-      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field limit, violation zero; correct the reported field and resend the request\n",
+      "text": "1 error\n\tinvalid_request · retry never\n\t\tthe request does not match the documented form: field limit, violation zero; correct the reported field and resend the request\n\t\trift.server.read_invalid\n",
       "type": "text"
     }
   ],
