@@ -2002,8 +2002,8 @@ with their bytes unchanged apart from the indent. A caller then recovers the tex
 removing the leading tabs of the indent, with no unescaping. A documentation text that holds
 only whitespace writes nothing. The subject of a commit message is one fact; the lines after
 the blank line that follows the subject are written line by line, without the blank lines at
-their start and the whitespace at the end of the message. The server writes every other fact on one line, with
-`\n`, `\r`, `\t`, and `\u{HEX}` for the control characters it holds. A value that holds ` · ` or `: ` is written between double quotes, with each `"` and `\` inside written after a `\`; a value without either stays bare.
+their start and the whitespace at the end of the message. The server writes every other fact on one line, without the spaces at its end, with
+`\n`, `\r`, `\t`, and `\u{HEX}` for the control characters it holds. A value among the facts of a line that holds ` · ` or `: ` is written between double quotes, with each `"` and `\` inside written after a `\`; a value without either stays bare, and so does a value written alone on its line, such as a declaration, an identity, or a commit subject.
 
 A caller that requests `score`, `source`,
 `documentation`, or `history` finds it in the compact text. The server enforces a byte limit on one
