@@ -8640,6 +8640,9 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A preparation batch superseded by whole-workspace work publishes nothing and
+    /// records `index preparation superseded` once, naming the epochs and the `rescan`
+    /// trigger the supervisor's next rebuild runs under.
     #[test]
     fn superseded_preparation_emits_no_startup_publication() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -8647,8 +8650,10 @@ pub(crate) mod tests {
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         let (context, _invalidations) = initial_preparation_context(root)?;
         let complete = stable_candidate(root, 0)?;
-        context.validation.observe_whole_workspace()?;
-        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let observed_epoch = context.validation.observe_whole_workspace()?;
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("info")
+            .install()?;
 
         assert_eq!(
             super::publish_preparation_after(
@@ -8668,7 +8673,20 @@ pub(crate) mod tests {
                 .preparation
                 .is_some()
         );
-        assert!(drain.queued_records().is_empty());
+        let records = drain.queued_records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].level(), "info");
+        assert_eq!(records[0].component(), "index");
+        assert_eq!(records[0].operation(), "index.build");
+        assert_eq!(records[0].message(), "index preparation superseded");
+        let fields: serde_json::Value = serde_json::from_str(records[0].fields())?;
+        assert_eq!(fields["epoch"], complete.epoch.to_string(), "{fields}");
+        assert_eq!(
+            fields["observed_epoch"],
+            observed_epoch.to_string(),
+            "{fields}"
+        );
+        assert_eq!(fields["trigger"], "rescan", "{fields}");
         Ok(())
     }
 
@@ -8715,6 +8733,98 @@ pub(crate) mod tests {
                 let fields: serde_json::Value = serde_json::from_str(publications[0].fields())?;
                 assert_eq!(fields["trigger"], "startup");
             }
+        }
+        Ok(())
+    }
+
+    /// Native events delivered after the empty startup publication and before the complete
+    /// batch publishes, in the order the macOS stream delivered them. The capture boundary's
+    /// `.rift` writes stay below the hard floor: the epoch holds and the preparation
+    /// publishes the tree. A `Create(Folder)` for `src`, a directory the fixture wrote
+    /// before the watcher started, asks for the whole workspace: the preparation records
+    /// `index preparation superseded` and publishes nothing, and the supervisor's rescan
+    /// publishes the tree a cold build reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_directory_event_during_preparation_leaves_the_startup_tree_to_the_supervisor()
+    -> TestResult {
+        for directory_event in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path();
+            fs::create_dir(root.join("src"))?;
+            fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
+            fs::write(root.join("README.md"), "See [Beacon](src/lib.rs#Beacon).\n")?;
+            let cold = published_facts(stable_candidate(root, 0)?.as_ref())?;
+            let (context, invalidations) = initial_preparation_context(root)?;
+            let validation = Arc::clone(&context.validation);
+            let state = Arc::clone(&context.published);
+            let roots = super::WatchRoots::resolve(root)?;
+            let initial = super::discover_initial_workspace(&context)
+                .await?
+                .ok_or("initial discovery was cancelled")?;
+
+            let state_directory = roots.canonical().join(".rift");
+            let boundary = state_directory.join(".tmpEa4R8n");
+            for event in [
+                Event::new(EventKind::Create(CreateKind::Folder)).add_path(state_directory),
+                Event::new(EventKind::Create(CreateKind::File)).add_path(boundary.clone()),
+                Event::new(EventKind::Remove(RemoveKind::File)).add_path(boundary),
+            ] {
+                super::report_watch_outcome(&roots, &validation, Ok(event));
+            }
+            assert_eq!(
+                validation.observed_epoch(),
+                0,
+                "`.rift` events move no epoch"
+            );
+            if directory_event {
+                let event = Event::new(EventKind::Create(CreateKind::Folder))
+                    .add_path(roots.canonical().join("src"));
+                super::report_watch_outcome(&roots, &validation, Ok(event));
+                assert_eq!(validation.observed_epoch(), 1);
+            }
+
+            let batch = complete_initial_batch(&context, initial);
+            let cancellation = validation.cancellation.clone();
+            // The blocking thread does not inherit this thread's default subscriber:
+            // the closure installs its own recorder and hands its drain back.
+            let (outcome, mut drain) = tokio::task::spawn_blocking(move || {
+                let (recorder, drain) = rift_tracing::ScopedRecorder::builder()
+                    .capture("rift_mcp=info")
+                    .install()?;
+                let outcome = super::prepare_initial_batch(&cancellation, batch);
+                drop(recorder);
+                Ok::<_, rift_tracing::LogFilterError>((outcome, drain))
+            })
+            .await??;
+            let records = drain
+                .queued_records()
+                .into_iter()
+                .filter(|record| matches!(record.operation(), "index.build" | "index.publish"))
+                .map(|record| record.message().to_owned())
+                .collect::<Vec<_>>();
+            if directory_event {
+                assert_eq!(outcome?.2, RebuildOutcome::Superseded);
+                assert_eq!(records, ["index preparation superseded"]);
+                assert!(state.read().await.current.preparation.is_some());
+            } else {
+                assert_eq!(outcome?.2, RebuildOutcome::Published);
+                assert_eq!(records, ["index snapshot published"]);
+            }
+
+            let watcher = super::unwatched(root, &validation)?;
+            let supervisor =
+                tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
+            let published = publication_matching(&state, &validation, &cold.digests).await;
+            validation.cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
+            let published = published?;
+            assert!(published.preparation.is_none());
+            assert_eq!(published.epoch, u64::from(directory_event));
+            assert_eq!(
+                published_facts(&published)?,
+                cold,
+                "startup publication facts must equal an independent cold build"
+            );
         }
         Ok(())
     }
@@ -11865,37 +11975,13 @@ pub(crate) mod tests {
         Ok((recorder, delivered))
     }
 
-    /// The startup state a failed documentation-reference check reports.
-    fn missing_references_message(
-        startup: &PublishedWorkspace,
-        validation: &IndexValidation,
-        delivered: &std::sync::Mutex<Vec<String>>,
-    ) -> String {
-        let pending = format!(
-            "{:?}",
-            *validation
-                .publication_lane
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        );
-        let events = delivered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        format!(
-            "fixture must publish documentation references: \
-             startup_epoch={}, tree_revision={:?}, preparation={:?}, held={:?}, \
-             observed_epoch={}, watch_failed={}, pending={pending}, delivered={events:?}",
-            startup.epoch,
-            startup.reads.tree_revision(),
-            startup.preparation,
-            startup.reads.workspace_digests(),
-            validation.observed_epoch(),
-            validation.watch_failed.load(Ordering::Acquire),
-        )
-    }
-
     /// A native workspace watcher publishes complete facts equal to a cold build.
+    ///
+    /// The startup publication is the first whose digests equal a cold build's, read once
+    /// the supervisor runs. `FSEvents` can deliver the fixture's own writes, made before the
+    /// watcher started, while the preparation runs: a `src` directory event asks for the
+    /// whole workspace, the preparation's publication is superseded, and the supervisor's
+    /// rescan publishes the tree.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn native_watcher_publication_matches_cold_indexed_facts() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -11907,41 +11993,49 @@ pub(crate) mod tests {
         )?;
         fs::write(root.join("src/removed.rs"), "pub struct Removed;\n")?;
         fs::write(root.join("README.md"), "See [Beacon](src/lib.rs#Beacon).\n")?;
+        let cold_a = stable_candidate(root, 0)?;
+        assert!(
+            !cold_a
+                .reads
+                .documentation_snapshot()
+                .index()
+                .references
+                .is_empty(),
+            "fixture must carry documentation references"
+        );
+        let cold_a_facts = published_facts(&cold_a)?;
+        assert!(
+            cold_a_facts.relationships.is_empty(),
+            "fixture semantic edges are empty"
+        );
 
         let (context, invalidations) = initial_preparation_context(root)?;
         let validation = Arc::clone(&context.validation);
+        let state = Arc::clone(&context.published);
         let watcher = super::workspace_watcher(root, &validation)?;
         let (_recorder, delivered) = native_event_recorder(root)?;
         let initial = super::discover_initial_workspace(&context)
             .await?
             .ok_or("initial discovery was cancelled")?;
         super::prepare_initial_workspace_from(&context, initial).await?;
-        let state = Arc::clone(&context.published);
-        let startup = Arc::clone(&state.read().await.current);
-        if startup
-            .reads
-            .documentation_snapshot()
-            .index()
-            .references
-            .is_empty()
-        {
-            return Err(missing_references_message(&startup, &validation, &delivered).into());
-        }
-        let startup_facts = published_facts(&startup)?;
-        let cold_a = stable_candidate(root, 0)?;
-        assert!(
-            startup_facts.relationships.is_empty(),
-            "fixture semantic edges are empty"
-        );
-        let cold_a_facts = published_facts(&cold_a)?;
-        assert_eq!(
-            startup_facts, cold_a_facts,
-            "startup publication facts must equal an independent cold build"
-        );
-
         let supervisor = tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
 
         let observed = async {
+            let startup = publication_matching(&state, &validation, &cold_a_facts.digests)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "startup publication: {error}, delivered={:?}",
+                        delivered
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    )
+                })?;
+            assert_eq!(
+                published_facts(&startup)?,
+                cold_a_facts,
+                "startup publication facts must equal an independent cold build"
+            );
             fs::write(
                 root.join("src/lib.rs"),
                 "pub struct Beacon;\npub fn new() {}\n",
