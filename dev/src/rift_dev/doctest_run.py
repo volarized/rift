@@ -52,9 +52,9 @@ def run(command: Command) -> None:
             del tail[: len(tail) - RUN_TAIL_BYTES_MAX]
 
     with collector(cases=cases) as served:
-        environment = served.environment("cargo test --doc")
         inherited = command.environment()
         source = os.environ if inherited is None else inherited
+        environment = served.environment("cargo test --doc", source=source)
         environment["OTEL_SDK_DISABLED"] = source.get("OTEL_SDK_DISABLED", "true")
         environment["RIFT_SCOPED_RECORDER_STREAM"] = "1"
         command.with_env(**environment)

@@ -9,11 +9,12 @@ receiver. The exporter appends `/v1/traces` and
 - every span received, with its name, trace and span identifiers, start and end,
   attributes, and the `service.instance.id` of the process that sent it, at most
   `SPANS_MAX`, and its duration for the per-operation summary;
-- every metric data point received, with its instrument's name, kind, and unit, its
+- every metric data point retained, with its instrument's name, kind, and unit, its
   attributes and resource attributes, the `service.instance.id` of the process that sent
   it, its value (a histogram's count, sum, and buckets),
   `start_time_unix_nano`, `time_unix_nano`, and aggregation temporality, at most
-  `POINTS_MAX`;
+  `POINTS_MAX`. Identical cumulative samples with the same resource and timestamps are
+  kept once;
 - the latest value of each metric series, for a per-test report.
 
 Bounds: a request body, encoded and decompressed, is at most `BODY_BYTES_MAX` bytes; the
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import signal
 import socket
 import sys
@@ -553,23 +555,25 @@ class MetricSummary:
 @dataclass(slots=True)
 class MetricSeries:
     """One metric name's series, each as its latest or accumulated value and count, keyed
-    by the instrumentation scope the point arrived under, then its attributes."""
+    by resource, start time, instrumentation scope, and attributes."""
 
     kind: str
     unit: str
-    values: dict[tuple[Scope, Attributes], tuple[float, int]] = field(
+    values: dict[tuple[Attributes, int, Scope, Attributes], tuple[float, int]] = field(
         default_factory=dict
     )
     points: int = 0
 
 
 class MetricStore:
-    """Metric data points received: the newest `POINTS_MAX` whole, and the latest value
-    of every series by metric name.
+    """Metric data points retained: the newest `POINTS_MAX` whole, and the latest value
+    of every bounded series by metric name.
 
-    For the latest value, a gauge and a cumulative sum or histogram replace a series'
-    value with the newest data point; a delta sum or histogram adds each data point to
-    it. The Rust exporter's default temporality is cumulative.
+    Resource, start time, scope, and attributes identify a series. Identical cumulative
+    samples with the same series and timestamp are kept once. A gauge and a cumulative
+    sum or histogram replace a series' value with the newest data point; a delta sum or
+    histogram adds each data point to it. The Rust exporter's default temporality is
+    cumulative.
     """
 
     def __init__(
@@ -577,6 +581,7 @@ class MetricStore:
     ) -> None:
         self.metrics: dict[str, MetricSeries] = {}
         self.points: deque[MetricPoint] = deque(maxlen=points_max)
+        self.cumulative_points: set[MetricPoint] = set()
         self.dropped = Dropped()
         self.received = 0
         self.lock = threading.Lock()
@@ -614,18 +619,13 @@ class MetricStore:
             return
         name = metric.name
         held = self.metrics.get(name)
-        if held is None:
-            if len(self.metrics) >= METRICS_MAX:
-                self.dropped.metric_names += 1
-                return
+        if held is None and len(self.metrics) < METRICS_MAX:
             held = MetricSeries(which, metric.unit)
             self.metrics[name] = held
+        elif held is None:
+            self.dropped.metric_names += 1
         for point in points:
             attributes = attribute_key(point.attributes)
-            key = (scope, attributes)
-            if key not in held.values and len(held.values) >= SERIES_MAX:
-                self.dropped.series += 1
-                continue
             if isinstance(point, HistogramDataPoint):
                 value, count = float(point.sum), int(point.count)
                 kept = MetricPoint(
@@ -660,9 +660,29 @@ class MetricStore:
             self.received += 1
             if self.tests is not None:
                 self.tests.keep(resource, kept)
-            if len(self.points) == self.points.maxlen:
+            duplicate = (
+                kept.temporality == "cumulative"
+                and kept in self.cumulative_points
+            )
+            if duplicate:
+                continue
+            if self.points.maxlen and len(self.points) == self.points.maxlen:
+                expired = self.points.popleft()
+                if expired.temporality == "cumulative":
+                    self.cumulative_points.discard(expired)
                 self.dropped.points += 1
-            self.points.append(kept)
+            if self.points.maxlen:
+                self.points.append(kept)
+                if kept.temporality == "cumulative":
+                    self.cumulative_points.add(kept)
+            else:
+                self.dropped.points += 1
+            if held is None:
+                continue
+            key = (resource, kept.start_time_unix_nano, scope, attributes)
+            if key not in held.values and len(held.values) >= SERIES_MAX:
+                self.dropped.series += 1
+                continue
             held.points += 1
             previous = held.values.get(key, (0.0, 0))
             held.values[key] = (
@@ -810,12 +830,14 @@ class LogStore:
 
 @dataclass(slots=True)
 class CaseTelemetry:
-    """What the processes of one test sent: the newest `CASE_POINTS_MAX` points,
-    `CASE_SPANS_MAX` spans, and `CASE_LOGS_MAX` log records, and what each bound dropped."""
+    """What the processes of one test sent: the newest points, spans, and log records
+    within their bounds, and what each bound dropped. Identical cumulative points are
+    kept once."""
 
     points: deque[MetricPoint] = field(
         default_factory=lambda: deque(maxlen=CASE_POINTS_MAX)
     )
+    cumulative_points: set[MetricPoint] = field(default_factory=set)
     spans: deque[SpanRecord] = field(
         default_factory=lambda: deque(maxlen=CASE_SPANS_MAX)
     )
@@ -855,9 +877,16 @@ class CaseStore:
                 held = CaseTelemetry()
                 self.tests[test] = held
             if isinstance(item, MetricPoint):
+                if item.temporality == "cumulative" and item in held.cumulative_points:
+                    return
                 if len(held.points) == held.points.maxlen:
+                    expired = held.points.popleft()
+                    if expired.temporality == "cumulative":
+                        held.cumulative_points.discard(expired)
                     held.dropped.points += 1
                 held.points.append(item)
+                if item.temporality == "cumulative":
+                    held.cumulative_points.add(item)
             elif isinstance(item, SpanRecord):
                 if len(held.spans) == held.spans.maxlen:
                     held.dropped.spans += 1
@@ -1004,7 +1033,11 @@ class Collector:
     logs: LogStore = field(default_factory=LogStore)
     cases: CaseStore | None = None
 
-    def environment(self, test_case: str | None = None) -> dict[str, str]:
+    def environment(
+        self,
+        test_case: str | None = None,
+        source: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         """The variables that point a server under test at this collector.
 
         `OTEL_EXPORTER_OTLP_ENDPOINT` is the base URL: Rift installs export only when it
@@ -1013,17 +1046,25 @@ class Collector:
         async periodic reader and `OTEL_BSP_SCHEDULE_DELAY` by the batch span
         processor's default configuration, both in milliseconds
         (`opentelemetry_sdk` 0.33.0); `OTEL_BLRP_SCHEDULE_DELAY` is the batch log
-        processor's. With `test_case`, `OTEL_RESOURCE_ATTRIBUTES` sets `test.case.name`,
+        processor's. Caller values for those standard interval variables are retained.
+        With `test_case`, `OTEL_RESOURCE_ATTRIBUTES` sets `test.case.name`,
         which the SDK's environment resource detector reads into every process's
         resource, so `CaseStore` files what each process sends under its test.
         """
         if not self.endpoint:
             return {}
+        inherited = os.environ if source is None else source
         environment = {
             "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
-            "OTEL_METRIC_EXPORT_INTERVAL": str(EXPORT_INTERVAL_MS),
-            "OTEL_BSP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
-            "OTEL_BLRP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
+            "OTEL_METRIC_EXPORT_INTERVAL": inherited.get(
+                "OTEL_METRIC_EXPORT_INTERVAL", str(EXPORT_INTERVAL_MS)
+            ),
+            "OTEL_BSP_SCHEDULE_DELAY": inherited.get(
+                "OTEL_BSP_SCHEDULE_DELAY", str(EXPORT_INTERVAL_MS)
+            ),
+            "OTEL_BLRP_SCHEDULE_DELAY": inherited.get(
+                "OTEL_BLRP_SCHEDULE_DELAY", str(EXPORT_INTERVAL_MS)
+            ),
         }
         if test_case:
             environment["OTEL_RESOURCE_ATTRIBUTES"] = resource_attribute(

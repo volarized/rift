@@ -32,13 +32,14 @@ Each part prints at most its named bound and says what the bound cut.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import re
 import sys
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import tomllib
@@ -48,11 +49,13 @@ from rift_dev.progress import finish, start
 from rift_dev.trace import (
     PID_KEY,
     SPAN_REQUEST_KEY,
+    Attributes,
     CaseStore,
     CaseTelemetry,
     Collector,
     LogEntry,
     MetricPoint,
+    Scope,
     SpanRecord,
     collector,
     fields_text,
@@ -261,19 +264,33 @@ def timeline(telemetry: CaseTelemetry) -> list[str]:
 
 
 def last_values(points: Iterable[MetricPoint]) -> list[str]:
-    """The newest point of every instrument series, per process and instrumentation
-    scope: two crates that declare one name keep a series each."""
+    """The newest point of each series, per resource, start time, scope, and attributes."""
     latest: dict[
-        tuple[str, str, tuple[str, str], tuple[tuple[str, str], ...]], MetricPoint
+        tuple[str, Attributes, int, Scope, Attributes], MetricPoint
     ] = {}
     for point in points:
-        key = (point.name, pid_of(point.resource), point.scope, point.attributes)
+        key = (
+            point.name,
+            point.resource,
+            point.start_time_unix_nano,
+            point.scope,
+            point.attributes,
+        )
         held = latest.get(key)
         if held is None or held.time_unix_nano <= point.time_unix_nano:
             latest[key] = point
     return [
         cut(f"pid={pid_of(point.resource)}  {point.line()}")
-        for point in sorted(latest.values(), key=lambda point: point.name)
+        for point in sorted(
+            latest.values(),
+            key=lambda point: (
+                point.name,
+                point.resource,
+                point.start_time_unix_nano,
+                point.scope,
+                point.attributes,
+            ),
+        )
     ]
 
 
@@ -505,11 +522,14 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     outcomes: dict[str, Outcome] = {}
     log_path = REPORT_DIRECTORY / f"nextest-{profile}-{time.time_ns()}.log"
     evidence_path = log_path.with_suffix(".telemetry.txt")
+    raw_evidence_path = log_path.with_suffix(".telemetry.jsonl")
     REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
     log_kept = 0
     log_dropped = 0
     evidence_kept = 0
     evidence_dropped = 0
+    raw_evidence_kept = 0
+    raw_evidence_dropped = 0
     pending = bytearray()
     reading: Outcome | None = None
     opened = False
@@ -518,10 +538,16 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
 
     def capture_passing(outcome: Outcome) -> None:
         nonlocal evidence_kept, evidence_dropped
+        nonlocal raw_evidence_kept, raw_evidence_dropped
         for name in cases.matching(outcome.names):
             held = cases.take(name)
             if held is None:
                 continue
+            raw_records = [
+                *(("log record", entry) for entry in held.logs),
+                *(("span", span) for span in held.spans),
+                *(("metric point", point) for point in held.points),
+            ]
             evidence = [
                 f"test.case.name={name}",
                 f"logs={len(held.logs)} spans={len(held.spans)} points={len(held.points)}",
@@ -546,6 +572,29 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                     artifact.write(retained)
                 evidence_kept += len(retained)
             evidence_dropped += len(data) - len(retained)
+            if raw_records:
+                with raw_evidence_path.open("ab") as artifact:
+                    for kind, record in raw_records:
+                        remaining = CASE_EVIDENCE_BYTES_MAX - evidence_kept - raw_evidence_kept
+                        if remaining <= 0:
+                            raw_evidence_dropped += 1
+                            continue
+                        data = (
+                            json.dumps(
+                                {
+                                    "test.case.name": name,
+                                    "kind": kind,
+                                    "record": asdict(record),
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                        if len(data) > remaining:
+                            raw_evidence_dropped += 1
+                            continue
+                        artifact.write(data)
+                        raw_evidence_kept += len(data)
 
     def line(raw: bytes) -> None:
         nonlocal reading, opened
@@ -602,7 +651,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             inherited = os.environ
         sdk_disabled = inherited.get(SDK_DISABLED, "true")
         command.with_env(
-            **served.environment(),
+            **served.environment(source=inherited),
             **{SDK_DISABLED: sdk_disabled, RECORDER_STREAM: "1"},
         )
         try:
@@ -651,6 +700,13 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     if evidence_dropped:
         echo(
             f"[telemetry evidence left out {evidence_dropped} bytes: {evidence_path}]\n".encode()
+        )
+    if raw_evidence_kept:
+        echo(f"[raw telemetry written to {raw_evidence_path}]\n".encode())
+    if raw_evidence_dropped:
+        echo(
+            f"[raw telemetry left out {raw_evidence_dropped} records: "
+            f"{raw_evidence_path}]\n".encode()
         )
     if stream_error is not None:
         raise stream_error.with_traceback(stream_error.__traceback__)
