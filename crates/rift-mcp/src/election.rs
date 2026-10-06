@@ -13,7 +13,7 @@ use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_error::{ErrorContext, RiftError, causes, errors};
@@ -44,6 +44,23 @@ const SERVER_ELECTION_FILE_NAME: &str = "server.lock";
 /// [`rift_tracing::lock`]: the claim in exclusive mode, held lifelong for the guard's life,
 /// and a probe in shared mode, held from its shared lock to that lock's release.
 const SERVER_ELECTION_LOCK: &str = "server.election";
+
+fn debug_election_claim(stage: &str, path: &Path) {
+    let lingering_lock_test = "$a_start_lost_to_a_lingering_shared_lock_spawns_again";
+    if !std::env::var_os("NEXTEST_ATTEMPT_ID")
+        .is_some_and(|attempt| attempt.to_string_lossy().ends_with(lingering_lock_test))
+    {
+        return;
+    }
+    let unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    eprintln!(
+        "DEBUG server election {stage} unix_ns={unix_ns} pid={} path={}",
+        std::process::id(),
+        path.display(),
+    );
+}
 
 /// `lock.wait.duration`, declared as `rift-tracing` declares it: same name, unit, kind,
 /// label keys, and boundaries, so the OpenTelemetry SDK serves both declarations from one
@@ -122,9 +139,16 @@ pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGu
                 .source(source)
                 .error()
         })?;
+    debug_election_claim("exclusive lock request", &election_path);
     let claimed = rift_tracing::lock(SERVER_ELECTION_LOCK)
         .lifelong()
         .try_acquire(|| election_file.try_lock().map(|()| election_file));
+    let outcome = match &claimed {
+        Ok(_) => "exclusive lock acquired",
+        Err(TryLockError::WouldBlock) => "exclusive lock refused: would block",
+        Err(TryLockError::Error(_)) => "exclusive lock refused: error",
+    };
+    debug_election_claim(outcome, &election_path);
     match claimed {
         Ok(election_file) => {
             let guard = ElectionGuard {

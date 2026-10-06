@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use std::fs::File;
 use std::io::{self, Read, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod process;
 use process::{Child, Command, Stdio, detached_command_for, spawn_detached};
@@ -45,6 +45,34 @@ pub const START_POLL_ATTEMPT_COUNT: u32 = 300;
 /// keeps such a lock for longer; the rest of the start window then passes
 /// as a wait.
 pub const START_SPAWN_COUNT_MAX: u32 = 4;
+
+fn debug_start_spawn(stage: &str, spawn_count: u32) {
+    if !debug_lingering_lock_test() {
+        return;
+    }
+    let unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    eprintln!(
+        "DEBUG server start {stage} unix_ns={unix_ns} pid={} spawn_count={spawn_count}",
+        std::process::id(),
+    );
+}
+
+fn debug_lingering_lock_test() -> bool {
+    let test = "$a_start_lost_to_a_lingering_shared_lock_spawns_again";
+    std::env::var_os("NEXTEST_ATTEMPT_ID")
+        .is_some_and(|attempt| attempt.to_string_lossy().ends_with(test))
+}
+
+fn debug_start_child_stderr(stderr: &str) {
+    if !debug_lingering_lock_test() {
+        return;
+    }
+    for line in stderr.lines().filter(|line| line.contains("DEBUG")) {
+        eprintln!("DEBUG captured child stderr {line}");
+    }
+}
 /// Bytes at the end of a detached server's stderr file read to classify its
 /// exit: the refusal a server exits on is the last thing it writes there.
 const EXIT_STDERR_TAIL_BYTES: u64 = 8 << 10;
@@ -458,16 +486,20 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
     /// Returns `launch`'s failure; the attempt still counts.
     pub fn spawn(&mut self, launch: impl FnOnce() -> io::Result<Spawned>) -> io::Result<()> {
         if self.is_spent() {
+            debug_start_spawn("spawn skipped: count spent", self.spawn_count);
             self.latest = SpawnWatch::Idle;
             return Ok(());
         }
         self.spawn_count += 1;
+        debug_start_spawn("spawn launch requested", self.spawn_count);
         match launch() {
             Ok(spawned) => {
+                debug_start_spawn("spawn launch succeeded", self.spawn_count);
                 self.latest = SpawnWatch::Running(spawned);
                 Ok(())
             }
             Err(error) => {
+                debug_start_spawn("spawn launch failed", self.spawn_count);
                 self.latest = SpawnWatch::Idle;
                 Err(error)
             }
@@ -501,6 +533,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
         election_held: bool,
     ) -> SpawnPollOutcome<Adopted, Spawned::Failure> {
         if let Some(adopted) = adopted {
+            debug_start_spawn("poll ready", self.spawn_count);
             return SpawnPollOutcome::Ready(adopted);
         }
         match std::mem::replace(&mut self.latest, SpawnWatch::Idle) {
@@ -509,10 +542,12 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                     Some(exit) => SpawnWatch::observed(exit),
                     None => SpawnWatch::Running(spawned),
                 };
+                debug_start_spawn("poll waiting on running child", self.spawn_count);
                 SpawnPollOutcome::Waiting
             }
             SpawnWatch::Exited(exit) if election_held => {
                 self.latest = SpawnWatch::Exited(exit);
+                debug_start_spawn("poll waiting on held election", self.spawn_count);
                 SpawnPollOutcome::Waiting
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) if self.is_spent() => {
@@ -522,6 +557,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                     spawn_count,
                     "the spawn count is spent; the start window passes as a wait"
                 );
+                debug_start_spawn("poll waiting: spawn count spent", self.spawn_count);
                 SpawnPollOutcome::Waiting
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) => {
@@ -529,10 +565,17 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                     component = "mcp",
                     "no process holds the election the spawned server lost; spawning again"
                 );
+                debug_start_spawn("poll election unheld", self.spawn_count);
                 SpawnPollOutcome::ElectionUnheld
             }
-            SpawnWatch::Exited(StartExit::Failed(failure)) => SpawnPollOutcome::Failed(failure),
-            SpawnWatch::Idle => SpawnPollOutcome::Waiting,
+            SpawnWatch::Exited(StartExit::Failed(failure)) => {
+                debug_start_spawn("poll failed", self.spawn_count);
+                SpawnPollOutcome::Failed(failure)
+            }
+            SpawnWatch::Idle => {
+                debug_start_spawn("poll idle", self.spawn_count);
+                SpawnPollOutcome::Waiting
+            }
         }
     }
 }
@@ -542,6 +585,7 @@ impl<Spawned: StartedServer> SpawnWatch<Spawned> {
     /// printed.
     fn observed(exit: StartExit<Spawned::Failure>) -> Self {
         if let StartExit::LostElection { stderr } = &exit {
+            debug_start_child_stderr(stderr);
             rift_tracing::info!(
                 component = "mcp",
                 stderr = %stderr,
