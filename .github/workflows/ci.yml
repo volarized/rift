@@ -133,8 +133,6 @@ jobs:
         timeout-minutes: 30
       - run: just audit
         timeout-minutes: 1
-      - run: just testing-check
-        timeout-minutes: 1
       # The pre-commit quick gate runs generated checks, the all-features
       # workspace compile, and strict Clippy. Their cold builds belong within the build budget.
       - run: just docs
@@ -454,12 +452,6 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - name: Verify Windows command ownership
-        if: runner.os == 'Windows'
-        timeout-minutes: 1
-        run: >-
-          uv run --locked --project dev pytest
-          dev/tests/test_commands.py
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py

@@ -18,9 +18,8 @@ flag_management:
 # The corpus job runs in `ci` as five matrix legs, and each leg uploads its own
 # `corpus` report beside the CLI job's `cli` report, so one run sends six builds.
 # Waiting for two let Codecov compute a pull request's patch from two corpus legs
-# before the CLI report landed. `dev/tests/test_delivery.py` counts every coverage
-# upload step once per matrix leg and refuses a wait that disagrees, so a new leg or
-# coverage job has to settle this again rather than silently reopen the window.
+# before the CLI report landed. Keep six uploads per run in step with the CLI and
+# corpus jobs.
 codecov:
   notify:
     after_n_builds: 6

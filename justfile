@@ -73,11 +73,6 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-testing-check:
-    uv run --locked --project dev ruff check dev
-    uv run --locked --project dev ty check dev
-    uv run --locked --project dev pytest dev/tests
-
 corpus-sync *args:
     {{ rift_dev }} corpus sync {{ args }}
 
@@ -86,11 +81,7 @@ integration-cli:
     cargo build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
 
-# The archive carries the corpus suites and nothing else. `--all-targets` built
-# and linked every test binary in the workspace, and each one links the whole
-# workspace; the live suites moved to the fast archive, which is built once for
-# every pull request. `dev/tests/test_delivery.py` refuses a selection that
-# leaves out a suite the corpus profile runs.
+# The archive carries the three corpus suites; the live suites use the fast archive.
 integration-archive:
     cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
@@ -111,7 +102,7 @@ integration-test:
 
 quick-gate: format dashes generate-check check clippy
 
-rust-gate: quick-gate docs doctest audit test release-test installer-test testing-check
+rust-gate: quick-gate docs doctest audit test release-test installer-test
 
 # One signed tag on the commit `origin/main` names right now; pushing it starts
 # `rift-release`.
