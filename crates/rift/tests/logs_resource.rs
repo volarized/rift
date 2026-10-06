@@ -149,23 +149,6 @@ fn printed_lines(output: &std::process::Output) -> Vec<String> {
         .collect()
 }
 
-/// The timestamp one printed line opens with: its date and its time, `2026-10-04
-/// 20:42:58.787Z`.
-fn printed_timestamp(line: &str) -> &str {
-    line.get(..24).unwrap_or_default()
-}
-
-/// Whether `stamp` is a UTC time with milliseconds, `YYYY-MM-DD HH:MM:SS.mmmZ`, the form
-/// every surface prints.
-fn is_utc_with_milliseconds(stamp: &str) -> bool {
-    let bytes = stamp.as_bytes();
-    bytes.len() == 24
-        && bytes[10] == b' '
-        && bytes[19] == b'.'
-        && bytes[23] == b'Z'
-        && stamp.chars().filter(char::is_ascii_digit).count() == 17
-}
-
 /// Polls `transcript` for `needle`, bounded by [`RECORD_ATTEMPTS`] reads.
 ///
 /// The follower writes as it prints, so a read that has not seen the line yet
@@ -283,11 +266,12 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
     assert!(!lines.is_empty(), "{lines:?}");
     let mut previous = String::new();
     for line in &lines {
-        let stamp = printed_timestamp(line).to_owned();
+        let stamp = harness::printed_timestamp(line);
         assert!(
-            is_utc_with_milliseconds(&stamp),
+            stamp.is_some(),
             "every line opens with a UTC timestamp: {line:?}"
         );
+        let stamp = stamp.unwrap_or_default().to_owned();
         assert!(stamp >= previous, "records print oldest first: {lines:?}");
         previous = stamp;
     }

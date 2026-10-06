@@ -2065,6 +2065,151 @@ fn a_failing_window_keeps_its_files_and_prints_each_registered_process() -> Test
         harness::killed_window_starts(reports.path())?.is_empty(),
         "a window carrying ended_at is left to the reader of its files"
     );
+    let ended_at = start.ended_at.ok_or("the start carries ended_at")?;
+    for expected in [
+        format!("\nT: {ended_at}\n"),
+        format!(
+            "\nmachine: logical_cpus={} memory_bytes=not read by the harness system={} \
+             architecture={}\n",
+            std::thread::available_parallelism()?,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    ] {
+        assert!(text.contains(&expected), "{expected:?} in {text}");
+    }
+    if let Ok(name) = std::env::var("NEXTEST_TEST_NAME") {
+        assert!(
+            text.contains(&format!("NEXTEST_TEST_NAME={name}")),
+            "the heading names the test: {text}"
+        );
+    }
+    Ok(())
+}
+
+/// A stderr copy past its bound keeps the bytes before it, says where it cut, and ends
+/// with the count of bytes it read and dropped; the window prints that count.
+#[test]
+fn a_cut_stderr_copy_counts_the_bytes_it_dropped() -> TestResult {
+    let reports = tempfile::tempdir()?;
+    let files = fixture_window_files(reports.path());
+    let window = harness::FailureWindow::begin_in(Some(files.clone()), Some(FIXTURE_ATTEMPT), &[]);
+    files.register_process(4242, FOREGROUND_LABEL)?;
+    let mut copy = files
+        .stderr_copy(4242)?
+        .ok_or("a window with a start keeps a stderr copy")?;
+    let bound = usize::try_from(harness::STDERR_FILE_BYTES_MAX)?;
+    copy.write(&vec![b'a'; bound - 1]);
+    copy.write(b"bcd");
+    copy.write(b"efgh");
+    drop(copy);
+
+    drop(window);
+
+    let kept = fs::read(files.stderr(4242))?;
+    assert_eq!(kept[bound - 1], b'b', "the bytes before the bound are kept");
+    let text = fs::read_to_string(files.text())?;
+    for expected in [
+        format!("[the copy reached its {bound}-byte bound; the rest is read and dropped]\n"),
+        format!("[6 bytes past the {bound}-byte bound were read and dropped]\n"),
+    ] {
+        assert!(text.contains(&expected), "{expected:?} in the window");
+    }
+    Ok(())
+}
+
+/// A copy within its bound states no cut and no dropped bytes.
+#[test]
+fn a_stderr_copy_within_its_bound_states_no_drop() -> TestResult {
+    let reports = tempfile::tempdir()?;
+    let files = fixture_window_files(reports.path());
+    let window = harness::FailureWindow::begin_in(Some(files.clone()), Some(FIXTURE_ATTEMPT), &[]);
+    files.register_process(4242, FOREGROUND_LABEL)?;
+    let mut copy = files
+        .stderr_copy(4242)?
+        .ok_or("a window with a start keeps a stderr copy")?;
+    copy.write(b"MCP server ready\n");
+    drop(copy);
+
+    drop(window);
+
+    let text = fs::read_to_string(files.text())?;
+    assert!(text.contains("MCP server ready\n"), "{text}");
+    assert!(!text.contains("read and dropped"), "{text}");
+    Ok(())
+}
+
+/// Timestamped lines of the sources interleave by timestamp; a line without one stays
+/// after the line before it; lines ahead of a source's first timestamp come first; one
+/// timestamp keeps the order of the sources; blank lines are left out.
+#[test]
+fn merged_lines_interleave_by_timestamp() {
+    let records = "[the first 9 bytes are cut by the 65536-byte bound]\n\
+                   2026-10-05 10:00:00.100Z INFO a\n\n\
+                   2026-10-05 10:00:00.300Z INFO c\n";
+    let proxy = "2026-10-05 10:00:00.200Z INFO b\n  continued\n\
+                 2026-10-05 10:00:00.300Z INFO d\n";
+    assert_eq!(
+        harness::merged_by_timestamp(&[("", records), ("rift mcp 7 | ", proxy)]),
+        "[the first 9 bytes are cut by the 65536-byte bound]\n\
+         2026-10-05 10:00:00.100Z INFO a\n\
+         rift mcp 7 | 2026-10-05 10:00:00.200Z INFO b\n\
+         rift mcp 7 |   continued\n\
+         2026-10-05 10:00:00.300Z INFO c\n\
+         rift mcp 7 | 2026-10-05 10:00:00.300Z INFO d\n"
+    );
+    assert_eq!(harness::merged_by_timestamp(&[("", ""), ("p ", "\n")]), "");
+    assert_eq!(harness::printed_timestamp("2026-10-05 10:00:00.1Z x"), None);
+    assert_eq!(harness::printed_timestamp("short"), None);
+}
+
+/// A window covering one workspace merges each registered `rift mcp` child's stderr into
+/// that workspace's records by timestamp and says so under the process; a stderr file
+/// holding the store's refusal is printed after the line saying the window falls back to
+/// it.
+#[test]
+fn a_one_workspace_window_merges_proxy_stderr_and_falls_back_on_a_store_refusal() -> TestResult {
+    let reports = tempfile::tempdir()?;
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let files = fixture_window_files(reports.path());
+    let window =
+        harness::FailureWindow::begin_in(Some(files.clone()), Some(FIXTURE_ATTEMPT), &[root]);
+    files.register_process(4343, "rift mcp")?;
+    files
+        .stderr_copy(4343)?
+        .ok_or("a window with a start keeps a stderr copy")?
+        .write(b"2026-10-05 10:00:00.200Z INFO proxy line\n");
+    let refusal = "rift: the log store refused a batch of 3; the log drain keeps it and \
+                   retries every 250 ms: database is locked\n";
+    let stderr_file = rift_mcp::stderr_file_path(root);
+    fs::create_dir_all(
+        stderr_file
+            .parent()
+            .ok_or("the stderr file has a directory")?,
+    )?;
+    fs::write(&stderr_file, refusal)?;
+
+    drop(window);
+
+    let text = fs::read_to_string(files.text())?;
+    for expected in [
+        "[merged by timestamp with the stderr of each line opening with `rift mcp 4343 | `]\n"
+            .to_owned(),
+        "rift mcp 4343 | 2026-10-05 10:00:00.200Z INFO proxy line\n".to_owned(),
+        "---- process 4343: rift mcp ----".to_owned(),
+        "merged by timestamp into the workspace's records above, each line opening with \
+         `rift mcp 4343 | `\n"
+            .to_owned(),
+        format!(
+            "---- {} ----\n[the log store refused writes (`rift: the log store refused a \
+             batch`): the window falls back to this stderr file for the records the store \
+             lacks]\n{refusal}",
+            stderr_file.display()
+        ),
+    ] {
+        assert!(text.contains(&expected), "{expected:?} in {text}");
+    }
     Ok(())
 }
 

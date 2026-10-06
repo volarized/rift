@@ -280,9 +280,10 @@ const TEXT_FILE_EXTENSION: &str = "text";
 /// Extension of the file one registered process's stderr is copied to.
 const STDERR_FILE_EXTENSION: &str = "stderr";
 /// Bytes of one registered process's stderr its window file keeps: the first ones. The
-/// bytes past it are read and dropped, and one notice line ends the file, so the tail a
-/// window prints of a cut file is the bytes before the bound, not the stream's end.
-const STDERR_FILE_BYTES_MAX: u64 = 16 << 20;
+/// bytes past it are read and dropped, one notice line follows the cut, and a line
+/// counting the dropped bytes ends the file once the stream closes, so the tail a window
+/// prints of a cut file is the bytes before the bound, not the stream's end.
+pub(crate) const STDERR_FILE_BYTES_MAX: u64 = 16 << 20;
 /// Exit text of a registered process whose exit the test did not observe.
 const EXIT_NOT_OBSERVED: &str = "still running at the window, as far as the test observed";
 /// Most windows [`print_ended_windows`] prints in one run; each spends up to
@@ -296,7 +297,8 @@ const ENDED_WINDOWS_MAX: usize = 8;
 /// What the tested processes recorded from the start of one test to its failure,
 /// printed on the test's stderr when the test fails and never when it passes.
 ///
-/// The window holds the test's identity and, for each workspace it covers, the
+/// The window holds the test's identity, `T`, the moment the window ends, and the host
+/// facts ([`machine_line`]); then, for each workspace it covers, the
 /// server's persisted records from the test's start to the failure, read through the
 /// window query of `rift server logs` (`--since`, `--until`): the newest
 /// [`WINDOW_RECORDS_MAX`] log records and the newest record of the table of operations in
@@ -309,6 +311,10 @@ const ENDED_WINDOWS_MAX: usize = 8;
 /// [`WINDOW_READ_MAX`], so one workspace prints at most two sources of that size
 /// and one record; a source that could not be read says why, beside the failure and
 /// never in its place. Each read prints how long it ran.
+///
+/// A window covering one workspace merges the stderr of each registered `rift mcp` child
+/// into that workspace's records by timestamp ([`merged_by_timestamp`]). A stderr file
+/// holding [`STORE_REFUSAL`] is printed after a line saying the window falls back to it.
 ///
 /// A case begins the window right after its [`StopOnDrop`], so the window drops
 /// first and prints before the teardown stop, which can itself outlast nextest's
@@ -434,6 +440,27 @@ impl FailureWindow {
                 "[the start was not written ({error}): a kill of this test leaves no window]"
             );
         }
+        match self.began {
+            Some(_) => {
+                let _ = writeln!(text, "T: {ended_at}");
+            }
+            None => text.push_str("T: not observed: this window ends when the run reads it\n"),
+        }
+        text.push_str(&machine_line());
+        let registered = self.registered();
+        // The lines of a `rift mcp` child merge with the store records by timestamp when
+        // the window covers one workspace: the start names no workspace per process.
+        let merged: Vec<MergedStderr> = match (&registered, self.roots.as_slice()) {
+            (Ok((files, processes)), [_]) => processes
+                .iter()
+                .filter(|process| process.label.starts_with(PROXY_LABEL))
+                .map(|process| MergedStderr {
+                    pid: process.pid,
+                    tail: file_tail(&files.stderr(process.pid), ""),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut workspaces: Vec<WorkspaceReads> = self
             .roots
             .iter()
@@ -443,56 +470,104 @@ impl FailureWindow {
             workspace.scan_in_flight(&since, &until, &budget);
         }
         for workspace in &workspaces {
-            text.push_str(&workspace.text());
+            text.push_str(&workspace.text(&merged));
         }
-        text.push_str(&self.processes_text());
+        text.push_str(&processes_text(registered, &merged));
         text.push_str("==== end of failure window ====\n");
         text
     }
 
-    /// The part of the window each registered process holds: its label, its exit status,
-    /// and the tail of its stderr copy.
-    fn processes_text(&self) -> String {
-        let mut text = String::from("---- processes the test registered ----\n");
+    /// The window's files and the processes its start registers, or the line saying why
+    /// the window holds none.
+    fn registered(&self) -> Result<(&WindowFiles, Vec<RegisteredProcess>), String> {
         let files = match &self.files {
             Ok(Some(files)) => files,
             Ok(None) => {
-                text.push_str("none recorded: outside nextest the window keeps no files\n");
-                return text;
+                return Err("none recorded: outside nextest the window keeps no files\n".into());
             }
-            Err(_) => {
-                text.push_str("none recorded: the start was not written\n");
-                return text;
-            }
+            Err(_) => return Err("none recorded: the start was not written\n".into()),
         };
-        let start = match WindowStart::read(&files.start()) {
-            Ok(start) => start,
-            Err(error) => {
-                let _ = writeln!(text, "not read: {error}");
-                return text;
-            }
-        };
-        if start.processes.is_empty() {
-            text.push_str("none registered\n");
+        match WindowStart::read(&files.start()) {
+            Ok(start) => Ok((files, start.processes)),
+            Err(error) => Err(format!("not read: {error}\n")),
         }
-        for process in &start.processes {
-            let stderr = files.stderr(process.pid);
-            let _ = writeln!(
-                text,
-                "---- process {pid}: {label} ----\nexit: {exit}\n---- {path} ----\n{tail}",
-                pid = process.pid,
-                label = process.label,
-                exit = process.exit.as_deref().unwrap_or(EXIT_NOT_OBSERVED),
-                path = stderr.display(),
-                tail = file_tail(
-                    &stderr,
-                    "absent: the harness drained no stderr of this process, or could not \
-                     create the copy and said why on the test's stderr"
-                ),
-            );
-        }
-        text
     }
+}
+
+/// Label prefix of a registered `rift mcp` child ([`relayed_proxy_client`]).
+const PROXY_LABEL: &str = "rift mcp";
+
+/// The stderr tail of one registered `rift mcp` child the window merges with the store
+/// records of its one workspace.
+struct MergedStderr {
+    pid: u32,
+    tail: String,
+}
+
+impl MergedStderr {
+    /// What opens each of its lines in the merged listing.
+    fn prefix(&self) -> String {
+        format!("{PROXY_LABEL} {} | ", self.pid)
+    }
+}
+
+/// The part of the window each registered process holds: its label, its exit status, and
+/// the tail of its stderr copy, or where that tail merged.
+fn processes_text(
+    registered: Result<(&WindowFiles, Vec<RegisteredProcess>), String>,
+    merged: &[MergedStderr],
+) -> String {
+    let mut text = String::from("---- processes the test registered ----\n");
+    let (files, processes) = match registered {
+        Ok(registered) => registered,
+        Err(line) => {
+            text.push_str(&line);
+            return text;
+        }
+    };
+    if processes.is_empty() {
+        text.push_str("none registered\n");
+    }
+    for process in &processes {
+        let stderr = files.stderr(process.pid);
+        let tail = if merged.iter().any(|copy| copy.pid == process.pid) {
+            format!(
+                "merged by timestamp into the workspace's records above, each line opening \
+                 with `{PROXY_LABEL} {} | `\n",
+                process.pid
+            )
+        } else {
+            stderr_tail(
+                &stderr,
+                "absent: the harness drained no stderr of this process, or could not create \
+                 the copy and said why on the test's stderr",
+            )
+        };
+        let _ = writeln!(
+            text,
+            "---- process {pid}: {label} ----\nexit: {exit}\n---- {path} ----\n{tail}",
+            pid = process.pid,
+            label = process.label,
+            exit = process.exit.as_deref().unwrap_or(EXIT_NOT_OBSERVED),
+            path = stderr.display(),
+        );
+    }
+    text
+}
+
+/// The host facts a window prints once, in the keys of `rift_dev.machine.machine_line`.
+/// The harness carries no reader of physical memory, so `memory_bytes` says so.
+fn machine_line() -> String {
+    let logical_cpus = std::thread::available_parallelism().map_or_else(
+        |error| format!("not read: {error}"),
+        |count| count.to_string(),
+    );
+    format!(
+        "machine: logical_cpus={logical_cpus} memory_bytes=not read by the harness system={} \
+         architecture={}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
 }
 
 impl Drop for FailureWindow {
@@ -649,6 +724,7 @@ impl WindowFiles {
         Ok(Some(StderrCopy {
             file: fs::File::create(self.stderr(pid))?,
             written: 0,
+            discarded: 0,
             cut: false,
         }))
     }
@@ -723,28 +799,47 @@ pub(crate) fn stderr_copy(pid: u32) -> Option<StderrCopy> {
 pub(crate) struct StderrCopy {
     file: fs::File,
     written: u64,
+    /// Bytes read past the bound and dropped.
+    discarded: u64,
     cut: bool,
 }
 
 impl StderrCopy {
     /// Appends `bytes`, up to the bound; the first write the bound cuts appends one
-    /// notice line, and every later write is dropped.
+    /// notice line, and every later write is dropped and counted in `discarded`.
     pub(crate) fn write(&mut self, bytes: &[u8]) {
+        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if self.cut {
+            self.discarded = self.discarded.saturating_add(length);
             return;
         }
         let room = STDERR_FILE_BYTES_MAX.saturating_sub(self.written);
         let kept = bytes.len().min(usize::try_from(room).unwrap_or(usize::MAX));
         let _ = self.file.write_all(&bytes[..kept]);
-        self.written = self
-            .written
-            .saturating_add(u64::try_from(kept).unwrap_or(u64::MAX));
+        let kept_length = u64::try_from(kept).unwrap_or(u64::MAX);
+        self.written = self.written.saturating_add(kept_length);
+        self.discarded = self
+            .discarded
+            .saturating_add(length.saturating_sub(kept_length));
         if kept < bytes.len() {
             self.cut = true;
             let _ = writeln!(
                 self.file,
                 "\n[the copy reached its {STDERR_FILE_BYTES_MAX}-byte bound; the rest is read \
                  and dropped]"
+            );
+        }
+    }
+}
+
+impl Drop for StderrCopy {
+    /// Ends a cut copy with the count of bytes its bound dropped, once its stream closed.
+    fn drop(&mut self) {
+        if self.cut {
+            let _ = writeln!(
+                self.file,
+                "[{} bytes past the {STDERR_FILE_BYTES_MAX}-byte bound were read and dropped]",
+                self.discarded
             );
         }
     }
@@ -840,14 +935,18 @@ fn test_identity() -> String {
         .name()
         .unwrap_or("unnamed test")
         .to_owned();
-    let identity: Vec<String> = ["NEXTEST_BINARY_ID", "NEXTEST_ATTEMPT_ID"]
-        .into_iter()
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                .map(|value| format!("{name}={value}"))
-        })
-        .collect();
+    let identity: Vec<String> = [
+        "NEXTEST_BINARY_ID",
+        "NEXTEST_TEST_NAME",
+        "NEXTEST_ATTEMPT_ID",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| format!("{name}={value}"))
+    })
+    .collect();
     format!("{test} {}", identity.join(" "))
 }
 
@@ -978,8 +1077,12 @@ enum InFlight {
 /// What the reads of a failure window found for one workspace.
 struct WorkspaceReads {
     root: PathBuf,
-    /// The log records of the window, under the command line that read them.
-    records: String,
+    /// The command line that read the log records of the window.
+    heading: String,
+    /// What the read printed, bounded by [`WINDOW_SOURCE_BYTES_MAX`].
+    printed: String,
+    /// How long the read ran, what its bound cut, or why it did not finish.
+    notes: String,
     in_flight: InFlight,
 }
 
@@ -988,16 +1091,18 @@ impl WorkspaceReads {
     fn records(root: &Path, since: &str, until: &str, budget: &ReadBudget) -> Self {
         let tail = WINDOW_RECORDS_MAX.to_string();
         let arguments = window_arguments(since, until, &tail);
-        let mut records = read_heading(&arguments);
+        let heading = read_heading(&arguments);
+        let mut printed = String::new();
+        let mut notes = String::new();
         let in_flight = match read_window(root, &arguments, budget) {
             Ok(read) => {
                 let count = read.printed.lines().filter(|line| !line.is_empty()).count();
                 let newest = newest_in_flight(read.printed.lines());
-                records.push_str(&bounded_tail(&read.printed));
-                records.push_str(&read.took);
+                printed = bounded_tail(&read.printed);
+                notes.push_str(&read.took);
                 if count >= WINDOW_RECORDS_MAX {
                     let _ = writeln!(
-                        records,
+                        notes,
                         "[the read reached its {WINDOW_RECORDS_MAX}-record bound; older records \
                          of the window are cut]"
                     );
@@ -1009,13 +1114,19 @@ impl WorkspaceReads {
                 }
             }
             Err(error) => {
-                let _ = writeln!(records, "the record read did not finish: {error}");
+                let _ = writeln!(
+                    notes,
+                    "the record read did not finish: {error}\n[the window falls back to the \
+                     stderr files below]"
+                );
                 InFlight::NotRead(format!("the record read did not finish: {error}"))
             }
         };
         Self {
             root: root.to_owned(),
-            records,
+            heading,
+            printed,
+            notes,
             in_flight,
         }
     }
@@ -1046,11 +1157,35 @@ impl WorkspaceReads {
         };
     }
 
-    /// The part of a failure window this workspace holds: its records of the window, then
-    /// its server's stderr file.
-    fn text(&self) -> String {
+    /// The part of a failure window this workspace holds: its records of the window, with
+    /// the lines of every `merged` stderr merged in by timestamp, then its server's stderr
+    /// file.
+    fn text(&self, merged: &[MergedStderr]) -> String {
         let mut text = format!("---- workspace {} ----\n", self.root.display());
-        text.push_str(&self.records);
+        text.push_str(&self.heading);
+        if merged.is_empty() {
+            text.push_str(&self.printed);
+        } else {
+            let prefixes: Vec<String> = merged.iter().map(MergedStderr::prefix).collect();
+            let _ = writeln!(
+                text,
+                "[merged by timestamp with the stderr of each line opening with {}]",
+                prefixes
+                    .iter()
+                    .map(|prefix| format!("`{prefix}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let mut sources = vec![("", self.printed.as_str())];
+            sources.extend(
+                prefixes
+                    .iter()
+                    .zip(merged)
+                    .map(|(prefix, copy)| (prefix.as_str(), copy.tail.as_str())),
+            );
+            text.push_str(&merged_by_timestamp(&sources));
+        }
+        text.push_str(&self.notes);
         text.push_str("---- newest record of the operations in flight in the window ----\n");
         match &self.in_flight {
             InFlight::Found(line) => {
@@ -1068,13 +1203,92 @@ impl WorkspaceReads {
             text,
             "---- {} ----\n{}",
             stderr_file.display(),
-            file_tail(
+            stderr_tail(
                 &stderr_file,
                 "absent: only a server `rift server start` spawned writes this file"
             )
         );
         text
     }
+}
+
+/// What opens the line a server's log drain writes to stderr when the log store refuses
+/// a batch (`write_retained`, `crates/rift-tracing/src/drain.rs`).
+const STORE_REFUSAL: &str = "rift: the log store refused a batch";
+
+/// [`file_tail`] of a stderr file, led by a line saying the window falls back to it when
+/// the file holds [`STORE_REFUSAL`]: the store lacks the records the drain kept retrying.
+fn stderr_tail(path: &Path, absent: &str) -> String {
+    let tail = file_tail(path, absent);
+    if !holds_store_refusal(path) {
+        return tail;
+    }
+    format!(
+        "[the log store refused writes (`{STORE_REFUSAL}`): the window falls back to this \
+         stderr file for the records the store lacks]\n{tail}"
+    )
+}
+
+/// Whether the file at `path`, read up to [`STDERR_FILE_BYTES_MAX`] bytes, holds a line
+/// opening with [`STORE_REFUSAL`].
+fn holds_store_refusal(path: &Path) -> bool {
+    use std::io::BufRead as _;
+
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    std::io::BufReader::new(file.take(STDERR_FILE_BYTES_MAX))
+        .split(b'\n')
+        .map_while(Result::ok)
+        .any(|line| line.starts_with(STORE_REFUSAL.as_bytes()))
+}
+
+/// Characters of the timestamp a printed line opens with, `2026-10-04 20:42:58.787Z`.
+const PRINTED_TIMESTAMP_CHARS: usize = 24;
+
+/// The timestamp `line` opens with when it is a UTC time with milliseconds,
+/// `YYYY-MM-DD HH:MM:SS.mmmZ`, the form every surface prints.
+pub(crate) fn printed_timestamp(line: &str) -> Option<&str> {
+    let stamp = line.get(..PRINTED_TIMESTAMP_CHARS)?;
+    let bytes = stamp.as_bytes();
+    let shaped = bytes[10] == b' '
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && stamp.chars().filter(char::is_ascii_digit).count() == 17;
+    shaped.then_some(stamp)
+}
+
+/// The lines of every `(prefix, text)` source merged by the timestamp each line opens
+/// with, `prefix` opening each line of its source.
+///
+/// A line that opens with no timestamp stays after the line before it in its source;
+/// the lines ahead of a source's first timestamp come first. Lines of one timestamp keep
+/// the order of `sources`, and blank lines are left out: a group spans one source.
+pub(crate) fn merged_by_timestamp(sources: &[(&str, &str)]) -> String {
+    // (timestamp, the source's lines from it to the next timestamp)
+    let mut entries: Vec<(Option<&str>, Vec<String>)> = Vec::new();
+    for (prefix, text) in sources {
+        let mut entry: Option<(Option<&str>, Vec<String>)> = None;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let stamp = printed_timestamp(line);
+            if stamp.is_some() || entry.is_none() {
+                entries.extend(entry.take());
+                entry = Some((stamp, Vec::new()));
+            }
+            if let Some((_, lines)) = &mut entry {
+                lines.push(format!("{prefix}{line}"));
+            }
+        }
+        entries.extend(entry);
+    }
+    // A stable sort: one timestamp keeps the order of the sources.
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut merged = String::new();
+    for line in entries.iter().flat_map(|(_, lines)| lines) {
+        merged.push_str(line);
+        merged.push('\n');
+    }
+    merged
 }
 
 /// The window query arguments of one read: `--since`, `--until`, `--tail`.
