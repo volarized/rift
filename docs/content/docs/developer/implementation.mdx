@@ -813,7 +813,10 @@ to the end of its `traced!` operation, the reading the duration histogram record
 
 A span keeps at most 1 KiB of field members: a member that does not fit is left out whole and
 counted in `fields_left_out`, so the object stays valid JSON and both objects fit the record's
-8 KiB fields bound. A task spawned without `.instrument` runs outside the span that spawned it,
+8 KiB fields bound. A record's own members keep the order they were recorded in, written
+through `serde_json` maps; the 8 KiB fields bound, `LOG_FIELDS_BYTES_MAX`, keeps each own member
+whole or leaves it out, and the count of members left out follows as `fields_left_out`. A task
+spawned without `.instrument` runs outside the span that spawned it,
 so its events carry neither member. A field the code itself names `root_span`, `nearest_span`,
 or `fields_left_out` is not recorded.
 
