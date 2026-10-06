@@ -412,7 +412,13 @@ impl DatabaseThread {
 
     /// Stops the worker and joins it by `deadline`, telling a deadline the worker outlasted
     /// apart from a worker that stopped with an error.
+    ///
+    /// A `deadline` already past at the call sets no timer: the stop runs
+    /// [`Self::stop_past_deadline`] instead.
     pub(crate) async fn stop(&self, deadline: Instant) -> Result<(), ShutdownFailure> {
+        if Instant::now() >= deadline {
+            return self.stop_past_deadline().await;
+        }
         let outlasted = |message: &str| ShutdownFailure::Deadline(worker_error(message));
         let failed = |message: &str| ShutdownFailure::Failed(worker_error(message));
         let mut join_state = timeout_at(deadline, self.join.lock())
@@ -469,6 +475,48 @@ impl DatabaseThread {
             return Err(outlasted("SQLite worker join exceeded deadline"));
         }
         response_outcome
+    }
+
+    /// [`Self::stop`] for a deadline already past: every step that would wait answers at
+    /// once. A held join state or a full queue is a deadline failure; otherwise the stop
+    /// queues `Shutdown`, starts the join, and answers a deadline failure without waiting
+    /// for the reply. A join already finished answers its result.
+    ///
+    /// A deadline timer is unnecessary here, and on a paused test clock it would never
+    /// fire: the blocking join stops the clock's auto-advance until the worker ends.
+    async fn stop_past_deadline(&self) -> Result<(), ShutdownFailure> {
+        let outlasted = |message: &str| ShutdownFailure::Deadline(worker_error(message));
+        let failed = |message: &str| ShutdownFailure::Failed(worker_error(message));
+        let Ok(mut join_state) = self.join.try_lock() else {
+            return Err(outlasted("SQLite worker shutdown wait exceeded deadline"));
+        };
+        let finished = match &mut *join_state {
+            JoinState::Complete(result) => result.clone(),
+            JoinState::Task(join) if join.is_finished() => match join.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            },
+            JoinState::Task(_) => return Err(outlasted("SQLite worker join exceeded deadline")),
+            JoinState::Thread(_) => {
+                return match self.sender.try_reserve() {
+                    Ok(permit) => {
+                        let (reply, _response) = oneshot::channel();
+                        permit.send(Command::Shutdown { reply });
+                        start_join(&mut join_state);
+                        Err(outlasted("SQLite worker shutdown exceeded deadline"))
+                    }
+                    Err(mpsc::error::TrySendError::Full(())) => Err(outlasted(
+                        "SQLite worker shutdown queue wait exceeded deadline",
+                    )),
+                    Err(mpsc::error::TrySendError::Closed(())) => {
+                        start_join(&mut join_state);
+                        Err(failed("SQLite worker stopped before shutdown"))
+                    }
+                };
+            }
+        };
+        *join_state = JoinState::Complete(finished.clone());
+        finished.map_err(|error| failed(&format!("SQLite worker stopped with error: {error}")))
     }
 }
 
@@ -1410,6 +1458,39 @@ mod tests {
             matches!(failed, Err(super::ShutdownFailure::Failed(_))),
             "a panicked worker fails its stop: {failed:?}"
         );
+    }
+
+    /// A stop whose deadline passed before the call sets no timer: on a paused clock, where
+    /// the blocking join stops auto-advance while the held worker runs, it answers a
+    /// deadline failure at once, and the queued `Shutdown` stops the worker once released.
+    #[tokio::test]
+    async fn a_stop_past_its_deadline_answers_at_once_on_a_paused_clock() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (held, _held_driver) =
+            driver(&directory.path().join("held"), Duration::from_secs(1)).await;
+        let (holding, release) = held.hold_for_test().await.expect("hold command must queue");
+        holding.await.expect("worker must hold");
+        tokio::time::pause();
+        let deadline = Instant::now();
+
+        let outlasted = held.stop(deadline).await;
+        let again = held.stop(deadline).await;
+
+        assert!(
+            matches!(&outlasted, Err(super::ShutdownFailure::Deadline(error))
+                if error.to_string().contains("SQLite worker shutdown exceeded deadline")),
+            "the stop queues `Shutdown` and answers the deadline: {outlasted:?}"
+        );
+        assert!(
+            matches!(&again, Err(super::ShutdownFailure::Deadline(error))
+                if error.to_string().contains("SQLite worker join exceeded deadline")),
+            "a second stop finds the join running: {again:?}"
+        );
+        release.send(()).expect("worker must resume");
+        tokio::time::resume();
+        held.stop(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("the released worker ends on the queued `Shutdown`");
     }
 
     #[tokio::test]

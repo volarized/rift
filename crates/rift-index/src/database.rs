@@ -3171,7 +3171,6 @@ mod tests {
         let database = limited_database(&path, DatabaseName::Index).await?;
         let (holding, release) = database.thread.hold_for_test().await?;
         holding.await?;
-        tokio::time::pause();
 
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         database.shutdown(tokio::time::Instant::now()).await?;
@@ -3196,7 +3195,6 @@ mod tests {
             "{fields}"
         );
         release.send(()).map_err(|()| "the held worker resumes")?;
-        tokio::time::resume();
         database
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
             .await?;
