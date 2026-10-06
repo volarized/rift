@@ -309,9 +309,10 @@ class ProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "child.pid"
             child = (
-                "import os,pathlib,signal,sys,time; "
+                "import os,pathlib,psutil,signal,sys,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
+                "pathlib.Path(sys.argv[1]).write_text("
+                "f'{os.getpid()} {psutil.Process().create_time()!r}'); time.sleep(30)"
             )
             parent = (
                 "import sys; from rift_dev.commands import Command; "
@@ -323,12 +324,25 @@ class ProcessTests(unittest.TestCase):
                     Path(__file__).parent
                 ).with_timeout(1).output()
             self.assertLess(time.monotonic() - started, 13)
-            pid = int(path.read_text())
+            identity, created = path.read_text().split()
+            pid = int(identity)
             try:
                 descendant = psutil.Process(pid)
-                self.assertEqual(descendant.status(), psutil.STATUS_ZOMBIE)
+                if descendant.create_time() != float(created):
+                    return  # The PID now names a later process.
+                if sys.platform == "win32":
+                    # psutil reads a Windows status as running or stopped, never
+                    # zombie; a zero wait returns once the process has exited.
+                    descendant.wait(timeout=0)
+                else:
+                    self.assertEqual(descendant.status(), psutil.STATUS_ZOMBIE)
             except psutil.NoSuchProcess:
                 pass
+            except psutil.TimeoutExpired:
+                self.fail(
+                    f"descendant {pid} created at {created} still ran at "
+                    f"{time.time()!r} after its owner returned"
+                )
 
 
 if __name__ == "__main__":

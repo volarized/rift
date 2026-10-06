@@ -704,8 +704,33 @@ class JobOwner:
         psutil.Process(process.pid).resume()
 
     def release(self, process: subprocess.Popen[bytes] | None) -> None:
-        """Close the only job handle, which kills every process still in it."""
-        self.handle.Close()
+        """Terminate every process in the job, wait for each exit, then close the job.
+
+        Job termination is asynchronous, like `TerminateProcess`: a descendant can
+        still run after the call returns, so each member's exit is awaited within
+        the cleanup bound. Closing the only handle stays the last stop.
+        """
+        import win32job
+
+        deadline = time.monotonic() + JOIN_SECONDS_MAX
+        try:
+            win32job.TerminateJobObject(int(self.handle), 1)
+            members: list[psutil.Process] = []
+            for pid in win32job.QueryInformationJobObject(
+                int(self.handle), win32job.JobObjectBasicProcessIdList
+            ):
+                try:
+                    members.append(psutil.Process(pid))
+                except psutil.NoSuchProcess:
+                    continue
+            _, alive = psutil.wait_procs(
+                members, timeout=max(0, deadline - time.monotonic())
+            )
+            if alive:
+                pids = ", ".join(str(member.pid) for member in alive)
+                raise RuntimeError(f"command descendants {pids} did not stop")
+        finally:
+            self.handle.Close()
 
 
 @contextmanager
