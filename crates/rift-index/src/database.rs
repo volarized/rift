@@ -88,6 +88,14 @@ static FILE_SIZE: rift_tracing::ObservableUpDownCounter<2> =
         "By",
         &["db.namespace", "sqlite.file.type"],
     );
+/// `sqlite.page.count`: the pages of the database file in use and on its freelist, read from
+/// the file's header when the meter collects.
+static PAGE_COUNT: rift_tracing::ObservableUpDownCounter<2> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        "sqlite.page.count",
+        "{page}",
+        &["db.namespace", "sqlite.page.state"],
+    );
 
 /// Suffix the migration lock file appends to the database file's whole name: the
 /// database `.rift/index` is prepared under `.rift/index.lock`.
@@ -326,9 +334,10 @@ pub struct WorkspaceDatabase {
     writes: Mutex<()>,
     /// Whether a shutdown has already run the close checkpoint.
     checkpointed: AtomicBool,
-    /// Keeps the file sizes and the worker's queue length reported while the database
-    /// lives; absent where the process installed no meter.
-    _readings: [Option<rift_tracing::ObservationGuard>; 2],
+    /// Keeps the file sizes, the page counts, the worker's queue length, and its open
+    /// transactions reported while the database lives; absent where the process installed
+    /// no meter.
+    _readings: [Option<rift_tracing::ObservationGuard>; 4],
 }
 
 /// The row one `PRAGMA wal_checkpoint` answers: whether it met another connection's lock,
@@ -491,9 +500,13 @@ impl WorkspaceDatabase {
         drop(migration_lock);
         checkpoint_at_open(&database, name, database_path).await;
         let queue_length = thread.observe_queue_length();
+        let transactions_active = thread.observe_transactions_active();
         let sizes = database_path.to_owned();
         let file_sizes =
             FILE_SIZE.observe(move |observation| observe_file_sizes(name, &sizes, observation));
+        let pages = database_path.to_owned();
+        let page_counts =
+            PAGE_COUNT.observe(move |observation| observe_page_counts(name, &pages, observation));
         let opened = Self {
             name,
             path: database_path.to_owned(),
@@ -502,7 +515,7 @@ impl WorkspaceDatabase {
             thread,
             writes: Mutex::new(()),
             checkpointed: AtomicBool::new(false),
-            _readings: [file_sizes, queue_length],
+            _readings: [file_sizes, page_counts, queue_length, transactions_active],
         };
         opened.record_pool();
         Ok(Arc::new(opened))
@@ -1025,6 +1038,28 @@ fn observe_file_sizes(
         if let Ok(metadata) = std::fs::metadata(&path) {
             observation.observe([database, kind], metadata.len());
         }
+    }
+}
+
+/// Reports the pages in use and on the freelist of the database file `path` of `name`, as
+/// [`rift_tracing::PageCounts::read`] answers them: one open and one 100-byte read of the
+/// file's header, off the worker and outside its queue. A file it answers nothing for
+/// reports nothing: absent, not zero.
+fn observe_page_counts(
+    name: DatabaseName,
+    path: &Path,
+    observation: &rift_tracing::Observation<'_, 2>,
+) {
+    if let Some(counts) = rift_tracing::PageCounts::read(path) {
+        let database = name.label();
+        observation.observe(
+            [database, rift_tracing::PAGE_STATE_USED],
+            u64::from(counts.used()),
+        );
+        observation.observe(
+            [database, rift_tracing::PAGE_STATE_FREE],
+            u64::from(counts.free()),
+        );
     }
 }
 
@@ -1661,8 +1696,9 @@ mod tests {
         assert_eq!(observations(committed), 1, "one COMMIT");
         let active = series(&metrics, "sqlite.transaction.active", &[vectors])?;
         assert_eq!(active.unit(), "{transaction}");
-        assert!(
-            last(active).abs() < f64::EPSILON,
+        assert_eq!(
+            active.value(),
+            &rift_tracing::SeriesValue::Sum(0.0),
             "the commit ended the transaction"
         );
         let result = ("sqlite.transaction.result", "commit");
@@ -1757,6 +1793,98 @@ mod tests {
                 .find("sqlite.queue.length", &[("db.namespace", "index")])
                 .is_none(),
             "a dropped database reports no queue"
+        );
+        Ok(())
+    }
+
+    /// The pages in use and on the freelist of `path`, as `SQLite` answers them on a
+    /// connection of its own after a truncate checkpoint wrote every page into the file.
+    fn checkpointed_page_counts(path: &Path) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(1))?;
+        let busy: i64 =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        assert_eq!(busy, 0, "the checkpoint met no lock");
+        let pages: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let free: i64 = connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok((pages - free, free))
+    }
+
+    /// An open database reports the pages its file's header holds at each collection: the
+    /// pages in use and the pages a dropped table left on the freelist, as `SQLite` counts
+    /// them once a checkpoint wrote them into the file.
+    #[tokio::test]
+    async fn an_open_database_reports_its_used_and_free_pages() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let database = WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await?;
+        {
+            let connection = rusqlite::Connection::open(&path)?;
+            connection.busy_timeout(Duration::from_secs(1))?;
+            connection.execute_batch(
+                "CREATE TABLE page_scratch(payload BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 16)
+                 INSERT INTO page_scratch SELECT randomblob(8192) FROM n;
+                 DROP TABLE page_scratch;",
+            )?;
+        }
+        let (used, free) = checkpointed_page_counts(&path)?;
+        assert!(free > 0, "the dropped table left free pages");
+
+        let metrics = recorder.metrics();
+        let state = |state: &'static str| [("db.namespace", "index"), ("sqlite.page.state", state)];
+        let reported_used = series(&metrics, "sqlite.page.count", &state("used"))?;
+        assert_eq!(reported_used.unit(), "{page}");
+        #[expect(clippy::cast_precision_loss, reason = "a test file holds few pages")]
+        let expected = |pages: i64| rift_tracing::SeriesValue::Sum(pages as f64);
+        assert_eq!(reported_used.value(), &expected(used));
+        let reported_free = series(&metrics, "sqlite.page.count", &state("free"))?;
+        assert_eq!(reported_free.value(), &expected(free));
+        drop(database);
+        assert!(
+            recorder
+                .metrics()
+                .find("sqlite.page.count", &state("used"))
+                .is_none(),
+            "a dropped database reports no pages"
+        );
+        Ok(())
+    }
+
+    /// `sqlite.transaction.active` reads one while a write transaction is open on the
+    /// database and zero once it rolled back.
+    #[tokio::test]
+    async fn an_open_transaction_is_observed_until_it_ends() -> TestResult {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Vectors, pool())
+                .await?;
+        let active = |metrics: &rift_tracing::MetricSnapshot| {
+            metrics
+                .find("sqlite.transaction.active", &[("db.namespace", "vectors")])
+                .map(|series| series.value().clone())
+        };
+        let mut writing = database.writing().await?;
+        let transaction = writing.transaction().await?;
+        assert_eq!(
+            active(&recorder.metrics()),
+            Some(rift_tracing::SeriesValue::Sum(1.0)),
+            "the begun transaction is open"
+        );
+        transaction.rollback().await?;
+        drop(writing);
+        assert_eq!(
+            active(&recorder.metrics()),
+            Some(rift_tracing::SeriesValue::Sum(0.0)),
+            "the rollback ended it"
+        );
+        drop(database);
+        assert_eq!(
+            active(&recorder.metrics()),
+            None,
+            "a dropped database reports no transactions"
         );
         Ok(())
     }

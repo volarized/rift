@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rift_tracing::{Counter, Gauge, Histogram, PerformanceMeasurement};
+use rift_tracing::{Counter, Histogram, PerformanceMeasurement};
 use toasty_core::Schema;
 use toasty_core::driver::operation::{Operation, Transaction, TransactionMode};
 use toasty_core::driver::{
@@ -101,10 +101,26 @@ static WRITE_LOCK_WAIT: Histogram<2> = Histogram::declare(
     "sqlite.write_lock.wait.duration",
     &["db.namespace", "error.type"],
 );
-/// `sqlite.transaction.active`: transactions begun and not yet ended, per database.
-static TRANSACTION_ACTIVE: Gauge<u64, 1> = Gauge::declare(
-    "sqlite.transaction.active",
-    "{transaction}",
+/// `sqlite.transaction.active`: transactions begun and not yet ended, per database, read
+/// when the meter collects.
+static TRANSACTION_ACTIVE: rift_tracing::ObservableUpDownCounter<1> =
+    rift_tracing::ObservableUpDownCounter::declare(
+        "sqlite.transaction.active",
+        "{transaction}",
+        &["db.namespace"],
+    );
+/// `sqlite.connection.refusals`: connection requests the worker refused because it held
+/// its bound of connections.
+static CONNECTION_REFUSALS: Counter<1> = Counter::declare(
+    "sqlite.connection.refusals",
+    "{connection}",
+    &["db.namespace"],
+);
+/// `sqlite.connection.reaped`: connections the worker removed because their driver
+/// connection dropped and no close command removed them first.
+static CONNECTION_REAPED: Counter<1> = Counter::declare(
+    "sqlite.connection.reaped",
+    "{connection}",
     &["db.namespace"],
 );
 /// `sqlite.commit.duration`: one `COMMIT` on the worker, a checkpoint it runs included.
@@ -341,18 +357,35 @@ impl DatabaseThread {
         })
     }
 
-    /// Counts one transaction begun, or with `begun` false one ended, and records the count.
+    /// Reports `sqlite.transaction.active`, the transactions begun on the database's
+    /// connections and not yet ended, each time the meter collects, until the returned guard
+    /// drops. The read holds the worker weakly, so it keeps no worker running, and reports
+    /// nothing once the worker dropped.
+    pub(crate) fn observe_transactions_active(
+        self: &Arc<Self>,
+    ) -> Option<rift_tracing::ObservationGuard> {
+        let name = self.name;
+        let worker = Arc::downgrade(self);
+        TRANSACTION_ACTIVE.observe(move |observation| {
+            if let Some(worker) = worker.upgrade() {
+                let active = worker.transactions_active.load(Ordering::Relaxed);
+                observation.observe([name.label()], active);
+            }
+        })
+    }
+
+    /// Counts one transaction begun, or with `begun` false one ended.
     fn count_transaction(&self, begun: bool) {
-        let active = if begun {
-            self.transactions_active.fetch_add(1, Ordering::Relaxed) + 1
+        if begun {
+            self.transactions_active.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.transactions_active
-                .fetch_sub(1, Ordering::Relaxed)
-                .saturating_sub(1)
-        };
-        TRANSACTION_ACTIVE
-            .labeled_value([self.name.label()], active)
-            .record();
+            // An end without a begin leaves the count at zero, never wrapped.
+            let _ = self.transactions_active.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |active| active.checked_sub(1),
+            );
+        }
     }
 
     /// [`Self::stop`] with either failure as its driver error.
@@ -808,13 +841,13 @@ impl DatabaseWorker {
         let mut reap = interval(CONNECTION_REAP_SPAN);
         loop {
             tokio::select! {
-                _ = reap.tick() => reap_connections(&mut self.connections),
+                _ = reap.tick() => self.reap_connections(),
                 command = receiver.recv() => {
                     let Some(command) = command else { break; };
                     if !self.handle(command).await {
                         break;
                     }
-                    reap_connections(&mut self.connections);
+                    self.reap_connections();
                 }
             }
         }
@@ -916,8 +949,9 @@ impl DatabaseWorker {
         context: ConnectContext,
         reply: oneshot::Sender<Result<(u64, Arc<()>), toasty_core::Error>>,
     ) {
-        reap_connections(&mut self.connections);
+        self.reap_connections();
         let result = if self.connections.len() >= self.connections_max {
+            CONNECTION_REFUSALS.labeled([self.name.label()]).add(1);
             Err(worker_error("SQLite connection bound reached"))
         } else {
             match self.driver.connect(&context).await {
@@ -1015,6 +1049,20 @@ impl DatabaseWorker {
         let _ = reply.send(result);
     }
 
+    /// Removes every connection whose driver connection dropped, and counts each one in
+    /// `sqlite.connection.reaped`.
+    fn reap_connections(&mut self) {
+        let held = self.connections.len();
+        self.connections
+            .retain(|_, connection| connection.lease.strong_count() > 0);
+        let reaped = held.saturating_sub(self.connections.len());
+        if reaped > 0 {
+            CONNECTION_REAPED
+                .labeled([self.name.label()])
+                .add(u64::try_from(reaped).unwrap_or(u64::MAX));
+        }
+    }
+
     async fn reset(&self, reply: oneshot::Sender<Result<(), toasty_core::Error>>) {
         let result = if self.connections.is_empty() {
             self.driver.reset_db().await
@@ -1025,10 +1073,6 @@ impl DatabaseWorker {
         };
         let _ = reply.send(result);
     }
-}
-
-fn reap_connections(connections: &mut HashMap<u64, OwnedConnection>) {
-    connections.retain(|_, connection| connection.lease.strong_count() > 0);
 }
 
 fn worker_error(message: &str) -> toasty_core::Error {
@@ -1162,6 +1206,106 @@ mod tests {
         .expect("connection reaping must finish within one second")
         .expect("dropped proxy must not leak actor slot");
         drop(connection);
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("worker must stop");
+    }
+
+    /// The `{connection}` count `name` holds for the index database in `metrics`, absent
+    /// when nothing was counted.
+    fn connections_counted(
+        metrics: &rift_tracing::MetricSnapshot,
+        name: &str,
+    ) -> Option<rift_tracing::SeriesValue> {
+        metrics
+            .find(name, &[("db.namespace", "index")])
+            .map(|series| {
+                assert_eq!(series.unit(), "{connection}");
+                series.value().clone()
+            })
+    }
+
+    /// A connection request past the worker's bound of one connection is refused and counted
+    /// once in `sqlite.connection.refusals`.
+    #[tokio::test]
+    async fn a_connection_past_the_bound_counts_one_refusal() {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the recorder installs");
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let held = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect("the first connection opens");
+        let refused = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect_err("a second connection passes the bound of one");
+        assert!(
+            refused.to_string().contains("connection bound reached"),
+            "{refused}"
+        );
+        let metrics = recorder.metrics();
+        assert_eq!(
+            connections_counted(&metrics, "sqlite.connection.refusals"),
+            Some(rift_tracing::SeriesValue::Sum(1.0))
+        );
+        assert_eq!(
+            connections_counted(&metrics, "sqlite.connection.reaped"),
+            None,
+            "the held connection is not reaped"
+        );
+        drop(held);
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("worker must stop");
+    }
+
+    /// A connection dropped while its close command cannot queue is reaped and counted once
+    /// in `sqlite.connection.reaped`.
+    #[tokio::test]
+    async fn a_connection_dropped_behind_a_full_queue_counts_one_reap() {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("the recorder installs");
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let connection = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect("first connection must open");
+        let (started, release) = actor
+            .hold_for_test()
+            .await
+            .expect("hold command must queue");
+        started.await.expect("worker must hold queue");
+        let (done, completed) = oneshot::channel();
+        actor
+            .sender
+            .try_send(Command::Noop(done))
+            .expect("one queued command must fill bounded queue");
+        drop(connection);
+        release.send(()).expect("worker must resume");
+        completed.await.expect("queued command must complete");
+        let reopened = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect("the reaped slot opens again");
+
+        let metrics = recorder.metrics();
+        assert_eq!(
+            connections_counted(&metrics, "sqlite.connection.reaped"),
+            Some(rift_tracing::SeriesValue::Sum(1.0))
+        );
+        assert_eq!(
+            connections_counted(&metrics, "sqlite.connection.refusals"),
+            None,
+            "the reaped slot refused nothing"
+        );
+        drop(reopened);
         actor
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await
