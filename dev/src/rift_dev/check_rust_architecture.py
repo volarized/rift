@@ -655,12 +655,15 @@ class ClockFinding:
     text: str
 
 
+def is_test_source(relative: pathlib.PurePath) -> bool:
+    """Whether a path under a package is a test suite: under `tests` or named `tests.rs`."""
+    return "tests" in relative.parts[:-1] or relative.name == "tests.rs"
+
+
 def clock_allowed(package: str, relative: pathlib.PurePath) -> bool:
     """Whether the inventory lists a file, or the file is a test suite."""
-    return (
-        f"{package}/{relative.as_posix()}" in CLOCK_INVENTORY
-        or "tests" in relative.parts[:-1]
-        or relative.name == "tests.rs"
+    return f"{package}/{relative.as_posix()}" in CLOCK_INVENTORY or is_test_source(
+        relative
     )
 
 
@@ -700,6 +703,59 @@ def clock_main() -> int:
     return 0
 
 
+# A crate emits instruments when its shipped source declares a `const SCOPE` of type
+# `InstrumentScope` or opens an operation through `traced!` or the `#[traced]` attribute,
+# whose expansion builds the scope through `__rift_instrument_scope!`.
+SCOPE_DECLARATION = re.compile(r"\bconst\s+SCOPE\s*:[^=;]*\bInstrumentScope\b")
+SCOPE_EXPANSION = re.compile(r"\btraced\s*!\s*[({\[]|#\[\s*(?:\w+\s*::\s*)*traced\b")
+SCOPES_MAX_DECLARATION = re.compile(
+    r"\bpub\s+const\s+SCOPES_MAX\s*:\s*usize\s*=\s*(\d+)\s*;"
+)
+SCOPES_MAX_FILE = pathlib.PurePath("src/metrics.rs")
+
+
+def scopes_max(packages: list[dict[str, Any]]) -> int:
+    """Read `SCOPES_MAX` from the `rift-tracing` source that declares it."""
+    owner = next(package for package in packages if package["name"] == TRACING_OWNER)
+    path = pathlib.Path(owner["manifest_path"]).parent / SCOPES_MAX_FILE
+    match = SCOPES_MAX_DECLARATION.search(path.read_text(encoding="utf-8"))
+    if match is None:
+        raise RuntimeError(f"{path} declares no `pub const SCOPES_MAX: usize`")
+    return int(match.group(1))
+
+
+def emitting_crates(packages: list[dict[str, Any]]) -> list[str]:
+    """List the packages whose shipped Rust source defines an instrumentation scope.
+
+    A procedural macro crate writes `traced!` into the code it expands to and emits
+    nothing itself, so it is skipped.
+    """
+    emitting = []
+    for package in packages:
+        if any("proc-macro" in target["kind"] for target in package.get("targets", [])):
+            continue
+        root = pathlib.Path(package["manifest_path"]).parent
+        if any(
+            SCOPE_DECLARATION.search(line) or SCOPE_EXPANSION.search(line)
+            for path in rust_sources(package)
+            if not is_test_source(path.relative_to(root))
+            for _, line in rust_code_lines(path.read_text(encoding="utf-8"))
+        ):
+            emitting.append(package["name"])
+    return emitting
+
+
+def fail_scopes(packages: list[dict[str, Any]]) -> None:
+    """Refuse more emitting crates than `SCOPES_MAX`, the meters one process builds."""
+    bound = scopes_max(packages)
+    emitting = emitting_crates(packages)
+    if len(emitting) > bound:
+        raise RuntimeError(
+            f"{len(emitting)} crates define an instrumentation scope, past "
+            f"SCOPES_MAX = {bound}: {', '.join(emitting)}"
+        )
+
+
 def main() -> int:
     """Check exact internal edges, binary targets, and backend ownership."""
     packages = rift_packages(cargo_metadata())
@@ -729,4 +785,5 @@ def main() -> int:
     fail_test_targets(packages)
     fail_storage_independence()
     fail_ownership(packages)
+    fail_scopes(packages)
     return 0

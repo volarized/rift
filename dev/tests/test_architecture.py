@@ -467,3 +467,113 @@ def test_a_clock_name_in_a_comment_or_another_identifier_is_not_a_read(
         },
     )
     assert clock_found([consumer]) == set()
+
+
+def scoped_workspace(
+    root: Path, bound: str, emitters: list[str]
+) -> list[dict[str, Any]]:
+    """An owner declaring `SCOPES_MAX = bound` and one emitting crate per name."""
+    owner = package(
+        root,
+        "rift-tracing",
+        [],
+        {
+            "src/metrics.rs": (
+                "pub(crate) const SCOPE: InstrumentScope =\n"
+                '    InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));\n'
+                f"pub const SCOPES_MAX: usize = {bound};\n"
+            )
+        },
+    )
+    crates = [
+        package(
+            root,
+            name,
+            [],
+            {
+                "src/lib.rs": (
+                    "const SCOPE: rift_tracing::InstrumentScope =\n"
+                    "    rift_tracing::InstrumentScope::new("
+                    'env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));\n'
+                )
+            },
+        )
+        for name in emitters
+    ]
+    return [owner, *crates]
+
+
+def test_scopes_max_is_read_from_the_rift_tracing_source(tmp_path: Path) -> None:
+    assert architecture.scopes_max(scoped_workspace(tmp_path, "6", [])) == 6
+
+
+def test_a_rift_tracing_source_without_scopes_max_is_refused(tmp_path: Path) -> None:
+    packages = scoped_workspace(tmp_path, "6", [])
+    metrics = Path(packages[0]["manifest_path"]).parent / "src/metrics.rs"
+    metrics.write_text("pub const OTHER: usize = 6;\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="declares no `pub const SCOPES_MAX"):
+        architecture.scopes_max(packages)
+
+
+def test_emitting_crates_as_many_as_scopes_max_pass(tmp_path: Path) -> None:
+    packages = scoped_workspace(tmp_path, "3", ["rift-a", "rift-b"])
+    assert architecture.emitting_crates(packages) == [
+        "rift-tracing",
+        "rift-a",
+        "rift-b",
+    ]
+    architecture.fail_scopes(packages)
+
+
+def test_one_emitting_crate_past_scopes_max_is_refused(tmp_path: Path) -> None:
+    packages = scoped_workspace(tmp_path, "3", ["rift-a", "rift-b", "rift-c"])
+    with pytest.raises(
+        RuntimeError,
+        match=r"4 crates define an instrumentation scope, past SCOPES_MAX = 3: "
+        r"rift-tracing, rift-a, rift-b, rift-c",
+    ):
+        architecture.fail_scopes(packages)
+
+
+def test_traced_in_shipped_source_counts_and_in_a_test_suite_or_comment_does_not(
+    tmp_path: Path,
+) -> None:
+    packages = scoped_workspace(tmp_path, "9", [])
+    shipped = package(
+        tmp_path,
+        "rift-shipped",
+        [],
+        {"src/lib.rs": 'fn run() { rift_tracing::traced!(component = "a", {}); }\n'},
+    )
+    attribute = package(
+        tmp_path,
+        "rift-attribute",
+        [],
+        {"src/lib.rs": "#[rift_tracing::traced]\nfn run() {}\n"},
+    )
+    quiet = package(
+        tmp_path,
+        "rift-quiet",
+        [],
+        {
+            "src/lib.rs": "// rift_tracing::traced!(a)\nfn run() {}\n",
+            "src/tests.rs": "fn t() { rift_tracing::traced!(a); }\n",
+            "tests/suite.rs": "fn t() { rift_tracing::traced!(a); }\n",
+        },
+    )
+    assert architecture.emitting_crates([*packages, shipped, attribute, quiet]) == [
+        "rift-tracing",
+        "rift-shipped",
+        "rift-attribute",
+    ]
+
+
+def test_a_procedural_macro_crate_naming_traced_is_not_an_emitter(
+    tmp_path: Path,
+) -> None:
+    packages = scoped_workspace(tmp_path, "9", [])
+    expansion = package(
+        tmp_path, "rift-macros", [], {"src/lib.rs": "fn x() { quote!(traced!(a)); }\n"}
+    )
+    expansion["targets"] = [{"kind": ["proc-macro"]}]
+    assert architecture.emitting_crates([*packages, expansion]) == ["rift-tracing"]
