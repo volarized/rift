@@ -24,7 +24,9 @@ pub use change_set::{
     ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
 };
 pub use content_cache::WorkspaceContentCache;
-pub use database::{DatabaseName, DatabasePool, HeldConnection, WorkspaceDatabase};
+pub use database::{
+    DatabaseName, DatabasePool, DatabaseReadings, HeldConnection, WorkspaceDatabase,
+};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lazy_database::LazyDatabase;
 pub use lexical::{

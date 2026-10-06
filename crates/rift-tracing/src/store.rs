@@ -479,7 +479,13 @@ pub struct LogStore {
     progress: Arc<CloseProgress>,
     /// Keeps the queue length, the file sizes, and the page counts reported while the
     /// store lives; absent where the process installed no meter.
-    _readings: [Option<ObservationGuard>; 3],
+    readings: Arc<StoreReadings>,
+}
+
+/// Keeps this store's observable readings registered without retaining its writer.
+#[derive(Debug)]
+pub struct StoreReadings {
+    _guards: [Option<ObservationGuard>; 3],
 }
 
 impl std::fmt::Debug for Command {
@@ -534,23 +540,32 @@ impl LogStore {
         let sizes: PathBuf = database.to_path_buf();
         let pages: PathBuf = database.to_path_buf();
         // The reads hold the queue weakly and copy the path, so none keeps the writer.
-        let readings = [
-            QUEUE_LENGTH.observe(move |observation| {
-                if let Some(sender) = queue.upgrade() {
-                    let queued = sender.max_capacity().saturating_sub(sender.capacity());
-                    observation.observe([DB_NAMESPACE], u64::try_from(queued).unwrap_or(u64::MAX));
-                }
-            }),
-            FILE_SIZE.observe(move |observation| observe_file_sizes(&sizes, observation)),
-            PAGE_COUNT.observe(move |observation| observe_page_counts(&pages, observation)),
-        ];
+        let readings = Arc::new(StoreReadings {
+            _guards: [
+                QUEUE_LENGTH.observe(move |observation| {
+                    if let Some(sender) = queue.upgrade() {
+                        let queued = sender.max_capacity().saturating_sub(sender.capacity());
+                        observation
+                            .observe([DB_NAMESPACE], u64::try_from(queued).unwrap_or(u64::MAX));
+                    }
+                }),
+                FILE_SIZE.observe(move |observation| observe_file_sizes(&sizes, observation)),
+                PAGE_COUNT.observe(move |observation| observe_page_counts(&pages, observation)),
+            ],
+        });
         Ok(Self {
             path: database,
             sender,
             closed: OnceLock::new(),
             progress,
-            _readings: readings,
+            readings,
         })
+    }
+
+    /// Keeps the store's file, page, and queue readings registered after its writer stops.
+    #[must_use]
+    pub fn readings(&self) -> Arc<StoreReadings> {
+        Arc::clone(&self.readings)
     }
 
     /// The metrics database file this store writes.

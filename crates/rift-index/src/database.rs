@@ -341,10 +341,18 @@ pub struct WorkspaceDatabase {
     writes: Mutex<()>,
     /// Whether a shutdown has already run the close checkpoint.
     checkpointed: AtomicBool,
-    /// Keeps the file sizes, the page counts, the worker's queue length, and its open
-    /// transactions reported while the database lives; absent where the process installed
-    /// no meter.
-    _readings: [Option<rift_tracing::ObservationGuard>; 4],
+    /// Keeps file sizes, page counts, queue length, and open transactions reported while
+    /// this database lives; absent where the process installed no meter.
+    readings: Arc<DatabaseReadings>,
+}
+
+/// Keeps this database's observable readings registered.
+///
+/// A server can retain this metadata-only owner through its final metric collection after
+/// the database worker stops. It does not retain the database, pool, or worker.
+#[derive(Debug)]
+pub struct DatabaseReadings {
+    _guards: [Option<rift_tracing::ObservationGuard>; 4],
 }
 
 /// The row one `PRAGMA wal_checkpoint` answers: whether it met another connection's lock,
@@ -522,7 +530,9 @@ impl WorkspaceDatabase {
             thread,
             writes: Mutex::new(()),
             checkpointed: AtomicBool::new(false),
-            _readings: [file_sizes, page_counts, queue_length, transactions_active],
+            readings: Arc::new(DatabaseReadings {
+                _guards: [file_sizes, page_counts, queue_length, transactions_active],
+            }),
         };
         opened.record_pool();
         Ok(Arc::new(opened))
@@ -559,6 +569,12 @@ impl WorkspaceDatabase {
     #[must_use]
     pub const fn pool(&self) -> DatabasePool {
         self.pool
+    }
+
+    /// Keeps this database's file, page, queue, and transaction readings registered.
+    #[must_use]
+    pub fn readings(&self) -> Arc<DatabaseReadings> {
+        Arc::clone(&self.readings)
     }
 
     /// A failure of this database's checkout, write turn, checkpoint, or worker stop,

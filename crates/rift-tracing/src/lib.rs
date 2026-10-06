@@ -101,7 +101,7 @@ pub use span::Span;
 pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{
     LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, STATEMENT_BOUNDARIES, StoreClose,
-    WalCheckpoint, sqlite_error_type,
+    StoreReadings, WalCheckpoint, sqlite_error_type,
 };
 
 /// Times a whole function as one [`traced!`] operation.

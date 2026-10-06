@@ -15,10 +15,11 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_error::{RiftError, errors};
-use rift_index::WorkspaceIndexLimits;
+use rift_index::{DatabaseReadings, WorkspaceIndexLimits};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rift_search::SearchIndex;
+use rift_tracing::StoreReadings;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::sync::Notify;
@@ -225,6 +226,8 @@ pub struct HttpServer {
 pub struct DeferredDatabaseShutdown(
     Option<Arc<SearchIndex>>,
     Option<Arc<rift_tracing::LogStore>>,
+    Vec<Arc<DatabaseReadings>>,
+    Option<Arc<StoreReadings>>,
 );
 
 impl DeferredDatabaseShutdown {
@@ -259,7 +262,8 @@ impl DeferredDatabaseShutdown {
         let Some(search_index) = self.0.take() else {
             return Ok(());
         };
-        stop_stage("SQLite worker shutdown", deadline, async {
+        self.retain_readings(search_index.database_readings());
+        let result = stop_stage("SQLite worker shutdown", deadline, async {
             search_index.shutdown(deadline).await.map_err(|error| {
                 rift_tracing::warn!(
                     component = "storage",
@@ -273,7 +277,18 @@ impl DeferredDatabaseShutdown {
                     .error()
             })
         })
-        .await
+        .await;
+        self.retain_readings(search_index.database_readings());
+        result
+    }
+
+    /// Retains each database's readings owner once, without retaining its worker.
+    fn retain_readings(&mut self, readings: Vec<Arc<DatabaseReadings>>) {
+        for reading in readings {
+            if !self.2.iter().any(|held| Arc::ptr_eq(held, &reading)) {
+                self.2.push(reading);
+            }
+        }
     }
 
     /// Closes the metrics database by `deadline`, when it opened.
@@ -285,8 +300,12 @@ impl DeferredDatabaseShutdown {
     /// # Cancel safety
     ///
     /// Dropping the future after the close is queued leaves the writer thread to close.
-    pub async fn close_logs(self, deadline: Instant) -> Result<(), RiftError> {
-        close_logs(self.1.as_deref(), deadline).await
+    pub async fn close_logs(&mut self, deadline: Instant) -> Result<(), RiftError> {
+        let logs = self.1.take();
+        if let Some(store) = &logs {
+            self.3 = Some(store.readings());
+        }
+        close_logs(logs.as_deref(), deadline).await
     }
 }
 
@@ -634,7 +653,7 @@ impl HttpServer {
         (
             deadline,
             stopped,
-            DeferredDatabaseShutdown(self.search_index, self.logs),
+            DeferredDatabaseShutdown(self.search_index, self.logs, Vec::new(), None),
         )
     }
 }
@@ -2280,7 +2299,8 @@ mod tests {
         );
         let limits = rift_search::SearchIndexLimits::default();
         let search = rift_search::SearchIndex::attached(database, Arc::clone(&vectors), limits)?;
-        let mut shutdown = super::DeferredDatabaseShutdown(Some(Arc::new(search)), None);
+        let mut shutdown =
+            super::DeferredDatabaseShutdown(Some(Arc::new(search)), None, Vec::new(), None);
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -2370,7 +2390,8 @@ mod tests {
             vectors,
             rift_search::SearchIndexLimits::default(),
         )?;
-        let mut shutdown = super::DeferredDatabaseShutdown(Some(Arc::new(search)), None);
+        let mut shutdown =
+            super::DeferredDatabaseShutdown(Some(Arc::new(search)), None, Vec::new(), None);
 
         shutdown
             .close_search(Instant::now() + Duration::from_millis(200))

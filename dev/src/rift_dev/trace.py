@@ -77,9 +77,11 @@ TRACES_PATH = "/v1/traces"
 METRICS_PATH = "/v1/metrics"
 LOGS_PATH = "/v1/logs"
 CASE_LOGS_PATH = "/test/case/logs"
+CASE_METRICS_PATH = "/test/case/metrics"
 PROTOBUF = "application/x-protobuf"
 BODY_BYTES_MAX = 8 * 1024 * 1024
 CASE_LOG_SNAPSHOT_BYTES_MAX = 1024 * 1024
+CASE_METRIC_SNAPSHOT_BYTES_MAX = 1024 * 1024
 METRICS_MAX = 512
 SERIES_MAX = 256
 GZIP_WINDOW = 31
@@ -122,6 +124,7 @@ CASE_POINTS_MAX = 20_000
 CASE_SPANS_MAX = 5_000
 CASE_LOGS_MAX = 20_000
 CASE_LOG_SNAPSHOT_MAX = 256
+CASE_METRIC_SNAPSHOT_MAX = 256
 # Tests `CaseStore` holds at once; a test past it is counted, not kept.
 CASES_MAX = 512
 # Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
@@ -919,6 +922,17 @@ class CaseStore:
             logs = tuple(reversed(held.logs))
             return logs[:limit], held.dropped.logs, len(logs)
 
+    def metric_snapshot(
+        self, test: str, limit: int
+    ) -> tuple[tuple[MetricPoint, ...], int, int] | None:
+        """The newest `limit` metric points for `test`, dropped count, and retained count."""
+        with self.lock:
+            held = self.tests.get(test)
+            if held is None:
+                return None
+            points = tuple(reversed(held.points))
+            return points[:limit], held.dropped.points, len(points)
+
     def forget(self, names: Callable[[str], bool]) -> int:
         """Drops every held test `names` accepts; answers how many."""
         with self.lock:
@@ -973,7 +987,8 @@ def receiver(
     `logs`.
 
     Starlette answers any other path with 404 and any other method with 405. When `cases`
-    is supplied, it also serves a bounded read-only snapshot of one live test's logs.
+    is supplied, it also serves bounded read-only snapshots of one live test's logs and
+    metric points.
     """
     held = metrics if metrics is not None else MetricStore()
     records = logs if logs is not None else LogStore()
@@ -1094,6 +1109,74 @@ def receiver(
             )
 
         routes.append(Route(CASE_LOGS_PATH, case_logs, methods=["GET"]))
+
+        async def case_metrics(request: Request) -> Response:
+            test = request.query_params.get(TEST_CASE_KEY)
+            if not test:
+                return PlainTextResponse(
+                    f"query parameter {TEST_CASE_KEY} is required", 400
+                )
+            raw_limit = request.query_params.get(
+                "limit", str(CASE_METRIC_SNAPSHOT_MAX)
+            )
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                return PlainTextResponse("limit must be an integer", 400)
+            if not 1 <= limit <= CASE_METRIC_SNAPSHOT_MAX:
+                return PlainTextResponse(
+                    f"limit must be between 1 and {CASE_METRIC_SNAPSHOT_MAX}", 400
+                )
+            snapshot = cases.metric_snapshot(test, limit)
+            if snapshot is None:
+                return PlainTextResponse("test case has no retained telemetry", 404)
+            newest_points, dropped, retained = snapshot
+            rows: list[dict[str, object]] = []
+            size = 0
+            for point in newest_points:
+                row: dict[str, object] = {
+                    "name": point.name,
+                    "kind": point.kind,
+                    "unit": point.unit,
+                    "temporality": point.temporality,
+                    "attributes": dict(point.attributes),
+                    "resource": dict(point.resource),
+                    "start_time_unix_nano": point.start_time_unix_nano,
+                    "time_unix_nano": point.time_unix_nano,
+                    "value": point.value,
+                    "count": point.count,
+                    "bounds": point.bounds,
+                    "bucket_counts": point.bucket_counts,
+                    "scope": {"name": point.scope[0], "version": point.scope[1]},
+                }
+                row_size = len(
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                if row_size > CASE_METRIC_SNAPSHOT_BYTES_MAX:
+                    return PlainTextResponse(
+                        "a metric point exceeds the case snapshot byte bound", 413
+                    )
+                if size + row_size > CASE_METRIC_SNAPSHOT_BYTES_MAX:
+                    break
+                rows.append(row)
+                size += row_size
+            omitted = retained - len(rows)
+            return JSONResponse(
+                {
+                    "test_case": test,
+                    "retained": retained,
+                    "dropped": dropped,
+                    "omitted": omitted,
+                    "points": list(reversed(rows)),
+                }
+            )
+
+        routes.append(Route(CASE_METRICS_PATH, case_metrics, methods=["GET"]))
 
     return Starlette(routes=routes)
 
