@@ -941,3 +941,19 @@ def test_read_records_raises_on_failure_for_the_caller_to_note(
     )
     with pytest.raises(RuntimeError, match="rift exited 3"):
         server.read_records()
+
+
+def test_tool_error_keeps_the_registered_identity_apart_from_diagnostics() -> None:
+    failure = parse_failure(
+        "search",
+        "1 error\n\tinvalid_request · retry never\n"
+        "\t\tthe request does not match the documented form\n"
+        "\t\terror[E0308] src/lib.rs:3:5: mismatched types\n"
+        "\t\trift.server.read_invalid\n",
+    )
+    assert failure.identity == "rift.server.read_invalid"
+    assert failure.diagnostics == ["error[E0308] src/lib.rs:3:5: mismatched types"]
+    unregistered = parse_failure(
+        "search", "1 error\n\tinternal_error · retry never\n\t\tbad request\n"
+    )
+    assert unregistered.identity == ""

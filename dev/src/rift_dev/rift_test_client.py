@@ -553,6 +553,8 @@ FAILURE_TITLE = re.compile(r"([0-9]+) (errors?)")
 INDENT_UNIT = "\t"
 FAILURE_HEAD = re.compile(re.escape(INDENT_UNIT) + r"(\S+) · retry (\S+)")
 FAILURE_LIMIT = re.compile(r"limit (\S+): (\d+) over (\d+)")
+# The registered identity a registered failure writes last in its first entry.
+FAILURE_IDENTITY = re.compile(r"rift(?:\.[a-z0-9_]+){2,}")
 FAILURE_LINE_INDENT = INDENT_UNIT * 2
 FAILURE_ESCAPE = re.compile(r"\\(?:([nrt])|u\{([0-9A-Fa-f]+)\})")
 FAILURE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
@@ -579,6 +581,7 @@ class ToolFailure(Exception):
 
     `text` is the raw content. `diagnostics` keeps the lines of the first entry
     after its message and limit line as raw text, without the two-level indent.
+    `identity` is the registered identity a registered failure writes last, else empty.
     """
 
     def __init__(
@@ -591,6 +594,7 @@ class ToolFailure(Exception):
         limit: FailureLimit | None = None,
         causes: Sequence[FailureCause] = (),
         diagnostics: Sequence[str] = (),
+        identity: str = "",
     ) -> None:
         """Keep the parsed lines and the raw text."""
         super().__init__(f"{tool} failed: {text}")
@@ -602,6 +606,7 @@ class ToolFailure(Exception):
         self.limit = limit
         self.causes = list(causes)
         self.diagnostics = list(diagnostics)
+        self.identity = identity
 
 
 def unescape_message(line: str) -> str:
@@ -656,7 +661,9 @@ def parse_failure(tool: str, text: str) -> ToolFailure:
     code, retry, body = entries[0]
     limit: FailureLimit | None = None
     diagnostics: list[str] = []
-    for line in body[1:]:
+    rest = body[1:]
+    identity = rest.pop() if rest and FAILURE_IDENTITY.fullmatch(rest[-1]) else ""
+    for line in rest:
         if line.startswith("limit "):
             found = FAILURE_LIMIT.fullmatch(line)
             require(
@@ -677,7 +684,15 @@ def parse_failure(tool: str, text: str) -> ToolFailure:
             FailureCause(cause_code, unescape_message(cause_body[0]), cause_retry)
         )
     return ToolFailure(
-        tool, text, code, unescape_message(body[0]), retry, limit, causes, diagnostics
+        tool,
+        text,
+        code,
+        unescape_message(body[0]),
+        retry,
+        limit,
+        causes,
+        diagnostics,
+        identity,
     )
 
 
