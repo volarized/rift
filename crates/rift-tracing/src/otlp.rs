@@ -707,6 +707,36 @@ impl OtlpExport {
         .await
     }
 
+    /// Flushes ended spans by `deadline` while leaving every provider open.
+    ///
+    /// Runs the span provider on its own thread because its SDK flush waits for the export
+    /// worker. The caller stops waiting at `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExportShutdownError::TimedOut`] when `deadline` passes first, and
+    /// [`ExportShutdownError::Failed`] when the span provider reports a failed flush.
+    pub async fn flush_traces(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let tracer = self
+            .providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|providers| providers.tracer.clone());
+        let operations = tracer
+            .map(|tracer| vec![export_operation_on_thread(move || tracer.force_flush())])
+            .unwrap_or_default();
+        wait_for_export_operations(
+            deadline,
+            operations,
+            "the export worker did not return a result",
+        )
+        .await
+    }
+
     /// Shuts down the span and meter providers by `deadline`, leaving the log provider open.
     ///
     /// Call this after records produced by the stop stage have left their spans. The span
@@ -1886,6 +1916,56 @@ mod tests {
             runtime.block_on(export.shutdown(deadline)),
             Ok(()),
             "a second shutdown finds nothing to shut down"
+        );
+    }
+
+    #[test]
+    fn trace_flush_leaves_metric_collection_for_provider_shutdown() {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let spans = RecordingExporter::default();
+        let tracer = tracer_provider(spans.clone(), BatchConfig::default(), resource());
+        tracer
+            .tracer("otlp shutdown test")
+            .start("trace.flush")
+            .end();
+        let metric_exporter = RecordingMetricExporter::default();
+        let meters = meter_provider(metric_exporter.clone(), resource());
+        meters
+            .meter("otlp shutdown test")
+            .u64_counter("shutdown.metric")
+            .build()
+            .add(1, &[]);
+        let export = OtlpExport::holding(Some(tracer), Some(meters), None);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        assert_eq!(runtime.block_on(export.flush_traces(deadline)), Ok(()));
+        assert_eq!(spans.count("trace.flush"), 1);
+        assert!(
+            metric_exporter
+                .metrics
+                .lock()
+                .expect("the exporter's metrics are not poisoned")
+                .is_empty(),
+            "the trace flush does not collect metric points"
+        );
+        assert_eq!(
+            runtime.block_on(export.shutdown_traces_and_metrics(deadline)),
+            Ok(())
+        );
+        let received = metric_exporter
+            .metrics
+            .lock()
+            .expect("the exporter's metrics are not poisoned");
+        assert_eq!(
+            received
+                .iter()
+                .filter(|(name, _)| name == "shutdown.metric")
+                .count(),
+            1,
+            "provider shutdown exports final metric points once"
         );
     }
 
