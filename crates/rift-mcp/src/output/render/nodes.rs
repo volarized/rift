@@ -53,7 +53,7 @@ fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextEr
         extensions: _,
     } = node;
     let mut facts = Facts::default();
-    facts.push(&kind.0);
+    facts.push_value(&kind.0);
     let count = excerpt.lines().count();
     if count > 1 {
         facts.push(&format!("{count} lines"));

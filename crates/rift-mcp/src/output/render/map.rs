@@ -7,7 +7,7 @@
 use rift_protocol::dependencies::PackageContextEntry;
 use rift_protocol::map::{MapHub, MapLanguage, MapModule, MapModuleRelationship, WorkspaceMap};
 
-use super::facts::{FACT_SEPARATOR, Facts, cut_hash, package_text, wire_name};
+use super::facts::{FACT_SEPARATOR, Facts, cut_hash, package_text, quoted_value, wire_name};
 use super::layout::{Sections, counted};
 use crate::output::text::{TextError, TextWriter};
 
@@ -106,7 +106,7 @@ fn module_lines(sections: &mut Sections<'_>, modules: &[MapModule]) -> Result<()
             children,
         } = module;
         let mut facts = Facts::default();
-        facts.push(relative_path(parent, &path.0));
+        facts.push_value(relative_path(parent, &path.0));
         facts.push(&counts(*files, *symbols));
         sections.entry(depth, facts.as_str())?;
         pending.extend(
@@ -136,7 +136,7 @@ fn hub_line(hub: &MapHub) -> String {
     } = hub;
     let mut facts = Facts::default();
     facts.push(&symbol.0);
-    facts.push(&kind.0);
+    facts.push_value(&kind.0);
     facts.push(&references_fact(*references));
     facts.as_str().to_owned()
 }
@@ -149,7 +149,11 @@ fn relationship_line(relationship: &MapModuleRelationship) -> String {
         references,
     } = relationship;
     let mut facts = Facts::default();
-    facts.push(&format!("{} → {}", from.0, to.0));
+    facts.push(&format!(
+        "{} → {}",
+        quoted_value(&from.0),
+        quoted_value(&to.0)
+    ));
     facts.push(&references_fact(*references));
     facts.as_str().to_owned()
 }
