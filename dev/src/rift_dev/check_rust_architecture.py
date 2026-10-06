@@ -18,10 +18,13 @@ TEST_ATTRIBUTE = re.compile(r"#\[(?:tokio::)?test\b")
 EXPECTED_EDGES = {
     "rift -> rift-core",
     "rift -> rift-error",
+    # Development edges only: share the surface-validation fixture with the proxy suite.
+    "rift -> rift-history",
     "rift -> rift-index",
     "rift -> rift-mcp",
     "rift -> rift-protocol",
     "rift -> rift-provider",
+    "rift -> rift-ranking",
     "rift -> rift-search",
     "rift -> rift-server",
     "rift -> rift-syntax",

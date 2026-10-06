@@ -60,6 +60,8 @@ zip.workspace = true
 rift-tracing = { workspace = true, features = ["fixtures"] }
 axum.workspace = true
 jsonschema.workspace = true
+rift-history = { workspace = true, features = ["fixtures"] }
+rift-ranking.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 rusqlite.workspace = true
 serde_json.workspace = true
