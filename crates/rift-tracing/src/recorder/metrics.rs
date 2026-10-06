@@ -22,25 +22,31 @@ struct RecorderMeters {
 
 static RECORDER_METERS: OnceLock<RecorderMeters> = OnceLock::new();
 
-/// Installs the recorders' meter provider unless the process already has one: a provider
-/// installed first, such as the `otlp` export's, stays and the reads see none of its
-/// values.
-pub(crate) fn install() {
-    let _ = meters();
+/// Installs the recorder's local reader beside its OTLP reader when configured.
+pub(crate) fn install(provider: Option<SdkMeterProvider>, exporter: InMemoryMetricExporter) {
+    let _ = RECORDER_METERS.get_or_init(|| {
+        let provider = provider.unwrap_or_else(|| local_provider(exporter.clone()));
+        crate::metrics::install_meter(provider.clone());
+        RecorderMeters { provider, exporter }
+    });
 }
 
 fn meters() -> &'static RecorderMeters {
     RECORDER_METERS.get_or_init(|| {
         let exporter = InMemoryMetricExporter::default();
-        let provider = SdkMeterProvider::builder()
-            .with_reader(PeriodicReader::builder(exporter.clone()).build())
-            .with_view(crate::metrics::cardinality_view(
-                crate::metrics::CARDINALITY_LIMIT,
-            ))
-            .build();
+        let provider = local_provider(exporter.clone());
         crate::metrics::install_meter(provider.clone());
         RecorderMeters { provider, exporter }
     })
+}
+
+fn local_provider(exporter: InMemoryMetricExporter) -> SdkMeterProvider {
+    SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter).build())
+        .with_view(crate::metrics::cardinality_view(
+            crate::metrics::CARDINALITY_LIMIT,
+        ))
+        .build()
 }
 
 /// Every series the SDK exports now; empty when nothing was recorded.

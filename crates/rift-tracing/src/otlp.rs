@@ -1,8 +1,8 @@
 //! The OTLP export of Rift's `tracing` spans, metrics, and log records.
 //!
 //! Every build carries the export, and a process exports nothing until an operator sets an
-//! OTLP endpoint variable - for the in-memory collector `just trace-collector` runs, or any
-//! other OTLP/HTTP receiver. Spans export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set;
+//! OTLP endpoint variable for an OTLP/HTTP receiver. Spans export when
+//! `OTEL_EXPORTER_OTLP_ENDPOINT` is set;
 //! metrics when it or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is; log records when it or
 //! `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is.
 //!
@@ -213,6 +213,17 @@ impl OtlpExport {
         }
     }
 
+    /// The meter provider the recorder reads and installs, with both local and OTLP
+    /// readers when an OTLP metric endpoint is configured.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn recorder_meter_provider(&self) -> Option<SdkMeterProvider> {
+        self.providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|providers| providers.meters.clone())
+    }
+
     /// Flushes buffered spans, log records, and the final metric points, and shuts every
     /// provider down, by `deadline`. A log record written after this call starts is not
     /// exported.
@@ -311,6 +322,19 @@ fn configured(variable: &str) -> bool {
     std::env::var_os(variable).is_some() && !sdk_disabled()
 }
 
+/// Whether this process needs a Tokio runtime to build its test OTLP exporters.
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) fn recorder_export_configured() -> bool {
+    !sdk_disabled()
+        && [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        ]
+        .iter()
+        .any(|variable| std::env::var_os(variable).is_some())
+}
+
 /// Whether [`SDK_DISABLED_VAR`] reads `true`, in any case.
 fn sdk_disabled() -> bool {
     disables_sdk(std::env::var(SDK_DISABLED_VAR).ok().as_deref())
@@ -330,6 +354,9 @@ fn resource() -> Resource {
     let mut builder = Resource::builder()
         .with_service_name(SERVICE_NAME)
         .with_attribute(KeyValue::new("service.version", SERVICE_VERSION));
+    if let Ok(test_case) = std::env::var("NEXTEST_ATTEMPT_ID") {
+        builder = builder.with_attribute(KeyValue::new("test.case.name", test_case));
+    }
     if let Some(instance) = instance_id() {
         builder = builder.with_attribute(KeyValue::new("service.instance.id", instance));
     }
@@ -388,6 +415,31 @@ pub(crate) fn layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
+    layer_inner(log_filter, meter_provider)
+}
+
+/// The recorder's OTLP layer, with an in-memory reader on its meter provider so local
+/// metric assertions continue to read the SDK's points.
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) fn recorder_layer<S>(
+    log_filter: tracing_subscriber::EnvFilter,
+    local_metrics: opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) -> (impl Layer<S> + Send + Sync, OtlpExport)
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+{
+    layer_inner(log_filter, move |exporter, resource| {
+        meter_provider_with_local_reader(exporter, resource, local_metrics)
+    })
+}
+
+fn layer_inner<S>(
+    log_filter: tracing_subscriber::EnvFilter,
+    make_meter_provider: impl FnOnce(MetricExporter, Resource) -> SdkMeterProvider,
+) -> (impl Layer<S> + Send + Sync, OtlpExport)
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+{
     let resource = resource();
     let logs = if LOG_ENDPOINT_VARS
         .iter()
@@ -420,7 +472,7 @@ where
             .with_protocol(Protocol::HttpBinary)
             .build()
         {
-            Ok(exporter) => Some(meter_provider(exporter, resource.clone())),
+            Ok(exporter) => Some(make_meter_provider(exporter, resource.clone())),
             Err(error) => {
                 eprintln!("rift: warning: otlp metric exporter did not build: {error}");
                 None
@@ -675,6 +727,32 @@ where
     };
     SdkMeterProvider::builder()
         .with_resource(resource)
+        .with_reader(reader.build())
+        .with_view(crate::metrics::cardinality_view(
+            crate::metrics::CARDINALITY_LIMIT,
+        ))
+        .build()
+}
+
+/// The recorder meter provider with an additional in-memory reader for local assertions.
+#[cfg(any(test, feature = "fixtures"))]
+fn meter_provider_with_local_reader<E>(
+    exporter: E,
+    resource: Resource,
+    local_metrics: opentelemetry_sdk::metrics::InMemoryMetricExporter,
+) -> SdkMeterProvider
+where
+    E: opentelemetry_sdk::metrics::exporter::PushMetricExporter,
+{
+    let reader = PeriodicReader::builder(exporter, runtime::Tokio);
+    let reader = if configured(METRIC_EXPORT_TIMEOUT_VAR) {
+        reader
+    } else {
+        reader.with_timeout(OTLP_EXPORT_TIMEOUT)
+    };
+    SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(opentelemetry_sdk::metrics::PeriodicReader::builder(local_metrics).build())
         .with_reader(reader.build())
         .with_view(crate::metrics::cardinality_view(
             crate::metrics::CARDINALITY_LIMIT,
@@ -1464,8 +1542,7 @@ mod tests {
         );
     }
 
-    /// Every exported span and metric names the service, its version, this process's
-    /// instance, and its process identifier.
+    /// Every exported signal names its service, version, instance, process, and nextest case.
     #[test]
     fn the_resource_names_the_service_instance_and_process() {
         use opentelemetry::{Key, Value};
@@ -1481,6 +1558,11 @@ mod tests {
         assert_eq!(
             resource.get(&Key::new("process.pid")),
             Some(Value::I64(i64::from(std::process::id())))
+        );
+        assert_eq!(
+            resource.get(&Key::new("test.case.name")),
+            std::env::var("NEXTEST_ATTEMPT_ID").ok().map(Value::from),
+            "the resource carries the exact nextest attempt identifier when set"
         );
         let instance = resource
             .get(&Key::new("service.instance.id"))

@@ -35,7 +35,9 @@ mod unscoped;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -45,7 +47,7 @@ use crate::drain::LogDrain;
 use crate::flight::{FlightLayer, FlightTable, observe_active};
 use crate::measurement::monotonic_now;
 use crate::metrics::ObservationGuard;
-use crate::otlp::SDK_TARGET;
+use crate::otlp::{self, OtlpExport, SDK_TARGET};
 use crate::record::LogRecord;
 use crate::render::LogLines;
 use crate::runtime::{LogFilterError, capture_layer, parsed_filter};
@@ -194,6 +196,8 @@ pub struct ScopedRecorder {
     /// Keeps the recorder's table of operations in flight reported in `operation.active`.
     _in_flight: Option<ObservationGuard>,
     _default: tracing::subscriber::DefaultGuard,
+    /// Flushes this test's exporter after its thread-local subscriber is restored.
+    _test_export: Option<TestOtlpExport>,
 }
 
 impl ScopedRecorder {
@@ -352,7 +356,15 @@ impl ScopedRecorderBuilder {
         });
         let (sink, drain) = log_capture();
         let sink = sink.retaining(Arc::clone(&retained));
-        metrics::install();
+        let local_metrics = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let runtime = TestOtlpRuntime::when_configured();
+        let (otlp_layer, export) = if let Some(runtime) = &runtime {
+            let _entered = runtime.handle.enter();
+            otlp::recorder_layer(filter.clone(), local_metrics.clone())
+        } else {
+            otlp::recorder_layer(filter.clone(), local_metrics.clone())
+        };
+        metrics::install(export.recorder_meter_provider(), local_metrics);
         let flights = Arc::new(FlightTable::default());
         let in_flight = observe_active(&flights);
         let span_context = self
@@ -361,14 +373,110 @@ impl ScopedRecorderBuilder {
         let subscriber = tracing_subscriber::registry()
             .with(span_context)
             .with(FlightLayer::new(flights))
-            .with(capture_layer(sink, filter));
+            .with(capture_layer(sink, filter))
+            .with(otlp_layer);
+        let test_export = runtime.map(|runtime| runtime.with_export(export));
         let recorder = ScopedRecorder {
             retained,
             output: PanicOutput::Stderr,
             _in_flight: in_flight,
             _default: tracing::subscriber::set_default(subscriber),
+            _test_export: test_export,
         };
         Ok((recorder, drain))
+    }
+}
+
+/// A Tokio runtime held on its owner thread until the scoped recorder shuts its export down.
+struct TestOtlpRuntime {
+    handle: tokio::runtime::Handle,
+    shutdown: SyncSender<OtlpExport>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TestOtlpRuntime {
+    fn when_configured() -> Option<Self> {
+        otlp::recorder_export_configured().then(Self::start)
+    }
+
+    fn start() -> Self {
+        let (ready, started) = mpsc::sync_channel(1);
+        let (shutdown, stop) = mpsc::sync_channel::<OtlpExport>(1);
+        let thread = thread::Builder::new()
+            .name("rift-test-otlp-runtime".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build();
+                let runtime = match runtime {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                if ready.send(Ok(runtime.handle().clone())).is_err() {
+                    return;
+                }
+                if let Ok(export) = stop.recv() {
+                    let deadline = tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT;
+                    if let Err(error) = runtime.block_on(export.shutdown(deadline)) {
+                        eprintln!("rift: warning: test OTLP export did not shut down: {error}");
+                    }
+                }
+                runtime.shutdown_timeout(crate::OTLP_SHUTDOWN_TIMEOUT);
+            })
+            .expect("the test OTLP runtime thread starts");
+        let handle = match started.recv() {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(error)) => panic!("the test OTLP runtime did not start: {error}"),
+            Err(error) => panic!("the test OTLP runtime did not report startup: {error}"),
+        };
+        Self {
+            handle,
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+
+    fn with_export(self, export: OtlpExport) -> TestOtlpExport {
+        TestOtlpExport {
+            runtime: Some(self),
+            export: Some(export),
+        }
+    }
+}
+
+/// An OTLP export and its runtime, dropped after the recorder restores its prior subscriber.
+struct TestOtlpExport {
+    runtime: Option<TestOtlpRuntime>,
+    export: Option<OtlpExport>,
+}
+
+impl std::fmt::Debug for TestOtlpExport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestOtlpExport")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TestOtlpExport {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        if let Some(export) = self.export.take()
+            && runtime.shutdown.send(export).is_err()
+        {
+            eprintln!("rift: warning: test OTLP runtime stopped before export shutdown");
+        }
+        if let Some(thread) = runtime.thread
+            && thread.join().is_err()
+        {
+            eprintln!("rift: warning: test OTLP runtime thread panicked");
+        }
     }
 }
 

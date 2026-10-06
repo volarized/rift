@@ -1,7 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     PanicOutput, RetainedRecords, SCOPED_RECORDER_PRINT_BYTES_MAX,
@@ -45,6 +45,35 @@ fn a_recorder_captures_every_level_on_its_thread_by_default() -> TestResult {
          a_recorder_captures_every_level_on_its_thread_by_default\",\"epoch\":\"3\"}"
     );
     Ok(())
+}
+
+/// The test export owner stops after a short scope, including from inside Tokio.
+#[tokio::test]
+async fn a_test_otlp_export_stops_when_dropped_inside_tokio() {
+    let started = Instant::now();
+    let export = super::TestOtlpRuntime::start().with_export(super::OtlpExport::default());
+    drop(export);
+
+    assert!(
+        started.elapsed() < crate::OTLP_SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+        "the test export runtime stops within its shutdown bound"
+    );
+}
+
+/// Unwinding still drops the test export owner and joins its runtime thread.
+#[test]
+fn a_test_otlp_export_stops_when_recorder_unwinds() {
+    let started = Instant::now();
+    let unwind = catch_unwind(AssertUnwindSafe(|| {
+        let _export = super::TestOtlpRuntime::start().with_export(super::OtlpExport::default());
+        panic!("the test body unwinds");
+    }));
+
+    assert!(unwind.is_err());
+    assert!(
+        started.elapsed() < crate::OTLP_SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+        "the test export runtime stops within its shutdown bound"
+    );
 }
 
 #[test]
