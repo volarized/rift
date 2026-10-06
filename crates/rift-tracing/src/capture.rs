@@ -72,12 +72,14 @@ pub(crate) const OUTCOME_FIELD: &str = "outcome";
 /// `acquired` for a lock wait. Every other value, such as `error`, `timeout`, `refused`, or
 /// `cancelled`, states it did not.
 const COMPLETED_OUTCOMES: [&str; 2] = ["ok", "acquired"];
-/// The `error.type` values the operation metrics keep as their own label: a panic, a
-/// cancellation, and the lock wait endings. Every other failure records `_OTHER`, the
-/// value OpenTelemetry's `error.type` names for a failure no listed value fits; a recorded
-/// value can be any string, and a metric label is a declared value.
+/// The `error.type` values the operation metrics keep as their own label beside the
+/// registered error identities: a panic, a cancellation, and the lock wait endings. Every
+/// other failure records `_OTHER`, the value OpenTelemetry's `error.type` names for a
+/// failure no listed value fits; a recorded value can be any string, and a metric label is
+/// a declared value.
 const ERROR_TYPE_LABELS: [&str; 4] = ["panic", "cancelled", "timeout", "refused"];
-/// The `error.type` label of a failure [`ERROR_TYPE_LABELS`] does not list.
+/// The `error.type` label of a failure that is neither in [`ERROR_TYPE_LABELS`] nor a
+/// registered error identity.
 const OTHER_ERROR_TYPE: &str = "_OTHER";
 /// Field names the layer writes itself. A span or event field under one of them is not
 /// recorded, so a member the layer writes never meets a field of the same name.
@@ -473,10 +475,13 @@ pub(crate) fn completed_outcome(value: &str) -> bool {
     COMPLETED_OUTCOMES.contains(&value)
 }
 
-/// The operation metrics' `error.type` label of the failure value `value`.
+/// The operation metrics' `error.type` label of the failure value `value`: the value
+/// itself when [`ERROR_TYPE_LABELS`] lists it or it is a registered error identity
+/// (`rift_error::errors::REGISTERED_SLUGS`), [`OTHER_ERROR_TYPE`] otherwise.
 fn error_type_label(value: &str) -> &'static str {
     ERROR_TYPE_LABELS
         .into_iter()
+        .chain(rift_error::errors::REGISTERED_SLUGS.iter().copied())
         .find(|label| *label == value)
         .unwrap_or(OTHER_ERROR_TYPE)
 }

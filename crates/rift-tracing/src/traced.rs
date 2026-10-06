@@ -241,13 +241,15 @@ pub fn parent_span(parent: &Span) -> Span {
 /// `cancelled` when it panicked or an awaited future was dropped before it returned. Work
 /// that records `error.type`, or an `outcome` other than `ok` or `acquired`, on the
 /// operation's span ends with `Error` too: `error.type` holds the recorded value when it is
-/// `panic`, `cancelled`, `timeout`, or `refused`, and `_OTHER` otherwise. The macro never
-/// reads the work's value. The span's close record states the same outcome as
-/// `status.code` and `error.type`, and the span records `code.function.name`, the
-/// function the macro expands in. The metric
-/// recording follows the operation, not its span: a clone of the span held elsewhere
-/// does not lengthen the duration, and the span's filters do not select it. A process
-/// that installed no meter records nothing and reads no clock for it.
+/// `panic`, `cancelled`, `timeout`, `refused`, or a registered error identity, as
+/// `RiftError::slug` spells it, and `_OTHER` otherwise. The macro never reads the work's
+/// value. The span's close record states the same outcome as `status.code` and
+/// `error.type`, and the span records `code.function.name`, the function the macro
+/// expands in. The duration is the time from
+/// the span's opening to the end of the work, read once: the histogram records it and the
+/// close record states it as `elapsed_ms`, so a clone of the span held elsewhere lengthens
+/// neither, and the span's filters do not select the metric recording. A process that
+/// installed no meter records no metrics.
 ///
 /// A computed operation name is refused at compile time:
 ///

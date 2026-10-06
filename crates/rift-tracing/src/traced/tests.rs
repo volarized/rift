@@ -554,3 +554,67 @@ fn span_instruments_a_future_and_keeps_the_caller_target() {
         [Some(module_path!())]
     );
 }
+
+/// The number of calls the operation `operation` recorded under `status.code` `Error` and
+/// `error_type`.
+fn failed_calls(
+    snapshot: &crate::MetricSnapshot,
+    operation: &str,
+    error_type: &str,
+) -> Option<f64> {
+    let labels = [
+        ("span.name", operation),
+        ("span.kind", "Internal"),
+        ("status.code", "Error"),
+        ("error.type", error_type),
+    ];
+    match snapshot.find("traces.span.metrics.calls", &labels)?.value() {
+        crate::SeriesValue::Sum(sum) => Some(*sum),
+        other => panic!("a counter holds a sum, not {other:?}"),
+    }
+}
+
+/// Work that records its `RiftError`'s registered identity as `error.type` ends with that
+/// identity as the operation metrics' `error.type` label and in its close record; an
+/// identity the registry does not hold is labeled `_OTHER`, and the close record keeps it.
+#[test]
+fn a_registered_error_identity_is_the_error_type_label() -> Result<(), Box<dyn std::error::Error>> {
+    let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
+    let stored: Result<(), rift_error::RiftError> = crate::traced!("test.registered", {
+        let error = crate::store::store_failure("open", std::path::Path::new("metrics"), "refused");
+        crate::Span::current().record("error.type", error.slug().as_str());
+        Err(error)
+    });
+    crate::traced!("test.unregistered", {
+        crate::Span::current().record("error.type", "rift.tracing.unregistered");
+    });
+    let snapshot = recorder.metrics();
+    drop(recorder);
+
+    let identity = rift_error::errors::tracing::log_store_failed::SLUG.as_str();
+    assert_eq!(stored.map_err(|error| error.slug().as_str()), Err(identity));
+    assert_eq!(
+        failed_calls(&snapshot, "test.registered", identity),
+        Some(1.0),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        failed_calls(&snapshot, "test.unregistered", "_OTHER"),
+        Some(1.0),
+        "{snapshot:?}"
+    );
+    let records = drain.queued_records();
+    for (operation, recorded) in [
+        ("test.registered", identity),
+        ("test.unregistered", "rift.tracing.unregistered"),
+    ] {
+        let closed = records
+            .iter()
+            .find(|record| record.message() == operation)
+            .ok_or("the operation's span wrote its close record")?;
+        let fields: serde_json::Value = serde_json::from_str(closed.fields())?;
+        assert_eq!(fields["status.code"], "Error", "{fields}");
+        assert_eq!(fields["error.type"], recorded, "{fields}");
+    }
+    Ok(())
+}
