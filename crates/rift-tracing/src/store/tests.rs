@@ -1109,3 +1109,219 @@ async fn a_collection_reads_the_metrics_database_page_counts() -> TestResult {
     );
     Ok(())
 }
+
+/// The count and sum of the histogram series `name` carries under exactly `labels`, or
+/// zeros when no point reached it.
+fn histogram(metrics: &crate::MetricSnapshot, name: &str, labels: &[(&str, &str)]) -> (u64, f64) {
+    match metrics.find(name, labels).map(crate::MetricSeries::value) {
+        Some(SeriesValue::Buckets { count, sum, .. }) => (*count, *sum),
+        _ => (0, 0.0),
+    }
+}
+
+/// The `db.client.operation.duration` labels of one metrics database operation that
+/// ended without a failure.
+fn metrics_operation(operation: &'static str) -> [(&'static str, &'static str); 3] {
+    [
+        ("db.system.name", "sqlite"),
+        ("db.namespace", "metrics"),
+        ("db.operation.name", operation),
+    ]
+}
+
+/// Each append records its inserts and its trim as one `db.client.operation.duration`
+/// point each, and its statements, the newest identity's read, one insert per record, and
+/// the trim, in `sqlite.transaction.statement.count`.
+#[tokio::test]
+async fn an_append_records_its_insert_and_trim_and_counts_its_statements() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    let statements = [("db.namespace", "metrics")];
+
+    store
+        .append(&[record("one"), record("two"), record("three")], KEEP_EVERY)
+        .await?;
+    let first = recorder.metrics();
+    store.append(&[record("four")], KEEP_EVERY).await?;
+    let second = recorder.metrics();
+
+    for operation in ["insert", "trim"] {
+        let labels = metrics_operation(operation);
+        assert_eq!(
+            histogram(&first, "db.client.operation.duration", &labels).0,
+            1,
+            "{operation}: {first:?}"
+        );
+        assert_eq!(
+            histogram(&second, "db.client.operation.duration", &labels).0,
+            2,
+            "{operation}: {second:?}"
+        );
+    }
+    let counted = |metrics| histogram(metrics, "sqlite.transaction.statement.count", &statements);
+    assert_eq!(counted(&first), (1, 5.0), "1 read, 3 inserts, 1 trim");
+    assert_eq!(counted(&second), (2, 8.0), "the second append ran 3 more");
+    assert_eq!(
+        second
+            .find("sqlite.transaction.statement.count", &statements)
+            .map(crate::MetricSeries::unit),
+        Some("{statement}")
+    );
+    Ok(())
+}
+
+/// An append the database refuses mid-insert records the insert as failed and counts the
+/// statements it started before the rollback.
+#[tokio::test]
+async fn a_refused_insert_records_its_failure_and_the_statements_it_started() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    {
+        let connection = rusqlite::Connection::open(store.path())?;
+        connection.execute_batch(
+            "CREATE TRIGGER refuse_second BEFORE INSERT ON log_records
+             WHEN NEW.message = 'refused'
+             BEGIN SELECT RAISE(ABORT, 'refused by the test trigger'); END;",
+        )?;
+    }
+
+    store
+        .append(&[record("kept"), record("refused")], KEEP_EVERY)
+        .await
+        .expect_err("the trigger refuses the second insert");
+    let metrics = recorder.metrics();
+
+    let failed = [
+        ("db.system.name", "sqlite"),
+        ("db.namespace", "metrics"),
+        ("db.operation.name", "insert"),
+        ("error.type", "_OTHER"),
+    ];
+    assert_eq!(
+        histogram(&metrics, "db.client.operation.duration", &failed).0,
+        1,
+        "{metrics:?}"
+    );
+    assert_eq!(
+        histogram(
+            &metrics,
+            "db.client.operation.duration",
+            &metrics_operation("trim")
+        )
+        .0,
+        0,
+        "a refused insert runs no trim"
+    );
+    assert_eq!(
+        histogram(
+            &metrics,
+            "sqlite.transaction.statement.count",
+            &[("db.namespace", "metrics")]
+        ),
+        (1, 3.0),
+        "1 read and 2 inserts started"
+    );
+    let rolled_back = [
+        ("db.namespace", "metrics"),
+        ("sqlite.transaction.result", "rollback"),
+    ];
+    assert_eq!(
+        histogram(&metrics, "sqlite.transaction.duration", &rolled_back).0,
+        1
+    );
+    Ok(())
+}
+
+/// A read connection's open is one `connect` point, and each page and count it reads is
+/// one `query` point; a file with no schema yet runs no query.
+#[tokio::test]
+async fn a_read_records_its_connect_and_each_query() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store.append(&[record("read")], KEEP_EVERY).await?;
+
+    let reads = reads(&store)?;
+    reads.recent(&LogQuery::newest(10))?;
+    reads.following(&LogQuery::newest(10))?;
+    reads.count()?;
+    let metrics = recorder.metrics();
+
+    let operations = |metrics: &crate::MetricSnapshot, operation| {
+        histogram(
+            metrics,
+            "db.client.operation.duration",
+            &metrics_operation(operation),
+        )
+        .0
+    };
+    assert_eq!(operations(&metrics, "connect"), 1, "{metrics:?}");
+    assert_eq!(operations(&metrics, "query"), 3, "{metrics:?}");
+
+    let empty = directory.path().join("empty");
+    rusqlite::Connection::open(&empty)?;
+    let unprepared = LogReader::new(&empty).connect()?;
+    unprepared.recent(&LogQuery::newest(10))?;
+    unprepared.count()?;
+    let after = recorder.metrics();
+    assert_eq!(operations(&after, "connect"), 2);
+    assert_eq!(operations(&after, "query"), 3, "no table, no query");
+    Ok(())
+}
+
+/// A refused read connection records its open as failed.
+#[test]
+fn a_refused_connect_records_its_failure() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+
+    LogReader::new(&directory.path().join("absent"))
+        .connect()
+        .expect_err("a reader never creates the file");
+    let metrics = recorder.metrics();
+
+    let failed = [
+        ("db.system.name", "sqlite"),
+        ("db.namespace", "metrics"),
+        ("db.operation.name", "connect"),
+        ("error.type", "_OTHER"),
+    ];
+    assert_eq!(
+        histogram(&metrics, "db.client.operation.duration", &failed).0,
+        1,
+        "{metrics:?}"
+    );
+    Ok(())
+}
+
+/// An open records no insert and no statement count: its schema transaction is no append.
+#[tokio::test]
+async fn an_open_records_no_insert_or_trim() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let _store = store(&directory).await?;
+    let metrics = recorder.metrics();
+
+    assert_eq!(
+        histogram(
+            &metrics,
+            "db.client.operation.duration",
+            &metrics_operation("insert")
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        histogram(
+            &metrics,
+            "sqlite.transaction.statement.count",
+            &[("db.namespace", "metrics")]
+        )
+        .0,
+        0,
+        "the schema transaction is not an append"
+    );
+    Ok(())
+}

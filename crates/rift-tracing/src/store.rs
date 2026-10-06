@@ -95,9 +95,24 @@ static PAGE_COUNT: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare
     &["db.namespace", "sqlite.page.state"],
 );
 
-/// `db.client.operation.duration`: one statement of the close on the writer thread, or the
-/// connection's close, by `db.operation.name`; a failed one adds `error.type` `_OTHER`, and
-/// the busy or locked result code as `db.response.status_code`.
+/// `sqlite.transaction.statement.count`: the statements one append transaction ran, its
+/// begin and its end left out.
+static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
+    "sqlite.transaction.statement.count",
+    "{statement}",
+    &["db.namespace"],
+    &STATEMENT_BOUNDARIES,
+);
+/// Upper bucket bounds of [`TRANSACTION_STATEMENTS`], in statements: the bounds the index
+/// and vectors workers use. One append runs at most [`LOG_BATCH_RECORDS_MAX`] inserts and
+/// two statements more.
+const STATEMENT_BOUNDARIES: [f64; 13] = [
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+];
+
+/// `db.client.operation.duration`: one operation on a metrics database connection, by
+/// `db.operation.name`; a failed one adds `error.type` `_OTHER`, and the busy or locked
+/// result code as `db.response.status_code`.
 static OPERATION_DURATION: Histogram<5> = Histogram::declare(
     "db.client.operation.duration",
     &[
@@ -174,12 +189,16 @@ const CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 /// connection sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` first, so the write-ahead log stays
 /// for the next open.
 const CONNECTION_CLOSE: &str = "close";
+/// The `db.operation.name` of an append's inserts: one point covers every insert of the batch.
+const INSERT_OPERATION: &str = "insert";
+/// The `db.operation.name` of an append's retention trim.
+const TRIM_OPERATION: &str = "trim";
 
-/// Runs one close step named `statement` and records its duration in
+/// Runs one operation named `operation` and records its duration in
 /// `db.client.operation.duration`, labeled by the `SQLite` failure `cause` finds in its
-/// error. A regressed clock records nothing and keeps the step's result.
-fn timed<Answer, Failure>(
-    statement: &'static str,
+/// error. A regressed clock records nothing and keeps the operation's result.
+pub(crate) fn timed<Answer, Failure>(
+    operation: &'static str,
     run: impl FnOnce() -> Result<Answer, Failure>,
     cause: impl FnOnce(&Failure) -> &rusqlite::Error,
 ) -> Result<Answer, Failure> {
@@ -198,7 +217,7 @@ fn timed<Answer, Failure>(
             },
         };
         OPERATION_DURATION
-            .labeled([DB_SYSTEM, DB_NAMESPACE, statement, status, failed])
+            .labeled([DB_SYSTEM, DB_NAMESPACE, operation, status, failed])
             .record(took);
     }
     result
@@ -759,39 +778,55 @@ impl MetricsWriter {
         let mut ended = TransactionEnd {
             begun: std::time::Instant::now(),
             result: "rollback",
+            statements: 0,
         };
+        ended.statements += 1;
         let newest: i64 = transaction
             .query_row("SELECT COALESCE(MAX(id), 0) FROM log_records", [], |row| {
                 row.get(0)
             })
             .map_err(|source| failure("read the newest identity", source))?;
-        let mut last = newest;
-        {
-            let mut insert = transaction
-                .prepare_cached(INSERT_RECORD)
-                .map_err(|source| failure("prepare append", source))?;
-            for record in records {
-                last = last.saturating_add(1);
-                insert
-                    .execute(params![
-                        last,
-                        LOG_KIND,
-                        record.recorded_at_ms,
-                        record.level,
-                        record.target,
-                        record.component,
-                        record.operation,
-                        record.message,
-                        record.fields,
-                    ])
-                    .map_err(|source| failure("insert record", source))?;
-            }
-        }
+        let last = timed(
+            INSERT_OPERATION,
+            || {
+                let mut insert = transaction
+                    .prepare_cached(INSERT_RECORD)
+                    .map_err(|source| ("prepare append", source))?;
+                let mut last = newest;
+                for record in records {
+                    last = last.saturating_add(1);
+                    ended.statements += 1;
+                    insert
+                        .execute(params![
+                            last,
+                            LOG_KIND,
+                            record.recorded_at_ms,
+                            record.level,
+                            record.target,
+                            record.component,
+                            record.operation,
+                            record.message,
+                            record.fields,
+                        ])
+                        .map_err(|source| ("insert record", source))?;
+                }
+                Ok(last)
+            },
+            |(_, source)| source,
+        )
+        .map_err(|(operation, source)| failure(operation, source))?;
         let retained = i64::try_from(retention_records).unwrap_or(i64::MAX);
-        let dropped = transaction
-            .prepare_cached(TRIM_RECORDS)
-            .and_then(|mut trim| trim.execute([last.saturating_sub(retained)]))
-            .map_err(|source| failure("trim records", source))?;
+        ended.statements += 1;
+        let dropped = timed(
+            TRIM_OPERATION,
+            || {
+                transaction
+                    .prepare_cached(TRIM_RECORDS)
+                    .and_then(|mut trim| trim.execute([last.saturating_sub(retained)]))
+            },
+            |source| source,
+        )
+        .map_err(|source| failure("trim records", source))?;
         let commit = std::time::Instant::now();
         let committed = transaction.commit();
         COMMIT_DURATION
@@ -845,10 +880,13 @@ impl MetricsWriter {
 }
 
 /// Records `sqlite.transaction.duration` for one append transaction when it drops, under
-/// the `sqlite.transaction.result` it ended with.
+/// the `sqlite.transaction.result` it ended with, and the statements it ran in
+/// `sqlite.transaction.statement.count`.
 struct TransactionEnd {
     begun: std::time::Instant,
     result: &'static str,
+    /// Statements started inside the transaction, a refused one included.
+    statements: u64,
 }
 
 impl Drop for TransactionEnd {
@@ -856,6 +894,9 @@ impl Drop for TransactionEnd {
         TRANSACTION_DURATION
             .labeled([DB_NAMESPACE, self.result])
             .record(self.begun.elapsed());
+        TRANSACTION_STATEMENTS
+            .labeled([DB_NAMESPACE])
+            .record(self.statements);
     }
 }
 

@@ -13,7 +13,13 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, Row, params_from_iter};
 
 use crate::record::{LOG_KIND, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, StoredLogRecord};
-use crate::store::{METRICS_BUSY_TIMEOUT, METRICS_SCHEMA_VERSION, store_failure};
+use crate::store::{METRICS_BUSY_TIMEOUT, METRICS_SCHEMA_VERSION, store_failure, timed};
+
+/// The `db.operation.name` of one read connection's open: the file's open, its busy
+/// timeout, its read-only mode, and the read of its schema version.
+const CONNECT_OPERATION: &str = "connect";
+/// The `db.operation.name` of one read connection's query: a page or a count.
+const QUERY_OPERATION: &str = "query";
 
 /// The columns one page selects, in the order [`stored_record`] reads them.
 const SELECT_RECORDS: &str = "SELECT id, recorded_at, level, target, component, \
@@ -43,29 +49,36 @@ impl LogReader {
 
     /// Opens one read connection, in read-only query mode, without the create flag.
     ///
-    /// A file at schema version zero holds no table yet and answers no records.
+    /// A file at schema version zero holds no table yet and answers no records. The open,
+    /// up to the schema version's read, is one `db.client.operation.duration` point.
     ///
     /// # Errors
     ///
     /// Returns `tracing.log_store_failed` when the file is absent or refused, or when it
     /// carries a schema version other than [`METRICS_SCHEMA_VERSION`].
     pub fn connect(&self) -> Result<LogReads, RiftError> {
-        let failure =
-            |operation: &str, source: rusqlite::Error| store_failure(operation, &self.path, source);
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        let (connection, found) = timed(
+            CONNECT_OPERATION,
+            || {
+                let connection = Connection::open_with_flags(
+                    &self.path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(|source| ("open for reading", source))?;
+                connection
+                    .busy_timeout(METRICS_BUSY_TIMEOUT)
+                    .map_err(|source| ("set the busy timeout", source))?;
+                connection
+                    .pragma_update(None, "query_only", true)
+                    .map_err(|source| ("enter read-only mode", source))?;
+                let found: i64 = connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(|source| ("read the schema version", source))?;
+                Ok((connection, found))
+            },
+            |(_, source)| source,
         )
-        .map_err(|source| failure("open for reading", source))?;
-        connection
-            .busy_timeout(METRICS_BUSY_TIMEOUT)
-            .map_err(|source| failure("set the busy timeout", source))?;
-        connection
-            .pragma_update(None, "query_only", true)
-            .map_err(|source| failure("enter read-only mode", source))?;
-        let found: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(|source| failure("read the schema version", source))?;
+        .map_err(|(operation, source)| store_failure(operation, &self.path, source))?;
         let holds_records = match found {
             0 => false,
             METRICS_SCHEMA_VERSION => true,
@@ -116,7 +129,8 @@ impl RecordOrder {
 }
 
 impl LogReads {
-    /// The newest records the query selects, newest first.
+    /// The newest records the query selects, newest first. The read is one
+    /// `db.client.operation.duration` point.
     ///
     /// # Errors
     ///
@@ -129,7 +143,8 @@ impl LogReads {
     ///
     /// A caller following the store reads with [`LogQuery::after`] set to the last
     /// identity it took, so one call returns only what landed since. The page is bounded
-    /// by the query's own limit, itself bounded by [`LOG_PAGE_RECORDS_MAX`].
+    /// by the query's own limit, itself bounded by [`LOG_PAGE_RECORDS_MAX`]. The read is one
+    /// `db.client.operation.duration` point.
     ///
     /// # Errors
     ///
@@ -138,7 +153,8 @@ impl LogReads {
         self.page(query, RecordOrder::Oldest)
     }
 
-    /// How many records the store currently holds.
+    /// How many records the store currently holds. The read is one
+    /// `db.client.operation.duration` point.
     ///
     /// # Errors
     ///
@@ -147,10 +163,15 @@ impl LogReads {
         if !self.holds_records {
             return Ok(0);
         }
-        let held: i64 = self
-            .connection
-            .query_row("SELECT COUNT(*) FROM log_records", [], |row| row.get(0))
-            .map_err(|source| store_failure("count records", &self.path, source))?;
+        let held: i64 = timed(
+            QUERY_OPERATION,
+            || {
+                self.connection
+                    .query_row("SELECT COUNT(*) FROM log_records", [], |row| row.get(0))
+            },
+            |source| source,
+        )
+        .map_err(|source| store_failure("count records", &self.path, source))?;
         Ok(u64::try_from(held).unwrap_or(0))
     }
 
@@ -193,12 +214,16 @@ impl LogReads {
         sql.push_str(" WHERE ");
         sql.push_str(&conditions.join(" AND "));
         sql.push_str(order.clause());
-        let failure = |source: rusqlite::Error| store_failure("read records", &self.path, source);
-        let mut statement = self.connection.prepare_cached(&sql).map_err(failure)?;
-        let rows = statement
-            .query_map(params_from_iter(values.iter()), stored_record)
-            .map_err(failure)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(failure)
+        timed(
+            QUERY_OPERATION,
+            || {
+                let mut statement = self.connection.prepare_cached(&sql)?;
+                let rows = statement.query_map(params_from_iter(values.iter()), stored_record)?;
+                rows.collect::<Result<Vec<_>, _>>()
+            },
+            |source| source,
+        )
+        .map_err(|source| store_failure("read records", &self.path, source))
     }
 }
 
