@@ -170,23 +170,41 @@ async fn main() -> ExitCode {
             false
         }
     };
-    // Flushes buffered spans and metric points before either exit path: the normal return
-    // below drops every other local first, and `process::exit` past it runs no destructor
-    // at all. A foreground server's stop already shut the export down inside its budget,
-    // and this finds nothing left to flush.
-    tracing_runtime.shutdown().await;
     if serves {
         // A foreground server's index build, a lane's pass, or a lexical transaction can
         // still be running when serving ends. Returning would drop the runtime, and that
         // drop waits for every `spawn_blocking` task to return and for every running task
         // to yield, which nothing can cancel; the server's outcome is already printed, its
         // log drain stopped, and its lock document retired, so the process leaves here.
-        std::process::exit(if succeeded {
+        //
+        // Both steps are recorded on stderr as the stop's last stages: the tracing shutdown
+        // with its outcome, then the exit with its status. A process the operating system
+        // keeps after the exit record, such as Windows waiting for a database thread's
+        // pending file flush to complete, shows as the time between that record and the
+        // close of its stderr.
+        let status = if succeeded {
             SERVED_EXIT_STATUS
         } else {
             FAILED_EXIT_STATUS
-        });
+        };
+        let deadline = tokio::time::Instant::now() + rift_tracing::OTLP_SHUTDOWN_TIMEOUT;
+        let _ = rift_mcp::stop_stage("tracing shutdown", deadline, async {
+            tracing_runtime.shutdown().await;
+            Ok::<(), rift_error::RiftError>(())
+        })
+        .await;
+        rift_tracing::info!(
+            component = "mcp",
+            operation = "server.stop",
+            stage = "process exit",
+            status,
+            "process exits"
+        );
+        std::process::exit(status);
     }
+    // Flushes buffered spans and metric points before the process returns, which drops
+    // every other local first.
+    tracing_runtime.shutdown().await;
     if succeeded {
         ExitCode::SUCCESS
     } else {

@@ -1653,6 +1653,20 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
         stderr.contains("database checkpoint outlasted the shutdown deadline"),
         "the outlasted checkpoint is named: {stderr}"
     );
+    // The held writer still waits inside SQLite's busy handler when the process leaves:
+    // a thread blocked in user space does not hold the exit, and the exit is the stop's
+    // last record.
+    let exit = stderr
+        .lines()
+        .rfind(|line| line.contains("process exits"))
+        .ok_or_else(|| format!("the exit is recorded: {stderr}"))?;
+    assert!(exit.contains("status=0"), "{exit}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("stage=tracing shutdown") && line.contains("outcome=ok")),
+        "the tracing shutdown ends inside its bound: {stderr}"
+    );
     // The held worker keeps its clone of the election guard, so the election is
     // released by the process exit, not by the stop.
     assert!(

@@ -203,6 +203,14 @@ stop begins, and each stage takes only what the one before it left:
    drain accepted and never wrote.
 5. The metrics database closes by the deadline, so it outlives every record.
 6. The election guard drops, right before the process exits.
+7. The `tracing shutdown` stage flushes what the export still holds, within
+   `OTLP_SHUTDOWN_TIMEOUT` (500 ms), and a `process exits` record with `stage = "process exit"`
+   and the exit `status` is the last line on stderr before the process exits.
+
+On Windows, a process does not end while one of its threads has pending I/O: "The terminated
+process cannot exit until all pending I/O has been completed or canceled" (`TerminateProcess`).
+A database thread still inside its close checkpoint's file flush keeps the process alive past the
+`process exits` record until that flush returns.
 
 A foreground repository server opens no metrics database of its own; its log drain routes each
 record to the consumer of the workspace the record names. Each workspace stops inside the serving
