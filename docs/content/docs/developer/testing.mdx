@@ -75,6 +75,16 @@ the process's metric points, one line each naming its scope as `otel.scope.name`
 `ScopedRecorderBuilder::clock` names the clock span timings and `measure_elapsed!` read on the
 recorder's thread, so a test advances time instead of sleeping.
 
+A failed binary test that opened a `FailureWindow` prints it to stderr. Its heading names the test
+with `NEXTEST_BINARY_ID`, `NEXTEST_TEST_NAME`, and `NEXTEST_ATTEMPT_ID`, then the window's bounds.
+A `T:` line states when the window ended, and a `machine:` line states the host's logical CPUs,
+system, and architecture; the harness reads no physical memory, so `memory_bytes` says so. When
+the window covers one workspace, each line a registered `rift mcp` child wrote to stderr merges
+into that workspace's records by timestamp, opening with `rift mcp <pid> | `. A stderr copy keeps
+at most 16 MiB and states the bytes it read and dropped past that bound. A server stderr file that
+holds `rift: the log store refused a batch` opens with a line saying the window falls back to that
+file for the records the store lacks.
+
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust.
 
@@ -254,7 +264,9 @@ log records. A collector that received nothing prints `no metric points received
 `no spans received`, and a bound that dropped anything is stated.
 
 Each note states a cut or a missing record instead of omitting it. The report names the files and
-the window bounds under `evidence`. A pass prints none of this.
+the window bounds under `evidence`. A server stderr that holds `rift: the log store refused a
+batch` opens with the same fallback line the Rust window prints, and a `machine:` line with the
+host facts closes the notes. A pass prints none of this.
 
 ## Artifact and agent checks
 

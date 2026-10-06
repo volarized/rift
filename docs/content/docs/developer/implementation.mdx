@@ -912,7 +912,10 @@ and the SDK records a label set past that into one series carrying `otel.metric.
 `ScopedRecorder::metrics`, each series naming its scope, printed as `otel.scope.name` and
 `otel.scope.version`. Every `traced!` operation records `traces.span.metrics.calls` and
 `traces.span.metrics.duration`, in seconds, labeled with its `span.name`, its `span.kind`,
-`Internal`, and its outcome as `status.code`, with `error.type` `panic` or `cancelled` when it did not finish. The metrics follow
+`Internal`, and its outcome as `status.code`, with `error.type` `panic` or `cancelled` when it did not finish. Work
+whose value is `Err(RiftError)`, the value of a block or the output of a future, records that
+error's registered identity as `error.type`; a block left through `?` or `return` has no value
+and records none. The metrics follow
 the operation, not its span: the duration is read once, at the operation's end, and the close
 record's `elapsed_ms` states the same reading, so a span clone held elsewhere lengthens neither,
 and the span's filters do not select it.
