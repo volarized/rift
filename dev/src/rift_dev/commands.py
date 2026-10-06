@@ -19,6 +19,7 @@ platform decides how a program is owned: a caller never names it.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import signal
@@ -42,6 +43,7 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 OUTPUT_BYTES_MAX: Final = 4 * 1024 * 1024
 COMMAND_SECONDS_MAX: Final = 300.0
 JOIN_SECONDS_MAX: Final = 10.0
+STREAM_CHUNK_BYTES_MAX: Final = 64 * 1024
 KILL_SECONDS_MAX: Final = 1.0
 INPUT_BYTES_MAX: Final = 16 * 1024 * 1024
 OWNER_ENV: Final = "_RIFT_TEST_PROCESS_OWNERS"
@@ -51,6 +53,12 @@ PROCESS_COUNT_MAX: Final = 65536
 _OWNERS: ContextVar[tuple[str, ...]] = ContextVar("rift_process_owners", default=())
 
 Argument = str | Path
+
+
+class ChunkReader(Protocol):
+    """The bounded read operation on a subprocess output pipe."""
+
+    def read1(self, size: int) -> bytes: ...
 
 
 class CommandFailed(RuntimeError):
@@ -180,6 +188,61 @@ class Command:
         if completed.returncode not in self.accepted:
             raise CommandFailed(self, completed.returncode, "")
         return Completion(completed.returncode)
+
+    async def stream(self, output: Callable[[bytes], None]) -> Completion:
+        """Streams bounded output chunks asynchronously under the command owner."""
+        timeout = self._captured_timeout()
+        started = time.monotonic()
+        reader: asyncio.Task[bytes] | None = None
+        try:
+            with self.spawn() as process:
+                if process.stdout is None:
+                    raise RuntimeError("command output pipe is unavailable")
+                source = cast(ChunkReader, process.stdout)
+                reader = asyncio.create_task(
+                    asyncio.to_thread(
+                        source.read1,
+                        STREAM_CHUNK_BYTES_MAX,
+                    )
+                )
+                while True:
+                    remaining = timeout - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise RuntimeError(f"{self.name} exceeded {timeout}s")
+                    try:
+                        chunk = await asyncio.wait_for(
+                            asyncio.shield(reader), timeout=remaining
+                        )
+                    except TimeoutError as error:
+                        raise RuntimeError(f"{self.name} exceeded {timeout}s") from error
+                    if not chunk:
+                        reader = None
+                        break
+                    output(chunk)
+                    reader = asyncio.create_task(
+                        asyncio.to_thread(
+                            source.read1,
+                            STREAM_CHUNK_BYTES_MAX,
+                        )
+                    )
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise RuntimeError(f"{self.name} exceeded {timeout}s")
+                try:
+                    status = process.wait(timeout=min(remaining, JOIN_SECONDS_MAX))
+                except TimeoutError as error:
+                    raise RuntimeError(f"{self.name} exceeded {timeout}s") from error
+        finally:
+            if reader is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(reader), timeout=JOIN_SECONDS_MAX
+                    )
+                except TimeoutError as error:
+                    raise RuntimeError("command stream did not close within its bound") from error
+        if status not in self.accepted:
+            raise CommandFailed(self, status, "")
+        return Completion(status)
 
     def output(self) -> str:
         """The program's stdout as text, captured under ownership and bounds."""

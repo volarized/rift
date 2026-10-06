@@ -312,37 +312,6 @@ container was created. The container and its files are removed afterwards, so no
 collector: the container runs with `--network none`, so the server inside cannot reach one.
 
 
-## Local traces
-
-Rift times cold-start work through `tracing` spans, opened by the `traced!` macro of
-`rift-tracing`, and records its metrics through OpenTelemetry instruments. Every build carries an
-OTLP/HTTP export that sends both to a collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one;
-`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` alone exports the metrics. With neither set, a process
-builds no exporter.
-
-Start the collector and point a run at it from a second terminal:
-
-```sh
-just trace-collector
-cargo build --release -p rift
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
-```
-
-`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans at
-`/v1/traces` and the exported metric points at `/v1/metrics` on port 4318 and keeps them in
-memory. `RIFT_OTLP_FILTER` overrides the span export's own filter; unset, it keeps Rift's own
-crates at `info`. The server exports metric points every `OTEL_METRIC_EXPORT_INTERVAL`
-milliseconds, 60 s when unset, and once more as it stops.
-
-Stop the collector with Ctrl-C once the run is done, and it prints one JSON line per operation:
-the span count, total duration, p50, p95, and max, in milliseconds. It then prints one JSON line
-per metric name with its kind, unit, series count, data point count, and value; the value is the
-sum of the latest value of each series, and a histogram adds its recorded count.
-
-A request body is at most 8 MiB encoded and decoded. The collector keeps at most 512 metric names
-and 256 series per name for these lines, and the newest 32,768 metric points and 8,192 spans for
-a failure window. A last `dropped` line counts what these bounds refused or dropped, when they
-did.
 
 The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
 errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at

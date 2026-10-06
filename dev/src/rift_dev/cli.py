@@ -15,6 +15,7 @@ import typer
 
 from rift_dev import (
     build_cache,
+    build_run,
     check_agent,
     check_artifact,
     check_coldstart,
@@ -25,7 +26,6 @@ from rift_dev import (
     generated,
     release_tag,
     suites,
-    trace,
     worktrees,
 )
 from rift_dev.commands import CommandFailed
@@ -156,6 +156,15 @@ def start_build_cache() -> None:
     raise typer.Exit(build_cache.main())
 
 
+@app.command(
+    "build",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def build(context: typer.Context) -> None:
+    """Run `cargo build` with the given arguments and compact output."""
+    build_run.run(list(context.args))
+
+
 @app.command("rust-architecture")
 def rust_architecture() -> None:
     """Check internal Cargo dependencies and test targets."""
@@ -166,15 +175,6 @@ def rust_architecture() -> None:
 def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None:
     """Check prose and source files for banned dash characters."""
     raise typer.Exit(check_dashes.main([str(path) for path in paths or []]))
-
-
-@app.command("trace-collector")
-def trace_collector(
-    host: Annotated[str, typer.Option()] = "127.0.0.1",
-    port: Annotated[int, typer.Option()] = 4318,
-) -> None:
-    """Collect OTLP/HTTP spans in memory; Ctrl-C prints one JSON line per operation."""
-    trace.collect(host, port)
 
 
 @app.command()
