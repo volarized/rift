@@ -1098,9 +1098,9 @@ async fn ranked_rows(
 ///
 /// One `bm25` call ranks the row and one more per column proves which columns
 /// carried a member. FTS5 evaluates an auxiliary function per candidate row,
-/// so the answer costs eight evaluations where it used to cost one; the
-/// `matches_max` bound is what keeps that bounded, and what it buys is a
-/// `matched_by` a reader can act on.
+/// so each candidate row costs one `bm25` evaluation for its rank and one per
+/// column of `SearchableField::ALL`; the `matches_max` bound keeps that
+/// bounded, and what it buys is a `matched_by` a reader can act on.
 fn lexical_search_sql() -> String {
     let ranked = rank_weights();
     let mut isolated = String::new();
