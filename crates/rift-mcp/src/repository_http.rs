@@ -685,7 +685,8 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    /// Diagnostics for PR #533: idle eviction events reach the test output.
+    /// Writes `rift_mcp::repository_http` events at `info` to the test output: a failed test
+    /// shows idle evictions.
     fn diagnostic_log() -> tracing::subscriber::DefaultGuard {
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
@@ -696,7 +697,7 @@ mod tests {
         )
     }
 
-    /// The retained workspace roots, and for PR #533 diagnostics each one's idle state,
+    /// The retained workspace roots, and each one's idle state for the release bound failure,
     /// read under one registry lock.
     async fn retained_workspaces(
         registry: &super::RepositoryWorkspaceRegistry,
