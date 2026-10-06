@@ -1062,3 +1062,50 @@ async fn an_append_behind_another_writer_counts_its_busy_retries() -> TestResult
     assert_eq!(reads(&store)?.count()?, 1);
     Ok(())
 }
+
+/// A collection reads the metrics database's pages in use and on its freelist from the
+/// file's header, as `SQLite` counts them once a checkpoint wrote them into the file; once
+/// the store drops, a collection reads none.
+#[tokio::test]
+async fn a_collection_reads_the_metrics_database_page_counts() -> TestResult {
+    let (recorder, _drain) = crate::ScopedRecorder::builder().install()?;
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store.append(&[record("counted")], KEEP_EVERY).await?;
+    let (used, free) = {
+        let connection = rusqlite::Connection::open(store.path())?;
+        connection.busy_timeout(Duration::from_secs(1))?;
+        let busy: i64 =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        assert_eq!(busy, 0, "the checkpoint met no lock");
+        let pages: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let free: i64 = connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        (pages - free, free)
+    };
+    let metrics = recorder.metrics();
+
+    let state = |state: &'static str| [("db.namespace", "metrics"), ("sqlite.page.state", state)];
+    #[expect(clippy::cast_precision_loss, reason = "a test file holds few pages")]
+    let expected = |pages: i64| SeriesValue::Sum(pages as f64);
+    let reported_used = metrics
+        .find("sqlite.page.count", &state("used"))
+        .ok_or("the used pages are reported")?;
+    assert_eq!(reported_used.unit(), "{page}");
+    assert_eq!(reported_used.value(), &expected(used));
+    assert!(used > 0, "the store holds its tables");
+    assert_eq!(
+        metrics
+            .find("sqlite.page.count", &state("free"))
+            .map(crate::MetricSeries::value),
+        Some(&expected(free))
+    );
+    drop(store);
+    assert!(
+        recorder
+            .metrics()
+            .find("sqlite.page.count", &state("used"))
+            .is_none(),
+        "a dropped store reports no pages"
+    );
+    Ok(())
+}

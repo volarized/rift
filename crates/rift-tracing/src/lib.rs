@@ -55,6 +55,7 @@ mod lock;
 mod measurement;
 mod metrics;
 mod otlp;
+mod pages;
 mod reads;
 mod record;
 #[cfg(any(test, feature = "fixtures"))]
@@ -80,6 +81,7 @@ pub use metrics::{
     ObservableUpDownCounter, Observation, ObservationGuard,
 };
 pub use otlp::{ExportShutdownError, OtlpExport};
+pub use pages::{PAGE_STATE_FREE, PAGE_STATE_USED, PageCounts};
 pub use reads::{LogReader, LogReads};
 pub use record::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,

@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
 
 use crate::metrics::{Counter, Histogram, ObservableUpDownCounter, Observation, ObservationGuard};
+use crate::pages::{PAGE_STATE_FREE, PAGE_STATE_USED, PageCounts};
 use crate::reads::LogReader;
 use crate::record::{LOG_BATCH_RECORDS_MAX, LOG_KIND, LogRecord};
 
@@ -85,6 +86,13 @@ static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
     "sqlite.file.size",
     "By",
     &["db.namespace", "sqlite.file.type"],
+);
+/// `sqlite.page.count`: the pages of the metrics database file in use and on its freelist,
+/// read from the file's header when the meter collects.
+static PAGE_COUNT: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
+    "sqlite.page.count",
+    "{page}",
+    &["db.namespace", "sqlite.page.state"],
 );
 
 /// `db.client.operation.duration`: one statement of the close on the writer thread, or the
@@ -216,6 +224,15 @@ fn observe_file_sizes(path: &Path, observation: &Observation<'_, 2>) {
         if let Ok(metadata) = std::fs::metadata(file) {
             observation.observe([DB_NAMESPACE, kind], metadata.len());
         }
+    }
+}
+
+/// Reports the pages in use and on the freelist of the database file at `path`, as
+/// [`PageCounts::read`] answers them; a file it answers nothing for reports nothing.
+fn observe_page_counts(path: &Path, observation: &Observation<'_, 2>) {
+    if let Some(counts) = PageCounts::read(path) {
+        observation.observe([DB_NAMESPACE, PAGE_STATE_USED], u64::from(counts.used()));
+        observation.observe([DB_NAMESPACE, PAGE_STATE_FREE], u64::from(counts.free()));
     }
 }
 
@@ -430,9 +447,9 @@ pub struct LogStore {
     sender: mpsc::Sender<Command>,
     closed: OnceLock<StoreClose>,
     progress: Arc<CloseProgress>,
-    /// Keeps the queue length and the file sizes reported while the store lives; absent
-    /// where the process installed no meter.
-    _readings: [Option<ObservationGuard>; 2],
+    /// Keeps the queue length, the file sizes, and the page counts reported while the
+    /// store lives; absent where the process installed no meter.
+    _readings: [Option<ObservationGuard>; 3],
 }
 
 impl std::fmt::Debug for Command {
@@ -485,7 +502,8 @@ impl LogStore {
         })??;
         let queue = sender.downgrade();
         let sizes: PathBuf = database.to_path_buf();
-        // Both reads hold the queue weakly and copy the path, so neither keeps the writer.
+        let pages: PathBuf = database.to_path_buf();
+        // The reads hold the queue weakly and copy the path, so none keeps the writer.
         let readings = [
             QUEUE_LENGTH.observe(move |observation| {
                 if let Some(sender) = queue.upgrade() {
@@ -494,6 +512,7 @@ impl LogStore {
                 }
             }),
             FILE_SIZE.observe(move |observation| observe_file_sizes(&sizes, observation)),
+            PAGE_COUNT.observe(move |observation| observe_page_counts(&pages, observation)),
         ];
         Ok(Self {
             path: database,
