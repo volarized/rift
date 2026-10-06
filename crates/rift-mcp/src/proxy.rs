@@ -566,7 +566,7 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// [`START_SPAWN_COUNT_MAX`](crate::spawn::START_SPAWN_COUNT_MAX) spawns in
 /// all, and any other exit refuses with the server's captured stderr.
 /// When the window closes on a holder of the election that is still building
-/// its first index and wrote to the workspace database during the window,
+/// its first index and wrote the index or the metrics database during the window,
 /// the refusal is one the caller resends; any other exhaustion refuses with
 /// the operator's next step.
 ///
@@ -2515,7 +2515,8 @@ mod tests {
     }
 
     /// A terminal repository miss ends the asking, and the workspace's own
-    /// election decides the start window as before.
+    /// election decides the start window: a holder that publishes no document
+    /// exhausts it.
     #[tokio::test(start_paused = true)]
     async fn a_terminal_repository_miss_is_asked_once() -> TestResult {
         let directory = tempfile::tempdir()?;
