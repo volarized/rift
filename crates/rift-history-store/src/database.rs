@@ -4,6 +4,7 @@
 //! each write batch commits in one `BEGIN IMMEDIATE` transaction, so the
 //! write lock is held for one batch at most and parsing never runs inside it.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -12,8 +13,10 @@ use std::time::Duration;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
-use rift_tracing::{Held, Histogram};
-use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
+use rift_tracing::{Held, Histogram, ObservableUpDownCounter, Observation, ObservationGuard};
+use rusqlite::{
+    CachedStatement, Connection, OptionalExtension as _, Transaction, TransactionBehavior, params,
+};
 
 use crate::record::CommitRecord;
 
@@ -84,8 +87,13 @@ const COMMIT_CHILD_TABLES: [&str; 4] = [
 ];
 
 /// Opens one connection to `database` in WAL mode, where a writer never
-/// blocks a reader.
+/// blocks a reader. The open is one `db.client.operation.duration` point.
 fn connect(database: &Path) -> Result<Connection, RiftError> {
+    timed(CONNECT_OPERATION, || open_connection(database))
+}
+
+/// The open [`connect`] times: the file, its busy timeout, WAL mode, and synchronous mode.
+fn open_connection(database: &Path) -> Result<Connection, RiftError> {
     let connection = Connection::open(database).map_err(|source| {
         errors::history_store::database()
             .operation("open store")
@@ -144,14 +152,22 @@ pub struct HeldCommit {
 pub struct StoreFiller {
     connection: Connection,
     _fill: Held<File>,
+    /// Keeps the store's file sizes reported while the filler lives; absent where the
+    /// process installed no meter.
+    _sizes: Option<ObservationGuard>,
 }
 
 impl StoreFiller {
-    /// Opens the write connection while `fill` holds the fill lock.
+    /// Opens the write connection while `fill` holds the fill lock, and reports the sizes
+    /// of the store's database file and write-ahead log in `sqlite.file.size` until the
+    /// filler drops.
     pub(crate) fn open(database: &Path, fill: Held<File>) -> Result<Self, RiftError> {
+        let connection = connect(database)?;
+        let sizes = database.to_path_buf();
         Ok(Self {
-            connection: connect(database)?,
+            connection,
             _fill: fill,
+            _sizes: FILE_SIZE.observe(move |observation| observe_file_sizes(&sizes, observation)),
         })
     }
 
@@ -180,11 +196,12 @@ impl StoreFiller {
     pub fn write_batch(&mut self, batch: &[CommitRecord]) -> Result<(), RiftError> {
         in_write_transaction(
             &mut self.connection,
+            INSERT_OPERATION,
             ["begin batch", "commit batch"],
             |transaction| {
                 for commit in batch {
                     let held: Option<i64> = transaction
-                        .prepare_cached("SELECT row FROM commits WHERE id = ?1")
+                        .prepare("SELECT row FROM commits WHERE id = ?1")
                         .and_then(|mut statement| {
                             statement
                                 .query_row([&commit.id], |row| row.get(0))
@@ -216,10 +233,11 @@ impl StoreFiller {
     pub fn trim(&mut self, keep: &BTreeSet<String>) -> Result<usize, RiftError> {
         in_write_transaction(
             &mut self.connection,
+            TRIM_OPERATION,
             ["begin trim", "commit trim"],
             |transaction| {
                 let held: Vec<(i64, String)> = transaction
-                    .prepare_cached("SELECT row, id FROM commits")
+                    .prepare("SELECT row, id FROM commits")
                     .and_then(|mut statement| {
                         statement
                             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -280,6 +298,110 @@ static TRANSACTION_DURATION: Histogram<2> = Histogram::declare(
 /// `sqlite.commit.duration`: one `COMMIT`, a checkpoint it runs included.
 static COMMIT_DURATION: Histogram<1> =
     Histogram::declare("sqlite.commit.duration", &["db.namespace"]);
+/// `sqlite.transaction.statement.count`: the statements one write transaction ran, its
+/// begin and its end left out.
+static TRANSACTION_STATEMENTS: Histogram<1, u64> = Histogram::declare_count(
+    "sqlite.transaction.statement.count",
+    "{statement}",
+    &["db.namespace"],
+    &STATEMENT_BOUNDARIES,
+);
+/// Upper bucket bounds of [`TRANSACTION_STATEMENTS`], in statements: the bounds the index
+/// and vectors workers use.
+const STATEMENT_BOUNDARIES: [f64; 13] = [
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+];
+/// `db.client.operation.duration`: one operation on a store connection, by
+/// `db.operation.name`; a failed one adds `error.type` `_OTHER`, and the busy or locked
+/// result code as `db.response.status_code`.
+static OPERATION_DURATION: Histogram<5> = Histogram::declare(
+    "db.client.operation.duration",
+    &[
+        "db.system.name",
+        "db.namespace",
+        "db.operation.name",
+        "db.response.status_code",
+        "error.type",
+    ],
+);
+/// The `db.system.name` of the store.
+const DB_SYSTEM: &str = "sqlite";
+/// The `db.operation.name` of one connection's open.
+const CONNECT_OPERATION: &str = "connect";
+/// The `db.operation.name` of one batch's writes, inside its transaction.
+const INSERT_OPERATION: &str = "insert";
+/// The `db.operation.name` of one trim's deletes, inside its transaction.
+const TRIM_OPERATION: &str = "trim";
+/// The `db.operation.name` of one read connection's query.
+const QUERY_OPERATION: &str = "query";
+/// `sqlite.file.size`: the size of the store's database file and of its write-ahead log,
+/// read when the meter collects.
+static FILE_SIZE: ObservableUpDownCounter<2> = ObservableUpDownCounter::declare(
+    "sqlite.file.size",
+    "By",
+    &["db.namespace", "sqlite.file.type"],
+);
+
+/// Runs one operation named `operation` and records its duration in
+/// `db.client.operation.duration`, labeled by the `SQLite` failure the refusal's source
+/// chain carries. A regressed clock records nothing and keeps the operation's result.
+fn timed<Answer>(
+    operation: &'static str,
+    run: impl FnOnce() -> Result<Answer, RiftError>,
+) -> Result<Answer, RiftError> {
+    let result;
+    let took = rift_tracing::measure_elapsed!("db.client.operation", {
+        result = run();
+    })
+    .ok()
+    .map(|((), measurement)| measurement.elapsed());
+    if let Some(took) = took {
+        let (status, failed) = match &result {
+            Ok(_) => ("", ""),
+            Err(refusal) => match sqlite_cause(refusal).map_or("_OTHER", error_type) {
+                "_OTHER" => ("", "_OTHER"),
+                code => (code, "_OTHER"),
+            },
+        };
+        OPERATION_DURATION
+            .labeled([DB_SYSTEM, DB_NAMESPACE, operation, status, failed])
+            .record(took);
+    }
+    result
+}
+
+/// The `SQLite` failure in `refusal`'s source chain, when it carries one.
+fn sqlite_cause(refusal: &RiftError) -> Option<&rusqlite::Error> {
+    std::iter::successors(std::error::Error::source(refusal), |cause| cause.source())
+        .find_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+}
+
+/// Reports the sizes of the database file at `path` and of its write-ahead log: two
+/// `fs::metadata` calls. A file that does not exist reports nothing.
+fn observe_file_sizes(path: &Path, observation: &Observation<'_, 2>) {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    for (kind, file) in [("database", path), ("wal", Path::new(&wal))] {
+        if let Ok(metadata) = std::fs::metadata(file) {
+            observation.observe([DB_NAMESPACE, kind], metadata.len());
+        }
+    }
+}
+
+/// One write transaction and the statements it started, counted as each is prepared:
+/// every write prepares the one statement it runs.
+struct CountedTransaction<'connection> {
+    transaction: Transaction<'connection>,
+    statements: Cell<u64>,
+}
+
+impl CountedTransaction<'_> {
+    /// Prepares `sql` through the connection's statement cache and counts it.
+    fn prepare(&self, sql: &str) -> rusqlite::Result<CachedStatement<'_>> {
+        self.statements.set(self.statements.get().saturating_add(1));
+        self.transaction.prepare_cached(sql)
+    }
+}
 
 /// The `error.type` of a failed statement: `SQLite`'s result code for busy, `5`, and for
 /// locked, `6`, the two a writer waits on, and `_OTHER` for every other failure.
@@ -295,12 +417,14 @@ fn error_type(failure: &rusqlite::Error) -> &'static str {
 /// what it wrote; a failed `body` rolls back. `operations` name the begin and the commit
 /// in a refusal.
 ///
-/// It records the wait for the write lock, the commit, and the transaction from its
-/// begin to its commit or rollback, all under `db.namespace` = `history`.
+/// It records the wait for the write lock, `body` as the `db.client.operation.duration`
+/// point of `operation`, the statements `body` started, the commit, and the transaction
+/// from its begin to its commit or rollback, all under `db.namespace` = `history`.
 fn in_write_transaction<Answer>(
     connection: &mut Connection,
+    operation: &'static str,
     operations: [&'static str; 2],
-    body: impl FnOnce(&Transaction<'_>) -> Result<Answer, RiftError>,
+    body: impl FnOnce(&CountedTransaction<'_>) -> Result<Answer, RiftError>,
 ) -> Result<Answer, RiftError> {
     let [begin_operation, commit_operation] = operations;
     let begun;
@@ -323,7 +447,7 @@ fn in_write_transaction<Answer>(
     })?;
     let ended;
     let lasted = rift_tracing::measure_elapsed!("sqlite.transaction", {
-        ended = finish_transaction(transaction, body, commit_operation);
+        ended = finish_transaction(transaction, operation, body, commit_operation);
     })
     .ok()
     .map(|((), lasted)| lasted);
@@ -336,15 +460,25 @@ fn in_write_transaction<Answer>(
     answer
 }
 
-/// Runs `body` in `transaction`, then commits it, or rolls it back when `body` fails;
-/// answers `body`'s answer, or the failure, with the `sqlite.transaction.result` it ended
-/// with. `commit` names the commit in a refusal.
+/// Runs `body` in `transaction` as `operation`, then commits it, or rolls it back when
+/// `body` fails; answers `body`'s answer, or the failure, with the
+/// `sqlite.transaction.result` it ended with. `commit` names the commit in a refusal.
 fn finish_transaction<Answer>(
     transaction: Transaction<'_>,
-    body: impl FnOnce(&Transaction<'_>) -> Result<Answer, RiftError>,
+    operation: &'static str,
+    body: impl FnOnce(&CountedTransaction<'_>) -> Result<Answer, RiftError>,
     commit: &'static str,
 ) -> (Result<Answer, RiftError>, &'static str) {
-    let answer = match body(&transaction) {
+    let counted = CountedTransaction {
+        transaction,
+        statements: Cell::new(0),
+    };
+    let answered = timed(operation, || body(&counted));
+    TRANSACTION_STATEMENTS
+        .labeled([DB_NAMESPACE])
+        .record(counted.statements.get());
+    let CountedTransaction { transaction, .. } = counted;
+    let answer = match answered {
         Ok(answer) => answer,
         Err(failure) => {
             drop(transaction);
@@ -372,47 +506,41 @@ fn finish_transaction<Answer>(
     }
 }
 
-/// Every commit the store `connection` reads holds, keyed by commit id.
+/// Every commit the store `connection` reads holds, keyed by commit id. The read is one
+/// `db.client.operation.duration` point.
 fn held_commits(connection: &Connection) -> Result<HashMap<String, HeldCommit>, RiftError> {
-    let mut statement = connection
-        .prepare_cached("SELECT id, base, boundary FROM commits")
-        .map_err(|source| {
-            errors::history_store::database()
-                .operation("read held commits")
-                .detail(source)
-                .error()
-        })?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                HeldCommit {
-                    base: row.get(1)?,
-                    boundary: row.get(2)?,
-                },
-            ))
-        })
-        .map_err(|source| {
-            errors::history_store::database()
-                .operation("read held commits")
-                .detail(source)
-                .error()
-        })?;
-    rows.collect::<Result<_, _>>().map_err(|source| {
-        errors::history_store::database()
-            .operation("read held commits")
-            .detail(source)
-            .error()
+    timed(QUERY_OPERATION, || {
+        connection
+            .prepare_cached("SELECT id, base, boundary FROM commits")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            HeldCommit {
+                                base: row.get(1)?,
+                                boundary: row.get(2)?,
+                            },
+                        ))
+                    })?
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(|source| {
+                errors::history_store::database()
+                    .operation("read held commits")
+                    .detail(source)
+                    .error()
+            })
     })
 }
 
 /// Writes one commit's rows, the message index entry after the commit row.
 fn write_commit(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &CountedTransaction<'_>,
     commit: &CommitRecord,
 ) -> Result<(), RiftError> {
     transaction
-        .prepare_cached(
+        .prepare(
             "INSERT INTO commits(id, base, boundary, author_name, author_email, committed_at, \
              time, message) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
@@ -434,9 +562,9 @@ fn write_commit(
                 .detail(source)
                 .error()
         })?;
-    let row = transaction.last_insert_rowid();
+    let row = transaction.transaction.last_insert_rowid();
     transaction
-        .prepare_cached("INSERT INTO commit_text(rowid, message) VALUES (?1, ?2)")
+        .prepare("INSERT INTO commit_text(rowid, message) VALUES (?1, ?2)")
         .and_then(|mut statement| statement.execute(params![row, commit.message]))
         .map_err(|source| {
             errors::history_store::database()
@@ -450,13 +578,13 @@ fn write_commit(
 
 /// Writes path and declaration rows that belong to one commit row.
 fn write_commit_paths_and_declarations(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &CountedTransaction<'_>,
     row: i64,
     commit: &CommitRecord,
 ) -> Result<(), RiftError> {
     for changed in &commit.paths {
         transaction
-            .prepare_cached("INSERT INTO changed_paths VALUES (?1, ?2, ?3, ?4)")
+            .prepare("INSERT INTO changed_paths VALUES (?1, ?2, ?3, ?4)")
             .and_then(|mut statement| {
                 statement.execute(params![
                     row,
@@ -474,7 +602,7 @@ fn write_commit_paths_and_declarations(
     }
     for renamed in &commit.renames {
         transaction
-            .prepare_cached("INSERT INTO renamed_paths VALUES (?1, ?2, ?3)")
+            .prepare("INSERT INTO renamed_paths VALUES (?1, ?2, ?3)")
             .and_then(|mut statement| {
                 statement.execute(params![row, renamed.old_path, renamed.new_path])
             })
@@ -487,7 +615,7 @@ fn write_commit_paths_and_declarations(
     }
     for moved in &commit.moves {
         transaction
-            .prepare_cached("INSERT INTO moved_declarations VALUES (?1, ?2, ?3, ?4)")
+            .prepare("INSERT INTO moved_declarations VALUES (?1, ?2, ?3, ?4)")
             .and_then(|mut statement| {
                 statement.execute(params![
                     row,
@@ -506,7 +634,7 @@ fn write_commit_paths_and_declarations(
     for declaration in &commit.declarations {
         let change = change_code(declaration.change);
         transaction
-            .prepare_cached("INSERT INTO changed_declarations VALUES (?1, ?2, ?3, ?4)")
+            .prepare("INSERT INTO changed_declarations VALUES (?1, ?2, ?3, ?4)")
             .and_then(|mut statement| {
                 statement.execute(params![
                     row,
@@ -528,9 +656,9 @@ fn write_commit_paths_and_declarations(
 /// Deletes one commit row and every row that belongs to it. The message
 /// index entry goes first, while the commit row still holds the message it
 /// was indexed from.
-fn delete_commit(transaction: &rusqlite::Transaction<'_>, row: i64) -> Result<(), RiftError> {
+fn delete_commit(transaction: &CountedTransaction<'_>, row: i64) -> Result<(), RiftError> {
     transaction
-        .prepare_cached(
+        .prepare(
             "INSERT INTO commit_text(commit_text, rowid, message) \
              SELECT 'delete', row, message FROM commits WHERE row = ?1",
         )
@@ -543,7 +671,7 @@ fn delete_commit(transaction: &rusqlite::Transaction<'_>, row: i64) -> Result<()
         })?;
     for table in COMMIT_CHILD_TABLES {
         transaction
-            .prepare_cached(&format!("DELETE FROM {table} WHERE commit_row = ?1"))
+            .prepare(&format!("DELETE FROM {table} WHERE commit_row = ?1"))
             .and_then(|mut statement| statement.execute([row]))
             .map_err(|source| {
                 errors::history_store::database()
@@ -553,7 +681,7 @@ fn delete_commit(transaction: &rusqlite::Transaction<'_>, row: i64) -> Result<()
             })?;
     }
     transaction
-        .prepare_cached("DELETE FROM commits WHERE row = ?1")
+        .prepare("DELETE FROM commits WHERE row = ?1")
         .and_then(|mut statement| statement.execute([row]))
         .map_err(|source| {
             errors::history_store::database()
@@ -672,35 +800,37 @@ impl StoreReads {
     ///
     /// Returns [`RiftError`] when `SQLite` refuses the read.
     pub fn commit(&self, id: &str) -> Result<Option<StoredCommit>, RiftError> {
-        self.connection
-            .prepare_cached(
-                "SELECT row, id, base, boundary, author_name, author_email, committed_at, message \
-                 FROM commits WHERE id = ?1",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_row([id], |row| {
-                        Ok(StoredCommit {
-                            row: row.get(0)?,
-                            id: row.get(1)?,
-                            base: row.get(2)?,
-                            boundary: row.get(3)?,
-                            author: CommitAuthor {
-                                name: row.get(4)?,
-                                email: row.get(5)?,
-                            },
-                            committed_at: row.get(6)?,
-                            message: row.get(7)?,
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT row, id, base, boundary, author_name, author_email, committed_at, \
+                     message FROM commits WHERE id = ?1",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_row([id], |row| {
+                            Ok(StoredCommit {
+                                row: row.get(0)?,
+                                id: row.get(1)?,
+                                base: row.get(2)?,
+                                boundary: row.get(3)?,
+                                author: CommitAuthor {
+                                    name: row.get(4)?,
+                                    email: row.get(5)?,
+                                },
+                                committed_at: row.get(6)?,
+                                message: row.get(7)?,
+                            })
                         })
-                    })
-                    .optional()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read commit")
-                    .detail(source)
-                    .error()
-            })
+                        .optional()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read commit")
+                        .detail(source)
+                        .error()
+                })
+        })
     }
 
     /// How `commit` changed the declaration `qualified_name` at `path`, when
@@ -715,23 +845,24 @@ impl StoreReads {
         path: &str,
         qualified_name: &str,
     ) -> Result<Option<SymbolVersionKind>, RiftError> {
-        let code: Option<String> = self
-            .connection
-            .prepare_cached(
-                "SELECT change FROM changed_declarations \
+        let code: Option<String> = timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT change FROM changed_declarations \
                  WHERE commit_row = ?1 AND path = ?2 AND qualified_name = ?3",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_row(params![commit.row, path, qualified_name], |row| row.get(0))
-                    .optional()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read declaration change")
-                    .detail(source)
-                    .error()
-            })?;
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_row(params![commit.row, path, qualified_name], |row| row.get(0))
+                        .optional()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read declaration change")
+                        .detail(source)
+                        .error()
+                })
+        })?;
         Ok(code.and_then(stored_change))
     }
 
@@ -746,21 +877,23 @@ impl StoreReads {
         commit: &StoredCommit,
         new_path: &str,
     ) -> Result<Option<String>, RiftError> {
-        self.connection
-            .prepare_cached(
-                "SELECT old_path FROM renamed_paths WHERE commit_row = ?1 AND new_path = ?2",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_row(params![commit.row, new_path], |row| row.get(0))
-                    .optional()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read renamed path")
-                    .detail(source)
-                    .error()
-            })
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT old_path FROM renamed_paths WHERE commit_row = ?1 AND new_path = ?2",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_row(params![commit.row, new_path], |row| row.get(0))
+                        .optional()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read renamed path")
+                        .detail(source)
+                        .error()
+                })
+        })
     }
 
     /// The path `commit` moved the declaration `qualified_name` now at `new_path`
@@ -775,24 +908,26 @@ impl StoreReads {
         new_path: &str,
         qualified_name: &str,
     ) -> Result<Option<String>, RiftError> {
-        self.connection
-            .prepare_cached(
-                "SELECT old_path FROM moved_declarations \
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT old_path FROM moved_declarations \
                  WHERE commit_row = ?1 AND new_path = ?2 AND qualified_name = ?3",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_row(params![commit.row, new_path, qualified_name], |row| {
-                        row.get(0)
-                    })
-                    .optional()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read moved declaration")
-                    .detail(source)
-                    .error()
-            })
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_row(params![commit.row, new_path, qualified_name], |row| {
+                            row.get(0)
+                        })
+                        .optional()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read moved declaration")
+                        .detail(source)
+                        .error()
+                })
+        })
     }
 
     /// The paths `commit` changed against the commit it was compared with, in path
@@ -807,21 +942,23 @@ impl StoreReads {
         limit: usize,
     ) -> Result<Vec<String>, RiftError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.connection
-            .prepare_cached(
-                "SELECT path FROM changed_paths WHERE commit_row = ?1 ORDER BY path LIMIT ?2",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![commit.row, limit], |row| row.get(0))?
-                    .collect()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read changed paths")
-                    .detail(source)
-                    .error()
-            })
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT path FROM changed_paths WHERE commit_row = ?1 ORDER BY path LIMIT ?2",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params![commit.row, limit], |row| row.get(0))?
+                        .collect()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read changed paths")
+                        .detail(source)
+                        .error()
+                })
+        })
     }
 
     /// The held commit no other held commit was compared with, newest first:
@@ -831,19 +968,21 @@ impl StoreReads {
     ///
     /// Returns [`RiftError`] when `SQLite` refuses the read.
     pub fn chain_head(&self) -> Result<Option<String>, RiftError> {
-        self.connection
-            .prepare_cached(
-                "SELECT id FROM commits WHERE id NOT IN \
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT id FROM commits WHERE id NOT IN \
                  (SELECT base FROM commits WHERE base IS NOT NULL) \
                  ORDER BY time DESC, id LIMIT 1",
-            )
-            .and_then(|mut statement| statement.query_row([], |row| row.get(0)).optional())
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("read chain head")
-                    .detail(source)
-                    .error()
-            })
+                )
+                .and_then(|mut statement| statement.query_row([], |row| row.get(0)).optional())
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("read chain head")
+                        .detail(source)
+                        .error()
+                })
+        })
     }
 
     /// The ids of the commits whose message matches the full-text `query`,
@@ -855,31 +994,184 @@ impl StoreReads {
     /// full-text query included.
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<String>, RiftError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.connection
-            .prepare_cached(
-                "SELECT commits.id FROM commit_text \
+        timed(QUERY_OPERATION, || {
+            self.connection
+                .prepare_cached(
+                    "SELECT commits.id FROM commit_text \
                  JOIN commits ON commits.row = commit_text.rowid \
                  WHERE commit_text MATCH ?1 ORDER BY commits.time DESC, commits.id LIMIT ?2",
-            )
-            .and_then(|mut statement| {
-                statement
-                    .query_map(params![query, limit], |row| row.get(0))?
-                    .collect()
-            })
-            .map_err(|source| {
-                errors::history_store::database()
-                    .operation("search commit messages")
-                    .detail(source)
-                    .error()
-            })
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params![query, limit], |row| row.get(0))?
+                        .collect()
+                })
+                .map_err(|source| {
+                    errors::history_store::database()
+                        .operation("search commit messages")
+                        .detail(source)
+                        .error()
+                })
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use rift_error::errors;
+    use rift_protocol::read::CommitAuthor;
+    use rift_tracing::{MetricSeries, MetricSnapshot, ScopedRecorder, SeriesValue};
     use rusqlite::ffi;
 
-    use super::error_type;
+    use super::{QUERY_OPERATION, error_type, timed};
+    use crate::{CommitRecord, HistoryStore, StoreLocation};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// One commit with no changed path, rename, move, or declaration: writing it new runs
+    /// three statements, the held read and the two inserts.
+    fn bare_commit(id: &str) -> CommitRecord {
+        CommitRecord {
+            id: id.to_owned(),
+            base: None,
+            boundary: false,
+            author: CommitAuthor {
+                name: "Rift Fixture".to_owned(),
+                email: "fixture@rift.invalid".to_owned(),
+            },
+            committed_at: "2026-01-01T00:00:00+00:00".to_owned(),
+            time: 0,
+            message: "Bare commit".to_owned(),
+            paths: Vec::new(),
+            renames: Vec::new(),
+            moves: Vec::new(),
+            declarations: Vec::new(),
+        }
+    }
+
+    /// The count and sum of the histogram series `name` carries under exactly `labels`, or
+    /// zeros when no point reached it.
+    fn histogram(metrics: &MetricSnapshot, name: &str, labels: &[(&str, &str)]) -> (u64, f64) {
+        match metrics.find(name, labels).map(MetricSeries::value) {
+            Some(SeriesValue::Buckets { count, sum, .. }) => (*count, *sum),
+            _ => (0, 0.0),
+        }
+    }
+
+    /// The `db.client.operation.duration` points of the history operation `operation`
+    /// that ended without a failure.
+    fn operations(metrics: &MetricSnapshot, operation: &str) -> u64 {
+        let labels = [
+            ("db.system.name", "sqlite"),
+            ("db.namespace", "history"),
+            ("db.operation.name", operation),
+        ];
+        histogram(metrics, "db.client.operation.duration", &labels).0
+    }
+
+    /// The store records each open, batch, trim, and read as one operation, counts the
+    /// statements each write transaction ran, and reports its file size while its filler
+    /// lives.
+    #[test]
+    fn the_store_records_its_operations_statements_and_file_size() -> TestResult {
+        let (recorder, _drain) = ScopedRecorder::builder().install()?;
+        let folder = tempfile::tempdir()?;
+        let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+        let mut filler = store.filler()?.ok_or("the first filler takes the lock")?;
+        let statements = [("db.namespace", "history")];
+        let counted = |metrics: &MetricSnapshot| {
+            histogram(metrics, "sqlite.transaction.statement.count", &statements)
+        };
+
+        filler.write_batch(&[bare_commit("c1")])?;
+        let written = recorder.metrics();
+        filler.write_batch(&[bare_commit("c1")])?;
+        let replaced = recorder.metrics();
+        let trimmed_count = filler.trim(&BTreeSet::new())?;
+        let trimmed = recorder.metrics();
+        store.reader().connect()?.held()?;
+        let read = recorder.metrics();
+
+        assert_eq!(counted(&written), (1, 3.0), "a held read and two inserts");
+        assert_eq!(
+            counted(&replaced),
+            (2, 12.0),
+            "a held read, six deletes, and two inserts more"
+        );
+        assert_eq!(trimmed_count, 1);
+        assert_eq!(
+            counted(&trimmed),
+            (3, 19.0),
+            "a read of the held and six deletes more"
+        );
+        assert_eq!(
+            operations(&read, "connect"),
+            3,
+            "the store, the filler, the reader"
+        );
+        assert_eq!(operations(&read, "insert"), 2);
+        assert_eq!(operations(&read, "trim"), 1);
+        assert_eq!(operations(&read, "query"), 1);
+        let database_file = [
+            ("db.namespace", "history"),
+            ("sqlite.file.type", "database"),
+        ];
+        assert!(
+            matches!(
+                read.find("sqlite.file.size", &database_file).map(MetricSeries::value),
+                Some(SeriesValue::Sum(size)) if *size > 0.0
+            ),
+            "{read:?}"
+        );
+        drop(filler);
+        assert!(
+            recorder
+                .metrics()
+                .find("sqlite.file.size", &database_file)
+                .is_none(),
+            "a dropped filler reports no size"
+        );
+        Ok(())
+    }
+
+    /// A refused operation whose source chain carries `SQLite`'s busy result records the
+    /// code as `db.response.status_code`; one without a `SQLite` cause records `_OTHER`
+    /// alone.
+    #[test]
+    fn a_refused_operation_records_the_sqlite_result_its_refusal_carries() -> TestResult {
+        let (recorder, _drain) = ScopedRecorder::builder().install()?;
+
+        let busy = timed(QUERY_OPERATION, || -> Result<(), _> {
+            errors::history_store::database()
+                .operation("read held commits")
+                .detail(failure(ffi::SQLITE_BUSY))
+                .fail()
+        });
+        let other = timed(QUERY_OPERATION, || -> Result<(), _> {
+            errors::history_store::database()
+                .operation("read held commits")
+                .detail(std::io::Error::other("not a database failure"))
+                .fail()
+        });
+        let metrics = recorder.metrics();
+
+        assert!(busy.is_err() && other.is_err());
+        let refused = |status: Option<&'static str>| {
+            let mut labels = vec![
+                ("db.system.name", "sqlite"),
+                ("db.namespace", "history"),
+                ("db.operation.name", "query"),
+                ("error.type", "_OTHER"),
+            ];
+            labels.extend(status.map(|code| ("db.response.status_code", code)));
+            histogram(&metrics, "db.client.operation.duration", &labels).0
+        };
+        assert_eq!(refused(Some("5")), 1, "{metrics:?}");
+        assert_eq!(refused(None), 1, "{metrics:?}");
+        Ok(())
+    }
 
     fn failure(code: std::ffi::c_int) -> rusqlite::Error {
         rusqlite::Error::SqliteFailure(ffi::Error::new(code), None)
