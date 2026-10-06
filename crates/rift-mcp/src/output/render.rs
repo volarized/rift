@@ -54,6 +54,7 @@ use rift_protocol::workspace::WorkspaceResourcePage;
 use super::text::{OUTPUT_TEXT_BYTES_MAX, TextError, TextWriter};
 use layout::Page;
 
+pub(crate) use error::RegisteredFailure;
 pub(crate) use logs::{LogFields, LogLine, LogsPage};
 
 /// An answer that writes itself as text.
@@ -117,6 +118,12 @@ impl Render for NodesResult {
 impl Render for ErrorData {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         error::answer(out, self)
+    }
+}
+
+impl Render for RegisteredFailure<'_> {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        error::registered(out, self)
     }
 }
 

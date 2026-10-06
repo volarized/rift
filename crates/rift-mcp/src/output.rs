@@ -68,7 +68,9 @@ enum AnswerFault {
 
 /// The completed error result for an answer that could not be served.
 fn refused(fault: AnswerFault) -> Result<CallToolResponse, ErrorData> {
-    ToolFailure::from(answer_error(fault).mcp().tool_error(wire::ErrorPhase::Read))
+    answer_error(fault)
+        .mcp()
+        .tool_failure(wire::ErrorPhase::Read)
         .into_call_tool_result()
 }
 

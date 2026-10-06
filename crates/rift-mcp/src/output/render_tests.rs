@@ -22,7 +22,7 @@ use strum::VariantArray;
 
 use super::facts::{cut_hash, date_of, moment_of, spaced_name, wire_name, wire_names};
 use super::inline::fields_of;
-use super::{Render, text_of};
+use super::{RegisteredFailure, Render, text_of};
 use crate::output::text::{INDENT_UNIT, OutputOverflow, TextError, TextWriter};
 
 fn rendered<T: Render>(answer: &T) -> String {
@@ -3802,6 +3802,73 @@ fn a_failure_with_an_empty_message_writes_its_head_and_no_message_entry() {
     golden(
         &error_data(ErrorCode::InternalError, ""),
         &["1 error", "\tinternal_error · retry never"],
+    );
+}
+
+#[test]
+fn a_registered_failure_writes_its_identity_after_its_limit_and_before_its_causes() {
+    let mut error = error_data(
+        ErrorCode::LimitExceeded,
+        "the request crosses a limit; narrow the request",
+    );
+    error.limit = Some(LimitEvidence {
+        field: "source.files".to_owned(),
+        limit: 10,
+        required: 11,
+    });
+    error.causes = vec![ErrorCause {
+        code: ErrorCode::StorageFailure,
+        message: "the store refused".to_owned(),
+        retry: RetryDirective::SameRequest,
+    }];
+    golden(
+        &RegisteredFailure {
+            identity: "rift.index.workspace_too_many_files",
+            error: &error,
+        },
+        &[
+            "2 errors",
+            "\tlimit_exceeded · retry never",
+            "\t\tthe request crosses a limit; narrow the request",
+            "\t\tlimit source.files: 11 over 10",
+            "\t\trift.index.workspace_too_many_files",
+            "\tstorage_failure · retry same_request",
+            "\t\tthe store refused",
+        ],
+    );
+}
+
+#[test]
+fn a_registered_failure_without_limit_or_causes_writes_its_identity_under_its_message() {
+    let error = error_data(ErrorCode::InvalidRequest, "query is empty");
+    golden(
+        &RegisteredFailure {
+            identity: "rift.ranking.query_empty",
+            error: &error,
+        },
+        &[
+            "1 error",
+            "\tinvalid_request · retry never",
+            "\t\tquery is empty",
+            "\t\trift.ranking.query_empty",
+        ],
+    );
+}
+
+#[test]
+fn a_registered_identity_with_a_control_character_stays_on_one_line() {
+    let error = error_data(ErrorCode::InternalError, "first");
+    golden(
+        &RegisteredFailure {
+            identity: "rift.test\nsplit",
+            error: &error,
+        },
+        &[
+            "1 error",
+            "\tinternal_error · retry never",
+            "\t\tfirst",
+            "\t\trift.test\\nsplit",
+        ],
     );
 }
 
