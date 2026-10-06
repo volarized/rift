@@ -189,6 +189,11 @@ impl TracingRuntime {
     /// The caller runs it before either exit path: a normal return drops every other
     /// local first, and `process::exit` past it runs no destructor at all. An export that
     /// fails or outlasts its bound is reported on stderr and fails nothing.
+    ///
+    /// # Panics
+    ///
+    /// When a configured test export fails to shut down, panics unless the thread is
+    /// already unwinding.
     pub async fn shutdown(self) {
         let Self {
             export,
@@ -203,7 +208,11 @@ impl TracingRuntime {
         let deadline = tokio::time::Instant::now() + OTLP_SHUTDOWN_TIMEOUT;
         #[cfg(any(test, feature = "fixtures"))]
         if let Some(runtime) = test_otlp_runtime {
-            runtime.shutdown(export);
+            if let Err(error) = runtime.shutdown(export)
+                && !std::thread::panicking()
+            {
+                panic!("{error}");
+            }
             return;
         }
         if let Err(error) = export.shutdown(deadline).await {
@@ -329,7 +338,7 @@ impl TracingRuntimeBuilder {
         if let Err(error) = installed {
             #[cfg(any(test, feature = "fixtures"))]
             if let Some(runtime) = test_otlp_runtime {
-                runtime.shutdown(export);
+                let _ = runtime.shutdown(export);
                 return Err(InstallError(error));
             }
             // Dropping the providers blocks on their shutdown, which waits for export tasks
