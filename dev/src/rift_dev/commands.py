@@ -189,9 +189,18 @@ class Command:
             raise CommandFailed(self, completed.returncode, "")
         return Completion(completed.returncode)
 
-    async def stream(self, output: Callable[[bytes], None]) -> Completion:
-        """Streams bounded output chunks asynchronously under the command owner."""
-        timeout = self._captured_timeout()
+    async def stream(
+        self,
+        output: Callable[[bytes], None],
+        *,
+        exit_wait_seconds: float | None = None,
+    ) -> Completion:
+        """Streams bounded output chunks asynchronously under the command owner.
+
+        `exit_wait_seconds` bounds the wait after output closes when no command
+        wall timeout was set.
+        """
+        timeout = self._streamed_timeout()
         started = time.monotonic()
         reader: asyncio.Task[bytes] | None = None
         try:
@@ -206,12 +215,15 @@ class Command:
                     )
                 )
                 while True:
-                    remaining = timeout - (time.monotonic() - started)
-                    if remaining <= 0:
+                    remaining = _remaining(timeout, started)
+                    if remaining is not None and remaining <= 0:
                         raise RuntimeError(f"{self.name} exceeded {timeout}s")
                     try:
-                        chunk = await asyncio.wait_for(
-                            asyncio.shield(reader), timeout=remaining
+                        pending = asyncio.shield(reader)
+                        chunk = (
+                            await pending
+                            if remaining is None
+                            else await asyncio.wait_for(pending, timeout=remaining)
                         )
                     except TimeoutError as error:
                         raise RuntimeError(f"{self.name} exceeded {timeout}s") from error
@@ -225,11 +237,14 @@ class Command:
                             STREAM_CHUNK_BYTES_MAX,
                         )
                     )
-                remaining = timeout - (time.monotonic() - started)
-                if remaining <= 0:
+                remaining = _remaining(timeout, started)
+                if remaining is not None and remaining <= 0:
                     raise RuntimeError(f"{self.name} exceeded {timeout}s")
                 try:
-                    status = process.wait(timeout=min(remaining, JOIN_SECONDS_MAX))
+                    wait_timeout = (
+                        remaining if remaining is not None else exit_wait_seconds
+                    )
+                    status = process.wait(timeout=wait_timeout)
                 except TimeoutError as error:
                     raise RuntimeError(f"{self.name} exceeded {timeout}s") from error
         finally:
@@ -401,10 +416,11 @@ class Process:
         """The exit status once the program has exited, `None` while it runs."""
         return self._process.poll()
 
-    def wait(self, timeout: float) -> int:
+    def wait(self, timeout: float | None) -> int:
         """Waits up to `timeout` seconds for the exit status.
 
-        Raises `TimeoutError` when the program is still running at the bound.
+        Raises `TimeoutError` when the program is still running at the bound; `None`
+        waits until it exits.
         """
         try:
             return self._process.wait(timeout=timeout)
@@ -412,7 +428,6 @@ class Process:
             raise TimeoutError(
                 f"process {self.pid} still running after {timeout}s"
             ) from error
-
     def interrupt(self) -> None:
         """Sends Ctrl-C's signal to the process group, or terminates on Windows.
 
@@ -422,6 +437,11 @@ class Process:
             self._process.terminate()
             return
         signal_group(self._process.pid, signal.SIGINT)
+
+
+def _remaining(timeout: float | None, started: float) -> float | None:
+    """The explicit timeout left, or `None` when the caller set no wall bound."""
+    return None if timeout is None else timeout - (time.monotonic() - started)
 
 
 @dataclass
