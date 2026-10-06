@@ -143,7 +143,9 @@ def test_a_failed_case_reports_every_section_from_what_its_process_sent(
     assert "process pid=4242 rift server start --foreground: exit ExitStatus(0)" in text
     assert "stop stage ended stage=log drain outcome=ok" in text
     assert "received: 1 log records, 1 spans, 1 points" in text
-    output = text.split("---- test output ----\n", 1)[1].split("---- processes ----", 1)[0]
+    output = text.split("---- test output ----\n", 1)[1].split(
+        "---- processes ----", 1
+    )[0]
     assert "    running 1 test" in output
     assert "database.close  streamed record" in output
     assert "Summary" not in output
@@ -245,3 +247,34 @@ def test_a_window_of_an_earlier_run_is_left_out(tmp_path: Path) -> None:
     path = directory / "run-1_suite_failing_case.window"
     assert nextest_run.windows_of(directory, outcome, path.stat().st_mtime - 1)
     assert not nextest_run.windows_of(directory, outcome, path.stat().st_mtime + 1)
+
+
+def test_last_values_keep_a_series_per_instrumentation_scope() -> None:
+    def point(scope: trace.Scope, value: float, second: int) -> trace.MetricPoint:
+        return trace.MetricPoint(
+            "sqlite.queue.length",
+            "sum",
+            "{command}",
+            "",
+            (("db.namespace", "index"),),
+            (("process.pid", "4242"),),
+            0,
+            second * 1_000_000_000,
+            value,
+            scope=scope,
+        )
+
+    lines = nextest_run.last_values(
+        [
+            point(("rift-index", "0.0.62"), 1, 1),
+            point(("rift-index", "0.0.62"), 2, 2),
+            point(("rift-tracing", "0.0.62"), 7, 1),
+        ]
+    )
+    assert len(lines) == 2, lines
+    assert any(
+        "otel.scope.name=rift-index" in line and "value=2" in line for line in lines
+    )
+    assert any(
+        "otel.scope.name=rift-tracing" in line and "value=7" in line for line in lines
+    )

@@ -193,6 +193,7 @@ def point(name: str, second: int, value: float) -> MetricPoint:
         NINE,
         NINE + second * 1_000_000_000,
         value,
+        scope=("rift-mcp", "0.0.62"),
     )
 
 
@@ -221,7 +222,7 @@ def filled() -> Collector:
 
 def test_a_point_and_a_span_print_in_the_layout_of_a_record() -> None:
     assert point("rift.requests", 10, 6).line() == (
-        "2026-10-05 09:00:10.000Z sum       rift.requests   outcome=ok  value=6 "
+        "2026-10-05 09:00:10.000Z sum       rift.requests   otel.scope.name=rift-mcp otel.scope.version=0.0.62  outcome=ok  value=6 "
         "unit=1 cumulative"
     )
     histogram = MetricPoint(
@@ -237,9 +238,10 @@ def test_a_point_and_a_span_print_in_the_layout_of_a_record() -> None:
         3,
         (0.1, 1.0),
         (2, 0, 1),
+        scope=("rift-mcp", "0.0.62"),
     )
     assert histogram.line() == (
-        "2026-10-05 09:00:00.000Z histogram rift.mcp.request.duration   count=3 "
+        "2026-10-05 09:00:00.000Z histogram rift.mcp.request.duration   otel.scope.name=rift-mcp otel.scope.version=0.0.62  count=3 "
         "sum=0.25 buckets=<=0.1:2,>1:1 unit=s cumulative"
     )
 
@@ -257,9 +259,10 @@ def test_the_window_prints_points_and_joins_spans_to_records_by_request() -> Non
     assert notes[2] == (
         f"metric points from {SINCE} until {UNTIL}, the newest {WINDOW_POINTS_MAX} at "
         "most:\n"
-        "2026-10-05 09:00:10.000Z sum       rift.a   outcome=ok  value=1 unit=1 "
-        "cumulative\n"
-        "2026-10-05 09:00:20.000Z sum       rift.b   outcome=ok  value=2 unit=1 "
+        "2026-10-05 09:00:10.000Z sum       rift.a   otel.scope.name=rift-mcp otel.scope.version=0.0.62  outcome=ok  value=1 "
+        "unit=1 cumulative\n"
+        "2026-10-05 09:00:20.000Z sum       rift.b   otel.scope.name=rift-mcp otel.scope.version=0.0.62  outcome=ok  value=2 "
+        "unit=1 "
         "cumulative"
     )
     assert notes[3].endswith(
@@ -279,8 +282,8 @@ def test_the_window_keeps_its_newest_points_and_states_drops(
     assert notes[0].splitlines()[1:] == [
         "[1 older points of the window were left out]",
         (
-            "2026-10-05 09:00:20.000Z sum       rift.b   outcome=ok  value=2 unit=1 "
-            "cumulative"
+            "2026-10-05 09:00:20.000Z sum       rift.b   otel.scope.name=rift-mcp otel.scope.version=0.0.62  outcome=ok  "
+            "value=2 unit=1 cumulative"
         ),
     ]
     assert notes[-1] == "the collector's bounds dropped: points=4"

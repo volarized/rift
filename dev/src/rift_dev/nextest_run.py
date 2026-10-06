@@ -254,10 +254,13 @@ def timeline(telemetry: CaseTelemetry) -> list[str]:
 
 
 def last_values(points: Iterable[MetricPoint]) -> list[str]:
-    """The newest point of every instrument series, per process."""
-    latest: dict[tuple[str, str, tuple[tuple[str, str], ...]], MetricPoint] = {}
+    """The newest point of every instrument series, per process and instrumentation
+    scope: two crates that declare one name keep a series each."""
+    latest: dict[
+        tuple[str, str, tuple[str, str], tuple[tuple[str, str], ...]], MetricPoint
+    ] = {}
     for point in points:
-        key = (point.name, pid_of(point.resource), point.attributes)
+        key = (point.name, pid_of(point.resource), point.scope, point.attributes)
         held = latest.get(key)
         if held is None or held.time_unix_nano <= point.time_unix_nano:
             latest[key] = point
