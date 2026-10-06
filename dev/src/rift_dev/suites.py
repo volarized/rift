@@ -9,7 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from rift_dev import nextest_run
+from rift_dev import doctest_run, nextest_run
+from rift_dev.build_run import run as run_cargo_build
 from rift_dev.commands import REPOSITORY, CargoCommand
 from rift_dev.config import CorpusName
 
@@ -29,6 +30,13 @@ CACHEDIR_TAG = (
 )
 
 LIVE_ARCHIVE = REPOSITORY / "target/live-archive"
+
+
+def doctest() -> None:
+    """Runs Rust documentation examples with the dev appliance collector."""
+    doctest_run.run(
+        CargoCommand("test", "--doc", "--workspace", "--all-features", "--locked")
+    )
 
 
 def coverage_target() -> None:
@@ -162,5 +170,12 @@ def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> Non
 
 
 def nextest(arguments: list[str]) -> None:
-    """Runs `cargo nextest` with `arguments` beside the collector, as every other suite."""
-    nextest_run.run(CargoCommand("nextest", *arguments))
+    """Runs a nextest suite or forwards a non-run nextest operation."""
+    if arguments and arguments[0] == "archive":
+        run_cargo_build(
+            arguments[1:], cargo_arguments=("nextest", "archive")
+        )
+    elif arguments and arguments[0] == "run":
+        nextest_run.run(CargoCommand("nextest", *arguments))
+    else:
+        CargoCommand("nextest", *arguments).run()

@@ -15,7 +15,7 @@ generate-check:
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
-    cargo check --workspace --all-targets --all-features --locked
+    {{ rift_dev }} check --workspace --all-targets --all-features --locked
     {{ rift_dev }} rust-architecture
 
 dashes *args:
@@ -29,14 +29,14 @@ conformance *args:
     {{ rift_dev }} conformance {{ args }}
 
 clippy:
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    {{ rift_dev }} clippy --workspace --all-targets --all-features -- -D warnings
 
 docs:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+    {{ rift_dev }} docs --workspace --all-features --no-deps
 
 # Stable Rust exposes doctests through rustdoc; nextest runs the other Rust tests.
 doctest:
-    cargo test --doc --workspace --all-features --locked
+    {{ rift_dev }} test doctest
 
 audit:
     cargo audit
@@ -52,7 +52,7 @@ clean:
 # compression level trades build time for bytes. Measured over one revision,
 # level 9 costs 17 seconds where level 19 costs six minutes for 15% more.
 fast-archive:
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
+    {{ rift_dev }} test archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
 
 test *args:
     {{ rift_dev }} test unit {{ args }}
@@ -71,12 +71,12 @@ corpus-sync *args:
 
 # The plain CLI the artifact job serves, from the corpus profile.
 integration-cli:
-    cargo build --locked --profile corpus -p rift
+    {{ rift_dev }} build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
 
 # The archive carries the three corpus suites; the live suites use the fast archive.
 integration-archive:
-    cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
+    {{ rift_dev }} test archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
 corpus-test *args:
     {{ rift_dev }} test corpus {{ args }}

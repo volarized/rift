@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping, Sequence
 
 from rift_dev.commands import REPOSITORY, CargoCommand
-from rift_dev.progress import finish, start
+from rift_dev.progress import RunLabel, finish, start
 
 BUILD_SECONDS_MAX = 1_800.0
 BUILD_LOG_BYTES_MAX = 32 * 1024 * 1024
@@ -14,14 +15,24 @@ BUILD_TAIL_BYTES_MAX = 1024 * 1024
 BUILD_LOG_DIRECTORY = REPOSITORY / "target" / "integration" / "build"
 
 
-def run(arguments: list[str]) -> None:
-    """Run `cargo build` with `arguments`, retaining bounded output for diagnosis."""
+def run(
+    arguments: Sequence[str],
+    *,
+    cargo_arguments: Sequence[str] = ("build",),
+    environment: Mapping[str, str] | None = None,
+    label: RunLabel = "build",
+) -> None:
+    """Run a Cargo command with compact output and a bounded retained log."""
+    if any(argument in {"-h", "--help", "-V", "--version"} for argument in arguments):
+        CargoCommand(*cargo_arguments, *arguments).run()
+        return
+
     BUILD_LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    log_path = BUILD_LOG_DIRECTORY / f"build-{time.time_ns()}.log"
+    log_path = BUILD_LOG_DIRECTORY / f"{label}-{time.time_ns()}.log"
     written = 0
     total = 0
     tail = bytearray()
-    started = start("build")
+    started = start(label)
 
     with log_path.open("wb") as output:
 
@@ -37,7 +48,11 @@ def run(arguments: list[str]) -> None:
                 del tail[: len(tail) - BUILD_TAIL_BYTES_MAX]
 
         async def execute() -> None:
-            command = CargoCommand("build", *arguments).with_timeout(BUILD_SECONDS_MAX)
+            command = CargoCommand(*cargo_arguments, *arguments).with_timeout(
+                BUILD_SECONDS_MAX
+            )
+            if environment is not None:
+                command.with_env(**environment)
             await command.stream(retain)
 
         failed = False
@@ -47,10 +62,12 @@ def run(arguments: list[str]) -> None:
             failed = True
             if tail:
                 print(tail.decode("utf-8", errors="replace"), end="")
-            detail = f"build output saved to {log_path}"
+                if not tail.endswith(b"\n"):
+                    print()
+            detail = f"{label} output saved to {log_path}"
             if total > written:
                 detail += f"; retained first {written} of {total} bytes"
             print(detail)
             raise
         finally:
-            finish("build", started, failed=failed)
+            finish(label, started, failed=failed)

@@ -6,8 +6,14 @@ import time
 from datetime import datetime
 from typing import Literal
 
-RunLabel = Literal["build", "tests"]
-_ICONS = {"build": "🔨", "tests": "🧪"}
+RunLabel = Literal["build", "check", "clippy", "docs", "tests"]
+_ICONS = {
+    "build": "🔨",
+    "check": "🔎",
+    "clippy": "🧹",
+    "docs": "📚",
+    "tests": "🧪",
+}
 
 
 def start(label: RunLabel) -> float:

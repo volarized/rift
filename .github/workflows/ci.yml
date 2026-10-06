@@ -545,7 +545,8 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
-          cargo nextest archive --locked
+          uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev
+          rift-dev test nextest-archive --locked
           --workspace --all-targets --all-features
           --archive-file target/native-live.tar.zst
           -E 'not binary(/^corpus_/)'

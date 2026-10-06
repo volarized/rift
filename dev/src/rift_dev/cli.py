@@ -9,9 +9,10 @@ import sys
 import traceback
 from builtins import BaseExceptionGroup
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import typer
+from typer.core import TyperCommand
 
 from rift_dev import (
     build_cache,
@@ -42,6 +43,25 @@ ArchiveArgument = Annotated[
 PathOption = Annotated[Path | None, typer.Option()]
 StringOption = Annotated[str | None, typer.Option()]
 FAILURE_GROUP_DEPTH_MAX = 32
+PASSTHROUGH_ARGUMENTS = "rift_dev_passthrough_arguments"
+
+
+class ForwardingTyperCommand(TyperCommand):
+    """Retain child arguments that Click removes while parsing its separator."""
+
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
+        ctx.meta[PASSTHROUGH_ARGUMENTS] = list(args)
+        return super().parse_args(ctx, args)
+
+
+def forwarded_arguments(context: typer.Context) -> list[str]:
+    """Return child arguments with Click's `--` separator preserved."""
+    arguments = context.meta.pop(PASSTHROUGH_ARGUMENTS, context.args)
+    if arguments and "--" in arguments:
+        separator = arguments.index("--")
+        if arguments[separator + 1 :] in (["--help"], ["-h"], ["--version"], ["-V"]):
+            del arguments[separator]
+    return list(arguments)
 
 
 @app.command()
@@ -158,11 +178,47 @@ def start_build_cache() -> None:
 
 @app.command(
     "build",
+    cls=ForwardingTyperCommand,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
 def build(context: typer.Context) -> None:
     """Run `cargo build` with the given arguments and compact output."""
-    build_run.run(list(context.args))
+    build_run.run(forwarded_arguments(context))
+
+
+@app.command(
+    "check",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def check(context: typer.Context) -> None:
+    """Run `cargo check` with the given arguments and compact output."""
+    build_run.run(forwarded_arguments(context), cargo_arguments=("check",), label="check")
+
+
+@app.command(
+    "clippy",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def clippy(context: typer.Context) -> None:
+    """Run `cargo clippy` with the given arguments and compact output."""
+    build_run.run(forwarded_arguments(context), cargo_arguments=("clippy",), label="clippy")
+
+
+@app.command(
+    "docs",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def docs(context: typer.Context) -> None:
+    """Run `cargo doc` with the given arguments and compact output."""
+    build_run.run(
+        forwarded_arguments(context),
+        cargo_arguments=("doc",),
+        environment={"RUSTDOCFLAGS": "-D warnings"},
+        label="docs",
+    )
 
 
 @app.command("rust-architecture")
@@ -205,6 +261,36 @@ def unit_tests(archive: ArchiveArgument = None) -> None:
     suites.unit(archive)
 
 
+@test_app.command("doctest")
+def doctest_tests() -> None:
+    """Run Rust documentation examples through the dev appliance."""
+    suites.doctest()
+
+
+@test_app.command(
+    "archive",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def archive(context: typer.Context) -> None:
+    """Build a cargo-llvm-cov nextest archive with compact output."""
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("llvm-cov", "nextest-archive")
+    )
+
+
+@test_app.command(
+    "nextest-archive",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def nextest_archive(context: typer.Context) -> None:
+    """Build a cargo-nextest archive with compact output."""
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("nextest", "archive")
+    )
+
+
 @test_app.command("live")
 def live_tests(archive: ArchiveArgument = None) -> None:
     """Run the live language-engine and model suites."""
@@ -213,11 +299,12 @@ def live_tests(archive: ArchiveArgument = None) -> None:
 
 @test_app.command(
     "nextest",
+    cls=ForwardingTyperCommand,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
 def nextest_tests(context: typer.Context) -> None:
     """Run `cargo nextest` with the given arguments beside the OTLP collector."""
-    suites.nextest(list(context.args))
+    suites.nextest(forwarded_arguments(context))
 
 
 @test_app.command("corpus")

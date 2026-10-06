@@ -120,7 +120,7 @@ jobs:
         timeout-minutes: 30
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --locked --package rift
+        run: uv run --locked --project dev rift-dev build --release --locked --package rift
       - name: Report the build cache
         if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
         run: sccache --show-stats
