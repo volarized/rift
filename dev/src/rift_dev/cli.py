@@ -252,6 +252,7 @@ def main() -> None:
     A streamed program has already printed its output, so the failure adds one
     line naming the program instead of a traceback.
     """
+    _use_utf8_output()
     try:
         app()
     except CommandFailed as failure:
@@ -260,6 +261,14 @@ def main() -> None:
     except Exception as failure:  # noqa: BLE001 - CLI reports failures without stack frames.
         print(f"error: {failure_message(failure)}", file=sys.stderr)
         raise SystemExit(1) from None
+
+
+def _use_utf8_output() -> None:
+    """Use UTF-8 for Typer output, including on Windows redirected streams."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
 
 
 def failure_message(failure: BaseException) -> str:
