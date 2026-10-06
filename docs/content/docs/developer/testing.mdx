@@ -65,6 +65,12 @@ The test selection keeps those dependencies in the integration suite.
 Some suites start a server that binds the loopback port range, which is machine-global. Nextest
 runs each test in its own process, so those suites share one `election` test group that admits a
 single test at a time.
+
+`just test` runs nextest through `rift-dev`, which sets `RIFT_SCOPED_RECORDER_STREAM` in each
+test process. Each `ScopedRecorder` a test installs then streams its records to stderr as it
+records them, so the report of a failed test, or of one nextest ended at its timeout, carries
+them under `---- test output ----`.
+
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
 does not support doctests on stable Rust.
 

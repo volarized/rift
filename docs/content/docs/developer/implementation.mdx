@@ -631,7 +631,8 @@ Every open runs `PRAGMA wal_checkpoint(TRUNCATE)` after its migrations, where no
 runs: SQLite reads the log the last process left ("the WAL file might be retained on disk after
 all connections to the database have been closed"), and the checkpoint moves it into the
 database and empties the file. The index and vectors open records `database checkpointed its
-write-ahead log` with operation `database.open`. Between opens the log stays bounded by SQLite's
+write-ahead log` with operation `database.open`, `journal_size_limit` in bytes or `-1` for none,
+and `wal_autocheckpoint`, the log pages at which a commit checkpoints. Between opens the log stays bounded by SQLite's
 automatic checkpoint, "when the WAL file reaches a threshold size of 1000 pages", and is cut back
 to `journal_size_limit` (`[search]` for the index and vectors databases,
 `METRICS_JOURNAL_SIZE_LIMIT_BYTES`, 4 MiB, for the metrics database) at the commit that restarts
@@ -988,7 +989,12 @@ export interval while the global queue grows names a blocked runtime worker.
 
 The owners of a quantity read it the same way. Each open `.rift/index`, `.rift/vectors`, and
 `.rift/metrics` database reports `sqlite.file.size` for the database file and its write-ahead
-log, from file metadata, and `sqlite.queue.length`, the commands waiting for its worker. The
+log, from file metadata, `sqlite.queue.length`, the commands waiting for its worker, and
+`sqlite.page.count` by `sqlite.page.state`, `used` or `free`, from the page and freelist counts in
+the file header, which change at a checkpoint. The index and vectors databases also report
+`sqlite.transaction.active`, the transactions begun on the worker's connections and not ended,
+and count `sqlite.connection.refusals`, the connection requests refused at the connection bound,
+and `sqlite.connection.reaped`, the connections removed after their driver connection dropped. The
 blocking pool reports `worker_pool.permit.count` by `worker_pool.permit.state`, `available` or
 `used`. One instrument runs at most `OBSERVATIONS_MAX` live reads, three databases for each of
 the 64 workspaces a repository process admits; a read past that is refused, and the first refusal
