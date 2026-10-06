@@ -182,7 +182,9 @@ pub mod __private {
     pub use crate::measurement::monotonic_now;
     pub use crate::metrics::{Completion, completion};
     pub use crate::span::{function_name, span_from};
-    pub use crate::traced::{parent_span, traced_future};
+    pub use crate::traced::{
+        FnOutput, OtherValue, RegisteredError, WorkValue, parent_span, returned, traced_future,
+    };
     pub use tracing;
 
     /// Installs the unscoped stream on a nextest test process's first record, span, or

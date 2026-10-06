@@ -10,10 +10,86 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use rift_error::RiftError;
 use tracing::instrument::{Instrument as _, Instrumented};
 
 use crate::Span;
 use crate::metrics::{Completion, InstrumentScope, future_completion};
+
+/// The work's value, borrowed for [`RegisteredError`] and [`OtherValue`] to read.
+///
+/// The macro calls `(&&WorkValue(&value)).registered_identity()`. Method lookup tries the
+/// receiver `&&WorkValue<T>` before `&WorkValue<T>`, so [`RegisteredError`], implemented on
+/// `&WorkValue<T>`, answers for the types it holds an impl for, and [`OtherValue`],
+/// implemented on every `WorkValue<T>`, answers for the rest.
+#[doc(hidden)]
+pub struct WorkValue<'value, T>(pub &'value T);
+
+/// Reads the registered identity of a work value that is `Err(RiftError)`.
+///
+/// Two impls keep a work value of a type not yet inferred at the call an open obligation,
+/// not a choice: a block that diverges has such a type, which falls back to `!`, and the
+/// impl for `!` takes it.
+#[doc(hidden)]
+pub trait RegisteredError {
+    /// The registered identity of the error the work returned, as `RiftError::slug` spells it.
+    fn registered_identity(&self) -> Option<&'static str>;
+}
+
+impl<T> RegisteredError for &WorkValue<'_, Result<T, RiftError>> {
+    fn registered_identity(&self) -> Option<&'static str> {
+        self.0.as_ref().err().map(|error| error.slug().as_str())
+    }
+}
+
+impl RegisteredError for &WorkValue<'_, Never> {
+    fn registered_identity(&self) -> Option<&'static str> {
+        match *self.0 {}
+    }
+}
+
+/// Reads no identity from a work value that is not `Result<_, RiftError>`.
+#[doc(hidden)]
+pub trait OtherValue {
+    /// No identity: the value is not a returned `RiftError`.
+    fn registered_identity(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+impl<T> OtherValue for WorkValue<'_, T> {}
+
+/// The return type of a function pointer type: stable Rust spells `!` only as a return
+/// type, and `<fn() -> ! as FnOutput>::Output` names it for the impl of `RegisteredError`.
+#[doc(hidden)]
+pub trait FnOutput {
+    /// The function pointer's return type.
+    type Output;
+}
+
+impl<T> FnOutput for fn() -> T {
+    type Output = T;
+}
+
+/// The type `!`: the type a diverging block's value falls back to.
+type Never = <fn() -> ! as FnOutput>::Output;
+
+/// Records on `span` the registered identity `read` finds in the value of a `traced!`
+/// block, as `error.type`, and returns the value.
+///
+/// The macro passes `read` as a closure argument: the compiler types a closure argument
+/// after the other arguments, so the closure reads `value` with its type inferred.
+#[doc(hidden)]
+pub fn returned<T>(
+    span: &tracing::Span,
+    read: impl FnOnce(&T) -> Option<&'static str>,
+    value: T,
+) -> T {
+    if let Some(identity) = read(&value) {
+        span.record("error.type", identity);
+    }
+    value
+}
 
 pin_project_lite::pin_project! {
     /// Where an awaited operation is: not yet polled, running under its span, or done.
@@ -40,12 +116,13 @@ pin_project_lite::pin_project! {
     /// `tracing`'s `Instrumented` enters the span for each poll and for the
     /// drop of the work, and exits it in between. The poll that completes the
     /// work drops it with its span, so the span closes when the work completes.
-    struct TracedFuture<Work, Open> {
+    struct TracedFuture<Work, Open, Read> {
         #[pin]
         stage: Stage<Work, Open>,
+        read: Read,
     }
 
-    impl<Work, Open> PinnedDrop for TracedFuture<Work, Open> {
+    impl<Work, Open, Read> PinnedDrop for TracedFuture<Work, Open, Read> {
         /// Records `error.type = "cancelled"` on the span of work dropped after its first
         /// poll and before it returned, ahead of the span's close, so the close record
         /// states the operation did not complete. A drop while the thread unwinds a panic
@@ -60,15 +137,17 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<Work, Open> Future for TracedFuture<Work, Open>
+impl<Work, Open, Read> Future for TracedFuture<Work, Open, Read>
 where
     Work: Future,
     Open: FnOnce() -> tracing::Span,
+    Read: Fn(&Work::Output) -> Option<&'static str>,
 {
     type Output = Work::Output;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut stage = self.project().stage;
+        let this = self.project();
+        let mut stage = this.stage;
         if let StageProjection::Waiting { .. } = stage.as_mut().project()
             && let StageReplacement::Waiting {
                 scope,
@@ -89,6 +168,9 @@ where
             panic!("a traced future was polled after it completed or its span constructor panicked")
         };
         let output = std::task::ready!(work.as_mut().poll(context));
+        if let Some(identity) = (this.read)(&output) {
+            work.span().record("error.type", identity);
+        }
         completion.finished(work.span());
         stage.set(Stage::Spent);
         Poll::Ready(output)
@@ -96,17 +178,20 @@ where
 }
 
 /// Wraps `work` so the span `open` builds, and the completion of `operation` under the
-/// instrumentation scope `scope`, start on the first poll.
+/// instrumentation scope `scope`, start on the first poll; the registered identity `read`
+/// finds in the work's output is recorded on the span as `error.type` before it completes.
 #[doc(hidden)]
-pub fn traced_future<Work, Open>(
+pub fn traced_future<Work, Open, Read>(
     scope: InstrumentScope,
     operation: &'static str,
     work: Work,
     open: Open,
+    read: Read,
 ) -> impl Future<Output = Work::Output>
 where
     Work: Future,
     Open: FnOnce() -> tracing::Span,
+    Read: Fn(&Work::Output) -> Option<&'static str>,
 {
     TracedFuture {
         stage: Stage::Waiting {
@@ -115,6 +200,7 @@ where
             work,
             open,
         },
+        read,
     }
 }
 
@@ -248,8 +334,12 @@ pub fn parent_span(parent: &Span) -> Span {
 /// that records `error.type`, or an `outcome` other than `ok` or `acquired`, on the
 /// operation's span ends with `Error` too: `error.type` holds the recorded value when it is
 /// `panic`, `cancelled`, `timeout`, `refused`, or a registered error identity, as
-/// `RiftError::slug` spells it, and `_OTHER` otherwise. The macro never reads the work's
-/// value. The span's close record states the same outcome as `status.code` and
+/// `RiftError::slug` spells it, and `_OTHER` otherwise. Work whose value is
+/// `Result<_, RiftError>` holding `Err`, the value of a block or the output of a future,
+/// records that error's registered identity as `error.type` itself, after it returns; a
+/// value of any other type records nothing. A block left through `?` or `return` has no
+/// value: the error leaves the enclosing function, and the block ends with `Ok` unless the
+/// work recorded a failure. The span's close record states the same outcome as `status.code` and
 /// `error.type`, and the span records `code.function.name`, the function the macro
 /// expands in. The duration is the time from
 /// the span's opening to the end of the work, read once: the histogram records it and the
@@ -389,8 +479,33 @@ macro_rules! __rift_traced_block {
         )
         .of_span(__rift_entered.id());
         $($crate::__rift_traced_opened!($open);)?
-        $work
+        $crate::__private::returned(
+            &__rift_entered,
+            $crate::__rift_registered_error!(),
+            // The arm passes the caller's expected type on to the work, and keeps a block's
+            // braces out of the argument position.
+            match () {
+                () => $work,
+            },
+        )
     }};
+}
+
+/// The closure reading the registered identity of a `traced!` operation's value.
+///
+/// After a diverging block the closure is unreachable code, and the lint is allowed on
+/// the closure alone, so the work keeps its own reports.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rift_registered_error {
+    () => {
+        #[allow(unreachable_code)]
+        |__rift_value| {
+            #[allow(unused_imports)]
+            use $crate::__private::{OtherValue as _, RegisteredError as _};
+            (&&$crate::__private::WorkValue(__rift_value)).registered_identity()
+        }
+    };
 }
 
 /// The instrumentation scope of the crate the macro expands in: its `CARGO_PKG_NAME` and
@@ -425,13 +540,19 @@ macro_rules! __rift_traced_future {
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
         $(let __rift_parent = $crate::__private::parent_span($parent);)?
-        $crate::__private::traced_future($crate::__rift_instrument_scope!(), $operation, $work, move || {
-            let __rift_span = $crate::__rift_traced_span!(
-                [$(__rift_parent $parent)?] [$($component)?] $operation [$($field = $value),*]
-            );
-            $(__rift_span.in_scope(|| $crate::__rift_traced_opened!($open));)?
-            __rift_span
-        })
+        $crate::__private::traced_future(
+            $crate::__rift_instrument_scope!(),
+            $operation,
+            $work,
+            move || {
+                let __rift_span = $crate::__rift_traced_span!(
+                    [$(__rift_parent $parent)?] [$($component)?] $operation [$($field = $value),*]
+                );
+                $(__rift_span.in_scope(|| $crate::__rift_traced_opened!($open));)?
+                __rift_span
+            },
+            $crate::__rift_registered_error!(),
+        )
     }};
 }
 
