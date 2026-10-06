@@ -1,5 +1,7 @@
 //! One log record, the bounds every record keeps, and the query one read carries.
 
+use std::time::Duration;
+
 /// Most records one append may carry. A drain task holding more splits.
 pub const LOG_BATCH_RECORDS_MAX: usize = 4_096;
 /// Maximum UTF-8 bytes kept for one record's message. A longer message is
@@ -145,6 +147,10 @@ pub struct LogQuery {
     pub(crate) since_ms: Option<i64>,
     pub(crate) until_ms: Option<i64>,
     pub(crate) limit: usize,
+    /// The tracing clock's reading, in milliseconds since the Unix epoch, that every age
+    /// bound of this query counts back from: taken by the first age bound, so a second one
+    /// and every page of a follow read share it.
+    pub(crate) clock_ms: Option<i64>,
 }
 
 impl LogQuery {
@@ -158,6 +164,7 @@ impl LogQuery {
             since_ms: None,
             until_ms: None,
             limit: limit.min(LOG_PAGE_RECORDS_MAX),
+            clock_ms: None,
         }
     }
 
@@ -197,6 +204,32 @@ impl LogQuery {
     pub const fn until_ms(mut self, recorded_at_ms: i64) -> Self {
         self.until_ms = Some(recorded_at_ms);
         self
+    }
+
+    /// Restricts the read to records recorded at or after the cutoff `age` before the
+    /// tracing clock's reading.
+    ///
+    /// The cutoff is resolved here, once, so every page a follow read takes with
+    /// [`Self::after`] selects the same records. An age past the epoch cuts off nothing.
+    #[must_use]
+    pub fn since_age(mut self, age: Duration) -> Self {
+        self.since_ms = Some(self.cutoff_ms(age));
+        self
+    }
+
+    /// Restricts the read to records recorded before the cutoff `age` before the tracing
+    /// clock's reading; with [`Self::since_age`], both cutoffs count back from one reading.
+    #[must_use]
+    pub fn until_age(mut self, age: Duration) -> Self {
+        self.until_ms = Some(self.cutoff_ms(age));
+        self
+    }
+
+    /// The instant `age` before the tracing clock's reading, in milliseconds since the Unix
+    /// epoch; the clock is read on the query's first cutoff and kept for the rest.
+    fn cutoff_ms(&mut self, age: Duration) -> i64 {
+        let clock_ms = *self.clock_ms.get_or_insert_with(crate::capture::now_ms);
+        clock_ms.saturating_sub(i64::try_from(age.as_millis()).unwrap_or(i64::MAX))
     }
 
     /// The severity this read is restricted to, when it is.

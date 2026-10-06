@@ -1296,6 +1296,90 @@ fn a_refused_connect_records_its_failure() -> TestResult {
     Ok(())
 }
 
+/// A query whose tracing clock read 10,000 ms: both age cutoffs count back from that one
+/// reading.
+fn aged_query() -> LogQuery {
+    LogQuery {
+        clock_ms: Some(10_000),
+        ..LogQuery::newest(10)
+    }
+    .since_age(Duration::from_secs(5))
+    .until_age(Duration::from_secs(1))
+}
+
+/// Age cutoffs select the records recorded from 5 s to 1 s before the clock's reading, in
+/// a recent read and in every page of a follow read.
+#[tokio::test]
+async fn age_cutoffs_select_the_records_inside_them_on_every_follow_page() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store
+        .append(
+            &[
+                recorded(4_999, "older"),
+                recorded(5_000, "cutoff"),
+                recorded(7_000, "inside"),
+                recorded(8_999, "last"),
+                recorded(9_000, "newer"),
+            ],
+            KEEP_EVERY,
+        )
+        .await?;
+    let reads = reads(&store)?;
+    let query = aged_query();
+
+    assert_eq!((query.since_ms, query.until_ms), (Some(5_000), Some(9_000)));
+    assert_eq!(
+        messages(&reads.recent(&query)?),
+        ["last", "inside", "cutoff"]
+    );
+    let paged = LogQuery {
+        limit: 1,
+        ..query.clone()
+    };
+    let mut followed = Vec::new();
+    let mut after = 0;
+    for _ in 0..4 {
+        let page = reads.following(&paged.clone().after(after))?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        after = last.identity();
+        followed.extend(
+            page.iter()
+                .map(|stored| stored.record().message().to_owned()),
+        );
+    }
+    assert_eq!(followed, ["cutoff", "inside", "last"]);
+    Ok(())
+}
+
+/// An age cutoff with no clock reading yet reads the tracing clock once, and an age past
+/// the epoch cuts off nothing.
+#[tokio::test]
+async fn an_age_cutoff_reads_the_tracing_clock_once() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = store(&directory).await?;
+    store.append(&[recorded(1, "early")], KEEP_EVERY).await?;
+    let before = crate::capture::now_ms();
+
+    let query = LogQuery::newest(10)
+        .since_age(Duration::MAX)
+        .until_age(Duration::ZERO);
+    let after = crate::capture::now_ms();
+
+    let clock_ms = query.clock_ms.ok_or("the first cutoff reads the clock")?;
+    assert!((before..=after).contains(&clock_ms));
+    assert_eq!(
+        query.until_ms,
+        Some(clock_ms),
+        "both cutoffs share the reading"
+    );
+    assert_eq!(query.since_ms, Some(clock_ms.saturating_sub(i64::MAX)));
+    assert_eq!(messages(&reads(&store)?.following(&query)?), ["early"]);
+    Ok(())
+}
+
 /// An open records no insert and no statement count: its schema transaction is no append.
 #[tokio::test]
 async fn an_open_records_no_insert_or_trim() -> TestResult {
