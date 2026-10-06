@@ -4268,6 +4268,13 @@ fn preparation_publication(
     }))
 }
 
+/// Publishes one preparation batch's candidate under the publication lane, unless the
+/// observation the lane holds supersedes it.
+///
+/// Pending work that asks for the whole workspace, a `rift.toml` that moved, or an
+/// observation the candidate cannot answer leaves the publication to the supervisor's
+/// next rebuild, and records `index preparation superseded` once with the pending
+/// work's trigger.
 fn publish_preparation_after(
     root: &Path,
     published: &RwLock<IndexState>,
@@ -4280,12 +4287,14 @@ fn publish_preparation_after(
     if pending.covers_whole_workspace()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
     {
+        trace_preparation_superseded(candidate.epoch, observed_epoch, &pending);
         drop(pending);
         return RebuildOutcome::Superseded;
     }
     let answer = answered_candidate(root, candidate, &pending, observed_epoch)
         .published_at_startup(candidate);
     let Some(answer) = answer else {
+        trace_preparation_superseded(candidate.epoch, observed_epoch, &pending);
         drop(pending);
         return RebuildOutcome::Superseded;
     };
@@ -4985,6 +4994,23 @@ fn trace_superseded(epoch: u64, observed_epoch: u64) {
         epoch,
         observed_epoch,
         "index rebuild superseded"
+    );
+}
+
+/// Emits the one record of a preparation batch whose publication the observation under
+/// the publication lane superseded: the epoch its candidate answers, the epoch the
+/// observation stood at, and the `index.rebuild.trigger` of the rebuild `pending` starts.
+///
+/// The record is at `info`, beside the preparation's own progress records, because the
+/// startup publication it names falls to the supervisor's next rebuild.
+fn trace_preparation_superseded(epoch: u64, observed_epoch: u64, pending: &PendingWork) {
+    rift_tracing::info!(
+        component = "index",
+        operation = "index.build",
+        epoch,
+        observed_epoch,
+        trigger = pending.rebuild_trigger(),
+        "index preparation superseded"
     );
 }
 
