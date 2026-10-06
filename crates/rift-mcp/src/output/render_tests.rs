@@ -4181,3 +4181,170 @@ fn the_compact_text_of_every_authored_example_is_shorter_in_bytes_than_its_json_
     assert_text_shorter_than_json::<GetSymbolResult>();
     assert_text_shorter_than_json::<NodesResult>();
 }
+
+// StatsAlloc is used only by this ignored measurement; run it alone in a release build.
+#[global_allocator]
+static ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
+
+/// Counts process-wide allocation and reallocation requests while `work` runs.
+fn counted<R>(work: impl FnOnce() -> R) -> (stats_alloc::Stats, R) {
+    let region = stats_alloc::Region::new(ALLOCATOR);
+    let value = work();
+    (region.change(), value)
+}
+
+#[derive(Clone, Copy)]
+struct AllocationSample {
+    answer: &'static str,
+    example: u64,
+    representation: &'static str,
+    counts: stats_alloc::Stats,
+    content_bytes: u64,
+    structured_content_bytes: u64,
+    combined_response_bytes: u64,
+}
+
+fn record_allocation_sample(sample: AllocationSample) {
+    let AllocationSample {
+        answer,
+        example,
+        representation,
+        counts,
+        content_bytes,
+        structured_content_bytes,
+        combined_response_bytes,
+    } = sample;
+    rift_tracing::info!(
+        target: "rift_mcp::output::render_tests",
+        measurement = "output allocation",
+        answer,
+        example,
+        representation,
+        allocations = u64::try_from(counts.allocations).expect("allocation count fits u64"),
+        deallocations = u64::try_from(counts.deallocations).expect("deallocation count fits u64"),
+        reallocations = u64::try_from(counts.reallocations).expect("reallocation count fits u64"),
+        bytes_allocated = u64::try_from(counts.bytes_allocated).expect("allocation bytes fit u64"),
+        bytes_deallocated =
+            u64::try_from(counts.bytes_deallocated).expect("deallocation bytes fit u64"),
+        bytes_reallocated =
+            i64::try_from(counts.bytes_reallocated).expect("reallocation bytes fit i64"),
+        content_bytes,
+        structured_content_bytes,
+        combined_response_bytes,
+        "output allocation measurement"
+    );
+}
+
+fn measure_allocations<T>(answer_name: &'static str)
+where
+    T: Render + Serialize + DeserializeOwned + JsonSchema + Clone,
+{
+    use rmcp::handler::server::tool::IntoCallToolResult as _;
+    use rmcp::model::CallToolResponse;
+
+    let answers = examples_of::<T>();
+    let mut samples = Vec::with_capacity(answers.len() * 4);
+    for (index, answer) in answers.into_iter().enumerate() {
+        let example = u64::try_from(index).expect("example index fits u64");
+        let (counts, text) = counted(|| rendered(&answer));
+        samples.push(AllocationSample {
+            answer: answer_name,
+            example,
+            representation: "text",
+            counts,
+            content_bytes: u64::try_from(text.len()).expect("content bytes fit u64"),
+            structured_content_bytes: 0,
+            combined_response_bytes: 0,
+        });
+        drop(text);
+
+        let (counts, json) = counted(|| serde_json::to_string(&answer).expect("answer serializes"));
+        samples.push(AllocationSample {
+            answer: answer_name,
+            example,
+            representation: "json_string",
+            counts,
+            content_bytes: 0,
+            structured_content_bytes: u64::try_from(json.len())
+                .expect("structured content bytes fit u64"),
+            combined_response_bytes: 0,
+        });
+        drop(json);
+
+        let (counts, value) = counted(|| serde_json::to_value(&answer).expect("answer serializes"));
+        let structured_content_bytes = serde_json::to_vec(&value)
+            .expect("structured content serializes")
+            .len();
+        samples.push(AllocationSample {
+            answer: answer_name,
+            example,
+            representation: "json_value",
+            counts,
+            content_bytes: 0,
+            structured_content_bytes: u64::try_from(structured_content_bytes)
+                .expect("structured content bytes fit u64"),
+            combined_response_bytes: 0,
+        });
+        drop(value);
+
+        let owned = answer.clone();
+        let (counts, result) =
+            counted(
+                || match crate::output::Json(owned).into_call_tool_result() {
+                    Ok(CallToolResponse::Complete(result)) => result,
+                    _ => panic!("authored answer completes"),
+                },
+            );
+        let content_bytes: usize = result
+            .content
+            .iter()
+            .map(|content| {
+                content
+                    .as_text()
+                    .expect("compact content is text")
+                    .text
+                    .len()
+            })
+            .sum();
+        let structured_content = result
+            .structured_content
+            .as_ref()
+            .expect("full output keeps structured content");
+        let structured_content_bytes = serde_json::to_vec(structured_content)
+            .expect("structured content serializes")
+            .len();
+        let combined_response_bytes = serde_json::to_vec(&result)
+            .expect("tool result serializes")
+            .len();
+        samples.push(AllocationSample {
+            answer: answer_name,
+            example,
+            representation: "call_tool_result",
+            counts,
+            content_bytes: u64::try_from(content_bytes).expect("content bytes fit u64"),
+            structured_content_bytes: u64::try_from(structured_content_bytes)
+                .expect("structured content bytes fit u64"),
+            combined_response_bytes: u64::try_from(combined_response_bytes)
+                .expect("response bytes fit u64"),
+        });
+        drop(result);
+    }
+    for sample in samples {
+        record_allocation_sample(sample);
+    }
+}
+
+#[test]
+#[ignore = "an allocation measurement; run alone in a release build"]
+fn output_allocation_cost() {
+    // Trigger test-process OTLP setup before any allocation region begins.
+    rift_tracing::info!(
+        target: "rift_mcp::output::render_tests",
+        measurement = "output allocation",
+        "output allocation measurement started"
+    );
+
+    measure_allocations::<SearchResult>("search");
+    measure_allocations::<GetSymbolResult>("get_symbol");
+    measure_allocations::<NodesResult>("nodes");
+}
