@@ -79,7 +79,10 @@ recorder's thread, so a test advances time instead of sleeping.
 does not support doctests on stable Rust.
 
 The remaining local checks cover formatting, generated files, crate boundaries, Clippy, Rust
-documentation, dependency policy, and developer tooling:
+documentation, dependency policy, and developer tooling. The crate boundary check,
+`rift-dev rust-architecture`, also counts the crates whose shipped source declares an
+instrumentation `SCOPE` or opens a `traced!` operation, and fails when they outnumber
+`SCOPES_MAX` in `crates/rift-tracing/src/metrics.rs`:
 
 ```sh
 just rust-gate
