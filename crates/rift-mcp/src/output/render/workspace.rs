@@ -4,11 +4,13 @@
 //! follow directly under it, and the warnings section comes last. A language writes only what
 //! departs from the normal state of an enabled language.
 
+use std::borrow::Cow;
+
 use rift_protocol::workspace::{
     WorkspaceLanguageSummary, WorkspaceLspSummary, WorkspaceResourcePage, WorkspaceSourceUnit,
 };
 
-use super::facts::{Facts, cut_hash, wire_name};
+use super::facts::{Facts, cut_hash, quoted_value, wire_name};
 use super::layout::{self, Sections};
 use crate::output::text::{TextError, TextWriter};
 
@@ -81,12 +83,12 @@ fn language_lines(
     patterns_line(
         sections,
         "include",
-        include.iter().map(|pattern| pattern.0.as_str()),
+        include.iter().map(|pattern| quoted_value(&pattern.0)),
     )?;
     patterns_line(
         sections,
         "exclude",
-        exclude.iter().map(|pattern| pattern.0.as_str()),
+        exclude.iter().map(|pattern| quoted_value(&pattern.0)),
     )
 }
 
@@ -94,9 +96,9 @@ fn language_lines(
 fn patterns_line<'a>(
     sections: &mut Sections<'_>,
     label: &str,
-    patterns: impl Iterator<Item = &'a str>,
+    patterns: impl Iterator<Item = Cow<'a, str>>,
 ) -> Result<(), TextError> {
-    let patterns: Vec<&str> = patterns.collect();
+    let patterns: Vec<Cow<'a, str>> = patterns.collect();
     if patterns.is_empty() {
         return Ok(());
     }
@@ -111,7 +113,7 @@ fn unit_line(unit: &WorkspaceSourceUnit) -> String {
         language,
     } = unit;
     let mut facts = Facts::default();
-    facts.push(&path.0);
+    facts.push_value(&path.0);
     if let Some(language) = language {
         facts.push(&language.identity_segment());
     }

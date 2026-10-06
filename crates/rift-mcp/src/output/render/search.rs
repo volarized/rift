@@ -9,7 +9,8 @@ use rift_protocol::search::{
 };
 
 use super::facts::{
-    Facts, author_of, block_of, cut_hash, describe, location, moment_of, spaced_name, wire_names,
+    Facts, author_of, block_of, cut_hash, describe, location, moment_of, quoted_value, spaced_name,
+    wire_names,
 };
 use super::layout::{self, Lines, Page};
 use super::walk;
@@ -134,7 +135,7 @@ fn matched_facts(
     tail: &Facts,
 ) -> Result<Facts, TextError> {
     let mut facts = Facts::default();
-    facts.push(place);
+    facts.push_value(place);
     facts.push(&wire_names(matched)?);
     rank_facts(view, &mut facts);
     facts.extend(tail);
@@ -223,10 +224,14 @@ fn change_line(lines: &mut Lines<'_>, view: &HitView<'_>) -> Result<(), TextErro
         head_path,
     } = change;
     let moved = match (base_path, head_path) {
-        (Some(base), Some(head)) if base != head => Some(format!("{} → {}", base.0, head.0)),
+        (Some(base), Some(head)) if base != head => Some(format!(
+            "{} → {}",
+            quoted_value(&base.0),
+            quoted_value(&head.0)
+        )),
         (Some(_), Some(_)) | (None, None) => None,
         (Some(only), None) | (None, Some(only)) => {
-            (Some(only) != view.path).then(|| only.0.clone())
+            (Some(only) != view.path).then(|| quoted_value(&only.0).into_owned())
         }
     };
     let mut facts = Facts::default();
@@ -302,9 +307,9 @@ fn commit_hit(
         paths_truncated,
     } = commit;
     let mut facts = Facts::default();
-    facts.push(cut_hash(&revision.0));
-    facts.push(&author_of(author));
-    facts.push(&moment_of(timestamp));
+    facts.push_value(cut_hash(&revision.0));
+    facts.push_value(&author_of(author));
+    facts.push_value(&moment_of(timestamp));
     rank_facts(view, &mut facts);
     lines.head(facts.as_str())?;
     let (subject, body) = split_message(message);

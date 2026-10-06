@@ -840,7 +840,7 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    /// Diagnostics for PR #533: a failed test prints the idle eviction records.
+    /// Captures `rift_mcp::repository_http` at `info`: a failed test prints idle eviction records.
     fn diagnostic_log() -> Result<rift_tracing::ScopedRecorder, rift_tracing::LogFilterError> {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
             .capture("rift_mcp::repository_http=info")
@@ -848,7 +848,7 @@ mod tests {
         Ok(recorder)
     }
 
-    /// The retained workspace roots, and for PR #533 diagnostics each one's idle state,
+    /// The retained workspace roots, and each one's idle state for the release bound failure,
     /// read under one registry lock.
     async fn retained_workspaces(
         registry: &super::RepositoryWorkspaceRegistry,

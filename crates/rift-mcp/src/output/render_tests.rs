@@ -3,6 +3,7 @@ use rift_protocol::documentation::{DocumentationContext, DocumentationHit};
 use rift_protocol::error::{
     ErrorCause, ErrorCode, ErrorData, ErrorPhase, LimitEvidence, RetryDirective,
 };
+use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
     Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeId,
@@ -14,6 +15,7 @@ use rift_protocol::read::{
 use rift_protocol::search::{
     CommitHit, GraphHop, MatchedField, SearchHit, SearchHitTarget, SearchResult, SymbolChange,
 };
+use rift_protocol::workspace::WorkspaceResourcePage;
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -3270,6 +3272,130 @@ fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "\thistory:",
             "\t\t2026-08-21 · aaaaaaaa · moved · \"Ops: \\\"bot\\\" \\\\ team <ops@example.com>\" · \"src/a · b.rs\"",
             "\t\t\"day 1: noon\" · bbbbbbbb · introduced · Alice <alice@example.com>",
+        ],
+    );
+}
+
+#[test]
+fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
+    let mut moved = changed(
+        SymbolVersionKind::Moved,
+        Some("old: a.rs"),
+        Some("new · a.rs"),
+    );
+    moved.path = Some(project_path("src/a · b.rs"));
+    let mut bare = placed_symbol_hit(symbol(Some(A_ID), "A"));
+    bare.path = Some(project_path("src/a:b·c.rs"));
+    let commit = CommitHit {
+        message: "Fix".to_owned(),
+        author: CommitAuthor {
+            name: "Ops: bot".to_owned(),
+            email: "ops@example.com".to_owned(),
+        },
+        timestamp: "day 1 · noon".to_owned(),
+        paths: Vec::new(),
+        ..commit_hit()
+    };
+    golden(
+        &only_page(vec![moved, bare, commit_target(commit)]),
+        &[
+            "3 results",
+            "\t[1] struct A",
+            "\t\t\"src/a · b.rs:1\" · name",
+            "\t\trift://symbol/rust/a.rs/A",
+            "\t\tmoved · \"old: a.rs\" → \"new · a.rs\"",
+            "\t[2] struct A",
+            "\t\tsrc/a:b·c.rs:1 · name",
+            "\t\trift://symbol/rust/a.rs/A",
+            "\t[3] 1f2080e4 · \"Ops: bot <ops@example.com>\" · \"day 1 · noon\"",
+            "\t\tFix",
+        ],
+    );
+}
+
+#[test]
+fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
+    let answer = nodes_result(
+        vec![
+            node("rift://node/rust/lib.rs@0-9#aaaaaaaa", "a · b", 0, 9),
+            node("rift://node/rust/lib.rs@1-8#bbbbbbbb", "c: d", 1, 8),
+            node("rift://node/rust/lib.rs@2-7#cccccccc", "e:f·g", 2, 7),
+        ],
+        vec!["a", "b", "c"],
+    );
+    golden(
+        &answer,
+        &[
+            "3 nodes",
+            "\t[1] \"a · b\"",
+            "\t\trift://node/rust/lib.rs@0-9#aaaaaaaa",
+            "\t[2] \"c: d\"",
+            "\t\trift://node/rust/lib.rs@1-8#bbbbbbbb",
+            "\t[3] e:f·g",
+            "\t\trift://node/rust/lib.rs@2-7#cccccccc",
+            "",
+            "\t\tc",
+        ],
+    );
+}
+
+#[test]
+fn a_map_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
+    let map: WorkspaceMap = serde_json::from_value(json!({
+        "revision": "3f9a1c2e",
+        "modules": [
+            {"path": "src · a", "files": 1, "symbols": 1, "children": [
+                {"path": "src · a/b: c", "files": 1, "symbols": 1}
+            ]},
+            {"path": "a:b·c", "files": 1, "symbols": 1}
+        ],
+        "hubs": [{"symbol": A_ID, "kind": "x · y", "references": 1}],
+        "module_relationships": [{"from": "a: b", "to": "a:b·c", "references": 2}],
+        "pagination": {"page_index": 0, "total_pages": 1}
+    }))
+    .expect("the map fixture deserializes");
+    golden(
+        &map,
+        &[
+            "map 3f9a1c2e",
+            "modules:",
+            "\t\"src · a\" · 1 file · 1 symbol",
+            "\t\t\"b: c\" · 1 file · 1 symbol",
+            "\ta:b·c · 1 file · 1 symbol",
+            "hubs:",
+            "\trift://symbol/rust/a.rs/A · \"x · y\" · 1 reference",
+            "module relationships:",
+            "\t\"a: b\" → a:b·c · 2 references",
+        ],
+    );
+}
+
+#[test]
+fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
+    let page: WorkspaceResourcePage = serde_json::from_value(json!({
+        "configuration_revision": "3f9a1c2e",
+        "languages": [{"language": "python", "enabled": true, "execution": false,
+            "syntax": false, "include": ["src/a · b/**"], "exclude": ["docs: old/**", "a:b·c/**"]}],
+        "source": [
+            {"path": "src/a · b.py", "digest": "8a4d20bc", "language": "python"},
+            {"path": "x: y.py", "digest": "8a4d20bc"},
+            {"path": "a:b·c.py", "digest": "8a4d20bc"}
+        ],
+        "pagination": {"page_index": 0, "total_pages": 1}
+    }))
+    .expect("the workspace fixture deserializes");
+    golden(
+        &page,
+        &[
+            "workspace 3f9a1c2e",
+            "languages:",
+            "\tpython",
+            "\t\tinclude \"src/a · b/**\"",
+            "\t\texclude \"docs: old/**\", a:b·c/**",
+            "source:",
+            "\t\"src/a · b.py\" · python · 8a4d20bc",
+            "\t\"x: y.py\" · 8a4d20bc",
+            "\ta:b·c.py · 8a4d20bc",
         ],
     );
 }
