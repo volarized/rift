@@ -869,7 +869,30 @@ def test_evidence_keeps_server_stderr_proxy_stderr_and_records(
     assert notes[0] == f"server stderr ({server.log_path}):\nserver: bound 127.0.0.1\n"
     assert notes[1] == f"rift mcp stderr ({proxy}):\nproxy: waiting for lock\n"
     assert "ERROR index build failed" in notes[2]
+    assert notes[-1].startswith("machine: logical_cpus=")
     assert server.proxy_logs == (proxy,)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fixture executable uses a Unix shebang")
+def test_evidence_falls_back_to_server_stderr_after_a_store_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rift_dev.rift_test_client import STORE_FALLBACK, STORE_REFUSAL
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    monkeypatch.setenv("RECORD_ARGUMENTS", str(tmp_path / "arguments"))
+    server = Server(
+        fake_binary(tmp_path, RECORDS_BINARY), root, tmp_path / "server.log"
+    )
+    refusal = f"{STORE_REFUSAL} of 3; the log drain keeps it: database is locked\n"
+    server.log_path.write_text(f"server: bound\n{refusal}", encoding="utf-8")
+    notes = server.evidence()
+    assert notes[0] == (
+        f"server stderr ({server.log_path}):\n{STORE_FALLBACK}server: bound\n{refusal}"
+    )
+    server.log_path.write_text(f"server: quoted {refusal}", encoding="utf-8")
+    assert STORE_FALLBACK not in server.evidence()[0]
 
 
 def test_evidence_tail_names_the_file_holding_the_rest(tmp_path: Path) -> None:

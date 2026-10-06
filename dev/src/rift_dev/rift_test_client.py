@@ -50,6 +50,7 @@ from rift_dev.commands import (
     termination_handler,
 )
 from rift_dev.log_records import Line, lines, newest_in_flight
+from rift_dev.machine import machine, machine_line
 from rift_dev.trace import Collector, nanoseconds
 
 # `list` and `dict` are invariant, so a `list[JsonObject]` an assertion builds is
@@ -249,6 +250,16 @@ def write_junit(path: Path, name: str, seconds: float, failure: str | None) -> N
         finding.text = xml_text(failure)
     path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
+
+
+# What opens the line a server's log drain writes to stderr when the log store refuses
+# a batch (`write_retained`, `crates/rift-tracing/src/drain.rs`), and the line a server
+# stderr holding it opens with: the store lacks the records the drain kept retrying.
+STORE_REFUSAL = "rift: the log store refused a batch"
+STORE_FALLBACK = (
+    f"[the log store refused writes (`{STORE_REFUSAL}`): the window falls back to this "
+    "stderr file for the records the store lacks]\n"
+)
 
 
 def cut_notice(stream: str, limit: int) -> str:
@@ -1009,12 +1020,18 @@ class Server:
         records, and the failure window.
 
         Each part is one note; a stream longer than `EVIDENCE_TAIL_BYTES` keeps its
-        newest bytes and names the file holding the rest. `since` and `lower_bound`
-        are those of `window`.
+        newest bytes and names the file holding the rest. A server stderr holding
+        `STORE_REFUSAL` opens with `STORE_FALLBACK`. The host facts of `machine_line`
+        close the notes, once. `since` and `lower_bound` are those of `window`.
         """
+        server_log = self.read_log()
+        refused = any(
+            line.startswith(STORE_REFUSAL) for line in server_log.splitlines()
+        )
         notes = [
             f"server stderr ({self.log_path}):\n"
-            + tail_text(self.read_log(), self.log_path)
+            + (STORE_FALLBACK if refused else "")
+            + tail_text(server_log, self.log_path)
         ]
         for proxy in self._proxy_logs:
             text = (
@@ -1025,6 +1042,7 @@ class Server:
             notes.append(f"rift mcp stderr ({proxy}):\n" + tail_text(text, proxy))
         notes.append(self.records())
         notes.extend(self.window(since, lower_bound))
+        notes.append(machine_line(machine()))
         return notes
 
     def await_publication(self) -> int:
