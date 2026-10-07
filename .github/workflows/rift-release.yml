@@ -96,7 +96,7 @@ jobs:
           shared-key: ${{ matrix.registry }}
           cache-targets: false
           save-if: false
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: sccache@0.18.0
       # The build passes no `--target`, so RUSTFLAGS reaches proc-macros too;
