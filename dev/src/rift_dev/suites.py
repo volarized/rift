@@ -106,7 +106,14 @@ def unit(archive: Path | None) -> None:
         (
             archive_selection(
                 archive,
-                ["-p", "rift-tracing", "--test", "shutdown", "--all-features", "--locked"],
+                [
+                    "-p",
+                    "rift-tracing",
+                    "--test",
+                    "shutdown",
+                    "--all-features",
+                    "--locked",
+                ],
             ),
             ["-E", "test(=shutdown_sends_records_before_closing_export)"],
             {"OTEL_SDK_DISABLED": "false", "RIFT_OTLP_FILTER": "debug"},
@@ -139,7 +146,7 @@ def unit(archive: Path | None) -> None:
         command.with_env(**environment)
         nextest_run.run(command)
 
-    CargoCommand(
+    report = CargoCommand(
         "llvm-cov",
         "report",
         "--ignore-filename-regex",
@@ -149,7 +156,10 @@ def unit(archive: Path | None) -> None:
         "lcov.info",
         "--fail-under-lines",
         COVERAGE_FLOOR,
-    ).run()
+    )
+    if archive is not None:
+        report.with_args("--nextest-archive-file", archive)
+    report.run()
 
 
 def live(archive: Path | None) -> None:
@@ -221,12 +231,17 @@ def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> Non
     nextest_run.run(command)
 
 
-def nextest(arguments: list[str]) -> None:
-    """Runs a nextest suite or forwards a non-run nextest operation."""
-    if arguments and arguments[0] == "archive":
-        run_cargo_build(
-            arguments[1:], cargo_arguments=("nextest", "archive")
+def nextest(arguments: list[str], *, coverage: bool = False) -> None:
+    """Runs a nextest suite, with optional llvm-cov coverage."""
+    if coverage:
+        if not arguments or arguments[0] != "run":
+            raise ValueError("The --coverage option requires the run operation.")
+        nextest_run.run(
+            CargoCommand("llvm-cov", "nextest", "--no-report", *arguments[1:])
         )
+        return
+    if arguments and arguments[0] == "archive":
+        run_cargo_build(arguments[1:], cargo_arguments=("nextest", "archive"))
     elif arguments and arguments[0] == "run":
         nextest_run.run(CargoCommand("nextest", *arguments))
     else:

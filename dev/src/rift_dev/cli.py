@@ -333,9 +333,21 @@ def live_tests(archive: ArchiveArgument = None) -> None:
     cls=ForwardingTyperCommand,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
-def nextest_tests(context: typer.Context) -> None:
+def nextest_tests(
+    context: typer.Context,
+    coverage: Annotated[
+        bool, typer.Option(help="Run this selection with `cargo llvm-cov nextest`.")
+    ] = False,
+) -> None:
     """Run `cargo nextest` with the given arguments beside the OTLP collector."""
-    suites.nextest(forwarded_arguments(context))
+    arguments = forwarded_arguments(context)
+    separator = arguments.index("--") if "--" in arguments else len(arguments)
+    arguments = [
+        argument
+        for argument in arguments[:separator]
+        if argument not in {"--coverage", "--no-coverage"}
+    ] + arguments[separator:]
+    suites.nextest(arguments, coverage=coverage)
 
 
 @test_app.command("corpus")
