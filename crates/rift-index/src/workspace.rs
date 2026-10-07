@@ -5803,13 +5803,15 @@ mod tests {
         fs::write(root.join("b.rs"), changed_content).expect("changed source");
         let changes = resolved(&first, root, &["b.rs"]);
         let rebuilt = first.rebuilt(&changes).expect("incremental rebuild");
-        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(1.0)));
+        // The first publication retains two entries; the rebuilt publication carries one.
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(3.0)));
         drop(rebuilt);
         assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
 
         let rebuilt = first.rebuilt(&changes).expect("incremental rebuild");
         let rebuilt_groups = rebuilt.symbol_index_documents_by_file();
-        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
+        // Each publication owns its cache slots even when document groups share an Arc.
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(4.0)));
 
         assert!(Arc::ptr_eq(&first_groups[0], &rebuilt_groups[0]));
         assert!(!Arc::ptr_eq(&first_groups[1], &rebuilt_groups[1]));
@@ -5833,10 +5835,11 @@ mod tests {
         let (invalidated, _invalidated_count, invalidated_reading) =
             observed_symbol_documents(Some(&rebuilt), &rebuilt.files, limits_changed);
         assert!(invalidated.read().expect("document cache lock").is_empty());
-        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(0.0)));
+        // The empty cache adds zero while both populated publications remain alive.
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(4.0)));
         drop(invalidated_reading);
         drop(invalidated);
-        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(4.0)));
 
         drop(rebuilt);
         assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));

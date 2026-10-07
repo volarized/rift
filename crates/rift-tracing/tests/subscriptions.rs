@@ -8,23 +8,36 @@ use rift_tracing::TracingRuntime;
 async fn installed_runtime_delivers_independent_publications_and_closes_after_shutdown()
 -> Result<(), Box<dyn std::error::Error>> {
     let (runtime, persistence) = TracingRuntime::builder()
-        .capture("info")
+        .capture(&format!("{}=info", module_path!()))
         .queue_records(2)
         .install()?;
     let mut persistence = persistence.ok_or("capture creates the persistence subscription")?;
     let mut first = runtime.logs().subscribe()?;
     let mut second = runtime.logs().subscribe()?;
-    rift_tracing::info!(component = "logs", "subscription publication");
-    let first = tokio::time::timeout(Duration::from_secs(2), first.recv())
-        .await?
-        .ok_or("first subscription receives the publication")?;
-    let second_record = tokio::time::timeout(Duration::from_secs(2), second.recv())
-        .await?
-        .ok_or("second subscription receives the publication")?;
-    assert_eq!(first.sequence(), second_record.sequence());
-    assert!(std::ptr::eq(first.record(), second_record.record()));
-    assert_eq!(first.record().message(), "subscription publication");
-    assert_eq!(persistence.try_recv_record()?, *first.record());
+    let messages = [
+        "subscription publication",
+        "second subscription publication",
+    ];
+    for message in messages {
+        rift_tracing::info!(component = "logs", "{message}");
+    }
+    let mut previous = 0;
+    for message in messages {
+        let first_record = tokio::time::timeout(Duration::from_secs(2), first.recv())
+            .await?
+            .ok_or("first subscription receives the publication")?;
+        let second_record = tokio::time::timeout(Duration::from_secs(2), second.recv())
+            .await?
+            .ok_or("second subscription receives the publication")?;
+        assert!(first_record.sequence() > previous);
+        assert_eq!(first_record.sequence(), second_record.sequence());
+        assert!(std::ptr::eq(first_record.record(), second_record.record()));
+        assert_eq!(first_record.record().message(), message);
+        assert_eq!(persistence.try_recv_record()?, *first_record.record());
+        previous = first_record.sequence();
+    }
+    assert_eq!(first.dropped(), 0);
+    assert_eq!(second.dropped(), 0);
     runtime.shutdown().await?;
     let final_records = second.recv_batch().await;
     assert!(

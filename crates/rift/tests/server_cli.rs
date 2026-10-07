@@ -1399,7 +1399,11 @@ fn a_stop_during_a_dependency_probe_kills_the_probe_and_ends_cleanly() -> TestRe
     );
     let probe = records
         .lines()
-        .find(|line| line.contains("dependency.probe") && line.contains("program=rustup"))
+        .find(|line| {
+            line.contains("dependency.probe")
+                && line.contains("program=rustup")
+                && line.contains("close ")
+        })
         .ok_or_else(|| format!("the store holds the probe's close: {records}"))?;
     assert!(probe.contains("close ✗ cancelled"), "{probe}");
     assert!(
@@ -1478,7 +1482,11 @@ fn a_stop_during_a_probe_whose_child_holds_the_pipes_ends_cleanly() -> TestResul
     );
     let probe = records
         .lines()
-        .find(|line| line.contains("dependency.probe") && line.contains("program=rustup"))
+        .find(|line| {
+            line.contains("dependency.probe")
+                && line.contains("program=rustup")
+                && line.contains("close ")
+        })
         .ok_or_else(|| format!("the store holds the probe's close: {records}"))?;
     assert!(probe.contains("close ✗ cancelled"), "{probe}");
     assert!(

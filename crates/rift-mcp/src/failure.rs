@@ -214,6 +214,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.history.unversioned",
                 "rift.server.read_unclaimed_extension",
                 "rift.server.read_unsupported",
+                "rift.tracing.log_stream_unavailable",
             ],
         ),
         (
@@ -246,6 +247,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.search.vector_width_mismatch",
                 "rift.search.weights_unreadable",
                 "rift.syntax.zero_limit",
+                "rift.tracing.log_queue_limit",
             ],
         ),
         (
@@ -449,6 +451,11 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             ],
         ),
         (
+            Code::LimitExceeded,
+            Retry::OperatorAction,
+            &["rift.tracing.log_subscription_limit"],
+        ),
+        (
             Code::PermissionDenied,
             Retry::Never,
             &["rift.lsp.uri_outside_root"],
@@ -640,6 +647,18 @@ mod tests {
             (
                 "rift.syntax.parse_cancelled",
                 (Code::Cancelled, Retry::SameRequest),
+            ),
+            (
+                "rift.tracing.log_queue_limit",
+                (Code::ConfigurationInvalid, Retry::OperatorAction),
+            ),
+            (
+                "rift.tracing.log_stream_unavailable",
+                (Code::CapabilityUnavailable, Retry::OperatorAction),
+            ),
+            (
+                "rift.tracing.log_subscription_limit",
+                (Code::LimitExceeded, Retry::OperatorAction),
             ),
         ] {
             assert_eq!(super::wire_guidance(slug), Some(expected), "{slug}");
