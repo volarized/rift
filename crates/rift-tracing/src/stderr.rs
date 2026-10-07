@@ -191,6 +191,8 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{
@@ -260,10 +262,28 @@ mod tests {
 
     /// Runs `emit` under a subscriber whose stderr lines go to the returned buffer.
     fn printed(emit: impl FnOnce()) -> Written {
+        crate::__private::stream_unscoped();
         let written = Written::default();
         let writer = written.clone();
-        let layer = StderrLines::new(move || writer.clone(), LevelColor::Plain);
-        tracing::subscriber::with_default(crate::capture::registry().with(layer), emit);
+        let layer = StderrLines::new(move || writer.clone(), LevelColor::Plain).with_filter(
+            crate::runtime::stderr_filter(EnvFilter::new("rift_tracing=trace,hidden=trace")),
+        );
+        let runtime = crate::recorder::TestOtlpRuntime::when_configured_without_runtime();
+        let (otlp_layer, export) = if let Some(runtime) = &runtime {
+            let _entered = runtime.enter();
+            crate::otlp::test_process_layer(EnvFilter::new("trace"))
+        } else {
+            crate::otlp::test_process_layer(EnvFilter::new("trace"))
+        };
+        tracing::subscriber::with_default(
+            crate::capture::registry().with(layer).with(otlp_layer),
+            emit,
+        );
+        if let Some(runtime) = runtime {
+            runtime
+                .shutdown(export)
+                .expect("the local test OTLP export shuts down");
+        }
         written
     }
 
@@ -351,15 +371,28 @@ mod tests {
     /// names. That span's own close reaches stderr alone.
     #[test]
     fn a_stderr_line_is_the_live_line_of_the_captured_record() {
+        crate::__private::stream_unscoped();
         let written = Written::default();
         let writer = written.clone();
         let (sink, mut drain) = crate::log_capture();
+        let capture_filter = EnvFilter::new("rift_tracing=trace,hidden=off");
+        let runtime = crate::recorder::TestOtlpRuntime::when_configured_without_runtime();
+        let (otlp_layer, export) = if let Some(runtime) = &runtime {
+            let _entered = runtime.enter();
+            crate::otlp::test_process_layer(capture_filter.clone())
+        } else {
+            crate::otlp::test_process_layer(capture_filter.clone())
+        };
         let subscriber = crate::capture::registry()
-            .with(StderrLines::new(move || writer.clone(), LevelColor::Plain))
-            .with(crate::runtime::capture_layer(
-                sink,
-                tracing_subscriber::EnvFilter::new("rift_tracing=trace,hidden=off"),
-            ));
+            .with(
+                StderrLines::new(move || writer.clone(), LevelColor::Plain).with_filter(
+                    crate::runtime::stderr_filter(EnvFilter::new(
+                        "rift_tracing=trace,hidden=trace",
+                    )),
+                ),
+            )
+            .with(crate::runtime::capture_layer(sink, capture_filter))
+            .with(otlp_layer);
         tracing::subscriber::with_default(subscriber, || {
             request_with_index_operation();
             let hidden = tracing::info_span!(
@@ -372,6 +405,11 @@ mod tests {
             drop(hidden);
             crate::warn!(component = "index", reason = "shutdown", "stopped");
         });
+        if let Some(runtime) = runtime {
+            runtime
+                .shutdown(export)
+                .expect("the local test OTLP export shuts down");
+        }
 
         let stored = std::iter::from_fn(|| drain.try_recv_record().ok()).collect::<Vec<_>>();
         let rendered = without_times(&LogLines::live_stream().lines(&stored));

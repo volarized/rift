@@ -11,7 +11,7 @@ use tracing::span::{Attributes, Id};
 use crate::Span;
 use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{Layer, Registry};
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// One opened span: its name, explicit parent, rendered fields, and whether it closed.
 #[derive(Clone, Debug)]
@@ -113,6 +113,7 @@ where
 }
 
 fn recording() -> (Recorder, tracing::subscriber::DefaultGuard) {
+    crate::__private::stream_unscoped();
     let recorder = Recorder::default();
     let guard = tracing_subscriber::registry()
         .with(recorder.clone())
@@ -434,13 +435,31 @@ fn async_block_question_mark_applies_to_the_block() {
 
 #[test]
 fn events_keep_the_caller_module_as_target() {
-    let (recorder, _guard) = recording();
+    crate::__private::stream_unscoped();
+    let runtime = crate::recorder::TestOtlpRuntime::when_configured_without_runtime();
+    let (otlp_layer, export) = if let Some(runtime) = &runtime {
+        let _entered = runtime.enter();
+        crate::otlp::test_process_layer(EnvFilter::new("trace"))
+    } else {
+        crate::otlp::test_process_layer(EnvFilter::new("trace"))
+    };
+    let recorder = Recorder::default();
+    let guard = tracing_subscriber::registry()
+        .with(recorder.clone())
+        .with(otlp_layer)
+        .set_default();
 
     crate::info!(component = "logs", operation = "logs.drain", "drained");
     crate::warn!(target: "rift_mcp::election", "election document unreadable");
 
     let targets = recorder.targets.lock().expect("not poisoned").clone();
     assert_eq!(targets, [module_path!(), "rift_mcp::election"]);
+    drop(guard);
+    if let Some(runtime) = runtime {
+        runtime
+            .shutdown(export)
+            .expect("the local test OTLP export shuts down");
+    }
 }
 
 /// A body holding this many bytes across an await keeps the future at least that large.
