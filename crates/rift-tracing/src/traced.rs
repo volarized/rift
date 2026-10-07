@@ -16,6 +16,9 @@ use tracing::instrument::{Instrument as _, Instrumented};
 use crate::Span;
 use crate::metrics::{Completion, InstrumentScope, future_completion};
 
+mod residual;
+pub use residual::{InlineResidual, InlineTry};
+
 /// The work's value, borrowed for [`RegisteredError`] and [`OtherValue`] to read.
 ///
 /// The macro calls `(&&WorkValue(&value)).registered_identity()`. Method lookup tries the
@@ -25,7 +28,7 @@ use crate::metrics::{Completion, InstrumentScope, future_completion};
 #[doc(hidden)]
 pub struct WorkValue<'value, T>(pub &'value T);
 
-/// Reads the registered identity of a work value that is `Err(RiftError)`.
+/// Reads the registered identity of `Err(RiftError)`, including ready `Poll` values.
 ///
 /// Two impls keep a work value of a type not yet inferred at the call an open obligation,
 /// not a choice: a block that diverges has such a type, which falls back to `!`, and the
@@ -42,13 +45,31 @@ impl<T> RegisteredError for &WorkValue<'_, Result<T, RiftError>> {
     }
 }
 
+impl<T> RegisteredError for &WorkValue<'_, Poll<Result<T, RiftError>>> {
+    fn registered_identity(&self) -> Option<&'static str> {
+        match self.0 {
+            Poll::Ready(Err(error)) => Some(error.slug().as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl<T> RegisteredError for &WorkValue<'_, Poll<Option<Result<T, RiftError>>>> {
+    fn registered_identity(&self) -> Option<&'static str> {
+        match self.0 {
+            Poll::Ready(Some(Err(error))) => Some(error.slug().as_str()),
+            _ => None,
+        }
+    }
+}
+
 impl RegisteredError for &WorkValue<'_, Never> {
     fn registered_identity(&self) -> Option<&'static str> {
         match *self.0 {}
     }
 }
 
-/// Reads no identity from a work value that is not `Result<_, RiftError>`.
+/// Reads no identity from work values outside the registered result types.
 #[doc(hidden)]
 pub trait OtherValue {
     /// No identity: the value is not a returned `RiftError`.
@@ -89,6 +110,16 @@ pub fn returned<T>(
         span.record("error.type", identity);
     }
     value
+}
+
+/// Records an inline exit's registered identity on its operation's owned span.
+#[doc(hidden)]
+pub fn exiting<T>(
+    span: &tracing::Span,
+    read: impl FnOnce(&T) -> Option<&'static str>,
+    value: T,
+) -> T {
+    returned(span, read, value)
 }
 
 pin_project_lite::pin_project! {
@@ -337,9 +368,13 @@ pub fn parent_span(parent: &Span) -> Span {
 /// `RiftError::slug` spells it, and `_OTHER` otherwise. Work whose value is
 /// `Result<_, RiftError>` holding `Err`, the value of a block or the output of a future,
 /// records that error's registered identity as `error.type` itself, after it returns; a
-/// value of any other type records nothing. A block left through `?` or `return` has no
-/// value: the error leaves the enclosing function, and the block ends with `Ok` unless the
-/// work recorded a failure. The span's close record states the same outcome as `status.code` and
+/// value of any other type records nothing. Inline `?` and `return` exits record a
+/// registered error before it leaves the enclosing function. Nested closures, async
+/// blocks own their exits and are read only when their output leaves the operation.
+/// Only `?` and `return` written directly in the inline work are inspected; exits
+/// produced by another macro expansion require explicit `error.type` recording.
+/// A try block owns `?`; its `return` still leaves the enclosing function.
+/// The span's close record states the same outcome as `status.code` and
 /// `error.type`, and the span records `code.function.name`, the function the macro
 /// expands in. The duration is the time from
 /// the span's opening to the end of the work, read once: the histogram records it and the
@@ -486,7 +521,7 @@ macro_rules! __rift_traced_block {
             // The arm passes the caller's expected type on to the work, and keeps a block's
             // braces out of the argument position.
             match () {
-                () => $work,
+                () => $crate::__private::__rift_traced_work!((__rift_entered, $work)),
             },
         )
     }};

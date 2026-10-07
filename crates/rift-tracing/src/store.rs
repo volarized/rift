@@ -455,7 +455,7 @@ impl CloseProgress {
 enum Command {
     /// Append one batch and trim back to `retention_records`.
     Append {
-        records: Arc<[LogRecord]>,
+        records: Arc<RetainedLogBatch>,
         retention_records: u64,
         /// When the caller started to send it.
         queued: std::time::Instant,
@@ -465,6 +465,20 @@ enum Command {
     Close {
         reply: oneshot::Sender<Result<WalCheckpoint, RiftError>>,
     },
+}
+
+/// A shared batch keeps its byte admission until the writer and its caller release it.
+#[derive(Debug)]
+pub(crate) struct RetainedLogBatch {
+    // Field drop order releases the records before their byte permits.
+    pub(crate) records: Arc<[LogRecord]>,
+    pub(crate) _bytes: Vec<Option<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl RetainedLogBatch {
+    fn len(&self) -> usize {
+        self.records.len()
+    }
 }
 
 /// The writing end of the metrics database: a handle on its writer thread.
@@ -607,8 +621,23 @@ impl LogStore {
         records: impl Into<Arc<[LogRecord]>>,
         retention_records: u64,
     ) -> Result<u64, RiftError> {
-        let records = records.into();
-        if records.is_empty() {
+        self.append_retained(
+            Arc::new(RetainedLogBatch {
+                records: records.into(),
+                _bytes: Vec::new(),
+            }),
+            retention_records,
+        )
+        .await
+    }
+
+    /// Queues a batch together with its byte admission, including after cancellation.
+    pub(crate) async fn append_retained(
+        &self,
+        records: Arc<RetainedLogBatch>,
+        retention_records: u64,
+    ) -> Result<u64, RiftError> {
+        if records.records.is_empty() {
             return Ok(0);
         }
         if records.len() > LOG_BATCH_RECORDS_MAX {
@@ -743,7 +772,9 @@ impl MetricsWriter {
                     QUEUE_WAIT
                         .labeled([DB_NAMESPACE, APPEND_OPERATION])
                         .record(queued.elapsed());
-                    let _ = reply.send(writer.append(&records, retention_records));
+                    let result = writer.append(&records.records, retention_records);
+                    drop(records);
+                    let _ = reply.send(result);
                 }
                 Command::Close { reply } => {
                     let closed = writer.close(progress);

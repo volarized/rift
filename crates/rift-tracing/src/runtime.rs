@@ -21,14 +21,17 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::{SubscriberInitExt as _, TryInitError};
 use tracing_subscriber::{EnvFilter, Layer};
 
-use crate::capture::{LogSink, log_capture};
-use crate::drain::LogDrain;
+use crate::capture::{LOG_QUEUE_RECORDS, LogSink, log_capture_with};
+use crate::drain::{
+    LOG_FLUSH_INTERVAL, LOG_SETTLE_TIMEOUT, LOG_WRITE_RETRY_INTERVAL, LogDeliveryOptions, LogDrain,
+};
 use crate::flight::{FlightLayer, FlightTable, StallReport, observe_active};
-use crate::metrics::ObservationGuard;
+use crate::metrics::{LOGS_CARDINALITY_LIMIT_DEFAULT, ObservationGuard};
 use crate::otlp::{self, OtlpExport};
 use crate::render::LevelColor;
 use crate::sampler::{SystemProcessReader, observe_process, observe_runtime};
 use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrLines};
+use crate::subscriptions::LogStream;
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 pub(crate) const DEFAULT_TRACING_FILTER: &str =
@@ -119,27 +122,39 @@ where
     sink.with_filter(reevaluated(filter))
 }
 
-/// A [`TracingRuntimeBuilder::install`] that found the process's global subscriber, or a
-/// `log` logger, already installed.
+/// A [`TracingRuntimeBuilder::install`] refused by configured limits or by a process
+/// whose global subscriber or `log` logger is already installed.
 ///
 /// The installation already in place stays as it was: it keeps receiving every span and
 /// event, and the refused builder started no stall report and holds no export.
 #[derive(Debug)]
-pub struct InstallError(TryInitError);
+pub enum InstallError {
+    /// The process already has a global subscriber or `log` logger.
+    AlreadyInstalled(TryInitError),
+    /// A configured log limit is outside its accepted range.
+    InvalidConfiguration(rift_error::RiftError),
+}
 
 impl fmt::Display for InstallError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "tracing is already installed in this process: {}",
-            self.0
-        )
+        match self {
+            Self::AlreadyInstalled(error) => {
+                write!(
+                    formatter,
+                    "tracing is already installed in this process: {error}"
+                )
+            }
+            Self::InvalidConfiguration(error) => fmt::Display::fmt(error, formatter),
+        }
     }
 }
 
 impl std::error::Error for InstallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+        match self {
+            Self::AlreadyInstalled(error) => Some(error),
+            Self::InvalidConfiguration(error) => Some(error),
+        }
     }
 }
 
@@ -153,6 +168,7 @@ pub struct TracingRuntime {
     stall: Option<StallReport>,
     /// Keeps the table of operations in flight reported in `operation.active`.
     _in_flight: Option<ObservationGuard>,
+    logs: LogStream,
 }
 
 /// How long [`TracingRuntime::shutdown`] waits for the OTLP export's final flush and
@@ -170,6 +186,13 @@ impl TracingRuntime {
             stderr: StderrPolicy::Unbounded,
             stderr_limit: SERVER_STDERR_BYTES_MAX,
             stall_delay: None,
+            delivery: LogDeliveryOptions {
+                queue_records: LOG_QUEUE_RECORDS,
+                flush_interval: LOG_FLUSH_INTERVAL,
+                retry_interval: LOG_WRITE_RETRY_INTERVAL,
+                settle_timeout: LOG_SETTLE_TIMEOUT,
+            },
+            cardinality_limit: LOGS_CARDINALITY_LIMIT_DEFAULT,
         }
     }
 
@@ -178,6 +201,12 @@ impl TracingRuntime {
     #[must_use]
     pub fn export(&self) -> OtlpExport {
         self.export.clone()
+    }
+
+    /// The captured record stream, with independent bounded subscriptions.
+    #[must_use]
+    pub const fn logs(&self) -> &LogStream {
+        &self.logs
     }
 
     /// Stops the stall report and joins its task, then flushes buffered spans, log records,
@@ -200,6 +229,7 @@ impl TracingRuntime {
             export,
             stall,
             _in_flight,
+            logs,
         } = self;
         if let Some(stall) = stall {
             stall.stop().await;
@@ -216,8 +246,9 @@ impl TracingRuntime {
             providers_deadline,
         );
 
-        let logs = export.shutdown_logs(deadline).await;
-        logs.and(providers)
+        let result = export.shutdown_logs(deadline).await;
+        logs.close();
+        result.and(providers)
     }
 }
 
@@ -229,9 +260,46 @@ pub struct TracingRuntimeBuilder {
     stderr: StderrPolicy,
     stderr_limit: u64,
     stall_delay: Option<Duration>,
+    delivery: LogDeliveryOptions,
+    cardinality_limit: u32,
 }
 
 impl TracingRuntimeBuilder {
+    /// Sets the accepted `[logs] queue_records` bound for independent capture queues.
+    /// The accepted range, 1 through 65,536, is checked by [`Self::install`].
+    pub const fn queue_records(mut self, records: usize) -> Self {
+        self.delivery.queue_records = records;
+        self
+    }
+
+    /// Sets the accepted `[logs] flush_interval` between persistence batches.
+    /// The accepted range, 1 millisecond through 1 hour, is checked by [`Self::install`].
+    pub const fn flush_interval(mut self, interval: Duration) -> Self {
+        self.delivery.flush_interval = interval;
+        self
+    }
+
+    /// Sets the accepted `[logs] retry_interval` for a retained refused batch.
+    /// The accepted range, 1 millisecond through 1 hour, is checked by [`Self::install`].
+    pub const fn retry_interval(mut self, interval: Duration) -> Self {
+        self.delivery.retry_interval = interval;
+        self
+    }
+
+    /// Sets the accepted `[logs] settle_timeout` bound before a log read.
+    /// The accepted range, 1 millisecond through 1 hour, is checked by [`Self::install`].
+    pub const fn settle_timeout(mut self, timeout: Duration) -> Self {
+        self.delivery.settle_timeout = timeout;
+        self
+    }
+
+    /// Sets the accepted `[logs] cardinality_limit` for each metric instrument.
+    /// The accepted range, 1 through 65,536, is checked by [`Self::install`].
+    pub const fn cardinality_limit(mut self, limit: u32) -> Self {
+        self.cardinality_limit = limit;
+        self
+    }
+
     /// Records what `filter` admits into the log drain [`Self::install`] returns.
     ///
     /// `filter` is the accepted `[logs] capture` value; a value `tracing` cannot parse
@@ -271,6 +339,44 @@ impl TracingRuntimeBuilder {
         self
     }
 
+    /// Checks accepted log limits before installation allocates any owner.
+    fn validate_log_limits(&self) -> Result<(), InstallError> {
+        if !(1..=65_536).contains(&self.delivery.queue_records) {
+            return Err(InstallError::InvalidConfiguration(
+                rift_error::errors::tracing::log_queue_limit()
+                    .observed(self.delivery.queue_records as u64)
+                    .maximum(65_536_u64)
+                    .error(),
+            ));
+        }
+        let out_of_range = |field: &'static str, value: String, range: &'static str| {
+            InstallError::InvalidConfiguration(
+                rift_error::errors::core::configuration_limit_out_of_range()
+                    .with(rift_error::ErrorContext::new("field", field))
+                    .with(rift_error::ErrorContext::new("value", value))
+                    .with(rift_error::ErrorContext::new("range", range))
+                    .error(),
+            )
+        };
+        if !(1..=65_536).contains(&self.cardinality_limit) {
+            return Err(out_of_range(
+                "logs.cardinality_limit",
+                self.cardinality_limit.to_string(),
+                "1..=65536",
+            ));
+        }
+        for (field, duration) in [
+            ("logs.flush_interval", self.delivery.flush_interval),
+            ("logs.retry_interval", self.delivery.retry_interval),
+            ("logs.settle_timeout", self.delivery.settle_timeout),
+        ] {
+            if !(Duration::from_millis(1)..=Duration::from_secs(3_600)).contains(&duration) {
+                return Err(out_of_range(field, format!("{duration:?}"), "1ms..=1h"));
+            }
+        }
+        Ok(())
+    }
+
     /// Installs the subscriber as the process's global default, registers the process and
     /// Tokio runtime readings when an OTLP endpoint installed a meter, and starts the stall
     /// report when [`Self::stall_delay`] ran.
@@ -282,23 +388,38 @@ impl TracingRuntimeBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError`] when the process already has a global subscriber, or a
+    /// Returns [`InstallError::InvalidConfiguration`] with `tracing.log_queue_limit`
+    /// when `queue_records` is outside 1 through 65,536. Other log limits return
+    /// `core.configuration_limit_out_of_range`: `cardinality_limit` accepts 1 through
+    /// 65,536, and delivery durations accept 1 millisecond through 1 hour. All limits
+    /// are checked before allocating a queue, provider, or subscriber, including when
+    /// capture is disabled.
+    /// Returns [`InstallError::AlreadyInstalled`] when the process has a global subscriber, or a
     /// `log` logger: `tracing-subscriber`'s `try_init` refuses a second one. The
     /// installation in place stays untouched, and this builder starts no stall report.
     pub fn install(self) -> Result<(TracingRuntime, Option<LogDrain>), InstallError> {
-        let (sink, drain) = match self.capture.as_deref() {
+        self.validate_log_limits()?;
+        let (sink, drain, logs) = match self.capture.as_deref() {
             Some(capture) => {
-                let (sink, drain) = log_capture();
+                let (sink, drain) = log_capture_with(self.delivery);
+                let logs = sink.logs.clone();
                 let filter = capture_filter(Some(capture));
-                (Some(capture_layer(sink, filter)), Some(drain))
+                (Some(capture_layer(sink, filter)), Some(drain), logs)
             }
-            None => (None, None),
+            None => (
+                None,
+                None,
+                LogStream::new(self.delivery.queue_records, false),
+            ),
         };
         #[cfg(any(test, feature = "fixtures"))]
         let _entered = (tokio::runtime::Handle::try_current().is_err()
             && otlp::recorder_export_configured())
         .then(|| crate::recorder::test_runtime().enter());
-        let (otlp_layer, export) = otlp::layer(capture_filter(self.capture.as_deref()));
+        let (otlp_layer, export) = otlp::layer(
+            capture_filter(self.capture.as_deref()),
+            self.cardinality_limit,
+        );
         let (writer, drain) = match self.stderr {
             StderrPolicy::Unbounded => (BoxMakeWriter::new(std::io::stderr), drain),
             StderrPolicy::Bounded => {
@@ -336,7 +457,7 @@ impl TracingRuntimeBuilder {
             } else {
                 drop(export);
             }
-            return Err(InstallError(error));
+            return Err(InstallError::AlreadyInstalled(error));
         }
         export.install_meter();
         let in_flight = observe_active(&flights);
@@ -360,6 +481,7 @@ impl TracingRuntimeBuilder {
                 export,
                 stall,
                 _in_flight: in_flight,
+                logs,
             },
             drain,
         ))
@@ -441,6 +563,131 @@ mod tests {
     use tracing_subscriber::{EnvFilter, Layer};
 
     use super::{StderrPolicy, validate_log_filter};
+
+    #[test]
+    fn test_install_refuses_out_of_range_delivery_and_cardinality_before_installing() {
+        type Setter =
+            fn(super::TracingRuntimeBuilder, super::Duration) -> super::TracingRuntimeBuilder;
+        for capture in [false, true] {
+            let builder = || {
+                let builder = crate::TracingRuntime::builder();
+                if capture {
+                    builder.capture("info")
+                } else {
+                    builder
+                }
+            };
+            for limit in [0, 65_537, u32::MAX] {
+                let error = builder().cardinality_limit(limit).install().err().expect(
+                    "cardinality outside its accepted range is refused before installation",
+                );
+                let super::InstallError::InvalidConfiguration(error) = error else {
+                    panic!("cardinality admission names its configuration failure");
+                };
+                assert_eq!(
+                    error.slug(),
+                    rift_error::errors::core::configuration_limit_out_of_range::SLUG
+                );
+                let context: std::collections::BTreeMap<_, _> = error.context().collect();
+                assert_eq!(
+                    context.get("field").map(String::as_str),
+                    Some("logs.cardinality_limit")
+                );
+                assert_eq!(context.get("value"), Some(&limit.to_string()));
+                assert_eq!(context.get("range").map(String::as_str), Some("1..=65536"));
+            }
+            let setters: [(&str, Setter); 3] = [
+                (
+                    "logs.flush_interval",
+                    super::TracingRuntimeBuilder::flush_interval,
+                ),
+                (
+                    "logs.retry_interval",
+                    super::TracingRuntimeBuilder::retry_interval,
+                ),
+                (
+                    "logs.settle_timeout",
+                    super::TracingRuntimeBuilder::settle_timeout,
+                ),
+            ];
+            for (field, setter) in setters {
+                for duration in [
+                    super::Duration::ZERO,
+                    super::Duration::from_nanos(999_999),
+                    super::Duration::from_secs(3_600) + super::Duration::from_nanos(1),
+                    super::Duration::MAX,
+                ] {
+                    let error = setter(builder(), duration).install().err().expect(
+                        "duration outside its accepted range is refused before installation",
+                    );
+                    let super::InstallError::InvalidConfiguration(error) = error else {
+                        panic!("delivery admission names its configuration failure");
+                    };
+                    assert_eq!(
+                        error.slug(),
+                        rift_error::errors::core::configuration_limit_out_of_range::SLUG
+                    );
+                    let context: std::collections::BTreeMap<_, _> = error.context().collect();
+                    assert_eq!(context.get("field").map(String::as_str), Some(field));
+                    assert_eq!(context.get("value"), Some(&format!("{duration:?}")));
+                    assert_eq!(context.get("range").map(String::as_str), Some("1ms..=1h"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_install_accepts_minimum_log_limits() -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, drain) = crate::TracingRuntime::builder()
+            .queue_records(1)
+            .cardinality_limit(1)
+            .flush_interval(super::Duration::from_millis(1))
+            .retry_interval(super::Duration::from_millis(1))
+            .settle_timeout(super::Duration::from_millis(1))
+            .install()?;
+        assert!(drain.is_none());
+        runtime.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_accepts_maximum_log_limits() -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, drain) = crate::TracingRuntime::builder()
+            .capture("info")
+            .queue_records(65_536)
+            .cardinality_limit(65_536)
+            .flush_interval(super::Duration::from_secs(3_600))
+            .retry_interval(super::Duration::from_secs(3_600))
+            .settle_timeout(super::Duration::from_secs(3_600))
+            .install()?;
+        assert!(drain.is_some());
+        runtime.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_refuses_out_of_range_queue_records_before_installing() {
+        for records in [0, 65_537, usize::MAX] {
+            let error = crate::TracingRuntime::builder()
+                .capture("info")
+                .queue_records(records)
+                .install()
+                .err()
+                .expect("the configured queue is refused before installation");
+            let super::InstallError::InvalidConfiguration(error) = error else {
+                panic!("queue admission names its configuration failure");
+            };
+            assert_eq!(
+                error.slug(),
+                rift_error::errors::tracing::log_queue_limit::SLUG
+            );
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| { key == "observed" && value == records.to_string() })
+            );
+        }
+    }
 
     #[test]
     fn only_a_server_off_a_terminal_bounds_its_stderr() {

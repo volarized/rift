@@ -66,6 +66,7 @@ mod sampler;
 mod span;
 mod stderr;
 mod store;
+mod subscriptions;
 mod traced;
 
 pub use capture::{
@@ -102,6 +103,9 @@ pub use stderr::SERVER_STDERR_BYTES_MAX;
 pub use store::{
     LogStore, METRICS_BUSY_TIMEOUT_MS, METRICS_SCHEMA_VERSION, STATEMENT_BOUNDARIES, StoreClose,
     StoreReadings, WalCheckpoint, sqlite_error_type,
+};
+pub use subscriptions::{
+    LOG_SUBSCRIPTION_BYTES_MAX, LOG_SUBSCRIPTIONS_MAX, LogPublication, LogStream, LogSubscription,
 };
 
 /// Times a whole function as one [`traced!`] operation.
@@ -182,8 +186,10 @@ pub mod __private {
     pub use crate::metrics::{Completion, completion};
     pub use crate::span::{function_name, span_from};
     pub use crate::traced::{
-        FnOutput, OtherValue, RegisteredError, WorkValue, parent_span, returned, traced_future,
+        FnOutput, InlineResidual, InlineTry, OtherValue, RegisteredError, WorkValue, exiting,
+        parent_span, returned, traced_future,
     };
+    pub use rift_tracing_macros::__rift_traced_work;
     pub use tracing;
 
     /// Installs the unscoped stream on a nextest test process's first record, span, or

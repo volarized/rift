@@ -140,6 +140,11 @@ agent meets can be explained without an operator reading the server's terminal:
 [logs]
 retention_records = 50000
 page_records = 500
+queue_records = 4096
+flush_interval = "250ms"
+retry_interval = "500ms"
+settle_timeout = "2s"
+cardinality_limit = 2000
 capture = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn"
 stall_delay = "10s"
 stderr_limit = "1mb"
@@ -148,6 +153,15 @@ stderr_limit = "1mb"
 - `retention_records` caps the records the store keeps, 100 to 1000000; a write past the cap
   drops the oldest records first
 - `page_records` caps what one `rift://logs` read returns, 1 to 5000
+- `queue_records` caps the records each log subscription holds, 1 to 65536. A full
+  subscription drops and counts excess records independently of other subscriptions
+- `flush_interval` is how long the drain waits before writing a partial batch, 1ms to 1h
+- `retry_interval` is how long the drain waits before retrying a batch the store refused,
+  1ms to 1h. The drain keeps the batch until the store accepts it or the drain stops
+- `settle_timeout` caps how long a persisted-log read waits for earlier records to be
+  written, 1ms to 1h. At the bound the read returns the records already in the store
+- `cardinality_limit` caps attribute sets each metric instrument holds, 1 to 65536.
+  Measurements past it join the `otel.metric.overflow=true` series
 - `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
   `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
   excludes never reaches the store, whatever the terminal shows

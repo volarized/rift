@@ -12,6 +12,54 @@ use crate::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// Cancelling a queued append keeps its byte admission until the writer drops its batch.
+#[tokio::test]
+async fn test_cancelled_append_retains_bytes_while_writer_holds_its_queue() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = Arc::new(LogStore::open(&metrics_path(&directory), None).await?);
+    let (holding, release) = store.hold_next_close();
+    let closing_store = Arc::clone(&store);
+    let close =
+        tokio::spawn(async move { closing_store.close(Instant::now() + THREAD_WAIT_MAX).await });
+    tokio::time::timeout(THREAD_WAIT_MAX, holding).await??;
+
+    let budget = crate::subscriptions::RecordBudget::new(4096);
+    let sample = record("retained");
+    let mut records = Vec::new();
+    let mut bytes = Vec::new();
+    while let Some(permit) = budget.reserve(&sample) {
+        records.push(sample.clone());
+        bytes.push(Some(permit));
+    }
+    assert!(!records.is_empty());
+    let batch = Arc::new(super::RetainedLogBatch {
+        records: records.into(),
+        _bytes: bytes,
+    });
+    let mut append = Box::pin(store.append_retained(batch, KEEP_EVERY));
+    tokio::select! {
+        biased;
+        result = &mut append => panic!("held writer answered append: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(store.sender.max_capacity() - store.sender.capacity(), 1);
+    drop(append);
+    assert!(budget.reserve(&sample).is_none());
+
+    release.send(())?;
+    close.await??;
+    tokio::time::timeout(THREAD_WAIT_MAX, async {
+        loop {
+            if budget.reserve(&sample).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
 /// Retention no suite here reaches, so nothing trims unless the suite is about trimming.
 const KEEP_EVERY: u64 = 1_000;
 /// Failure bound on one wait for the writer thread; never a way to order two events.
@@ -743,7 +791,10 @@ async fn a_close_queued_behind_a_held_writer_times_out_in_the_queued_stage() -> 
     store
         .sender
         .send(super::Command::Append {
-            records: Arc::from([record("held")]),
+            records: Arc::new(super::RetainedLogBatch {
+                records: Arc::from([record("held")]),
+                _bytes: Vec::new(),
+            }),
             retention_records: KEEP_EVERY,
             queued: std::time::Instant::now(),
             reply,
@@ -874,7 +925,10 @@ async fn a_reader_names_the_file_its_store_writes() -> TestResult {
 fn a_command_debugs_with_its_record_count_and_no_reply() {
     let (reply, _answer) = tokio::sync::oneshot::channel();
     let append = super::Command::Append {
-        records: Arc::from([record("first"), record("second")]),
+        records: Arc::new(super::RetainedLogBatch {
+            records: Arc::from([record("first"), record("second")]),
+            _bytes: Vec::new(),
+        }),
         retention_records: 5,
         queued: std::time::Instant::now(),
         reply,

@@ -1227,6 +1227,20 @@ message = "log batch holds more records than its accepted limit of {maximum}"
 action = "split the batch below {maximum} records and retry"
 fields = { observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
 
+[error.tracing.log_subscription_limit]
+message = "log subscriptions exceed their accepted limit of {maximum}"
+action = "drop an existing log subscription and retry"
+fields = { observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
+[error.tracing.log_stream_unavailable]
+message = "log capture is disabled or closed"
+action = "enable log capture and subscribe before tracing shutdown"
+
+[error.tracing.log_queue_limit]
+message = "log queue records are outside their accepted range of 1 through {maximum}"
+action = "set queue_records within the accepted range and retry"
+fields = { observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
 [error.history.contribution_invalid]
 message = "history Contribution conversion rejected: {detail}"
 action = "check the history Contribution data and retry"

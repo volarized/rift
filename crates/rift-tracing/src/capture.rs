@@ -24,10 +24,11 @@ use tracing_subscriber::layer::{Context, Layered, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
-use crate::drain::{LogDrain, LogSettlement, QueuedRecord};
+use crate::drain::{LogDeliveryOptions, LogDrain, LogSettlement, QueuedRecord};
 use crate::measurement::process_monotonic_now;
 use crate::metrics::{Counter, SCOPE};
 use crate::record::{LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LogRecord, bounded};
+use crate::subscriptions::{LOG_SUBSCRIPTION_BYTES_MAX, LogStream, RecordBudget};
 
 /// Records the queue holds before a send drops one. The queue exists to absorb a burst
 /// while the drain writes; a workspace that emits more than this between two flushes is
@@ -114,13 +115,15 @@ const _: () = assert!(EVENT_SPAN_MEMBERS_BYTES_MAX < LOG_FIELDS_BYTES_MAX / 4 * 
 
 /// The `tracing` layer that copies admitted events into the queue.
 ///
-/// Cloning shares one queue: the layer is installed once, and a clone held for a test
-/// observes the same drops.
+/// Cloning shares one stream and its persistence subscription. Each additional
+/// subscription has its own bounded queue and loss count.
 #[derive(Clone, Debug)]
 pub struct LogSink {
     sender: Sender<QueuedRecord>,
     dropped: Arc<AtomicU64>,
     pub(crate) settlement: Arc<LogSettlement>,
+    pub(crate) logs: LogStream,
+    budget: RecordBudget,
 }
 
 impl LogSink {
@@ -130,16 +133,32 @@ impl LogSink {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Queues one record, counting a drop rather than waiting for room.
+    /// Publishes one record to independent bounded queues without waiting for room.
     ///
-    /// The record takes its sequence before the send, and a send that finds no room
+    /// Publication orders the sequence and sends together. A send that finds no room
     /// finishes it again: a read waiting on the sequence must never wait for a record no
     /// drain sees. A drop also adds one to `log.queue.dropped` with `error.type`
     /// `queue_full`, through the instrument the meter's install built: the send runs inside
     /// this layer, and building the instrument here would report through `tracing` into it.
     pub(crate) fn send(&self, record: LogRecord) {
+        self.logs
+            .publish(record, |record| self.send_persistence(record));
+    }
+
+    /// Sends to the persistence subscription inside the stream's publication lock.
+    fn send_persistence(&self, record: LogRecord) -> u64 {
         let sequence = self.settlement.accept();
-        match self.sender.try_send(QueuedRecord { sequence, record }) {
+        let Some(bytes) = self.budget.reserve(&record) else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.settlement.finish_dropped();
+            LOG_QUEUE_DROPPED.add_built([QUEUE_FULL], 1);
+            return sequence;
+        };
+        match self.sender.try_send(QueuedRecord {
+            sequence,
+            record,
+            bytes: Some(bytes),
+        }) {
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 self.settlement.finish_dropped();
@@ -148,25 +167,34 @@ impl LogSink {
             Err(TrySendError::Closed(_)) => self.settlement.finish_dropped(),
             Ok(()) => {}
         }
+        sequence
     }
 }
 
-/// Builds the layer and its drain, sharing one bounded queue and one settlement.
+/// Builds the layer and its first subscription, the persistence drain.
 ///
 /// A `rift://logs` read finds the settlement through the dispatcher the layer is
 /// installed in.
 #[must_use]
 pub fn log_capture() -> (LogSink, LogDrain) {
-    let (sender, receiver) = mpsc::channel(LOG_QUEUE_RECORDS);
+    log_capture_with(LogDeliveryOptions::default())
+}
+
+/// Builds the persistence subscription under accepted delivery settings.
+pub(crate) fn log_capture_with(options: LogDeliveryOptions) -> (LogSink, LogDrain) {
+    let (sender, receiver) = mpsc::channel(options.queue_records);
     let dropped = Arc::new(AtomicU64::new(0));
-    let settlement = Arc::new(LogSettlement::default());
+    let settlement = Arc::new(LogSettlement::with_options(options));
+    let budget = RecordBudget::new(LOG_SUBSCRIPTION_BYTES_MAX);
     (
         LogSink {
             sender,
             dropped: Arc::clone(&dropped),
             settlement: Arc::clone(&settlement),
+            logs: LogStream::new(options.queue_records, true),
+            budget: budget.clone(),
         },
-        LogDrain::new(receiver, dropped, settlement),
+        LogDrain::new(receiver, dropped, settlement).with_budget(budget),
     )
 }
 

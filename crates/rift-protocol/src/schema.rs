@@ -1218,15 +1218,30 @@ pub fn declare_dependencies_ranges(schema: &mut Schema) {
 }
 
 /// A [`LogsConfiguration`](crate::configuration::LogsConfiguration) states its
-/// `Duration` and `ByteSize` floors and ceilings as `rift:range` on `stall_delay` and
-/// `stderr_limit`: schema validation alone cannot compare `"1s"` or
+/// `Duration` and `ByteSize` floors and ceilings as `rift:range` on quantity fields:
+/// schema validation alone cannot compare `"1s"` or
 /// `"1mb"` against a bound, so the server enforces them at load and the schema carries
 /// them for readers.
 pub fn declare_logs_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        ByteSize, Duration, LOGS_STALL_DELAY_MS_MAX, LOGS_STALL_DELAY_MS_MIN,
-        LOGS_STDERR_BYTES_MAX, LOGS_STDERR_BYTES_MIN, LogsConfiguration,
+        ByteSize, Duration, LOGS_DELIVERY_MS_MAX, LOGS_DELIVERY_MS_MIN, LOGS_STALL_DELAY_MS_MAX,
+        LOGS_STALL_DELAY_MS_MIN, LOGS_STDERR_BYTES_MAX, LOGS_STDERR_BYTES_MIN, LogsConfiguration,
     };
+    for property in [
+        property!(LogsConfiguration, flush_interval),
+        property!(LogsConfiguration, retry_interval),
+        property!(LogsConfiguration, settle_timeout),
+    ] {
+        annotate_property(
+            schema,
+            property,
+            RIFT_RANGE,
+            range(
+                &Duration::from_millis(LOGS_DELIVERY_MS_MIN),
+                &Duration::from_millis(LOGS_DELIVERY_MS_MAX),
+            ),
+        );
+    }
     annotate_property(
         schema,
         property!(LogsConfiguration, stall_delay),
@@ -2333,6 +2348,37 @@ mod tests {
             json!(Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT)),
             "stall_delay must advertise the model's default"
         );
+    }
+
+    #[test]
+    fn logs_configuration_schema_states_delivery_ranges_and_defaults() {
+        use crate::configuration::{
+            Duration, LOGS_CARDINALITY_LIMIT_MAX, LOGS_DELIVERY_MS_MAX, LOGS_DELIVERY_MS_MIN,
+            LOGS_QUEUE_RECORDS_MAX, LogsConfiguration,
+        };
+        let schema = serde_json::to_value(schema_for!(LogsConfiguration)).expect("schema");
+        let defaults = serde_json::to_value(LogsConfiguration::default()).expect("defaults");
+        for (field, maximum) in [
+            ("queue_records", LOGS_QUEUE_RECORDS_MAX),
+            ("cardinality_limit", LOGS_CARDINALITY_LIMIT_MAX),
+        ] {
+            let property = &schema["properties"][field];
+            assert_eq!(property["minimum"], json!(1), "{field}");
+            assert_eq!(property["maximum"], json!(maximum), "{field}");
+            assert_eq!(property[keyword::DEFAULT], defaults[field], "{field}");
+        }
+        for field in ["flush_interval", "retry_interval", "settle_timeout"] {
+            let property = &schema["properties"][field];
+            assert_eq!(
+                property[RIFT_RANGE],
+                json!({
+                    "min": Duration::from_millis(LOGS_DELIVERY_MS_MIN),
+                    "max": Duration::from_millis(LOGS_DELIVERY_MS_MAX),
+                }),
+                "{field}"
+            );
+            assert_eq!(property[keyword::DEFAULT], defaults[field], "{field}");
+        }
     }
 
     #[test]

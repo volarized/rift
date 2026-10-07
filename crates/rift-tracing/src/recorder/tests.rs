@@ -246,7 +246,7 @@ fn unscoped_export_child() -> TestResult {
         return Ok(());
     };
     let shutdown_export = !matches!(mode.to_str(), Some("no-shutdown" | "unwind"));
-    if !shutdown_export {
+    if !shutdown_export && crate::otlp::recorder_export_configured() {
         assert!(shutdown_hooks::add_shutdown_hook(
             assert_unscoped_export_shutdown_succeeded
         ));

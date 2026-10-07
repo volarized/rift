@@ -21,6 +21,78 @@ const STOP_DEADLINE: Duration = Duration::from_secs(4);
 /// twice the longest of these.
 const THREAD_WAIT_MAX: Duration = Duration::from_secs(10);
 
+#[tokio::test(start_paused = true)]
+async fn accepted_flush_interval_drives_batch_collection_and_reads_can_flush_early() {
+    let interval = Duration::from_millis(17);
+    let (sink, drain) = crate::capture::log_capture_with(super::LogDeliveryOptions {
+        flush_interval: interval,
+        ..super::LogDeliveryOptions::default()
+    });
+    let cancellation = CancellationToken::new();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        drain.wait_for_flush(&cancellation).await,
+        super::FlushReady::Due
+    ));
+    assert_eq!(started.elapsed(), interval);
+    sink.settlement.flush.notify_one();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        drain.wait_for_flush(&cancellation).await,
+        super::FlushReady::Due
+    ));
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "a read requests an immediate flush"
+    );
+    cancellation.cancel();
+    assert!(matches!(
+        drain.wait_for_flush(&cancellation).await,
+        super::FlushReady::Cancelled
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_settlement_timeout_bounds_the_dispatchers_unwritten_record() {
+    let timeout = Duration::from_millis(23);
+    let (sink, _drain) = crate::capture::log_capture_with(super::LogDeliveryOptions {
+        settle_timeout: timeout,
+        ..super::LogDeliveryOptions::default()
+    });
+    sink.settlement.draining.store(true, Ordering::SeqCst);
+    sink.send(record("unwritten"));
+    let _subscriber = tracing::subscriber::set_default(crate::capture::registry().with(sink));
+    let started = tokio::time::Instant::now();
+    super::settle_for_read("/workspace").await;
+    assert_eq!(started.elapsed(), timeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_retry_interval_keeps_refused_records_until_success() {
+    let interval = Duration::from_millis(31);
+    let attempts = std::cell::Cell::new(0_u32);
+    let started = tokio::time::Instant::now();
+    super::write_retained_with(1, interval, || {
+        let attempt = attempts.get() + 1;
+        attempts.set(attempt);
+        async move {
+            if attempt < 3 {
+                Err(rift_error::errors::tracing::log_store_failed()
+                    .operation("append")
+                    .path(std::path::Path::new(".rift/metrics"))
+                    .detail(std::io::Error::other("database is locked"))
+                    .error())
+            } else {
+                Ok(1)
+            }
+        }
+    })
+    .await;
+    assert_eq!(attempts.get(), 3);
+    assert_eq!(started.elapsed(), interval * 2);
+}
+
 /// One lane with `accepted` sequences stamped, the drain written through
 /// `written_through`, and a drain that is running or is not.
 fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlement {
@@ -33,6 +105,7 @@ fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlem
         flush: tokio::sync::Notify::new(),
         draining: AtomicBool::new(draining),
         routes: std::sync::OnceLock::new(),
+        options: super::LogDeliveryOptions::default(),
     }
 }
 
