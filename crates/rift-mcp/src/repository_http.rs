@@ -320,14 +320,20 @@ impl RepositoryWorkspaceRegistry {
         if self.stop.is_cancelled() {
             return Err(Self::stopping());
         }
-        let started = Instant::now();
-        let _admission = self.admit().await?;
-        self.validate_workspace_settings(root.clone()).await?;
-        let cell = self.workspace_cell(&root).await?;
-        let workspace = cell
-            .get_or_try_init(|| self.build_workspace(root.clone()))
-            .await;
-        let elapsed_ms = started.elapsed().as_millis();
+        let _admission;
+        let cell;
+        let workspace;
+        let elapsed = rift_tracing::measure_elapsed!("repository.workspace", {
+            _admission = self.admit().await?;
+            self.validate_workspace_settings(root.clone()).await?;
+            cell = self.workspace_cell(&root).await?;
+            workspace = cell
+                .get_or_try_init(|| self.build_workspace(root.clone()))
+                .await;
+        });
+        let elapsed_ms = elapsed
+            .ok()
+            .map(|((), measurement)| measurement.elapsed().as_millis());
         match workspace {
             Ok(_) => {
                 rift_tracing::info!(
