@@ -8,7 +8,7 @@ use rift_core::FileDigest;
 use rift_syntax::{SyntaxFacts, SyntaxLimits, SyntaxProvider, registry};
 
 /// `cache.entry.count`: entries held by each bounded content cache.
-static ENTRY_COUNT: rift_tracing::ObservableUpDownCounter<1> =
+pub(crate) static ENTRY_COUNT: rift_tracing::ObservableUpDownCounter<1> =
     rift_tracing::ObservableUpDownCounter::declare(
         crate::database_thread::SCOPE,
         "cache.entry.count",

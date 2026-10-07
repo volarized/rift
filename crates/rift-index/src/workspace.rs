@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Read as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -2019,6 +2020,8 @@ pub struct WorkspaceIndex {
     language: Arc<WorkspaceLanguagePolicy>,
     content_cache: WorkspaceContentCache,
     symbol_documents: RwLock<BTreeMap<ProjectPath, CachedSymbolDocuments>>,
+    symbol_document_entry_count: Arc<AtomicU64>,
+    _symbol_document_entry_count_reading: Option<rift_tracing::ObservationGuard>,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
     semantics: WorkspaceSemantics,
@@ -2276,7 +2279,8 @@ impl WorkspaceIndex {
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
-        let symbol_documents = carried_symbol_documents(previous, &files, limits.syntax());
+        let (symbol_documents, symbol_document_entry_count, symbol_document_entry_count_reading) =
+            observed_symbol_documents(previous, &files, limits.syntax());
         Ok(Self {
             root,
             files,
@@ -2287,6 +2291,8 @@ impl WorkspaceIndex {
             language,
             content_cache: content_cache.clone(),
             symbol_documents,
+            symbol_document_entry_count,
+            _symbol_document_entry_count_reading: symbol_document_entry_count_reading,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
             semantics,
@@ -2377,7 +2383,8 @@ impl WorkspaceIndex {
             Some((&self.documentation, &self.notebooks)),
         )?;
         check_cancelled(cancelled)?;
-        let symbol_documents = carried_symbol_documents(Some(self), &files, self.limits.syntax());
+        let (symbol_documents, symbol_document_entry_count, symbol_document_entry_count_reading) =
+            observed_symbol_documents(Some(self), &files, self.limits.syntax());
         Ok(Self {
             root: self.root.clone(),
             files,
@@ -2388,6 +2395,8 @@ impl WorkspaceIndex {
             language: Arc::clone(&self.language),
             content_cache: self.content_cache.clone(),
             symbol_documents,
+            symbol_document_entry_count,
+            _symbol_document_entry_count_reading: symbol_document_entry_count_reading,
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
             semantics,
@@ -2495,7 +2504,8 @@ impl WorkspaceIndex {
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
-        let symbol_documents = carried_symbol_documents(previous, &files, limits.syntax());
+        let (symbol_documents, symbol_document_entry_count, symbol_document_entry_count_reading) =
+            observed_symbol_documents(previous, &files, limits.syntax());
         Ok(Self {
             root,
             files,
@@ -2506,6 +2516,8 @@ impl WorkspaceIndex {
             language,
             content_cache,
             symbol_documents,
+            symbol_document_entry_count,
+            _symbol_document_entry_count_reading: symbol_document_entry_count_reading,
             text_inclusion,
             fingerprint,
             semantics,
@@ -2821,6 +2833,10 @@ impl WorkspaceIndex {
             }
             groups.push(documents);
         }
+        self.symbol_document_entry_count.store(
+            u64::try_from(cache.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         (groups, left_out)
     }
 
@@ -5215,6 +5231,34 @@ fn carried_symbol_documents(
     RwLock::new(carried)
 }
 
+fn observed_symbol_documents(
+    previous: Option<&WorkspaceIndex>,
+    files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    limits: SyntaxLimits,
+) -> (
+    RwLock<BTreeMap<ProjectPath, CachedSymbolDocuments>>,
+    Arc<AtomicU64>,
+    Option<rift_tracing::ObservationGuard>,
+) {
+    let cache = carried_symbol_documents(previous, files, limits);
+    let entry_count = Arc::new(AtomicU64::new(
+        u64::try_from(
+            cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        )
+        .unwrap_or(u64::MAX),
+    ));
+    let observed_entry_count = Arc::downgrade(&entry_count);
+    let entry_count_reading = crate::content_cache::ENTRY_COUNT.observe(move |observation| {
+        if let Some(entry_count) = observed_entry_count.upgrade() {
+            observation.observe(["symbol_documents"], entry_count.load(Ordering::Relaxed));
+        }
+    });
+    (cache, entry_count, entry_count_reading)
+}
+
 /// The searchable fields one declaration fills: equal bytes produce equal fields and one
 /// digest.
 #[must_use]
@@ -5695,6 +5739,18 @@ mod tests {
 
     #[test]
     fn vector_symbol_documents_share_unchanged_files_only() {
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("recorder installs");
+        let labels = [("cache.name", "symbol_documents")];
+        let assert_symbol_document_count = |expected| {
+            let metrics = recorder.metrics();
+            let count = metrics.find("cache.entry.count", &labels).map(|series| {
+                assert_eq!(series.unit(), "{entry}");
+                series.value().clone()
+            });
+            assert_eq!(count, expected);
+        };
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();
         fs::write(root.join("a.rs"), "pub fn alpha() {}\n").expect("first source");
@@ -5704,6 +5760,7 @@ mod tests {
         let inclusion = TextFileInclusion::default();
         let first =
             WorkspaceIndex::build(root, limits, &visibility, &inclusion).expect("workspace builds");
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(0.0)));
 
         assert!(
             first
@@ -5727,9 +5784,11 @@ mod tests {
                 .expect("document cache lock")
                 .is_empty()
         );
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(0.0)));
 
         let first_groups = first.symbol_index_documents_by_file();
         assert_eq!(first_groups.len(), 2);
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
         let original_path = ProjectPath::new("a.rs").expect("original path");
         let original_file = first.file(&original_path).expect("indexed file");
         assert_symbol_documents_do_not_carry_for_path_or_language(
@@ -5744,7 +5803,13 @@ mod tests {
         fs::write(root.join("b.rs"), changed_content).expect("changed source");
         let changes = resolved(&first, root, &["b.rs"]);
         let rebuilt = first.rebuilt(&changes).expect("incremental rebuild");
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(1.0)));
+        drop(rebuilt);
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
+
+        let rebuilt = first.rebuilt(&changes).expect("incremental rebuild");
         let rebuilt_groups = rebuilt.symbol_index_documents_by_file();
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
 
         assert!(Arc::ptr_eq(&first_groups[0], &rebuilt_groups[0]));
         assert!(!Arc::ptr_eq(&first_groups[1], &rebuilt_groups[1]));
@@ -5765,8 +5830,18 @@ mod tests {
             limits.syntax().syntax_depth_max(),
         )
         .expect("changed syntax bounds");
-        let invalidated = carried_symbol_documents(Some(&rebuilt), &rebuilt.files, limits_changed);
+        let (invalidated, _invalidated_count, invalidated_reading) =
+            observed_symbol_documents(Some(&rebuilt), &rebuilt.files, limits_changed);
         assert!(invalidated.read().expect("document cache lock").is_empty());
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(0.0)));
+        drop(invalidated_reading);
+        drop(invalidated);
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
+
+        drop(rebuilt);
+        assert_symbol_document_count(Some(rift_tracing::SeriesValue::Sum(2.0)));
+        drop(first);
+        assert_symbol_document_count(None);
     }
 
     #[test]
