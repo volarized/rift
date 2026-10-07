@@ -317,6 +317,59 @@ jobs:
           report_type: test_results
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # The ordinary nextest route disables SDK exports. This Linux run exercises the same
+  # archived unit suite with SDK export on, retaining bounded OTLP receipts on failure.
+  sdk-enabled-unit:
+    needs: rust-build
+    if: ${{ !cancelled() && needs.rust-build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: fast-build
+          path: target
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145
+      - run: rustup toolchain install 1.98 --profile minimal --component llvm-tools-preview
+      - name: Record archive identity
+        run: |
+          mkdir -p target/integration/nextest-sdk
+          printf 'commit=%s\nrun=%s\nattempt=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > target/integration/nextest-sdk/archive.txt
+          shasum -a 256 target/fast.tar.zst >> target/integration/nextest-sdk/archive.txt
+      - name: Run workspace suite with SDK export enabled
+        id: sdk_tests
+        timeout-minutes: 10
+        env:
+          CARGO_LLVM_COV_TARGET_DIR: target/llvm-cov-sdk
+          OTEL_SDK_DISABLED: "false"
+          RIFT_OTLP_FILTER: debug
+          RIFT_TEST_REPORT_DIRECTORY: target/integration/nextest-sdk
+        run: >-
+          uv run --locked --project dev rift-dev test nextest run --coverage
+          --archive-file target/fast.tar.zst --extract-overwrite --workspace-remap .
+          --profile ci --no-tests fail -E 'not test(/_probe$/)'
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ !cancelled() && steps.sdk_tests.outcome != 'skipped' }}
+        with:
+          name: sdk-enabled-unit
+          path: |
+            target/nextest/ci/junit.xml
+            target/nextest/ci/failure-windows/
+            target/integration/nextest-sdk/
+          if-no-files-found: error
+          retention-days: 7
+
   # The live suites drive real language engines: rust-analyzer, the TypeScript
   # server Bun installs, and the model hub the vector ranking reads. They run
   # against the same build the unit suites do, so they reuse that archive rather
