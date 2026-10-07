@@ -1182,7 +1182,6 @@ impl TraceReceiver {
 /// The batch processor's and the metric reader's export interval the export tests set: ten
 /// minutes, so no scheduled export runs while the server serves and only the stop's final
 /// flush sends.
-#[cfg(unix)]
 const EXPORT_INTERVAL_PAST_THE_TEST_MS: &str = "600000";
 
 /// The variables that point a server at `endpoint` with no scheduled export.
@@ -1258,7 +1257,6 @@ fn assert_export_stage_outcome(expected: &[&str]) -> TestResult {
     Ok(())
 }
 
-#[cfg(unix)]
 fn case_snapshot(path: &str) -> TestResult<serde_json::Value> {
     let attempt = std::env::var("NEXTEST_ATTEMPT_ID")?;
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
@@ -1284,7 +1282,6 @@ fn case_snapshot(path: &str) -> TestResult<serde_json::Value> {
     Ok(response)
 }
 
-#[cfg(unix)]
 fn assert_database_readings_follow_close() -> TestResult {
     let logs = case_snapshot("/test/case/logs")?;
     let close = logs["logs"]
