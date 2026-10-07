@@ -90,7 +90,25 @@ def unit(archive: Path | None) -> None:
             [
                 "-E",
                 "test(=recorder::tests::a_test_with_no_recorder_exports_from_sync_async_and_unwinding_contexts)",
+                "-E",
+                "test(=otlp::tests::trace_flush_leaves_metric_collection_for_provider_shutdown)",
+                "-E",
+                "test(=otlp::tests::staged_shutdown_keeps_logs_open_until_trace_and_meter_shutdown_finishes)",
+                "-E",
+                "test(=otlp::tests::a_stalled_collector_ends_the_shutdown_at_its_deadline)",
+                "-E",
+                "test(=otlp::tests::a_refusing_collector_keeps_the_span_queue_bounded_and_counts_the_drops)",
+                "-E",
+                "test(=otlp::tests::a_refusing_collector_keeps_the_log_queue_bounded_and_counts_the_drops)",
             ],
+            {"OTEL_SDK_DISABLED": "false", "RIFT_OTLP_FILTER": "debug"},
+        ),
+        (
+            archive_selection(
+                archive,
+                ["-p", "rift-tracing", "--test", "shutdown", "--all-features", "--locked"],
+            ),
+            ["-E", "test(=shutdown_sends_records_before_closing_export)"],
             {"OTEL_SDK_DISABLED": "false", "RIFT_OTLP_FILTER": "debug"},
         ),
         (
