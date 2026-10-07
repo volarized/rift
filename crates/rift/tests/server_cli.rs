@@ -480,6 +480,26 @@ fn document_path(root: &Path) -> PathBuf {
     root.join(".rift").join(SERVER_LOCK_FILE_NAME)
 }
 
+fn wait_for_initial_trigram_index(connection: &rusqlite::Connection) -> TestResult {
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the initial file rows to reach the trigram index",
+        || {
+            let (file_rows, pending) = connection
+                .query_row(
+                    "SELECT (SELECT count(*) FROM lexical_documents \
+                     WHERE file_content IS NOT NULL), \
+                     (SELECT count(*) FROM lexical_trigram_pending)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .ok()?;
+            (file_rows > 0 && pending == 0).then_some(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Polls `condition` every [`POLL_INTERVAL`] up to `attempts` times, and for no
 /// longer than those attempts span at that interval.
 ///
@@ -1736,9 +1756,11 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
             .then_some(())
     })?;
 
+    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
+    wait_for_initial_trigram_index(&holder)?;
+
     // Another process takes the index database's write lock, then a source change makes
     // the server write: its `BEGIN IMMEDIATE` waits inside SQLite's busy handler.
-    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
     holder.execute_batch("BEGIN IMMEDIATE")?;
     fs::write(
         root.join("lib.rs"),
