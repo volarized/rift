@@ -70,6 +70,7 @@ EXPECTED_EDGES = {
     "rift-lsp -> rift-core",
     "rift-lsp -> rift-error",
     "rift-lsp -> rift-provider",
+    "rift-lsp -> rift-tracing",
     "rift-mcp -> rift-core",
     "rift-mcp -> rift-error",
     "rift-mcp -> rift-analysis",

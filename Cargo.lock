@@ -4730,6 +4730,7 @@ dependencies = [
  "rift-core",
  "rift-error",
  "rift-provider",
+ "rift-tracing",
  "serde",
  "serde_json",
  "tempfile",
