@@ -600,10 +600,11 @@ impl WorkspaceDatabase {
     /// log, which the next open recovers.
     ///
     /// The close records `database closed; the write-ahead log stays for the next open` with
-    /// the frames the log held as `log`, the frames already moved as `checkpointed`, and its
-    /// `elapsed_ms`. The connection's open is recorded at `debug` as `the close keeps the
-    /// write-ahead log`. A connection that cannot open by `deadline` is recorded at `warn`, and
-    /// the worker stops anyway; its last connection's close then checkpoints.
+    /// the frames the log held as `log` and the frames already moved as `checkpointed`. The
+    /// `database.close` span close carries `elapsed_ms`. The connection's open is recorded at
+    /// `debug` as `the close keeps the write-ahead log`. A connection that cannot open by
+    /// `deadline` is recorded at `warn`, and the worker stops anyway; its last connection's
+    /// close then checkpoints.
     ///
     /// A worker whose stop outlasts `deadline` does not fail the close, whatever it was
     /// running: the stop is recorded as a `warn` event, the worker keeps running until it
@@ -633,7 +634,6 @@ impl WorkspaceDatabase {
             open = true,
             database = database,
             async {
-                let started = tokio::time::Instant::now();
                 let keeper = if self.checkpointed.swap(true, Ordering::AcqRel) {
                     None
                 } else {
@@ -663,7 +663,6 @@ impl WorkspaceDatabase {
                         database,
                         log = frames.log,
                         checkpointed = frames.checkpointed,
-                        elapsed_ms = elapsed_ms(started.elapsed()),
                         "database closed; the write-ahead log stays for the next open"
                     );
                 }
@@ -2981,10 +2980,10 @@ mod tests {
             .collect()
     }
 
-    /// The close records the frames the log held, the frames already moved, and how long
-    /// it ran; the written frames stay unmoved.
+    /// The close records the frames the log held and the frames already moved; the written
+    /// frames stay unmoved.
     #[tokio::test]
-    async fn the_close_records_the_frames_it_leaves_and_its_time() -> TestResult {
+    async fn the_close_records_the_frames_it_leaves() -> TestResult {
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let directory = tempfile::tempdir()?;
         let path = DatabaseName::Index.path(directory.path());
@@ -3018,7 +3017,6 @@ mod tests {
         let log = count("log").ok_or("log is a count")?;
         let moved = count("checkpointed").ok_or("checkpointed is a count")?;
         assert!(log > moved, "the written frames stay in the log: {fields}");
-        assert!(count("elapsed_ms").is_some(), "{fields}");
         Ok(())
     }
 
