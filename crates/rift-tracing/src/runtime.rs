@@ -38,7 +38,7 @@ pub(crate) const DEFAULT_TRACING_FILTER: &str =
 /// Default stderr filter: the default targets, with only the stall reports of the table of
 /// operations in flight. The table's other records reach the capture under its own filter.
 pub(crate) const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
-                                     rift_tracing::flight=warn";
+                                     rift_tracing::runtime=warn,rift_tracing::flight=warn";
 
 /// How much the process may write to its standard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
