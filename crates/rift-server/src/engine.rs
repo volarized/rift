@@ -793,13 +793,31 @@ impl EngineSlot {
         if let Some(start) = held.starting.take() {
             start.abort();
             if let Ok(Ok(started)) = start.await {
-                Box::pin(started.shutdown()).await;
+                let engine = self.name().to_owned();
+                let program = self.program().to_owned();
+                Box::pin(rift_tracing::traced!(
+                    component = "engine",
+                    operation = "EngineSession::shutdown",
+                    engine = engine,
+                    program = program,
+                    async move { started.shutdown().await }
+                ))
+                .await;
             }
         }
         let Some(session) = held.session.take() else {
             return;
         };
-        let stderr = Box::pin(session.shutdown()).await;
+        let engine = self.name().to_owned();
+        let program = self.program().to_owned();
+        let stderr = Box::pin(rift_tracing::traced!(
+            component = "engine",
+            operation = "EngineSession::shutdown",
+            engine = engine,
+            program = program,
+            async move { session.shutdown().await }
+        ))
+        .await;
         self.report_state(LspState::Stopped);
         let engine = self.name();
         rift_tracing::debug!(
@@ -1391,6 +1409,9 @@ impl EngineSlot {
     /// a request that waits for it can be dropped without ending it.
     fn spawn_start(&self) -> tokio::task::JoinHandle<Result<EngineSession, RiftError>> {
         let root = self.workspace_root.clone();
+        let parent = rift_tracing::Span::current();
+        let engine_name = self.name().to_owned();
+        let program_name = self.program().to_owned();
         match (
             self.configuration.embedded,
             self.configuration.command.as_ref(),
@@ -1398,12 +1419,32 @@ impl EngineSlot {
             (Some(engine), _) => {
                 let launch = self.embedded_launch(engine);
                 tokio::spawn(async move {
-                    Box::pin(crate::embedded::started_session(launch, &root)).await
+                    rift_tracing::traced!(
+                        parent: &parent,
+                        component = "engine",
+                        operation = "engine.start",
+                        engine = engine_name,
+                        program = program_name,
+                        async move {
+                            Box::pin(crate::embedded::started_session(launch, &root)).await
+                        }
+                    )
+                    .await
                 })
             }
             (None, Some(command)) => {
                 let launch = self.launch(command);
-                tokio::spawn(async move { Box::pin(EngineSession::start(launch, &root)).await })
+                tokio::spawn(async move {
+                    rift_tracing::traced!(
+                        parent: &parent,
+                        component = "engine",
+                        operation = "engine.start",
+                        engine = engine_name,
+                        program = program_name,
+                        async move { Box::pin(EngineSession::start(launch, &root)).await }
+                    )
+                    .await
+                })
             }
             (None, None) => {
                 unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
@@ -1518,7 +1559,16 @@ impl EngineSlot {
         let ended = replaced.is_ended();
         // Boxed for the reason `end_session` boxes it: the shutdown future is 9,920 bytes
         // on aarch64. One allocation per replaced session.
-        let stderr = Box::pin(replaced.shutdown()).await;
+        let engine = self.name().to_owned();
+        let program = self.program().to_owned();
+        let stderr = Box::pin(rift_tracing::traced!(
+            component = "engine",
+            operation = "EngineSession::shutdown",
+            engine = engine,
+            program = program,
+            async move { replaced.shutdown().await }
+        ))
+        .await;
         let engine = self.name();
         if ended {
             rift_tracing::warn!(
