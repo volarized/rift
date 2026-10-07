@@ -457,13 +457,10 @@ const RECORDED_AFTER_OPEN: &str =
 fn a_field_recorded_after_open_reaches_later_events() {
     crate::__private::stream_unscoped();
     let (sink, mut drain) = log_capture();
-    let runtime = crate::recorder::TestOtlpRuntime::when_configured_without_runtime();
-    let (otlp_layer, export) = if let Some(runtime) = &runtime {
-        let _entered = runtime.enter();
-        crate::otlp::test_process_layer(EnvFilter::new("trace"))
-    } else {
-        crate::otlp::test_process_layer(EnvFilter::new("trace"))
-    };
+    let _entered =
+        crate::otlp::recorder_export_configured().then(|| crate::recorder::test_runtime().enter());
+    let (otlp_layer, export) = crate::otlp::recorder_layer(EnvFilter::new("trace"));
+    crate::recorder::retain_export(export);
     let subscriber = crate::capture::registry().with(sink).with(otlp_layer);
 
     tracing::subscriber::with_default(subscriber, || {
@@ -476,11 +473,6 @@ fn a_field_recorded_after_open_reaches_later_events() {
         span.record("upstream_request_id", 12);
         span.in_scope(|| tracing::info!("after"));
     });
-    if let Some(runtime) = runtime {
-        runtime
-            .shutdown(export)
-            .expect("the local test OTLP export shuts down");
-    }
 
     let records = event_fields(queued(&mut drain));
     assert_eq!(records[0].0, "before");

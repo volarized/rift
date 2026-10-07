@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-exclude = ["vendor/tracing-opentelemetry"]
 
 [workspace.package]
 version = "0.0.62"
@@ -177,9 +176,6 @@ ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491b
 ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
 ty_python_core = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
-
-[patch.crates-io]
-tracing-opentelemetry = { path = "vendor/tracing-opentelemetry" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

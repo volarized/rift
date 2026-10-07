@@ -10,7 +10,7 @@ description = "The metrics database and the instrumentation Rift crates emit thr
 [features]
 # The scoped recorder for dependent crates' tests; never a production feature. Enable it
 # from `[dev-dependencies]` only, so a release build carries no recorder. Its metric reads
-# come from the SDK's in-memory exporter.
+# collect from the SDK reader; the dev appliance receives standard OTLP in Python.
 fixtures = ["dep:shutdown_hooks", "opentelemetry_sdk/testing"]
 
 [lints]

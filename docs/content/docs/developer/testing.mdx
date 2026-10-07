@@ -81,8 +81,10 @@ A successful run prints its start time followed by:
 
 A failed run groups output by test, with the error first, then timestamped logs and metrics.
 Its report keeps original multiline records, trace and span IDs, span duration and status, and
-metric units and temporality. `ScopedRecorder` also streams records to nextest's captured stderr
-through `RIFT_SCOPED_RECORDER_STREAM`, so a timeout retains output before process termination.
+metric units and temporality. Rust exports OTLP through the standard SDK Tokio batch processors
+and periodic reader, using async HTTP. Python receives the exported records. SDK providers stay
+open until test process exit; synchronous SDK shutdown runs on Tokio's blocking pool within the
+existing deadline. The upstream `tracing-opentelemetry` crate is used without a vendor patch.
 `ScopedRecorderBuilder::clock` names the clock span timings and `measure_elapsed!` read on the
 recorder's thread, so a test advances time instead of sleeping.
 

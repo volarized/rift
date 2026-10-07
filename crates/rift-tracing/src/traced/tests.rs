@@ -436,13 +436,10 @@ fn async_block_question_mark_applies_to_the_block() {
 #[test]
 fn events_keep_the_caller_module_as_target() {
     crate::__private::stream_unscoped();
-    let runtime = crate::recorder::TestOtlpRuntime::when_configured_without_runtime();
-    let (otlp_layer, export) = if let Some(runtime) = &runtime {
-        let _entered = runtime.enter();
-        crate::otlp::test_process_layer(EnvFilter::new("trace"))
-    } else {
-        crate::otlp::test_process_layer(EnvFilter::new("trace"))
-    };
+    let _entered =
+        crate::otlp::recorder_export_configured().then(|| crate::recorder::test_runtime().enter());
+    let (otlp_layer, export) = crate::otlp::recorder_layer(EnvFilter::new("trace"));
+    crate::recorder::retain_export(export);
     let recorder = Recorder::default();
     let guard = tracing_subscriber::registry()
         .with(recorder.clone())
@@ -455,11 +452,6 @@ fn events_keep_the_caller_module_as_target() {
     let targets = recorder.targets.lock().expect("not poisoned").clone();
     assert_eq!(targets, [module_path!(), "rift_mcp::election"]);
     drop(guard);
-    if let Some(runtime) = runtime {
-        runtime
-            .shutdown(export)
-            .expect("the local test OTLP export shuts down");
-    }
 }
 
 /// A body holding this many bytes across an await keeps the future at least that large.

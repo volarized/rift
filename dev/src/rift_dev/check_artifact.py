@@ -21,7 +21,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import TEST_CASE_KEY, resource_attribute
+from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
 
 ARTIFACT_SECONDS = 240.0
 CONFIGURATION = "[search.vector]\ndisabled = true\n"
@@ -108,6 +108,38 @@ async def check_external_change(client: Client, root: Path) -> None:
     )
 
 
+def check_database_readings_follow_close(telemetry: Collector) -> None:
+    """Require standard OTLP to retain database readings after the server closes SQLite."""
+    closes = [
+        entry
+        for entry in telemetry.logs.between(None, None)
+        if entry.body == "database closed; the write-ahead log stays for the next open"
+        and ("operation", "database.close") in entry.attributes
+    ]
+    require(bool(closes), "the collector retains the database.close record")
+    close_time = max(entry.time_unix_nano for entry in closes)
+    instances = {entry.instance for entry in closes}
+    points = telemetry.metrics.between(None, None)
+    for namespace in ("index", "metrics"):
+        for name, attribute, value in (
+            ("sqlite.file.size", "sqlite.file.type", "database"),
+            ("sqlite.file.size", "sqlite.file.type", "wal"),
+            ("sqlite.page.count", "sqlite.page.state", "used"),
+            ("sqlite.page.count", "sqlite.page.state", "free"),
+        ):
+            require(
+                any(
+                    point.name == name
+                    and ("db.namespace", namespace) in point.attributes
+                    and (attribute, value) in point.attributes
+                    and point.instance in instances
+                    and point.time_unix_nano > close_time
+                    for point in points
+                ),
+                f"the collector retains post-close {name} for {namespace} with {attribute}={value}",
+            )
+
+
 async def check_artifact(binary: Path, version: str) -> None:
     """Run the real executable without compiling or replacing its bytes."""
     async with gate_deadline("artifact", ARTIFACT_SECONDS):
@@ -136,6 +168,7 @@ async def check_artifact(binary: Path, version: str) -> None:
                     await check_reads(client)
                     await check_external_change(client, root)
                 server.stop()
+                check_database_readings_follow_close(telemetry)
             except BaseException as error:
                 for note in server.evidence():
                     error.add_note(note)

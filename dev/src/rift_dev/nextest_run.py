@@ -392,7 +392,7 @@ class ArtifactStore:
 
 
 def measurement_summary(logs: Iterable[LogEntry]) -> list[str]:
-    """Summarize recorded T-149 samples without combining separate processes."""
+    """Summarize recorded cost samples without combining separate processes."""
     groups: dict[
         tuple[str, tuple[str, ...], str],
         dict[str, list[tuple[float, int]]],
@@ -429,7 +429,7 @@ def measurement_summary(logs: Iterable[LogEntry]) -> list[str]:
 
     if not groups and incomplete == 0:
         return []
-    lines = ["---- T-149 measurement medians ----"]
+    lines = ["---- measurement medians ----"]
     for (measurement, group_values, instance), samples in sorted(groups.items()):
         group_keys = MEASUREMENT_FIELDS[measurement][0]
         labels = " ".join(

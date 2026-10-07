@@ -2,8 +2,8 @@
 //! of the process's meter.
 //!
 //! The first recorder a process installs builds one meter provider and retains its reader.
-//! A read collects once. With an OTLP exporter, that collection also supplies the points
-//! for export. The provider bounds each instrument at
+//! A fixture read collects once for its assertions. OTLP export runs independently on
+//! the SDK periodic reader. The provider bounds each instrument at
 //! [`CARDINALITY_LIMIT`](crate::CARDINALITY_LIMIT) series. Nothing here aggregates; a series
 //! is one point, its labels and value as the SDK reported them.
 
@@ -14,38 +14,25 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMe
 use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
-pub(crate) type MetricExport =
-    Arc<dyn Fn(ResourceMetrics) -> Result<(), crate::otlp::ExportShutdownError> + Send + Sync>;
-
 /// The meter provider and reader every recorder of the process reads.
 struct RecorderMeters {
     reader: Arc<dyn MetricReader>,
     exporter: Option<InMemoryMetricExporter>,
-    metric_export: Option<MetricExport>,
 }
 
 static RECORDER_METERS: OnceLock<RecorderMeters> = OnceLock::new();
 
 /// Installs the recorder's meter provider and reader when configured.
-pub(crate) fn install(
-    provider: Option<SdkMeterProvider>,
-    reader: Option<Arc<dyn MetricReader>>,
-    metric_export: Option<MetricExport>,
-) {
+pub(crate) fn install(provider: Option<SdkMeterProvider>, reader: Option<Arc<dyn MetricReader>>) {
     let _ = RECORDER_METERS.get_or_init(|| {
-        let (provider, reader, exporter, metric_export) =
+        let (provider, reader, exporter) =
             if let (Some(provider), Some(reader)) = (provider, reader) {
-                (provider, reader, None, metric_export)
+                (provider, reader, None)
             } else {
-                let (provider, reader, exporter) = local_provider();
-                (provider, reader, exporter, None)
+                local_provider()
             };
         crate::metrics::install_meter(provider.clone());
-        RecorderMeters {
-            reader,
-            exporter,
-            metric_export,
-        }
+        RecorderMeters { reader, exporter }
     });
 }
 
@@ -53,11 +40,7 @@ fn meters() -> &'static RecorderMeters {
     RECORDER_METERS.get_or_init(|| {
         let (provider, reader, exporter) = local_provider();
         crate::metrics::install_meter(provider.clone());
-        RecorderMeters {
-            reader,
-            exporter,
-            metric_export: None,
-        }
+        RecorderMeters { reader, exporter }
     })
 }
 
@@ -91,11 +74,7 @@ pub(crate) fn snapshot() -> MetricSnapshot {
     if let Some(exporter) = &meters.exporter {
         exporter.reset();
     }
-    let snapshot = MetricSnapshot::of(&exported);
-    if let Some(export) = &meters.metric_export {
-        let _ = export(exported);
-    }
-    snapshot
+    MetricSnapshot::of(&exported)
 }
 
 /// Every series one export of the process's instruments holds, ordered by instrument

@@ -25,20 +25,10 @@
 mod metrics;
 mod unscoped;
 
-use std::sync::Arc;
-#[cfg(any(test, feature = "fixtures"))]
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, SyncSender};
-#[cfg(any(test, feature = "fixtures"))]
-use std::sync::{Mutex, OnceLock, TryLockError};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-#[cfg(any(test, feature = "fixtures"))]
-use opentelemetry_otlp::MetricExporter;
-#[cfg(any(test, feature = "fixtures"))]
-use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::{SpanContextLayer, log_capture};
@@ -69,440 +59,170 @@ static UNSCOPED_TRIED: AtomicBool = AtomicBool::new(false);
 /// Whether this process installed a recorder: from then on the unscoped stream enables
 /// nothing (`unscoped.rs` states why).
 static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Owns test-process exporters until explicit shutdown or process exit.
-#[cfg(any(test, feature = "fixtures"))]
-static UNSCOPED_TEST_EXPORT: OnceLock<Mutex<Option<UnscopedTestExport>>> = OnceLock::new();
-#[cfg(any(test, feature = "fixtures"))]
-static UNSCOPED_SHUTDOWN_HOOK: OnceLock<bool> = OnceLock::new();
-#[cfg(any(test, feature = "fixtures"))]
-static UNSCOPED_EXPORT_STATE: AtomicU8 = AtomicU8::new(0);
-#[cfg(any(test, feature = "fixtures"))]
-const UNSCOPED_EXPORT_INITIALIZING: u8 = 1;
-#[cfg(any(test, feature = "fixtures"))]
-const UNSCOPED_EXPORT_ACTIVE: u8 = 2;
-#[cfg(any(test, feature = "fixtures"))]
-const UNSCOPED_EXPORT_SHUTTING_DOWN: u8 = 3;
-#[cfg(any(test, feature = "fixtures"))]
-const UNSCOPED_EXPORT_CLOSED: u8 = 4;
-#[cfg(any(test, feature = "fixtures"))]
-const UNSCOPED_EXPORT_FAILED: u8 = 5;
+/// SDK providers remain open until the test process exits.
+static TEST_EXPORTS: OnceLock<Mutex<Vec<OtlpExport>>> = OnceLock::new();
+static TEST_METERS: OnceLock<()> = OnceLock::new();
+static TEST_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static TEST_SHUTDOWN_HOOK: OnceLock<bool> = OnceLock::new();
+const TEST_EXPORTS_MAX: usize = 512;
 #[cfg(test)]
 static UNSCOPED_EXPORT_SHUTDOWN_SUCCEEDED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(any(test, feature = "fixtures"))]
-fn unscoped_test_export_slot() -> &'static Mutex<Option<UnscopedTestExport>> {
-    UNSCOPED_TEST_EXPORT.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-fn register_unscoped_shutdown_hook() -> bool {
-    *UNSCOPED_SHUTDOWN_HOOK
-        .get_or_init(|| shutdown_hooks::add_shutdown_hook(shutdown_unscoped_test_export_at_exit))
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-fn unscoped_shutdown_deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now()
-        + otlp::OTLP_EXPORT_TIMEOUT
-        + crate::OTLP_SHUTDOWN_TIMEOUT
-        + crate::OTLP_SHUTDOWN_TIMEOUT
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-struct UnscopedExportSetup {
-    finished: bool,
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-impl UnscopedExportSetup {
-    fn begin() -> Option<Self> {
-        let deadline = unscoped_shutdown_deadline();
-        loop {
-            match UNSCOPED_EXPORT_STATE.compare_exchange(
-                0,
-                UNSCOPED_EXPORT_INITIALIZING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(Self { finished: false }),
-                Err(UNSCOPED_EXPORT_ACTIVE | UNSCOPED_EXPORT_CLOSED) => return None,
-                Err(UNSCOPED_EXPORT_INITIALIZING) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "test process export setup finishes within its shutdown budget"
-                    );
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(state) => panic!("unknown test process export state {state}"),
-            }
-        }
-    }
-
-    fn finish(mut self) {
-        UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_ACTIVE, Ordering::Release);
-        self.finished = true;
-    }
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-impl Drop for UnscopedExportSetup {
-    fn drop(&mut self) {
-        if !self.finished {
-            let _ = UNSCOPED_EXPORT_STATE.compare_exchange(
-                UNSCOPED_EXPORT_INITIALIZING,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-    }
-}
-
-/// Installs the unscoped exporter once per process, when [`SCOPED_RECORDER_STREAM_VARIABLE`]
-/// is set and nextest started the process. `tracing-core`'s global default "can only be
-/// set once; subsequent attempts to set the global default will fail", so a process that
-/// set one first keeps it, and no stream starts.
-pub(crate) fn stream_unscoped() {
-    if UNSCOPED_TRIED.load(Ordering::Relaxed) || UNSCOPED_TRIED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if RECORDER_INSTALLED.load(Ordering::Relaxed)
-        || !std::env::args_os().any(|argument| argument == NEXTEST_ARGUMENT)
-    {
-        return;
-    }
-    let stream = std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_some();
-    #[cfg(any(test, feature = "fixtures"))]
-    let export_enabled = otlp::test_process_export_configured();
-    #[cfg(not(any(test, feature = "fixtures")))]
-    let export_enabled = false;
-    if !stream && !export_enabled {
-        return;
-    }
-    #[cfg(any(test, feature = "fixtures"))]
-    let export_setup = if export_enabled {
+/// Drives the SDK's standard asynchronous processors for synchronous libtest callers.
+pub(crate) fn test_runtime() -> &'static tokio::runtime::Runtime {
+    TEST_RUNTIME.get_or_init(|| {
         assert!(
-            register_unscoped_shutdown_hook(),
+            *TEST_SHUTDOWN_HOOK.get_or_init(|| shutdown_hooks::add_shutdown_hook(
+                shutdown_unscoped_test_export_at_exit
+            )),
             "test process export shutdown hook registers before setup"
         );
-        let Some(setup) = UnscopedExportSetup::begin() else {
-            return;
-        };
-        Some(setup)
-    } else {
-        None
-    };
-    let Ok(filter) = recorder_filter(Some(UNSCOPED_CAPTURE)) else {
-        return;
-    };
-    // No drain reads the queue: a closed queue counts no drop in `log.queue.dropped`.
-    let (sink, _drain) = log_capture();
-    let flights = Arc::new(FlightTable::default());
-    #[cfg(any(test, feature = "fixtures"))]
-    let (otlp_layer, test_export) = if export_enabled {
-        let runtime = TestOtlpRuntime::start();
-        let entered = runtime.handle.enter();
-        let (layer, export) = otlp::test_process_layer(filter.clone());
-        drop(entered);
-        (Some(layer), Some(runtime.with_export(export)))
-    } else {
-        (None, None)
-    };
-    let subscriber = crate::capture::registry()
-        .with(FlightLayer::new(Arc::clone(&flights)))
-        .with(capture_layer(sink, filter))
-        .with(unscoped::StopAtRecorder);
-    #[cfg(any(test, feature = "fixtures"))]
-    let subscriber = subscriber.with(otlp_layer);
-    if tracing::subscriber::set_global_default(subscriber).is_err() {
-        return;
-    }
-    #[cfg(any(test, feature = "fixtures"))]
-    let (worker_stop, stop_receiver) = if test_export.is_some() {
-        let (stop, receiver) = mpsc::sync_channel(1);
-        (Some(stop), Some(receiver))
-    } else {
-        (None, None)
-    };
-    #[cfg(any(test, feature = "fixtures"))]
-    let worker = spawn_unscoped_stream(Arc::clone(&flights), stop_receiver);
-    #[cfg(not(any(test, feature = "fixtures")))]
-    let _worker = spawn_unscoped_stream(flights, None);
-    #[cfg(any(test, feature = "fixtures"))]
-    if let Some(test_export) = test_export {
-        test_export.install_meter();
-        let stop = worker_stop.expect("an unscoped test export owns its worker stop channel");
-        *unscoped_test_export_slot()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UnscopedTestExport {
-            export: Some(test_export),
-            stop,
-            worker,
-        });
-        export_setup
-            .expect("an enabled test process export owns setup")
-            .finish();
-    }
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test OTLP runtime builds")
+    })
 }
 
-#[cfg(any(test, feature = "fixtures"))]
+pub(crate) fn retain_export(export: OtlpExport) {
+    if !otlp::recorder_export_configured() {
+        return;
+    }
+    let mut exports = TEST_EXPORTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        exports.len() < TEST_EXPORTS_MAX,
+        "test process SDK providers stay within their bound"
+    );
+    exports.push(export);
+}
+
 fn install_test_process_export(filter: tracing_subscriber::EnvFilter) {
-    if std::env::var_os("NEXTEST_ATTEMPT_ID").is_none()
-        || !std::env::args_os().any(|argument| argument == "--exact")
+    if !otlp::recorder_export_configured() {
+        return;
+    }
+    TEST_METERS.get_or_init(|| {
+        let _entered = test_runtime().enter();
+        let (layer, export) = otlp::test_process_layer::<tracing_subscriber::Registry>(filter);
+        drop(layer);
+        metrics::install(
+            export.recorder_meter_provider(),
+            export.recorder_metric_reader(),
+        );
+        retain_export(export);
+    });
+}
+
+/// Installs the standard OTLP layer for a test without a scoped recorder.
+pub(crate) fn stream_unscoped() {
+    if RECORDER_INSTALLED.load(Ordering::Relaxed)
+        || UNSCOPED_TRIED.swap(true, Ordering::Relaxed)
+        || std::env::var_os("NEXTEST_ATTEMPT_ID").is_none()
+        || !std::env::args_os().any(|argument| argument == NEXTEST_ARGUMENT)
+        || std::env::var_os(SCOPED_RECORDER_STREAM_VARIABLE).is_none()
         || !otlp::recorder_export_configured()
     {
         return;
     }
-
-    assert!(
-        register_unscoped_shutdown_hook(),
-        "test process export shutdown hook registers before setup"
-    );
-    let Some(export_setup) = UnscopedExportSetup::begin() else {
+    let Ok(filter) = recorder_filter(Some(UNSCOPED_CAPTURE)) else {
         return;
     };
-
-    let runtime = TestOtlpRuntime::when_configured()
-        .expect("a configured test process export owns its runtime");
-    let entered = runtime.handle.enter();
-    let (layer, export) = otlp::test_process_layer::<tracing_subscriber::Registry>(filter);
-    drop(entered);
-    drop(layer);
-
-    let export = runtime.with_export(export);
-    export.install_meter();
-    let (stop, _receiver) = mpsc::sync_channel(1);
-    *unscoped_test_export_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UnscopedTestExport {
-        export: Some(export),
-        stop,
-        worker: None,
-    });
-    export_setup.finish();
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-struct UnscopedTestExport {
-    export: Option<TestOtlpExport>,
-    stop: SyncSender<()>,
-    worker: Option<JoinHandle<()>>,
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-impl UnscopedTestExport {
-    fn shutdown_before(
-        &mut self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), ExportShutdownError> {
-        let Some(mut export) = self.export.take() else {
-            return Ok(());
-        };
-        if let Some(worker) = self.worker.take() {
-            let _ = self.stop.try_send(());
-            let worker_deadline =
-                deadline - otlp::OTLP_EXPORT_TIMEOUT - crate::OTLP_SHUTDOWN_TIMEOUT;
-            while !worker.is_finished() && tokio::time::Instant::now() < worker_deadline {
-                thread::sleep(Duration::from_millis(1));
-            }
-            if !worker.is_finished() {
-                std::mem::forget(export);
-                return Err(ExportShutdownError::TimedOut);
-            }
-            let worker_panicked = worker.join().is_err();
-            let shutdown = export.shutdown_before(deadline);
-            if worker_panicked {
-                return shutdown.and(Err(ExportShutdownError::Failed(
-                    "the unscoped stream worker panicked".to_owned(),
-                )));
-            }
-            return shutdown;
-        }
-        export.shutdown_before(deadline)
-    }
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-struct UnscopedExportShutdown {
-    succeeded: bool,
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-impl Drop for UnscopedExportShutdown {
-    fn drop(&mut self) {
-        UNSCOPED_EXPORT_STATE.store(
-            if self.succeeded {
-                UNSCOPED_EXPORT_CLOSED
-            } else {
-                UNSCOPED_EXPORT_FAILED
-            },
-            Ordering::Release,
-        );
-    }
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-fn take_unscoped_test_export(
-    deadline: tokio::time::Instant,
-) -> Result<Option<(UnscopedTestExport, UnscopedExportShutdown)>, ExportShutdownError> {
-    loop {
-        match UNSCOPED_EXPORT_STATE.load(Ordering::Acquire) {
-            0 | UNSCOPED_EXPORT_CLOSED => return Ok(None),
-            UNSCOPED_EXPORT_FAILED => {
-                return Err(ExportShutdownError::Failed(
-                    "the test process export shutdown failed".to_owned(),
-                ));
-            }
-            UNSCOPED_EXPORT_INITIALIZING | UNSCOPED_EXPORT_SHUTTING_DOWN => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ExportShutdownError::TimedOut);
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-            UNSCOPED_EXPORT_ACTIVE => {
-                if UNSCOPED_EXPORT_STATE
-                    .compare_exchange(
-                        UNSCOPED_EXPORT_ACTIVE,
-                        UNSCOPED_EXPORT_SHUTTING_DOWN,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-                break;
-            }
-            state => {
-                return Err(ExportShutdownError::Failed(format!(
-                    "unknown test process export state {state}"
-                )));
-            }
-        }
-    }
-
-    let slot = unscoped_test_export_slot();
-    loop {
-        match slot.try_lock() {
-            Ok(mut owner) => {
-                let Some(owner) = owner.take() else {
-                    UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_FAILED, Ordering::Release);
-                    return Err(ExportShutdownError::Failed(
-                        "the active test process export has no owner".to_owned(),
-                    ));
-                };
-                return Ok(Some((owner, UnscopedExportShutdown { succeeded: false })));
-            }
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let mut owner = poisoned.into_inner();
-                let Some(owner) = owner.take() else {
-                    UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_FAILED, Ordering::Release);
-                    return Err(ExportShutdownError::Failed(
-                        "the active test process export has no owner".to_owned(),
-                    ));
-                };
-                return Ok(Some((owner, UnscopedExportShutdown { succeeded: false })));
-            }
-            Err(TryLockError::WouldBlock) => {
-                if tokio::time::Instant::now() >= deadline {
-                    UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_ACTIVE, Ordering::Release);
-                    return Err(ExportShutdownError::TimedOut);
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-extern "C" fn shutdown_unscoped_test_export_at_exit() {
-    if UNSCOPED_EXPORT_STATE.load(Ordering::Acquire) == 0 {
+    let _entered = test_runtime().enter();
+    let flights = Arc::new(FlightTable::default());
+    let (layer, export) = otlp::test_process_layer(filter.clone());
+    let subscriber = crate::capture::registry()
+        .with(FlightLayer::new(Arc::clone(&flights)))
+        .with(layer)
+        .with(filter)
+        .with(unscoped::StopAtRecorder);
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
         return;
     }
-    let result = shutdown_unscoped_test_export_before(unscoped_shutdown_deadline());
-    let completed =
-        result.is_ok() && UNSCOPED_EXPORT_STATE.load(Ordering::Acquire) == UNSCOPED_EXPORT_CLOSED;
-    #[cfg(test)]
-    UNSCOPED_EXPORT_SHUTDOWN_SUCCEEDED.store(completed, Ordering::Release);
-    if !completed {
-        std::process::abort();
-    }
+    TEST_METERS.get_or_init(|| {
+        metrics::install(
+            export.recorder_meter_provider(),
+            export.recorder_metric_reader(),
+        );
+    });
+    retain_export(export);
+    test_runtime().spawn(async move {
+        let mut ticks = tokio::time::interval(UNSCOPED_IN_FLIGHT_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let listing = flights.listing(monotonic_now());
+            if listing.in_flight > 0 {
+                tracing::info!(target: "rift_tracing::flight", reason = "unscoped_stream",
+                in_flight = listing.in_flight, left_out = listing.left_out,
+                untracked = listing.untracked, operations = %listing, "operations in flight");
+            }
+        }
+    });
 }
 
-#[cfg(any(test, feature = "fixtures"))]
-fn shutdown_unscoped_test_export_before(
-    deadline: tokio::time::Instant,
-) -> Result<(), ExportShutdownError> {
-    let Some((mut owner, mut shutdown)) = take_unscoped_test_export(deadline)? else {
+fn shutdown_test_exports() -> Result<(), ExportShutdownError> {
+    let Some(runtime) = TEST_RUNTIME.get() else {
         return Ok(());
     };
-    let result = owner.shutdown_before(deadline);
-    shutdown.succeeded = result.is_ok();
-    drop(shutdown);
-    result
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-fn spawn_unscoped_stream(
-    flights: Arc<FlightTable>,
-    stop_receiver: Option<mpsc::Receiver<()>>,
-) -> Option<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("rift-unscoped-stream".to_owned())
-        .spawn(move || {
-            loop {
-                if let Some(stop_receiver) = &stop_receiver {
-                    match stop_receiver.recv_timeout(UNSCOPED_IN_FLIGHT_INTERVAL) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                } else {
-                    thread::sleep(UNSCOPED_IN_FLIGHT_INTERVAL);
-                }
-                let listing = flights.listing(monotonic_now());
-                if listing.in_flight > 0 {
-                    tracing::info!(
-                        target: "rift_tracing::flight",
-                        reason = "unscoped_stream",
-                        in_flight = listing.in_flight,
-                        left_out = listing.left_out,
-                        untracked = listing.untracked,
-                        operations = %listing,
-                        "operations in flight"
-                    );
-                }
-            }
+    let exports = TEST_EXPORTS
+        .get()
+        .map(|exports| {
+            std::mem::take(
+                &mut *exports
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
         })
-        .ok()
-}
-
-#[cfg(not(any(test, feature = "fixtures")))]
-fn spawn_unscoped_stream(flights: Arc<FlightTable>) {
-    let _ = std::thread::Builder::new()
-        .name("rift-unscoped-stream".to_owned())
-        .spawn(move || {
-            loop {
-                thread::sleep(UNSCOPED_IN_FLIGHT_INTERVAL);
-                let listing = flights.listing(monotonic_now());
-                if listing.in_flight > 0 {
-                    tracing::info!(
-                        target: "rift_tracing::flight",
-                        reason = "unscoped_stream",
-                        in_flight = listing.in_flight,
-                        left_out = listing.left_out,
-                        untracked = listing.untracked,
-                        operations = %listing,
-                        "operations in flight"
-                    );
-                }
+        .unwrap_or_default();
+    if exports.is_empty() {
+        return Ok(());
+    }
+    // libtest's process-exit hook is synchronous; all exporter work remains async.
+    runtime.block_on(async move {
+        let deadline = tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT;
+        let mut tasks = tokio::task::JoinSet::new();
+        for export in exports {
+            tasks.spawn(async move { export.shutdown(deadline).await });
+        }
+        let mut result = Ok(());
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => result = Err(error),
+                Err(error) => result = Err(ExportShutdownError::Failed(error.to_string())),
             }
-        });
+        }
+        result
+    })
 }
 
-/// Shuts down the unscoped test export after its records, returning a shutdown error.
+extern "C" fn shutdown_unscoped_test_export_at_exit() {
+    // Rustdoc's main thread has destroyed Tokio's context before atexit runs.
+    // Enter the retained runtime on a fresh thread; exporter work stays async.
+    let result = std::thread::Builder::new()
+        .name("rift-test-otlp-shutdown".to_owned())
+        .spawn(shutdown_test_exports)
+        .map_err(|error| ExportShutdownError::Failed(error.to_string()))
+        .and_then(|worker| {
+            worker.join().unwrap_or_else(|_| {
+                Err(ExportShutdownError::Failed(
+                    "the test process export shutdown task panicked".to_owned(),
+                ))
+            })
+        });
+    #[cfg(test)]
+    UNSCOPED_EXPORT_SHUTDOWN_SUCCEEDED.store(result.is_ok(), Ordering::Release);
+    if let Err(error) = result {
+        eprintln!("rift: warning: {error}");
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn shutdown_unscoped_test_export() -> Result<(), ExportShutdownError> {
-    shutdown_unscoped_test_export_before(unscoped_shutdown_deadline())
+    shutdown_test_exports()
 }
 
 /// The filter a recorder captures under: `capture`, or every level of every target, with
@@ -554,8 +274,6 @@ pub struct ScopedRecorder {
     /// Keeps the recorder's table of operations in flight reported in `operation.active`.
     _in_flight: Option<ObservationGuard>,
     _default: tracing::subscriber::DefaultGuard,
-    /// Flushes this test's exporter after its thread-local subscriber is restored.
-    _test_export: Option<TestOtlpExport>,
 }
 
 impl ScopedRecorder {
@@ -661,21 +379,10 @@ impl ScopedRecorderBuilder {
         #[cfg(any(test, feature = "fixtures"))]
         install_test_process_export(filter.clone());
         let (sink, drain) = log_capture();
-        let runtime = TestOtlpRuntime::when_configured();
-        let (otlp_layer, export) = if let Some(runtime) = &runtime {
-            let _entered = runtime.handle.enter();
-            otlp::recorder_layer(filter.clone())
-        } else {
-            otlp::recorder_layer(filter.clone())
-        };
-        let meter_provider = export.recorder_meter_provider();
-        let metric_reader = export.recorder_metric_reader();
-        let metric_exporter = export.recorder_metric_exporter();
-        let metric_export = match (runtime.as_ref(), metric_exporter) {
-            (Some(runtime), Some(exporter)) => Some(runtime.metric_exporter(exporter)),
-            _ => None,
-        };
-        metrics::install(meter_provider, metric_reader, metric_export);
+        let _entered = otlp::recorder_export_configured().then(|| test_runtime().enter());
+        let (otlp_layer, export) = otlp::recorder_layer(filter.clone());
+        metrics::install(None, None);
+        retain_export(export);
         let flights = Arc::new(FlightTable::default());
         let in_flight = observe_active(&flights);
         let span_context = self
@@ -686,286 +393,11 @@ impl ScopedRecorderBuilder {
             .with(FlightLayer::new(flights))
             .with(capture_layer(sink, filter))
             .with(otlp_layer);
-        let test_export = runtime.map(|runtime| runtime.with_export(export));
         let recorder = ScopedRecorder {
             _in_flight: in_flight,
             _default: tracing::subscriber::set_default(subscriber),
-            _test_export: test_export,
         };
         Ok((recorder, drain))
-    }
-}
-
-/// A Tokio runtime held on its owner thread until the scoped recorder shuts its export down.
-#[cfg(any(test, feature = "fixtures"))]
-enum TestOtlpRequest {
-    ExportMetrics {
-        exporter: Arc<MetricExporter>,
-        metrics: ResourceMetrics,
-        deadline: tokio::time::Instant,
-        reply: SyncSender<Result<(), ExportShutdownError>>,
-    },
-    Shutdown {
-        export: OtlpExport,
-        deadline: tokio::time::Instant,
-        reply: SyncSender<Result<(), ExportShutdownError>>,
-    },
-}
-
-#[cfg(any(test, feature = "fixtures"))]
-pub(crate) struct TestOtlpRuntime {
-    handle: tokio::runtime::Handle,
-    requests: SyncSender<TestOtlpRequest>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl TestOtlpRuntime {
-    fn when_configured() -> Option<Self> {
-        otlp::recorder_export_configured().then(Self::start)
-    }
-
-    pub(crate) fn when_configured_without_runtime() -> Option<Self> {
-        tokio::runtime::Handle::try_current()
-            .is_err()
-            .then(Self::when_configured)
-            .flatten()
-    }
-
-    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
-        self.handle.enter()
-    }
-
-    fn start() -> Self {
-        let (ready, started) = mpsc::sync_channel(1);
-        let (requests, stop) = mpsc::sync_channel::<TestOtlpRequest>(1);
-        let thread = thread::Builder::new()
-            .name("rift-test-otlp-runtime".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build();
-                let runtime = match runtime {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                if ready.send(Ok(runtime.handle().clone())).is_err() {
-                    return;
-                }
-                while let Ok(request) = stop.recv() {
-                    match request {
-                        TestOtlpRequest::ExportMetrics {
-                            exporter,
-                            metrics,
-                            deadline,
-                            reply,
-                        } => {
-                            let result = runtime.block_on(otlp::export_metric_snapshot(
-                                &exporter, &metrics, deadline,
-                            ));
-                            let _ = reply.send(result);
-                        }
-                        TestOtlpRequest::Shutdown {
-                            export,
-                            deadline,
-                            reply,
-                        } => {
-                            let result = runtime.block_on(export.shutdown(deadline));
-                            runtime.shutdown_timeout(
-                                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                            );
-                            let _ = reply.send(result);
-                            return;
-                        }
-                    }
-                }
-                runtime.shutdown_timeout(crate::OTLP_SHUTDOWN_TIMEOUT);
-            })
-            .expect("the test OTLP runtime thread starts");
-        let handle = match started.recv() {
-            Ok(Ok(handle)) => handle,
-            Ok(Err(error)) => panic!("the test OTLP runtime did not start: {error}"),
-            Err(error) => panic!("the test OTLP runtime did not report startup: {error}"),
-        };
-        Self {
-            handle,
-            requests,
-            thread: Some(thread),
-        }
-    }
-
-    pub(crate) fn shutdown(self, export: OtlpExport) -> Result<(), ExportShutdownError> {
-        self.shutdown_before(
-            export,
-            tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT,
-        )
-    }
-
-    fn shutdown_before(
-        mut self,
-        export: OtlpExport,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), ExportShutdownError> {
-        let (reply, result) = mpsc::sync_channel(1);
-        let mut request = TestOtlpRequest::Shutdown {
-            export,
-            deadline,
-            reply,
-        };
-        let sent = loop {
-            match self.requests.try_send(request) {
-                Ok(()) => break Ok(()),
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    break Err(ExportShutdownError::Failed(
-                        "the test OTLP runtime stopped before export shutdown".to_owned(),
-                    ));
-                }
-                Err(mpsc::TrySendError::Full(held)) => {
-                    request = held;
-                    if tokio::time::Instant::now() >= deadline {
-                        break Err(ExportShutdownError::TimedOut);
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-        };
-        let mut outcome = if let Err(error) = sent {
-            Err(error)
-        } else {
-            match result
-                .recv_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
-            {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(ExportShutdownError::TimedOut),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(ExportShutdownError::Failed(
-                    "the test OTLP runtime stopped before reporting export shutdown".to_owned(),
-                )),
-            }
-        };
-        if let Some(thread) = self.thread.take() {
-            while !thread.is_finished() && tokio::time::Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(1));
-            }
-            if !thread.is_finished() {
-                outcome = Err(ExportShutdownError::TimedOut);
-            } else if thread.join().is_err() {
-                outcome = Err(ExportShutdownError::Failed(
-                    "the test OTLP runtime thread panicked".to_owned(),
-                ));
-            }
-        }
-        outcome
-    }
-
-    fn with_export(self, export: OtlpExport) -> TestOtlpExport {
-        TestOtlpExport {
-            runtime: Some(self),
-            export: Some(export),
-        }
-    }
-
-    fn metric_exporter(
-        &self,
-        exporter: Arc<MetricExporter>,
-    ) -> crate::recorder::metrics::MetricExport {
-        let requests = self.requests.clone();
-        Arc::new(move |metrics| {
-            let deadline = tokio::time::Instant::now() + otlp::OTLP_EXPORT_TIMEOUT;
-            let (reply, response) = mpsc::sync_channel(1);
-            let mut request = TestOtlpRequest::ExportMetrics {
-                exporter: Arc::clone(&exporter),
-                metrics,
-                deadline,
-                reply,
-            };
-            loop {
-                match requests.try_send(request) {
-                    Ok(()) => break,
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        return Err(ExportShutdownError::Failed(
-                            "the test OTLP runtime stopped before metric export".to_owned(),
-                        ));
-                    }
-                    Err(mpsc::TrySendError::Full(held)) => {
-                        request = held;
-                        if tokio::time::Instant::now() >= deadline {
-                            return Err(ExportShutdownError::TimedOut);
-                        }
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            }
-            match response
-                .recv_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
-            {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(ExportShutdownError::TimedOut),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(ExportShutdownError::Failed(
-                    "the test OTLP runtime stopped before reporting metric export".to_owned(),
-                )),
-            }
-        })
-    }
-}
-
-/// An OTLP export and its runtime, dropped after the recorder restores its prior subscriber.
-struct TestOtlpExport {
-    runtime: Option<TestOtlpRuntime>,
-    export: Option<OtlpExport>,
-}
-
-impl std::fmt::Debug for TestOtlpExport {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TestOtlpExport")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for TestOtlpExport {
-    fn drop(&mut self) {
-        if let Err(error) = self.shutdown()
-            && !thread::panicking()
-        {
-            panic!("{error}");
-        }
-    }
-}
-
-impl TestOtlpExport {
-    fn shutdown(&mut self) -> Result<(), ExportShutdownError> {
-        self.shutdown_before(tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT)
-    }
-
-    fn shutdown_before(
-        &mut self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), ExportShutdownError> {
-        let Some(runtime) = self.runtime.take() else {
-            return Ok(());
-        };
-        let Some(export) = self.export.take() else {
-            return Ok(());
-        };
-        runtime.shutdown_before(export, deadline)
-    }
-
-    fn install_meter(&self) {
-        if let Some(export) = self.export.as_ref() {
-            let provider = export.recorder_meter_provider();
-            let reader = export.recorder_metric_reader();
-            let metric_exporter = export.recorder_metric_exporter();
-            let metric_export = match (&self.runtime, metric_exporter) {
-                (Some(runtime), Some(exporter)) => Some(runtime.metric_exporter(exporter)),
-                _ => None,
-            };
-            metrics::install(provider, reader, metric_export);
-        } else {
-            metrics::install(None, None, None);
-        }
     }
 }
 
