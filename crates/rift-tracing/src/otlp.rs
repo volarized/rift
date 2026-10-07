@@ -2745,6 +2745,35 @@ mod tests {
     /// handed to a log record exporter.
     #[test]
     fn no_endpoint_installs_no_log_export() {
+        const CHILD: &str = "RIFT_OTLP_NO_ENDPOINT_CHILD";
+
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("the test executable is available"),
+            );
+            command
+                .args([
+                    "--exact",
+                    "otlp::tests::no_endpoint_installs_no_log_export",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("OTEL_SDK_DISABLED", "false")
+                .env_remove("NEXTEST_ATTEMPT_ID")
+                .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+            let output = command.output().expect("the isolated test process starts");
+            assert!(
+                output.status.success(),
+                "the isolated test process failed: stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         assert!(
             !LOG_ENDPOINT_VARS
                 .iter()
