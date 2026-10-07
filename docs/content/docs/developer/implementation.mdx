@@ -757,13 +757,39 @@ The flags narrow what prints:
 Agents read these records through [`rift://logs`](/docs/mcp#resource-logs).
 The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
 
-`rift-tracing` holds a record from its capture to its row. The `LogSink` layer copies each event
-and span close that `[logs]` `capture` admits into a queue of 4,096 records, and a full queue
-drops the newest record and counts it in `log.queue.dropped` with `error.type` `queue_full`. The log drain writes the queue in batches. A batch the
-metrics database refuses stays with the drain, which retries it every 500 ms with no attempt
+`rift-tracing` holds a record from its capture to its row. The `LogSink` layer publishes each
+event and span close that `[logs]` `capture` admits to the persistence queue and independent
+subscriptions. A full persistence queue drops the newest record and counts it in
+`log.queue.dropped` with `error.type` `queue_full`.
+
+The log drain writes the queue in batches.
+A batch the metrics database refuses stays with the drain, which retries it with no attempt
 count; meanwhile the queue fills and then drops, and the next batch written carries a
 `the log queue was full and dropped records` record with the `dropped` count. The stop's
 deadline bounds the retry: a drain aborted there reports what it held as `unwritten`.
+
+`runtime.logs().subscribe()` returns `Result<LogSubscription, RiftError>` and registers an
+independent subscription. Disabled or closed capture returns `tracing.log_stream_unavailable`;
+16 registered subscriptions, including persistence, returns `tracing.log_subscription_limit`.
+
+Registration and publication use one order, so subscriptions receive records from registration
+onward, with no replay. `recv()` reads one `LogPublication`; `recv_batch()` reads a bounded batch.
+
+Each publication carries its `sequence` and an immutable record shared across subscriptions.
+The sequence preserves dropped positions, so consumers can compare it with their loss count.
+
+Each subscription shares an 8 MiB byte budget between its queue and publications its consumer
+retains; a full record or byte budget drops the incoming record and increments that
+subscription's `dropped()` count. Dropping a subscription unregisters it and releases its queue;
+already returned publications release their bytes when their owner drops them.
+
+The byte accounting includes the publication envelope, record, shared ownership header, and
+string lengths. Bounded channel slots and allocator overhead sit outside that accounting.
+
+The [`[logs]`](/docs/developer/configuration#logs) keys `queue_records`, `flush_interval`,
+`retry_interval`, and `settle_timeout` configure queue capacity, partial-batch flushes, retained
+retries, and persisted-log settlement. Under repository serving, a routing drain sends records
+to one bounded consumer per admitted workspace, selected from the request span's `workspace`.
 
 <VersionBadge version="v0.0.62" />
 
@@ -780,7 +806,7 @@ write the same record. A dependency's span with neither `component` nor `operati
 
 `rift mcp` opens `mcp.forward` with `request_id` empty and records the forwarded request's id
 once rmcp sends it, so the proxy's lines join the server's request group; records before the
-send carry none.
+send carry none. The span also records the caller's original JSON-RPC id as `caller_request_id`.
 
 `traced!`, `#[rift_tracing::timed]`, `info_span!`, `debug_span!`, and the event macros record
 `code.function.name`, the function that opened the span or emitted the event, read from the
@@ -904,22 +930,28 @@ Every instrument is a `static` declaration over an OpenTelemetry instrument: a `
 `Gauge`, `Histogram`, or `ObservableUpDownCounter` with the `InstrumentScope` of the declaring
 crate, its name, unit, and label keys, whose label values are `&'static str` literals. Its points
 carry that crate's `CARGO_PKG_NAME` and `CARGO_PKG_VERSION` as their instrumentation scope, from
-one meter per scope, at most `SCOPES_MAX`, 6; a scope past it records nothing, and one `WARN`
+one meter per scope, at most `SCOPES_MAX`, 7; a scope past it records nothing, and one `WARN`
 record, `meter refused an instrumentation scope past its bound`, names it. The
 `traces.span.metrics.*` points of a `traced!` operation take the scope of the crate whose
 `traced!` opened it. A recording hands the value to the OpenTelemetry SDK, which
 aggregates and exports it, so `rift-tracing` holds no value of its own. A process that installed
 no meter records nothing, at the cost of two atomic reads per recording.
 
-A view on the meter provider bounds every instrument at `CARDINALITY_LIMIT`, 2,000 label sets,
+A view on the meter provider bounds every instrument at
+[`[logs] cardinality_limit`](/docs/developer/configuration#logs) label sets,
 and the SDK records a label set past that into one series carrying `otel.metric.overflow`. A test reads what the SDK exported through
 `ScopedRecorder::metrics`, each series naming its scope, printed as `otel.scope.name` and
 `otel.scope.version`. Every `traced!` operation records `traces.span.metrics.calls` and
 `traces.span.metrics.duration`, in seconds, labeled with its `span.name`, its `span.kind`,
 `Internal`, and its outcome as `status.code`, with `error.type` `panic` or `cancelled` when it did not finish. Work
 whose value is `Err(RiftError)`, the value of a block or the output of a future, records that
-error's registered identity as `error.type`; a block left through `?` or `return` has no value
-and records none. The metrics follow
+error's registered identity as `error.type`. An inline `?` converts the error to the enclosing
+function's error type before recording its registered identity; an inline `return` records the
+returned error. Nested functions, closures, and async blocks retain their own return behavior.
+Only `?` and `return` written directly in the inline work are inspected; exits produced by
+another macro expansion require explicit `error.type` recording.
+
+The metrics follow
 the operation, not its span: the duration is read once, at the operation's end, and the close
 record's `elapsed_ms` states the same reading, so a span clone held elsewhere lengthens neither,
 and the span's filters do not select it.
@@ -1008,6 +1040,14 @@ nothing. The process readings go through `sysinfo`:
 
 `process.cpu.time` and `process.disk.io` stay cumulative, and a collector derives rates from them.
 A value the platform does not report stays absent and is never recorded as zero.
+
+Retained cache entries report `cache.entry.count` by `cache.name`: `WorkspaceContentCache`,
+`symbol_documents`, and `prepared_resolution`, plus the global client's `CachedCapabilities`,
+`CachedResolution`, and `CachedFailure`. Each observation follows its owner, so clones share
+one reading and the last owner removes it. A global client slot retains at most one entry.
+
+Independent owners with identical labels contribute to one sum per collection. Expiry stops
+reuse but leaves the retained entry counted until replacement, clearing, or drop.
 
 The Tokio readings load the counters of Tokio's stable `RuntimeMetrics` for the runtime that
 installed the subscriber: `tokio.runtime.worker.count`, `tokio.runtime.task.count`,
@@ -1407,6 +1447,16 @@ instead, and the new session reads every file from disk.
 Each process has configured startup and request timeouts. The
 [`[lsp]`](/docs/developer/configuration#languages-and-lsp) configuration also bounds retries
 and process replacements.
+
+LSP startup records `engine child spawned` with the child's `pid` and its piped `stdin`,
+`stdout`, and `stderr`. Shutdown records `engine.child.wait` while waiting for exit;
+a timeout or failed wait records its outcome and enters `engine.child.kill` to kill and reap
+the child. `engine child exited` retains the pid observed before the wait or kill.
+
+The bounded command runner records `child spawned`, an open `process.wait` operation, and
+`child exited`, with `pid`, stream destinations, and the observed `exit_code` when available.
+The wait records `ok`, `refused`, `timeout`, or `cancelled`, so a stalled dependency probe
+remains visible in the operations in flight.
 
 ## Configuration
 
