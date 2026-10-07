@@ -604,6 +604,29 @@ jobs:
           path: target/nextest/ci-windows-update/junit.xml
           if-no-files-found: error
           retention-days: 7
+      # https://github.com/volarized/rift/issues/568
+      - name: Capture OTLP requests for Windows shutdown regressions
+        if: ${{ !cancelled() && matrix.target == 'x86_64-pc-windows-msvc' }}
+        env:
+          OTEL_SDK_DISABLED: "false"
+          RIFT_OTLP_FILTER: trace
+          RIFT_TEST_REPORT_DIRECTORY: target/integration/windows-otlp-request
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: >-
+          uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev
+          rift-dev test nextest run --locked
+          --workspace --all-targets --all-features --profile ci-windows-update --no-tests fail
+          -E '(binary_id(=rift::logs_resource) and test(=a_repository_served_workspace_answers_its_own_records)) or
+          (binary_id(=rift::server_cli) and test(=a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget))'
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ !cancelled() && matrix.target == 'x86_64-pc-windows-msvc' }}
+        with:
+          name: native-windows-otlp-request-${{ matrix.target }}
+          path: |
+            target/integration/windows-otlp-request/
+            target/nextest/ci-windows-update/junit.xml
+          if-no-files-found: error
+          retention-days: 7
       - name: Report the build cache
         if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
         run: sccache --show-stats

@@ -40,9 +40,9 @@ import threading
 import time
 import zlib
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 import uvicorn
@@ -127,6 +127,12 @@ CASE_LOG_SNAPSHOT_MAX = 256
 CASE_METRIC_SNAPSHOT_MAX = 256
 # Tests `CaseStore` holds at once; a test past it is counted, not kept.
 CASES_MAX = 512
+# Export requests kept for a failed test report. Requests arrive before their resource
+# attributes can name a test, so the bound applies before decode too.
+EXPORT_REQUESTS_MAX = 1_024
+EXPORT_REQUEST_IDENTITIES_MAX = 8
+EXPORT_REQUEST_REPORT_MAX = 128
+REQUEST_IDENTITY_CHARS_MAX = 128
 # Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
 # leaves out, as received from `rift` on 2026-10-05.
 SPAN_KEYS_OMITTED = frozenset(["target", "busy_ns", "idle_ns"])
@@ -224,6 +230,162 @@ class Dropped:
         return json.dumps({"dropped": self.counts()})
 
 
+@dataclass(frozen=True, slots=True)
+class RequestIdentity:
+    """One decoded resource's test, process, and service instance identifiers."""
+
+    test_case: str | None
+    pid: str | None
+    instance: str | None
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StoreReceipt:
+    """Decode and store times plus bounded identities from one OTLP request."""
+
+    decoded_unix_nano: int
+    stored_unix_nano: int
+    identities: tuple[RequestIdentity, ...]
+    identities_omitted: int
+
+
+@dataclass(slots=True)
+class ExportRequest:
+    """One bounded OTLP/HTTP request, including requests that fail before decode."""
+
+    request_id: int
+    path: str
+    arrived_unix_nano: int
+    body_read_unix_nano: int | None = None
+    body_decoded_unix_nano: int | None = None
+    decoded_unix_nano: int | None = None
+    stored_unix_nano: int | None = None
+    handler_finished_unix_nano: int | None = None
+    encoded_bytes: int | None = None
+    decoded_bytes: int | None = None
+    intended_status: int | None = None
+    outcome: str = "pending"
+    identities: tuple[RequestIdentity, ...] = ()
+    identities_omitted: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RequestSnapshot:
+    """The requests selected for one failure, with every bound count."""
+
+    requests: tuple[ExportRequest, ...]
+    received: int
+    retained: int
+    dropped: int
+    omitted: int
+
+
+class RequestStore:
+    """The newest bounded OTLP/HTTP requests, including unassigned requests."""
+
+    def __init__(self) -> None:
+        self.requests: deque[ExportRequest] = deque(maxlen=EXPORT_REQUESTS_MAX)
+        self.received = 0
+        self.dropped = 0
+        self.lock = threading.Lock()
+
+    def begin(self, path: str) -> ExportRequest:
+        """Keeps request arrival before content validation or body decode."""
+        with self.lock:
+            request = ExportRequest(
+                request_id=self.received + 1,
+                path=path,
+                arrived_unix_nano=time.time_ns(),
+            )
+            self.received += 1
+            if len(self.requests) == self.requests.maxlen:
+                self.dropped += 1
+            self.requests.append(request)
+            return request
+
+    def update(self, request: ExportRequest, **fields: object) -> None:
+        """Updates one retained request while its route advances."""
+        with self.lock:
+            for name, value in fields.items():
+                setattr(request, name, value)
+
+    def finish(
+        self, request: ExportRequest, status: int, outcome: str
+    ) -> ExportRequest:
+        """Records handler status and finish time before returning a response."""
+        self.update(
+            request,
+            handler_finished_unix_nano=time.time_ns(),
+            intended_status=status,
+            outcome=outcome,
+        )
+        return request
+
+    def for_failure(self, names: Sequence[str], pids: set[str]) -> RequestSnapshot:
+        """Selects decoded requests for the failed test's cases or registered processes.
+
+        Requests without decoded identities stay visible, bounded to the newest quarter
+        of the report limit.
+        """
+        return self._select(names, pids, include_unassigned=True)
+
+    def for_cases(self, names: Sequence[str], pids: set[str]) -> RequestSnapshot:
+        """Selects decoded requests attributed to the given test cases."""
+        return self._select(names, pids, include_unassigned=False)
+
+    def for_run(self, failed_ids: set[int]) -> RequestSnapshot:
+        """Returns attributed requests and failed unassigned requests for one test run."""
+        with self.lock:
+            held = tuple(
+                replace(request)
+                for request in self.requests
+                if request.identities or request.request_id in failed_ids
+            )
+            return RequestSnapshot(
+                requests=held,
+                received=self.received,
+                retained=len(held),
+                dropped=self.dropped,
+                omitted=0,
+            )
+
+    def _select(
+        self, names: Sequence[str], pids: set[str], *, include_unassigned: bool
+    ) -> RequestSnapshot:
+        with self.lock:
+            held = tuple(replace(request) for request in self.requests)
+            received = self.received
+            dropped = self.dropped
+        cases = set(names)
+        unassigned: list[ExportRequest] = []
+        matched: list[ExportRequest] = []
+        for request in held:
+            if any(
+                identity.test_case in cases
+                or (identity.pid is not None and identity.pid in pids)
+                for identity in request.identities
+            ):
+                matched.append(request)
+            elif include_unassigned and not request.identities:
+                unassigned.append(request)
+        unassigned_limit = EXPORT_REQUEST_REPORT_MAX // 4
+        selected = [
+            *matched,
+            *(unassigned[-unassigned_limit:] if include_unassigned else ()),
+        ]
+        selected.sort(key=lambda request: request.arrived_unix_nano)
+        omitted = max(0, len(selected) - EXPORT_REQUEST_REPORT_MAX)
+        requests = tuple(selected[-EXPORT_REQUEST_REPORT_MAX:])
+        return RequestSnapshot(
+            requests=requests,
+            received=received,
+            retained=len(held),
+            dropped=dropped,
+            omitted=omitted,
+        )
+
+
 def value_text(value: AnyValue) -> str:
     """An attribute value as text: a map as `{key=value ...}`, an array as
     `[value ...]`; a value of a kind the text does not read, such as bytes, becomes its
@@ -259,6 +421,45 @@ def instance_of(resource: Attributes) -> str:
 def test_of(resource: Attributes) -> str:
     """The `test.case.name` resource attribute; empty when the resource carries none."""
     return dict(resource).get(TEST_CASE_KEY, "")
+
+
+def request_identity(resource: Attributes) -> RequestIdentity | None:
+    """A request identity only when decode supplied a test, process, or instance."""
+    values = dict(resource)
+    test_case = values.get(TEST_CASE_KEY) or None
+    pid = values.get(PID_KEY) or None
+    instance = values.get(INSTANCE_KEY) or None
+    if test_case is None and pid is None and instance is None:
+        return None
+    fields = tuple(
+        None if value is None else value[:REQUEST_IDENTITY_CHARS_MAX]
+        for value in (test_case, pid, instance)
+    )
+    truncated = any(
+        value is not None and len(value) > REQUEST_IDENTITY_CHARS_MAX
+        for value in (test_case, pid, instance)
+    )
+    return RequestIdentity(*fields, truncated=truncated)
+
+
+def store_receipt(identities: Iterable[Attributes], decoded: int) -> StoreReceipt:
+    """Bounds decoded request identities and records completion after store work."""
+    kept: list[RequestIdentity] = []
+    omitted = 0
+    for resource in identities:
+        identity = request_identity(resource)
+        if identity is None or identity in kept:
+            continue
+        if len(kept) < EXPORT_REQUEST_IDENTITIES_MAX:
+            kept.append(identity)
+        else:
+            omitted += 1
+    return StoreReceipt(
+        decoded_unix_nano=decoded,
+        stored_unix_nano=time.time_ns(),
+        identities=tuple(kept),
+        identities_omitted=omitted,
+    )
 
 
 def process_text(resource: Attributes) -> str:
@@ -474,9 +675,10 @@ class SpanStore:
         self.lock = threading.Lock()
         self.tests = tests
 
-    def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its spans."""
+    def record(self, body: bytes) -> StoreReceipt:
+        """Decodes one export request, keeps its spans, and reports its resources."""
         request = ExportTraceServiceRequest.FromString(body)
+        decoded = time.time_ns()
         with self.lock:
             for resource_spans in request.resource_spans:
                 resource = attribute_key(resource_spans.resource.attributes)
@@ -495,6 +697,13 @@ class SpanStore:
                                 resource=resource,
                             )
                         )
+        return store_receipt(
+            (
+                attribute_key(resource_spans.resource.attributes)
+                for resource_spans in request.resource_spans
+            ),
+            decoded,
+        )
 
     def keep(self, span: SpanRecord) -> None:
         """Keeps one span, dropping the oldest past a bound. The caller holds the lock."""
@@ -593,9 +802,10 @@ class MetricStore:
         self.lock = threading.Lock()
         self.tests = tests
 
-    def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its data points."""
+    def record(self, body: bytes) -> StoreReceipt:
+        """Decodes one export request, keeps its points, and reports its resources."""
         request = ExportMetricsServiceRequest.FromString(body)
+        decoded = time.time_ns()
         with self.lock:
             for resource_metrics in request.resource_metrics:
                 resource = attribute_key(resource_metrics.resource.attributes)
@@ -603,6 +813,13 @@ class MetricStore:
                     scope = (scope_metrics.scope.name, scope_metrics.scope.version)
                     for metric in scope_metrics.metrics:
                         self.keep(metric, resource, scope)
+        return store_receipt(
+            (
+                attribute_key(resource_metrics.resource.attributes)
+                for resource_metrics in request.resource_metrics
+            ),
+            decoded,
+        )
 
     def keep(
         self, metric: Metric, resource: Attributes = (), scope: Scope = ("", "")
@@ -803,15 +1020,23 @@ class LogStore:
         self.lock = threading.Lock()
         self.tests = tests
 
-    def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its log records."""
+    def record(self, body: bytes) -> StoreReceipt:
+        """Decodes one export request, keeps its logs, and reports its resources."""
         request = ExportLogsServiceRequest.FromString(body)
+        decoded = time.time_ns()
         with self.lock:
             for resource_logs in request.resource_logs:
                 resource = attribute_key(resource_logs.resource.attributes)
                 for scope_logs in resource_logs.scope_logs:
                     for record in scope_logs.log_records:
                         self.keep(log_entry(record, resource))
+        return store_receipt(
+            (
+                attribute_key(resource_logs.resource.attributes)
+                for resource_logs in request.resource_logs
+            ),
+            decoded,
+        )
 
     def keep(self, entry: LogEntry) -> None:
         """Keeps one record, dropping the oldest past the bound. The caller holds the lock."""
@@ -958,23 +1183,23 @@ def inflate(body: bytes, encoding: str | None) -> bytes | None:
     return inflated
 
 
-async def bounded_body(request: Request) -> bytes | None:
-    """The encoded request body; None once it passes `BODY_BYTES_MAX`, read no further.
+async def bounded_body(request: Request) -> tuple[bytes | None, int]:
+    """The encoded body or None past its bound, and bytes read before refusal.
 
     A declared `content-length` past the bound refuses the body before any of it is
     read.
     """
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > BODY_BYTES_MAX:
-        return None
+        return None, 0
     chunks: list[bytes] = []
     size = 0
     async for chunk in request.stream():
         size += len(chunk)
         if size > BODY_BYTES_MAX:
-            return None
+            return None, size
         chunks.append(chunk)
-    return b"".join(chunks)
+    return b"".join(chunks), size
 
 
 def receiver(
@@ -982,6 +1207,7 @@ def receiver(
     metrics: MetricStore | None = None,
     logs: LogStore | None = None,
     cases: CaseStore | None = None,
+    requests: RequestStore | None = None,
 ) -> Starlette:
     """The application that feeds OTLP/HTTP export requests into `spans`, `metrics`, and
     `logs`.
@@ -992,38 +1218,69 @@ def receiver(
     """
     held = metrics if metrics is not None else MetricStore()
     records = logs if logs is not None else LogStore()
+    request_records = requests if requests is not None else RequestStore()
 
     def route(
         path: str,
-        keep: Callable[[bytes], None],
+        keep: Callable[[bytes], StoreReceipt],
         response: bytes,
         noun: str,
     ) -> Route:
         async def export(request: Request) -> Response:
+            observed = request_records.begin(path)
             if request.headers.get("content-type", "").split(";")[0] != PROTOBUF:
+                request_records.finish(observed, 415, "content-type")
                 return PlainTextResponse(f"the collector reads {PROTOBUF}", 415)
             try:
-                encoded = await bounded_body(request)
+                encoded, encoded_bytes = await bounded_body(request)
+                request_records.update(
+                    observed,
+                    body_read_unix_nano=time.time_ns(),
+                    encoded_bytes=encoded_bytes,
+                )
                 body = (
                     None
                     if encoded is None
                     else inflate(encoded, request.headers.get("content-encoding"))
                 )
             except zlib.error:
+                request_records.finish(observed, 400, "gzip")
                 return PlainTextResponse("the body is not gzip", 400)
             except ClientDisconnect:
+                request_records.finish(observed, 400, "disconnect")
                 return PlainTextResponse("the exporter disconnected", 400)
+            except Exception:
+                request_records.finish(observed, 500, "receiver-error")
+                raise
+            request_records.update(
+                observed,
+                body_decoded_unix_nano=time.time_ns(),
+                decoded_bytes=None if body is None else len(body),
+            )
             if body is None:
                 with held.lock:
                     held.dropped.bodies += 1
+                request_records.finish(observed, 413, "body-bound")
                 return PlainTextResponse(
                     f"a body is at most {BODY_BYTES_MAX} bytes, encoded and decoded",
                     413,
                 )
             try:
-                keep(body)
+                receipt = keep(body)
             except DecodeError:
+                request_records.finish(observed, 400, "protobuf")
                 return PlainTextResponse(f"the body is not an {noun}", 400)
+            except Exception:
+                request_records.finish(observed, 500, "receiver-error")
+                raise
+            request_records.update(
+                observed,
+                decoded_unix_nano=receipt.decoded_unix_nano,
+                stored_unix_nano=receipt.stored_unix_nano,
+                identities=receipt.identities,
+                identities_omitted=receipt.identities_omitted,
+            )
+            request_records.finish(observed, 200, "ok")
             return Response(response, media_type=PROTOBUF)
 
         return Route(path, export, methods=["POST"])
@@ -1116,9 +1373,7 @@ def receiver(
                 return PlainTextResponse(
                     f"query parameter {TEST_CASE_KEY} is required", 400
                 )
-            raw_limit = request.query_params.get(
-                "limit", str(CASE_METRIC_SNAPSHOT_MAX)
-            )
+            raw_limit = request.query_params.get("limit", str(CASE_METRIC_SNAPSHOT_MAX))
             try:
                 limit = int(raw_limit)
             except ValueError:
@@ -1193,6 +1448,7 @@ class Collector:
     endpoint: str = ""
     logs: LogStore = field(default_factory=LogStore)
     cases: CaseStore | None = None
+    requests: RequestStore = field(default_factory=RequestStore)
 
     def environment(
         self,
@@ -1307,7 +1563,13 @@ def collector(
         port = listener.getsockname()[1]
         server = uvicorn.Server(
             uvicorn.Config(
-                receiver(stores.spans, stores.metrics, stores.logs, stores.cases),
+                receiver(
+                    stores.spans,
+                    stores.metrics,
+                    stores.logs,
+                    stores.cases,
+                    stores.requests,
+                ),
                 lifespan="off",
                 log_config=None,
                 log_level="warning",

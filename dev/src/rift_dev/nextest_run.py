@@ -49,6 +49,7 @@ import tomllib
 from rift_dev.commands import REPOSITORY, Command, CommandFailed
 from rift_dev.progress import finish, start
 from rift_dev.trace import (
+    EXPORT_REQUESTS_MAX,
     PID_KEY,
     SPAN_REQUEST_KEY,
     Attributes,
@@ -57,6 +58,7 @@ from rift_dev.trace import (
     Collector,
     LogEntry,
     MetricPoint,
+    RequestSnapshot,
     Scope,
     SpanRecord,
     collector,
@@ -87,6 +89,7 @@ SUMMARY_LINE = re.compile(r"^\s*Summary \[")
 PASSED = ("PASS", "LEAK", "FLAKY")
 # The report directory below the repository, which CI uploads.
 REPORT_DIRECTORY = REPOSITORY / "target" / "integration" / "nextest"
+REPORT_DIRECTORY_ENV = "RIFT_TEST_REPORT_DIRECTORY"
 # The failure window directory of one profile, below the repository (`harness.rs`).
 WINDOW_DIRECTORY = "target/nextest/{profile}/failure-windows"
 # Lines one report prints per part, the newest of each.
@@ -500,6 +503,8 @@ def case_report(
     config_file: Path,
     windows: Sequence[Window],
     served: Collector,
+    requests: RequestSnapshot,
+    request_details: bool = True,
 ) -> str:
     """One failed test's report, top to bottom."""
     runner = " ".join(
@@ -570,6 +575,63 @@ def case_report(
             else "no per-test store"
         )
     )
+    sections.append(
+        "---- OTLP requests ----\n"
+        f"received={requests.received} retained={requests.retained} "
+        f"dropped={requests.dropped} omitted={requests.omitted}"
+    )
+    if request_details:
+        for request in requests.requests:
+            identities = (
+                "; ".join(
+                    " ".join(
+                        f"{key}={value}"
+                        for key, value in (
+                            ("test.case.name", identity.test_case),
+                            ("process.pid", identity.pid),
+                            ("service.instance.id", identity.instance),
+                        )
+                        if value is not None
+                    )
+                    + (" truncated=true" if identity.truncated else "")
+                    for identity in request.identities
+                )
+                or "no decoded resource identity"
+            )
+            sections.append(
+                f"request={request.request_id} path={request.path} "
+                f"intended_status={request.intended_status} outcome={request.outcome} "
+                f"bytes={request.encoded_bytes}/{request.decoded_bytes} "
+                f"identities_omitted={request.identities_omitted} identity={identities}"
+            )
+            sections.append(
+                "request timestamps unix_nano "
+                f"arrived={request.arrived_unix_nano} "
+                f"body_read={request.body_read_unix_nano} "
+                f"body_decoded={request.body_decoded_unix_nano} "
+                f"protobuf_decoded={request.decoded_unix_nano} "
+                f"stored={request.stored_unix_nano} "
+                f"handler_finished={request.handler_finished_unix_nano}"
+            )
+    else:
+        for request in requests.requests[-8:]:
+
+            def elapsed(start: int | None, end: int | None) -> str:
+                return (
+                    "?"
+                    if start is None or end is None
+                    else f"{(end - start) / 1e6:.3f}"
+                )
+
+            sections.append(
+                f"request={request.request_id} path={request.path} "
+                f"intended_status={request.intended_status} "
+                f"bytes={request.encoded_bytes}/{request.decoded_bytes} "
+                f"arrival_body_ms={elapsed(request.arrived_unix_nano, request.body_read_unix_nano)} "
+                f"inflate_ms={elapsed(request.body_read_unix_nano, request.body_decoded_unix_nano)} "
+                f"store_ms={elapsed(request.decoded_unix_nano, request.stored_unix_nano)} "
+                f"handler_ms={elapsed(request.arrived_unix_nano, request.handler_finished_unix_nano)}"
+            )
     sections.append(f"==== end of failed test: {outcome.title} ====")
     return "\n".join(sections) + "\n"
 
@@ -601,16 +663,20 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     started = time.time()
     cases = CaseStore()
     outcomes: dict[str, Outcome] = {}
-    log_path = REPORT_DIRECTORY / f"nextest-{profile}-{time.time_ns()}.log"
+    report_directory = Path(os.environ.get(REPORT_DIRECTORY_ENV, REPORT_DIRECTORY))
+    if not report_directory.is_absolute():
+        report_directory = REPOSITORY / report_directory
+    log_path = report_directory / f"nextest-{profile}-{time.time_ns()}.log"
     evidence_path = log_path.with_suffix(".telemetry.txt")
     raw_evidence_path = log_path.with_suffix(".telemetry.jsonl")
-    REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    report_directory.mkdir(parents=True, exist_ok=True)
     log_kept = 0
     log_dropped = 0
     evidence_kept = 0
     evidence_dropped = 0
     raw_evidence_kept = 0
     raw_evidence_dropped = 0
+    failed_request_ids: set[int] = set()
     pending = bytearray()
     reading: Outcome | None = None
     opened = False
@@ -650,6 +716,33 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                         continue
                     artifact.write(data)
                     raw_evidence_kept += len(data)
+
+    def write_request_evidence(requests: RequestSnapshot) -> None:
+        nonlocal raw_evidence_kept, raw_evidence_dropped
+        if not requests.requests:
+            return
+        ordered = sorted(
+            requests.requests,
+            key=lambda request: request.request_id not in failed_request_ids,
+        )
+        with raw_evidence_path.open("ab") as artifact:
+            for index, request in enumerate(ordered):
+                remaining = CASE_EVIDENCE_BYTES_MAX - evidence_kept - raw_evidence_kept
+                if remaining <= 0:
+                    raw_evidence_dropped += len(ordered) - index
+                    return
+                data = (
+                    json.dumps(
+                        {"kind": "collector request", "record": asdict(request)},
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                if len(data) > remaining:
+                    raw_evidence_dropped += 1
+                    continue
+                artifact.write(data)
+                raw_evidence_kept += len(data)
 
     def capture_passing(outcome: Outcome) -> None:
         nonlocal evidence_kept, evidence_dropped
@@ -763,19 +856,53 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             ]
             for name, held in telemetry:
                 write_raw_evidence(name, held)
+            windows = windows_of(directory, outcome, started)
+            process_ids = {
+                window_pid
+                for window in windows
+                for value in window.keys.get("process", [])
+                if (window_pid := value.partition(" ")[0])
+            }
+            requests = served.requests.for_failure(
+                cases.matching(outcome.names), process_ids
+            )
+            failed_request_ids.update(
+                request.request_id for request in requests.requests
+            )
+            oldest_retained = max(0, requests.received - EXPORT_REQUESTS_MAX)
+            failed_request_ids.intersection_update(
+                {
+                    request_id
+                    for request_id in failed_request_ids
+                    if request_id > oldest_retained
+                }
+            )
             report = case_report(
                 outcome,
                 telemetry,
                 command=shown,
                 profile=profile,
                 config_file=config_file_of(arguments_seen),
-                windows=windows_of(directory, outcome, started),
+                windows=windows,
                 served=served,
+                requests=requests,
             )
-            path = REPORT_DIRECTORY / report_name(outcome)
+            console_report = case_report(
+                outcome,
+                telemetry,
+                command=shown,
+                profile=profile,
+                config_file=config_file_of(arguments_seen),
+                windows=windows,
+                served=served,
+                requests=requests,
+                request_details=False,
+            )
+            path = report_directory / report_name(outcome)
             path.write_text(report, encoding="utf-8")
-            echo(report.encode("utf-8"))
+            echo(console_report.encode("utf-8"))
             echo(f"[report written to {path}]\n".encode())
+        write_request_evidence(served.requests.for_run(failed_request_ids))
     failed = (
         stream_error is not None
         or status != 0
