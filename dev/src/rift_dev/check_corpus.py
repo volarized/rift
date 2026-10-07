@@ -11,7 +11,6 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable
-from dataclasses import asdict
 from pathlib import Path
 
 from rift_dev.corpus_assertions import (
@@ -54,7 +53,7 @@ from rift_dev.log_records import (
     stop_measurements,
 )
 from rift_dev.machine import machine, machine_line
-from rift_dev.nextest_run import CASE_EVIDENCE_BYTES_MAX
+from rift_dev.nextest_run import CollectionSummary, retained_collector
 from rift_dev.rift_test_client import (
     LOG_FILTER,
     Client,
@@ -74,10 +73,6 @@ from rift_dev.rift_test_client import (
 from rift_dev.trace import (
     TEST_CASE_KEY,
     Collector,
-    LogEntry,
-    MetricPoint,
-    SpanRecord,
-    collector,
     resource_attribute,
 )
 
@@ -222,8 +217,7 @@ class Corpus:
                 "OTEL_RESOURCE_ATTRIBUTES": resource_attribute(
                     TEST_CASE_KEY, self.test_case_name()
                 ),
-                # The nextest runner disables export in every test process; the server
-                # this case starts exports to the case's collector.
+                # The server uses the same enabled SDK policy as its parent.
                 SDK_DISABLED: "false",
             },
             collector=self.telemetry,
@@ -269,7 +263,9 @@ class Corpus:
         try:
             async with asyncio.timeout(budget):
                 with (
-                    collector() as telemetry,
+                    retained_collector(
+                        self.report.parent / f"{self.report.stem}.telemetry"
+                    ) as telemetry,
                     tempfile.TemporaryDirectory(
                         prefix=f"rift-corpus-{self.pin.name}-"
                     ) as directory,
@@ -290,7 +286,11 @@ class Corpus:
                 telemetry_artifact = self.write_telemetry_artifact()
             except (OSError, TypeError, ValueError) as error:
                 telemetry_artifact = {
-                    "path": str(self.report.with_suffix(".telemetry.jsonl")),
+                    "path": str(
+                        self.report.parent
+                        / f"{self.report.stem}.telemetry"
+                        / "telemetry.jsonl"
+                    ),
                     "error": str(error),
                 }
             self.report.write_text(
@@ -321,68 +321,23 @@ class Corpus:
         return collector_counts(self.telemetry)
 
     def write_telemetry_artifact(self) -> JsonObject | None:
-        """Write newest decoded OTLP rows beside report within existing artifact bound."""
-        telemetry = self.telemetry
-        if telemetry is None:
+        """Read final collection accounting after bounded collector shutdown."""
+        if self.telemetry is None:
             return None
-
-        logs = telemetry.logs.between(None, None)
-        spans = telemetry.spans.between(None, None)
-        points = telemetry.metrics.between(None, None)
-        signals = {"logs": logs, "spans": spans, "points": points}
-        received = {
-            "logs": telemetry.logs.received,
-            "spans": telemetry.spans.received,
-            "points": telemetry.metrics.received,
+        directory = self.report.parent / f"{self.report.stem}.telemetry"
+        summary = CollectionSummary.model_validate_json(
+            (directory / "telemetry-summary.json").read_bytes()
+        )
+        return {
+            "path": str(directory / "telemetry.jsonl"),
+            "summary": str(directory / "telemetry-summary.json"),
+            "received": summary.received,
+            "retained": summary.retained,
+            "omitted": summary.omitted,
+            "received_bytes": summary.received_bytes,
+            "errors": list(summary.errors),
+            "collector_dropped": dict(summary.cache_evictions.counts()),
         }
-        rows: list[
-            tuple[int, str, LogEntry | SpanRecord | MetricPoint]
-        ] = [
-            *((entry.time_unix_nano, "logs", entry) for entry in logs),
-            *((span.end_time_unix_nano, "spans", span) for span in spans),
-            *((point.time_unix_nano, "points", point) for point in points),
-        ]
-
-        included_rows: list[tuple[int, str, bytes]] = []
-        included = {kind: 0 for kind in signals}
-        size = 0
-        for timestamp, kind, record in sorted(
-            rows, key=lambda item: (item[0], item[1]), reverse=True
-        ):
-            row = (
-                json.dumps(
-                    {"kind": kind, "record": asdict(record)},
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                + b"\n"
-            )
-            if size + len(row) <= CASE_EVIDENCE_BYTES_MAX:
-                included_rows.append((timestamp, kind, row))
-                included[kind] += 1
-                size += len(row)
-
-        included_rows.reverse()
-        path = self.report.with_suffix(".telemetry.jsonl")
-        artifact: JsonObject = {
-            "path": str(path),
-            "byte_limit": CASE_EVIDENCE_BYTES_MAX,
-            "bytes": size,
-            "received": received,
-            "retained": {kind: len(records) for kind, records in signals.items()},
-            "included": included,
-            "omitted": {
-                kind: len(records) - included[kind]
-                for kind, records in signals.items()
-            },
-            "collector_dropped": dict(telemetry.dropped().counts()),
-        }
-        try:
-            path.write_bytes(b"".join(row for _, _, row in included_rows))
-        except OSError as error:
-            artifact["error"] = str(error)
-        return artifact
 
     async def tree(self, directory: Path) -> None:
         """Run the case; on failure keep each server's evidence before the tree goes."""

@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  OTEL_SDK_DISABLED: "false"
+
 jobs:
   docs:
     runs-on: ubuntu-latest

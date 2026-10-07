@@ -284,11 +284,12 @@ class RequestSnapshot:
 class RequestStore:
     """The newest bounded OTLP/HTTP requests, including unassigned requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, observe: Callable[[ExportRequest], None] | None = None) -> None:
         self.requests: deque[ExportRequest] = deque(maxlen=EXPORT_REQUESTS_MAX)
         self.received = 0
         self.dropped = 0
         self.lock = threading.Lock()
+        self.observe = observe
 
     def begin(self, path: str) -> ExportRequest:
         """Keeps request arrival before content validation or body decode."""
@@ -320,6 +321,8 @@ class RequestStore:
             intended_status=status,
             outcome=outcome,
         )
+        if self.observe is not None:
+            self.observe(replace(request))
         return request
 
     def for_failure(self, names: Sequence[str], pids: set[str]) -> RequestSnapshot:
@@ -605,6 +608,10 @@ class SpanRecord:
     attributes: Attributes
     instance: str = ""
     resource: Attributes = ()
+    parent_span_id: str = ""
+    status_code: int = 0
+    status_message: str = ""
+    kind: int = 0
 
     @property
     def duration_ms(self) -> float:
@@ -695,6 +702,10 @@ class SpanStore:
                                 attributes=attribute_key(span.attributes),
                                 instance=instance,
                                 resource=resource,
+                                parent_span_id=span.parent_span_id.hex(),
+                                status_code=span.status.code,
+                                status_message=span.status.message,
+                                kind=span.kind,
                             )
                         )
         return store_receipt(
@@ -1084,11 +1095,15 @@ class CaseStore:
     `CASES_MAX` held at once is counted under `refused`.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        observe: Callable[[MetricPoint | SpanRecord | LogEntry], bool] | None = None,
+    ) -> None:
         self.tests: dict[str, CaseTelemetry] = {}
         self.unattributed = 0
         self.refused = 0
         self.lock = threading.Lock()
+        self.observe = observe
 
     def keep(
         self, resource: Attributes, item: MetricPoint | SpanRecord | LogEntry
@@ -1096,6 +1111,8 @@ class CaseStore:
         """Files `item` under the test its sender names."""
         test = test_of(resource)
         with self.lock:
+            if self.observe is not None and not self.observe(item):
+                return
             if not test:
                 self.unattributed += 1
                 return
@@ -1472,7 +1489,15 @@ class Collector:
             return {}
         inherited = os.environ if source is None else source
         environment = {
+            "OTEL_SDK_DISABLED": "false",
             "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint + TRACES_PATH,
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": self.endpoint + LOGS_PATH,
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": self.endpoint + METRICS_PATH,
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
             "OTEL_METRIC_EXPORT_INTERVAL": inherited.get(
                 "OTEL_METRIC_EXPORT_INTERVAL", str(EXPORT_INTERVAL_MS)
             ),
@@ -1543,6 +1568,7 @@ def collector(
     spans_max: int = SPANS_MAX,
     logs_max: int = LOGS_MAX,
     cases: CaseStore | None = None,
+    request_observer: Callable[[ExportRequest], None] | None = None,
 ) -> Iterator[Collector]:
     """Serves a receiver on `127.0.0.1` from a thread until the block exits.
 
@@ -1556,6 +1582,7 @@ def collector(
         MetricStore(points_max, cases),
         logs=LogStore(logs_max, cases),
         cases=cases,
+        requests=RequestStore(observe=request_observer),
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:

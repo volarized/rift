@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from rift_dev.local_index_read import settled_local
+from rift_dev.nextest_run import retained_collector
 from rift_dev.rift_test_client import (
     POLL_SECONDS,
     Client,
@@ -20,7 +21,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import TEST_CASE_KEY, collector, resource_attribute
+from rift_dev.trace import TEST_CASE_KEY, resource_attribute
 
 ARTIFACT_SECONDS = 240.0
 CONFIGURATION = "[search.vector]\ndisabled = true\n"
@@ -116,7 +117,7 @@ async def check_artifact(binary: Path, version: str) -> None:
         root.mkdir()
         lay_out_workspace(root)
         with (
-            collector() as telemetry,
+            retained_collector(base) as telemetry,
             Server(
                 binary,
                 root,

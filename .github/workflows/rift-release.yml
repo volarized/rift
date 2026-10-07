@@ -14,6 +14,7 @@ permissions:
 
 env:
   RIFT_TAG: ${{ github.ref_name }}
+  OTEL_SDK_DISABLED: "false"
 
 jobs:
   validate:

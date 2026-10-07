@@ -194,76 +194,76 @@ class Command:
         output: Callable[[bytes], None],
         *,
         exit_wait_seconds: float | None = None,
+        stderr: Callable[[bytes], None] | None = None,
     ) -> Completion:
-        """Streams bounded output chunks asynchronously under the command owner.
+        """Drain both streams concurrently with process exit under command ownership.
 
-        `exit_wait_seconds` bounds the wait after output closes when no command
-        wall timeout was set.
+        Children inherit the environment with the command's overlay applied last.
+        `exit_wait_seconds` bounds pipe closure after exit. Each read is bounded;
+        consumers own retained-byte limits and continue draining after those limits.
         """
-        timeout = self._streamed_timeout()
-        started = time.monotonic()
-        reader: asyncio.Task[bytes] | None = None
+        readers: list[asyncio.Task[None]] = []
+        waiter: asyncio.Task[int] | None = None
+
+        async def drain(source: IO[bytes], accept: Callable[[bytes], None]) -> None:
+            pipe = cast(ChunkReader, source)
+            while chunk := await asyncio.to_thread(pipe.read1, STREAM_CHUNK_BYTES_MAX):
+                accept(chunk)
+
         try:
-            with self.spawn() as process:
-                if process.stdout is None:
-                    raise RuntimeError("command output pipe is unavailable")
-                source = cast(ChunkReader, process.stdout)
-                reader = asyncio.create_task(
-                    asyncio.to_thread(
-                        source.read1,
-                        STREAM_CHUNK_BYTES_MAX,
-                    )
-                )
-                while True:
-                    remaining = _remaining(timeout, started)
-                    if remaining is not None and remaining <= 0:
-                        raise RuntimeError(f"{self.name} exceeded {timeout}s")
-                    try:
-                        pending = asyncio.shield(reader)
-                        chunk = (
-                            await pending
-                            if remaining is None
-                            else await asyncio.wait_for(pending, timeout=remaining)
+            with tempfile.TemporaryFile() as stdin, termination_handler():
+                stdin.write(self.input_bytes)
+                stdin.seek(0)
+                with owned_process(
+                    self.argv, self.environment(), self.directory, stdin
+                ) as process:
+                    if process.stdout is None or process.stderr is None:
+                        raise RuntimeError("command output pipes are unavailable")
+                    readers = [
+                        asyncio.create_task(drain(process.stdout, output)),
+                        asyncio.create_task(drain(process.stderr, stderr or output)),
+                    ]
+                    waiter = asyncio.create_task(asyncio.to_thread(process.wait))
+                    timeout = self._streamed_timeout()
+                    deadline = None if timeout is None else time.monotonic() + timeout
+                    pending = set(readers) | {waiter}
+                    while waiter in pending:
+                        remaining = (
+                            None
+                            if deadline is None
+                            else max(0, deadline - time.monotonic())
                         )
-                    except TimeoutError as error:
-                        raise RuntimeError(f"{self.name} exceeded {timeout}s") from error
-                    if not chunk:
-                        reader = None
-                        break
-                    output(chunk)
-                    reader = asyncio.create_task(
-                        asyncio.to_thread(
-                            source.read1,
-                            STREAM_CHUNK_BYTES_MAX,
+                        done, pending = await asyncio.wait(
+                            pending,
+                            timeout=remaining,
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
-                    )
-                remaining = _remaining(timeout, started)
-                if remaining is not None and remaining <= 0:
-                    raise RuntimeError(f"{self.name} exceeded {timeout}s")
-                try:
-                    wait_timeout = (
-                        remaining if remaining is not None else exit_wait_seconds
-                    )
-                    status = process.wait(timeout=wait_timeout)
-                except TimeoutError as error:
-                    raise RuntimeError(f"{self.name} exceeded {timeout}s") from error
-        finally:
-            if reader is not None:
-                try:
+                        if not done:
+                            raise RuntimeError(f"{self.name} exceeded {timeout}s")
+                        for task in done:
+                            task.result()
+                    status = waiter.result()
                     await asyncio.wait_for(
-                        asyncio.shield(reader), timeout=JOIN_SECONDS_MAX
+                        asyncio.gather(*readers),
+                        timeout=exit_wait_seconds or JOIN_SECONDS_MAX,
                     )
-                except TimeoutError as error:
-                    raise RuntimeError("command stream did not close within its bound") from error
+        finally:
+            for task in readers:
+                task.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            if waiter is not None:
+                await asyncio.wait_for(asyncio.shield(waiter), JOIN_SECONDS_MAX)
         if status not in self.accepted:
             raise CommandFailed(self, status, "")
         return Completion(status)
 
-    def output(self) -> str:
+    def output(self, *, echo_stderr: bool = True) -> str:
         """The program's stdout as text, captured under ownership and bounds."""
-        return self.output_bytes().decode("utf-8", errors="replace")
+        return self.output_bytes(echo_stderr=echo_stderr).decode(
+            "utf-8", errors="replace"
+        )
 
-    def output_bytes(self) -> bytes:
+    def output_bytes(self, *, echo_stderr: bool = True) -> bytes:
         """The program's exact stdout, with stderr, input, and lifetime bounded.
 
         Stderr is echoed once the program succeeds and carried in the failure
@@ -277,7 +277,7 @@ class Command:
         with tempfile.TemporaryFile() as stdin, termination_handler():
             stdin.write(self.input_bytes)
             stdin.seek(0)
-            output = self._capture(stdin, timeout)
+            output = self._capture(stdin, timeout, echo_stderr=echo_stderr)
             if self.deadline is not None and time.monotonic() > self.deadline:
                 raise RuntimeError("command deadline expired during cleanup")
             return output
@@ -323,7 +323,7 @@ class Command:
             raise ValueError("command timeout must be positive")
         return timeout
 
-    def _capture(self, stdin: BinaryIO, timeout: float) -> bytes:
+    def _capture(self, stdin: BinaryIO, timeout: float, *, echo_stderr: bool) -> bytes:
         """Joins both drains after process cleanup, including after a failure."""
         failed = threading.Event()
         drains: list[Drain] = []
@@ -367,7 +367,7 @@ class Command:
         detail = stderr.data.decode("utf-8", errors="replace")
         if process.returncode not in self.accepted:
             raise CommandFailed(self, process.returncode, detail)
-        if detail:
+        if detail and echo_stderr:
             sys.stderr.write(detail)
         return bytes(stdout.data)
 
@@ -428,6 +428,7 @@ class Process:
             raise TimeoutError(
                 f"process {self.pid} still running after {timeout}s"
             ) from error
+
     def interrupt(self) -> None:
         """Sends Ctrl-C's signal to the process group, or terminates on Windows.
 

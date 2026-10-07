@@ -1089,6 +1089,17 @@ fn resource() -> Resource {
     if let Ok(test_case) = std::env::var("NEXTEST_ATTEMPT_ID") {
         builder = builder.with_attribute(KeyValue::new("test.case.name", test_case));
     }
+    for (variable, attribute) in [
+        ("NEXTEST_RUN_ID", "nextest.run_id"),
+        ("NEXTEST_BINARY_ID", "nextest.binary_id"),
+        ("NEXTEST_TEST_NAME", "nextest.test_name"),
+        ("NEXTEST_ATTEMPT", "nextest.attempt"),
+        ("NEXTEST_TOTAL_ATTEMPTS", "nextest.total_attempts"),
+    ] {
+        if let Ok(value) = std::env::var(variable) {
+            builder = builder.with_attribute(KeyValue::new(attribute, value));
+        }
+    }
     if let Some(instance) = instance_id() {
         builder = builder.with_attribute(KeyValue::new("service.instance.id", instance));
     }

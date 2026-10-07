@@ -7,6 +7,8 @@ run from it; without one, each suite compiles what it runs.
 from __future__ import annotations
 
 import os
+import shlex
+from collections.abc import Sequence
 from pathlib import Path
 
 from rift_dev import doctest_run, nextest_run
@@ -30,6 +32,8 @@ CACHEDIR_TAG = (
 )
 
 LIVE_ARCHIVE = REPOSITORY / "target/live-archive"
+COVERAGE_ENV_TARGET = REPOSITORY / "target/llvm-cov-tracing-opentelemetry"
+TRACING_OPENTELEMETRY = "tracing-opentelemetry"
 
 
 def doctest() -> None:
@@ -39,7 +43,7 @@ def doctest() -> None:
     )
 
 
-def coverage_target() -> None:
+def coverage_target(target: Path | None = None) -> None:
     """Creates the directory cargo-llvm-cov builds into and nextest extracts into.
 
     Nextest will not create it, so it exists before an archive run. cargo-llvm-cov
@@ -48,15 +52,84 @@ def coverage_target() -> None:
     uncleaned directory counts every source file twice, once from a stale object
     with no hits, and the floor fails on a green suite.
     """
-    target = Path(
-        os.environ.get(
-            "CARGO_LLVM_COV_TARGET_DIR", REPOSITORY / "target/llvm-cov-target"
+    if target is None:
+        target = Path(
+            os.environ.get(
+                "CARGO_LLVM_COV_TARGET_DIR", REPOSITORY / "target/llvm-cov-target"
+            )
         )
-    )
     target.mkdir(parents=True, exist_ok=True)
     tag = target / "CACHEDIR.TAG"
     if not tag.is_file():
         tag.write_text(CACHEDIR_TAG, encoding="utf-8")
+
+
+def parse_coverage_environment(output: str) -> dict[str, str]:
+    """Parse cargo-llvm-cov's shell-escaped `show-env --sh` output."""
+    try:
+        tokens = shlex.split(output, comments=False, posix=True)
+    except ValueError as error:
+        raise ValueError(
+            "cargo llvm-cov show-env returned invalid shell output"
+        ) from error
+    if not tokens or len(tokens) % 2:
+        raise ValueError("cargo llvm-cov show-env returned invalid shell output")
+
+    environment: dict[str, str] = {}
+    for operation, assignment in zip(tokens[::2], tokens[1::2], strict=True):
+        name, separator, value = assignment.partition("=")
+        if (
+            operation != "export"
+            or not separator
+            or not name.isascii()
+            or not name.isidentifier()
+        ):
+            raise ValueError("cargo llvm-cov show-env returned invalid shell output")
+        if name in environment:
+            raise ValueError("cargo llvm-cov show-env repeated an environment variable")
+        environment[name] = value
+    return environment
+
+
+def coverage_environment(
+    packages: Sequence[str] = (TRACING_OPENTELEMETRY,),
+) -> dict[str, str]:
+    """Return coverage variables for selected dependency packages."""
+    coverage_target(COVERAGE_ENV_TARGET)
+    output = (
+        CargoCommand(
+            "llvm-cov",
+            "show-env",
+            "--sh",
+            "--dep-coverage",
+            ",".join(packages),
+        )
+        .with_env(CARGO_TARGET_DIR=str(COVERAGE_ENV_TARGET))
+        .output()
+    )
+    environment = parse_coverage_environment(output)
+    environment["CARGO_TARGET_DIR"] = str(COVERAGE_ENV_TARGET)
+    return environment
+
+
+def coverage_report(arguments: Sequence[str]) -> None:
+    """Write a report, using the isolated target for tracing-opentelemetry."""
+    packages_selected: list[str] = []
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--dep-coverage="):
+            packages = argument.partition("=")[2]
+        elif argument == "--dep-coverage" and index + 1 < len(arguments):
+            packages = arguments[index + 1]
+        else:
+            continue
+        packages_selected.extend(packages.replace(",", " ").split())
+
+    command = CargoCommand("llvm-cov", "report", *arguments)
+    if TRACING_OPENTELEMETRY in packages_selected:
+        command.with_env(
+            **coverage_environment(tuple(dict.fromkeys(packages_selected)))
+        )
+    command.run()
 
 
 def archive_selection(archive: Path | None, sources: list[str]) -> list[str]:
@@ -73,66 +146,18 @@ def archive_selection(archive: Path | None, sources: list[str]) -> list[str]:
 
 
 def unit(archive: Path | None) -> None:
-    """Runs unit and selected measurement tests under one coverage report.
+    """Run the unit suite once under one coverage report.
 
     Unit tests use local fixtures and require no language servers or model
     downloads.
     """
     coverage_target()
     CargoCommand("llvm-cov", "clean", "--workspace").run()
-    unit_sources = ["--workspace", "--all-targets", "--all-features", "--locked"]
-    invocations = [
-        (archive_selection(archive, unit_sources), [], {}),
-        (
-            archive_selection(
-                archive, ["-p", "rift-tracing", "--lib", "--all-features", "--locked"]
-            ),
-            [
-                "-E",
-                "test(=recorder::tests::a_test_with_no_recorder_exports_from_sync_async_and_unwinding_contexts)",
-                "-E",
-                "test(=otlp::tests::trace_flush_leaves_metric_collection_for_provider_shutdown)",
-                "-E",
-                "test(=otlp::tests::staged_shutdown_keeps_logs_open_until_trace_and_meter_shutdown_finishes)",
-                "-E",
-                "test(=otlp::tests::a_stalled_collector_ends_the_shutdown_at_its_deadline)",
-                "-E",
-                "test(=otlp::tests::a_refusing_collector_keeps_the_span_queue_bounded_and_counts_the_drops)",
-                "-E",
-                "test(=otlp::tests::a_refusing_collector_keeps_the_log_queue_bounded_and_counts_the_drops)",
-            ],
-            {"OTEL_SDK_DISABLED": "false", "RIFT_OTLP_FILTER": "debug"},
-        ),
-        (
-            archive_selection(
-                archive,
-                [
-                    "-p",
-                    "rift-tracing",
-                    "--test",
-                    "shutdown",
-                    "--all-features",
-                    "--locked",
-                ],
-            ),
-            ["-E", "test(=shutdown_sends_records_before_closing_export)"],
-            {"OTEL_SDK_DISABLED": "false", "RIFT_OTLP_FILTER": "debug"},
-        ),
-        (
-            archive_selection(
-                archive, ["-p", "rift-mcp", "--lib", "--all-features", "--locked"]
-            ),
-            [
-                "--run-ignored",
-                "all",
-                "-E",
-                "binary(=rift_mcp) and test(=output::render::tests::output_allocation_cost)",
-            ],
-            {"OTEL_SDK_DISABLED": "false"},
-        ),
-    ]
-    for selection, filters, environment in invocations:
-        command = CargoCommand(
+    selection = archive_selection(
+        archive, ["--workspace", "--all-targets", "--all-features", "--locked"]
+    )
+    nextest_run.run(
+        CargoCommand(
             "llvm-cov",
             "nextest",
             "--no-report",
@@ -141,10 +166,8 @@ def unit(archive: Path | None) -> None:
             "ci",
             "--no-tests",
             "fail",
-            *filters,
         )
-        command.with_env(**environment)
-        nextest_run.run(command)
+    )
 
     report = CargoCommand(
         "llvm-cov",
@@ -231,8 +254,30 @@ def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> Non
     nextest_run.run(command)
 
 
-def nextest(arguments: list[str], *, coverage: bool = False) -> None:
+def nextest(
+    arguments: list[str],
+    *,
+    coverage: bool = False,
+    coverage_env: bool = False,
+    coverage_env_clean: bool = False,
+) -> None:
     """Runs a nextest suite, with optional llvm-cov coverage."""
+    if coverage and coverage_env:
+        raise ValueError(
+            "The --coverage and --coverage-env options cannot be combined."
+        )
+    if coverage_env_clean and not coverage_env:
+        raise ValueError("The --coverage-env-clean option requires --coverage-env.")
+    if coverage_env:
+        if not arguments or arguments[0] != "run":
+            raise ValueError("The --coverage-env option requires the run operation.")
+        environment = coverage_environment()
+        if coverage_env_clean:
+            CargoCommand("llvm-cov", "clean", "--workspace").with_env(
+                **environment
+            ).run()
+        nextest_run.run(CargoCommand("nextest", *arguments).with_env(**environment))
+        return
     if coverage:
         if not arguments or arguments[0] != "run":
             raise ValueError("The --coverage option requires the run operation.")

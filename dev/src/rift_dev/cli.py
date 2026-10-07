@@ -251,7 +251,7 @@ def format_rust(context: typer.Context) -> None:
 )
 def coverage_report(context: typer.Context) -> None:
     """Write an llvm-cov report with its selected output visible."""
-    CargoCommand("llvm-cov", "report", *forwarded_arguments(context)).run()
+    suites.coverage_report(forwarded_arguments(context))
 
 
 @app.command("rust-architecture")
@@ -344,6 +344,13 @@ def nextest_tests(
     coverage: Annotated[
         bool, typer.Option(help="Run this selection with `cargo llvm-cov nextest`.")
     ] = False,
+    coverage_env: Annotated[
+        bool,
+        typer.Option(help="Run this selection with `cargo nextest` under `show-env`."),
+    ] = False,
+    coverage_env_clean: Annotated[
+        bool, typer.Option(help="Clean coverage data before this run.")
+    ] = False,
 ) -> None:
     """Run `cargo nextest` with the given arguments beside the OTLP collector."""
     arguments = forwarded_arguments(context)
@@ -351,9 +358,22 @@ def nextest_tests(
     arguments = [
         argument
         for argument in arguments[:separator]
-        if argument not in {"--coverage", "--no-coverage"}
+        if argument
+        not in {
+            "--coverage",
+            "--no-coverage",
+            "--coverage-env",
+            "--no-coverage-env",
+            "--coverage-env-clean",
+            "--no-coverage-env-clean",
+        }
     ] + arguments[separator:]
-    suites.nextest(arguments, coverage=coverage)
+    suites.nextest(
+        arguments,
+        coverage=coverage,
+        coverage_env=coverage_env,
+        coverage_env_clean=coverage_env_clean,
+    )
 
 
 @test_app.command("corpus")
