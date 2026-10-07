@@ -113,7 +113,7 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,oas3-gen@0.28.0,cargo-audit,cargo-deny,sccache@0.18.0
       - run: >-
@@ -205,7 +205,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145,sccache@0.18.0
       - run: >-
@@ -264,7 +264,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145
 
@@ -352,7 +352,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,cargo-nextest@0.9.145
       - run: >-
@@ -407,7 +407,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,cargo-nextest@0.9.145
       - run: >-
@@ -515,7 +515,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: cargo-nextest@0.9.145,sccache@0.18.0
       # Each runner builds for its own host, so the build passes no
@@ -632,7 +632,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145,sccache@0.18.0
       # The archive carries test binaries compiled from these exact Rust
@@ -692,7 +692,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,sccache@0.18.0
       # Keyed like the corpus archive: the same Rust inputs produce the same CLI.
@@ -771,7 +771,7 @@ jobs:
         with:
           name: integration-archive
           path: target
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145
       - run: rustup component add llvm-tools-preview
@@ -847,7 +847,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.24
         with:
           tool: just
       # The conformance runner is a Bun package; the checks around it drive the
