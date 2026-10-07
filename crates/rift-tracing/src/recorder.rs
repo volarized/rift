@@ -25,11 +25,13 @@
 mod metrics;
 mod unscoped;
 
-#[cfg(test)]
-use std::sync::PoisonError;
+use std::sync::Arc;
+#[cfg(any(test, feature = "fixtures"))]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(any(test, feature = "fixtures"))]
+use std::sync::{Mutex, OnceLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -67,9 +69,94 @@ static UNSCOPED_TRIED: AtomicBool = AtomicBool::new(false);
 /// Whether this process installed a recorder: from then on the unscoped stream enables
 /// nothing (`unscoped.rs` states why).
 static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Owns test-process exporters until the nextest child exits.
+/// Owns test-process exporters until explicit shutdown or process exit.
 #[cfg(any(test, feature = "fixtures"))]
-static UNSCOPED_TEST_EXPORT: OnceLock<Mutex<Option<TestOtlpExport>>> = OnceLock::new();
+static UNSCOPED_TEST_EXPORT: OnceLock<Mutex<Option<UnscopedTestExport>>> = OnceLock::new();
+#[cfg(any(test, feature = "fixtures"))]
+static UNSCOPED_SHUTDOWN_HOOK: OnceLock<bool> = OnceLock::new();
+#[cfg(any(test, feature = "fixtures"))]
+static UNSCOPED_EXPORT_STATE: AtomicU8 = AtomicU8::new(0);
+#[cfg(any(test, feature = "fixtures"))]
+const UNSCOPED_EXPORT_INITIALIZING: u8 = 1;
+#[cfg(any(test, feature = "fixtures"))]
+const UNSCOPED_EXPORT_ACTIVE: u8 = 2;
+#[cfg(any(test, feature = "fixtures"))]
+const UNSCOPED_EXPORT_SHUTTING_DOWN: u8 = 3;
+#[cfg(any(test, feature = "fixtures"))]
+const UNSCOPED_EXPORT_CLOSED: u8 = 4;
+#[cfg(any(test, feature = "fixtures"))]
+const UNSCOPED_EXPORT_FAILED: u8 = 5;
+#[cfg(test)]
+static UNSCOPED_EXPORT_SHUTDOWN_SUCCEEDED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(test, feature = "fixtures"))]
+fn unscoped_test_export_slot() -> &'static Mutex<Option<UnscopedTestExport>> {
+    UNSCOPED_TEST_EXPORT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn register_unscoped_shutdown_hook() -> bool {
+    *UNSCOPED_SHUTDOWN_HOOK
+        .get_or_init(|| shutdown_hooks::add_shutdown_hook(shutdown_unscoped_test_export_at_exit))
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn unscoped_shutdown_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + otlp::OTLP_EXPORT_TIMEOUT
+        + crate::OTLP_SHUTDOWN_TIMEOUT
+        + crate::OTLP_SHUTDOWN_TIMEOUT
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+struct UnscopedExportSetup {
+    finished: bool,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl UnscopedExportSetup {
+    fn begin() -> Option<Self> {
+        let deadline = unscoped_shutdown_deadline();
+        loop {
+            match UNSCOPED_EXPORT_STATE.compare_exchange(
+                0,
+                UNSCOPED_EXPORT_INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { finished: false }),
+                Err(UNSCOPED_EXPORT_ACTIVE | UNSCOPED_EXPORT_CLOSED) => return None,
+                Err(UNSCOPED_EXPORT_INITIALIZING) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "test process export setup finishes within its shutdown budget"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(state) => panic!("unknown test process export state {state}"),
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_ACTIVE, Ordering::Release);
+        self.finished = true;
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for UnscopedExportSetup {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = UNSCOPED_EXPORT_STATE.compare_exchange(
+                UNSCOPED_EXPORT_INITIALIZING,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
 
 /// Installs the unscoped exporter once per process, when [`SCOPED_RECORDER_STREAM_VARIABLE`]
 /// is set and nextest started the process. `tracing-core`'s global default "can only be
@@ -92,6 +179,19 @@ pub(crate) fn stream_unscoped() {
     if !stream && !export_enabled {
         return;
     }
+    #[cfg(any(test, feature = "fixtures"))]
+    let export_setup = if export_enabled {
+        assert!(
+            register_unscoped_shutdown_hook(),
+            "test process export shutdown hook registers before setup"
+        );
+        let Some(setup) = UnscopedExportSetup::begin() else {
+            return;
+        };
+        Some(setup)
+    } else {
+        None
+    };
     let Ok(filter) = recorder_filter(Some(UNSCOPED_CAPTURE)) else {
         return;
     };
@@ -118,15 +218,271 @@ pub(crate) fn stream_unscoped() {
         return;
     }
     #[cfg(any(test, feature = "fixtures"))]
+    let (worker_stop, stop_receiver) = if test_export.is_some() {
+        let (stop, receiver) = mpsc::sync_channel(1);
+        (Some(stop), Some(receiver))
+    } else {
+        (None, None)
+    };
+    #[cfg(any(test, feature = "fixtures"))]
+    let worker = spawn_unscoped_stream(Arc::clone(&flights), stop_receiver);
+    #[cfg(not(any(test, feature = "fixtures")))]
+    let _worker = spawn_unscoped_stream(flights, None);
+    #[cfg(any(test, feature = "fixtures"))]
     if let Some(test_export) = test_export {
         test_export.install_meter();
-        let _ = UNSCOPED_TEST_EXPORT.set(Mutex::new(Some(test_export)));
+        let stop = worker_stop.expect("an unscoped test export owns its worker stop channel");
+        *unscoped_test_export_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UnscopedTestExport {
+            export: Some(test_export),
+            stop,
+            worker,
+        });
+        export_setup
+            .expect("an enabled test process export owns setup")
+            .finish();
     }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn install_test_process_export(filter: tracing_subscriber::EnvFilter) {
+    if std::env::var_os("NEXTEST_ATTEMPT_ID").is_none()
+        || !std::env::args_os().any(|argument| argument == "--exact")
+        || !otlp::recorder_export_configured()
+    {
+        return;
+    }
+
+    assert!(
+        register_unscoped_shutdown_hook(),
+        "test process export shutdown hook registers before setup"
+    );
+    let Some(export_setup) = UnscopedExportSetup::begin() else {
+        return;
+    };
+
+    let runtime = TestOtlpRuntime::when_configured()
+        .expect("a configured test process export owns its runtime");
+    let entered = runtime.handle.enter();
+    let (layer, export) = otlp::test_process_layer::<tracing_subscriber::Registry>(filter);
+    drop(entered);
+    drop(layer);
+
+    let export = runtime.with_export(export);
+    export.install_meter();
+    let (stop, _receiver) = mpsc::sync_channel(1);
+    *unscoped_test_export_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UnscopedTestExport {
+        export: Some(export),
+        stop,
+        worker: None,
+    });
+    export_setup.finish();
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+struct UnscopedTestExport {
+    export: Option<TestOtlpExport>,
+    stop: SyncSender<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl UnscopedTestExport {
+    fn shutdown_before(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let Some(mut export) = self.export.take() else {
+            return Ok(());
+        };
+        if let Some(worker) = self.worker.take() {
+            let _ = self.stop.try_send(());
+            let worker_deadline =
+                deadline - otlp::OTLP_EXPORT_TIMEOUT - crate::OTLP_SHUTDOWN_TIMEOUT;
+            while !worker.is_finished() && tokio::time::Instant::now() < worker_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            if !worker.is_finished() {
+                std::mem::forget(export);
+                return Err(ExportShutdownError::TimedOut);
+            }
+            let worker_panicked = worker.join().is_err();
+            let shutdown = export.shutdown_before(deadline);
+            if worker_panicked {
+                return shutdown.and(Err(ExportShutdownError::Failed(
+                    "the unscoped stream worker panicked".to_owned(),
+                )));
+            }
+            return shutdown;
+        }
+        export.shutdown_before(deadline)
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+struct UnscopedExportShutdown {
+    succeeded: bool,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for UnscopedExportShutdown {
+    fn drop(&mut self) {
+        UNSCOPED_EXPORT_STATE.store(
+            if self.succeeded {
+                UNSCOPED_EXPORT_CLOSED
+            } else {
+                UNSCOPED_EXPORT_FAILED
+            },
+            Ordering::Release,
+        );
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn take_unscoped_test_export(
+    deadline: tokio::time::Instant,
+) -> Result<Option<(UnscopedTestExport, UnscopedExportShutdown)>, ExportShutdownError> {
+    loop {
+        match UNSCOPED_EXPORT_STATE.load(Ordering::Acquire) {
+            0 | UNSCOPED_EXPORT_CLOSED => return Ok(None),
+            UNSCOPED_EXPORT_FAILED => {
+                return Err(ExportShutdownError::Failed(
+                    "the test process export shutdown failed".to_owned(),
+                ));
+            }
+            UNSCOPED_EXPORT_INITIALIZING | UNSCOPED_EXPORT_SHUTTING_DOWN => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ExportShutdownError::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            UNSCOPED_EXPORT_ACTIVE => {
+                if UNSCOPED_EXPORT_STATE
+                    .compare_exchange(
+                        UNSCOPED_EXPORT_ACTIVE,
+                        UNSCOPED_EXPORT_SHUTTING_DOWN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                break;
+            }
+            state => {
+                return Err(ExportShutdownError::Failed(format!(
+                    "unknown test process export state {state}"
+                )));
+            }
+        }
+    }
+
+    let slot = unscoped_test_export_slot();
+    loop {
+        match slot.try_lock() {
+            Ok(mut owner) => {
+                let Some(owner) = owner.take() else {
+                    UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_FAILED, Ordering::Release);
+                    return Err(ExportShutdownError::Failed(
+                        "the active test process export has no owner".to_owned(),
+                    ));
+                };
+                return Ok(Some((owner, UnscopedExportShutdown { succeeded: false })));
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut owner = poisoned.into_inner();
+                let Some(owner) = owner.take() else {
+                    UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_FAILED, Ordering::Release);
+                    return Err(ExportShutdownError::Failed(
+                        "the active test process export has no owner".to_owned(),
+                    ));
+                };
+                return Ok(Some((owner, UnscopedExportShutdown { succeeded: false })));
+            }
+            Err(TryLockError::WouldBlock) => {
+                if tokio::time::Instant::now() >= deadline {
+                    UNSCOPED_EXPORT_STATE.store(UNSCOPED_EXPORT_ACTIVE, Ordering::Release);
+                    return Err(ExportShutdownError::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+extern "C" fn shutdown_unscoped_test_export_at_exit() {
+    if UNSCOPED_EXPORT_STATE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let result = shutdown_unscoped_test_export_before(unscoped_shutdown_deadline());
+    let completed =
+        result.is_ok() && UNSCOPED_EXPORT_STATE.load(Ordering::Acquire) == UNSCOPED_EXPORT_CLOSED;
+    #[cfg(test)]
+    UNSCOPED_EXPORT_SHUTDOWN_SUCCEEDED.store(completed, Ordering::Release);
+    if !completed {
+        std::process::abort();
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn shutdown_unscoped_test_export_before(
+    deadline: tokio::time::Instant,
+) -> Result<(), ExportShutdownError> {
+    let Some((mut owner, mut shutdown)) = take_unscoped_test_export(deadline)? else {
+        return Ok(());
+    };
+    let result = owner.shutdown_before(deadline);
+    shutdown.succeeded = result.is_ok();
+    drop(shutdown);
+    result
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn spawn_unscoped_stream(
+    flights: Arc<FlightTable>,
+    stop_receiver: Option<mpsc::Receiver<()>>,
+) -> Option<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("rift-unscoped-stream".to_owned())
+        .spawn(move || {
+            loop {
+                if let Some(stop_receiver) = &stop_receiver {
+                    match stop_receiver.recv_timeout(UNSCOPED_IN_FLIGHT_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                } else {
+                    thread::sleep(UNSCOPED_IN_FLIGHT_INTERVAL);
+                }
+                let listing = flights.listing(monotonic_now());
+                if listing.in_flight > 0 {
+                    tracing::info!(
+                        target: "rift_tracing::flight",
+                        reason = "unscoped_stream",
+                        in_flight = listing.in_flight,
+                        left_out = listing.left_out,
+                        untracked = listing.untracked,
+                        operations = %listing,
+                        "operations in flight"
+                    );
+                }
+            }
+        })
+        .ok()
+}
+
+#[cfg(not(any(test, feature = "fixtures")))]
+fn spawn_unscoped_stream(flights: Arc<FlightTable>) {
     let _ = std::thread::Builder::new()
         .name("rift-unscoped-stream".to_owned())
         .spawn(move || {
             loop {
-                std::thread::sleep(UNSCOPED_IN_FLIGHT_INTERVAL);
+                thread::sleep(UNSCOPED_IN_FLIGHT_INTERVAL);
                 let listing = flights.listing(monotonic_now());
                 if listing.in_flight > 0 {
                     tracing::info!(
@@ -143,42 +499,10 @@ pub(crate) fn stream_unscoped() {
         });
 }
 
-#[cfg(any(test, feature = "fixtures"))]
-fn install_test_process_export(filter: tracing_subscriber::EnvFilter) {
-    if std::env::var_os("NEXTEST_ATTEMPT_ID").is_none()
-        || !std::env::args_os().any(|argument| argument == "--exact")
-        || !otlp::recorder_export_configured()
-    {
-        return;
-    }
-
-    let mut retained = UNSCOPED_TEST_EXPORT
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if retained.is_some() {
-        return;
-    }
-
-    let runtime = TestOtlpRuntime::when_configured()
-        .expect("a configured test process export owns its runtime");
-    let entered = runtime.handle.enter();
-    let (layer, export) = otlp::test_process_layer::<tracing_subscriber::Registry>(filter);
-    drop(entered);
-    drop(layer);
-
-    let export = runtime.with_export(export);
-    export.install_meter();
-    *retained = Some(export);
-}
-
-/// Shuts down the unscoped test export after a passing test has emitted its records.
+/// Shuts down the unscoped test export after its records, returning a shutdown error.
 #[cfg(test)]
-pub(crate) fn shutdown_unscoped_test_export() {
-    if let Some(export) = UNSCOPED_TEST_EXPORT.get() {
-        let export = { export.lock().unwrap_or_else(PoisonError::into_inner).take() };
-        drop(export);
-    }
+pub(crate) fn shutdown_unscoped_test_export() -> Result<(), ExportShutdownError> {
+    shutdown_unscoped_test_export_before(unscoped_shutdown_deadline())
 }
 
 /// The filter a recorder captures under: `capture`, or every level of every target, with
@@ -473,8 +797,18 @@ impl TestOtlpRuntime {
         }
     }
 
-    pub(crate) fn shutdown(mut self, export: OtlpExport) -> Result<(), ExportShutdownError> {
-        let deadline = tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT;
+    pub(crate) fn shutdown(self, export: OtlpExport) -> Result<(), ExportShutdownError> {
+        self.shutdown_before(
+            export,
+            tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    fn shutdown_before(
+        mut self,
+        export: OtlpExport,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
         let (reply, result) = mpsc::sync_channel(1);
         let mut request = TestOtlpRequest::Shutdown {
             export,
@@ -593,21 +927,32 @@ impl std::fmt::Debug for TestOtlpExport {
 
 impl Drop for TestOtlpExport {
     fn drop(&mut self) {
-        let Some(runtime) = self.runtime.take() else {
-            return;
-        };
-        if let Some(export) = self.export.take() {
-            let result = runtime.shutdown(export);
-            if let Err(error) = result
-                && !thread::panicking()
-            {
-                panic!("{error}");
-            }
+        if let Err(error) = self.shutdown()
+            && !thread::panicking()
+        {
+            panic!("{error}");
         }
     }
 }
 
 impl TestOtlpExport {
+    fn shutdown(&mut self) -> Result<(), ExportShutdownError> {
+        self.shutdown_before(tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_before(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let Some(runtime) = self.runtime.take() else {
+            return Ok(());
+        };
+        let Some(export) = self.export.take() else {
+            return Ok(());
+        };
+        runtime.shutdown_before(export, deadline)
+    }
+
     fn install_meter(&self) {
         if let Some(export) = self.export.as_ref() {
             let provider = export.recorder_meter_provider();

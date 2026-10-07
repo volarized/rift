@@ -261,6 +261,12 @@ fn a_recorder_clock_is_read_on_its_thread_alone() -> TestResult {
 /// nothing.
 const UNSCOPED_CHILD_VARIABLE: &str = "RIFT_TRACING_UNSCOPED_CHILD";
 
+extern "C" fn assert_unscoped_export_shutdown_succeeded() {
+    if !super::UNSCOPED_EXPORT_SHUTDOWN_SUCCEEDED.load(Ordering::Acquire) {
+        std::process::abort();
+    }
+}
+
 /// The child process the unscoped exporter tests start, as nextest would: `--exact` and
 /// `--nocapture`. Modes cover sync, Tokio runtimes, unwind, and scoped recorder installs.
 #[test]
@@ -268,6 +274,12 @@ fn unscoped_export_child() -> TestResult {
     let Some(mode) = std::env::var_os(UNSCOPED_CHILD_VARIABLE) else {
         return Ok(());
     };
+    let shutdown_export = !matches!(mode.to_str(), Some("no-shutdown" | "unwind"));
+    if !shutdown_export {
+        assert!(shutdown_hooks::add_shutdown_hook(
+            assert_unscoped_export_shutdown_succeeded
+        ));
+    }
     if mode == "first-scoped" {
         record_first_scoped_metrics()?;
     } else if mode == "scoped" {
@@ -285,6 +297,8 @@ fn unscoped_export_child() -> TestResult {
         assert!(messages.contains(&"scoped debug record exported"));
         assert!(messages.contains(&"recorded with scoped recorder"));
         assert!(!messages.contains(&"recorded on another thread"));
+    } else if mode == "no-shutdown" {
+        record_unscoped_signals("no-shutdown");
     } else if mode == "current-thread" {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -308,7 +322,9 @@ fn unscoped_export_child() -> TestResult {
             .map_err(|_| "the recording thread panicked")?;
         record_unscoped_signals("plain");
     }
-    super::shutdown_unscoped_test_export();
+    if shutdown_export {
+        super::shutdown_unscoped_test_export()?;
+    }
     Ok(())
 }
 
@@ -413,7 +429,9 @@ fn record_scoped_signals(mode: &str) {
 
 /// Starts a nextest-like child with the process exporter enabled and suppresses its
 /// process output; the parent collector retains its OTLP records.
-fn unscoped_child(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn unscoped_child_status(
+    mode: &str,
+) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .args([
@@ -422,11 +440,16 @@ fn unscoped_child(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
             "--nocapture",
         ])
         .env("RIFT_OTLP_FILTER", "debug")
+        .env("OTEL_METRIC_EXPORT_INTERVAL", "600000")
         .env(SCOPED_RECORDER_STREAM_VARIABLE, "1")
         .env(UNSCOPED_CHILD_VARIABLE, mode)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let status = command.status()?;
+    Ok(command.status()?)
+}
+
+fn unscoped_child(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = unscoped_child_status(mode)?;
     assert!(status.success(), "child mode {mode} exited with {status}");
     Ok(())
 }
@@ -438,8 +461,9 @@ fn a_test_with_no_recorder_exports_from_sync_async_and_unwinding_contexts() -> T
         "current-thread",
         "multi-thread",
         "unwind",
-        "first-scoped",
         "scoped",
+        "no-shutdown",
+        "first-scoped",
     ] {
         unscoped_child(mode)?;
     }
