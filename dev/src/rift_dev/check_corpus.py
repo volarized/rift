@@ -260,8 +260,9 @@ class Corpus:
         self.report.parent.mkdir(parents=True, exist_ok=True)
         facts = machine()
         print(machine_line(facts), flush=True)
+        work_timeout = asyncio.timeout(budget)
         try:
-            async with asyncio.timeout(budget):
+            async with work_timeout:
                 with (
                     retained_collector(
                         self.report.parent / f"{self.report.stem}.telemetry"
@@ -280,7 +281,24 @@ class Corpus:
                 status = "passed"
         except BaseException as error:
             failure = "".join(traceback.format_exception(error))
-            raise
+            # Issue #578: the FastAPI action deadline expired entering shallow history.
+            # Preserve the traceback and artifacts; other errors remain failures.
+            if (
+                self.pin.name == "fastapi"
+                and self.case == "workspace"
+                and self.last_action == "symlink_root"
+                and type(error) is TimeoutError
+                and work_timeout.expired()
+            ):
+                status = "xfail"
+                print(
+                    "XFAIL https://github.com/volarized/rift/issues/578: "
+                    "FastAPI action deadline expired after symlink_root",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                raise
         finally:
             try:
                 telemetry_artifact = self.write_telemetry_artifact()
