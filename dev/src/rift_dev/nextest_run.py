@@ -617,18 +617,46 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     status: int | None = None
     stream_error: BaseException | None = None
 
+    def write_raw_evidence(name: str, held: CaseTelemetry) -> None:
+        nonlocal raw_evidence_kept, raw_evidence_dropped
+
+        raw_records = [
+            *(("log record", entry) for entry in held.logs),
+            *(("span", span) for span in held.spans),
+            *(("metric point", point) for point in held.points),
+        ]
+        if raw_records:
+            with raw_evidence_path.open("ab") as artifact:
+                for kind, record in raw_records:
+                    remaining = (
+                        CASE_EVIDENCE_BYTES_MAX - evidence_kept - raw_evidence_kept
+                    )
+                    if remaining <= 0:
+                        raw_evidence_dropped += 1
+                        continue
+                    data = (
+                        json.dumps(
+                            {
+                                "test.case.name": name,
+                                "kind": kind,
+                                "record": asdict(record),
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    if len(data) > remaining:
+                        raw_evidence_dropped += 1
+                        continue
+                    artifact.write(data)
+                    raw_evidence_kept += len(data)
+
     def capture_passing(outcome: Outcome) -> None:
         nonlocal evidence_kept, evidence_dropped
-        nonlocal raw_evidence_kept, raw_evidence_dropped
         for name in cases.matching(outcome.names):
             held = cases.take(name)
             if held is None:
                 continue
-            raw_records = [
-                *(("log record", entry) for entry in held.logs),
-                *(("span", span) for span in held.spans),
-                *(("metric point", point) for point in held.points),
-            ]
             measurements = measurement_summary(held.logs)
             evidence = [
                 f"test.case.name={name}",
@@ -651,33 +679,9 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             if retained:
                 with evidence_path.open("ab") as artifact:
                     artifact.write(retained)
-                evidence_kept += len(retained)
+            evidence_kept += len(retained)
             evidence_dropped += len(data) - len(retained)
-            if raw_records:
-                with raw_evidence_path.open("ab") as artifact:
-                    for kind, record in raw_records:
-                        remaining = (
-                            CASE_EVIDENCE_BYTES_MAX - evidence_kept - raw_evidence_kept
-                        )
-                        if remaining <= 0:
-                            raw_evidence_dropped += 1
-                            continue
-                        data = (
-                            json.dumps(
-                                {
-                                    "test.case.name": name,
-                                    "kind": kind,
-                                    "record": asdict(record),
-                                },
-                                separators=(",", ":"),
-                            )
-                            + "\n"
-                        ).encode("utf-8")
-                        if len(data) > remaining:
-                            raw_evidence_dropped += 1
-                            continue
-                        artifact.write(data)
-                        raw_evidence_kept += len(data)
+            write_raw_evidence(name, held)
 
     def line(raw: bytes) -> None:
         nonlocal reading, opened
@@ -757,6 +761,8 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                 for name in cases.matching(outcome.names)
                 if (held := cases.take(name)) is not None
             ]
+            for name, held in telemetry:
+                write_raw_evidence(name, held)
             report = case_report(
                 outcome,
                 telemetry,
