@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from rift_dev.commands import CargoCommand
+from rift_dev.rust_source import (
+    measurement_elapsed_rows,
+    stored_duration_elapsed_rows,
+    test_rows,
+)
 
 # Cargo runs a test function only from a target it compiles, so a file holding one
 # of these attributes is a suite rather than a helper another suite includes.
@@ -678,13 +683,28 @@ def clock_findings(packages: list[dict[str, Any]]) -> list[ClockFinding]:
             continue
         root = pathlib.Path(package["manifest_path"]).parent
         for path in rust_sources(package):
-            if clock_allowed(package["name"], path.relative_to(root)):
+            relative = path.relative_to(root)
+            if clock_allowed(package["name"], relative):
                 continue
-            code = rust_code_lines(path.read_text(encoding="utf-8"))
+            contents = path.read_bytes()
+            code = rust_code_lines(contents.decode("utf-8"))
+            candidates = [
+                (number, line) for number, line in code if CLOCK_READ.search(line)
+            ]
+            if not candidates:
+                continue
+            test_code_rows = test_rows(contents)
+            non_clock_elapsed = measurement_elapsed_rows(contents) | (
+                stored_duration_elapsed_rows(contents)
+            )
             findings.extend(
                 ClockFinding(package["name"], str(path), number, line.strip())
-                for number, line in code
-                if CLOCK_READ.search(line)
+                for number, line in candidates
+                if number not in test_code_rows
+                and not (
+                    number in non_clock_elapsed
+                    and not CLOCK_READ.search(re.sub(r"\.elapsed\s*\(\)", "", line))
+                )
             )
     return findings
 
