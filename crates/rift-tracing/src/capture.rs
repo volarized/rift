@@ -192,6 +192,19 @@ pub(crate) fn registry() -> Layered<SpanContextLayer, Registry> {
     tracing_subscriber::registry().with(SpanContextLayer::default())
 }
 
+/// Records fields without dispatching tracing events emitted by their formatters. A nested
+/// `get_default` already returns `NoSubscriber`; a global dispatch needs an explicit scope.
+pub(crate) fn without_default_dispatch<T>(record: impl FnOnce() -> T) -> T {
+    let no_subscriber = tracing::dispatcher::get_default(|dispatch| {
+        dispatch.is::<tracing::subscriber::NoSubscriber>()
+    });
+    if no_subscriber {
+        record()
+    } else {
+        tracing::dispatcher::with_default(&tracing::dispatcher::Dispatch::none(), record)
+    }
+}
+
 /// The `tracing` layer that keeps, for every span, what the records written inside it
 /// carry: its labels and fields, its root span, and how long it was busy and idle.
 ///
@@ -269,7 +282,7 @@ where
             return;
         };
         let mut fields = RecordedFields::default();
-        attributes.record(&mut fields);
+        without_default_dispatch(|| attributes.record(&mut fields));
         let parent = span.parent().and_then(|parent| {
             parent
                 .extensions()
@@ -300,7 +313,7 @@ where
             return;
         };
         let mut fields = RecordedFields::default();
-        values.record(&mut fields);
+        without_default_dispatch(|| values.record(&mut fields));
         if let Some(entry) = span.extensions().get::<SpanEntry>() {
             entry.node.labels_mut().extend(&fields.rest);
         }
@@ -640,7 +653,7 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     let mut fields = RecordedFields::default();
-    event.record(&mut fields);
+    without_default_dispatch(|| event.record(&mut fields));
     let RecordedFields {
         message,
         mut component,
