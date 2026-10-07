@@ -247,12 +247,13 @@ def retained_collector(directory: Path) -> Iterator[Collector]:
         ) as served:
             yield served
     finally:
+        artifact.close()
         summary = CollectionSummary(
             errors=tuple(
                 [
-                    f"collection omitted={artifact.omitted} requests_failed={artifact.request_errors}"
+                    f"collection omitted={artifact.omitted} requests_failed={artifact.request_errors} write_error={artifact.write_error}"
                 ]
-                if artifact.omitted or artifact.request_errors
+                if artifact.omitted or artifact.request_errors or artifact.write_error
                 else []
             ),
             received=artifact.received,
@@ -267,7 +268,7 @@ def retained_collector(directory: Path) -> Iterator[Collector]:
         (directory / "telemetry-summary.json").write_text(
             summary.model_dump_json(indent=2) + "\n", encoding="utf-8"
         )
-    if artifact.omitted or artifact.request_errors:
+    if artifact.omitted or artifact.request_errors or artifact.write_error:
         raise RuntimeError(
             f"collection incomplete; inspect {directory / 'telemetry-summary.json'}"
         )
@@ -291,7 +292,14 @@ class ArtifactStore:
         self.written = 0
         self.received_bytes = 0
         self.lock = threading.Lock()
-        self.path.touch()
+        self.output = self.path.open("ab")
+
+    def close(self) -> None:
+        """Close the retained file after the collector finishes its bounded shutdown."""
+        try:
+            self.output.close()
+        except OSError as error:
+            self.write_error = str(error)[:LINE_CHARS_MAX]
 
     def write(
         self, evidence: LogEvidence | SpanEvidence | MetricEvidence | RequestEvidence
@@ -304,8 +312,7 @@ class ArtifactStore:
                 self.omitted += 1
                 return
             try:
-                with self.path.open("ab") as artifact:
-                    artifact.write(data)
+                self.output.write(data)
             except OSError as error:
                 self.write_error = str(error)[:LINE_CHARS_MAX]
                 self.omitted += 1
@@ -318,25 +325,27 @@ class ArtifactStore:
         try:
             identity = AttemptIdentity.model_validate(dict(record.resource))
         except ValidationError:
-            self.unassigned += 1
+            with self.lock:
+                self.unassigned += 1
             return False
-        outcome = self.cases.get((identity.binary, identity.test))
-        if outcome is None or (
-            self.run_id is not None and self.run_id != identity.run_id
-        ):
-            self.unassigned += 1
-            return False
-        self.run_id = identity.run_id
-        held = self.identities.get(identity.attempt_id)
-        if held is not None and held != identity:
-            self.unassigned += 1
-            return False
-        if held is None and len(self.identities) >= CASES_MAX:
-            self.unassigned += 1
-            return False
-        self.identities[identity.attempt_id] = identity
-        # Original records remain in JSONL after terminal results and late arrivals.
-        return outcome.result is None or outcome.failed
+        with self.lock:
+            outcome = self.cases.get((identity.binary, identity.test))
+            if outcome is None or (
+                self.run_id is not None and self.run_id != identity.run_id
+            ):
+                self.unassigned += 1
+                return False
+            self.run_id = identity.run_id
+            held = self.identities.get(identity.attempt_id)
+            if held is not None and held != identity:
+                self.unassigned += 1
+                return False
+            if held is None and len(self.identities) >= CASES_MAX:
+                self.unassigned += 1
+                return False
+            self.identities[identity.attempt_id] = identity
+            # Original records remain in JSONL after terminal results and late arrivals.
+            return outcome.result is None or outcome.failed
 
     def record(self, record: LogEntry | SpanRecord | MetricPoint) -> None:
         """Serialize one original telemetry record through its Pydantic model."""
@@ -356,7 +365,8 @@ class ArtifactStore:
         """Retain every finished request before its diagnostic cache expires."""
         self.write(RequestEvidence(record=request))
         if request.intended_status != 200 or request.outcome != "ok":
-            self.request_errors += 1
+            with self.lock:
+                self.request_errors += 1
 
     def telemetry(self, outcomes: Sequence[Outcome]) -> dict[str, CaseTelemetry]:
         selected = {(o.case.binary, o.case.test): o.case.full_name for o in outcomes}
@@ -1135,6 +1145,11 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             status = error.status
         errors.append(f"{'setup' if config is None else 'collection'} error: {error}")
     finally:
+        artifact.close()
+        if artifact.write_error and not any(
+            error.startswith("artifact write error:") for error in errors
+        ):
+            errors.append(f"artifact write error: {artifact.write_error}")
         if config is not None:
             export = (
                 CargoCommand(

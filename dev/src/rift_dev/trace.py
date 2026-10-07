@@ -30,6 +30,7 @@ caller reads them while the thread writes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -1201,9 +1202,8 @@ def receiver(
     """The application that feeds OTLP/HTTP export requests into `spans`, `metrics`, and
     `logs`.
 
-    Starlette answers any other path with 404 and any other method with 405. When `cases`
-    is supplied, it also serves bounded read-only snapshots of one live test's logs and
-    metric points.
+    Starlette answers any other path with 404 and any other method with 405. Decode and
+    retention run outside the HTTP event loop so other export bodies keep draining.
     """
     held = metrics if metrics is not None else MetricStore()
     records = logs if logs is not None else LogStore()
@@ -1255,7 +1255,7 @@ def receiver(
                     413,
                 )
             try:
-                receipt = keep(body)
+                receipt = await asyncio.to_thread(keep, body)
             except DecodeError:
                 request_records.finish(observed, 400, "protobuf")
                 return PlainTextResponse(f"the body is not an {noun}", 400)

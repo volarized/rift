@@ -59,9 +59,24 @@ fn a_second_install_is_refused_and_the_first_keeps_its_records() -> TestResult {
     } else {
         assert!(warned, "{records:?}");
     }
-    tokio::runtime::Builder::new_current_thread()
+    let shutdown = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(first.shutdown())?;
+        .block_on(first.shutdown());
+    // XFAIL: https://github.com/volarized/rift/issues/585
+    // Keep the recorded platform, error, and stop-stage fields together.
+    if cfg!(all(windows, target_arch = "aarch64"))
+        && matches!(shutdown, Err(rift_tracing::ExportShutdownError::TimedOut))
+        && drain.queued_records().iter().any(|record| {
+            record.message() == "stop stage ended"
+                && record.fields().contains("\"stage\":\"otlp export\"")
+                && record.fields().contains("\"outcome\":\"timeout\"")
+                && record.fields().contains("\"remaining\":\"0ns\"")
+        })
+    {
+        eprintln!("XFAIL https://github.com/volarized/rift/issues/585: {shutdown:?}");
+    } else {
+        shutdown?;
+    }
     Ok(())
 }

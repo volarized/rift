@@ -186,6 +186,8 @@ def run(command: Command) -> None:
         except BaseException as error:  # noqa: BLE001 - retain setup and collection errors.
             failure = failure or error
             errors.append(f"appliance error: {error}")
+        finally:
+            artifact.close()
     output = "\n".join(
         path.read_text(encoding="utf-8", errors="replace") for path in paths
     )
@@ -199,6 +201,8 @@ def run(command: Command) -> None:
         errors.append(
             f"collection omitted={artifact.omitted} requests_failed={artifact.request_errors} output_bytes_omitted={omitted}"
         )
+    if artifact.write_error:
+        errors.append(f"artifact write error: {artifact.write_error}")
     if served_dropped.bodies or served_dropped.kinds:
         errors.append(f"collector refused data: {served_dropped.counts()}")
     if len(failed_names) > FAILURES_MAX:

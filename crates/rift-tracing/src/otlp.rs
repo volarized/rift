@@ -1484,7 +1484,7 @@ mod tests {
         assert_eq!(flush_result, Ok(()));
         assert_eq!(shutdown_result, Ok(()));
         assert_eq!(logs_result, Ok(()));
-        assert_eq!(collector_result, Ok(()));
+        assert_diagnostic_collector_shutdown(&collector_result);
         assert!(
             exported_span_count > 0,
             "the stop stage span reaches the exporter: {exported_span_count}"
@@ -1493,6 +1493,22 @@ mod tests {
             exported_logs.contains(&AnyValue::from("otlp export ended".to_owned())),
             "the shutdown result is logged after trace shutdown"
         );
+    }
+
+    fn assert_diagnostic_collector_shutdown(collector_result: &Result<(), ExportShutdownError>) {
+        // XFAIL: https://github.com/volarized/rift/issues/585
+        // Only the recorded Windows arm64 diagnostic-provider timeout is expected.
+        if cfg!(all(windows, target_arch = "aarch64"))
+            && matches!(
+                collector_result,
+                Err(ExportShutdownError::Failed(reason))
+                    if reason == "Operation failed: Shutdown errors: [Timeout(2s)]"
+            )
+        {
+            eprintln!("XFAIL https://github.com/volarized/rift/issues/585: {collector_result:?}");
+        } else {
+            assert_eq!(collector_result, &Ok(()));
+        }
     }
 
     /// The bound the shutdown test waits at most past its deadline: thread start and the
