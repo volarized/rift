@@ -694,10 +694,42 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         raise ValueError("CI appliance requires OTEL_SDK_DISABLED=false")
     if source.get("OTEL_SDK_DISABLED", "").lower() == "true":
         raise ValueError("appliance collection requires OTEL_SDK_DISABLED=false")
-    if (
-        command.arguments[:2] == ["llvm-cov", "nextest"]
-        and "--archive-file" not in listing
-    ):
+    llvm_cov = command.arguments[:2] == ["llvm-cov", "nextest"]
+    archived = any(a.partition("=")[0] == "--archive-file" for a in listing)
+    archive_directory: Path | None = None
+    if llvm_cov and archived:
+        # cargo-llvm-cov injects --extract-to during execution. Discovery must
+        # use that same directory and must not forward a duplicate option.
+        target = source.get(
+            "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+        )
+        retained: list[str] = []
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument == "--":
+                retained.extend(arguments[index:])
+                break
+            name, separator, value = argument.partition("=")
+            if name == "--extract-to":
+                if not separator:
+                    index += 1
+                    if index >= len(arguments):
+                        raise ValueError("missing value for --extract-to")
+                    value = arguments[index]
+                target = value
+            else:
+                retained.append(argument)
+            index += 1
+        archive_directory = Path(target)
+        if not archive_directory.is_absolute():
+            archive_directory = command.directory / archive_directory
+        archive_directory.mkdir(parents=True, exist_ok=True)
+        command.with_env(CARGO_LLVM_COV_TARGET_DIR=str(archive_directory))
+        arguments = retained
+        command.arguments = [*command.arguments[:2], *arguments]
+        listing = list_arguments(arguments)
+    if llvm_cov and not archived:
         # show-env is cargo-llvm-cov's supported custom-workflow interface. One
         # instrumented build supplies discovery, execution, and the later report.
         from rift_dev.suites import parse_coverage_environment
@@ -722,6 +754,8 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
     # Options cannot follow the emulated libtest separator.
     discovery.arguments = ["nextest", "list", *listing]
     append_options(discovery, "--message-format", "json")
+    if archive_directory is not None:
+        append_options(discovery, "--extract-to", str(archive_directory))
     discovery.with_environment(command.environment() or source).with_cwd(
         command.directory
     )
@@ -1025,6 +1059,8 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     except BaseException as error:  # noqa: BLE001 - also save setup/cancellation evidence.
         if original_error is None:
             original_error = error
+        if isinstance(error, CommandFailed):
+            status = error.status
         errors.append(f"{'setup' if config is None else 'collection'} error: {error}")
     finally:
         if config is not None:

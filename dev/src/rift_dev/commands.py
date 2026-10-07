@@ -243,10 +243,15 @@ class Command:
                         for task in done:
                             task.result()
                     status = waiter.result()
-                    await asyncio.wait_for(
-                        asyncio.gather(*readers),
-                        timeout=exit_wait_seconds or JOIN_SECONDS_MAX,
-                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*readers),
+                            timeout=exit_wait_seconds or JOIN_SECONDS_MAX,
+                        )
+                    except TimeoutError as error:
+                        raise RuntimeError(
+                            "command streams did not close within their exit bound"
+                        ) from error
         finally:
             for task in readers:
                 task.cancel()
