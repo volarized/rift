@@ -1221,11 +1221,37 @@ fn inline_questions_preserve_success_pending_and_none_without_error_identity() {
         assert!(matches!(poll_option(Poll::Ready(None)), Poll::Ready(None)));
         assert!(poll_option(Poll::Pending).is_pending());
     });
-    let records = queued(&mut drain);
-    assert_eq!(records.len(), 7);
+    let records: Vec<_> = queued(&mut drain)
+        .into_iter()
+        .filter(|record| {
+            record.target() == module_path!()
+                && matches!(
+                    record.message(),
+                    "test.option_continue"
+                        | "test.control_continue"
+                        | "test.poll_continue"
+                        | "test.poll_option_continue"
+                )
+        })
+        .collect();
+    assert_eq!(records.len(), 7, "captured records: {records:?}");
+    assert_eq!(
+        records.iter().map(LogRecord::message).collect::<Vec<_>>(),
+        [
+            "test.option_continue",
+            "test.control_continue",
+            "test.poll_continue",
+            "test.poll_continue",
+            "test.poll_option_continue",
+            "test.poll_option_continue",
+            "test.poll_option_continue",
+        ],
+        "captured records: {records:?}"
+    );
     for record in records {
         let fields: serde_json::Value =
             serde_json::from_str(record.fields()).expect("record fields");
+        assert_eq!(fields["span"], "closed", "{fields}");
         assert_eq!(fields["status.code"], "Ok", "{fields}");
         assert!(fields.get("error.type").is_none(), "{fields}");
     }
@@ -1247,8 +1273,13 @@ fn a_bare_return_leaves_the_function_and_closes_without_error_identity() {
         work(true, &reached);
     });
     assert!(!reached.get());
-    let records = queued(&mut drain);
-    assert_eq!(records.len(), 1);
+    let records: Vec<_> = queued(&mut drain)
+        .into_iter()
+        .filter(|record| {
+            record.target() == module_path!() && record.message() == "test.bare_return"
+        })
+        .collect();
+    assert_eq!(records.len(), 1, "captured records: {records:?}");
     let fields = fields_of(&records, "test.bare_return");
     assert_eq!(fields["span"], "closed");
     assert_eq!(fields["status.code"], "Ok");
