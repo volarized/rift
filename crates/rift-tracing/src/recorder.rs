@@ -143,6 +143,35 @@ pub(crate) fn stream_unscoped() {
         });
 }
 
+#[cfg(any(test, feature = "fixtures"))]
+fn install_test_process_export(filter: tracing_subscriber::EnvFilter) {
+    if std::env::var_os("NEXTEST_ATTEMPT_ID").is_none()
+        || !std::env::args_os().any(|argument| argument == "--exact")
+        || !otlp::recorder_export_configured()
+    {
+        return;
+    }
+
+    let mut retained = UNSCOPED_TEST_EXPORT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if retained.is_some() {
+        return;
+    }
+
+    let runtime = TestOtlpRuntime::when_configured()
+        .expect("a configured test process export owns its runtime");
+    let entered = runtime.handle.enter();
+    let (layer, export) = otlp::test_process_layer::<tracing_subscriber::Registry>(filter);
+    drop(entered);
+    drop(layer);
+
+    let export = runtime.with_export(export);
+    export.install_meter();
+    *retained = Some(export);
+}
+
 /// Shuts down the unscoped test export after a passing test has emitted its records.
 #[cfg(test)]
 pub(crate) fn shutdown_unscoped_test_export() {
@@ -304,9 +333,9 @@ impl ScopedRecorderBuilder {
     /// Returns [`LogFilterError`] when the [`Self::capture`] filter does not parse.
     pub fn install(self) -> Result<(ScopedRecorder, LogDrain), LogFilterError> {
         let filter = recorder_filter(self.capture.as_deref())?;
-        #[cfg(any(test, feature = "fixtures"))]
-        stream_unscoped();
         RECORDER_INSTALLED.store(true, Ordering::Relaxed);
+        #[cfg(any(test, feature = "fixtures"))]
+        install_test_process_export(filter.clone());
         let (sink, drain) = log_capture();
         let runtime = TestOtlpRuntime::when_configured();
         let (otlp_layer, export) = if let Some(runtime) = &runtime {

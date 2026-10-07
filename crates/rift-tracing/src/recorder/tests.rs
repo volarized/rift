@@ -268,7 +268,9 @@ fn unscoped_export_child() -> TestResult {
     let Some(mode) = std::env::var_os(UNSCOPED_CHILD_VARIABLE) else {
         return Ok(());
     };
-    if mode == "scoped" {
+    if mode == "first-scoped" {
+        record_first_scoped_metrics()?;
+    } else if mode == "scoped" {
         record_unscoped_signals("scoped.before");
         let (recorder, mut drain) = ScopedRecorder::builder().install()?;
         crate::info!(component = "index", "recorded on the recorder's thread");
@@ -308,6 +310,69 @@ fn unscoped_export_child() -> TestResult {
     }
     super::shutdown_unscoped_test_export();
     Ok(())
+}
+
+fn record_first_scoped_metrics() -> TestResult {
+    let elapsed = Arc::new(AtomicU64::new(0));
+    let first_clock = Arc::clone(&elapsed);
+    let (first, _) = ScopedRecorder::builder()
+        .clock(move || Duration::from_nanos(first_clock.load(Ordering::Relaxed)))
+        .install()?;
+    assert!(!super::UNSCOPED_TRIED.load(Ordering::Relaxed));
+    crate::traced!("search.request", {
+        elapsed.fetch_add(250_000_000, Ordering::Relaxed);
+    });
+    assert_scoped_metric_snapshot(&first, 1.0, 1, 0.25);
+    drop(first);
+
+    let second_clock = Arc::clone(&elapsed);
+    let (second, _) = ScopedRecorder::builder()
+        .clock(move || Duration::from_nanos(second_clock.load(Ordering::Relaxed)))
+        .install()?;
+    crate::traced!("search.request", {
+        elapsed.fetch_add(250_000_000, Ordering::Relaxed);
+    });
+    assert_scoped_metric_snapshot(&second, 2.0, 2, 0.5);
+    drop(second);
+    Ok(())
+}
+
+fn assert_scoped_metric_snapshot(recorder: &ScopedRecorder, calls: f64, count: u64, sum: f64) {
+    let snapshot = recorder.metrics();
+    assert_eq!(
+        snapshot
+            .find(
+                "traces.span.metrics.calls",
+                &[
+                    ("span.name", "search.request"),
+                    ("span.kind", "Internal"),
+                    ("status.code", "Ok"),
+                ],
+            )
+            .map(|series| series.value().clone()),
+        Some(SeriesValue::Sum(calls))
+    );
+    match snapshot
+        .find(
+            "traces.span.metrics.duration",
+            &[
+                ("span.name", "search.request"),
+                ("span.kind", "Internal"),
+                ("status.code", "Ok"),
+            ],
+        )
+        .map(super::metrics::MetricSeries::value)
+    {
+        Some(SeriesValue::Buckets {
+            count: actual_count,
+            sum: actual_sum,
+            ..
+        }) => {
+            assert_eq!(*actual_count, count);
+            assert!((*actual_sum - sum).abs() < f64::EPSILON);
+        }
+        other => panic!("expected duration histogram, got {other:?}"),
+    }
 }
 
 /// Emits one log, span, and operation metric under the unscoped subscriber.
@@ -373,6 +438,7 @@ fn a_test_with_no_recorder_exports_from_sync_async_and_unwinding_contexts() -> T
         "current-thread",
         "multi-thread",
         "unwind",
+        "first-scoped",
         "scoped",
     ] {
         unscoped_child(mode)?;
