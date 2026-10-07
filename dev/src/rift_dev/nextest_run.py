@@ -230,6 +230,7 @@ class RunSummary(CollectionSummary):
     unlaunched: int
     attempts: tuple[AttemptIdentity, ...]
     artifacts: tuple[str, ...]
+    result_bytes_omitted: int = 0
 
 
 @contextmanager
@@ -818,6 +819,8 @@ class EventReader:
         self.discarding = False
         self.errors: list[str] = []
         self.error_count = 0
+        self.output_bytes = 0
+        self.output_bytes_omitted = 0
 
     def error(self, detail: str) -> None:
         self.error_count += 1
@@ -869,7 +872,18 @@ class EventReader:
                 self.error(
                     f"Nextest terminal result without unique start: {event.name}"
                 )
-            outcome.result = event
+            # Bound aggregate retained result text, not just each JSONL event.
+            # The portable recording remains Nextest's captured-output source.
+            texts: dict[str, str] = {}
+            for field in ("stdout", "reason"):
+                data = getattr(event, field).encode("utf-8")
+                kept = data[: max(0, RUN_LOG_BYTES_MAX - self.output_bytes)]
+                text = kept.decode("utf-8", errors="ignore")
+                size = len(text.encode("utf-8"))
+                self.output_bytes += size
+                self.output_bytes_omitted += len(data) - size
+                texts[field] = text
+            outcome.result = event.model_copy(update=texts)
             if event.event == "ok":
                 with self.cases.lock:
                     names = [
@@ -1042,6 +1056,10 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             if reader.pending:
                 reader.line(bytes(reader.pending))
             errors.extend(reader.errors)
+            if reader.output_bytes_omitted:
+                errors.append(
+                    f"retained result output bytes omitted={reader.output_bytes_omitted}; original capture remains in recording.zip"
+                )
             if reader.error_count > len(reader.errors):
                 errors.append(
                     f"{reader.error_count - len(reader.errors)} further result errors"
@@ -1123,6 +1141,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
         cache_evictions=served.dropped(),
         request_cache_evictions=served.requests.dropped,
         log_bytes_omitted=omitted_log,
+        result_bytes_omitted=reader.output_bytes_omitted if reader else 0,
         artifacts=tuple(str(path) for path in directory.iterdir() if path.is_file()),
     )
     (directory / "run.json").write_text(

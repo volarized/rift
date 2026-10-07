@@ -1628,6 +1628,8 @@ def collector(
         finally:
             server.should_exit = True
             thread.join(COLLECTOR_STOP_SECONDS)
+        if failures:
+            raise RuntimeError(f"the OTLP collector failed: {failures}")
         if thread.is_alive():
             raise RuntimeError(
                 f"the OTLP collector thread outlived its {COLLECTOR_STOP_SECONDS}s stop"
