@@ -3173,13 +3173,23 @@ done
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
         let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
-        eprintln!("before the feed: attempts={attempts} elapsed={elapsed:?}");
+        rift_tracing::info!(
+            component = "engine",
+            attempts,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            unconfirmed,
+            "before the feed"
+        );
         assert!(!unconfirmed, "the engine read ready before the feed");
 
         pool.owe_changed_paths(&edited_other());
         let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
-        eprintln!(
-            "after the feed: attempts={attempts} elapsed={elapsed:?} unconfirmed={unconfirmed}"
+        rift_tracing::info!(
+            component = "engine",
+            attempts,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            unconfirmed,
+            "after the feed"
         );
         let notified = std::fs::read_to_string(directory.path().join("notified.log"))
             .expect("the engine was told");
@@ -3212,8 +3222,12 @@ done
 
         pool.owe_changed_paths(&edited_other());
         let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
-        eprintln!(
-            "unwatched after the feed: attempts={attempts} elapsed={elapsed:?} unconfirmed={unconfirmed}"
+        rift_tracing::info!(
+            component = "engine",
+            attempts,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            unconfirmed,
+            "unwatched after the feed"
         );
         assert!(
             !directory.path().join("notified.log").exists(),
