@@ -631,6 +631,118 @@ jobs:
         if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
         run: sccache --show-stats
 
+  tracing-cost:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: cargo-nextest@0.9.145
+      - run: rustup toolchain install 1.98 --profile minimal
+      - name: Record T-149 source inputs
+        run: |
+          mkdir -p target/integration/t149
+          {
+            printf 'run=%s attempt=%s commit=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA"
+            printf 'runner_os=%s runner_arch=%s profile=t149 cargo_profile=release\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            shasum -a 256 Cargo.toml Cargo.lock crates/rift-tracing/Cargo.toml crates/rift-tracing/src/metrics.rs crates/rift-tracing/src/capture/tests.rs crates/rift-tracing/src/metrics/tests.rs
+          } > target/integration/t149/receipt.txt
+      - name: List release test binary
+        run: |
+          uv run --locked --project dev rift-dev test nextest list --locked \
+            --profile t149 --cargo-profile release -p rift-tracing --lib \
+            --list-type binaries-only --message-format json \
+            > target/integration/t149/binaries.json
+          python3 - <<'PYCODE'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("target/integration/t149")
+          binaries = json.loads((root / "binaries.json").read_text())["rust-binaries"]
+          binary_id = "rift-tracing"
+          if set(binaries) != {binary_id}:
+              raise SystemExit(f"expected only {binary_id} binary, got {sorted(binaries)}")
+          binary = binaries[binary_id]
+          if binary["binary-id"] != binary_id or binary["kind"] != "lib":
+              raise SystemExit(f"unexpected test binary metadata: {binary}")
+          path = Path(binary["binary-path"])
+          if not path.is_absolute():
+              raise SystemExit(f"test binary path is not absolute: {path}")
+          if not path.is_file():
+              raise SystemExit(f"test binary is missing: {path}")
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          with (root / "receipt.txt").open("a") as receipt:
+              receipt.write(f"binary_id={binary['binary-id']}\n")
+              receipt.write(f"package_id={binary['package-id']}\n")
+              receipt.write(f"binary_path={path}\n")
+              receipt.write(f"binary_sha256={digest}\n")
+          PYCODE
+      - name: Measure operation records
+        env:
+          OTEL_SDK_DISABLED: "false"
+          RIFT_OTLP_FILTER: debug
+          RIFT_TEST_REPORT_DIRECTORY: target/integration/t149/operation
+        run: |
+          printf 'measurement=operation_record_cost RIFT_COST_METER=unset argv=rift-dev test nextest run --locked --profile t149 --no-tests fail --run-ignored only --cargo-profile release -p rift-tracing --lib -E test(=capture::tests::operation_record_cost)\n' >> target/integration/t149/receipt.txt
+          env -u RIFT_COST_METER uv run --locked --project dev rift-dev test nextest run --locked --profile t149 --no-tests fail --run-ignored only --cargo-profile release -p rift-tracing --lib -E 'test(=capture::tests::operation_record_cost)'
+      - name: Preserve operation report
+        if: always()
+        run: |
+          if [ -f target/nextest/t149/junit.xml ]; then
+            cp target/nextest/t149/junit.xml target/integration/t149/operation.junit.xml
+          fi
+      - name: Measure record path with meter off
+        env:
+          OTEL_SDK_DISABLED: "false"
+          RIFT_OTLP_FILTER: debug
+          RIFT_TEST_REPORT_DIRECTORY: target/integration/t149/meter-off
+        run: |
+          printf 'measurement=record_path_cost RIFT_COST_METER=unset argv=rift-dev test nextest run --locked --profile t149 --no-tests fail --run-ignored only --cargo-profile release -p rift-tracing --lib -E test(=metrics::tests::record_path_cost)\n' >> target/integration/t149/receipt.txt
+          env -u RIFT_COST_METER uv run --locked --project dev rift-dev test nextest run --locked --profile t149 --no-tests fail --run-ignored only --cargo-profile release -p rift-tracing --lib -E 'test(=metrics::tests::record_path_cost)'
+      - name: Preserve meter-off report
+        if: always()
+        run: |
+          if [ -f target/nextest/t149/junit.xml ]; then
+            cp target/nextest/t149/junit.xml target/integration/t149/meter-off.junit.xml
+          fi
+      - name: Measure record path with meter on
+        env:
+          OTEL_SDK_DISABLED: "false"
+          RIFT_OTLP_FILTER: debug
+          RIFT_COST_METER: "1"
+          RIFT_TEST_REPORT_DIRECTORY: target/integration/t149/meter-on
+        run: |
+          printf 'measurement=record_path_cost RIFT_COST_METER=1 argv=rift-dev test nextest run --locked --profile t149 --no-tests fail --run-ignored only --cargo-profile release -p rift-tracing --lib -E test(=metrics::tests::record_path_cost)\n' >> target/integration/t149/receipt.txt
+          uv run --locked --project dev rift-dev test nextest run --locked --profile t149 --no-tests fail --run-ignored only --cargo-profile release -p rift-tracing --lib -E 'test(=metrics::tests::record_path_cost)'
+      - name: Preserve meter-on report
+        if: always()
+        run: |
+          if [ -f target/nextest/t149/junit.xml ]; then
+            cp target/nextest/t149/junit.xml target/integration/t149/meter-on.junit.xml
+          fi
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: tracing-cost-${{ matrix.os }}
+          path: target/integration/t149/
+          if-no-files-found: error
+          retention-days: 7
+
   # The corpus profile compiles the whole workspace optimized. The corpus jobs
   # run an instrumented archive and the artifact job serves the plain CLI, and
   # the two builds share no compiled workspace crate, so each has a job of its

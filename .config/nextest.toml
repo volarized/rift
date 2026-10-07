@@ -123,3 +123,15 @@ failure-output = "immediate-final"
 
 [profile.live.junit]
 path = "junit.xml"
+
+# The release cost measurements exceed the default per-test deadline. Keep the
+# CI global deadline while granting these two measurements 300 seconds.
+[profile.t149]
+inherits = "ci"
+
+[[profile.t149.overrides]]
+filter = 'test(=capture::tests::operation_record_cost) or test(=metrics::tests::record_path_cost)'
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
+
+[profile.t149.junit]
+path = "junit.xml"
