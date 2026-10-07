@@ -257,7 +257,7 @@ fn finish_collection(
         .collect::<Result<Vec<_>, _>>()?;
     rift_tracing::traced!(
         component = "documentation",
-        operation = "documentation.collect",
+        operation = "collect_documentation_incremental",
         phase = "collect_documentation_incremental",
         sources = sources.sources().len(),
         declarations = declarations.len(),

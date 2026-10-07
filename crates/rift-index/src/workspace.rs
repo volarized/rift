@@ -2263,7 +2263,7 @@ impl WorkspaceIndex {
         })?;
         let declarations = rift_tracing::traced!(
             component = "documentation",
-            operation = "documentation.collect",
+            operation = "accepted_declarations",
             phase = "accepted_declarations",
             files = files.len(),
             { accepted_declarations(&files, &semantics) }
@@ -3556,7 +3556,7 @@ fn built_contents(
                 );
                 let built = rift_tracing::traced!(
                     component = "index",
-                    operation = "index.semantics",
+                    operation = "WorkspaceSemantics::build_project_facts",
                     phase = "WorkspaceSemantics::build_project_facts",
                     files = contents.files.len(),
                     {
