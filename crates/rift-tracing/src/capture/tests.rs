@@ -1,11 +1,14 @@
+use std::fmt;
 use std::future::Future as _;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
+use std::thread;
 use std::time::Duration;
 
 use tracing::field::Visit as _;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -72,6 +75,98 @@ fn an_event_reaches_the_queue_with_its_labels() {
     assert_eq!(records[0].component(), "index");
     assert_eq!(records[0].operation(), "index.reconcile");
     assert_eq!(records[0].fields(), "{\"epoch\":\"7\"}");
+}
+
+#[test]
+fn formatter_scope_handles_another_threads_scoped_dispatch_ending() {
+    let (sink, mut drain) = log_capture();
+    let flights = Arc::new(crate::flight::FlightTable::default());
+    let subscriber = crate::capture::registry()
+        .with(crate::flight::FlightLayer::new(Arc::clone(&flights)))
+        .with(crate::runtime::capture_layer(sink, EnvFilter::new("trace")));
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("the test process has no earlier global subscriber");
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+    let other = thread::spawn(move || {
+        let dispatch = tracing::dispatcher::Dispatch::none();
+        tracing::dispatcher::with_default(&dispatch, || {
+            ready_tx.send(()).expect("the test is waiting");
+            release_rx.recv().expect("the formatter releases the scope");
+        });
+        dropped_tx
+            .send(())
+            .expect("the formatter observes scope drop");
+    });
+    ready_rx.recv().expect("the scoped dispatch is active");
+
+    let value = FormatterRace {
+        release: release_tx,
+        dropped: Mutex::new(dropped_rx),
+        started: AtomicBool::new(false),
+    };
+    let span = tracing::info_span!(
+        "index.reconcile",
+        component = "index",
+        operation = "index.reconcile",
+        detail = %value,
+    );
+    let listing = flights.listing(crate::measurement::monotonic_now());
+    assert_eq!(listing.in_flight, 1);
+    assert!(
+        listing
+            .operations
+            .contains("\"operation\":\"index.reconcile\"")
+    );
+    assert!(listing.operations.contains("\"component\":\"index\""));
+    span.in_scope(|| tracing::info!("the workspace settled"));
+    drop(span);
+    other.join().expect("the scoped dispatch thread finishes");
+
+    let records = queued(&mut drain);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.message() == "field formatter event")
+    );
+    let settled = records
+        .iter()
+        .find(|record| record.message() == "the workspace settled")
+        .expect("the operation event reaches capture");
+    assert_eq!(settled.component(), "index");
+    assert_eq!(settled.operation(), "index.reconcile");
+    let closed = records
+        .iter()
+        .find(|record| record.fields().contains("\"span\":\"closed\""))
+        .expect("the operation close reaches capture");
+    assert_eq!(closed.component(), "index");
+    assert_eq!(closed.operation(), "index.reconcile");
+    assert!(closed.fields().contains("\"detail\":\"field value\""));
+}
+
+struct FormatterRace {
+    release: mpsc::SyncSender<()>,
+    dropped: Mutex<mpsc::Receiver<()>>,
+    started: AtomicBool,
+}
+
+impl fmt::Display for FormatterRace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.started.swap(true, Ordering::AcqRel) {
+            self.release
+                .send(())
+                .expect("the scoped dispatch is active");
+            self.dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("the scoped dispatch has dropped");
+            tracing::trace!(target: "ty_project::db", "field formatter event");
+        }
+        formatter.write_str("field value")
+    }
 }
 
 #[test]

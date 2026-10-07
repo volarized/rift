@@ -247,7 +247,7 @@ impl FlightTable {
             return;
         };
         let mut fields = EntryFields::recorded_later();
-        crate::capture::without_default_dispatch(|| values.record(&mut fields));
+        values.record(&mut fields);
         for (target, value) in [
             (&mut entry.component, fields.component),
             (&mut entry.lock, fields.lock),
@@ -418,7 +418,7 @@ where
             return;
         };
         let mut fields = EntryFields::default();
-        crate::capture::without_default_dispatch(|| attributes.record(&mut fields));
+        attributes.record(&mut fields);
         // A lifelong hold opens as a root so the operation that took the lock can close; it
         // names the span it was opened in as its parent. Any other root has none.
         let parent = if fields.lifelong {
