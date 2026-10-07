@@ -260,6 +260,12 @@ def rust_architecture() -> None:
     raise typer.Exit(check_rust_architecture.main())
 
 
+@app.command("clock-inventory")
+def clock_inventory() -> None:
+    """Check clock reads against the reviewed inventory."""
+    raise typer.Exit(check_rust_architecture.clock_main())
+
+
 @app.command()
 def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None:
     """Check prose and source files for banned dash characters."""
