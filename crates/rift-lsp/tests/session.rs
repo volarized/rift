@@ -2022,6 +2022,9 @@ async fn lingering_engine_is_killed_at_the_shutdown_timeout() {
 /// `EngineSession::shutdown`'s own timeout and kills it there instead.
 #[tokio::test]
 async fn engine_that_answers_shutdown_but_never_exits_is_killed_after_the_wait() {
+    let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .install()
+        .expect("recorder");
     let workspace = tempfile::tempdir().expect("tempdir");
     let session = EngineSession::start(
         process_lifecycle::answers_shutdown_but_never_exits(),
@@ -2036,6 +2039,30 @@ async fn engine_that_answers_shutdown_but_never_exits_is_killed_after_the_wait()
         elapsed < Duration::from_secs(10),
         "the post-shutdown kill must not wait out the engine: {elapsed:?}"
     );
+    drop(recorder);
+    let records = drain.queued_records();
+    let spawned = records
+        .iter()
+        .find(|record| record.message() == "engine child spawned")
+        .expect("spawn is recorded");
+    let fields: Value = serde_json::from_str(spawned.fields()).expect("record fields");
+    let pid = &fields["pid"];
+    for stream in ["stdin", "stdout", "stderr"] {
+        assert_eq!(fields[stream], "piped");
+    }
+    let wait = records
+        .iter()
+        .find(|record| record.message() == "engine.child.wait")
+        .expect("wait closes");
+    let fields: Value = serde_json::from_str(wait.fields()).expect("record fields");
+    assert_eq!(fields["pid"], *pid);
+    assert_eq!(fields["error.type"], "timeout");
+    let exited = records
+        .iter()
+        .find(|record| record.message() == "engine child exited")
+        .expect("exit is recorded");
+    let fields: Value = serde_json::from_str(exited.fields()).expect("record fields");
+    assert_eq!(fields["pid"], *pid);
 }
 
 /// A spawned session's `Debug` rendering names its child's pid, and
