@@ -674,6 +674,17 @@ mod tests {
                 .install()
                 .err()
                 .expect("the configured queue is refused before installation");
+            let rendered = error.to_string();
+            let source = std::error::Error::source(&error)
+                .expect("invalid configuration retains its registered error");
+            let registered = source
+                .downcast_ref::<rift_error::RiftError>()
+                .expect("the source is the registered configuration error");
+            assert_eq!(rendered, registered.to_string());
+            assert_eq!(
+                registered.slug(),
+                rift_error::errors::tracing::log_queue_limit::SLUG
+            );
             let super::InstallError::InvalidConfiguration(error) = error else {
                 panic!("queue admission names its configuration failure");
             };

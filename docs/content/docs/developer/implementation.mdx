@@ -770,18 +770,23 @@ deadline bounds the retry: a drain aborted there reports what it held as `unwrit
 
 `runtime.logs().subscribe()` returns `Result<LogSubscription, RiftError>` and registers an
 independent subscription. Disabled or closed capture returns `tracing.log_stream_unavailable`;
-16 registered subscriptions, including persistence, returns `tracing.log_subscription_limit`.
+registration at 16 admitted subscriptions, including persistence and closed subscriptions
+with retained publications, returns `tracing.log_subscription_limit`.
 
 Registration and publication use one order, so subscriptions receive records from registration
 onward, with no replay. `recv()` reads one `LogPublication`; `recv_batch()` reads a bounded batch.
 
-Each publication carries its `sequence` and an immutable record shared across subscriptions.
+Each publication carries its `sequence` and an immutable record shared across subscriptions;
+`record()` borrows that record.
 The sequence preserves dropped positions, so consumers can compare it with their loss count.
 
 Each subscription shares an 8 MiB byte budget between its queue and publications its consumer
 retains; a full record or byte budget drops the incoming record and increments that
 subscription's `dropped()` count. Dropping a subscription unregisters it and releases its queue;
-already returned publications release their bytes when their owner drops them.
+already returned publications release their bytes when their owner drops them. A closed or
+dropped subscription keeps its admission while buffered or returned publications retain bytes.
+Its place becomes available after the last publication drops. The 16 admitted budgets retain
+at most 128 MiB of records; explicit copies made by a caller sit outside those budgets.
 
 The byte accounting includes the publication envelope, record, shared ownership header, and
 string lengths. Bounded channel slots and allocator overhead sit outside that accounting.
@@ -790,6 +795,11 @@ The [`[logs]`](/docs/developer/configuration#logs) keys `queue_records`, `flush_
 `retry_interval`, and `settle_timeout` configure queue capacity, partial-batch flushes, retained
 retries, and persisted-log settlement. Under repository serving, a routing drain sends records
 to one bounded consumer per admitted workspace, selected from the request span's `workspace`.
+Each consumer holds at most `min(queue_records, 256)` queued records and the same number in a
+batch, sharing a 1 MiB byte budget. At most 64 consumer budgets remain retained, including
+replaced consumers and their queued records or writer batches. Admission at that bound refuses
+the new consumer before replacing the current route. These budgets sit outside the 128 MiB
+subscription budgets.
 
 <VersionBadge version="v0.0.62" />
 
@@ -933,9 +943,10 @@ carry that crate's `CARGO_PKG_NAME` and `CARGO_PKG_VERSION` as their instrumenta
 one meter per scope, at most `SCOPES_MAX`, 7; a scope past it records nothing, and one `WARN`
 record, `meter refused an instrumentation scope past its bound`, names it. The
 `traces.span.metrics.*` points of a `traced!` operation take the scope of the crate whose
-`traced!` opened it. A recording hands the value to the OpenTelemetry SDK, which
-aggregates and exports it, so `rift-tracing` holds no value of its own. A process that installed
-no meter records nothing, at the cost of two atomic reads per recording.
+`traced!` opened it. Synchronous recordings go directly to the OpenTelemetry SDK, which
+aggregates and exports them. Observable reads sum identical labels in a bounded map for one
+collection, then publish to the SDK and release that map. A process that installed no meter
+records nothing, at the cost of two atomic reads per recording.
 
 A view on the meter provider bounds every instrument at
 [`[logs] cardinality_limit`](/docs/developer/configuration#logs) label sets,

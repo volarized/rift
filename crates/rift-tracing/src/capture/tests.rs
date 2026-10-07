@@ -642,6 +642,48 @@ fn a_full_queue_drops_and_counts() {
     assert_eq!(queued(&mut drain).len(), LOG_QUEUE_RECORDS);
 }
 
+#[tokio::test]
+async fn persistence_byte_capacity_refuses_with_record_room_and_releases_after_read() {
+    let (sink, mut drain) = log_capture();
+    let mut subscription = sink.logs.subscribe().expect("subscription fits");
+    let large = LogRecord::new(
+        1,
+        "info",
+        "rift_tracing::capture",
+        "logs",
+        "logs.test",
+        &"m".repeat(crate::LOG_MESSAGE_BYTES_MAX),
+        &"f".repeat(LOG_FIELDS_BYTES_MAX),
+    );
+    let mut published = 0;
+    for sequence in 1..LOG_QUEUE_RECORDS {
+        sink.send(large.clone());
+        let publication = subscription
+            .recv()
+            .await
+            .expect("independent delivery arrives");
+        assert_eq!(publication.sequence(), sequence as u64);
+        published = sequence;
+        if sink.dropped() != 0 {
+            break;
+        }
+    }
+    assert_eq!(sink.dropped(), 1);
+    assert_eq!(subscription.dropped(), 0);
+    let retained = queued(&mut drain).len();
+    assert_eq!(retained + 1, published);
+    assert!(retained > 0 && published < LOG_QUEUE_RECORDS);
+    sink.send(record("after byte capacity releases"));
+    assert_eq!(sink.dropped(), 1);
+    assert_eq!(
+        drain
+            .try_recv_record()
+            .expect("persistence resumes")
+            .message(),
+        "after byte capacity releases"
+    );
+}
+
 #[test]
 fn a_closed_drain_does_not_report_queue_pressure() {
     let (sink, drain) = log_capture();
@@ -1132,6 +1174,85 @@ fn a_returned_registered_error_is_the_close_record_error_type() {
             "{message}: {fields}"
         );
     }
+}
+
+#[test]
+fn inline_questions_preserve_success_pending_and_none_without_error_identity() {
+    use std::ops::ControlFlow;
+
+    fn option(value: Option<u8>) -> Option<u8> {
+        crate::traced!("test.option_continue", { Some(value? + 1) })
+    }
+    fn control(value: ControlFlow<u8, u8>) -> ControlFlow<u8, u8> {
+        crate::traced!("test.control_continue", {
+            ControlFlow::Continue(value? + 1)
+        })
+    }
+    fn poll_result(
+        value: Poll<Result<u8, rift_error::RiftError>>,
+    ) -> Poll<Result<u8, rift_error::RiftError>> {
+        crate::traced!("test.poll_continue", {
+            let value = value?;
+            value.map(|value| Ok(value + 1))
+        })
+    }
+    fn poll_option(
+        value: Poll<Option<Result<u8, rift_error::RiftError>>>,
+    ) -> Poll<Option<Result<u8, rift_error::RiftError>>> {
+        crate::traced!("test.poll_option_continue", {
+            let value = value?;
+            value.map(|value| value.map(|value| Ok(value + 1)))
+        })
+    }
+
+    let (sink, mut drain) = log_capture();
+    tracing::subscriber::with_default(crate::capture::registry().with(sink), || {
+        assert_eq!(option(Some(4)), Some(5));
+        assert_eq!(control(ControlFlow::Continue(4)), ControlFlow::Continue(5));
+        assert!(matches!(
+            poll_result(Poll::Ready(Ok(4))),
+            Poll::Ready(Ok(5))
+        ));
+        assert!(poll_result(Poll::Pending).is_pending());
+        assert!(matches!(
+            poll_option(Poll::Ready(Some(Ok(4)))),
+            Poll::Ready(Some(Ok(5)))
+        ));
+        assert!(matches!(poll_option(Poll::Ready(None)), Poll::Ready(None)));
+        assert!(poll_option(Poll::Pending).is_pending());
+    });
+    let records = queued(&mut drain);
+    assert_eq!(records.len(), 7);
+    for record in records {
+        let fields: serde_json::Value =
+            serde_json::from_str(record.fields()).expect("record fields");
+        assert_eq!(fields["status.code"], "Ok", "{fields}");
+        assert!(fields.get("error.type").is_none(), "{fields}");
+    }
+}
+
+#[test]
+fn a_bare_return_leaves_the_function_and_closes_without_error_identity() {
+    fn work(early: bool, reached: &std::cell::Cell<bool>) {
+        crate::traced!("test.bare_return", {
+            if early {
+                return;
+            }
+        });
+        reached.set(true);
+    }
+    let reached = std::cell::Cell::new(false);
+    let (sink, mut drain) = log_capture();
+    tracing::subscriber::with_default(crate::capture::registry().with(sink), || {
+        work(true, &reached);
+    });
+    assert!(!reached.get());
+    let records = queued(&mut drain);
+    assert_eq!(records.len(), 1);
+    let fields = fields_of(&records, "test.bare_return");
+    assert_eq!(fields["span"], "closed");
+    assert_eq!(fields["status.code"], "Ok");
+    assert!(fields.get("error.type").is_none());
 }
 
 /// Runs one operation per way of ending, each recording how it ended on its own span.

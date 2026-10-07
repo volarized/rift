@@ -30,6 +30,10 @@ impl RecordBudget {
         Self(Arc::new(Semaphore::new(bytes)))
     }
 
+    pub(crate) fn downgrade(&self) -> Weak<Semaphore> {
+        Arc::downgrade(&self.0)
+    }
+
     /// Reserves a record's retained storage without waiting for the consumer.
     pub(crate) fn reserve(&self, record: &LogRecord) -> Option<OwnedSemaphorePermit> {
         let bytes = record_bytes(record);
@@ -103,11 +107,18 @@ impl SubscriptionQueue {
     }
 }
 
+/// One admission slot, retained while its queue or publications own byte capacity.
+#[derive(Debug)]
+struct SubscriptionSlot {
+    queue: Option<SubscriptionQueue>,
+    budget: Weak<Semaphore>,
+}
+
 /// The bounded subscribers and the lock that orders registration and publication.
 #[derive(Debug)]
 struct Publications {
     enabled: bool,
-    queues: Vec<Option<SubscriptionQueue>>,
+    queues: Vec<SubscriptionSlot>,
 }
 
 /// The captured record stream exposed by [`crate::TracingRuntime::logs`].
@@ -146,17 +157,24 @@ impl LogStream {
     ///
     /// Returns `tracing.log_stream_unavailable` when capture is disabled or closed,
     /// or `tracing.log_subscription_limit` when [`LOG_SUBSCRIPTIONS_MAX`] subscriptions,
-    /// including persistence, are already registered.
+    /// including persistence and closed subscriptions with retained publications,
+    /// already hold admission.
     pub fn subscribe(&self) -> Result<LogSubscription, RiftError> {
         let mut publications = self.publications();
         if !publications.enabled {
             return errors::tracing::log_stream_unavailable().fail();
         }
-        let slot = publications.queues.iter().position(Option::is_none);
+        let slot = publications
+            .queues
+            .iter()
+            .position(|slot| slot.queue.is_none() && slot.budget.upgrade().is_none());
         let slot = match slot {
             Some(slot) => slot,
             None if publications.queues.len() < LOG_SUBSCRIPTIONS_MAX - 1 => {
-                publications.queues.push(None);
+                publications.queues.push(SubscriptionSlot {
+                    queue: None,
+                    budget: Weak::new(),
+                });
                 publications.queues.len() - 1
             }
             None => {
@@ -168,11 +186,15 @@ impl LogStream {
         };
         let (sender, receiver) = mpsc::channel(self.queue_records);
         let dropped = Arc::new(AtomicU64::new(0));
-        publications.queues[slot] = Some(SubscriptionQueue {
-            sender,
-            budget: RecordBudget::new(LOG_SUBSCRIPTION_BYTES_MAX),
-            dropped: Arc::clone(&dropped),
-        });
+        let budget = RecordBudget::new(LOG_SUBSCRIPTION_BYTES_MAX);
+        publications.queues[slot] = SubscriptionSlot {
+            budget: budget.downgrade(),
+            queue: Some(SubscriptionQueue {
+                sender,
+                budget,
+                dropped: Arc::clone(&dropped),
+            }),
+        };
         Ok(LogSubscription {
             receiver,
             dropped,
@@ -184,13 +206,17 @@ impl LogStream {
     /// Runs the persistence send and fan-out under one publication order.
     pub(crate) fn publish(&self, record: LogRecord, persist: impl FnOnce(LogRecord) -> u64) {
         let publications = self.publications();
-        if publications.queues.iter().all(Option::is_none) {
+        if publications.queues.iter().all(|slot| slot.queue.is_none()) {
             persist(record);
             return;
         }
         let record = Arc::new(record);
         let sequence = persist((*record).clone());
-        for queue in publications.queues.iter().flatten() {
+        for queue in publications
+            .queues
+            .iter()
+            .filter_map(|slot| slot.queue.as_ref())
+        {
             queue.send(sequence, &record);
         }
     }
@@ -206,7 +232,8 @@ impl LogStream {
 /// One independent queue and its loss count.
 ///
 /// Dropping the subscription unregisters it and releases its queued records.
-/// Publications already returned keep their byte capacity until their owner drops them.
+/// Publications already returned keep their byte capacity and admission until their
+/// owner drops them.
 #[derive(Debug)]
 #[must_use = "dropping a subscription unregisters it and releases its queued records"]
 pub struct LogSubscription {
@@ -257,12 +284,13 @@ impl LogSubscription {
     fn unregister(&self) {
         if let Some(publications) = self.publications.upgrade() {
             let mut publications = publications.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(queue) = publications.queues.get_mut(self.slot)
-                && queue
+            if let Some(slot) = publications.queues.get_mut(self.slot)
+                && slot
+                    .queue
                     .as_ref()
                     .is_some_and(|queue| Arc::ptr_eq(&queue.dropped, &self.dropped))
             {
-                *queue = None;
+                slot.queue = None;
             }
         }
     }

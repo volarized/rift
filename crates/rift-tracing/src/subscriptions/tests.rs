@@ -143,16 +143,16 @@ async fn closure_drains_buffered_records_and_released_slot_keeps_its_new_owner()
     let mut old = sink.logs.subscribe().expect("old subscription fits");
     sink.send(record("before closure"));
     old.close();
-    let mut new = sink
-        .logs
-        .subscribe()
-        .expect("closed subscription released its slot");
     drop(
         old.recv()
             .await
             .expect("buffered publication survives closure"),
     );
     assert!(old.recv().await.is_none());
+    let mut new = sink
+        .logs
+        .subscribe()
+        .expect("closed subscription released its slot");
     drop(old);
     sink.send(record("after closure"));
     let received = new
@@ -160,6 +160,93 @@ async fn closure_drains_buffered_records_and_released_slot_keeps_its_new_owner()
         .await
         .expect("old drop leaves replacement registered");
     assert_eq!(received.record().message(), "after closure");
+}
+
+#[tokio::test]
+async fn retained_publications_keep_admission_until_the_last_record_drops() {
+    let (sink, mut persistence) = log_capture();
+    let mut subscriptions: Vec<_> = (1..LOG_SUBSCRIPTIONS_MAX)
+        .map(|_| sink.logs.subscribe().expect("subscription fits"))
+        .collect();
+    sink.send(record("first"));
+    sink.send(record("second"));
+    let mut old = subscriptions.pop().expect("last subscription exists");
+    let mut retained = old.recv_batch().await;
+    assert_eq!(retained.len(), 2);
+    drop(old);
+
+    for _ in 0..3 {
+        let error = sink
+            .logs
+            .subscribe()
+            .expect_err("retained publications keep admission");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::tracing::log_subscription_limit::SLUG
+        );
+    }
+    drop(retained.pop());
+    assert!(sink.logs.subscribe().is_err());
+    drop(retained);
+    let mut replacement = sink
+        .logs
+        .subscribe()
+        .expect("last publication releases admission");
+    sink.send(record("third"));
+    let publication = replacement.recv().await.expect("replacement receives");
+    assert_eq!(publication.sequence(), 3);
+    assert_eq!(publication.record().message(), "third");
+    assert_eq!(replacement.dropped(), 0);
+    for mut subscription in subscriptions {
+        assert_eq!(subscription.dropped(), 0);
+        let received = subscription.recv_batch().await;
+        assert_eq!(
+            received
+                .iter()
+                .map(super::LogPublication::sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
+    assert_eq!(
+        persistence
+            .queued_records()
+            .iter()
+            .map(LogRecord::message)
+            .collect::<Vec<_>>(),
+        ["first", "second", "third"]
+    );
+}
+
+#[tokio::test]
+async fn closed_buffered_publications_keep_admission_until_released() {
+    let (sink, _persistence) = log_capture();
+    let mut subscriptions: Vec<_> = (1..LOG_SUBSCRIPTIONS_MAX)
+        .map(|_| sink.logs.subscribe().expect("subscription fits"))
+        .collect();
+    sink.send(record("before closure"));
+    let mut old = subscriptions.pop().expect("last subscription exists");
+    old.close();
+    assert!(sink.logs.subscribe().is_err());
+    let publication = old.recv().await.expect("closed queue remains readable");
+    assert!(sink.logs.subscribe().is_err());
+    drop(publication);
+    let mut replacement = sink
+        .logs
+        .subscribe()
+        .expect("released publication frees admission");
+    assert!(old.recv().await.is_none());
+    drop(old);
+    sink.send(record("after closure"));
+    assert_eq!(
+        replacement
+            .recv()
+            .await
+            .expect("old drop keeps replacement registered")
+            .record()
+            .message(),
+        "after closure"
+    );
 }
 
 #[tokio::test]

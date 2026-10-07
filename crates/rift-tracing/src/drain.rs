@@ -20,13 +20,13 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use rift_error::{RiftError, causes};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::{Notify, OwnedSemaphorePermit, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -343,6 +343,7 @@ impl LogDrain {
     /// # Errors
     ///
     /// Returns the queue's own answer when it holds no record or is closed.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn try_recv_record(&mut self) -> Result<LogRecord, mpsc::error::TryRecvError> {
         self.receiver.try_recv().map(|queued| queued.record)
     }
@@ -552,13 +553,21 @@ impl LogDrain {
 
 /// The workspace consumers of one routing drain, by the workspace each writes for.
 ///
-/// At most [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumers are kept. The map's
+/// At most [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumer budgets are retained,
+/// including replaced consumers and their queued records or writer batches. The map's
 /// lock is held for a lookup and a `try_send`, never across an await.
 #[derive(Debug)]
 struct LogRoutes {
     retention_records: u64,
-    consumers: Mutex<BTreeMap<String, WorkspaceRoute>>,
+    consumers: Mutex<WorkspaceConsumers>,
     options: LogDeliveryOptions,
+}
+
+/// Active routes and retained consumer budgets, admitted under the same lock.
+#[derive(Debug, Default)]
+struct WorkspaceConsumers {
+    routes: BTreeMap<String, WorkspaceRoute>,
+    budgets: Vec<Weak<Semaphore>>,
 }
 
 /// The sending end of one workspace consumer's queue, and its lane.
@@ -610,12 +619,12 @@ impl LogRoutes {
     fn with_options(retention_records: u64, options: LogDeliveryOptions) -> Self {
         Self {
             retention_records,
-            consumers: Mutex::new(BTreeMap::new()),
+            consumers: Mutex::new(WorkspaceConsumers::default()),
             options,
         }
     }
 
-    fn consumers(&self) -> MutexGuard<'_, BTreeMap<String, WorkspaceRoute>> {
+    fn consumers(&self) -> MutexGuard<'_, WorkspaceConsumers> {
         self.consumers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -627,7 +636,7 @@ impl LogRoutes {
         let Some(workspace) = workspace_of(&record) else {
             return;
         };
-        if let Some(route) = self.consumers().get(&workspace) {
+        if let Some(route) = self.consumers().routes.get(&workspace) {
             route.send(record);
         }
     }
@@ -636,8 +645,9 @@ impl LogRoutes {
     /// workspace's records to it from now on.
     ///
     /// A consumer already routed for `workspace` stops receiving: the new one replaces it.
-    /// Answers `None` when [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumers of other
-    /// workspaces are routed.
+    /// Answers `None` when [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumer budgets
+    /// are retained, including replaced consumers, queued records, and writer batches.
+    /// A refusal leaves the current route unchanged.
     fn admit(
         self: &Arc<Self>,
         upstream: &Arc<LogSettlement>,
@@ -651,12 +661,14 @@ impl LogRoutes {
         let budget = RecordBudget::new(LOG_SUBSCRIPTION_BYTES_MAX / 8);
         {
             let mut consumers = self.consumers();
-            if consumers.len() >= RunningLogDrain::WORKSPACE_CONSUMERS_MAX
-                && !consumers.contains_key(workspace)
-            {
+            consumers
+                .budgets
+                .retain(|budget| budget.upgrade().is_some());
+            if consumers.budgets.len() >= RunningLogDrain::WORKSPACE_CONSUMERS_MAX {
                 return None;
             }
-            consumers.insert(
+            consumers.budgets.push(budget.downgrade());
+            consumers.routes.insert(
                 workspace.to_owned(),
                 WorkspaceRoute {
                     sender,
@@ -680,6 +692,7 @@ impl LogRoutes {
     /// The lane of the consumer routed for `workspace`.
     fn settlement_of(&self, workspace: &str) -> Option<Arc<LogSettlement>> {
         self.consumers()
+            .routes
             .get(workspace)
             .map(|route| Arc::clone(&route.settlement))
     }
@@ -690,10 +703,11 @@ impl LogRoutes {
     fn release(&self, workspace: &str, settlement: &Arc<LogSettlement>) {
         let mut consumers = self.consumers();
         if consumers
+            .routes
             .get(workspace)
             .is_some_and(|route| Arc::ptr_eq(&route.settlement, settlement))
         {
-            consumers.remove(workspace);
+            consumers.routes.remove(workspace);
         }
     }
 }
@@ -780,8 +794,9 @@ pub struct RunningLogDrain {
 }
 
 impl RunningLogDrain {
-    /// Most workspace consumers one routing drain keeps at once: at least the workspaces
-    /// one repository process retains, `SERVER_WORKSPACES_MAX`.
+    /// Most consumer budgets one routing drain retains at once, including replaced
+    /// consumers, queued records, and writer batches: at least the workspaces one
+    /// repository process retains, `SERVER_WORKSPACES_MAX`.
     pub const WORKSPACE_CONSUMERS_MAX: usize = 64;
 
     /// Starts `drain` writing into `store`, trimming it back to `retention_records`.
@@ -833,7 +848,7 @@ impl RunningLogDrain {
     ///
     /// `workspace` is spelled as the `workspace` field carries it: the workspace root's
     /// display form. Answers `None` when that dispatcher has no routing drain, and when
-    /// [`Self::WORKSPACE_CONSUMERS_MAX`] consumers of other workspaces run. The consumer's
+    /// [`Self::WORKSPACE_CONSUMERS_MAX`] consumer budgets remain retained. The consumer's
     /// [`Self::stop`] first waits, by its deadline, for the routing drain to hand on what
     /// it had taken, then ends the route and flushes.
     #[must_use]
