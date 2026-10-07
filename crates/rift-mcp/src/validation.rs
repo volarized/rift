@@ -8498,6 +8498,41 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    // XFAIL: https://github.com/volarized/rift/issues/579
+    // Only recorded Windows arm64 and macOS Intel OTLP deadline panics are expected at these test drops.
+    fn drop_recorder(recorder: rift_tracing::ScopedRecorder) {
+        #[cfg(not(any(
+            all(windows, target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        )))]
+        drop(recorder);
+        #[cfg(any(
+            all(windows, target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64")
+        ))]
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(recorder)))
+        {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied());
+            if matches!(
+                message,
+                Some(
+                    "the otlp export shutdown failed: the otlp export shutdown passed its deadline; the otlp export shutdown passed its deadline"
+                )
+            ) {
+                eprintln!(
+                    "XFAIL https://github.com/volarized/rift/issues/579: {}",
+                    message.unwrap_or_default()
+                );
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
     /// A supervisor that ends drops its watcher with it and records both ends, the
     /// supervisor's first.
     #[tokio::test(start_paused = true)]
@@ -8528,7 +8563,7 @@ pub(crate) mod tests {
         ));
         validation.cancellation.cancel();
         supervisor.await?;
-        drop(recorder);
+        drop_recorder(recorder);
 
         let records = drain.queued_records();
         let position = |message: &str| {

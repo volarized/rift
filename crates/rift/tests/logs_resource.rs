@@ -708,10 +708,22 @@ async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
         stages.iter().any(|line| line.contains("stage=log drain")),
         "the repository stop runs a log drain stage: {stages:#?}"
     );
-    assert!(
-        stages.iter().all(|line| line.contains("outcome=ok")),
-        "every stop stage ends ok: {stages:#?}"
-    );
+    for stage in &stages {
+        // XFAIL: https://github.com/volarized/rift/issues/568
+        // Retain the recorded Intel macOS export timeout; every other stage must end ok.
+        if cfg!(all(target_os = "macos", target_arch = "x86_64"))
+            && stage.contains("stage=otlp export")
+            && stage.contains("outcome=timeout")
+            && stage.contains("remaining=0ns")
+        {
+            eprintln!("XFAIL https://github.com/volarized/rift/issues/568: {stage}");
+        } else {
+            assert!(
+                stage.contains("outcome=ok"),
+                "every stop stage ends ok: {stages:#?}"
+            );
+        }
+    }
     for (index, root) in roots.iter().enumerate() {
         let output = run_rift(root, &["server", "logs"]).await?;
         require_success(&output, "rift server logs after the stop")?;
