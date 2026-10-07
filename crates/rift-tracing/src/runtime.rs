@@ -34,7 +34,7 @@ use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrL
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 pub(crate) const DEFAULT_TRACING_FILTER: &str =
-    "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+    "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,rift_tracing::runtime=info";
 /// Default stderr filter: the default targets, with only the stall reports of the table of
 /// operations in flight. The table's other records reach the capture under its own filter.
 pub(crate) const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
@@ -398,7 +398,6 @@ fn record_shutdown_result(
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     match result {
         Ok(()) => crate::info!(
-            target: "rift",
             stage = "otlp export",
             phase,
             outcome = "ok",
@@ -407,7 +406,6 @@ fn record_shutdown_result(
             "stop stage ended"
         ),
         Err(otlp::ExportShutdownError::TimedOut) => crate::warn!(
-            target: "rift",
             stage = "otlp export",
             phase,
             outcome = "timeout",
@@ -416,7 +414,6 @@ fn record_shutdown_result(
             "stop stage ended"
         ),
         Err(error @ otlp::ExportShutdownError::Failed(_)) => crate::warn!(
-            target: "rift",
             stage = "otlp export",
             phase,
             outcome = "error",
