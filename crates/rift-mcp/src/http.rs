@@ -2325,6 +2325,104 @@ mod tests {
         Ok(())
     }
 
+    /// An opened vectors database keeps its file and page readings through deferred shutdown.
+    #[tokio::test]
+    async fn an_open_vectors_database_keeps_file_and_page_readings_until_shutdown_owner_drops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir_all(&state_directory)?;
+        let pool = DatabasePool::new(4, 60_000);
+        let database = WorkspaceDatabase::open(
+            &DatabaseName::Index.path(&state_directory),
+            DatabaseName::Index,
+            pool,
+        )
+        .await?;
+        let vectors = Arc::new(LazyDatabase::new(
+            &DatabaseName::Vectors.path(&state_directory),
+            DatabaseName::Vectors,
+            None,
+        ));
+        let opened = vectors.resolve(pool).await?;
+        assert_eq!(opened.name(), DatabaseName::Vectors);
+        drop(opened);
+
+        let search = rift_search::SearchIndex::attached(
+            database,
+            vectors,
+            rift_search::SearchIndexLimits::default(),
+        )?;
+        let mut shutdown =
+            super::DeferredDatabaseShutdown(Some(Arc::new(search)), None, Vec::new(), None);
+        shutdown
+            .close_search(Instant::now() + Duration::from_secs(5))
+            .await?;
+
+        let metrics = recorder.metrics();
+        let file_size = metrics
+            .find(
+                "sqlite.file.size",
+                &[
+                    ("db.namespace", "vectors"),
+                    ("sqlite.file.type", "database"),
+                ],
+            )
+            .ok_or("the deferred owner keeps the vectors file reading registered")?;
+        assert!(matches!(
+            file_size.value(),
+            rift_tracing::SeriesValue::Sum(bytes) if *bytes > 0.0
+        ));
+        let used_pages = metrics
+            .find(
+                "sqlite.page.count",
+                &[("db.namespace", "vectors"), ("sqlite.page.state", "used")],
+            )
+            .ok_or("the deferred owner keeps vectors used-page reading registered")?;
+        assert!(matches!(
+            used_pages.value(),
+            rift_tracing::SeriesValue::Sum(pages) if *pages > 0.0
+        ));
+        let free_pages = metrics
+            .find(
+                "sqlite.page.count",
+                &[("db.namespace", "vectors"), ("sqlite.page.state", "free")],
+            )
+            .ok_or("the deferred owner keeps vectors free-page reading registered")?;
+        assert!(matches!(
+            free_pages.value(),
+            rift_tracing::SeriesValue::Sum(pages) if *pages >= 0.0
+        ));
+
+        drop(shutdown);
+        let metrics = recorder.metrics();
+        assert!(
+            metrics
+                .find(
+                    "sqlite.file.size",
+                    &[
+                        ("db.namespace", "vectors"),
+                        ("sqlite.file.type", "database"),
+                    ],
+                )
+                .is_none(),
+            "dropping deferred shutdown releases vectors file reading"
+        );
+        assert!(
+            metrics
+                .find(
+                    "sqlite.page.count",
+                    &[("db.namespace", "vectors"), ("sqlite.page.state", "used")],
+                )
+                .is_none(),
+            "dropping deferred shutdown releases vectors page reading"
+        );
+        Ok(())
+    }
+
     /// A stop failure of the index database lands in the metrics database: another
     /// connection holds the write lock on `.rift/index` while a lexical write waits on it
     /// past the index close, so the worker's stop outlasts its deadline, and the drain's
