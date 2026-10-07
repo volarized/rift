@@ -33,8 +33,10 @@ use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor
 #[cfg(any(test, feature = "fixtures"))]
 use opentelemetry_sdk::logs::{LogBatch, LogProcessor, SdkLogRecord};
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
-use opentelemetry_sdk::metrics::SdkMeterProvider;
 #[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_sdk::metrics::ManualReader;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use opentelemetry_sdk::metrics::reader::MetricReader;
@@ -535,6 +537,7 @@ struct Providers {
     meters: Option<SdkMeterProvider>,
     logs: Option<LoggerExport>,
     recorder_metric_reader: Option<Arc<dyn MetricReader>>,
+    recorder_metric_exporter: Option<Arc<MetricExporter>>,
 }
 
 /// The logger provider and the gate the log record layer emits through.
@@ -601,6 +604,19 @@ impl std::fmt::Display for ExportShutdownError {
 
 impl std::error::Error for ExportShutdownError {}
 
+/// Exports the same SDK collection a recorder reads, by its deadline.
+pub(crate) async fn export_metric_snapshot(
+    exporter: &MetricExporter,
+    metrics: &ResourceMetrics,
+    deadline: tokio::time::Instant,
+) -> Result<(), ExportShutdownError> {
+    match tokio::time::timeout_at(deadline, exporter.export(metrics)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ExportShutdownError::Failed(error.to_string())),
+        Err(_) => Err(ExportShutdownError::TimedOut),
+    }
+}
+
 impl OtlpExport {
     /// An export that holds `tracer`, `meters`, and `logs`.
     fn holding(
@@ -614,6 +630,7 @@ impl OtlpExport {
                 meters,
                 logs,
                 recorder_metric_reader: None,
+                recorder_metric_exporter: None,
             }))),
         }
     }
@@ -623,6 +640,7 @@ impl OtlpExport {
         meters: Option<SdkMeterProvider>,
         logs: Option<LoggerExport>,
         recorder_metric_reader: Option<Arc<dyn MetricReader>>,
+        recorder_metric_exporter: Option<Arc<MetricExporter>>,
     ) -> Self {
         let export = Self::holding(tracer, meters, logs);
         if let Some(providers) = export
@@ -632,6 +650,7 @@ impl OtlpExport {
             .as_mut()
         {
             providers.recorder_metric_reader = recorder_metric_reader;
+            providers.recorder_metric_exporter = recorder_metric_exporter;
         }
         export
     }
@@ -668,6 +687,15 @@ impl OtlpExport {
             .and_then(|providers| providers.recorder_metric_reader.clone())
     }
 
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn recorder_metric_exporter(&self) -> Option<Arc<MetricExporter>> {
+        self.providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|providers| providers.recorder_metric_exporter.clone())
+    }
+
     /// Flushes ended spans and metric points by `deadline` while leaving every provider open.
     ///
     /// Each SDK call runs on its own thread because the metrics reader blocks while it
@@ -682,6 +710,7 @@ impl OtlpExport {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), ExportShutdownError> {
+        let metric_export = self.export_recorder_metrics(deadline).await;
         let (tracer, meters) = {
             let held = self
                 .providers
@@ -699,12 +728,13 @@ impl OtlpExport {
         if let Some(meters) = meters {
             operations.push(export_operation_on_thread(move || meters.force_flush()));
         }
-        wait_for_export_operations(
+        let flush = wait_for_export_operations(
             deadline,
             operations,
             "the export worker did not return a result",
         )
-        .await
+        .await;
+        combine_export_results(metric_export, flush)
     }
 
     /// Flushes ended spans by `deadline` while leaving every provider open.
@@ -751,7 +781,7 @@ impl OtlpExport {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), ExportShutdownError> {
-        let (tracer, meters) = {
+        let (tracer, meters, metric_reader, metric_exporter) = {
             let mut held = self
                 .providers
                 .lock()
@@ -759,16 +789,28 @@ impl OtlpExport {
             let Some(providers) = held.as_mut() else {
                 return Ok(());
             };
-            (providers.tracer.take(), providers.meters.take())
+            (
+                providers.tracer.take(),
+                providers.meters.take(),
+                providers.recorder_metric_reader.take(),
+                providers.recorder_metric_exporter.take(),
+            )
         };
+        let metric_export =
+            export_recorder_metrics(metric_reader, metric_exporter.clone(), deadline).await;
         let mut operations = Vec::new();
         if let Some(tracer) = tracer {
             operations.push(export_operation_on_thread(move || tracer.shutdown()));
         }
-        if let Some(meters) = meters {
-            operations.push(export_operation_on_thread(move || meters.shutdown()));
+        if meters.is_some() || metric_exporter.is_some() {
+            operations.push(export_operation_on_thread(move || {
+                shutdown_meter_provider(meters, metric_exporter, deadline)
+            }));
         }
-        wait_for_export_operations(deadline, operations, "the shutdown thread did not start").await
+        let shutdown =
+            wait_for_export_operations(deadline, operations, "the shutdown thread did not start")
+                .await;
+        combine_export_results(metric_export, shutdown)
     }
 
     /// Shuts down the log provider by `deadline`, after stop results have been recorded.
@@ -833,23 +875,102 @@ impl OtlpExport {
             tracer,
             meters,
             logs,
-            ..
+            recorder_metric_reader,
+            recorder_metric_exporter,
         }) = taken
         else {
             return Ok(());
         };
+        let metric_export = export_recorder_metrics(
+            recorder_metric_reader,
+            recorder_metric_exporter.clone(),
+            deadline,
+        )
+        .await;
         let tracer = tracer.map(|tracer| export_operation_on_thread(move || tracer.shutdown()));
-        let meters = meters.map(|meters| export_operation_on_thread(move || meters.shutdown()));
+        let meters = if meters.is_some() || recorder_metric_exporter.is_some() {
+            Some(export_operation_on_thread(move || {
+                shutdown_meter_provider(meters, recorder_metric_exporter, deadline)
+            }))
+        } else {
+            None
+        };
         let logs = logs.map(|logs| {
             logs.open.store(false, Ordering::Release);
             export_operation_on_thread(move || logs.provider.shutdown())
         });
-        wait_for_export_operations(
+        let shutdown = wait_for_export_operations(
             deadline,
             [tracer, meters, logs].into_iter().flatten().collect(),
             "the shutdown thread did not start",
         )
-        .await
+        .await;
+        combine_export_results(metric_export, shutdown)
+    }
+
+    async fn export_recorder_metrics(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ExportShutdownError> {
+        let (reader, exporter) = {
+            let held = self
+                .providers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(providers) = held.as_ref() else {
+                return Ok(());
+            };
+            (
+                providers.recorder_metric_reader.clone(),
+                providers.recorder_metric_exporter.clone(),
+            )
+        };
+        export_recorder_metrics(reader, exporter, deadline).await
+    }
+}
+
+async fn export_recorder_metrics(
+    reader: Option<Arc<dyn MetricReader>>,
+    exporter: Option<Arc<MetricExporter>>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ExportShutdownError> {
+    let (Some(reader), Some(exporter)) = (reader, exporter) else {
+        return Ok(());
+    };
+    let mut metrics = ResourceMetrics::default();
+    reader
+        .collect(&mut metrics)
+        .map_err(|error| ExportShutdownError::Failed(error.to_string()))?;
+    export_metric_snapshot(&exporter, &metrics, deadline).await
+}
+
+fn combine_export_results(
+    first: Result<(), ExportShutdownError>,
+    second: Result<(), ExportShutdownError>,
+) -> Result<(), ExportShutdownError> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(ExportShutdownError::Failed(format!("{first}; {second}"))),
+    }
+}
+
+fn shutdown_meter_provider(
+    meters: Option<SdkMeterProvider>,
+    exporter: Option<Arc<MetricExporter>>,
+    deadline: tokio::time::Instant,
+) -> Result<(), OTelSdkError> {
+    let meter_result = meters.map_or(Ok(()), |meters| meters.shutdown());
+    let exporter_result = exporter.map_or(Ok(()), |exporter| {
+        exporter
+            .shutdown_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    });
+    match (meter_result, exporter_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(first), Err(second)) => {
+            Err(OTelSdkError::InternalFailure(format!("{first}; {second}")))
+        }
     }
 }
 
@@ -1028,7 +1149,7 @@ where
 {
     layer_inner(
         log_filter,
-        |exporter, resource| (meter_provider(exporter, resource), None),
+        |exporter, resource| (meter_provider(exporter, resource), None, None),
         false,
         false,
     )
@@ -1044,7 +1165,12 @@ where
 {
     layer_inner(
         otlp_filter(log_filter),
-        |exporter, resource| (meter_provider(exporter, resource), None),
+        |exporter, resource| {
+            let exporter = Arc::new(exporter);
+            let (provider, reader) =
+                meter_provider_with_manual_reader(resource, exporter.temporality());
+            (provider, Some(reader), Some(exporter))
+        },
         true,
         false,
     )
@@ -1062,8 +1188,10 @@ where
     layer_inner(
         otlp_filter(log_filter),
         |exporter, resource| {
-            let (provider, reader) = meter_provider_with_recorder_reader(exporter, resource);
-            (provider, Some(reader))
+            let exporter = Arc::new(exporter);
+            let (provider, reader) =
+                meter_provider_with_manual_reader(resource, exporter.temporality());
+            (provider, Some(reader), Some(exporter))
         },
         false,
         true,
@@ -1075,7 +1203,11 @@ fn layer_inner<S>(
     make_meter_provider: impl FnOnce(
         MetricExporter,
         Resource,
-    ) -> (SdkMeterProvider, Option<Arc<dyn MetricReader>>),
+    ) -> (
+        SdkMeterProvider,
+        Option<Arc<dyn MetricReader>>,
+        Option<Arc<MetricExporter>>,
+    ),
     test_process: bool,
     cumulative_recorder_metrics: bool,
 ) -> (impl Layer<S> + Send + Sync, OtlpExport)
@@ -1105,7 +1237,7 @@ where
     } else {
         None
     };
-    let (meters, recorder_metric_reader) = if METRIC_ENDPOINT_VARS
+    let (meters, recorder_metric_reader, recorder_metric_exporter) = if METRIC_ENDPOINT_VARS
         .iter()
         .any(|variable| configured(variable))
     {
@@ -1119,16 +1251,17 @@ where
         };
         match builder.build() {
             Ok(exporter) => {
-                let (provider, reader) = make_meter_provider(exporter, resource.clone());
-                (Some(provider), reader)
+                let (provider, reader, recorder_exporter) =
+                    make_meter_provider(exporter, resource.clone());
+                (Some(provider), reader, recorder_exporter)
             }
             Err(error) => {
                 eprintln!("rift: warning: otlp metric exporter did not build: {error}");
-                (None, None)
+                (None, None, None)
             }
         }
     } else {
-        (None, None)
+        (None, None, None)
     };
     let tracer = if configured("OTEL_EXPORTER_OTLP_ENDPOINT") {
         match SpanExporter::builder()
@@ -1163,6 +1296,7 @@ where
             meters,
             logs,
             recorder_metric_reader,
+            recorder_metric_exporter,
         ),
     )
 }
@@ -1433,31 +1567,57 @@ where
         .build()
 }
 
-/// The recorder meter provider and a handle for local SDK metric assertions.
+/// The test OTLP provider and its demand-driven reader.
 #[cfg(any(test, feature = "fixtures"))]
-fn meter_provider_with_recorder_reader<E>(
-    exporter: E,
+fn meter_provider_with_manual_reader(
     resource: Resource,
-) -> (SdkMeterProvider, Arc<dyn MetricReader>)
-where
-    E: PushMetricExporter,
-{
-    let reader = PeriodicReader::builder(exporter, runtime::Tokio);
-    let reader = if configured(METRIC_EXPORT_TIMEOUT_VAR) {
-        reader
-    } else {
-        reader.with_timeout(OTLP_EXPORT_TIMEOUT)
-    };
-    let reader = reader.build();
-    let local_reader: Arc<dyn MetricReader> = Arc::new(reader.clone());
+    temporality: opentelemetry_sdk::metrics::Temporality,
+) -> (SdkMeterProvider, Arc<dyn MetricReader>) {
+    let reader = Arc::new(
+        ManualReader::builder()
+            .with_temporality(temporality)
+            .build(),
+    );
+    let reader_handle: Arc<ManualReader> = Arc::clone(&reader);
+    let reader_handle: Arc<dyn MetricReader> = reader_handle;
     let provider = SdkMeterProvider::builder()
         .with_resource(resource)
-        .with_reader(reader)
+        .with_reader(SharedManualReader(Arc::clone(&reader)))
         .with_view(crate::metrics::cardinality_view(
             crate::metrics::CARDINALITY_LIMIT,
         ))
         .build();
-    (provider, local_reader)
+    (provider, reader_handle)
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+#[derive(Debug, Clone)]
+struct SharedManualReader(Arc<ManualReader>);
+
+#[cfg(any(test, feature = "fixtures"))]
+impl MetricReader for SharedManualReader {
+    fn register_pipeline(&self, pipeline: std::sync::Weak<opentelemetry_sdk::metrics::Pipeline>) {
+        self.0.register_pipeline(pipeline);
+    }
+
+    fn collect(&self, metrics: &mut ResourceMetrics) -> OTelSdkResult {
+        self.0.collect(metrics)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+
+    fn temporality(
+        &self,
+        kind: opentelemetry_sdk::metrics::InstrumentKind,
+    ) -> opentelemetry_sdk::metrics::Temporality {
+        self.0.temporality(kind)
+    }
 }
 
 /// The tracer provider that batches every ended span into `exporter` under `batch`.

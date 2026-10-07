@@ -33,6 +33,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_otlp::MetricExporter;
+#[cfg(any(test, feature = "fixtures"))]
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::capture::{SpanContextLayer, log_capture};
@@ -311,7 +315,12 @@ impl ScopedRecorderBuilder {
         };
         let meter_provider = export.recorder_meter_provider();
         let metric_reader = export.recorder_metric_reader();
-        metrics::install(meter_provider, metric_reader);
+        let metric_exporter = export.recorder_metric_exporter();
+        let metric_export = match (runtime.as_ref(), metric_exporter) {
+            (Some(runtime), Some(exporter)) => Some(runtime.metric_exporter(exporter)),
+            _ => None,
+        };
+        metrics::install(meter_provider, metric_reader, metric_export);
         let flights = Arc::new(FlightTable::default());
         let in_flight = observe_active(&flights);
         let span_context = self
@@ -334,16 +343,24 @@ impl ScopedRecorderBuilder {
 
 /// A Tokio runtime held on its owner thread until the scoped recorder shuts its export down.
 #[cfg(any(test, feature = "fixtures"))]
-type TestOtlpShutdown = (
-    OtlpExport,
-    tokio::time::Instant,
-    SyncSender<Result<(), ExportShutdownError>>,
-);
+enum TestOtlpRequest {
+    ExportMetrics {
+        exporter: Arc<MetricExporter>,
+        metrics: ResourceMetrics,
+        deadline: tokio::time::Instant,
+        reply: SyncSender<Result<(), ExportShutdownError>>,
+    },
+    Shutdown {
+        export: OtlpExport,
+        deadline: tokio::time::Instant,
+        reply: SyncSender<Result<(), ExportShutdownError>>,
+    },
+}
 
 #[cfg(any(test, feature = "fixtures"))]
 pub(crate) struct TestOtlpRuntime {
     handle: tokio::runtime::Handle,
-    shutdown: SyncSender<TestOtlpShutdown>,
+    requests: SyncSender<TestOtlpRequest>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -365,7 +382,7 @@ impl TestOtlpRuntime {
 
     fn start() -> Self {
         let (ready, started) = mpsc::sync_channel(1);
-        let (shutdown, stop) = mpsc::sync_channel::<TestOtlpShutdown>(1);
+        let (requests, stop) = mpsc::sync_channel::<TestOtlpRequest>(1);
         let thread = thread::Builder::new()
             .name("rift-test-otlp-runtime".to_owned())
             .spawn(move || {
@@ -383,15 +400,34 @@ impl TestOtlpRuntime {
                 if ready.send(Ok(runtime.handle().clone())).is_err() {
                     return;
                 }
-                if let Ok((export, deadline, reply)) = stop.recv() {
-                    let result = runtime.block_on(export.shutdown(deadline));
-                    runtime.shutdown_timeout(
-                        deadline.saturating_duration_since(tokio::time::Instant::now()),
-                    );
-                    let _ = reply.send(result);
-                } else {
-                    runtime.shutdown_timeout(crate::OTLP_SHUTDOWN_TIMEOUT);
+                while let Ok(request) = stop.recv() {
+                    match request {
+                        TestOtlpRequest::ExportMetrics {
+                            exporter,
+                            metrics,
+                            deadline,
+                            reply,
+                        } => {
+                            let result = runtime.block_on(otlp::export_metric_snapshot(
+                                &exporter, &metrics, deadline,
+                            ));
+                            let _ = reply.send(result);
+                        }
+                        TestOtlpRequest::Shutdown {
+                            export,
+                            deadline,
+                            reply,
+                        } => {
+                            let result = runtime.block_on(export.shutdown(deadline));
+                            runtime.shutdown_timeout(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            );
+                            let _ = reply.send(result);
+                            return;
+                        }
+                    }
                 }
+                runtime.shutdown_timeout(crate::OTLP_SHUTDOWN_TIMEOUT);
             })
             .expect("the test OTLP runtime thread starts");
         let handle = match started.recv() {
@@ -401,7 +437,7 @@ impl TestOtlpRuntime {
         };
         Self {
             handle,
-            shutdown,
+            requests,
             thread: Some(thread),
         }
     }
@@ -409,11 +445,30 @@ impl TestOtlpRuntime {
     pub(crate) fn shutdown(mut self, export: OtlpExport) -> Result<(), ExportShutdownError> {
         let deadline = tokio::time::Instant::now() + crate::OTLP_SHUTDOWN_TIMEOUT;
         let (reply, result) = mpsc::sync_channel(1);
-        let sent = self.shutdown.send((export, deadline, reply));
-        let mut outcome = if sent.is_err() {
-            Err(ExportShutdownError::Failed(
-                "the test OTLP runtime stopped before export shutdown".to_owned(),
-            ))
+        let mut request = TestOtlpRequest::Shutdown {
+            export,
+            deadline,
+            reply,
+        };
+        let sent = loop {
+            match self.requests.try_send(request) {
+                Ok(()) => break Ok(()),
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    break Err(ExportShutdownError::Failed(
+                        "the test OTLP runtime stopped before export shutdown".to_owned(),
+                    ));
+                }
+                Err(mpsc::TrySendError::Full(held)) => {
+                    request = held;
+                    if tokio::time::Instant::now() >= deadline {
+                        break Err(ExportShutdownError::TimedOut);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        let mut outcome = if let Err(error) = sent {
+            Err(error)
         } else {
             match result
                 .recv_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
@@ -445,6 +500,49 @@ impl TestOtlpRuntime {
             runtime: Some(self),
             export: Some(export),
         }
+    }
+
+    fn metric_exporter(
+        &self,
+        exporter: Arc<MetricExporter>,
+    ) -> crate::recorder::metrics::MetricExport {
+        let requests = self.requests.clone();
+        Arc::new(move |metrics| {
+            let deadline = tokio::time::Instant::now() + otlp::OTLP_EXPORT_TIMEOUT;
+            let (reply, response) = mpsc::sync_channel(1);
+            let mut request = TestOtlpRequest::ExportMetrics {
+                exporter: Arc::clone(&exporter),
+                metrics,
+                deadline,
+                reply,
+            };
+            loop {
+                match requests.try_send(request) {
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        return Err(ExportShutdownError::Failed(
+                            "the test OTLP runtime stopped before metric export".to_owned(),
+                        ));
+                    }
+                    Err(mpsc::TrySendError::Full(held)) => {
+                        request = held;
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(ExportShutdownError::TimedOut);
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            match response
+                .recv_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(ExportShutdownError::TimedOut),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(ExportShutdownError::Failed(
+                    "the test OTLP runtime stopped before reporting metric export".to_owned(),
+                )),
+            }
+        })
     }
 }
 
@@ -481,7 +579,16 @@ impl Drop for TestOtlpExport {
 impl TestOtlpExport {
     fn install_meter(&self) {
         if let Some(export) = self.export.as_ref() {
-            export.install_meter();
+            let provider = export.recorder_meter_provider();
+            let reader = export.recorder_metric_reader();
+            let metric_exporter = export.recorder_metric_exporter();
+            let metric_export = match (&self.runtime, metric_exporter) {
+                (Some(runtime), Some(exporter)) => Some(runtime.metric_exporter(exporter)),
+                _ => None,
+            };
+            metrics::install(provider, reader, metric_export);
+        } else {
+            metrics::install(None, None, None);
         }
     }
 }
