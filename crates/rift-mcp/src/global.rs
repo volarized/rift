@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use percent_encoding::percent_decode_str;
@@ -35,11 +36,33 @@ use rift_server::{CalleeDeclaration, CalleePackage, PackageCallee, PositionEncod
 use tokio::sync::Mutex;
 
 /// One client shared by reads under the same accepted configuration and credential value.
-#[derive(Default)]
 pub(crate) struct GlobalState {
     client: Mutex<Option<ClientSlot>>,
     prepared_resolution: Mutex<Option<CachedResolutionRequest>>,
+    prepared_resolution_entries: Arc<AtomicU64>,
+    _prepared_resolution_reading: Option<Arc<rift_tracing::ObservationGuard>>,
     observation: Arc<StdMutex<Option<ServiceState>>>,
+}
+
+impl Default for GlobalState {
+    fn default() -> Self {
+        let prepared_resolution_entries = Arc::new(AtomicU64::new(0));
+        let observed_entries = Arc::downgrade(&prepared_resolution_entries);
+        let prepared_resolution_reading = crate::metrics::PREPARED_RESOLUTION_CACHE_ENTRIES
+            .observe(move |observation| {
+                if let Some(entries) = observed_entries.upgrade() {
+                    observation.observe(["prepared_resolution"], entries.load(Ordering::Relaxed));
+                }
+            })
+            .map(Arc::new);
+        Self {
+            client: Mutex::default(),
+            prepared_resolution: Mutex::default(),
+            prepared_resolution_entries,
+            _prepared_resolution_reading: prepared_resolution_reading,
+            observation: Arc::default(),
+        }
+    }
 }
 
 impl fmt::Debug for GlobalState {
@@ -298,6 +321,7 @@ impl GlobalState {
             context: Arc::clone(&context),
             prepared: Arc::clone(&prepared),
         });
+        self.prepared_resolution_entries.store(1, Ordering::Relaxed);
         Ok((context, prepared))
     }
 
@@ -1527,6 +1551,7 @@ mod tests {
     use rift_error::errors;
     use rift_protocol::read::GlobalFailureClass;
     use rift_ranking::{ParsedQuery, QueryPhase};
+    use rift_tracing::{ScopedRecorder, SeriesValue};
 
     #[test]
     fn client_failures_map_to_bounded_warning_classes() {
@@ -2021,11 +2046,31 @@ mod tests {
     #[tokio::test]
     async fn resolution_request_cache_invalidates_on_limit_snapshot_and_requested_packages()
     -> Result<(), rift_cloud_client::ClientError> {
+        let (recorder, _drain) = ScopedRecorder::builder()
+            .install()
+            .expect("the default filter parses");
+        let labels = [("cache.name", "prepared_resolution")];
         let context = context_with_path_dependencies(7);
         let state = super::GlobalState::default();
+        assert_eq!(
+            recorder
+                .metrics()
+                .find("cache.entry.count", &labels)
+                .map(rift_tracing::MetricSeries::value),
+            Some(&SeriesValue::Sum(0.0)),
+            "an empty prepared resolution cache reports zero entries"
+        );
         let (_, first) = state
             .prepared_resolution_request(&read_context(&context), 2)
             .await?;
+        assert_eq!(
+            recorder
+                .metrics()
+                .find("cache.entry.count", &labels)
+                .map(rift_tracing::MetricSeries::value),
+            Some(&SeriesValue::Sum(1.0)),
+            "a prepared request fills the one-entry cache"
+        );
         let (_, raised) = state
             .prepared_resolution_request(&read_context(&context), 3)
             .await?;
@@ -2074,6 +2119,22 @@ mod tests {
             "the key follows the snapshot and selection, even when the read built another context"
         );
         assert!(Arc::ptr_eq(&named, &retained));
+        assert_eq!(
+            recorder
+                .metrics()
+                .find("cache.entry.count", &labels)
+                .map(rift_tracing::MetricSeries::value),
+            Some(&SeriesValue::Sum(1.0)),
+            "cache hits and replacements keep one entry"
+        );
+        drop(state);
+        assert!(
+            recorder
+                .metrics()
+                .find("cache.entry.count", &labels)
+                .is_none(),
+            "dropping the cache owner unregisters its reading"
+        );
         Ok(())
     }
 

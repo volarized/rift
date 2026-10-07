@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use rift_tracing::Histogram;
+use rift_tracing::{Histogram, ObservableUpDownCounter};
 use rmcp::ErrorData;
 use rmcp::model::{CallToolResponse, ErrorCode, ProtocolVersion};
 
@@ -21,6 +21,10 @@ use crate::failure::RIFT_ERROR_CODE;
 /// name and version.
 pub(crate) const SCOPE: rift_tracing::InstrumentScope =
     rift_tracing::InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
+/// `cache.entry.count`: entries held by the prepared resolution cache.
+pub(crate) static PREPARED_RESOLUTION_CACHE_ENTRIES: ObservableUpDownCounter<1> =
+    ObservableUpDownCounter::declare(SCOPE, "cache.entry.count", "{entry}", &["cache.name"]);
 
 /// The `mcp.method.name` of the session's opening request.
 pub(crate) const INITIALIZE: &str = "initialize";
