@@ -29,10 +29,22 @@
 //! sharing, and re-election, and add the few helpers only they use.
 
 mod engine_fixture;
+#[path = "../../rift-mcp/tests/global_api.rs"]
+#[allow(
+    dead_code,
+    reason = "the shared surface fixture uses a subset of the global API"
+)]
+mod global_api;
 mod harness;
+#[path = "../../rift-mcp/tests/hermetic_search.rs"]
+mod hermetic_search;
 mod live_engine_gate;
 mod rust_engine;
+#[path = "../../rift-mcp/tests/surface_corpus.rs"]
+mod surface_corpus;
 mod test_case;
+#[path = "../../rift-mcp/tests/text_complete/mod.rs"]
+mod text_complete;
 
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -64,6 +76,7 @@ use rift_protocol::lock::{
 use rift_protocol::retry::RetryPolicy;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use serde_json::json;
+use surface_corpus::{SurfaceFixture, corpus};
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
@@ -885,22 +898,6 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
     Ok(())
 }
 
-/// One request per tool: a search naming `source` and `score`, a `get_symbol` with source, and
-/// a `nodes` read, all against the fixture's `beacon` declaration.
-fn representative_requests() -> [(&'static str, serde_json::Value); 3] {
-    [
-        (
-            "search",
-            json!({"query": "beacon", "target": "symbol", "include": ["source", "score"]}),
-        ),
-        (
-            "get_symbol",
-            json!({"name": "beacon", "include": ["source"]}),
-        ),
-        ("nodes", json!({"path": "lib.rs", "position": 8})),
-    ]
-}
-
 /// Most polls of a search before the lexical population pass has landed.
 const SEARCH_POPULATION_POLLS_MAX: usize = 60;
 
@@ -928,6 +925,27 @@ async fn await_search_population(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err("the lexical pass never settled for the search".into())
+}
+
+/// Waits until the fixture's background history fill indexes its second commit.
+async fn await_commit_population(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult {
+    let request = json!({"target": "commit", "query": "witness"});
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let answer = proxied_call(client, "search", &request).await?;
+        if answer["results"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the history store did not answer commit search: {answer}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The identities the text of a request must state: the symbol ids of the `search` and
@@ -973,8 +991,8 @@ fn text_of(result: &CallToolResult) -> TestResult<&str> {
 /// there.
 #[tokio::test]
 async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -> TestResult {
-    let directory = workspace()?;
-    let root = directory.path();
+    let fixture = SurfaceFixture::start().await?;
+    let root = fixture.root();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
 
@@ -984,38 +1002,53 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
     );
     let (all, text) = (all?, text?);
     await_workspace_ready(&all).await?;
-    for (name, request) in representative_requests() {
-        if name == "search" {
-            await_search_population(&all, &request).await?;
-        }
-        let (all_result, text_result) = tokio::join!(
-            proxied_result(&all, name, &request),
-            proxied_result(&text, name, &request),
-        );
-        let (all_result, text_result) = (all_result?, text_result?);
-        assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
-        assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
-        assert_eq!(
-            text_result.structured_content, None,
-            "{name}: {text_result:?}"
-        );
-        let all_text = text_of(&all_result)?;
-        assert_eq!(all_text, text_of(&text_result)?, "{name}: texts differ");
+    await_search_population(&all, &json!({"query": "beacon"})).await?;
+    await_commit_population(&all).await?;
 
-        let structured = all_result
-            .structured_content
-            .as_ref()
-            .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
-        let identities = stated_identities(name, structured);
-        assert!(
-            !identities.is_empty(),
-            "{name}: no identity to state: {structured}"
-        );
-        for identity in identities {
-            assert!(
-                all_text.split_whitespace().any(|token| token == identity),
-                "{name}: identity {identity} is no bare token of the text:\n{all_text}"
+    for (name, initial_request) in corpus() {
+        let mut request = initial_request;
+        let mut page_index = request["page_index"].as_u64().unwrap_or(0);
+        loop {
+            if name == "search" {
+                await_search_population(&all, &request).await?;
+            }
+            let (all_result, text_result) = tokio::join!(
+                proxied_result(&all, name, &request),
+                proxied_result(&text, name, &request),
             );
+            let (all_result, text_result) = (all_result?, text_result?);
+            assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
+            assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
+            assert_eq!(
+                text_result.structured_content, None,
+                "{name}: {text_result:?}"
+            );
+            text_complete::assert_text_states(name, &all_result);
+            let all_text = text_of(&all_result)?;
+            assert_eq!(all_text, text_of(&text_result)?, "{name}: texts differ");
+
+            let structured = all_result
+                .structured_content
+                .as_ref()
+                .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
+            for identity in stated_identities(name, structured) {
+                assert!(
+                    all_text.split_whitespace().any(|token| token == identity),
+                    "{name}: identity {identity} is no bare token of the text:\n{all_text}"
+                );
+            }
+
+            let Some(pagination) = structured.get("pagination") else {
+                break;
+            };
+            let total_pages = pagination["total_pages"]
+                .as_u64()
+                .ok_or_else(|| format!("{name}: pagination.total_pages must be an integer"))?;
+            if page_index + 1 >= total_pages {
+                break;
+            }
+            page_index += 1;
+            request["page_index"] = json!(page_index);
         }
     }
 
