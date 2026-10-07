@@ -793,13 +793,31 @@ impl EngineSlot {
         if let Some(start) = held.starting.take() {
             start.abort();
             if let Ok(Ok(started)) = start.await {
-                Box::pin(started.shutdown()).await;
+                let engine = self.name().to_owned();
+                let program = self.program().to_owned();
+                Box::pin(rift_tracing::traced!(
+                    component = "engine",
+                    operation = "EngineSession::shutdown",
+                    engine = engine,
+                    program = program,
+                    async move { started.shutdown().await }
+                ))
+                .await;
             }
         }
         let Some(session) = held.session.take() else {
             return;
         };
-        let stderr = Box::pin(session.shutdown()).await;
+        let engine = self.name().to_owned();
+        let program = self.program().to_owned();
+        let stderr = Box::pin(rift_tracing::traced!(
+            component = "engine",
+            operation = "EngineSession::shutdown",
+            engine = engine,
+            program = program,
+            async move { session.shutdown().await }
+        ))
+        .await;
         self.report_state(LspState::Stopped);
         let engine = self.name();
         rift_tracing::debug!(
@@ -1391,6 +1409,9 @@ impl EngineSlot {
     /// a request that waits for it can be dropped without ending it.
     fn spawn_start(&self) -> tokio::task::JoinHandle<Result<EngineSession, RiftError>> {
         let root = self.workspace_root.clone();
+        let parent = rift_tracing::Span::current();
+        let engine_name = self.name().to_owned();
+        let program_name = self.program().to_owned();
         match (
             self.configuration.embedded,
             self.configuration.command.as_ref(),
@@ -1398,12 +1419,32 @@ impl EngineSlot {
             (Some(engine), _) => {
                 let launch = self.embedded_launch(engine);
                 tokio::spawn(async move {
-                    Box::pin(crate::embedded::started_session(launch, &root)).await
+                    rift_tracing::traced!(
+                        parent: &parent,
+                        component = "engine",
+                        operation = "engine.start",
+                        engine = engine_name,
+                        program = program_name,
+                        async move {
+                            Box::pin(crate::embedded::started_session(launch, &root)).await
+                        }
+                    )
+                    .await
                 })
             }
             (None, Some(command)) => {
                 let launch = self.launch(command);
-                tokio::spawn(async move { Box::pin(EngineSession::start(launch, &root)).await })
+                tokio::spawn(async move {
+                    rift_tracing::traced!(
+                        parent: &parent,
+                        component = "engine",
+                        operation = "engine.start",
+                        engine = engine_name,
+                        program = program_name,
+                        async move { Box::pin(EngineSession::start(launch, &root)).await }
+                    )
+                    .await
+                })
             }
             (None, None) => {
                 unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
@@ -1518,7 +1559,16 @@ impl EngineSlot {
         let ended = replaced.is_ended();
         // Boxed for the reason `end_session` boxes it: the shutdown future is 9,920 bytes
         // on aarch64. One allocation per replaced session.
-        let stderr = Box::pin(replaced.shutdown()).await;
+        let engine = self.name().to_owned();
+        let program = self.program().to_owned();
+        let stderr = Box::pin(rift_tracing::traced!(
+            component = "engine",
+            operation = "EngineSession::shutdown",
+            engine = engine,
+            program = program,
+            async move { replaced.shutdown().await }
+        ))
+        .await;
         let engine = self.name();
         if ended {
             rift_tracing::warn!(
@@ -2623,9 +2673,12 @@ done
             .await
             .expect_err("the engine never reads ready inside the retry table");
         let elapsed = started.elapsed();
-        eprintln!(
-            "exchange: attempts={attempts:?} elapsed={elapsed:?} error={:?}",
-            failure.slug()
+        rift_tracing::info!(
+            component = "engine",
+            attempts = attempts.load(std::sync::atomic::Ordering::SeqCst),
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            error = %failure.slug(),
+            "exchange"
         );
         assert_eq!(failure.slug(), errors::lsp::engine_analyzing::SLUG);
         assert!(
@@ -2770,10 +2823,12 @@ done
             .await
             .expect("the walk settles");
         let stamps = stamps.lock().expect("attempt stamps").clone();
-        eprintln!(
-            "walk: attempts={} elapsed={:?} answer={answer:?}",
-            stamps.len(),
-            started.elapsed()
+        rift_tracing::info!(
+            component = "engine",
+            attempts = stamps.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            answer = ?answer,
+            "walk"
         );
         assert_eq!(answer, OutgoingAnswer::Ready(0));
         assert_eq!(
@@ -2856,10 +2911,12 @@ done
             .expect("a spent wait is an answer, not a failure");
         let returned = Instant::now();
         let times = times.lock().expect("attempt times").clone();
-        eprintln!(
-            "spent walk: completed={} elapsed={:?} answer={answer:?}",
-            times.len(),
-            returned - started
+        rift_tracing::info!(
+            component = "engine",
+            completed = times.len(),
+            elapsed_ms = (returned - started).as_secs_f64() * 1000.0,
+            answer = ?answer,
+            "spent walk"
         );
         assert_eq!(
             answer,
@@ -2980,9 +3037,11 @@ done
             )
             .await
             .expect("a retryable refusal at the spent wait is an answer");
-        eprintln!(
-            "retryable refusal: elapsed={:?} answer={answer:?}",
-            started.elapsed()
+        rift_tracing::info!(
+            component = "engine",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            answer = ?answer,
+            "retryable refusal"
         );
         assert!(
             matches!(answer, OutgoingAnswer::Unsettled { attempts } if (2..=3).contains(&attempts)),
@@ -3164,13 +3223,23 @@ done
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
         let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
-        eprintln!("before the feed: attempts={attempts} elapsed={elapsed:?}");
+        rift_tracing::info!(
+            component = "engine",
+            attempts,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            unconfirmed,
+            "before the feed"
+        );
         assert!(!unconfirmed, "the engine read ready before the feed");
 
         pool.owe_changed_paths(&edited_other());
         let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
-        eprintln!(
-            "after the feed: attempts={attempts} elapsed={elapsed:?} unconfirmed={unconfirmed}"
+        rift_tracing::info!(
+            component = "engine",
+            attempts,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            unconfirmed,
+            "after the feed"
         );
         let notified = std::fs::read_to_string(directory.path().join("notified.log"))
             .expect("the engine was told");
@@ -3203,8 +3272,12 @@ done
 
         pool.owe_changed_paths(&edited_other());
         let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
-        eprintln!(
-            "unwatched after the feed: attempts={attempts} elapsed={elapsed:?} unconfirmed={unconfirmed}"
+        rift_tracing::info!(
+            component = "engine",
+            attempts,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            unconfirmed,
+            "unwatched after the feed"
         );
         assert!(
             !directory.path().join("notified.log").exists(),

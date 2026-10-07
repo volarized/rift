@@ -25,9 +25,12 @@ from __future__ import annotations
 import json
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+from pydantic import BaseModel, ValidationError
 
 from rift_dev.commands import (
     REPOSITORY,
@@ -36,6 +39,8 @@ from rift_dev.commands import (
     CommandFailed,
     Process,
 )
+from rift_dev.nextest_run import retained_collector
+from rift_dev.trace import Collector
 
 TOOL_DIRECTORY = REPOSITORY / "tools" / "mcp-conformance"
 EXPECTED_FAILURES = TOOL_DIRECTORY / "expected-failures.yml"
@@ -79,6 +84,18 @@ def lay_out_workspace(root: Path) -> None:
     (root / "src" / "main.rs").write_text(FIXTURE_SOURCE, encoding="utf-8")
 
 
+class CargoTarget(BaseModel):
+    name: str
+
+
+class CargoMessage(BaseModel):
+    """Public Cargo JSON message fields used to locate the built executable."""
+
+    reason: str
+    executable: Path | None = None
+    target: CargoTarget | None = None
+
+
 def build_server_binary(*, release: bool = False, target: str | None = None) -> Path:
     """Build `rift` and answer the executable Cargo wrote.
 
@@ -96,28 +113,33 @@ def build_server_binary(*, release: bool = False, target: str | None = None) -> 
     messages = command.with_output_limit(BUILD_OUTPUT_BYTES_MAX).output()
     for line in messages.splitlines():
         try:
-            message = json.loads(line)
-        except ValueError:
+            message = CargoMessage.model_validate_json(line)
+        except ValidationError:
             continue
         if (
-            message.get("reason") == "compiler-artifact"
-            and message.get("executable")
-            and message.get("target", {}).get("name") == "rift"
+            message.reason == "compiler-artifact"
+            and message.executable is not None
+            and message.target is not None
+            and message.target.name == "rift"
         ):
-            return Path(message["executable"])
+            return message.executable
     raise RuntimeError("the build reported no rift executable")
 
 
 @contextmanager
-def started_server(binary: Path, root: Path, log_path: Path) -> Iterator[Process]:
+def started_server(
+    binary: Path, root: Path, log_path: Path, telemetry: Collector
+) -> Iterator[Process]:
     """A foreground server over `root` with the token check off, owned until the end.
 
     Its output goes to `log_path`. On the way out the server gets the interrupt
     it stops on, and whatever outlasts `STOP_SECONDS_MAX` is ended with it.
     """
-    command = Command(
-        binary, "server", "start", "--foreground", "--auth", "skip"
-    ).with_cwd(root)
+    command = (
+        Command(binary, "server", "start", "--foreground", "--auth", "skip")
+        .with_cwd(root)
+        .with_env(**telemetry.environment("conformance"))
+    )
     with log_path.open("wb") as log, command.spawn(log) as server:
         try:
             yield server
@@ -208,9 +230,11 @@ def main(supplied: Path | None = None) -> int:
     if not binary.is_file():
         raise RuntimeError(f"conformance binary does not exist: {binary}")
     install_runner()
+    artifacts = REPOSITORY / "target/integration/conformance" / str(uuid.uuid4())
+    artifacts.mkdir(parents=True)
     with (
         tempfile.TemporaryDirectory(prefix="rift-conformance-") as directory,
-        tempfile.TemporaryDirectory(prefix="rift-conformance-log-") as log_directory,
+        retained_collector(artifacts) as telemetry,
     ):
         root = Path(directory)
         lay_out_workspace(root)
@@ -219,7 +243,7 @@ def main(supplied: Path | None = None) -> int:
         # fingerprint on every line, and the startup capture never settles:
         # the server refuses to start, naming `server.log` as the file that
         # moved between two scans.
-        log_path = Path(log_directory) / "server.log"
-        with started_server(binary, root, log_path) as server:
+        log_path = artifacts / "server.log"
+        with started_server(binary, root, log_path, telemetry) as server:
             port = await_published_port(server, root, log_path)
             return run_suite(port)

@@ -121,9 +121,6 @@ pub struct LogSink {
     sender: Sender<QueuedRecord>,
     dropped: Arc<AtomicU64>,
     pub(crate) settlement: Arc<LogSettlement>,
-    /// The copies a scoped recorder prints when its test panics.
-    #[cfg(any(test, feature = "fixtures"))]
-    retained: Option<Arc<crate::recorder::RetainedRecords>>,
 }
 
 impl LogSink {
@@ -141,10 +138,6 @@ impl LogSink {
     /// `queue_full`, through the instrument the meter's install built: the send runs inside
     /// this layer, and building the instrument here would report through `tracing` into it.
     pub(crate) fn send(&self, record: LogRecord) {
-        #[cfg(any(test, feature = "fixtures"))]
-        if let Some(retained) = &self.retained {
-            retained.keep(&record);
-        }
         let sequence = self.settlement.accept();
         match self.sender.try_send(QueuedRecord { sequence, record }) {
             Err(TrySendError::Full(_)) => {
@@ -155,13 +148,6 @@ impl LogSink {
             Err(TrySendError::Closed(_)) => self.settlement.finish_dropped(),
             Ok(()) => {}
         }
-    }
-
-    /// Keeps a copy of every record this sink sends in `retained`.
-    #[cfg(any(test, feature = "fixtures"))]
-    pub(crate) fn retaining(mut self, retained: Arc<crate::recorder::RetainedRecords>) -> Self {
-        self.retained = Some(retained);
-        self
     }
 }
 
@@ -179,8 +165,6 @@ pub fn log_capture() -> (LogSink, LogDrain) {
             sender,
             dropped: Arc::clone(&dropped),
             settlement: Arc::clone(&settlement),
-            #[cfg(any(test, feature = "fixtures"))]
-            retained: None,
         },
         LogDrain::new(receiver, dropped, settlement),
     )

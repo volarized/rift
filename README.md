@@ -95,7 +95,6 @@ Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 | `just doctest` | Rust documentation examples |
 | `just release-test` | Release archive contract |
 | `just installer-test` | Offline installer contract |
-| `just testing-check` | Python lint, types, and tests |
 | `just rust-gate` | Local formatting, static checks, and unit tests |
 | `just corpus-sync [name]` | Fetch the pinned Bun, Next.js, and FastAPI trees |
 | `just corpus-test <name>` | Corpus suite for `bun`, `nextjs`, or `fastapi` |

@@ -48,7 +48,7 @@ pub(crate) fn rift_binary() -> PathBuf {
 /// ends inside this bound, and this bound ends inside nextest's one-minute
 /// deadline. It also covers the proxy's start window, the longest a refusal to
 /// start takes. `mcp_proxy`'s `proxied_forward_budget_ends_inside_the_call_bound`
-/// pins the first relation and `dev/tests/test_delivery.py` the second.
+/// pins the first relation.
 pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_secs(45);
 /// Bound on one proxied call that starts and settles a language engine.
 pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);

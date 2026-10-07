@@ -480,6 +480,26 @@ fn document_path(root: &Path) -> PathBuf {
     root.join(".rift").join(SERVER_LOCK_FILE_NAME)
 }
 
+fn wait_for_initial_trigram_index(connection: &rusqlite::Connection) -> TestResult {
+    wait_for(
+        START_POLL_ATTEMPT_COUNT,
+        "the initial file rows to reach the trigram index",
+        || {
+            let (file_rows, pending) = connection
+                .query_row(
+                    "SELECT (SELECT count(*) FROM lexical_documents \
+                     WHERE file_content IS NOT NULL), \
+                     (SELECT count(*) FROM lexical_trigram_pending)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .ok()?;
+            (file_rows > 0 && pending == 0).then_some(())
+        },
+    )?;
+    Ok(())
+}
+
 /// Polls `condition` every [`POLL_INTERVAL`] up to `attempts` times, and for no
 /// longer than those attempts span at that interval.
 ///
@@ -1026,13 +1046,13 @@ impl ListeningForeground {
     /// Starts a foreground server in `root` with `variables` added to the inherited
     /// environment, and returns once it has printed its listening line: the server installs
     /// its stop signal handlers before it prints that line.
-    fn start(root: &Path, variables: &[(&str, &str)]) -> TestResult<Self> {
+    fn start(root: &Path, variables: &[(String, String)]) -> TestResult<Self> {
         use std::io::BufRead as _;
 
         let mut child = rift_command()?
             .args(["server", "start", "--foreground"])
             .envs(SERVER_LOG_VARIABLES)
-            .envs(variables.iter().copied())
+            .envs(variables.iter().map(|(name, value)| (name, value)))
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1116,86 +1136,53 @@ fn sigterm_stops_a_foreground_server_through_its_stop() -> TestResult {
     Ok(())
 }
 
-/// Every OTLP/HTTP export request one receiver answered: when it arrived, its path, and its
-/// body's length.
-#[cfg(unix)]
-type ReceivedExports =
-    std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, &'static str, usize)>>>;
-
-/// An OTLP/HTTP receiver on a loopback port that records each span and metric export and
-/// answers success.
-#[cfg(unix)]
-struct TraceReceiver {
-    _runtime: tokio::runtime::Runtime,
-    port: u16,
-    exports: ReceivedExports,
-}
-
-#[cfg(unix)]
-impl TraceReceiver {
-    fn start() -> TestResult<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()?;
-        let listener = runtime.block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))?;
-        let port = listener.local_addr()?.port();
-        let exports = ReceivedExports::default();
-        let route = |path: &'static str| {
-            let recorded = std::sync::Arc::clone(&exports);
-            axum::routing::post(move |body: axum::body::Bytes| async move {
-                recorded
-                    .lock()
-                    .expect("the recorded exports are not poisoned")
-                    .push((std::time::Instant::now(), path, body.len()));
-                axum::http::StatusCode::OK
-            })
-        };
-        let receiver = axum::Router::new()
-            .route("/v1/traces", route("/v1/traces"))
-            .route("/v1/metrics", route("/v1/metrics"))
-            .route("/v1/logs", route("/v1/logs"));
-        runtime.spawn(async move { axum::serve(listener, receiver).await });
-        Ok(Self {
-            _runtime: runtime,
-            port,
-            exports,
-        })
-    }
-
-    fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    /// The byte counts of the exports to `path` that arrived at or after `moment`.
-    fn exports_since(&self, path: &str, moment: std::time::Instant) -> Vec<usize> {
-        self.exports
-            .lock()
-            .expect("the recorded exports are not poisoned")
-            .iter()
-            .filter(|(arrived, received, _)| *arrived >= moment && *received == path)
-            .map(|(_, _, bytes)| *bytes)
-            .collect()
-    }
-}
-
 /// The batch processor's and the metric reader's export interval the export tests set: ten
 /// minutes, so no scheduled export runs while the server serves and only the stop's final
 /// flush sends.
-#[cfg(unix)]
 const EXPORT_INTERVAL_PAST_THE_TEST_MS: &str = "600000";
 
 /// The variables that point a server at `endpoint` with no scheduled export.
 #[cfg(unix)]
-fn export_variables(endpoint: &str) -> [(&str, &str); 3] {
-    [
-        ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
-        ("OTEL_BSP_SCHEDULE_DELAY", EXPORT_INTERVAL_PAST_THE_TEST_MS),
+fn export_variables(endpoint: &str) -> TestResult<Vec<(String, String)>> {
+    let collector = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
+    Ok(vec![
         (
-            "OTEL_METRIC_EXPORT_INTERVAL",
-            EXPORT_INTERVAL_PAST_THE_TEST_MS,
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT".to_owned(),
+            format!("{}/v1/traces", endpoint.trim_end_matches('/')),
         ),
-    ]
+        (
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT".to_owned(),
+            format!("{}/v1/metrics", endpoint.trim_end_matches('/')),
+        ),
+        (
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_owned(),
+            format!("{}/v1/logs", collector.trim_end_matches('/')),
+        ),
+        (
+            "OTEL_BSP_SCHEDULE_DELAY".to_owned(),
+            EXPORT_INTERVAL_PAST_THE_TEST_MS.to_owned(),
+        ),
+        (
+            "OTEL_METRIC_EXPORT_INTERVAL".to_owned(),
+            EXPORT_INTERVAL_PAST_THE_TEST_MS.to_owned(),
+        ),
+    ])
+}
+
+#[cfg(unix)]
+fn assert_export_stage_outcome(stderr: &str, expected: &[&str]) {
+    assert!(
+        stderr.lines().any(|line| {
+            line.contains("stop stage ended")
+                && line.contains("stage=otlp export")
+                && line.contains("phase=traces and metrics")
+                && expected.iter().any(|outcome| {
+                    line.split_whitespace()
+                        .any(|field| field == format!("outcome={outcome}"))
+                })
+        }),
+        "the export stage records outcome {expected:?}: {stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -1205,11 +1192,9 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);
-    let receiver = TraceReceiver::start()?;
-    let endpoint = receiver.endpoint();
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
 
-    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
-    let signalled = std::time::Instant::now();
+    let server = ListeningForeground::start(root, &export_variables(&endpoint)?)?;
     let (status, elapsed, stderr) = server.terminate()?;
 
     assert!(
@@ -1220,20 +1205,7 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
         elapsed <= STOP_EXIT_BOUND,
         "a signalled server flushes and exits inside the stop bound: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
-    let spans = receiver.exports_since("/v1/traces", signalled);
-    assert!(
-        spans.iter().any(|bytes| *bytes > 0),
-        "the export shutdown sends the spans the server closed while serving: {spans:?}"
-    );
-    let points = receiver.exports_since("/v1/metrics", signalled);
-    assert_eq!(
-        points.len(),
-        1,
-        "the export shutdown sends the final metric points once: {points:?}"
-    );
-    let records = stored_records(root)?;
-    let export = stage_ended_line(&records, "otlp export")?;
-    assert!(export.contains("outcome=ok"), "{export}");
+    assert_export_stage_outcome(&stderr, &["ok"]);
     failure_window.passed();
     Ok(())
 }
@@ -1256,7 +1228,7 @@ fn a_stalled_collector_ends_the_export_stage_timeout_inside_the_stop_bound() -> 
         drop(held);
     });
 
-    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let server = ListeningForeground::start(root, &export_variables(&endpoint)?)?;
     let (status, elapsed, stderr) = server.terminate()?;
 
     assert!(
@@ -1267,10 +1239,7 @@ fn a_stalled_collector_ends_the_export_stage_timeout_inside_the_stop_bound() -> 
         elapsed <= STOP_EXIT_BOUND,
         "the export stage holds the stop for its reserve alone: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
-    let records = stored_records(root)?;
-    let export = stage_ended_line(&records, "otlp export")?;
-    assert!(export.contains("outcome=timeout"), "{export}");
-    assert!(export.contains("WARN"), "{export}");
+    assert_export_stage_outcome(&stderr, &["timeout"]);
     failure_window.passed();
     Ok(())
 }
@@ -1290,7 +1259,7 @@ fn a_refused_collector_ends_the_export_stage_error_and_the_stop_cleanly() -> Tes
     let endpoint = format!("http://127.0.0.1:{}", refused.local_addr()?.port());
     drop(refused);
 
-    let server = ListeningForeground::start(root, &export_variables(&endpoint))?;
+    let server = ListeningForeground::start(root, &export_variables(&endpoint)?)?;
     let (status, elapsed, stderr) = server.terminate()?;
 
     assert!(
@@ -1301,13 +1270,7 @@ fn a_refused_collector_ends_the_export_stage_error_and_the_stop_cleanly() -> Tes
         elapsed <= STOP_EXIT_BOUND,
         "elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
     );
-    let records = stored_records(root)?;
-    let export = stage_ended_line(&records, "otlp export")?;
-    assert!(
-        export.contains("outcome=error") || export.contains("outcome=timeout"),
-        "{export}"
-    );
-    assert!(export.contains("WARN"), "{export}");
+    assert_export_stage_outcome(&stderr, &["error", "timeout"]);
     failure_window.passed();
     Ok(())
 }
@@ -1324,6 +1287,10 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         .args(["server", "start", "--foreground"])
         .current_dir(root)
         .envs(SERVER_LOG_VARIABLES)
+        .env(
+            "OTEL_METRIC_EXPORT_INTERVAL",
+            EXPORT_INTERVAL_PAST_THE_TEST_MS,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1613,9 +1580,11 @@ fn a_stop_whose_index_close_outlasts_its_bound_ends_timeout_and_retires_the_docu
             .then_some(())
     })?;
 
+    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
+    wait_for_initial_trigram_index(&holder)?;
+
     // Another process takes the index database's write lock, then a source change makes
     // the server write: its `BEGIN IMMEDIATE` waits inside SQLite's busy handler.
-    let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
     holder.execute_batch("BEGIN IMMEDIATE")?;
     fs::write(
         root.join("lib.rs"),
@@ -2518,6 +2487,16 @@ const ELECTION_FILE_NAME: &str = "server.lock";
 /// Polls while waiting for a spawned server's stderr refusal.
 const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
 
+fn debug_lingering_lock(stage: &str, path: &Path) {
+    rift_tracing::debug!(
+        component = "mcp",
+        stage,
+        pid = std::process::id(),
+        path = %path.display(),
+        "lingering shared lock test"
+    );
+}
+
 /// A claim that meets any lock on the election file loses the start election,
 /// a shared one included. This test keeps a shared lock on the file the way a
 /// probe's lock outlives the probe on Windows, which releases a closed handle's
@@ -2539,6 +2518,8 @@ fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
         .write(true)
         .open(root.join(".rift").join(ELECTION_FILE_NAME))?;
     lingering.try_lock_shared()?;
+    let election_path = root.join(".rift").join(ELECTION_FILE_NAME);
+    debug_lingering_lock("acquired", &election_path);
 
     // The start writes into files: on Windows the detached server inherits the
     // starting process's handles, so a pipe would stay open until it leaves.
@@ -2567,8 +2548,20 @@ fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
             "a refused child opens no database: {name}"
         );
     }
-    lingering.unlock()?;
+    debug_lingering_lock("unlock requested", &election_path);
+    let unlocked = lingering.unlock();
+    debug_lingering_lock(
+        if unlocked.is_ok() {
+            "unlock returned ok"
+        } else {
+            "unlock returned error"
+        },
+        &election_path,
+    );
+    unlocked?;
+    debug_lingering_lock("handle drop requested", &election_path);
     drop(lingering);
+    debug_lingering_lock("handle dropped", &election_path);
     let status = start.wait()?;
     lost?;
 

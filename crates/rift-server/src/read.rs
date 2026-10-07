@@ -5377,7 +5377,11 @@ pub fn compute() -> i32 {
         );
         *previous = captured;
         *last = next;
-        eprintln!("paired Git status, ordinary edit: {ordinary_status:?}");
+        rift_tracing::info!(
+            component = "index",
+            git_status = ?ordinary_status,
+            "paired Git status, ordinary edit"
+        );
         commit_source(root, global_config, false)
     }
 
@@ -5465,7 +5469,11 @@ pub fn compute() -> i32 {
         assert_ne!(captured, *previous, "racy rewrite changes captured digests");
         *previous = captured;
         *last = next;
-        eprintln!("paired Git status, racy rewrite: {racy_status:?}");
+        rift_tracing::info!(
+            component = "index",
+            git_status = ?racy_status,
+            "paired Git status, racy rewrite"
+        );
         commit_source(root, global_config, false)
     }
 
@@ -5535,7 +5543,11 @@ pub fn compute() -> i32 {
         );
         *previous = captured;
         *last = next;
-        eprintln!("paired Git status, restored old mtime: {old_mtime_status:?}");
+        rift_tracing::info!(
+            component = "index",
+            git_status = ?old_mtime_status,
+            "paired Git status, restored old mtime"
+        );
         Ok(())
     }
 
@@ -5606,7 +5618,11 @@ pub fn compute() -> i32 {
             captured, *previous,
             "case-only rename changes captured digests"
         );
-        eprintln!("paired Git status, case-only rename: {case_status:?}");
+        rift_tracing::info!(
+            component = "index",
+            git_status = ?case_status,
+            "paired Git status, case-only rename"
+        );
         Ok(())
     }
 

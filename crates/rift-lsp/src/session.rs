@@ -513,9 +513,12 @@ impl EngineSession {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|source| errors::lsp::engine_launch_failed().source(source).error())?;
+        let mut child = rift_tracing::traced!(
+            "EngineSession::start",
+            command
+                .spawn()
+                .map_err(|source| errors::lsp::engine_launch_failed().source(source).error())
+        )?;
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {

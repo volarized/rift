@@ -13,6 +13,7 @@ from rift_dev.check_artifact import (
     symbol_hit,
     symbol_id,
 )
+from rift_dev.nextest_run import retained_collector
 from rift_dev.rift_test_client import (
     Client,
     Server,
@@ -26,7 +27,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import TEST_CASE_KEY, collector, resource_attribute
+from rift_dev.trace import TEST_CASE_KEY, resource_attribute
 
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
@@ -146,7 +147,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
         )
         (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
         with (
-            collector() as telemetry,
+            retained_collector(base) as telemetry,
             Server(
                 binary,
                 root,

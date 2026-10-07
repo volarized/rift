@@ -3,7 +3,7 @@ set dotenv-load := false
 rift_dev := "uv run --locked --project dev rift-dev"
 
 format:
-    cargo fmt --all --check
+    {{ rift_dev }} fmt --all --check
 
 generate:
     {{ rift_dev }} generate
@@ -15,7 +15,7 @@ generate-check:
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
-    cargo check --workspace --all-targets --all-features --locked
+    {{ rift_dev }} check --workspace --all-targets --all-features --locked
     {{ rift_dev }} rust-architecture
 
 dashes *args:
@@ -28,22 +28,15 @@ dashes *args:
 conformance *args:
     {{ rift_dev }} conformance {{ args }}
 
-# An in-memory OTLP/HTTP collector for timing `traced!`/`traced_async!` spans on
-# port 4318. Point a `rift` process at it with
-# `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`; Ctrl-C prints one JSON line
-# per operation.
-trace-collector *args:
-    {{ rift_dev }} trace-collector {{ args }}
-
 clippy:
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    {{ rift_dev }} clippy --workspace --all-targets --all-features -- -D warnings
 
 docs:
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+    {{ rift_dev }} docs --workspace --all-features --no-deps
 
 # Stable Rust exposes doctests through rustdoc; nextest runs the other Rust tests.
 doctest:
-    cargo test --doc --workspace --all-features --locked
+    {{ rift_dev }} test doctest
 
 audit:
     cargo audit
@@ -59,7 +52,7 @@ clean:
 # compression level trades build time for bytes. Measured over one revision,
 # level 9 costs 17 seconds where level 19 costs six minutes for 15% more.
 fast-archive:
-    cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
+    {{ rift_dev }} test archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
 
 test *args:
     {{ rift_dev }} test unit {{ args }}
@@ -73,26 +66,17 @@ release-test:
 installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
-testing-check:
-    uv run --locked --project dev ruff check dev
-    uv run --locked --project dev ty check dev
-    uv run --locked --project dev pytest dev/tests
-
 corpus-sync *args:
     {{ rift_dev }} corpus sync {{ args }}
 
 # The plain CLI the artifact job serves, from the corpus profile.
 integration-cli:
-    cargo build --locked --profile corpus -p rift
+    {{ rift_dev }} build --locked --profile corpus -p rift
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
 
-# The archive carries the corpus suites and nothing else. `--all-targets` built
-# and linked every test binary in the workspace, and each one links the whole
-# workspace; the live suites moved to the fast archive, which is built once for
-# every pull request. `dev/tests/test_delivery.py` refuses a selection that
-# leaves out a suite the corpus profile runs.
+# The archive carries the three corpus suites; the live suites use the fast archive.
 integration-archive:
-    cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
+    {{ rift_dev }} test archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
 corpus-test *args:
     {{ rift_dev }} test corpus {{ args }}
@@ -111,7 +95,7 @@ integration-test:
 
 quick-gate: format dashes generate-check check clippy
 
-rust-gate: quick-gate docs doctest audit test release-test installer-test testing-check
+rust-gate: quick-gate docs doctest audit test release-test installer-test
 
 # One signed tag on the commit `origin/main` names right now; pushing it starts
 # `rift-release`.

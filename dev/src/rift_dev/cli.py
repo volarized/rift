@@ -9,12 +9,14 @@ import sys
 import traceback
 from builtins import BaseExceptionGroup
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import typer
+from typer.core import TyperCommand
 
 from rift_dev import (
     build_cache,
+    build_run,
     check_agent,
     check_artifact,
     check_coldstart,
@@ -25,12 +27,12 @@ from rift_dev import (
     generated,
     release_tag,
     suites,
-    trace,
     worktrees,
 )
-from rift_dev.commands import CommandFailed
+from rift_dev.commands import CargoCommand, CommandFailed
 from rift_dev.config import BinaryOptions, CorpusCase, CorpusName, CorpusOptions
 from rift_dev.corpus_cache import git, measure, pins
+from rift_dev.progress import finish, start
 from rift_dev.rift_test_client import candidate_binary, run_gate, workspace_version
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -42,6 +44,25 @@ ArchiveArgument = Annotated[
 PathOption = Annotated[Path | None, typer.Option()]
 StringOption = Annotated[str | None, typer.Option()]
 FAILURE_GROUP_DEPTH_MAX = 32
+PASSTHROUGH_ARGUMENTS = "rift_dev_passthrough_arguments"
+
+
+class ForwardingTyperCommand(TyperCommand):
+    """Retain child arguments that Click removes while parsing its separator."""
+
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
+        ctx.meta[PASSTHROUGH_ARGUMENTS] = list(args)
+        return super().parse_args(ctx, args)
+
+
+def forwarded_arguments(context: typer.Context) -> list[str]:
+    """Return child arguments with Click's `--` separator preserved."""
+    arguments = context.meta.pop(PASSTHROUGH_ARGUMENTS, context.args)
+    if arguments and "--" in arguments:
+        separator = arguments.index("--")
+        if arguments[separator + 1 :] in (["--help"], ["-h"], ["--version"], ["-V"]):
+            del arguments[separator]
+    return list(arguments)
 
 
 @app.command()
@@ -156,25 +177,99 @@ def start_build_cache() -> None:
     raise typer.Exit(build_cache.main())
 
 
+@app.command(
+    "build",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def build(context: typer.Context) -> None:
+    """Run `cargo build` with the given arguments and compact output."""
+    build_run.run(forwarded_arguments(context))
+
+
+@app.command(
+    "check",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def check(context: typer.Context) -> None:
+    """Run `cargo check` with the given arguments and compact output."""
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("check",), label="check"
+    )
+
+
+@app.command(
+    "clippy",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def clippy(context: typer.Context) -> None:
+    """Run `cargo clippy` with the given arguments and compact output."""
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("clippy",), label="clippy"
+    )
+
+
+@app.command(
+    "docs",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def docs(context: typer.Context) -> None:
+    """Run `cargo doc` with the given arguments and compact output."""
+    build_run.run(
+        forwarded_arguments(context),
+        cargo_arguments=("doc",),
+        environment={"RUSTDOCFLAGS": "-D warnings"},
+        label="docs",
+    )
+
+
+@app.command(
+    "fmt",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def format_rust(context: typer.Context) -> None:
+    """Check Rust formatting with compact output."""
+    started = start("format")
+    failed = False
+    try:
+        CargoCommand("fmt", *forwarded_arguments(context)).run()
+    except Exception:
+        failed = True
+        raise
+    finally:
+        finish("format", started, failed=failed)
+
+
+@app.command(
+    "coverage-report",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def coverage_report(context: typer.Context) -> None:
+    """Write an llvm-cov report with its selected output visible."""
+    suites.coverage_report(forwarded_arguments(context))
+
+
 @app.command("rust-architecture")
 def rust_architecture() -> None:
     """Check internal Cargo dependencies and test targets."""
     raise typer.Exit(check_rust_architecture.main())
 
 
+@app.command("clock-inventory")
+def clock_inventory() -> None:
+    """Check clock reads against the reviewed inventory."""
+    raise typer.Exit(check_rust_architecture.clock_main())
+
+
 @app.command()
 def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None:
     """Check prose and source files for banned dash characters."""
     raise typer.Exit(check_dashes.main([str(path) for path in paths or []]))
-
-
-@app.command("trace-collector")
-def trace_collector(
-    host: Annotated[str, typer.Option()] = "127.0.0.1",
-    port: Annotated[int, typer.Option()] = 4318,
-) -> None:
-    """Collect OTLP/HTTP spans in memory; Ctrl-C prints one JSON line per operation."""
-    trace.collect(host, port)
 
 
 @app.command()
@@ -205,6 +300,34 @@ def unit_tests(archive: ArchiveArgument = None) -> None:
     suites.unit(archive)
 
 
+@test_app.command("doctest")
+def doctest_tests() -> None:
+    """Run Rust documentation examples through the dev appliance."""
+    suites.doctest()
+
+
+@test_app.command(
+    "archive",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def archive(context: typer.Context) -> None:
+    """Build a cargo-llvm-cov nextest archive with compact output."""
+    build_run.run(
+        forwarded_arguments(context), cargo_arguments=("llvm-cov", "nextest-archive")
+    )
+
+
+@test_app.command(
+    "nextest-archive",
+    cls=ForwardingTyperCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def nextest_archive(context: typer.Context) -> None:
+    """Build a cargo-nextest archive with compact output."""
+    build_run.run(forwarded_arguments(context), cargo_arguments=("nextest", "archive"))
+
+
 @test_app.command("live")
 def live_tests(archive: ArchiveArgument = None) -> None:
     """Run the live language-engine and model suites."""
@@ -213,11 +336,44 @@ def live_tests(archive: ArchiveArgument = None) -> None:
 
 @test_app.command(
     "nextest",
+    cls=ForwardingTyperCommand,
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
-def nextest_tests(context: typer.Context) -> None:
+def nextest_tests(
+    context: typer.Context,
+    coverage: Annotated[
+        bool, typer.Option(help="Run this selection with `cargo llvm-cov nextest`.")
+    ] = False,
+    coverage_env: Annotated[
+        bool,
+        typer.Option(help="Run this selection with `cargo nextest` under `show-env`."),
+    ] = False,
+    coverage_env_clean: Annotated[
+        bool, typer.Option(help="Clean coverage data before this run.")
+    ] = False,
+) -> None:
     """Run `cargo nextest` with the given arguments beside the OTLP collector."""
-    suites.nextest(list(context.args))
+    arguments = forwarded_arguments(context)
+    separator = arguments.index("--") if "--" in arguments else len(arguments)
+    arguments = [
+        argument
+        for argument in arguments[:separator]
+        if argument
+        not in {
+            "--coverage",
+            "--no-coverage",
+            "--coverage-env",
+            "--no-coverage-env",
+            "--coverage-env-clean",
+            "--no-coverage-env-clean",
+        }
+    ] + arguments[separator:]
+    suites.nextest(
+        arguments,
+        coverage=coverage,
+        coverage_env=coverage_env,
+        coverage_env_clean=coverage_env_clean,
+    )
 
 
 @test_app.command("corpus")
@@ -252,6 +408,7 @@ def main() -> None:
     A streamed program has already printed its output, so the failure adds one
     line naming the program instead of a traceback.
     """
+    _use_utf8_output()
     try:
         app()
     except CommandFailed as failure:
@@ -260,6 +417,14 @@ def main() -> None:
     except Exception as failure:  # noqa: BLE001 - CLI reports failures without stack frames.
         print(f"error: {failure_message(failure)}", file=sys.stderr)
         raise SystemExit(1) from None
+
+
+def _use_utf8_output() -> None:
+    """Use UTF-8 for Typer output, including on Windows redirected streams."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
 
 
 def failure_message(failure: BaseException) -> str:

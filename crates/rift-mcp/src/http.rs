@@ -15,10 +15,11 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_error::{RiftError, errors};
-use rift_index::WorkspaceIndexLimits;
+use rift_index::{DatabaseReadings, WorkspaceIndexLimits};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rift_search::SearchIndex;
+use rift_tracing::StoreReadings;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::sync::Notify;
@@ -225,6 +226,8 @@ pub struct HttpServer {
 pub struct DeferredDatabaseShutdown(
     Option<Arc<SearchIndex>>,
     Option<Arc<rift_tracing::LogStore>>,
+    Vec<Arc<DatabaseReadings>>,
+    Option<Arc<StoreReadings>>,
 );
 
 impl DeferredDatabaseShutdown {
@@ -259,7 +262,8 @@ impl DeferredDatabaseShutdown {
         let Some(search_index) = self.0.take() else {
             return Ok(());
         };
-        stop_stage("SQLite worker shutdown", deadline, async {
+        self.retain_readings(search_index.database_readings());
+        let result = stop_stage("SQLite worker shutdown", deadline, async {
             search_index.shutdown(deadline).await.map_err(|error| {
                 rift_tracing::warn!(
                     component = "storage",
@@ -273,7 +277,18 @@ impl DeferredDatabaseShutdown {
                     .error()
             })
         })
-        .await
+        .await;
+        self.retain_readings(search_index.database_readings());
+        result
+    }
+
+    /// Retains each database's readings owner once, without retaining its worker.
+    fn retain_readings(&mut self, readings: Vec<Arc<DatabaseReadings>>) {
+        for reading in readings {
+            if !self.2.iter().any(|held| Arc::ptr_eq(held, &reading)) {
+                self.2.push(reading);
+            }
+        }
     }
 
     /// Closes the metrics database by `deadline`, when it opened.
@@ -285,8 +300,12 @@ impl DeferredDatabaseShutdown {
     /// # Cancel safety
     ///
     /// Dropping the future after the close is queued leaves the writer thread to close.
-    pub async fn close_logs(self, deadline: Instant) -> Result<(), RiftError> {
-        close_logs(self.1.as_deref(), deadline).await
+    pub async fn close_logs(&mut self, deadline: Instant) -> Result<(), RiftError> {
+        let logs = self.1.take();
+        if let Some(store) = &logs {
+            self.3 = Some(store.readings());
+        }
+        close_logs(logs.as_deref(), deadline).await
     }
 }
 
@@ -634,7 +653,7 @@ impl HttpServer {
         (
             deadline,
             stopped,
-            DeferredDatabaseShutdown(self.search_index, self.logs),
+            DeferredDatabaseShutdown(self.search_index, self.logs, Vec::new(), None),
         )
     }
 }
@@ -2280,7 +2299,8 @@ mod tests {
         );
         let limits = rift_search::SearchIndexLimits::default();
         let search = rift_search::SearchIndex::attached(database, Arc::clone(&vectors), limits)?;
-        let mut shutdown = super::DeferredDatabaseShutdown(Some(Arc::new(search)), None);
+        let mut shutdown =
+            super::DeferredDatabaseShutdown(Some(Arc::new(search)), None, Vec::new(), None);
         let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -2302,6 +2322,104 @@ mod tests {
         assert_eq!(failed.operation(), "database.close");
         drop(opening);
         drop(migration_lock);
+        Ok(())
+    }
+
+    /// An opened vectors database keeps its file and page readings through deferred shutdown.
+    #[tokio::test]
+    async fn an_open_vectors_database_keeps_file_and_page_readings_until_shutdown_owner_drops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
+
+        let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir_all(&state_directory)?;
+        let pool = DatabasePool::new(4, 60_000);
+        let database = WorkspaceDatabase::open(
+            &DatabaseName::Index.path(&state_directory),
+            DatabaseName::Index,
+            pool,
+        )
+        .await?;
+        let vectors = Arc::new(LazyDatabase::new(
+            &DatabaseName::Vectors.path(&state_directory),
+            DatabaseName::Vectors,
+            None,
+        ));
+        let opened = vectors.resolve(pool).await?;
+        assert_eq!(opened.name(), DatabaseName::Vectors);
+        drop(opened);
+
+        let search = rift_search::SearchIndex::attached(
+            database,
+            vectors,
+            rift_search::SearchIndexLimits::default(),
+        )?;
+        let mut shutdown =
+            super::DeferredDatabaseShutdown(Some(Arc::new(search)), None, Vec::new(), None);
+        shutdown
+            .close_search(Instant::now() + Duration::from_secs(5))
+            .await?;
+
+        let metrics = recorder.metrics();
+        let file_size = metrics
+            .find(
+                "sqlite.file.size",
+                &[
+                    ("db.namespace", "vectors"),
+                    ("sqlite.file.type", "database"),
+                ],
+            )
+            .ok_or("the deferred owner keeps the vectors file reading registered")?;
+        assert!(matches!(
+            file_size.value(),
+            rift_tracing::SeriesValue::Sum(bytes) if *bytes > 0.0
+        ));
+        let used_pages = metrics
+            .find(
+                "sqlite.page.count",
+                &[("db.namespace", "vectors"), ("sqlite.page.state", "used")],
+            )
+            .ok_or("the deferred owner keeps vectors used-page reading registered")?;
+        assert!(matches!(
+            used_pages.value(),
+            rift_tracing::SeriesValue::Sum(pages) if *pages > 0.0
+        ));
+        let free_pages = metrics
+            .find(
+                "sqlite.page.count",
+                &[("db.namespace", "vectors"), ("sqlite.page.state", "free")],
+            )
+            .ok_or("the deferred owner keeps vectors free-page reading registered")?;
+        assert!(matches!(
+            free_pages.value(),
+            rift_tracing::SeriesValue::Sum(pages) if *pages >= 0.0
+        ));
+
+        drop(shutdown);
+        let metrics = recorder.metrics();
+        assert!(
+            metrics
+                .find(
+                    "sqlite.file.size",
+                    &[
+                        ("db.namespace", "vectors"),
+                        ("sqlite.file.type", "database"),
+                    ],
+                )
+                .is_none(),
+            "dropping deferred shutdown releases vectors file reading"
+        );
+        assert!(
+            metrics
+                .find(
+                    "sqlite.page.count",
+                    &[("db.namespace", "vectors"), ("sqlite.page.state", "used")],
+                )
+                .is_none(),
+            "dropping deferred shutdown releases vectors page reading"
+        );
         Ok(())
     }
 
@@ -2370,7 +2488,8 @@ mod tests {
             vectors,
             rift_search::SearchIndexLimits::default(),
         )?;
-        let mut shutdown = super::DeferredDatabaseShutdown(Some(Arc::new(search)), None);
+        let mut shutdown =
+            super::DeferredDatabaseShutdown(Some(Arc::new(search)), None, Vec::new(), None);
 
         shutdown
             .close_search(Instant::now() + Duration::from_millis(200))

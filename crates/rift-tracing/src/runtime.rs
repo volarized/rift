@@ -32,11 +32,11 @@ use crate::stderr::{BoundedStderr, SERVER_STDERR_BYTES_MAX, StderrBound, StderrL
 
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 pub(crate) const DEFAULT_TRACING_FILTER: &str =
-    "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
+    "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,rift_tracing::runtime=info";
 /// Default stderr filter: the default targets, with only the stall reports of the table of
 /// operations in flight. The table's other records reach the capture under its own filter.
 pub(crate) const DEFAULT_STDERR_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn,\
-                                     rift_tracing::flight=warn";
+                                     rift_tracing::runtime=warn,rift_tracing::flight=warn";
 
 /// How much the process may write to its standard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,8 @@ pub struct TracingRuntime {
 /// How long [`TracingRuntime::shutdown`] waits for the OTLP export's final flush and
 /// shutdown before the process leaves without them.
 pub const OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+/// Time inside [`OTLP_SHUTDOWN_TIMEOUT`] left for the final log export.
+const OTLP_LOG_SHUTDOWN_RESERVE: Duration = Duration::from_millis(50);
 
 impl TracingRuntime {
     /// A builder whose subscriber writes stderr unbounded, captures nothing, and reports
@@ -183,16 +185,39 @@ impl TracingRuntime {
     /// [`OTLP_SHUTDOWN_TIMEOUT`].
     ///
     /// The caller runs it before either exit path: a normal return drops every other
-    /// local first, and `process::exit` past it runs no destructor at all. An export that
-    /// fails or outlasts its bound is reported on stderr and fails nothing.
-    pub async fn shutdown(self) {
-        if let Some(stall) = self.stall {
+    /// local first, and `process::exit` past it runs no destructor at all. A traces and
+    /// metrics failure is recorded at `WARN` while the log provider remains open. The log
+    /// provider shutdown result takes precedence when both phases fail. Neither changes
+    /// the process's success status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ExportShutdownError::TimedOut`] when a phase exceeds its bound, or
+    /// [`crate::ExportShutdownError::Failed`] when a provider reports an export or
+    /// shutdown failure.
+    pub async fn shutdown(self) -> Result<(), crate::ExportShutdownError> {
+        let Self {
+            export,
+            stall,
+            _in_flight,
+        } = self;
+        if let Some(stall) = stall {
             stall.stop().await;
         }
         let deadline = tokio::time::Instant::now() + OTLP_SHUTDOWN_TIMEOUT;
-        if let Err(error) = self.export.shutdown(deadline).await {
-            eprintln!("rift: warning: {error}");
-        }
+
+        let providers_deadline = deadline - OTLP_LOG_SHUTDOWN_RESERVE;
+        let started = tokio::time::Instant::now();
+        let providers = export.shutdown_traces_and_metrics(providers_deadline).await;
+        record_shutdown_result(
+            &providers,
+            "traces and metrics",
+            started,
+            providers_deadline,
+        );
+
+        let logs = export.shutdown_logs(deadline).await;
+        logs.and(providers)
     }
 }
 
@@ -253,7 +278,7 @@ impl TracingRuntimeBuilder {
     /// The returned drain exists only when [`Self::capture`] ran; without it the
     /// subscriber has no recording layer and allocates no log queue. The stall report runs
     /// on the calling Tokio runtime, and the runtime readings read it; called outside one,
-    /// the runtime reports no stall, reads no runtime, and says so on stderr.
+    /// the runtime reports no stall, reads no runtime, and records a warning.
     ///
     /// # Errors
     ///
@@ -269,6 +294,10 @@ impl TracingRuntimeBuilder {
             }
             None => (None, None),
         };
+        #[cfg(any(test, feature = "fixtures"))]
+        let _entered = (tokio::runtime::Handle::try_current().is_err()
+            && otlp::recorder_export_configured())
+        .then(|| crate::recorder::test_runtime().enter());
         let (otlp_layer, export) = otlp::layer(capture_filter(self.capture.as_deref()));
         let (writer, drain) = match self.stderr {
             StderrPolicy::Unbounded => (BoxMakeWriter::new(std::io::stderr), drain),
@@ -301,11 +330,12 @@ impl TracingRuntimeBuilder {
             .with(otlp_layer)
             .try_init();
         if let Err(error) = installed {
-            // Dropping the providers blocks on their shutdown, which waits for export tasks
-            // this runtime drives; a thread of its own drops them instead.
-            let _ = std::thread::Builder::new()
-                .name("rift-otlp-shutdown".to_owned())
-                .spawn(move || drop(export));
+            // SDK provider shutdown is synchronous; keep it off Tokio worker threads.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(move || drop(export));
+            } else {
+                drop(export);
+            }
             return Err(InstallError(error));
         }
         export.install_meter();
@@ -317,7 +347,10 @@ impl TracingRuntimeBuilder {
         }
         let stall = self.stall_delay.and_then(|delay| {
             if runtime.is_err() {
-                eprintln!("rift: warning: no Tokio runtime runs the stall report");
+                crate::warn!(
+                    target: "rift",
+                    "no Tokio runtime runs the stall report"
+                );
                 return None;
             }
             Some(StallReport::spawn(Arc::clone(&flights), delay))
@@ -330,6 +363,43 @@ impl TracingRuntimeBuilder {
             },
             drain,
         ))
+    }
+}
+
+fn record_shutdown_result(
+    result: &Result<(), otlp::ExportShutdownError>,
+    phase: &'static str,
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match result {
+        Ok(()) => crate::info!(
+            stage = "otlp export",
+            phase,
+            outcome = "ok",
+            elapsed_ms,
+            ?remaining,
+            "stop stage ended"
+        ),
+        Err(otlp::ExportShutdownError::TimedOut) => crate::warn!(
+            stage = "otlp export",
+            phase,
+            outcome = "timeout",
+            elapsed_ms,
+            ?remaining,
+            "stop stage ended"
+        ),
+        Err(error @ otlp::ExportShutdownError::Failed(_)) => crate::warn!(
+            stage = "otlp export",
+            phase,
+            outcome = "error",
+            elapsed_ms,
+            ?remaining,
+            %error,
+            "stop stage ended"
+        ),
     }
 }
 

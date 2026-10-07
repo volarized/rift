@@ -160,11 +160,12 @@ async fn main() -> ExitCode {
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
     let export = tracing_runtime.export();
     let succeeded = match run(cli, drain, retention_records, export).await {
-        Ok(Some(outcome)) => {
-            println!("{outcome}");
+        Ok(outcome) => {
+            if let Some(outcome) = outcome {
+                println!("{outcome}");
+            }
             true
         }
-        Ok(None) => true,
         Err(error) => {
             eprint!("{}", error.rendered());
             false
@@ -177,11 +178,10 @@ async fn main() -> ExitCode {
         // to yield, which nothing can cancel; the server's outcome is already printed, its
         // log drain stopped, and its lock document retired, so the process leaves here.
         //
-        // Both steps are recorded on stderr as the stop's last stages: the tracing shutdown
-        // with its outcome, then the exit with its status. A process the operating system
-        // keeps after the exit record, such as Windows waiting for a database thread's
-        // pending file flush to complete, shows as the time between that record and the
-        // close of its stderr.
+        // Both steps are recorded before exit: the tracing shutdown, then the exit with
+        // its status. A process the operating system keeps after the exit record, such as
+        // Windows waiting for a database thread's pending file flush to complete, shows as
+        // the time between that record and the close of its stderr.
         let status = if succeeded {
             SERVED_EXIT_STATUS
         } else {
@@ -189,7 +189,7 @@ async fn main() -> ExitCode {
         };
         let deadline = tokio::time::Instant::now() + rift_tracing::OTLP_SHUTDOWN_TIMEOUT;
         let _ = rift_mcp::stop_stage("tracing shutdown", deadline, async {
-            tracing_runtime.shutdown().await;
+            let _ = tracing_runtime.shutdown().await;
             Ok::<(), rift_error::RiftError>(())
         })
         .await;
@@ -204,7 +204,7 @@ async fn main() -> ExitCode {
     }
     // Flushes buffered spans and metric points before the process returns, which drops
     // every other local first.
-    tracing_runtime.shutdown().await;
+    let _ = tracing_runtime.shutdown().await;
     if succeeded {
         ExitCode::SUCCESS
     } else {

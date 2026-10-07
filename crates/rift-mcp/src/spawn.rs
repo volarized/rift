@@ -45,6 +45,7 @@ pub const START_POLL_ATTEMPT_COUNT: u32 = 300;
 /// keeps such a lock for longer; the rest of the start window then passes
 /// as a wait.
 pub const START_SPAWN_COUNT_MAX: u32 = 4;
+
 /// Bytes at the end of a detached server's stderr file read to classify its
 /// exit: the refusal a server exits on is the last thing it writes there.
 const EXIT_STDERR_TAIL_BYTES: u64 = 8 << 10;

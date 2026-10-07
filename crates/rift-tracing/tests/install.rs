@@ -3,6 +3,8 @@
 //! A global subscriber is process state, so this binary holds one test: nextest and
 //! `cargo test` each run it in a process of its own.
 
+use std::time::Duration;
+
 use rift_tracing::TracingRuntime;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -11,7 +13,10 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// the first installation keeps receiving every record.
 #[test]
 fn a_second_install_is_refused_and_the_first_keeps_its_records() -> TestResult {
-    let (first, drain) = TracingRuntime::builder().capture("trace").install()?;
+    let (first, drain) = TracingRuntime::builder()
+        .capture("trace")
+        .stall_delay(Duration::from_secs(1))
+        .install()?;
     let mut drain = drain.ok_or("a capture filter returns a drain")?;
 
     let Err(refused) = TracingRuntime::builder().capture("trace").install() else {
@@ -33,9 +38,45 @@ fn a_second_install_is_refused_and_the_first_keeps_its_records() -> TestResult {
             .any(|record| record.message() == "recorded after the refused install"),
         "{records:?}"
     );
-    tokio::runtime::Builder::new_current_thread()
+    let warned = records
+        .iter()
+        .any(|record| record.message() == "no Tokio runtime runs the stall report");
+    // XFAIL: https://github.com/volarized/rift/issues/581
+    // Standard async OTLP fixtures enter their test-owned Tokio runtime at installation.
+    let fixture_runtime = !std::env::var("OTEL_SDK_DISABLED")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        && [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        ]
+        .iter()
+        .any(|variable| std::env::var(variable).is_ok_and(|value| !value.trim().is_empty()));
+    if !warned && fixture_runtime {
+        eprintln!(
+            "XFAIL https://github.com/volarized/rift/issues/581: the OTLP fixture supplies a Tokio runtime"
+        );
+    } else {
+        assert!(warned, "{records:?}");
+    }
+    let shutdown = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(first.shutdown());
+    // XFAIL: https://github.com/volarized/rift/issues/585
+    // Keep the recorded platform, error, and stop-stage fields together.
+    if cfg!(all(windows, target_arch = "aarch64"))
+        && matches!(shutdown, Err(rift_tracing::ExportShutdownError::TimedOut))
+        && drain.queued_records().iter().any(|record| {
+            record.message() == "stop stage ended"
+                && record.fields().contains("\"stage\":\"otlp export\"")
+                && record.fields().contains("\"outcome\":\"timeout\"")
+                && record.fields().contains("\"remaining\":\"0ns\"")
+        })
+    {
+        eprintln!("XFAIL https://github.com/volarized/rift/issues/585: {shutdown:?}");
+    } else {
+        shutdown?;
+    }
     Ok(())
 }

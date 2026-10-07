@@ -8,11 +8,8 @@ Unit tests, live language-engine and embedding-model suites, and the corpus, art
 cold-start checks all run on every pull request and push to `main`. The corpus checks run against
 pinned Next.js, Bun, and FastAPI repositories. Each release target other than x86-64 Linux builds
 every workspace target once and runs the unit suite from that build, so every test runs on the OS
-it targets. On Windows the `ci` profile in `.config/nextest.toml` leaves out nine server and proxy
-tests: a detached server there inherits the output pipes of the `rift` process that started it, so a
-test that reads that process's output to its end waits for the server to exit
-([issue #388](https://github.com/volarized/rift/issues/388)). x86-64 Linux runs the unit
-suite from one instrumented archive, and the corpus checks there reuse one optimized archive
+it targets. Windows runs the server and proxy regressions under the same `ci` profile.
+x86-64 Linux runs the unit suite from one instrumented archive, and the corpus checks there reuse one optimized archive
 rather than compiling their own. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.
 
@@ -66,14 +63,39 @@ Some suites start a server that binds the loopback port range, which is machine-
 runs each test in its own process, so those suites share one `election` test group that admits a
 single test at a time.
 
-`just test` runs nextest through `rift-dev`, which sets `RIFT_SCOPED_RECORDER_STREAM` in each
-test process. Each `ScopedRecorder` a test installs then streams its records to stderr as it
-records them, so the report of a failed test, or of one nextest ended at its timeout, carries
-them under `---- test output ----`. A recorder whose test panics prints its newest records, then
-the process's metric points, one line each naming its scope as `otel.scope.name` and
-`otel.scope.version`; a streaming recorder prints the metric points alone.
+`just test` runs one instrumented nextest invocation through `rift-dev`. The appliance sets
+`OTEL_SDK_DISABLED=false` and starts a local OTLP HTTP/protobuf collector before execution.
+Test processes and their children inherit the same logs, traces, and metrics endpoints; the
+collector stays open through process cleanup and exporter shutdown.
+
+Nextest captures test output and emits JSON+ results. Python validates those results and the
+saved telemetry JSONL through Pydantic models. Discovery supplies an exact lookup from each
+JSON+ full name to its binary ID and test name; OTLP resources carry those identities with the
+run ID and opaque attempt ID. Retries remain zero, and tests keep nextest's concurrent scheduling.
+
+A successful run prints its start time followed by:
+
+```text
+{n} tests launched, all succeeded in under {x} minutes and {y} seconds.
+```
+
+A failed run groups output by test, with the error first, then timestamped logs and metrics.
+Its report keeps original multiline records, trace and span IDs, span duration and status, and
+metric units and temporality. Rust exports OTLP through the standard SDK Tokio batch processors
+and periodic reader, using async HTTP. Python receives the exported records. SDK providers stay
+open until test process exit; synchronous SDK shutdown runs on Tokio's blocking pool within the
+existing deadline. The upstream `tracing-opentelemetry` crate is used without a vendor patch.
 `ScopedRecorderBuilder::clock` names the clock span timings and `measure_elapsed!` read on the
 recorder's thread, so a test advances time instead of sleeping.
+
+Each invocation retains artifacts under `target/integration/nextest/nextest-<profile>-<uuid>`:
+`run.json` separates execution results from collection errors, `telemetry.jsonl` keeps original
+OTLP records and collector request timing, and `recording.zip` exports that invocation's nextest
+recording. `RIFT_TEST_REPORT_DIRECTORY` selects another parent directory. The appliance bounds
+console evidence at 64 KiB, each captured stream at 16 MiB, and telemetry at 256 MiB; it continues
+draining after retention limits and reports omissions. Cache evictions have separate counters
+because original records remain on disk. JSON+ exposes no source-output truncation count, so the
+report names the recording as the source for nextest's captured output.
 
 A failed binary test that opened a `FailureWindow` prints it to stderr. Its heading names the test
 with `NEXTEST_BINARY_ID`, `NEXTEST_TEST_NAME`, and `NEXTEST_ATTEMPT_ID`, then the window's bounds.
@@ -86,7 +108,9 @@ holds `rift: the log store refused a batch` opens with a line saying the window 
 file for the records the store lacks.
 
 `just doctest` runs Rust documentation examples through `cargo test --doc`, because nextest
-does not support doctests on stable Rust.
+does not support doctests on stable Rust. The appliance retains their captured output and
+suite-scoped telemetry under `target/integration/doctest`. Stable batched rustdoc execution
+supplies no supported per-example OTLP identity; failed example names come from rustdoc output.
 
 The remaining local checks cover formatting, generated files, crate boundaries, Clippy, Rust
 documentation, dependency policy, and developer tooling. The crate boundary check,
@@ -208,6 +232,9 @@ the check repeats only reads that returned older source with `stale_index`; olde
 that warning fails. The report records source revisions, warnings, each call's duration and its
 own deadline, its overlapping writes, and each tool's first and maximum duration.
 
+Artifact, agent, and conformance checks also retain original OTLP records and collection
+accounting in their persistent report directories through server cleanup.
+
 Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
 and failure, including the complete Python traceback. `RIFT_CORPUS_REPORT` selects the JSON
 report location. Nextest displays the foreground server and MCP proxy diagnostics when each
@@ -312,37 +339,6 @@ container was created. The container and its files are removed afterwards, so no
 collector: the container runs with `--network none`, so the server inside cannot reach one.
 
 
-## Local traces
-
-Rift times cold-start work through `tracing` spans, opened by the `traced!` macro of
-`rift-tracing`, and records its metrics through OpenTelemetry instruments. Every build carries an
-OTLP/HTTP export that sends both to a collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one;
-`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` alone exports the metrics. With neither set, a process
-builds no exporter.
-
-Start the collector and point a run at it from a second terminal:
-
-```sh
-just trace-collector
-cargo build --release -p rift
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
-```
-
-`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans at
-`/v1/traces` and the exported metric points at `/v1/metrics` on port 4318 and keeps them in
-memory. `RIFT_OTLP_FILTER` overrides the span export's own filter; unset, it keeps Rift's own
-crates at `info`. The server exports metric points every `OTEL_METRIC_EXPORT_INTERVAL`
-milliseconds, 60 s when unset, and once more as it stops.
-
-Stop the collector with Ctrl-C once the run is done, and it prints one JSON line per operation:
-the span count, total duration, p50, p95, and max, in milliseconds. It then prints one JSON line
-per metric name with its kind, unit, series count, data point count, and value; the value is the
-sum of the latest value of each series, and a histogram adds its recorded count.
-
-A request body is at most 8 MiB encoded and decoded. The collector keeps at most 512 metric names
-and 256 series per name for these lines, and the newest 32,768 metric points and 8,192 spans for
-a failure window. A last `dropped` line counts what these bounds refused or dropped, when they
-did.
 
 The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
 errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at
@@ -360,8 +356,4 @@ uv run --locked --project dev rift-dev agent --binary target/release/rift
 ```
 
 The justfile wraps the same commands for local work and CI: a recipe that is more than a few
-plain commands is a `rift-dev` command, and the recipe calls it. Package checks run with:
-
-```sh
-just testing-check
-```
+plain commands is a `rift-dev` command, and the recipe calls it.

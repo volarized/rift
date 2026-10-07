@@ -11,6 +11,7 @@
 //! from the same schema the caller lists.
 
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rift_error::errors;
 use rift_protocol::error as wire;
@@ -22,7 +23,32 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure};
+use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, McpFailure, WireFailure};
+
+/// The registered failure retained while the tool router handles a refused parameter.
+#[derive(Clone, Default)]
+pub(crate) struct ParameterFailure(Arc<Mutex<Option<McpFailure>>>);
+
+impl ParameterFailure {
+    /// Saves the first registered parameter failure for this request.
+    fn record(&self, failure: McpFailure) {
+        let mut stored = self.stored();
+        if stored.is_none() {
+            *stored = Some(failure);
+        }
+    }
+
+    /// Takes the registered parameter failure, if extraction refused the request.
+    pub(crate) fn take(&self) -> Option<McpFailure> {
+        self.stored().take()
+    }
+
+    fn stored(&self) -> MutexGuard<'_, Option<McpFailure>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// The arguments one tool call carries, deserialized into its parameter model.
 pub(crate) struct Parameters<P>(pub P);
@@ -54,12 +80,20 @@ where
             |schema| expected_shape(&Value::Object(schema.as_ref().clone()), &steps),
         );
         let field = named_member(&steps[..shape.followed()]);
-        let refused = errors::mcp::parameter_invalid()
+        let failure = errors::mcp::parameter_invalid()
             .tool(tool)
             .maybe_field(field)
             .maybe_accepted((!shape.accepted().is_empty()).then(|| shape.accepted().join(", ")))
             .maybe_example(shape.example().map(ToString::to_string))
             .mcp();
-        refused.tool_error(wire::ErrorPhase::Read).fail()
+        let error = failure.tool_error(wire::ErrorPhase::Read);
+        if let Some(parameter_failure) = context
+            .request_context()
+            .extensions
+            .get::<ParameterFailure>()
+        {
+            parameter_failure.record(failure);
+        }
+        error.fail()
     }
 }

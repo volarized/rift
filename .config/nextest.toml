@@ -49,8 +49,7 @@ threads-required = "num-test-threads"
 # one-minute deadline ends the test first: nextest reports a timeout and the
 # suite never prints the readiness it reached, which is the whole diagnostic a
 # slow or unreachable hub is meant to leave behind. The deadline here is above
-# every wait either suite declares, and `dev/tests/test_delivery.py` keeps it
-# there.
+# every wait either suite declares.
 [[profile.default.overrides]]
 filter = 'binary(=live_vector_search) or binary(=live_model_sources)'
 slow-timeout = { period = "420s", terminate-after = 1, grace-period = "30s" }
@@ -60,11 +59,16 @@ slow-timeout = { period = "420s", terminate-after = 1, grace-period = "30s" }
 # two runs of the fixture's engine retry policy and a start window, past the
 # one-minute default. Under that default nextest ends the case before its own
 # bound can fail it with the engine's answer. The deadline here is above that
-# bound and the proxied call the case makes first, and
-# `dev/tests/test_delivery.py` keeps it there.
+# bound and the proxied call the case makes first.
 [[profile.default.overrides]]
 filter = 'binary(=mcp_proxy) & test(=live_proxied_read_resolves_incoming_references)'
 slow-timeout = { period = "180s", terminate-after = 1, grace-period = "10s" }
+
+# These ignored cost measurements run locally through the ordinary profiles.
+# Keep their existing per-test deadline without a separate measurement profile.
+[[profile.default.overrides]]
+filter = 'test(=capture::tests::operation_record_cost) or test(=metrics::tests::record_path_cost)'
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
 
 [profile.ci]
 default-filter = "not binary(/^live_/) and not binary(/^corpus_/) and not test(/^live_/)"

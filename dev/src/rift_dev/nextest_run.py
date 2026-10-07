@@ -1,168 +1,470 @@
-"""Run nextest beside an in-memory OTLP collector and report each failed test from it.
-
-Every process a test spawns exports to the collector: the runner hands nextest the
-collector's environment (`Collector.environment()`), the test process inherits it, and
-the Rust harness adds `test.case.name` through `OTEL_RESOURCE_ATTRIBUTES` to every
-`rift` process it starts (`crates/rift/tests/harness.rs`). `CaseStore` files what
-arrives under that name. The runner reads nextest's status lines as they print: a test
-that passes drops what its processes sent, a test that fails keeps it.
-
-After nextest returns, one report per failed test prints and is written under
-`target/integration/nextest/`, which CI uploads. A report reads top to bottom without
-other files:
-
-- the test, the OS and runner, the command, nextest's status and duration, and the
-  profile's slow timeout;
-- one timeline, by time, of the log records, span begins and ends, and metric points
-  the test's processes sent, each line naming its process and request;
-- the last value of every instrument series;
-- the operations opened with no end received, and the newest `operations in flight`
-  record;
-- the test's own stdout and stderr as nextest printed them under its failure, which
-  hold the records of every `ScopedRecorder` the test installed: the runner sets
-  `RIFT_SCOPED_RECORDER_STREAM`, so each record prints as it is recorded and a test
-  nextest ends at its timeout still leaves them;
-- each process the harness registered: its exit status and the tail of its stderr,
-  from the failure window directory `target/nextest/<profile>/failure-windows/`;
-- what the collector received, dropped, and could not attribute.
-
-Each part prints at most its named bound and says what the bound cut.
-"""
+"""Collect Nextest results and OTLP records under exact invocation identities."""
 
 from __future__ import annotations
 
+import asyncio
+import math
 import os
 import platform
 import re
-import sys
+import threading
 import time
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+import uuid
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from statistics import median
+from typing import Annotated, Literal
 
 import tomllib
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from rift_dev.commands import REPOSITORY, Command, CommandFailed
+from rift_dev.commands import REPOSITORY, CargoCommand, Command, CommandFailed
+from rift_dev.progress import start
 from rift_dev.trace import (
+    EXPORT_REQUEST_REPORT_MAX,
     PID_KEY,
     SPAN_REQUEST_KEY,
+    Attributes,
     CaseStore,
     CaseTelemetry,
     Collector,
+    Dropped,
+    ExportRequest,
     LogEntry,
     MetricPoint,
+    Scope,
     SpanRecord,
     collector,
     fields_text,
     stamp,
 )
 
-# One nextest status line: `        FAIL [  15.614s] (2292/4226) rift::server_cli name`.
-# A retried attempt opens with `TRY <n>`; a stress run adds `[ 47/200]` before the
-# counters in parentheses.
-STATUS_LINE = re.compile(
-    r"^\s*(?:TRY \d+ )?(?P<status>PASS|FAIL|TIMEOUT|SIGSEGV|SIGABRT|SIGBUS|SIGKILL|"
-    r"SIGTERM|ABORT|LEAK-FAIL|LEAK|FLAKY \d+/\d+)\s+\[\s*(?P<seconds>[0-9.]+)s\]\s+"
-    r"(?:\[\s*(?P<iteration>\d+)/\d+\]\s+)?(?:\([^)]*\)\s+)*"
-    r"(?P<binary>\S+)\s+(?P<test>\S+)\s*$"
-)
-# The OpenTelemetry specification's "Disable the SDK for all signals": "true" makes the
-# test processes themselves export nothing (`crates/rift-tracing/src/otlp.rs`).
-SDK_DISABLED = "OTEL_SDK_DISABLED"
-# Makes each `ScopedRecorder` print every record to stderr as it is recorded
-# (`crates/rift-tracing/src/recorder.rs`, `SCOPED_RECORDER_STREAM_VARIABLE`).
-RECORDER_STREAM = "RIFT_SCOPED_RECORDER_STREAM"
-# The header nextest opens a test's captured stdout or stderr with, under its status line.
-OUTPUT_HEADER = re.compile(r"^  (?:stdout|stderr) ───")
-# The line nextest opens its final summary with.
-SUMMARY_LINE = re.compile(r"^\s*Summary \[")
-# Statuses that end a test without a failure.
-PASSED = ("PASS", "LEAK", "FLAKY")
-# The report directory below the repository, which CI uploads.
-REPORT_DIRECTORY = REPOSITORY / "target" / "integration" / "nextest"
-# The failure window directory of one profile, below the repository (`harness.rs`).
-WINDOW_DIRECTORY = "target/nextest/{profile}/failure-windows"
-# Lines one report prints per part, the newest of each.
-TIMELINE_LINES_MAX = 3_000
-INSTRUMENT_LINES_MAX = 400
-OPEN_LINES_MAX = 100
-OUTPUT_LINES_MAX = 2_000
-STDERR_BYTES_MAX = 64 * 1024
-# How long the runner waits for nextest to exit once its output closed.
-EXIT_WAIT_SECONDS = 60.0
-# Characters one report line keeps.
+REPORT_DIRECTORY = REPOSITORY / "target/integration/nextest"
+REPORT_DIRECTORY_ENV = "RIFT_TEST_REPORT_DIRECTORY"
+RUN_LOG_BYTES_MAX = 16 * 1024 * 1024
+# Original records for a full workspace run require more than 16 MiB.
+# This bounds disk retention independently of the diagnostic caches.
+RUN_TELEMETRY_BYTES_MAX = 256 * 1024 * 1024
+EVENT_BYTES_MAX = 16 * 1024 * 1024
+CASES_MAX = 32_768
+RUN_SECONDS_MAX = 3_600.0
+EXIT_WAIT_SECONDS = 10.0
+CONSOLE_BYTES_MAX = 64 * 1024
+CONSOLE_EVIDENCE_MAX = 8
 LINE_CHARS_MAX = 2_000
-# The log record message an operation declared with `open = true` opens with
-# (`crates/rift-tracing/src/span.rs`), and the table of operations in flight's.
+OPEN_LINES_MAX = 100
 OPENED_MESSAGE = "operation opened"
 IN_FLIGHT_MESSAGE = "operations in flight"
+MEASUREMENT_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "operation_record_cost": (("threads",), ("operation_ns", "event_ns")),
+    "record_path_cost": (
+        ("meter",),
+        ("counter_ns_per_record", "histogram_ns_per_record"),
+    ),
+    "output allocation measurement": (
+        ("answer", "example", "representation"),
+        (
+            "allocations",
+            "deallocations",
+            "reallocations",
+            "bytes_allocated",
+            "bytes_deallocated",
+            "bytes_reallocated",
+            "content_bytes",
+            "structured_content_bytes",
+            "combined_response_bytes",
+        ),
+    ),
+}
 
 
-@dataclass(slots=True)
-class Outcome:
-    """One test's status lines as nextest printed them."""
+class NextestMetadata(BaseModel):
+    """Public JSON+ metadata emitted by pinned Nextest."""
+
+    crate: str
+    test_binary: str
+    kind: str
+    stress_index: int | None = None
+
+
+class TestEvent(BaseModel):
+    """One public JSON+ test event; output is Nextest's combined capture."""
+
+    model_config = ConfigDict(strict=True)
+    type: Literal["test"]
+    event: Literal["started", "ok", "failed", "ignored"]
+    name: str
+    exec_time: float | None = None
+    stdout: str = ""
+    reason: str = ""
+
+
+class SuiteEvent(BaseModel):
+    """One public JSON+ suite event."""
+
+    model_config = ConfigDict(strict=True)
+    type: Literal["suite"]
+    event: Literal["started", "ok", "failed"]
+    nextest: NextestMetadata
+
+
+EVENT = TypeAdapter(Annotated[TestEvent | SuiteEvent, Field(discriminator="type")])
+
+
+class FilterMatch(BaseModel):
+    """Nextest discovery's selected or filtered case."""
+
+    status: Literal["matches", "mismatch"]
+
+
+class ListedTest(BaseModel):
+    """One discovery entry, including ignored selection."""
+
+    filter_match: FilterMatch = Field(alias="filter-match")
+
+
+class ListedSuite(BaseModel):
+    """Discovery owns binary IDs; JSON+ owns display names."""
+
+    package_name: str = Field(alias="package-name")
+    binary_id: str = Field(alias="binary-id")
+    binary_name: str = Field(alias="binary-name")
+    testcases: dict[str, ListedTest]
+
+
+class TestList(BaseModel):
+    """Nextest's public test list, validated before execution."""
+
+    rust_suites: dict[str, ListedSuite] = Field(alias="rust-suites")
+
+
+class CaseIdentity(BaseModel):
+    """Exact discovery identity for one selected test."""
 
     binary: str
     test: str
-    stress: int | None = None
-    lines: list[str] = field(default_factory=list)
-    failed: bool = False
-    # The test's stdout and stderr blocks nextest printed under its first failed status.
-    output: list[str] = field(default_factory=list)
+    full_name: str
+    selected: bool
 
-    def names(self, case: str) -> bool:
-        """Whether `case`, a nextest attempt identifier such as
-        `<run>:rift::server_cli@stress-3$name`, is an attempt of this test in this
-        stress iteration."""
-        return names_case(case, self.binary, self.test, self.stress)
+
+class AttemptIdentity(BaseModel):
+    """Identity read from an emitting process, never decoded from its attempt ID."""
+
+    run_id: uuid.UUID = Field(alias="nextest.run_id")
+    binary: str = Field(alias="nextest.binary_id")
+    test: str = Field(alias="nextest.test_name")
+    attempt: Literal["1"] = Field(alias="nextest.attempt")
+    total_attempts: Literal["1"] = Field(alias="nextest.total_attempts")
+    attempt_id: str = Field(alias="test.case.name")
+
+
+class Outcome(BaseModel):
+    """Started and terminal result for one selected case."""
+
+    case: CaseIdentity
+    started: bool = False
+    result: TestEvent | None = None
 
     @property
-    def title(self) -> str:
-        """The binary and test, and the stress iteration when nextest ran one."""
-        iteration = "" if self.stress is None else f" (stress index {self.stress})"
-        return f"{self.binary} {self.test}{iteration}"
+    def failed(self) -> bool:
+        return self.started and (self.result is None or self.result.event != "ok")
 
 
-def names_case(case: str, binary: str, test: str, stress: int | None = None) -> bool:
-    """Whether the attempt identifier `case` names `test` of `binary`: the binary, with
-    `@stress-<stress>` when a stress run adds the 0-indexed iteration, then `$` and the
-    test's name."""
-    head, separator, name = case.rpartition("$")
-    expected = binary if stress is None else f"{binary}@stress-{stress}"
-    return bool(separator) and name == test and head.endswith(expected)
+class LogEvidence(BaseModel):
+    kind: Literal["log record"] = "log record"
+    record: LogEntry
 
 
-def status_of(line: str) -> tuple[str, str, str, int | None] | None:
-    """The status, binary, test, and 0-indexed stress iteration of a nextest status
-    line (nextest prints the iteration 1-indexed as `[ 47/200]`); None for any other."""
-    found = STATUS_LINE.match(line)
-    if found is None:
-        return None
-    iteration = found["iteration"]
-    stress = None if iteration is None else int(iteration) - 1
-    return found["status"], found["binary"], found["test"], stress
+class SpanEvidence(BaseModel):
+    kind: Literal["span"] = "span"
+    record: SpanRecord
 
 
-def output_line(line: str, opened: bool) -> bool:
-    """Whether `line` belongs to a test's output block nextest prints under its status
-    line: a block header, or once a header `opened` the block, a blank line or a line
-    indented by four spaces that is not the summary."""
-    if OUTPUT_HEADER.match(line):
-        return True
-    return opened and (
-        not line.strip() or (line.startswith("    ") and not SUMMARY_LINE.match(line))
-    )
+class MetricEvidence(BaseModel):
+    kind: Literal["metric point"] = "metric point"
+    record: MetricPoint
 
 
-def failed_status(status: str) -> bool:
-    """Whether a status ends a test with a failure."""
-    return not status.startswith(PASSED)
+class RequestEvidence(BaseModel):
+    kind: Literal["collector request"] = "collector request"
+    record: ExportRequest
+
+
+EVIDENCE = TypeAdapter(
+    Annotated[
+        LogEvidence | SpanEvidence | MetricEvidence | RequestEvidence,
+        Field(discriminator="kind"),
+    ]
+)
+
+
+class CollectionSummary(BaseModel):
+    """Original records, retained artifacts, and diagnostic cache accounting."""
+
+    received: int
+    retained: int
+    omitted: int
+    received_bytes: int
+    errors: tuple[str, ...] = ()
+    unassigned: int = 0
+    cache_evictions: Dropped = Field(default_factory=Dropped)
+    request_cache_evictions: int = 0
+    log_bytes_omitted: int = 0
+
+
+class RunSummary(CollectionSummary):
+    """Execution and collection remain separate results."""
+
+    invocation: str
+    command: str
+    platform: str
+    profile: str
+    status: int | None
+    elapsed_seconds: float
+    launched: int
+    attempts_launched: int
+    succeeded: int
+    failed: int
+    incomplete: int
+    unlaunched: int
+    attempts: tuple[AttemptIdentity, ...]
+    artifacts: tuple[str, ...]
+    result_bytes_omitted: int = 0
+    expected_failure: str | None = None
+
+
+@contextmanager
+def retained_collector(directory: Path) -> Iterator[Collector]:
+    """Keep scenario telemetry through server cleanup and collector shutdown."""
+    directory.mkdir(parents=True, exist_ok=True)
+    artifact = ArtifactStore(directory / "telemetry.jsonl", {})
+    served = Collector()
+    try:
+        with collector(
+            cases=CaseStore(observe=artifact.record_only),
+            request_observer=artifact.request,
+        ) as served:
+            yield served
+    finally:
+        artifact.close()
+        summary = CollectionSummary(
+            errors=tuple(
+                [
+                    f"collection omitted={artifact.omitted} requests_failed={artifact.request_errors} write_error={artifact.write_error}"
+                ]
+                if artifact.omitted or artifact.request_errors or artifact.write_error
+                else []
+            ),
+            received=artifact.received,
+            retained=artifact.retained,
+            omitted=artifact.omitted,
+            received_bytes=artifact.received_bytes,
+            unassigned=0,
+            cache_evictions=served.dropped(),
+            request_cache_evictions=served.requests.dropped,
+            log_bytes_omitted=0,
+        )
+        (directory / "telemetry-summary.json").write_text(
+            summary.model_dump_json(indent=2) + "\n", encoding="utf-8"
+        )
+    if artifact.omitted or artifact.request_errors or artifact.write_error:
+        raise RuntimeError(
+            f"collection incomplete; inspect {directory / 'telemetry-summary.json'}"
+        )
+
+
+class ArtifactStore:
+    """Spool original records while bounded stores serve live test snapshots."""
+
+    def __init__(self, path: Path, outcomes: dict[str, Outcome]) -> None:
+        self.path = path
+        self.outcomes = outcomes
+        self.cases = {(o.case.binary, o.case.test): o for o in outcomes.values()}
+        self.identities: dict[str, AttemptIdentity] = {}
+        self.run_id: uuid.UUID | None = None
+        self.received = 0
+        self.retained = 0
+        self.omitted = 0
+        self.unassigned = 0
+        self.request_errors = 0
+        self.write_error: str | None = None
+        self.written = 0
+        self.received_bytes = 0
+        self.lock = threading.Lock()
+        self.output = self.path.open("ab")
+
+    def close(self) -> None:
+        """Close the retained file after the collector finishes its bounded shutdown."""
+        try:
+            self.output.close()
+        except OSError as error:
+            self.write_error = str(error)[:LINE_CHARS_MAX]
+
+    def write(
+        self, evidence: LogEvidence | SpanEvidence | MetricEvidence | RequestEvidence
+    ) -> None:
+        data = EVIDENCE.dump_json(evidence) + b"\n"
+        with self.lock:
+            self.received += 1
+            self.received_bytes += len(data)
+            if self.written + len(data) > RUN_TELEMETRY_BYTES_MAX:
+                self.omitted += 1
+                return
+            try:
+                self.output.write(data)
+            except OSError as error:
+                self.write_error = str(error)[:LINE_CHARS_MAX]
+                self.omitted += 1
+                return
+            self.written += len(data)
+            self.retained += 1
+
+    def observe(self, record: LogEntry | SpanRecord | MetricPoint) -> bool:
+        self.record(record)
+        try:
+            identity = AttemptIdentity.model_validate(dict(record.resource))
+        except ValidationError:
+            with self.lock:
+                self.unassigned += 1
+            return False
+        with self.lock:
+            outcome = self.cases.get((identity.binary, identity.test))
+            if outcome is None or (
+                self.run_id is not None and self.run_id != identity.run_id
+            ):
+                self.unassigned += 1
+                return False
+            self.run_id = identity.run_id
+            held = self.identities.get(identity.attempt_id)
+            if held is not None and held != identity:
+                self.unassigned += 1
+                return False
+            if held is None and len(self.identities) >= CASES_MAX:
+                self.unassigned += 1
+                return False
+            self.identities[identity.attempt_id] = identity
+            # Original records remain in JSONL after terminal results and late arrivals.
+            return outcome.result is None or outcome.failed
+
+    def record(self, record: LogEntry | SpanRecord | MetricPoint) -> None:
+        """Serialize one original telemetry record through its Pydantic model."""
+        if isinstance(record, LogEntry):
+            self.write(LogEvidence(record=record))
+        elif isinstance(record, SpanRecord):
+            self.write(SpanEvidence(record=record))
+        else:
+            self.write(MetricEvidence(record=record))
+
+    def record_only(self, record: LogEntry | SpanRecord | MetricPoint) -> bool:
+        """Persist suite records without retaining another per-case copy."""
+        self.record(record)
+        return False
+
+    def request(self, request: ExportRequest) -> None:
+        """Retain every finished request before its diagnostic cache expires."""
+        self.write(RequestEvidence(record=request))
+        if request.intended_status != 200 or request.outcome != "ok":
+            with self.lock:
+                self.request_errors += 1
+
+    def telemetry(self, outcomes: Sequence[Outcome]) -> dict[str, CaseTelemetry]:
+        selected = {(o.case.binary, o.case.test): o.case.full_name for o in outcomes}
+        attempts = {
+            name: selected[(identity.binary, identity.test)]
+            for name, identity in self.identities.items()
+            if (identity.binary, identity.test) in selected
+        }
+        held = {o.case.full_name: CaseTelemetry() for o in outcomes}
+        with self.path.open("rb") as source:
+            for line in source:
+                row = EVIDENCE.validate_json(line)
+                if isinstance(row, RequestEvidence):
+                    continue
+                attempt = dict(row.record.resource).get("test.case.name", "")
+                full_name = attempts.get(attempt)
+                if full_name is None:
+                    continue
+                telemetry = held[full_name]
+                if isinstance(row, LogEvidence):
+                    if len(telemetry.logs) == telemetry.logs.maxlen:
+                        telemetry.dropped.logs += 1
+                    telemetry.logs.append(row.record)
+                elif isinstance(row, SpanEvidence):
+                    if len(telemetry.spans) == telemetry.spans.maxlen:
+                        telemetry.dropped.spans += 1
+                    telemetry.spans.append(row.record)
+                else:
+                    if len(telemetry.points) == telemetry.points.maxlen:
+                        telemetry.dropped.points += 1
+                    telemetry.points.append(row.record)
+        return held
+
+
+def measurement_summary(logs: Iterable[LogEntry]) -> list[str]:
+    """Summarize recorded cost samples without combining separate processes."""
+    groups: dict[
+        tuple[str, tuple[str, ...], str],
+        dict[str, list[tuple[float, int]]],
+    ] = {}
+    incomplete = 0
+    for entry in logs:
+        if entry.body not in MEASUREMENT_FIELDS:
+            continue
+        group_keys, fields = MEASUREMENT_FIELDS[entry.body]
+        attributes = dict(entry.attributes)
+        group_values = tuple(attributes.get(name) for name in group_keys)
+        instance = entry.instance
+        if any(value is None for value in group_values) or instance is None:
+            incomplete += 1
+            continue
+        key = (
+            entry.body,
+            tuple(value for value in group_values if value is not None),
+            instance,
+        )
+        samples = groups.setdefault(key, {name: [] for name in fields})
+        row_incomplete = False
+        for name in fields:
+            try:
+                value = float(attributes[name])
+            except (KeyError, ValueError):
+                row_incomplete = True
+                continue
+            if not math.isfinite(value):
+                row_incomplete = True
+                continue
+            samples[name].append((value, entry.time_unix_nano))
+        incomplete += int(row_incomplete)
+
+    if not groups and incomplete == 0:
+        return []
+    lines = ["---- measurement medians ----"]
+    for (measurement, group_values, instance), samples in sorted(groups.items()):
+        group_keys = MEASUREMENT_FIELDS[measurement][0]
+        labels = " ".join(
+            f"{name}={value}"
+            for name, value in zip(group_keys, group_values, strict=True)
+        )
+        lines.append(f"{measurement} {labels} service.instance.id={instance}")
+        for name, values in samples.items():
+            if not values:
+                lines.append(f"{name}: no complete samples")
+                continue
+            times = [timestamp for _, timestamp in values]
+            lines.append(
+                f"{name}: median={median(value for value, _ in values):g} "
+                f"samples={len(values)} time_unix_nano={min(times)}..{max(times)}"
+            )
+    if incomplete:
+        lines.append(f"incomplete measurement rows={incomplete}")
+    return lines
 
 
 def profile_of(arguments: Sequence[str]) -> str:
-    """The nextest profile `--profile` selects, else `NEXTEST_PROFILE`, else `default`."""
+    """The nextest profile `-P` or `--profile` selects, else `NEXTEST_PROFILE`, else `default`."""
     for index, argument in enumerate(arguments):
-        if argument == "--profile" and index + 1 < len(arguments):
+        if argument in ("-P", "--profile") and index + 1 < len(arguments):
             return arguments[index + 1]
         if argument.startswith("--profile="):
             return argument.split("=", 1)[1]
@@ -254,19 +556,31 @@ def timeline(telemetry: CaseTelemetry) -> list[str]:
 
 
 def last_values(points: Iterable[MetricPoint]) -> list[str]:
-    """The newest point of every instrument series, per process and instrumentation
-    scope: two crates that declare one name keep a series each."""
-    latest: dict[
-        tuple[str, str, tuple[str, str], tuple[tuple[str, str], ...]], MetricPoint
-    ] = {}
+    """The newest point of each series, per resource, start time, scope, and attributes."""
+    latest: dict[tuple[str, Attributes, int, Scope, Attributes], MetricPoint] = {}
     for point in points:
-        key = (point.name, pid_of(point.resource), point.scope, point.attributes)
+        key = (
+            point.name,
+            point.resource,
+            point.start_time_unix_nano,
+            point.scope,
+            point.attributes,
+        )
         held = latest.get(key)
         if held is None or held.time_unix_nano <= point.time_unix_nano:
             latest[key] = point
     return [
         cut(f"pid={pid_of(point.resource)}  {point.line()}")
-        for point in sorted(latest.values(), key=lambda point: point.name)
+        for point in sorted(
+            latest.values(),
+            key=lambda point: (
+                point.name,
+                point.resource,
+                point.start_time_unix_nano,
+                point.scope,
+                point.attributes,
+            ),
+        )
     ]
 
 
@@ -296,270 +610,690 @@ def still_open(logs: Iterable[LogEntry], spans: Iterable[SpanRecord]) -> list[st
     return lines
 
 
-@dataclass(slots=True)
-class Window:
-    """What the Rust harness wrote for one test into the failure window directory."""
-
-    path: Path
-    keys: dict[str, list[str]]
-
-    @classmethod
-    def read(cls, path: Path) -> Window:
-        keys: dict[str, list[str]] = {}
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            key, _, value = line.partition("=")
-            keys.setdefault(key, []).append(value)
-        return cls(path, keys)
-
-    def first(self, key: str) -> str:
-        return (self.keys.get(key) or [""])[0]
-
-
-def windows_of(directory: Path, outcome: Outcome, since: float = 0.0) -> list[Window]:
-    """The window files written since `since`, in seconds of the epoch, whose `attempt=`
-    line names an attempt of `outcome`'s test. A failed window stays in the directory
-    after its run, so a file older than this run belongs to an earlier one."""
-    if not directory.is_dir():
-        return []
-    found = []
-    for path in sorted(directory.glob("*.window")):
-        try:
-            if path.stat().st_mtime < since:
-                continue
-            window = Window.read(path)
-        except OSError:
-            continue
-        if outcome.names(window.first("attempt")):
-            found.append(window)
-    return found
+# These options affect reporting or scheduling, not discovery. Nextest's list
+# command accepts the remaining selection, build, archive, and profile options.
+RUN_VALUE_OPTIONS = frozenset(
+    {
+        "--no-tests",
+        "--retries",
+        "--test-threads",
+        "-j",
+        "--success-output",
+        "--failure-output",
+        "--status-level",
+        "--final-status-level",
+        "--message-format",
+        "--message-format-version",
+        "--max-fail",
+        "--max-progress-running",
+    }
+)
+RUN_FLAG_OPTIONS = frozenset(
+    {"--no-report", "--no-fail-fast", "--fail-fast", "--hide-progress-bar"}
+)
+UNSUPPORTED_OPTIONS = frozenset(
+    {"--no-capture", "--nocapture", "--stress-count", "--stress-duration"}
+)
 
 
-def tail(path: Path, bound: int = STDERR_BYTES_MAX) -> str:
-    """The last `bound` bytes of `path`, saying what the bound cut."""
-    try:
-        with path.open("rb") as file:
-            size = file.seek(0, os.SEEK_END)
-            file.seek(max(0, size - bound))
-            text = file.read().decode("utf-8", errors="replace")
-    except OSError as error:
-        return f"(unreadable: {error})"
-    return (f"[{size - bound} earlier bytes left out]\n" if size > bound else "") + text
-
-
-def processes(windows: Sequence[Window]) -> list[str]:
-    """Each registered process, its exit status, and its stderr tail."""
-    if not windows:
-        return [
-            (
-                "no failure window file names this test: the test opened no "
-                "`harness::FailureWindow`, or it passed its window before it failed"
+def list_arguments(arguments: Sequence[str]) -> list[str]:
+    """Keep discovery selection unchanged while removing execution-only options."""
+    retained: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            retained.extend(arguments[index:])
+            break
+        name = argument.partition("=")[0]
+        if name in UNSUPPORTED_OPTIONS:
+            raise ValueError(
+                f"appliance requires captured, single-attempt execution: {name}"
             )
+        if name in RUN_VALUE_OPTIONS:
+            index += 1 if "=" in argument else 2
+            continue
+        if name not in RUN_FLAG_OPTIONS:
+            retained.append(argument)
+        index += 1
+    return retained
+
+
+def append_options(command: Command, *options: str) -> None:
+    """Place runner options before the emulated libtest separator."""
+    index = (
+        command.arguments.index("--")
+        if "--" in command.arguments
+        else len(command.arguments)
+    )
+    command.arguments[index:index] = options
+
+
+def controlled_arguments(arguments: Sequence[str]) -> list[str]:
+    """Own JSON+ format and zero retries without passing duplicate CLI options."""
+    retained: list[str] = []
+    index = 0
+    controlled = {"--message-format", "--message-format-version", "--retries"}
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            retained.extend(arguments[index:])
+            break
+        name, separator, value = argument.partition("=")
+        if name == "--user-config-file":
+            raise ValueError("appliance owns the isolated recording user configuration")
+        if name in controlled:
+            if not separator:
+                index += 1
+                if index >= len(arguments):
+                    raise ValueError(f"missing value for {name}")
+                value = arguments[index]
+            if name == "--retries" and value != "0":
+                raise ValueError("appliance requires zero retries")
+        else:
+            retained.append(argument)
+        index += 1
+    return retained
+
+
+def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path]:
+    """Discover exact identities using the same instrumented build as execution."""
+    arguments = controlled_arguments(command.arguments[2:])
+    command.arguments = [*command.arguments[:2], *arguments]
+    listing = list_arguments(arguments)
+    source = command.environment() or dict(os.environ)
+    if source.get("CI") and source.get("OTEL_SDK_DISABLED", "").lower() == "true":
+        raise ValueError("CI appliance requires OTEL_SDK_DISABLED=false")
+    if source.get("OTEL_SDK_DISABLED", "").lower() == "true":
+        raise ValueError("appliance collection requires OTEL_SDK_DISABLED=false")
+    llvm_cov = command.arguments[:2] == ["llvm-cov", "nextest"]
+    archived = any(a.partition("=")[0] == "--archive-file" for a in listing)
+    archive_directory: Path | None = None
+    if llvm_cov and archived:
+        # cargo-llvm-cov injects --extract-to during execution. Discovery must
+        # use that same directory and must not forward a duplicate option.
+        target = source.get(
+            "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+        )
+        retained: list[str] = []
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument == "--":
+                retained.extend(arguments[index:])
+                break
+            name, separator, value = argument.partition("=")
+            if name == "--extract-to":
+                if not separator:
+                    index += 1
+                    if index >= len(arguments):
+                        raise ValueError("missing value for --extract-to")
+                    value = arguments[index]
+                target = value
+            else:
+                retained.append(argument)
+            index += 1
+        archive_directory = Path(target)
+        if not archive_directory.is_absolute():
+            archive_directory = command.directory / archive_directory
+        archive_directory.mkdir(parents=True, exist_ok=True)
+        command.with_env(CARGO_LLVM_COV_TARGET_DIR=str(archive_directory))
+        arguments = retained
+        command.arguments = [*command.arguments[:2], *arguments]
+        listing = list_arguments(arguments)
+    if llvm_cov and not archived:
+        # show-env is cargo-llvm-cov's supported custom-workflow interface. One
+        # instrumented build supplies discovery, execution, and the later report.
+        from rift_dev.suites import parse_coverage_environment
+
+        target = source.get(
+            "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+        )
+        coverage = (
+            CargoCommand("llvm-cov", "show-env", "--sh")
+            .with_environment(source)
+            .with_env(CARGO_TARGET_DIR=target)
+        )
+        command.with_env(
+            **parse_coverage_environment(coverage.output()), CARGO_TARGET_DIR=target
+        )
+        command.arguments = [
+            "nextest",
+            "run",
+            *[a for a in arguments if a != "--no-report"],
         ]
-    lines: list[str] = []
-    for window in windows:
-        lines.append(f"window file: {window.path}")
-        for key in ("started_at", "ended_at", "root"):
-            for value in window.keys.get(key, []):
-                lines.append(f"{key}: {value}")
-        exits: dict[str, str] = {}
-        for value in window.keys.get("exit", []):
-            pid, _, status = value.partition(" ")
-            exits[pid] = status
-        registered = window.keys.get("process", [])
-        if not registered:
-            lines.append("no process registered by the harness")
-        for value in registered:
-            pid, _, label = value.partition(" ")
-            status = exits.get(pid, "still running when the window ended")
-            lines.append(f"process pid={pid} {label}: exit {status}")
-        stem = window.path.name.removesuffix(".window")
-        stderr_files = sorted(window.path.parent.glob(f"{stem}.*.stderr"))
-        if not stderr_files:
-            lines.append("no stderr file retained for this window")
-        for stderr in stderr_files:
-            lines.append(f"---- {stderr.name} ----")
-            lines.append(tail(stderr))
-        text = window.path.with_suffix(".text")
-        if text.is_file():
-            lines.append(f"---- {text.name}: the window the test printed ----")
-            lines.append(tail(text))
-    return lines
+    discovery = CargoCommand("nextest", "list", *listing, "--message-format", "json")
+    # Options cannot follow the emulated libtest separator.
+    discovery.arguments = ["nextest", "list", *listing]
+    append_options(discovery, "--message-format", "json")
+    if archive_directory is not None:
+        append_options(discovery, "--extract-to", str(archive_directory))
+    discovery.with_environment(command.environment() or source).with_cwd(
+        command.directory
+    )
+    discovery.with_timeout(RUN_SECONDS_MAX).with_output_limit(RUN_LOG_BYTES_MAX)
+    discovered = TestList.model_validate_json(discovery.output_bytes(echo_stderr=False))
+    outcomes: dict[str, Outcome] = {}
+    for suite in discovered.rust_suites.values():
+        for name, test in suite.testcases.items():
+            full_name = f"{suite.package_name}::{suite.binary_name}${name}"
+            if full_name in outcomes:
+                raise ValueError(f"duplicate Nextest full name: {full_name}")
+            outcomes[full_name] = Outcome(
+                case=CaseIdentity(
+                    binary=suite.binary_id,
+                    test=name,
+                    full_name=full_name,
+                    selected=test.filter_match.status == "matches",
+                )
+            )
+            if len(outcomes) > CASES_MAX:
+                raise ValueError(f"Nextest discovery exceeded {CASES_MAX} cases")
+    if not any(outcome.case.selected for outcome in outcomes.values()):
+        raise ValueError("Nextest discovered no tests")
+    config = directory / "record.toml"
+    config.write_text(
+        "[experimental]\nrecord = true\n\n[record]\nenabled = true\n", encoding="utf-8"
+    )
+    # An isolated store makes `latest` belong to this invocation, including failure.
+    command.with_env(
+        NEXTEST_STATE_DIR=str(directory / "store"),
+        NEXTEST_EXPERIMENTAL_LIBTEST_JSON="1",
+        NEXTEST_RETRIES="0",
+    )
+    append_options(
+        command,
+        "--user-config-file",
+        str(config),
+        "--message-format",
+        "libtest-json-plus",
+        "--message-format-version",
+        "0.1",
+        "--retries",
+        "0",
+    )
+    if command.timeout_seconds is None:
+        command.with_timeout(RUN_SECONDS_MAX)
+    return outcomes, config
 
 
-def case_report(
+class EventReader:
+    """Bound JSONL buffering without stopping either command pipe drain."""
+
+    def __init__(
+        self, outcomes: dict[str, Outcome], cases: CaseStore, artifact: ArtifactStore
+    ) -> None:
+        self.outcomes = outcomes
+        self.cases = cases
+        self.artifact = artifact
+        self.pending = bytearray()
+        self.discarding = False
+        self.errors: list[str] = []
+        self.error_count = 0
+        self.output_bytes = 0
+        self.output_bytes_omitted = 0
+
+    def error(self, detail: str) -> None:
+        self.error_count += 1
+        if len(self.errors) < CONSOLE_EVIDENCE_MAX:
+            self.errors.append(detail)
+
+    def feed(self, data: bytes) -> None:
+        for segment in data.splitlines(keepends=True):
+            ended = segment.endswith(b"\n")
+            if len(self.pending) + len(segment) > EVENT_BYTES_MAX:
+                self.pending.clear()
+                self.discarding = True
+                self.error("Nextest JSON+ event exceeded byte bound")
+            if not self.discarding:
+                self.pending.extend(segment)
+            if ended:
+                if not self.discarding:
+                    self.line(bytes(self.pending))
+                self.pending.clear()
+                self.discarding = False
+
+    def line(self, data: bytes) -> None:
+        try:
+            event = EVENT.validate_json(data)
+        except ValidationError as error:
+            self.error(f"invalid Nextest JSON+ event: {str(error)[:LINE_CHARS_MAX]}")
+            return
+        if isinstance(event, SuiteEvent):
+            if event.nextest.stress_index is not None:
+                self.error("Nextest stress results cannot identify individual attempts")
+            return
+        outcome = self.outcomes.get(event.name)
+        if outcome is None:
+            self.error(f"unassigned Nextest full name: {event.name}")
+            return
+        if event.event == "started":
+            # JSON+ emits starts for ignore-mismatch skips. Discovery identifies
+            # these even when Nextest omits their ignored terminal event.
+            if not outcome.case.selected:
+                return
+            if outcome.started:
+                self.error(f"duplicate Nextest start: {event.name}")
+            outcome.started = True
+        elif event.event == "ignored":
+            outcome.started = False
+            outcome.result = event
+        else:
+            if outcome.result is not None or not outcome.started:
+                self.error(
+                    f"Nextest terminal result without unique start: {event.name}"
+                )
+            # Bound aggregate retained result text, not just each JSONL event.
+            # The portable recording remains Nextest's captured-output source.
+            texts: dict[str, str] = {}
+            for field in ("stdout", "reason"):
+                data = getattr(event, field).encode("utf-8")
+                kept = data[: max(0, RUN_LOG_BYTES_MAX - self.output_bytes)]
+                text = kept.decode("utf-8", errors="ignore")
+                size = len(text.encode("utf-8"))
+                self.output_bytes += size
+                self.output_bytes_omitted += len(data) - size
+                texts[field] = text
+            outcome.result = event.model_copy(update=texts)
+            if event.event == "ok":
+                with self.cases.lock:
+                    names = [
+                        name
+                        for name, identity in self.artifact.identities.items()
+                        if identity.binary == outcome.case.binary
+                        and identity.test == outcome.case.test
+                    ]
+                    for name in names:
+                        self.cases.tests.pop(name, None)
+
+
+def failure_report(
     outcome: Outcome,
-    telemetry: Sequence[tuple[str, CaseTelemetry]],
-    *,
-    command: str,
+    held: CaseTelemetry,
+    artifact: ArtifactStore,
+    command: Command,
     profile: str,
-    config_file: Path,
-    windows: Sequence[Window],
-    served: Collector,
 ) -> str:
-    """One failed test's report, top to bottom."""
-    runner = " ".join(
-        f"{name}={os.environ[name]}"
-        for name in (
-            "RUNNER_NAME",
-            "RUNNER_OS",
-            "RUNNER_ARCH",
-            "ImageOS",
-            "ImageVersion",
-        )
-        if name in os.environ
-    )
-    sections = [
-        f"==== failed test: {outcome.title} ====",
-        f"os: {platform.platform()} {platform.machine()}"
-        + (f"  runner: {runner}" if runner else ""),
-        f"command: {command}",
-        f"nextest profile {profile}, slow-timeout {slow_timeout(profile, config_file)}",
-        "status lines:",
-        *outcome.lines,
+    """Render original bounded records and exact attempt metadata before cleanup."""
+    result = outcome.result
+    identities = [
+        identity
+        for identity in artifact.identities.values()
+        if identity.binary == outcome.case.binary and identity.test == outcome.case.test
     ]
-    logs: list[LogEntry] = []
-    spans: list[SpanRecord] = []
-    points: list[MetricPoint] = []
-    for name, held in telemetry:
-        logs.extend(held.logs)
-        spans.extend(held.spans)
-        points.extend(held.points)
-        sections.append(
-            f"telemetry of test.case.name={name}: {len(held.logs)} log records, "
-            f"{len(held.spans)} spans, {len(held.points)} points; this test's bounds "
-            f"dropped {held.dropped.counts()}"
+    lines = [
+        f"{outcome.case.test} failed!",
+        "  Error:",
+        result.stdout if result else "No terminal result received.",
+        result.reason if result else "",
+        f"  Binary: {outcome.case.binary}",
+        f"  Full name: {outcome.case.full_name}",
+        f"  Platform: {platform.platform()}",
+        f"  Profile: {profile}",
+        f"  Command: {command}",
+        f"  Status: {result.event if result else 'incomplete'}",
+        f"  Test deadline: {slow_timeout(profile, config_file_of(command.arguments))}",
+        "  Attempts:",
+        *[f"    {identity.model_dump_json(by_alias=True)}" for identity in identities],
+        "  Output capture: JSON+ reports combined output. Portable recording retains captured output; JSON+ supplies no truncation metadata.",
+        "  Logs:",
+    ]
+    for entry in held.logs:
+        lines.extend(
+            [
+                f"    {entry.line()} trace={entry.trace_id} span={entry.span_id}",
+                f"      resource: {fields_text(entry.resource)}",
+            ]
         )
-    if not telemetry:
-        sections.append(
-            "no telemetry carries this test's test.case.name: its processes exported "
-            "nothing, or the test spawned no process through the harness"
+    lines.append("  Metrics:")
+    for point in held.points:
+        lines.extend(
+            [f"    {point.line()}", f"      resource: {fields_text(point.resource)}"]
         )
-    merged = CaseTelemetry()
-    merged.logs.extend(sorted(logs, key=lambda entry: entry.time_unix_nano))
-    merged.spans.extend(spans)
-    merged.points.extend(points)
-    sections.append("---- timeline ----")
-    sections.extend(newest(timeline(merged), TIMELINE_LINES_MAX, "timeline lines"))
-    sections.append("---- last value of every instrument series ----")
-    sections.extend(
-        newest(last_values(points), INSTRUMENT_LINES_MAX, "series")
-        or ["no metric points"]
+    if held.spans:
+        lines.append("  Traces:")
+        for span in held.spans:
+            lines.extend(
+                [
+                    f"    {span.line()} trace={span.trace_id} span={span.span_id} parent={span.parent_span_id} status={span.status_code} {span.status_message}",
+                    f"      start={stamp(span.start_time_unix_nano)} end={stamp(span.end_time_unix_nano)} resource: {fields_text(span.resource)}",
+                ]
+            )
+    lines.extend(still_open(held.logs, held.spans))
+    lines.extend(measurement_summary(held.logs))
+    lines.append(
+        f"  Report omissions: {held.dropped.counts()}; original records: {artifact.path}"
     )
-    sections.append("---- operations opened with no end received ----")
-    sections.extend(still_open(logs, spans))
-    sections.append("---- test output ----")
-    sections.extend(
-        newest([cut(line) for line in outcome.output], OUTPUT_LINES_MAX, "output lines")
-        or ["nextest printed no output under this test's status"]
+    lines.append(f"  Artifacts: {artifact.path.parent}")
+    return "\n".join(lines) + "\n"
+
+
+def success_line(count: int, elapsed: float) -> str:
+    """Round elapsed duration up so the stated bound contains the run."""
+    minutes, seconds = divmod(math.ceil(elapsed), 60)
+    return f"{count} tests launched, all succeeded in under {minutes} minutes and {seconds} seconds."
+
+
+def collection_report(
+    directory: Path, errors: Sequence[str], served: Collector, artifact: ArtifactStore
+) -> None:
+    """Keep request timing and omission totals separate from assertion failures."""
+    from collections import deque
+
+    requests: deque[RequestEvidence] = deque(maxlen=EXPORT_REQUEST_REPORT_MAX)
+    with artifact.path.open("rb") as source:
+        for line in source:
+            try:
+                evidence = EVIDENCE.validate_json(line)
+            except ValidationError:
+                continue
+            if isinstance(evidence, RequestEvidence):
+                requests.append(evidence)
+    lines = [
+        "==== collection errors ====",
+        *errors,
+        f"received={artifact.received} retained={artifact.retained} omitted={artifact.omitted} unassigned={artifact.unassigned}",
+        f"diagnostic cache evictions: {served.dropped().counts()}",
+        f"requests received={served.requests.received}; newest retained timing rows below, at most {EXPORT_REQUEST_REPORT_MAX}",
+        "handler_finished is recorded before returning the HTTP response; intended_status is not client receipt",
+        *[request.model_dump_json() for request in requests],
+        f"original records: {artifact.path}",
+    ]
+    (directory / "collection-error.txt").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
     )
-    sections.append("---- processes ----")
-    sections.extend(processes(windows))
-    cases = served.cases
-    sections.append(
-        "---- collector ----\n"
-        f"received: {served.logs.received} log records, {served.spans.received} spans, "
-        f"{served.metrics.received} points; dropped: {served.dropped().counts()}; "
-        + (
-            f"unattributed items: {cases.unattributed}; tests refused: {cases.refused}"
-            if cases is not None
-            else "no per-test store"
-        )
+
+
+def expected_global_timeout(
+    arguments: Sequence[str],
+    status: int | None,
+    errors: Sequence[str],
+    launched: int,
+    failed: Sequence[Outcome],
+    incomplete: int,
+    unlaunched: int,
+    stderr_path: Path,
+) -> str | None:
+    """Retain only the recorded Windows x64 CI suite deadline as expected."""
+    expected = (
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--profile",
+        "ci",
+        "--no-tests",
+        "fail",
+        "-E",
+        "not test(/_probe$/)",
     )
-    sections.append(f"==== end of failed test: {outcome.title} ====")
-    return "\n".join(sections) + "\n"
-
-
-def echo(data: bytes) -> None:
-    """Writes `data` to stdout as bytes: nextest prints UTF-8, which a Windows console
-    code page such as cp1252 cannot encode as text."""
-    sys.stdout.flush()
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
-
-
-def report_name(outcome: Outcome) -> str:
-    """The report's file name: the binary and test with path separators replaced."""
-    iteration = "" if outcome.stress is None else f"-stress-{outcome.stress}"
-    name = f"{outcome.binary}-{outcome.test}{iteration}"
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".txt"
+    if (
+        not os.environ.get("CI")
+        or platform.system() != "Windows"
+        or platform.machine().lower() not in {"amd64", "x86_64"}
+        or tuple(arguments) != expected
+        or status != 100
+        or not launched
+        or failed
+        or incomplete
+        or not unlaunched
+        or list(errors)
+        != [
+            f"{unlaunched} selected tests never started",
+            f"runner exited {status}; inspect {stderr_path}",
+        ]
+    ):
+        return None
+    stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    if (
+        "Cancelling due to global timeout:" in stderr
+        and re.search(r"Summary\s+\[\s*480\.\d+s\]", stderr) is not None
+        and f"warning: {unlaunched}/{launched + unlaunched} tests were not run due to global timeout"
+        in stderr
+    ):
+        return "https://github.com/volarized/rift/issues/580"
+    return None
 
 
 def run(command: Command, arguments: Sequence[str] | None = None) -> None:
-    """Runs `command`, a nextest invocation, beside a collector; reports each failure.
-
-    Raises `CommandFailed` with nextest's status when it fails, after the reports.
-    """
-    shown = " ".join([command.program, *command.arguments])
+    """Run one captured Nextest invocation, saving evidence before raising failures."""
     arguments_seen = list(arguments if arguments is not None else command.arguments)
     profile = profile_of(arguments_seen)
-    started = time.time()
-    cases = CaseStore()
+    root = Path(os.environ.get(REPORT_DIRECTORY_ENV, REPORT_DIRECTORY))
+    if not root.is_absolute():
+        root = REPOSITORY / root
+    directory = root / f"nextest-{profile}-{uuid.uuid4()}"
+    directory.mkdir(parents=True)
+    started = start("tests")
+    errors: list[str] = []
+    original_error: BaseException | None = None
+    status: int | None = None
     outcomes: dict[str, Outcome] = {}
-    with collector(cases=cases) as served:
-        # A test process that installs Rift's tracing itself must not export: its
-        # in-process export would differ from the runs the test was written for. The
-        # harness removes the variable from every `rift` process it spawns.
-        command.with_env(
-            **served.environment(), **{SDK_DISABLED: "true", RECORDER_STREAM: "1"}
-        )
-        with command.spawn() as process:
-            assert process.stdout is not None
-            # The failed test whose first output block the lines that follow belong to.
-            reading: Outcome | None = None
-            opened = False
-            for raw in process.stdout:
-                line = raw.decode("utf-8", errors="replace")
-                echo(raw)
-                found = status_of(line.rstrip("\n"))
-                if found is None:
-                    if reading is not None and output_line(line.rstrip("\n"), opened):
-                        opened = True
-                        reading.output.append(line.rstrip("\n"))
-                        if len(reading.output) > 2 * OUTPUT_LINES_MAX:
-                            del reading.output[:OUTPUT_LINES_MAX]
-                    else:
-                        reading = None
-                    continue
-                status, binary, test, stress = found
-                outcome = outcomes.setdefault(
-                    f"{binary}${test}@{stress}",
-                    Outcome(binary=binary, test=test, stress=stress),
+    config: Path | None = None
+    stdout_path = directory / "stdout.jsonl"
+    stderr_path = directory / "stderr.log"
+    raw_path = directory / "telemetry.jsonl"
+    omitted_log = 0
+    served = Collector()
+    artifact = ArtifactStore(raw_path, outcomes)
+    reader: EventReader | None = None
+    try:
+        outcomes, config = prepare(command, directory)
+        artifact = ArtifactStore(raw_path, outcomes)
+        cases = CaseStore(observe=artifact.observe)
+        reader = EventReader(outcomes, cases, artifact)
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            counts = [0, 0]
+
+            def retain(data: bytes, index: int) -> None:
+                nonlocal omitted_log
+                kept = data[: max(0, RUN_LOG_BYTES_MAX - counts[index])]
+                (stdout if index == 0 else stderr).write(kept)
+                counts[index] += len(kept)
+                omitted_log += len(data) - len(kept)
+                if index == 0:
+                    assert reader is not None
+                    reader.feed(data)
+
+            with collector(cases=cases, request_observer=artifact.request) as served:
+                command.with_env(
+                    **served.environment(source=command.environment()),
+                    RIFT_SCOPED_RECORDER_STREAM="1",
                 )
-                if line.strip() not in outcome.lines:
-                    outcome.lines.append(line.strip())
-                reading, opened = None, False
-                if failed_status(status):
-                    outcome.failed = True
-                    if not outcome.output:
-                        reading = outcome
-                elif not outcome.failed:
-                    cases.forget(outcome.names)
-                    del outcomes[f"{binary}${test}@{stress}"]
-            status = process.wait(EXIT_WAIT_SECONDS)
-        sys.stdout.flush()
-        failed = [outcome for outcome in outcomes.values() if outcome.failed]
-        directory = REPOSITORY / WINDOW_DIRECTORY.format(profile=profile)
-        if failed:
-            REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        for outcome in failed:
-            telemetry = [
-                (name, held)
-                for name in cases.matching(outcome.names)
-                if (held := cases.take(name)) is not None
-            ]
-            report = case_report(
-                outcome,
-                telemetry,
-                command=shown,
-                profile=profile,
-                config_file=config_file_of(arguments_seen),
-                windows=windows_of(directory, outcome, started),
-                served=served,
+                try:
+                    status = asyncio.run(
+                        command.stream(
+                            lambda data: retain(data, 0),
+                            stderr=lambda data: retain(data, 1),
+                            exit_wait_seconds=EXIT_WAIT_SECONDS,
+                        )
+                    ).status
+                except BaseException as error:  # noqa: BLE001 - retain evidence before re-raising.
+                    original_error = error
+                    if isinstance(error, CommandFailed):
+                        status = error.status
+                    else:
+                        errors.append(f"incomplete execution: {error}")
+            # Collector has completed its bounded shutdown before the final snapshot.
+            if reader.pending:
+                reader.line(bytes(reader.pending))
+            errors.extend(reader.errors)
+            if reader.output_bytes_omitted:
+                errors.append(
+                    f"retained result output bytes omitted={reader.output_bytes_omitted}; original capture remains in recording.zip"
+                )
+            if reader.error_count > len(reader.errors):
+                errors.append(
+                    f"{reader.error_count - len(reader.errors)} further result errors"
+                )
+            if artifact.request_errors:
+                errors.append(f"collection requests failed: {artifact.request_errors}")
+            if served.dropped().bodies or served.dropped().kinds:
+                errors.append(f"collection refused data: {served.dropped().counts()}")
+            if artifact.write_error:
+                errors.append(f"artifact write error: {artifact.write_error}")
+            if artifact.omitted or artifact.unassigned or omitted_log:
+                errors.append(
+                    f"collection omitted={artifact.omitted} unassigned={artifact.unassigned} output_bytes_omitted={omitted_log}"
+                )
+    except BaseException as error:  # noqa: BLE001 - also save setup/cancellation evidence.
+        if original_error is None:
+            original_error = error
+        if isinstance(error, CommandFailed):
+            status = error.status
+        errors.append(f"{'setup' if config is None else 'collection'} error: {error}")
+    finally:
+        artifact.close()
+        if artifact.write_error and not any(
+            error.startswith("artifact write error:") for error in errors
+        ):
+            errors.append(f"artifact write error: {artifact.write_error}")
+        if config is not None:
+            export = (
+                CargoCommand(
+                    "nextest",
+                    "store",
+                    "export",
+                    "latest",
+                    "--user-config-file",
+                    config,
+                    "--archive-file",
+                    directory / "recording.zip",
+                )
+                .with_environment(command.environment() or os.environ)
+                .with_cwd(command.directory)
             )
-            path = REPORT_DIRECTORY / report_name(outcome)
-            path.write_text(report, encoding="utf-8")
-            echo(report.encode("utf-8"))
-            echo(f"[report written to {path}]\n".encode())
-        sys.stdout.flush()
-    if status != 0:
-        raise CommandFailed(command, status, "")
+            try:
+                export.output_bytes(echo_stderr=False)
+            except Exception as error:  # noqa: BLE001 - preserve original execution status.
+                errors.append(f"recording export error: {error}")
+
+    failed = [outcome for outcome in outcomes.values() if outcome.failed]
+    launched = sum(outcome.started for outcome in outcomes.values())
+    incomplete = sum(
+        outcome.started and outcome.result is None for outcome in outcomes.values()
+    )
+    unlaunched = sum(
+        outcome.case.selected and not outcome.started for outcome in outcomes.values()
+    )
+    if not launched:
+        errors.append("no tests launched")
+    if incomplete:
+        errors.append(f"{incomplete} tests have no terminal result")
+    if unlaunched:
+        errors.append(f"{unlaunched} selected tests never started")
+    if status not in (0, None) and not failed:
+        errors.append(f"runner exited {status}; inspect {stderr_path}")
+    expected_failure = expected_global_timeout(
+        arguments_seen,
+        status,
+        errors,
+        launched,
+        failed,
+        incomplete,
+        unlaunched,
+        stderr_path,
+    )
+    elapsed = time.monotonic() - started
+    summary = RunSummary(
+        invocation=directory.name,
+        command=str(command),
+        platform=platform.platform(),
+        profile=profile,
+        status=status,
+        elapsed_seconds=elapsed,
+        launched=launched,
+        attempts_launched=launched,
+        succeeded=launched - len(failed),
+        failed=len(failed) - incomplete,
+        incomplete=incomplete,
+        unlaunched=unlaunched,
+        attempts=tuple(artifact.identities.values()),
+        errors=tuple(errors),
+        received=artifact.received,
+        retained=artifact.retained,
+        omitted=artifact.omitted,
+        received_bytes=artifact.received_bytes,
+        unassigned=artifact.unassigned,
+        cache_evictions=served.dropped(),
+        request_cache_evictions=served.requests.dropped,
+        log_bytes_omitted=omitted_log,
+        result_bytes_omitted=reader.output_bytes_omitted if reader else 0,
+        expected_failure=expected_failure,
+        artifacts=tuple(str(path) for path in directory.iterdir() if path.is_file()),
+    )
+    (directory / "run.json").write_text(
+        summary.model_dump_json(indent=2, by_alias=True) + "\n", encoding="utf-8"
+    )
+    console_bytes = 0
+    console_omitted = 0
+    try:
+        telemetry = artifact.telemetry(failed) if failed else {}
+    except (OSError, ValidationError) as error:
+        errors.append(f"artifact read error: {str(error)[:LINE_CHARS_MAX]}")
+        telemetry = {outcome.case.full_name: CaseTelemetry() for outcome in failed}
+    if errors:
+        collection_report(directory, errors, served, artifact)
+    for outcome in failed:
+        held = telemetry[outcome.case.full_name]
+        report = failure_report(outcome, held, artifact, command, profile)
+        filename = re.sub(r"[^A-Za-z0-9._-]", "_", outcome.case.full_name)
+        path = (
+            directory
+            / f"{filename[:120]}-{uuid.uuid5(uuid.NAMESPACE_OID, outcome.case.full_name)}.txt"
+        )
+        path.write_text(report, encoding="utf-8")
+        result = outcome.result
+        rows = timeline(held)[-CONSOLE_EVIDENCE_MAX:]
+        console = "\n".join(
+            [
+                f"{outcome.case.test} failed!",
+                "  Error:",
+                (result.stdout or result.reason)
+                if result
+                else "No terminal result received.",
+                "  Logs and metrics:",
+                *rows,
+                f"  Artifacts: {path}",
+            ]
+        )
+        data = console.encode("utf-8")[: max(0, CONSOLE_BYTES_MAX - console_bytes)]
+        console_bytes += len(data)
+        console_omitted += len(console.encode("utf-8")) - len(data)
+        if data:
+            print(data.decode("utf-8", errors="ignore"), flush=True)
+    if console_omitted:
+        print(
+            f"console bytes omitted={console_omitted}; complete bounded reports: {directory}",
+            flush=True,
+        )
+    summary = summary.model_copy(
+        update={
+            "errors": tuple(errors),
+            "artifacts": tuple(
+                str(path) for path in directory.iterdir() if path.is_file()
+            ),
+        }
+    )
+    (directory / "run.json").write_text(
+        summary.model_dump_json(indent=2, by_alias=True) + "\n", encoding="utf-8"
+    )
+    if errors or failed or status != 0:
+        print(
+            f"run failed: cases={len(failed)}; errors={len(errors)}; artifacts={directory}",
+            flush=True,
+        )
+        for error in errors[:CONSOLE_EVIDENCE_MAX]:
+            print(cut(error), flush=True)
+        if expected_failure and len(errors) == 2:
+            print(
+                f"XFAIL {expected_failure}: launched={launched}; succeeded={summary.succeeded}; unlaunched={unlaunched}; runner_status={status}; artifacts={directory}",
+                flush=True,
+            )
+            return
+        if original_error is not None:
+            raise original_error
+        raise CommandFailed(command, status or 1, f"evidence: {directory}")
+    print(success_line(launched, elapsed), flush=True)

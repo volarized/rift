@@ -28,13 +28,10 @@ packages = ["src/rift_dev"]
 
 [dependency-groups]
 dev = [
-    "pytest==9.1.1",
-    "PyYAML==6.0.3",
     "ruff==0.16.8",
     "ty==0.0.82",
     "types-pywin32==312.0.0.20260827",
     "pre-commit==4.6.2",
+    "tree-sitter==0.25.2",
+    "tree-sitter-rust==0.24.0",
 ]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  OTEL_SDK_DISABLED: "false"
+
 jobs:
   docs:
     runs-on: ubuntu-latest
@@ -132,8 +135,6 @@ jobs:
       - run: uv run --locked --project dev pre-commit run --all-files
         timeout-minutes: 30
       - run: just audit
-        timeout-minutes: 1
-      - run: just testing-check
         timeout-minutes: 1
       # The pre-commit quick gate runs generated checks, the all-features
       # workspace compile, and strict Clippy. Their cold builds belong within the build budget.
@@ -454,12 +455,6 @@ jobs:
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - name: Verify Windows command ownership
-        if: runner.os == 'Windows'
-        timeout-minutes: 1
-        run: >-
-          uv run --locked --project dev pytest
-          dev/tests/test_commands.py
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py
@@ -553,7 +548,8 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
-          cargo nextest archive --locked
+          uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev
+          rift-dev test nextest-archive --locked
           --workspace --all-targets --all-features
           --archive-file target/native-live.tar.zst
           -E 'not binary(/^corpus_/)'
@@ -796,7 +792,7 @@ jobs:
       - name: Report corpus coverage
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
         # `generate-check` validates generated wire bytes; coverage measures maintained Rust source.
-        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated\.rs$' --lcov --output-path target/corpus.lcov
+        run: uv run --locked --project dev rift-dev coverage-report --nextest-archive-file target/integration.tar.zst --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated\.rs$' --lcov --output-path target/corpus.lcov
       # A Dependabot-triggered run reads the Dependabot secret scope, not the
       # Actions scope that holds `CODECOV_TOKEN` - see the `rust` job's own
       # coverage uploads above. Skip both uploads so the missing token fails

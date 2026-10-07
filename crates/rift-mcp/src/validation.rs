@@ -751,6 +751,17 @@ impl ConfigurationState {
         }
     }
 
+    /// Returns the accepted configuration or its registered tool failure.
+    pub(crate) fn accepted_for_tool(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<WorkspaceConfiguration, crate::output::ToolFailure> {
+        match &self.accepted {
+            Ok(configuration) => Ok(configuration.clone()),
+            Err(error) => error.mcp().tool_failure(phase).fail(),
+        }
+    }
+
     /// Whether the last acceptance of `rift.toml` succeeded.
     ///
     /// Every table accessor below answers the shipped default while it did not, so a
@@ -5548,6 +5559,21 @@ pub(crate) mod tests {
         let invalid = ConfigurationState::accept(directory.path());
         assert!(invalid.accepted.is_err());
         assert_eq!(invalid.global_configuration(), defaults);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_tool_configuration_keeps_registered_failure() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("rift.toml"), "invalid = true\n")?;
+        let configuration = ConfigurationState::accept(directory.path());
+        let Err(crate::output::ToolFailure::Registered(failure, phase)) =
+            configuration.accepted_for_tool(wire::ErrorPhase::Read)
+        else {
+            return Err("invalid configuration must retain its registered tool failure".into());
+        };
+        assert_eq!(failure.slug().as_str(), "rift.core.configuration_malformed");
+        assert_eq!(phase, wire::ErrorPhase::Read);
         Ok(())
     }
 

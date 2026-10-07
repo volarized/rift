@@ -9,13 +9,13 @@ receiver. The exporter appends `/v1/traces` and
 - every span received, with its name, trace and span identifiers, start and end,
   attributes, and the `service.instance.id` of the process that sent it, at most
   `SPANS_MAX`, and its duration for the per-operation summary;
-- every metric data point received, with its instrument's name, kind, and unit, its
+- every metric data point retained, with its instrument's name, kind, and unit, its
   attributes and resource attributes, the `service.instance.id` of the process that sent
   it, its value (a histogram's count, sum, and buckets),
   `start_time_unix_nano`, `time_unix_nano`, and aggregation temporality, at most
-  `POINTS_MAX`;
-- the latest value of each metric series, for the summary `rift-dev trace-collector`
-  prints when it stops.
+  `POINTS_MAX`. Identical cumulative samples with the same resource and timestamps are
+  kept once;
+- the latest value of each metric series, for a per-test report.
 
 Bounds: a request body, encoded and decompressed, is at most `BODY_BYTES_MAX` bytes; the
 summary keeps at most `METRICS_MAX` metric names and `SERIES_MAX` series per name; the
@@ -30,8 +30,10 @@ caller reads them while the thread writes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import os
 import signal
 import socket
 import sys
@@ -39,9 +41,9 @@ import threading
 import time
 import zlib
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 import uvicorn
@@ -120,6 +122,12 @@ CASE_SPANS_MAX = 5_000
 CASE_LOGS_MAX = 20_000
 # Tests `CaseStore` holds at once; a test past it is counted, not kept.
 CASES_MAX = 512
+# Export requests kept for a failed test report. Requests arrive before their resource
+# attributes can name a test, so the bound applies before decode too.
+EXPORT_REQUESTS_MAX = 1_024
+EXPORT_REQUEST_IDENTITIES_MAX = 8
+EXPORT_REQUEST_REPORT_MAX = 128
+REQUEST_IDENTITY_CHARS_MAX = 128
 # Attributes `tracing-opentelemetry` 0.34.0 puts on every span, which a span's line
 # leaves out, as received from `rift` on 2026-10-05.
 SPAN_KEYS_OMITTED = frozenset(["target", "busy_ns", "idle_ns"])
@@ -217,6 +225,165 @@ class Dropped:
         return json.dumps({"dropped": self.counts()})
 
 
+@dataclass(frozen=True, slots=True)
+class RequestIdentity:
+    """One decoded resource's test, process, and service instance identifiers."""
+
+    test_case: str | None
+    pid: str | None
+    instance: str | None
+    truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class StoreReceipt:
+    """Decode and store times plus bounded identities from one OTLP request."""
+
+    decoded_unix_nano: int
+    stored_unix_nano: int
+    identities: tuple[RequestIdentity, ...]
+    identities_omitted: int
+
+
+@dataclass(slots=True)
+class ExportRequest:
+    """One bounded OTLP/HTTP request, including requests that fail before decode."""
+
+    request_id: int
+    path: str
+    arrived_unix_nano: int
+    body_read_unix_nano: int | None = None
+    body_decoded_unix_nano: int | None = None
+    decoded_unix_nano: int | None = None
+    stored_unix_nano: int | None = None
+    handler_finished_unix_nano: int | None = None
+    encoded_bytes: int | None = None
+    decoded_bytes: int | None = None
+    intended_status: int | None = None
+    outcome: str = "pending"
+    identities: tuple[RequestIdentity, ...] = ()
+    identities_omitted: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RequestSnapshot:
+    """The requests selected for one failure, with every bound count."""
+
+    requests: tuple[ExportRequest, ...]
+    received: int
+    retained: int
+    dropped: int
+    omitted: int
+
+
+class RequestStore:
+    """The newest bounded OTLP/HTTP requests, including unassigned requests."""
+
+    def __init__(self, observe: Callable[[ExportRequest], None] | None = None) -> None:
+        self.requests: deque[ExportRequest] = deque(maxlen=EXPORT_REQUESTS_MAX)
+        self.received = 0
+        self.dropped = 0
+        self.lock = threading.Lock()
+        self.observe = observe
+
+    def begin(self, path: str) -> ExportRequest:
+        """Keeps request arrival before content validation or body decode."""
+        with self.lock:
+            request = ExportRequest(
+                request_id=self.received + 1,
+                path=path,
+                arrived_unix_nano=time.time_ns(),
+            )
+            self.received += 1
+            if len(self.requests) == self.requests.maxlen:
+                self.dropped += 1
+            self.requests.append(request)
+            return request
+
+    def update(self, request: ExportRequest, **fields: object) -> None:
+        """Updates one retained request while its route advances."""
+        with self.lock:
+            for name, value in fields.items():
+                setattr(request, name, value)
+
+    def finish(
+        self, request: ExportRequest, status: int, outcome: str
+    ) -> ExportRequest:
+        """Records handler status and finish time before returning a response."""
+        self.update(
+            request,
+            handler_finished_unix_nano=time.time_ns(),
+            intended_status=status,
+            outcome=outcome,
+        )
+        if self.observe is not None:
+            self.observe(replace(request))
+        return request
+
+    def for_failure(self, names: Sequence[str], pids: set[str]) -> RequestSnapshot:
+        """Selects decoded requests for the failed test's cases or registered processes.
+
+        Requests without decoded identities stay visible, bounded to the newest quarter
+        of the report limit.
+        """
+        return self._select(names, pids, include_unassigned=True)
+
+    def for_cases(self, names: Sequence[str], pids: set[str]) -> RequestSnapshot:
+        """Selects decoded requests attributed to the given test cases."""
+        return self._select(names, pids, include_unassigned=False)
+
+    def for_run(self, failed_ids: set[int]) -> RequestSnapshot:
+        """Returns attributed requests and failed unassigned requests for one test run."""
+        with self.lock:
+            held = tuple(
+                replace(request)
+                for request in self.requests
+                if request.identities or request.request_id in failed_ids
+            )
+            return RequestSnapshot(
+                requests=held,
+                received=self.received,
+                retained=len(held),
+                dropped=self.dropped,
+                omitted=0,
+            )
+
+    def _select(
+        self, names: Sequence[str], pids: set[str], *, include_unassigned: bool
+    ) -> RequestSnapshot:
+        with self.lock:
+            held = tuple(replace(request) for request in self.requests)
+            received = self.received
+            dropped = self.dropped
+        cases = set(names)
+        unassigned: list[ExportRequest] = []
+        matched: list[ExportRequest] = []
+        for request in held:
+            if any(
+                identity.test_case in cases
+                or (identity.pid is not None and identity.pid in pids)
+                for identity in request.identities
+            ):
+                matched.append(request)
+            elif include_unassigned and not request.identities:
+                unassigned.append(request)
+        unassigned_limit = EXPORT_REQUEST_REPORT_MAX // 4
+        selected = [
+            *matched,
+            *(unassigned[-unassigned_limit:] if include_unassigned else ()),
+        ]
+        selected.sort(key=lambda request: request.arrived_unix_nano)
+        omitted = max(0, len(selected) - EXPORT_REQUEST_REPORT_MAX)
+        requests = tuple(selected[-EXPORT_REQUEST_REPORT_MAX:])
+        return RequestSnapshot(
+            requests=requests,
+            received=received,
+            retained=len(held),
+            dropped=dropped,
+            omitted=omitted,
+        )
+
+
 def value_text(value: AnyValue) -> str:
     """An attribute value as text: a map as `{key=value ...}`, an array as
     `[value ...]`; a value of a kind the text does not read, such as bytes, becomes its
@@ -252,6 +419,45 @@ def instance_of(resource: Attributes) -> str:
 def test_of(resource: Attributes) -> str:
     """The `test.case.name` resource attribute; empty when the resource carries none."""
     return dict(resource).get(TEST_CASE_KEY, "")
+
+
+def request_identity(resource: Attributes) -> RequestIdentity | None:
+    """A request identity only when decode supplied a test, process, or instance."""
+    values = dict(resource)
+    test_case = values.get(TEST_CASE_KEY) or None
+    pid = values.get(PID_KEY) or None
+    instance = values.get(INSTANCE_KEY) or None
+    if test_case is None and pid is None and instance is None:
+        return None
+    fields = tuple(
+        None if value is None else value[:REQUEST_IDENTITY_CHARS_MAX]
+        for value in (test_case, pid, instance)
+    )
+    truncated = any(
+        value is not None and len(value) > REQUEST_IDENTITY_CHARS_MAX
+        for value in (test_case, pid, instance)
+    )
+    return RequestIdentity(*fields, truncated=truncated)
+
+
+def store_receipt(identities: Iterable[Attributes], decoded: int) -> StoreReceipt:
+    """Bounds decoded request identities and records completion after store work."""
+    kept: list[RequestIdentity] = []
+    omitted = 0
+    for resource in identities:
+        identity = request_identity(resource)
+        if identity is None or identity in kept:
+            continue
+        if len(kept) < EXPORT_REQUEST_IDENTITIES_MAX:
+            kept.append(identity)
+        else:
+            omitted += 1
+    return StoreReceipt(
+        decoded_unix_nano=decoded,
+        stored_unix_nano=time.time_ns(),
+        identities=tuple(kept),
+        identities_omitted=omitted,
+    )
 
 
 def process_text(resource: Attributes) -> str:
@@ -397,6 +603,10 @@ class SpanRecord:
     attributes: Attributes
     instance: str = ""
     resource: Attributes = ()
+    parent_span_id: str = ""
+    status_code: int = 0
+    status_message: str = ""
+    kind: int = 0
 
     @property
     def duration_ms(self) -> float:
@@ -467,9 +677,10 @@ class SpanStore:
         self.lock = threading.Lock()
         self.tests = tests
 
-    def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its spans."""
+    def record(self, body: bytes) -> StoreReceipt:
+        """Decodes one export request, keeps its spans, and reports its resources."""
         request = ExportTraceServiceRequest.FromString(body)
+        decoded = time.time_ns()
         with self.lock:
             for resource_spans in request.resource_spans:
                 resource = attribute_key(resource_spans.resource.attributes)
@@ -486,8 +697,19 @@ class SpanStore:
                                 attributes=attribute_key(span.attributes),
                                 instance=instance,
                                 resource=resource,
+                                parent_span_id=span.parent_span_id.hex(),
+                                status_code=span.status.code,
+                                status_message=span.status.message,
+                                kind=span.kind,
                             )
                         )
+        return store_receipt(
+            (
+                attribute_key(resource_spans.resource.attributes)
+                for resource_spans in request.resource_spans
+            ),
+            decoded,
+        )
 
     def keep(self, span: SpanRecord) -> None:
         """Keeps one span, dropping the oldest past a bound. The caller holds the lock."""
@@ -554,23 +776,25 @@ class MetricSummary:
 @dataclass(slots=True)
 class MetricSeries:
     """One metric name's series, each as its latest or accumulated value and count, keyed
-    by the instrumentation scope the point arrived under, then its attributes."""
+    by resource, start time, instrumentation scope, and attributes."""
 
     kind: str
     unit: str
-    values: dict[tuple[Scope, Attributes], tuple[float, int]] = field(
+    values: dict[tuple[Attributes, int, Scope, Attributes], tuple[float, int]] = field(
         default_factory=dict
     )
     points: int = 0
 
 
 class MetricStore:
-    """Metric data points received: the newest `POINTS_MAX` whole, and the latest value
-    of every series by metric name.
+    """Metric data points retained: the newest `POINTS_MAX` whole, and the latest value
+    of every bounded series by metric name.
 
-    For the latest value, a gauge and a cumulative sum or histogram replace a series'
-    value with the newest data point; a delta sum or histogram adds each data point to
-    it. The Rust exporter's default temporality is cumulative.
+    Resource, start time, scope, and attributes identify a series. Identical cumulative
+    samples with the same series and timestamp are kept once. A gauge and a cumulative
+    sum or histogram replace a series' value with the newest data point; a delta sum or
+    histogram adds each data point to it. The Rust exporter's default temporality is
+    cumulative.
     """
 
     def __init__(
@@ -578,14 +802,16 @@ class MetricStore:
     ) -> None:
         self.metrics: dict[str, MetricSeries] = {}
         self.points: deque[MetricPoint] = deque(maxlen=points_max)
+        self.cumulative_points: set[MetricPoint] = set()
         self.dropped = Dropped()
         self.received = 0
         self.lock = threading.Lock()
         self.tests = tests
 
-    def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its data points."""
+    def record(self, body: bytes) -> StoreReceipt:
+        """Decodes one export request, keeps its points, and reports its resources."""
         request = ExportMetricsServiceRequest.FromString(body)
+        decoded = time.time_ns()
         with self.lock:
             for resource_metrics in request.resource_metrics:
                 resource = attribute_key(resource_metrics.resource.attributes)
@@ -593,6 +819,13 @@ class MetricStore:
                     scope = (scope_metrics.scope.name, scope_metrics.scope.version)
                     for metric in scope_metrics.metrics:
                         self.keep(metric, resource, scope)
+        return store_receipt(
+            (
+                attribute_key(resource_metrics.resource.attributes)
+                for resource_metrics in request.resource_metrics
+            ),
+            decoded,
+        )
 
     def keep(
         self, metric: Metric, resource: Attributes = (), scope: Scope = ("", "")
@@ -615,18 +848,13 @@ class MetricStore:
             return
         name = metric.name
         held = self.metrics.get(name)
-        if held is None:
-            if len(self.metrics) >= METRICS_MAX:
-                self.dropped.metric_names += 1
-                return
+        if held is None and len(self.metrics) < METRICS_MAX:
             held = MetricSeries(which, metric.unit)
             self.metrics[name] = held
+        elif held is None:
+            self.dropped.metric_names += 1
         for point in points:
             attributes = attribute_key(point.attributes)
-            key = (scope, attributes)
-            if key not in held.values and len(held.values) >= SERIES_MAX:
-                self.dropped.series += 1
-                continue
             if isinstance(point, HistogramDataPoint):
                 value, count = float(point.sum), int(point.count)
                 kept = MetricPoint(
@@ -661,9 +889,28 @@ class MetricStore:
             self.received += 1
             if self.tests is not None:
                 self.tests.keep(resource, kept)
-            if len(self.points) == self.points.maxlen:
+            duplicate = (
+                kept.temporality == "cumulative" and kept in self.cumulative_points
+            )
+            if duplicate:
+                continue
+            if self.points.maxlen and len(self.points) == self.points.maxlen:
+                expired = self.points.popleft()
+                if expired.temporality == "cumulative":
+                    self.cumulative_points.discard(expired)
                 self.dropped.points += 1
-            self.points.append(kept)
+            if self.points.maxlen:
+                self.points.append(kept)
+                if kept.temporality == "cumulative":
+                    self.cumulative_points.add(kept)
+            else:
+                self.dropped.points += 1
+            if held is None:
+                continue
+            key = (resource, kept.start_time_unix_nano, scope, attributes)
+            if key not in held.values and len(held.values) >= SERIES_MAX:
+                self.dropped.series += 1
+                continue
             held.points += 1
             previous = held.values.get(key, (0.0, 0))
             held.values[key] = (
@@ -779,15 +1026,23 @@ class LogStore:
         self.lock = threading.Lock()
         self.tests = tests
 
-    def record(self, body: bytes) -> None:
-        """Decodes one export request and keeps its log records."""
+    def record(self, body: bytes) -> StoreReceipt:
+        """Decodes one export request, keeps its logs, and reports its resources."""
         request = ExportLogsServiceRequest.FromString(body)
+        decoded = time.time_ns()
         with self.lock:
             for resource_logs in request.resource_logs:
                 resource = attribute_key(resource_logs.resource.attributes)
                 for scope_logs in resource_logs.scope_logs:
                     for record in scope_logs.log_records:
                         self.keep(log_entry(record, resource))
+        return store_receipt(
+            (
+                attribute_key(resource_logs.resource.attributes)
+                for resource_logs in request.resource_logs
+            ),
+            decoded,
+        )
 
     def keep(self, entry: LogEntry) -> None:
         """Keeps one record, dropping the oldest past the bound. The caller holds the lock."""
@@ -811,12 +1066,14 @@ class LogStore:
 
 @dataclass(slots=True)
 class CaseTelemetry:
-    """What the processes of one test sent: the newest `CASE_POINTS_MAX` points,
-    `CASE_SPANS_MAX` spans, and `CASE_LOGS_MAX` log records, and what each bound dropped."""
+    """What the processes of one test sent: the newest points, spans, and log records
+    within their bounds, and what each bound dropped. Identical cumulative points are
+    kept once."""
 
     points: deque[MetricPoint] = field(
         default_factory=lambda: deque(maxlen=CASE_POINTS_MAX)
     )
+    cumulative_points: set[MetricPoint] = field(default_factory=set)
     spans: deque[SpanRecord] = field(
         default_factory=lambda: deque(maxlen=CASE_SPANS_MAX)
     )
@@ -833,11 +1090,15 @@ class CaseStore:
     `CASES_MAX` held at once is counted under `refused`.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        observe: Callable[[MetricPoint | SpanRecord | LogEntry], bool] | None = None,
+    ) -> None:
         self.tests: dict[str, CaseTelemetry] = {}
         self.unattributed = 0
         self.refused = 0
         self.lock = threading.Lock()
+        self.observe = observe
 
     def keep(
         self, resource: Attributes, item: MetricPoint | SpanRecord | LogEntry
@@ -845,6 +1106,8 @@ class CaseStore:
         """Files `item` under the test its sender names."""
         test = test_of(resource)
         with self.lock:
+            if self.observe is not None and not self.observe(item):
+                return
             if not test:
                 self.unattributed += 1
                 return
@@ -856,9 +1119,16 @@ class CaseStore:
                 held = CaseTelemetry()
                 self.tests[test] = held
             if isinstance(item, MetricPoint):
+                if item.temporality == "cumulative" and item in held.cumulative_points:
+                    return
                 if len(held.points) == held.points.maxlen:
+                    expired = held.points.popleft()
+                    if expired.temporality == "cumulative":
+                        held.cumulative_points.discard(expired)
                     held.dropped.points += 1
                 held.points.append(item)
+                if item.temporality == "cumulative":
+                    held.cumulative_points.add(item)
             elif isinstance(item, SpanRecord):
                 if len(held.spans) == held.spans.maxlen:
                     held.dropped.spans += 1
@@ -903,93 +1173,128 @@ def inflate(body: bytes, encoding: str | None) -> bytes | None:
     return inflated
 
 
-async def bounded_body(request: Request) -> bytes | None:
-    """The encoded request body; None once it passes `BODY_BYTES_MAX`, read no further.
+async def bounded_body(request: Request) -> tuple[bytes | None, int]:
+    """The encoded body or None past its bound, and bytes read before refusal.
 
     A declared `content-length` past the bound refuses the body before any of it is
     read.
     """
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > BODY_BYTES_MAX:
-        return None
+        return None, 0
     chunks: list[bytes] = []
     size = 0
     async for chunk in request.stream():
         size += len(chunk)
         if size > BODY_BYTES_MAX:
-            return None
+            return None, size
         chunks.append(chunk)
-    return b"".join(chunks)
+    return b"".join(chunks), size
 
 
 def receiver(
-    spans: SpanStore, metrics: MetricStore | None = None, logs: LogStore | None = None
+    spans: SpanStore,
+    metrics: MetricStore | None = None,
+    logs: LogStore | None = None,
+    cases: CaseStore | None = None,
+    requests: RequestStore | None = None,
 ) -> Starlette:
     """The application that feeds OTLP/HTTP export requests into `spans`, `metrics`, and
     `logs`.
 
-    Starlette answers any other path with 404 and any other method with 405.
+    Starlette answers any other path with 404 and any other method with 405. Decode and
+    retention run outside the HTTP event loop so other export bodies keep draining.
     """
     held = metrics if metrics is not None else MetricStore()
     records = logs if logs is not None else LogStore()
+    request_records = requests if requests is not None else RequestStore()
 
     def route(
         path: str,
-        keep: Callable[[bytes], None],
+        keep: Callable[[bytes], StoreReceipt],
         response: bytes,
         noun: str,
     ) -> Route:
         async def export(request: Request) -> Response:
+            observed = request_records.begin(path)
             if request.headers.get("content-type", "").split(";")[0] != PROTOBUF:
+                request_records.finish(observed, 415, "content-type")
                 return PlainTextResponse(f"the collector reads {PROTOBUF}", 415)
             try:
-                encoded = await bounded_body(request)
+                encoded, encoded_bytes = await bounded_body(request)
+                request_records.update(
+                    observed,
+                    body_read_unix_nano=time.time_ns(),
+                    encoded_bytes=encoded_bytes,
+                )
                 body = (
                     None
                     if encoded is None
                     else inflate(encoded, request.headers.get("content-encoding"))
                 )
             except zlib.error:
+                request_records.finish(observed, 400, "gzip")
                 return PlainTextResponse("the body is not gzip", 400)
             except ClientDisconnect:
+                request_records.finish(observed, 400, "disconnect")
                 return PlainTextResponse("the exporter disconnected", 400)
+            except Exception:
+                request_records.finish(observed, 500, "receiver-error")
+                raise
+            request_records.update(
+                observed,
+                body_decoded_unix_nano=time.time_ns(),
+                decoded_bytes=None if body is None else len(body),
+            )
             if body is None:
                 with held.lock:
                     held.dropped.bodies += 1
+                request_records.finish(observed, 413, "body-bound")
                 return PlainTextResponse(
                     f"a body is at most {BODY_BYTES_MAX} bytes, encoded and decoded",
                     413,
                 )
             try:
-                keep(body)
+                receipt = await asyncio.to_thread(keep, body)
             except DecodeError:
+                request_records.finish(observed, 400, "protobuf")
                 return PlainTextResponse(f"the body is not an {noun}", 400)
+            except Exception:
+                request_records.finish(observed, 500, "receiver-error")
+                raise
+            request_records.update(
+                observed,
+                decoded_unix_nano=receipt.decoded_unix_nano,
+                stored_unix_nano=receipt.stored_unix_nano,
+                identities=receipt.identities,
+                identities_omitted=receipt.identities_omitted,
+            )
+            request_records.finish(observed, 200, "ok")
             return Response(response, media_type=PROTOBUF)
 
         return Route(path, export, methods=["POST"])
 
-    return Starlette(
-        routes=[
-            route(
-                TRACES_PATH,
-                spans.record,
-                ExportTraceServiceResponse().SerializeToString(),
-                "ExportTraceServiceRequest",
-            ),
-            route(
-                METRICS_PATH,
-                held.record,
-                ExportMetricsServiceResponse().SerializeToString(),
-                "ExportMetricsServiceRequest",
-            ),
-            route(
-                LOGS_PATH,
-                records.record,
-                ExportLogsServiceResponse().SerializeToString(),
-                "ExportLogsServiceRequest",
-            ),
-        ]
-    )
+    routes = [
+        route(
+            TRACES_PATH,
+            spans.record,
+            ExportTraceServiceResponse().SerializeToString(),
+            "ExportTraceServiceRequest",
+        ),
+        route(
+            METRICS_PATH,
+            held.record,
+            ExportMetricsServiceResponse().SerializeToString(),
+            "ExportMetricsServiceRequest",
+        ),
+        route(
+            LOGS_PATH,
+            records.record,
+            ExportLogsServiceResponse().SerializeToString(),
+            "ExportLogsServiceRequest",
+        ),
+    ]
+    return Starlette(routes=routes)
 
 
 @dataclass(slots=True)
@@ -1004,8 +1309,13 @@ class Collector:
     endpoint: str = ""
     logs: LogStore = field(default_factory=LogStore)
     cases: CaseStore | None = None
+    requests: RequestStore = field(default_factory=RequestStore)
 
-    def environment(self, test_case: str | None = None) -> dict[str, str]:
+    def environment(
+        self,
+        test_case: str | None = None,
+        source: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         """The variables that point a server under test at this collector.
 
         `OTEL_EXPORTER_OTLP_ENDPOINT` is the base URL: Rift installs export only when it
@@ -1014,17 +1324,33 @@ class Collector:
         async periodic reader and `OTEL_BSP_SCHEDULE_DELAY` by the batch span
         processor's default configuration, both in milliseconds
         (`opentelemetry_sdk` 0.33.0); `OTEL_BLRP_SCHEDULE_DELAY` is the batch log
-        processor's. With `test_case`, `OTEL_RESOURCE_ATTRIBUTES` sets `test.case.name`,
+        processor's. Caller values for those standard interval variables are retained.
+        With `test_case`, `OTEL_RESOURCE_ATTRIBUTES` sets `test.case.name`,
         which the SDK's environment resource detector reads into every process's
         resource, so `CaseStore` files what each process sends under its test.
         """
         if not self.endpoint:
             return {}
+        inherited = os.environ if source is None else source
         environment = {
+            "OTEL_SDK_DISABLED": "false",
             "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
-            "OTEL_METRIC_EXPORT_INTERVAL": str(EXPORT_INTERVAL_MS),
-            "OTEL_BSP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
-            "OTEL_BLRP_SCHEDULE_DELAY": str(EXPORT_INTERVAL_MS),
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint + TRACES_PATH,
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": self.endpoint + LOGS_PATH,
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": self.endpoint + METRICS_PATH,
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
+            "OTEL_METRIC_EXPORT_INTERVAL": inherited.get(
+                "OTEL_METRIC_EXPORT_INTERVAL", str(EXPORT_INTERVAL_MS)
+            ),
+            "OTEL_BSP_SCHEDULE_DELAY": inherited.get(
+                "OTEL_BSP_SCHEDULE_DELAY", str(EXPORT_INTERVAL_MS)
+            ),
+            "OTEL_BLRP_SCHEDULE_DELAY": inherited.get(
+                "OTEL_BLRP_SCHEDULE_DELAY", str(EXPORT_INTERVAL_MS)
+            ),
         }
         if test_case:
             environment["OTEL_RESOURCE_ATTRIBUTES"] = resource_attribute(
@@ -1086,6 +1412,7 @@ def collector(
     spans_max: int = SPANS_MAX,
     logs_max: int = LOGS_MAX,
     cases: CaseStore | None = None,
+    request_observer: Callable[[ExportRequest], None] | None = None,
 ) -> Iterator[Collector]:
     """Serves a receiver on `127.0.0.1` from a thread until the block exits.
 
@@ -1099,6 +1426,7 @@ def collector(
         MetricStore(points_max, cases),
         logs=LogStore(logs_max, cases),
         cases=cases,
+        requests=RequestStore(observe=request_observer),
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -1106,7 +1434,13 @@ def collector(
         port = listener.getsockname()[1]
         server = uvicorn.Server(
             uvicorn.Config(
-                receiver(stores.spans, stores.metrics, stores.logs),
+                receiver(
+                    stores.spans,
+                    stores.metrics,
+                    stores.logs,
+                    stores.cases,
+                    stores.requests,
+                ),
                 lifespan="off",
                 log_config=None,
                 log_level="warning",
@@ -1138,6 +1472,8 @@ def collector(
         finally:
             server.should_exit = True
             thread.join(COLLECTOR_STOP_SECONDS)
+        if failures:
+            raise RuntimeError(f"the OTLP collector failed: {failures}")
         if thread.is_alive():
             raise RuntimeError(
                 f"the OTLP collector thread outlived its {COLLECTOR_STOP_SECONDS}s stop"

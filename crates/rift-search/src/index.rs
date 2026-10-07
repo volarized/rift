@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rift_core::ProjectPath;
-use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
+use rift_index::{DatabaseName, DatabasePool, DatabaseReadings, LazyDatabase, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalSearchIndex, PatternCandidates, RevisionScoped,
     StoredVector, TrigramBatch, VectorStore,
@@ -595,6 +595,19 @@ impl SearchIndex {
             self.vectors.shutdown(deadline)
         );
         index.and(vectors)
+    }
+
+    /// Keeps readings for the index database and any vectors database already open.
+    ///
+    /// Does not open the vectors database. Call again after [`Self::shutdown`] to include a
+    /// first open that was in flight when shutdown began.
+    #[must_use]
+    pub fn database_readings(&self) -> Vec<Arc<DatabaseReadings>> {
+        let mut readings = vec![self.database.readings()];
+        if let Some(database) = self.vectors.opened() {
+            readings.push(database.readings());
+        }
+        readings
     }
 
     /// The vector store, opening the vectors database when this is its first use.

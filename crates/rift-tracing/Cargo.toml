@@ -10,8 +10,8 @@ description = "The metrics database and the instrumentation Rift crates emit thr
 [features]
 # The scoped recorder for dependent crates' tests; never a production feature. Enable it
 # from `[dev-dependencies]` only, so a release build carries no recorder. Its metric reads
-# come from the SDK's in-memory exporter.
-fixtures = ["opentelemetry_sdk/testing"]
+# collect from the SDK reader; the dev appliance receives standard OTLP in Python.
+fixtures = ["dep:shutdown_hooks", "opentelemetry_sdk/testing"]
 
 [lints]
 workspace = true
@@ -33,6 +33,7 @@ rusqlite.workspace = true
 # `preserve_order` backs `serde_json::Map` with an `IndexMap`, so a record's fields serialize
 # in the order the capture inserts them, whichever other crate the build carries.
 serde_json = { workspace = true, features = ["preserve_order"] }
+shutdown_hooks = { version = "=0.1.0", optional = true }
 sysinfo.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -41,6 +42,7 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+shutdown_hooks = "=0.1.0"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

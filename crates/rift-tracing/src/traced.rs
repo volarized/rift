@@ -460,6 +460,7 @@ macro_rules! __rift_traced_block {
         [$($parent:expr)?] [$($component:expr)?] $operation:literal [$($open:ident)?]
         [$($field:ident = $value:expr),*] $work:expr
     ) => {{
+        $crate::__private::stream_unscoped();
         let __rift_entered = $crate::__private::tracing::span!(
             $(parent: $parent,)?
             $crate::__private::tracing::Level::INFO,
