@@ -108,11 +108,25 @@ LINE_CHARS_MAX = 2_000
 # (`crates/rift-tracing/src/span.rs`), and the table of operations in flight's.
 OPENED_MESSAGE = "operation opened"
 IN_FLIGHT_MESSAGE = "operations in flight"
-MEASUREMENT_FIELDS = {
-    "operation_record_cost": ("threads", ("operation_ns", "event_ns")),
+MEASUREMENT_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "operation_record_cost": (("threads",), ("operation_ns", "event_ns")),
     "record_path_cost": (
-        "meter",
+        ("meter",),
         ("counter_ns_per_record", "histogram_ns_per_record"),
+    ),
+    "output allocation measurement": (
+        ("answer", "example", "representation"),
+        (
+            "allocations",
+            "deallocations",
+            "reallocations",
+            "bytes_allocated",
+            "bytes_deallocated",
+            "bytes_reallocated",
+            "content_bytes",
+            "structured_content_bytes",
+            "combined_response_bytes",
+        ),
     ),
 }
 
@@ -120,21 +134,25 @@ MEASUREMENT_FIELDS = {
 def measurement_summary(logs: Iterable[LogEntry]) -> list[str]:
     """Summarize recorded T-149 samples without combining separate processes."""
     groups: dict[
-        tuple[str, str, str],
+        tuple[str, tuple[str, ...], str],
         dict[str, list[tuple[float, int]]],
     ] = {}
     incomplete = 0
     for entry in logs:
         if entry.body not in MEASUREMENT_FIELDS:
             continue
-        group_key, fields = MEASUREMENT_FIELDS[entry.body]
+        group_keys, fields = MEASUREMENT_FIELDS[entry.body]
         attributes = dict(entry.attributes)
-        group_value = attributes.get(group_key)
+        group_values = tuple(attributes.get(name) for name in group_keys)
         instance = entry.instance
-        if group_value is None or instance is None:
+        if any(value is None for value in group_values) or instance is None:
             incomplete += 1
             continue
-        key = (entry.body, group_value, instance)
+        key = (
+            entry.body,
+            tuple(value for value in group_values if value is not None),
+            instance,
+        )
         samples = groups.setdefault(key, {name: [] for name in fields})
         row_incomplete = False
         for name in fields:
@@ -152,12 +170,13 @@ def measurement_summary(logs: Iterable[LogEntry]) -> list[str]:
     if not groups and incomplete == 0:
         return []
     lines = ["---- T-149 measurement medians ----"]
-    for (measurement, group_value, instance), samples in sorted(groups.items()):
-        group_key = MEASUREMENT_FIELDS[measurement][0]
-        lines.append(
-            f"{measurement} {group_key}={group_value} "
-            f"service.instance.id={instance}"
+    for (measurement, group_values, instance), samples in sorted(groups.items()):
+        group_keys = MEASUREMENT_FIELDS[measurement][0]
+        labels = " ".join(
+            f"{name}={value}"
+            for name, value in zip(group_keys, group_values, strict=True)
         )
+        lines.append(f"{measurement} {labels} service.instance.id={instance}")
         for name, values in samples.items():
             if not values:
                 lines.append(f"{name}: no complete samples")
@@ -329,9 +348,7 @@ def timeline(telemetry: CaseTelemetry) -> list[str]:
 
 def last_values(points: Iterable[MetricPoint]) -> list[str]:
     """The newest point of each series, per resource, start time, scope, and attributes."""
-    latest: dict[
-        tuple[str, Attributes, int, Scope, Attributes], MetricPoint
-    ] = {}
+    latest: dict[tuple[str, Attributes, int, Scope, Attributes], MetricPoint] = {}
     for point in points:
         key = (
             point.name,
@@ -619,9 +636,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
                 f"dropped={held.dropped.counts()}",
                 *measurements,
                 "---- log records ----",
-                *newest(
-                    [entry.line() for entry in held.logs], 3, "log records"
-                ),
+                *newest([entry.line() for entry in held.logs], 3, "log records"),
                 "---- spans ----",
                 *newest([span.line() for span in held.spans], 3, "spans"),
                 "---- last metric value of each series ----",
@@ -641,7 +656,9 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
             if raw_records:
                 with raw_evidence_path.open("ab") as artifact:
                     for kind, record in raw_records:
-                        remaining = CASE_EVIDENCE_BYTES_MAX - evidence_kept - raw_evidence_kept
+                        remaining = (
+                            CASE_EVIDENCE_BYTES_MAX - evidence_kept - raw_evidence_kept
+                        )
                         if remaining <= 0:
                             raw_evidence_dropped += 1
                             continue
