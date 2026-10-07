@@ -304,6 +304,8 @@ impl ScopedRecorderBuilder {
     /// Returns [`LogFilterError`] when the [`Self::capture`] filter does not parse.
     pub fn install(self) -> Result<(ScopedRecorder, LogDrain), LogFilterError> {
         let filter = recorder_filter(self.capture.as_deref())?;
+        #[cfg(any(test, feature = "fixtures"))]
+        stream_unscoped();
         RECORDER_INSTALLED.store(true, Ordering::Relaxed);
         let (sink, drain) = log_capture();
         let runtime = TestOtlpRuntime::when_configured();
