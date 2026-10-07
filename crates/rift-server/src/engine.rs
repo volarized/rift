@@ -2623,9 +2623,12 @@ done
             .await
             .expect_err("the engine never reads ready inside the retry table");
         let elapsed = started.elapsed();
-        eprintln!(
-            "exchange: attempts={attempts:?} elapsed={elapsed:?} error={:?}",
-            failure.slug()
+        rift_tracing::info!(
+            component = "engine",
+            attempts = attempts.load(std::sync::atomic::Ordering::SeqCst),
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            error = %failure.slug(),
+            "exchange"
         );
         assert_eq!(failure.slug(), errors::lsp::engine_analyzing::SLUG);
         assert!(
@@ -2770,10 +2773,12 @@ done
             .await
             .expect("the walk settles");
         let stamps = stamps.lock().expect("attempt stamps").clone();
-        eprintln!(
-            "walk: attempts={} elapsed={:?} answer={answer:?}",
-            stamps.len(),
-            started.elapsed()
+        rift_tracing::info!(
+            component = "engine",
+            attempts = stamps.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            answer = ?answer,
+            "walk"
         );
         assert_eq!(answer, OutgoingAnswer::Ready(0));
         assert_eq!(
@@ -2856,10 +2861,12 @@ done
             .expect("a spent wait is an answer, not a failure");
         let returned = Instant::now();
         let times = times.lock().expect("attempt times").clone();
-        eprintln!(
-            "spent walk: completed={} elapsed={:?} answer={answer:?}",
-            times.len(),
-            returned - started
+        rift_tracing::info!(
+            component = "engine",
+            completed = times.len(),
+            elapsed_ms = (returned - started).as_secs_f64() * 1000.0,
+            answer = ?answer,
+            "spent walk"
         );
         assert_eq!(
             answer,
@@ -2980,9 +2987,11 @@ done
             )
             .await
             .expect("a retryable refusal at the spent wait is an answer");
-        eprintln!(
-            "retryable refusal: elapsed={:?} answer={answer:?}",
-            started.elapsed()
+        rift_tracing::info!(
+            component = "engine",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            answer = ?answer,
+            "retryable refusal"
         );
         assert!(
             matches!(answer, OutgoingAnswer::Unsettled { attempts } if (2..=3).contains(&attempts)),
