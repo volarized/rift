@@ -2261,7 +2261,13 @@ impl WorkspaceIndex {
                 previous.map(|index| index.semantics.graph()),
             )
         })?;
-        let declarations = accepted_declarations(&files, &semantics);
+        let declarations = rift_tracing::traced!(
+            component = "documentation",
+            operation = "documentation.collect",
+            phase = "accepted_declarations",
+            files = files.len(),
+            { accepted_declarations(&files, &semantics) }
+        );
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -3548,14 +3554,22 @@ fn built_contents(
                     &contents.text_files,
                     &contents.left_out,
                 );
-                let built = WorkspaceSemantics::build_project_facts(
-                    contents
-                        .files
-                        .values()
-                        .map(|file| (file.syntax(), file.path())),
-                    declarations_max,
-                    fingerprint.revision_number(),
-                    previous,
+                let built = rift_tracing::traced!(
+                    component = "index",
+                    operation = "index.semantics",
+                    phase = "WorkspaceSemantics::build_project_facts",
+                    files = contents.files.len(),
+                    {
+                        WorkspaceSemantics::build_project_facts(
+                            contents
+                                .files
+                                .values()
+                                .map(|file| (file.syntax(), file.path())),
+                            declarations_max,
+                            fingerprint.revision_number(),
+                            previous,
+                        )
+                    }
                 );
                 match built {
                     Ok(BuiltSemantics {

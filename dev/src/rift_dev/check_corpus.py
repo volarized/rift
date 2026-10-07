@@ -11,6 +11,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
 from rift_dev.corpus_assertions import (
@@ -53,6 +54,7 @@ from rift_dev.log_records import (
     stop_measurements,
 )
 from rift_dev.machine import machine, machine_line
+from rift_dev.nextest_run import CASE_EVIDENCE_BYTES_MAX
 from rift_dev.rift_test_client import (
     LOG_FILTER,
     Client,
@@ -69,7 +71,15 @@ from rift_dev.rift_test_client import (
     string_value,
     utc_now,
 )
-from rift_dev.trace import TEST_CASE_KEY, Collector, collector, resource_attribute
+from rift_dev.trace import (
+    TEST_CASE_KEY,
+    Collector,
+    LogEntry,
+    MetricPoint,
+    SpanRecord,
+    collector,
+    resource_attribute,
+)
 
 # The OpenTelemetry specification's "Disable the SDK for all signals"; any value other than
 # "true" leaves the export enabled.
@@ -276,6 +286,13 @@ class Corpus:
             failure = "".join(traceback.format_exception(error))
             raise
         finally:
+            try:
+                telemetry_artifact = self.write_telemetry_artifact()
+            except (OSError, TypeError, ValueError) as error:
+                telemetry_artifact = {
+                    "path": str(self.report.with_suffix(".telemetry.jsonl")),
+                    "error": str(error),
+                }
             self.report.write_text(
                 json.dumps(
                     {
@@ -289,6 +306,7 @@ class Corpus:
                         "evidence": self.evidence,
                         "stops": self.stops,
                         "collector": self.collector_counts(),
+                        "telemetry_artifact": telemetry_artifact,
                         "elapsed_seconds": time.monotonic() - started,
                         "actions": self.actions,
                     },
@@ -301,6 +319,70 @@ class Corpus:
     def collector_counts(self) -> JsonObject | None:
         """What the case's collector received and dropped; None before it started."""
         return collector_counts(self.telemetry)
+
+    def write_telemetry_artifact(self) -> JsonObject | None:
+        """Write newest decoded OTLP rows beside report within existing artifact bound."""
+        telemetry = self.telemetry
+        if telemetry is None:
+            return None
+
+        logs = telemetry.logs.between(None, None)
+        spans = telemetry.spans.between(None, None)
+        points = telemetry.metrics.between(None, None)
+        signals = {"logs": logs, "spans": spans, "points": points}
+        received = {
+            "logs": telemetry.logs.received,
+            "spans": telemetry.spans.received,
+            "points": telemetry.metrics.received,
+        }
+        rows: list[
+            tuple[int, str, LogEntry | SpanRecord | MetricPoint]
+        ] = [
+            *((entry.time_unix_nano, "logs", entry) for entry in logs),
+            *((span.end_time_unix_nano, "spans", span) for span in spans),
+            *((point.time_unix_nano, "points", point) for point in points),
+        ]
+
+        included_rows: list[tuple[int, str, bytes]] = []
+        included = {kind: 0 for kind in signals}
+        size = 0
+        for timestamp, kind, record in sorted(
+            rows, key=lambda item: (item[0], item[1]), reverse=True
+        ):
+            row = (
+                json.dumps(
+                    {"kind": kind, "record": asdict(record)},
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            if size + len(row) <= CASE_EVIDENCE_BYTES_MAX:
+                included_rows.append((timestamp, kind, row))
+                included[kind] += 1
+                size += len(row)
+
+        included_rows.reverse()
+        path = self.report.with_suffix(".telemetry.jsonl")
+        artifact: JsonObject = {
+            "path": str(path),
+            "byte_limit": CASE_EVIDENCE_BYTES_MAX,
+            "bytes": size,
+            "received": received,
+            "retained": {kind: len(records) for kind, records in signals.items()},
+            "included": included,
+            "omitted": {
+                kind: len(records) - included[kind]
+                for kind, records in signals.items()
+            },
+            "collector_dropped": dict(telemetry.dropped().counts()),
+        }
+        try:
+            path.write_bytes(b"".join(row for _, _, row in included_rows))
+        except OSError as error:
+            artifact["error"] = str(error)
+        return artifact
 
     async def tree(self, directory: Path) -> None:
         """Run the case; on failure keep each server's evidence before the tree goes."""

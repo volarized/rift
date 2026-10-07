@@ -255,8 +255,15 @@ fn finish_collection(
         .iter()
         .map(DeclarationFacts::validated)
         .collect::<Result<Vec<_>, _>>()?;
-    collect_documentation_incremental(previous, &sources, &declarations)?
-        .with_source_omissions(omissions)
+    rift_tracing::traced!(
+        component = "documentation",
+        operation = "documentation.collect",
+        phase = "collect_documentation_incremental",
+        sources = sources.sources().len(),
+        declarations = declarations.len(),
+        { collect_documentation_incremental(previous, &sources, &declarations)? }
+    )
+    .with_source_omissions(omissions)
 }
 
 fn decode_notebooks(
