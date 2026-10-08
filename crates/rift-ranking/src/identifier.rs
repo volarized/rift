@@ -61,14 +61,69 @@ impl IdentifierMatchClass {
     }
 }
 
-/// Classifies one lowercase candidate against one declaration's names.
+/// One identifier match, ordered by original spelling and then match class.
 ///
-/// `name` and `qualified_name` arrive lowercased, as `candidate` does: a
-/// caller writing `searchhit` reaches `SearchHit`, and the class is the same
-/// whichever spelling was typed. Returns `None` when the declaration carries
-/// the candidate nowhere.
+/// An exact original name or qualified name precedes every normalized fallback.
+/// The class retains the same field meaning for callers carrying lowercase candidates.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct IdentifierMatch {
+    spelling: IdentifierSpelling,
+    class: IdentifierMatchClass,
+}
+
+/// Whether equality preserves the spelling the caller supplied.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum IdentifierSpelling {
+    Original,
+    Normalized,
+}
+
+impl IdentifierMatch {
+    /// The field comparison class, independent of original spelling preference.
+    #[must_use]
+    pub const fn class(self) -> IdentifierMatchClass {
+        self.class
+    }
+}
+
+/// Classifies one candidate against names using case-insensitive comparison.
+///
+/// Original and lowercase candidates receive the same field comparison class.
+/// Use [`identifier_match`] when ordering must prefer the caller's original spelling.
 #[must_use]
 pub fn match_class(
+    candidate: &str,
+    name: &str,
+    qualified_name: &str,
+) -> Option<IdentifierMatchClass> {
+    identifier_match(candidate, name, qualified_name).map(IdentifierMatch::class)
+}
+
+/// Matches original names, retaining exact spelling preference and normalized fallback.
+///
+/// Equality with either original name precedes normalized matches. Within each
+/// spelling, qualified equality, name equality, prefix, and substring retain their order.
+#[must_use]
+pub fn identifier_match(
+    candidate: &str,
+    name: &str,
+    qualified_name: &str,
+) -> Option<IdentifierMatch> {
+    let original_exact = candidate == name || candidate == qualified_name;
+    let spelling = if original_exact {
+        IdentifierSpelling::Original
+    } else {
+        IdentifierSpelling::Normalized
+    };
+    let candidate = candidate.to_lowercase();
+    let name = name.to_lowercase();
+    let qualified_name = qualified_name.to_lowercase();
+    normalized_match_class(&candidate, &name, &qualified_name)
+        .map(|class| IdentifierMatch { spelling, class })
+}
+
+/// Classifies names whose comparison spelling is already lowercase.
+fn normalized_match_class(
     candidate: &str,
     name: &str,
     qualified_name: &str,
@@ -91,14 +146,21 @@ pub fn match_class(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentifierCandidate {
     text: String,
+    normalized_text: String,
     position: usize,
 }
 
 impl IdentifierCandidate {
-    /// The candidate, lowercased for comparison.
+    /// The candidate with its original spelling.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The candidate lowercased for case-insensitive comparison.
+    #[must_use]
+    pub fn normalized_text(&self) -> &str {
+        &self.normalized_text
     }
 
     /// The candidate's place in the query, counting from the front. Two
@@ -153,15 +215,49 @@ pub fn identifier_candidates(query: &str) -> Vec<IdentifierCandidate> {
     candidates
 }
 
-/// Appends one lowercased candidate, keeping the first position a spelling
-/// appeared at.
+/// Accepts original candidates or the deduplicated lowercase list older callers send.
+///
+/// Each list retains candidate order. A mixed list or an unrelated identifier is refused.
+#[must_use]
+pub fn identifier_candidates_match(
+    candidates: &[IdentifierCandidate],
+    supplied: &[String],
+) -> bool {
+    if candidates.len() == supplied.len()
+        && candidates
+            .iter()
+            .zip(supplied)
+            .all(|(candidate, text)| candidate.text() == text)
+    {
+        return true;
+    }
+    let mut normalized: Vec<&str> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let text = candidate.normalized_text();
+        if !normalized.contains(&text) {
+            normalized.push(text);
+        }
+    }
+    normalized.len() == supplied.len()
+        && normalized
+            .iter()
+            .zip(supplied)
+            .all(|(candidate, text)| *candidate == text)
+}
+
+/// Appends one original spelling, keeping its first candidate position.
 fn push_candidate(candidates: &mut Vec<IdentifierCandidate>, value: &str) {
-    let text = value.to_lowercase();
+    let text = value.to_owned();
     if text.is_empty() || candidates.iter().any(|held| held.text == text) {
         return;
     }
     let position = candidates.len();
-    candidates.push(IdentifierCandidate { text, position });
+    let normalized_text = value.to_lowercase();
+    candidates.push(IdentifierCandidate {
+        text,
+        normalized_text,
+        position,
+    });
 }
 
 /// Whether the whole value is one identifier token: no whitespace, at least
@@ -270,11 +366,10 @@ pub fn identifier_terms<'a>(
     rendered
 }
 
-/// Accumulates one identifier ranking: the best class each identity reached,
-/// the earliest candidate that reached it, and the field that proved it.
+/// Accumulates the best identifier match and candidate position for each identity.
 ///
 /// An identity that matched several candidates appears once. Ordering is by
-/// class, then by the earliest candidate position, then by identity, so two
+/// original spelling, class, candidate position, then identity, so two
 /// runs over the same corpus produce the same order.
 #[derive(Clone, Debug, Default)]
 pub struct IdentifierRanking {
@@ -284,7 +379,7 @@ pub struct IdentifierRanking {
 /// The best evidence one identity accumulated.
 #[derive(Clone, Copy, Debug)]
 struct Placement {
-    class: IdentifierMatchClass,
+    matched: IdentifierMatch,
     position: usize,
     fields: FieldSet,
 }
@@ -308,10 +403,26 @@ impl IdentifierRanking {
         class: IdentifierMatchClass,
         candidate: &IdentifierCandidate,
     ) {
-        let placement = Placement {
+        let matched = IdentifierMatch {
+            spelling: IdentifierSpelling::Normalized,
             class,
-            position: candidate.position(),
-            fields: FieldSet::of(class.field()),
+        };
+        self.observe_match(identity, candidate.position(), matched);
+    }
+
+    /// Records a match, retaining original spelling preference before candidate position.
+    ///
+    /// The best match determines placement, while all matching fields join the answer.
+    pub fn observe_match(
+        &mut self,
+        identity: DocumentIdentity,
+        position: usize,
+        matched: IdentifierMatch,
+    ) {
+        let placement = Placement {
+            matched,
+            position,
+            fields: FieldSet::of(matched.class().field()),
         };
         self.best
             .entry(identity)
@@ -331,8 +442,8 @@ impl IdentifierRanking {
         let mut placed: Vec<(DocumentIdentity, Placement)> = self.best.into_iter().collect();
         placed.sort_by(|left, right| {
             left.1
-                .class
-                .cmp(&right.1.class)
+                .matched
+                .cmp(&right.1.matched)
                 .then(left.1.position.cmp(&right.1.position))
                 .then(left.0.cmp(&right.0))
         });
@@ -351,14 +462,14 @@ impl IdentifierRanking {
 }
 
 impl Placement {
-    /// Keeps the better of two placements: the stronger class, and at an equal
-    /// class the earlier candidate. The field sets always union, since both
-    /// fields genuinely proved a match.
+    /// Keeps the preferred spelling and class, then the earlier candidate.
+    /// Field sets union because every recorded field proved a match.
     fn absorb(&mut self, other: Self) {
         self.fields = self.fields.union(other.fields);
-        if other.class < self.class || (other.class == self.class && other.position < self.position)
+        if other.matched < self.matched
+            || (other.matched == self.matched && other.position < self.position)
         {
-            self.class = other.class;
+            self.matched = other.matched;
             self.position = other.position;
         }
     }
@@ -368,7 +479,7 @@ impl Placement {
 mod tests {
     use super::{
         IDENTIFIER_CANDIDATES_MAX, IdentifierMatchClass, IdentifierRanking, identifier_candidates,
-        identifier_terms, match_class, split_identifier_words,
+        identifier_match, identifier_terms, match_class, split_identifier_words,
     };
     use crate::document::{DocumentIdentity, SearchableField};
 
@@ -490,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_a_bare_identifier_query_is_its_own_candidate() {
-        assert_eq!(candidate_texts("SearchHit"), ["searchhit"]);
+        assert_eq!(candidate_texts("SearchHit"), ["SearchHit"]);
     }
 
     #[test]
@@ -504,7 +615,7 @@ mod tests {
     fn test_a_camel_case_token_in_prose_is_a_candidate() {
         assert_eq!(
             candidate_texts("where is getUserName called"),
-            ["getusername"]
+            ["getUserName"]
         );
     }
 
@@ -529,7 +640,114 @@ mod tests {
 
     #[test]
     fn test_a_repeated_spelling_contributes_one_candidate() {
-        assert_eq!(candidate_texts("SearchHit and searchHit"), ["searchhit"]);
+        assert_eq!(candidate_texts("SearchHit and SearchHit"), ["SearchHit"]);
+    }
+
+    #[test]
+    fn test_identifier_candidates_preserve_original_case_and_distinct_spellings() {
+        // https://github.com/volarized/rift/issues/597
+        assert_eq!(
+            candidate_texts("SearchHit and searchHit and SearchHit"),
+            ["SearchHit", "searchHit"]
+        );
+    }
+
+    #[test]
+    fn test_original_spelling_precedes_normalized_fallback_at_bound_one() {
+        for spelling in ["SearchHit", "searchHit"] {
+            let candidate = identifier_candidates(spelling).remove(0);
+            let mut ranking = IdentifierRanking::new();
+            for name in ["SearchHit", "searchHit"] {
+                let matched =
+                    identifier_match(candidate.text(), name, name).expect("the identifier matches");
+                ranking.observe_match(identity(name), candidate.position(), matched);
+            }
+            assert_eq!(ranking.finish(1)[0].identity().as_str(), spelling);
+        }
+    }
+
+    #[test]
+    fn test_original_name_equality_precedes_normalized_qualified_equality() {
+        let original = identifier_match("SearchHit", "SearchHit", "index::SearchHit")
+            .expect("the identifier matches");
+        let normalized = identifier_match("SearchHit", "searchhit", "searchhit")
+            .expect("the identifier matches");
+        assert!(original < normalized);
+        assert_eq!(original.class(), IdentifierMatchClass::NameExact);
+        assert_eq!(normalized.class(), IdentifierMatchClass::QualifiedExact);
+    }
+
+    #[test]
+    fn test_original_spelling_precedes_earlier_normalized_candidate() {
+        let candidates = identifier_candidates("SearchHit searchHit");
+        let mut ranking = IdentifierRanking::new();
+        for candidate in &candidates {
+            let matched = identifier_match(candidate.text(), "searchHit", "searchHit")
+                .expect("the identifier matches");
+            ranking.observe_match(identity("later"), candidate.position(), matched);
+        }
+        let fallback = identifier_match("SearchHit", "SEARCHHIT", "SEARCHHIT")
+            .expect("the identifier matches");
+        ranking.observe_match(identity("earlier"), 0, fallback);
+        assert_eq!(ranking.finish(1)[0].identity().as_str(), "later");
+    }
+
+    #[test]
+    fn test_candidates_keep_qualified_camel_snake_and_unicode_spelling() {
+        for spelling in [
+            "index::SearchHit",
+            "createProgram",
+            "parse_config",
+            "ÜberName",
+        ] {
+            let candidates = identifier_candidates(spelling);
+            assert_eq!(candidates[0].text(), spelling);
+            assert_eq!(candidates[0].normalized_text(), spelling.to_lowercase());
+            let matched =
+                identifier_match(spelling, spelling, spelling).expect("the identifier matches");
+            assert_eq!(matched.class(), IdentifierMatchClass::QualifiedExact);
+            let lowercase = spelling.to_lowercase();
+            let fallback =
+                identifier_match(&lowercase, spelling, spelling).expect("the identifier matches");
+            assert_eq!(fallback.class(), IdentifierMatchClass::QualifiedExact);
+        }
+        assert_eq!(match_class("ABSENT", "SearchHit", "index::SearchHit"), None);
+        assert_eq!(
+            match_class("SEARCH", "SearchHit", "index::SearchHit"),
+            Some(IdentifierMatchClass::NamePrefix)
+        );
+        assert_eq!(
+            match_class("INDEX", "SearchHit", "index::SearchHit"),
+            Some(IdentifierMatchClass::Substring)
+        );
+    }
+
+    #[test]
+    fn test_parsed_query_retains_both_original_identifier_spellings() {
+        let query = crate::ParsedQuery::parse("SearchHit and searchHit").expect("the query parses");
+        let candidates = query.candidates();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(super::IdentifierCandidate::text)
+                .collect::<Vec<_>>(),
+            ["SearchHit", "searchHit"]
+        );
+    }
+
+    #[test]
+    fn test_candidate_lists_accept_original_or_legacy_normalized_spelling() {
+        let candidates = identifier_candidates("SearchHit and searchHit");
+        let originals = vec!["SearchHit".to_owned(), "searchHit".to_owned()];
+        let legacy = vec!["searchhit".to_owned()];
+        let mixed = vec!["SearchHit".to_owned(), "searchhit".to_owned()];
+        let unrelated = vec!["OtherName".to_owned()];
+        assert!(super::identifier_candidates_match(&candidates, &originals));
+        assert!(super::identifier_candidates_match(&candidates, &legacy));
+        assert!(!super::identifier_candidates_match(&candidates, &mixed));
+        assert!(!super::identifier_candidates_match(&candidates, &unrelated));
+        assert!(!super::identifier_candidates_match(&candidates, &[]));
+        assert!(super::identifier_candidates_match(&[], &[]));
     }
 
     #[test]

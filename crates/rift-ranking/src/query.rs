@@ -637,7 +637,7 @@ mod tests {
         assert!(
             candidates
                 .iter()
-                .any(|candidate| candidate.text() == "sourceunitid"),
+                .any(|candidate| candidate.text() == "SourceUnitId"),
             "the dotted name's final segment must reach the identifier ranking: {candidates:?}"
         );
     }
