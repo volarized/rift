@@ -327,7 +327,7 @@ mod tests {
     use rift_core::ProjectPath;
     use rift_syntax::{DocumentPlacement, SyntaxLimits, SyntaxSource, registry};
 
-    use super::{PlacedDocument, PlacedFacts, WorkspaceSemantics, publication_limits};
+    use super::{PlacedDocument, WorkspaceSemantics, publication_limits};
 
     fn document() -> rift_syntax::SyntaxDocument {
         let path = ProjectPath::new("src/lib.rs").expect("path");
@@ -385,7 +385,7 @@ mod tests {
         let complete = WorkspaceSemantics::build_placed(
             &[PlacedDocument {
                 document: &document,
-                placement: placement.clone(),
+                placement,
             }],
             1,
             7,
@@ -393,12 +393,8 @@ mod tests {
         )
         .expect("complete document semantics");
         let facts = document.shared_facts();
-        let compact = WorkspaceSemantics::build_facts_placed(
-            &[PlacedFacts {
-                facts: &facts,
-                path: document.path(),
-                placement,
-            }],
+        let compact = WorkspaceSemantics::build_project_facts(
+            [(facts.as_ref(), document.path())],
             1,
             7,
             None,

@@ -367,3 +367,67 @@ fn test_retained_total_counts_only_published_document_copies() {
         "rift.analysis.package_retained_source_bytes_exceeded"
     );
 }
+
+#[test]
+fn test_notebook_document_bound_keeps_cells_and_counts_only_published_source() {
+    let notebook = r#"{"cells":[{"cell_type":"markdown","id":"first","source":"First."},{"cell_type":"markdown","id":"second","source":"Second."}],"metadata":{}}"#;
+    let package = identity();
+    let language = language(ShippedLanguage::Python);
+    let origin = origin(&package);
+    let path = ProjectPath::new("notebooks/guide.ipynb").expect("notebook path");
+    let files = [PackageSource::new(&path, notebook)];
+    let analyze_notebook = |limits| {
+        let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+        PackageAnalyzer::analyze(input, 1)
+    };
+    let default = analyze_notebook(ExactPackageLimits::new(1, notebook.len() as u64))
+        .expect("default notebook publication");
+    assert_eq!(default.publication().documents.len(), 2);
+    assert!(default.publication().warnings.is_empty());
+
+    let retained_bytes = notebook.len() + "First.".len();
+    let configuration = format!(
+        "[package]\ndocuments = 2\nretained_source = \"{}b\"\nretained_total = \"{retained_bytes}b\"\n",
+        notebook.len(),
+    );
+    let environment = ConfigurationEnvironment::from_variables([("RIFT_PACKAGE_DOCUMENTS", "1")]);
+    let accepted =
+        accept_configuration::<WorkspaceConfiguration>(Some(&configuration), &environment)
+            .expect("notebook collection configuration");
+    let limits = ExactPackageLimits::from_configuration(accepted.configuration()).expect("limits");
+    let bounded = analyze_notebook(limits).expect("only published notebook source is retained");
+    let publication = bounded.publication();
+    assert_eq!(publication.units, default.publication().units);
+    assert_eq!(publication.documents.len(), 1);
+    let first_document = default
+        .publication()
+        .documents
+        .iter()
+        .find(|document| document.file_content.as_deref() == Some("First."))
+        .expect("default first notebook document");
+    assert_eq!(&publication.documents[0], first_document);
+    assert_eq!(
+        publication.documents[0].file_content.as_deref(),
+        Some("First.")
+    );
+    assert_eq!(publication.documentation.sources.len(), 2);
+    assert_eq!(publication.documentation.coverage.omitted, 0);
+    assert!(matches!(
+        publication.warnings.as_slice(),
+        [rift_protocol::index::PackageAnalysisWarning::PublicationTruncated {
+            collection,
+            bound: 1,
+        }] if collection == "documents"
+    ));
+
+    let mut configuration = accepted.configuration().clone();
+    configuration.package.documents = 2;
+    let limits = ExactPackageLimits::from_configuration(&configuration).expect("two documents");
+    assert_eq!(
+        analyze_notebook(limits)
+            .expect_err("second document exceeds retained total")
+            .slug()
+            .as_str(),
+        "rift.analysis.package_retained_source_bytes_exceeded"
+    );
+}

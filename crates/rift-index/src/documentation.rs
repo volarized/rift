@@ -894,6 +894,141 @@ mod tests {
     }
 
     #[test]
+    fn documentation_build_omits_regular_source_past_chunk_bound() {
+        use rift_analysis::documentation::DocumentationLimits;
+        use rift_protocol::documentation::DocumentationConfiguration;
+
+        let path = rift_core::ProjectPath::new("guide.txt").expect("path");
+        let text = "body\nnext\n";
+        assert_eq!(super::regular_chunks(&path, text, 5).len(), 2);
+        let text_files = BTreeMap::from([(
+            path.clone(),
+            Arc::new(TextSourceFile::from_content(path, text.into())),
+        )]);
+        let exact = DocumentationConfiguration {
+            max_blocks: 2,
+            ..Default::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&exact).expect("bounds");
+        let (collection, _) = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            5,
+            &limits,
+            None,
+        )
+        .expect("exact chunk bound");
+        assert_eq!(collection.index().coverage.parsed, 1);
+        assert_eq!(collection.index().coverage.omitted, 0);
+        assert_eq!(collection.index().blocks.len(), 1);
+
+        let lowered = DocumentationConfiguration {
+            max_blocks: 1,
+            ..exact
+        };
+        let limits = DocumentationLimits::from_configuration(&lowered).expect("bounds");
+        let (collection, _) = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            5,
+            &limits,
+            None,
+        )
+        .expect("bounded chunk omission");
+        assert_eq!(collection.index().coverage.selected, 1);
+        assert_eq!(collection.index().coverage.parsed, 0);
+        assert_eq!(collection.index().coverage.omitted, 1);
+        assert!(collection.index().blocks.is_empty());
+        assert_eq!(
+            warning_kind(collection.index(), "guide.txt"),
+            Some((
+                rift_protocol::documentation::DocumentationStage::Source,
+                rift_protocol::documentation::DocumentationWarningKind::SourceUnavailable,
+            ))
+        );
+    }
+
+    #[test]
+    fn documentation_build_counts_regular_sources_and_notebook_cells_together() {
+        use rift_analysis::documentation::DocumentationLimits;
+        use rift_protocol::documentation::DocumentationConfiguration;
+
+        let text_files = [
+            ("guide.md", "body"),
+            (
+                "notebook.ipynb",
+                r#"{"cells":[{"cell_type":"markdown","source":"cell"}],"metadata":{}}"#,
+            ),
+        ]
+        .into_iter()
+        .map(|(path, content)| {
+            let path = rift_core::ProjectPath::new(path).expect("path");
+            (
+                path.clone(),
+                Arc::new(TextSourceFile::from_content(path, content.into())),
+            )
+        })
+        .collect();
+        let exact = DocumentationConfiguration {
+            max_sources: 2,
+            ..Default::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&exact).expect("bounds");
+        let (collection, notebooks) = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            1_024,
+            &limits,
+            None,
+        )
+        .expect("exact combined source bound");
+        assert_eq!(collection.index().coverage.selected, 2);
+        assert_eq!(collection.index().coverage.parsed, 2);
+        assert_eq!(collection.index().coverage.omitted, 0);
+        assert_eq!(notebooks.len(), 1);
+
+        let lowered = DocumentationConfiguration {
+            max_sources: 1,
+            ..exact
+        };
+        let limits = DocumentationLimits::from_configuration(&lowered).expect("bounds");
+        let error = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            1_024,
+            &limits,
+            None,
+        )
+        .expect_err("combined source count past bound refuses");
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_documentation_limit::SLUG
+        );
+        let context = error.context().collect::<Vec<_>>();
+        for (key, expected) in [
+            ("field", "sources"),
+            ("path", "notebook.ipynb"),
+            ("observed", "2"),
+            ("maximum", "1"),
+        ] {
+            assert!(
+                context
+                    .iter()
+                    .any(|(actual, value)| *actual == key && value == expected),
+                "{key}={expected}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_notebook_build_keeps_omission_and_emits_no_cell_documents() {
         let path = rift_core::ProjectPath::new("broken.ipynb").expect("valid path");
         let text_file = Arc::new(TextSourceFile::from_content(path.clone(), "{".into()));

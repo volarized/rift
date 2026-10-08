@@ -1013,6 +1013,68 @@ mod tests {
     }
 
     #[test]
+    fn test_source_set_revalidates_chunks_and_bytes_under_narrower_limits() {
+        use crate::documentation::DocumentationLimits;
+        use rift_protocol::configuration::ByteSize;
+        use rift_protocol::documentation::{DocumentationChunk, DocumentationConfiguration};
+
+        let text = "body";
+        let configuration = DocumentationConfiguration {
+            max_blocks: 2,
+            max_file: ByteSize::from_bytes(4),
+            ..DocumentationConfiguration::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&configuration).expect("input bounds");
+        let input = DocumentationInput::with_limits(source("guide.md", text), text, &limits)
+            .expect("accepted source")
+            .with_chunks(vec![
+                DocumentationChunk {
+                    identity: "guide.md#0".to_owned(),
+                    range: TextRange { start: 0, end: 2 },
+                },
+                DocumentationChunk {
+                    identity: "guide.md#1".to_owned(),
+                    range: TextRange { start: 2, end: 4 },
+                },
+            ])
+            .expect("exact chunk bound");
+        assert!(DocumentationSourceSet::with_limits(vec![input.clone()], &limits).is_ok());
+
+        for (configuration, field) in [
+            (
+                DocumentationConfiguration {
+                    max_blocks: 1,
+                    ..configuration.clone()
+                },
+                "chunks",
+            ),
+            (
+                DocumentationConfiguration {
+                    max_file: ByteSize::from_bytes(3),
+                    ..configuration
+                },
+                "source_bytes",
+            ),
+        ] {
+            let limits = DocumentationLimits::from_configuration(&configuration)
+                .expect("narrower collection bounds");
+            let error = DocumentationSourceSet::with_limits(vec![input.clone()], &limits)
+                .expect_err("input exceeds selected collection bound");
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.analysis.documentation_limit_exceeded"
+            );
+            assert_eq!(
+                crate::documentation::failure::context_value(&error, "field").as_deref(),
+                Some(field),
+            );
+        }
+        let defaults = DocumentationSourceSet::new(vec![input]).expect("default collection bounds");
+        assert_eq!(defaults.sources().len(), 1);
+        assert_eq!(defaults.sources()[0].chunks.len(), 2);
+    }
+
+    #[test]
     fn test_source_set_total_bytes_and_notebook_range_bounds_are_enforced() {
         let text =
             "a".repeat(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX as usize);
