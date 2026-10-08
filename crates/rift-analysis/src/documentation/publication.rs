@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "collector")]
 use rift_protocol::documentation::DocumentationStage;
 use rift_protocol::documentation::{
-    DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_HEADING_DEPTH_MAX, DOCUMENTATION_REFERENCES_MAX,
-    DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TEXT_BYTES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX,
-    DOCUMENTATION_WARNINGS_MAX, DocumentationBlock, DocumentationBlockKind,
+    DOCUMENTATION_BLOCKS_CEILING, DOCUMENTATION_HEADING_DEPTH_CEILING,
+    DOCUMENTATION_REFERENCES_CEILING, DOCUMENTATION_SOURCES_CEILING,
+    DOCUMENTATION_TEXT_BYTES_CEILING, DOCUMENTATION_TOTAL_BYTES_CEILING,
+    DOCUMENTATION_WARNINGS_CEILING, DocumentationBlock, DocumentationBlockKind,
     DocumentationContentIdentity, DocumentationDigest, DocumentationIndex, DocumentationLink,
     DocumentationLinkResolution, DocumentationReference, DocumentationSource, DocumentationTarget,
     DocumentationWarning, DocumentationWarningKind,
@@ -34,7 +35,7 @@ pub fn validate_documentation_hit(
             .fail();
     }
     validate_source_metadata(&hit.source)?;
-    validate_block(&hit.block, &hit.source)
+    validate_block(&hit.block, &hit.source, None)
 }
 
 /// Validates exact-symbol context, source facts, reference ordering, and total excerpt bytes.
@@ -52,7 +53,7 @@ pub fn validate_documentation_context(
     if !is_revision_digest(&context.documentation_revision)
         || !valid_symbol_identity(symbol)
         || context.references.len() > DOCUMENTATION_SYMBOL_REFERENCES_MAX as usize
-        || context.warnings.len() > DOCUMENTATION_WARNINGS_MAX as usize
+        || context.warnings.len() > DOCUMENTATION_WARNINGS_CEILING as usize
     {
         return errors::analysis::documentation_limit_exceeded()
             .field("documentation")
@@ -72,7 +73,7 @@ pub fn validate_documentation_context(
             || block.symbol.is_some()
             || !is_digest(&reference.identity)
             || !identities.insert(&reference.identity)
-            || !valid_text(&reference.authored)
+            || !valid_text(&reference.authored, None)
             || !contains(&block.range, &reference.range)
             || hit.documentation.documentation_revision != context.documentation_revision
         {
@@ -122,6 +123,8 @@ pub fn validate_documentation_context(
 /// A validated documentation index with exact-symbol reverse references.
 #[derive(Debug)]
 pub struct DocumentationCollection {
+    #[cfg(feature = "collector")]
+    limits: super::DocumentationLimits,
     index: DocumentationIndex,
     references: BTreeMap<SymbolId, Vec<usize>>,
     blocks: BTreeMap<DocumentationDigest, usize>,
@@ -147,8 +150,8 @@ impl DocumentationCollection {
         mut sources: Vec<DocumentationSource>,
         mut blocks: Vec<DocumentationBlock>,
     ) -> Result<Self, RiftError> {
-        if sources.len() > DOCUMENTATION_SOURCES_MAX as usize
-            || blocks.len() > DOCUMENTATION_BLOCKS_MAX as usize
+        if sources.len() > DOCUMENTATION_SOURCES_CEILING as usize
+            || blocks.len() > DOCUMENTATION_BLOCKS_CEILING as usize
         {
             return errors::analysis::documentation_limit_exceeded()
                 .field("projection.records")
@@ -196,7 +199,14 @@ impl DocumentationCollection {
     ///
     /// Returns a typed refusal for invalid identities, ranges, ordering, or relationships.
     pub fn new(index: DocumentationIndex) -> Result<Self, RiftError> {
-        validate_counts(&index)?;
+        Self::new_with_limits(index, None)
+    }
+
+    pub(super) fn new_with_limits(
+        index: DocumentationIndex,
+        limits: Option<super::DocumentationLimits>,
+    ) -> Result<Self, RiftError> {
+        validate_counts(&index, limits.as_ref())?;
         if index.documentation_revision != super::documentation_revision() {
             return errors::analysis::documentation_revision_invalid()
                 .field("documentation_revision")
@@ -209,10 +219,10 @@ impl DocumentationCollection {
                 .field("selection_digest")
                 .fail();
         }
-        let blocks = validate_blocks(&index, &sources)?;
-        validate_links(&index, &sources, &blocks)?;
+        let blocks = validate_blocks(&index, &sources, limits.as_ref())?;
+        validate_links(&index, &sources, &blocks, limits.as_ref())?;
         validate_warnings(&index.warnings, &sources, true)?;
-        let mut references = validate_references(&index, &blocks)?;
+        let mut references = validate_references(&index, &blocks, limits.as_ref())?;
         for positions in references.values_mut() {
             positions.sort_by_key(|position| {
                 let reference = &index.references[*position];
@@ -239,6 +249,8 @@ impl DocumentationCollection {
             .map(|(position, source)| (source.identity.clone(), position))
             .collect();
         Ok(Self {
+            #[cfg(feature = "collector")]
+            limits: limits.unwrap_or_default(),
             index,
             references,
             blocks,
@@ -285,7 +297,7 @@ impl DocumentationCollection {
         self,
         omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     ) -> Result<Self, RiftError> {
-        if omissions.len() > DOCUMENTATION_SOURCES_MAX as usize {
+        if omissions.len() > self.limits.sources_max as usize {
             return errors::analysis::documentation_limit_exceeded()
                 .field("sources")
                 .fail();
@@ -297,6 +309,7 @@ impl DocumentationCollection {
         })?;
         let DocumentationCollection {
             mut index,
+            limits,
             #[cfg(feature = "collector")]
             extraction_cache,
             #[cfg(feature = "collector")]
@@ -307,7 +320,7 @@ impl DocumentationCollection {
             .coverage
             .selected
             .checked_add(omitted_count)
-            .filter(|count| *count <= DOCUMENTATION_SOURCES_MAX)
+            .filter(|count| *count <= limits.sources_max)
             .ok_or_else(|| {
                 errors::analysis::documentation_limit_exceeded()
                     .field("sources")
@@ -322,8 +335,7 @@ impl DocumentationCollection {
                     .field("sources")
                     .error()
             })?;
-        let warning_slots =
-            (DOCUMENTATION_WARNINGS_MAX as usize).saturating_sub(index.warnings.len());
+        let warning_slots = (limits.warnings_max as usize).saturating_sub(index.warnings.len());
         for (source, kind) in omissions.into_iter().take(warning_slots) {
             index.warnings.push(DocumentationWarning {
                 source,
@@ -332,7 +344,7 @@ impl DocumentationCollection {
                 count: 1,
             });
         }
-        let mut collection = Self::new(index)?;
+        let mut collection = Self::new_with_limits(index, Some(limits))?;
         #[cfg(feature = "collector")]
         {
             collection.extraction_cache = extraction_cache;
@@ -582,22 +594,47 @@ fn link_address(link: &DocumentationLink) -> LinkAddress {
     (link.block.clone(), link.range.start, link.range.end)
 }
 
-fn validate_counts(index: &DocumentationIndex) -> Result<(), RiftError> {
+fn validate_counts(
+    index: &DocumentationIndex,
+    limits: Option<&super::DocumentationLimits>,
+) -> Result<(), RiftError> {
     let counts = [
-        ("sources", index.sources.len(), DOCUMENTATION_SOURCES_MAX),
-        ("blocks", index.blocks.len(), DOCUMENTATION_BLOCKS_MAX),
-        ("links", index.links.len(), DOCUMENTATION_REFERENCES_MAX),
+        (
+            "sources",
+            index.sources.len(),
+            limits.map_or(DOCUMENTATION_SOURCES_CEILING, |limits| limits.sources_max),
+        ),
+        (
+            "blocks",
+            index.blocks.len(),
+            limits.map_or(DOCUMENTATION_BLOCKS_CEILING, |limits| limits.blocks_max),
+        ),
+        (
+            "links",
+            index.links.len(),
+            limits.map_or(DOCUMENTATION_REFERENCES_CEILING, |limits| {
+                limits.references_max
+            }),
+        ),
         (
             "references",
             index.references.len(),
-            DOCUMENTATION_REFERENCES_MAX,
+            limits.map_or(DOCUMENTATION_REFERENCES_CEILING, |limits| {
+                limits.references_max
+            }),
         ),
         (
             "unresolved_references",
             index.unresolved_references.len(),
-            DOCUMENTATION_REFERENCES_MAX,
+            limits.map_or(DOCUMENTATION_REFERENCES_CEILING, |limits| {
+                limits.references_max
+            }),
         ),
-        ("warnings", index.warnings.len(), DOCUMENTATION_WARNINGS_MAX),
+        (
+            "warnings",
+            index.warnings.len(),
+            limits.map_or(DOCUMENTATION_WARNINGS_CEILING, |limits| limits.warnings_max),
+        ),
     ];
     if let Some((field, _, _)) = counts
         .into_iter()
@@ -625,7 +662,8 @@ fn validate_counts(index: &DocumentationIndex) -> Result<(), RiftError> {
     let retained = u32::try_from(index.sources.len()).unwrap_or(u32::MAX);
     let selected_matches = retained >= index.coverage.parsed
         && retained <= index.coverage.selected
-        && index.coverage.selected <= DOCUMENTATION_SOURCES_MAX;
+        && index.coverage.selected
+            <= limits.map_or(DOCUMENTATION_SOURCES_CEILING, |limits| limits.sources_max);
     if !counts_match || !truncation_bounded || !selected_matches {
         return errors::analysis::documentation_limit_exceeded()
             .field("coverage")
@@ -649,7 +687,7 @@ fn validate_sources(
         }
         total_bytes = total_bytes
             .checked_add(source.byte_length)
-            .filter(|bytes| *bytes <= DOCUMENTATION_TOTAL_BYTES_MAX)
+            .filter(|bytes| *bytes <= DOCUMENTATION_TOTAL_BYTES_CEILING)
             .ok_or_else(|| {
                 errors::analysis::documentation_limit_exceeded()
                     .field("source_bytes")
@@ -664,6 +702,7 @@ fn validate_sources(
 fn validate_blocks<'index>(
     index: &'index DocumentationIndex,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
+    limits: Option<&super::DocumentationLimits>,
 ) -> Result<BTreeMap<&'index DocumentationDigest, &'index DocumentationBlock>, RiftError> {
     let mut blocks = BTreeMap::new();
     let mut previous = None;
@@ -673,7 +712,7 @@ fn validate_blocks<'index>(
                 .field("block.source")
                 .error()
         })?;
-        validate_block(block, source)?;
+        validate_block(block, source, limits)?;
         let order = (
             &block.source,
             block.range.start,
@@ -698,6 +737,7 @@ fn validate_blocks<'index>(
 fn validate_block(
     block: &DocumentationBlock,
     source: &DocumentationSource,
+    limits: Option<&super::DocumentationLimits>,
 ) -> Result<(), RiftError> {
     let range_valid = block.range.end > block.range.start && block.range.end <= source.byte_length;
     let line_valid = block.line > 0 && block.line <= source.byte_length;
@@ -718,7 +758,7 @@ fn validate_block(
     let language_valid = block
         .language
         .as_ref()
-        .is_none_or(|language| valid_text(language));
+        .is_none_or(|language| valid_text(language, limits));
     let prose_valid = block.kind != DocumentationBlockKind::Prose || block.language.is_none();
     if !symbol_valid {
         return errors::analysis::documentation_identity_invalid()
@@ -730,29 +770,38 @@ fn validate_block(
             .field("block.language")
             .fail();
     }
-    validate_headings(block)?;
+    validate_headings(block, limits)?;
     validate_chunks(block, source)
 }
 
-fn valid_text(text: &str) -> bool {
-    !text.is_empty() && text.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize
+fn valid_text(text: &str, limits: Option<&super::DocumentationLimits>) -> bool {
+    !text.is_empty()
+        && text.len() as u64
+            <= limits.map_or(u64::from(DOCUMENTATION_TEXT_BYTES_CEILING), |limits| {
+                limits.text_bytes_max
+            })
 }
 
 fn valid_symbol_identity(symbol: &SymbolId) -> bool {
     rift_core::parse_symbol_identity(&symbol.0).is_ok()
 }
 
-fn validate_headings(block: &DocumentationBlock) -> Result<(), RiftError> {
-    if block.heading_path.len() > DOCUMENTATION_HEADING_DEPTH_MAX as usize {
+fn validate_headings(
+    block: &DocumentationBlock,
+    limits: Option<&super::DocumentationLimits>,
+) -> Result<(), RiftError> {
+    let maximum = limits.map_or(DOCUMENTATION_HEADING_DEPTH_CEILING, |limits| {
+        limits.heading_depth_max
+    });
+    if block.heading_path.len() > maximum as usize {
         return errors::analysis::documentation_limit_exceeded()
             .field("heading_path")
             .fail();
     }
     let mut previous_level = 0;
     for heading in &block.heading_path {
-        let ordered =
-            heading.level > previous_level && heading.level <= DOCUMENTATION_HEADING_DEPTH_MAX;
-        if !ordered || !valid_text(&heading.name) {
+        let ordered = heading.level > previous_level && heading.level <= maximum;
+        if !ordered || !valid_text(&heading.name, limits) {
             return errors::analysis::documentation_order_invalid()
                 .field("heading_path")
                 .fail();
@@ -766,7 +815,7 @@ fn validate_chunks(
     block: &DocumentationBlock,
     source: &DocumentationSource,
 ) -> Result<(), RiftError> {
-    if block.chunks.len() > DOCUMENTATION_BLOCKS_MAX as usize {
+    if block.chunks.len() > DOCUMENTATION_BLOCKS_CEILING as usize {
         return errors::analysis::documentation_limit_exceeded()
             .field("chunks")
             .fail();
@@ -806,6 +855,7 @@ fn validate_links(
     index: &DocumentationIndex,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
+    limits: Option<&super::DocumentationLimits>,
 ) -> Result<(), RiftError> {
     let mut addresses = BTreeSet::new();
     for link in &index.links {
@@ -816,7 +866,10 @@ fn validate_links(
         })?;
         let unique = addresses.insert(link_address(link));
         let range_valid = contains_link_range(block, &link.range);
-        let text_bounded = link.authored.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize;
+        let text_bounded = link.authored.len() as u64
+            <= limits.map_or(u64::from(DOCUMENTATION_TEXT_BYTES_CEILING), |limits| {
+                limits.text_bytes_max
+            });
         if !unique || !range_valid || !text_bounded {
             return errors::analysis::documentation_range_invalid()
                 .field("link")
@@ -912,6 +965,7 @@ fn validate_warnings(
 fn validate_references(
     index: &DocumentationIndex,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
+    limits: Option<&super::DocumentationLimits>,
 ) -> Result<BTreeMap<SymbolId, Vec<usize>>, RiftError> {
     let mut identities = BTreeSet::new();
     let mut reverse: BTreeMap<SymbolId, Vec<usize>> = BTreeMap::new();
@@ -926,7 +980,7 @@ fn validate_references(
         let symbol_valid = valid_symbol_identity(&reference.target);
         if !unique
             || !symbol_valid
-            || !valid_text(&reference.authored)
+            || !valid_text(&reference.authored, limits)
             || !is_digest(&reference.identity)
         {
             return errors::analysis::documentation_identity_invalid()
@@ -966,7 +1020,7 @@ fn validate_references(
                 .is_ok()
         });
         if !contains(&block.range, &candidate.range)
-            || !valid_text(&candidate.authored)
+            || !valid_text(&candidate.authored, limits)
             || !language_valid
         {
             return errors::analysis::documentation_range_invalid()
@@ -1476,9 +1530,10 @@ mod tests {
 
     #[test]
     fn publication_total_source_bytes_are_bounded() {
-        let source_bytes = u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_MAX);
+        let source_bytes =
+            u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_CEILING);
         let source_count = usize::try_from(
-            rift_protocol::documentation::DOCUMENTATION_TOTAL_BYTES_MAX / source_bytes,
+            rift_protocol::documentation::DOCUMENTATION_TOTAL_BYTES_CEILING / source_bytes,
         )
         .expect("fixture source count")
             + 1;
@@ -1503,16 +1558,16 @@ mod tests {
         let base = index(vec![source_record.clone()]);
 
         let mut over_count = base.clone();
-        over_count.warnings = vec![
-            rift_protocol::documentation::DocumentationWarning {
-                source: source_record.identity.clone(),
-                stage: rift_protocol::documentation::DocumentationStage::Extract,
-                kind: rift_protocol::documentation::DocumentationWarningKind::OmittedRange,
-                count: 1,
-            };
-            rift_protocol::documentation::DOCUMENTATION_WARNINGS_MAX as usize
-                + 1
-        ];
+        over_count.warnings =
+            vec![
+                rift_protocol::documentation::DocumentationWarning {
+                    source: source_record.identity.clone(),
+                    stage: rift_protocol::documentation::DocumentationStage::Extract,
+                    kind: rift_protocol::documentation::DocumentationWarningKind::OmittedRange,
+                    count: 1,
+                };
+                rift_protocol::documentation::DOCUMENTATION_WARNINGS_CEILING as usize + 1
+            ];
         refused_field(over_count, "warnings");
 
         let mut bad_coverage = base;

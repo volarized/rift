@@ -16,10 +16,8 @@ use ignore::{DirEntry, Match, Walk, WalkBuilder};
 pub use rift_analysis::IndexedFile;
 use rift_analysis::documentation::{DocumentationCollection, DocumentationLayer};
 use rift_core::constants::{
-    READ_RESULTS_MAX_DEFAULT, VCS_IGNORE_FILE, WORKSPACE_BYTES_MAX_DEFAULT,
-    WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DECLARATIONS_MAX_DEFAULT,
-    WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT,
-    WORKSPACE_IGNORED_DIRECTORIES,
+    VCS_IGNORE_FILE, WORKSPACE_BYTES_MAX_DEFAULT, WORKSPACE_CONFIGURATION_FILE,
+    WORKSPACE_DECLARATIONS_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
     CompositionId, LanguageFileSelections, PortableSymbolFacts, ProjectPath, ProviderId,
@@ -68,6 +66,8 @@ pub struct WorkspaceIndexLimits {
     file_bytes_max: usize,
     workspace_bytes_max: usize,
     declarations_max: usize,
+    relationships_max: usize,
+    revision_tree_entries_max: usize,
     directory_depth_max: usize,
     results_max: usize,
     syntax: SyntaxLimits,
@@ -96,12 +96,48 @@ impl WorkspaceIndexLimits {
             file_bytes_max,
             workspace_bytes_max,
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
+            relationships_max: usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+                .unwrap_or(usize::MAX),
+            revision_tree_entries_max: usize::try_from(
+                rift_protocol::configuration::HISTORY_TREE_ENTRIES_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
             directory_depth_max,
             results_max,
             syntax: SyntaxLimits::default(),
             large_files: LargeFileStrategy::default(),
         }
         .validated()
+    }
+
+    /// Replaces the entry bound a committed revision tree is collected under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the bound is outside the accepted history range.
+    pub fn with_revision_tree_entries(
+        mut self,
+        revision_tree_entries_max: usize,
+    ) -> Result<Self, RiftError> {
+        let value = u64::try_from(revision_tree_entries_max).unwrap_or(u64::MAX);
+        if !(1..=rift_protocol::configuration::HISTORY_TREE_ENTRIES_MAX).contains(&value) {
+            return Err(rift_core::configuration_violation_error(
+                &rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange {
+                    field: "providers.history.tree_entries",
+                    value,
+                    min: 1,
+                    max: rift_protocol::configuration::HISTORY_TREE_ENTRIES_MAX,
+                },
+            ));
+        }
+        self.revision_tree_entries_max = revision_tree_entries_max;
+        Ok(self)
+    }
+
+    /// Most entries one committed revision tree visits before its listing is refused.
+    #[must_use]
+    pub const fn revision_tree_entries_max(self) -> usize {
+        self.revision_tree_entries_max
     }
 
     /// Refuses any bound that is zero, so no build runs under a bound it cannot meet.
@@ -116,12 +152,14 @@ impl WorkspaceIndexLimits {
         Ok(self)
     }
 
-    const fn bounds(self) -> [usize; 6] {
+    const fn bounds(self) -> [usize; 8] {
         [
             self.files_max,
             self.file_bytes_max,
             self.workspace_bytes_max,
             self.declarations_max,
+            self.relationships_max,
+            self.revision_tree_entries_max,
             self.directory_depth_max,
             self.results_max,
         ]
@@ -148,6 +186,24 @@ impl WorkspaceIndexLimits {
         .validated()
     }
 
+    /// Sets directory scan depth and collected read results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when either bound is zero.
+    pub fn with_read_bounds(
+        self,
+        directory_depth_max: usize,
+        results_max: usize,
+    ) -> Result<Self, RiftError> {
+        Self {
+            directory_depth_max,
+            results_max,
+            ..self
+        }
+        .validated()
+    }
+
     /// Returns maximum result count accepted per query.
     #[must_use]
     pub const fn results_max(self) -> usize {
@@ -164,6 +220,24 @@ impl WorkspaceIndexLimits {
     #[must_use]
     pub const fn declarations_max(self) -> usize {
         self.declarations_max
+    }
+
+    /// Returns maximum relationship edges held by the adjacency index.
+    #[must_use]
+    pub const fn relationships_max(self) -> usize {
+        self.relationships_max
+    }
+
+    /// Applies caller-selected relationship capacity.
+    ///
+    /// # Errors
+    /// Returns a registered error for zero capacity.
+    pub fn with_relationships(self, relationships_max: usize) -> Result<Self, RiftError> {
+        Self {
+            relationships_max,
+            ..self
+        }
+        .validated()
     }
 
     /// Returns maximum bytes accepted for one source file.
@@ -241,8 +315,18 @@ impl Default for WorkspaceIndexLimits {
             file_bytes_max: registry::file_bytes_max_default(),
             workspace_bytes_max: WORKSPACE_BYTES_MAX_DEFAULT,
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
-            directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
-            results_max: READ_RESULTS_MAX_DEFAULT,
+            relationships_max: usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+                .unwrap_or(usize::MAX),
+            revision_tree_entries_max: usize::try_from(
+                rift_protocol::configuration::HISTORY_TREE_ENTRIES_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
+            directory_depth_max: usize::try_from(
+                rift_protocol::source::SOURCE_DIRECTORY_DEPTH_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
+            results_max: usize::try_from(rift_protocol::configuration::SEARCH_RESULTS_DEFAULT)
+                .unwrap_or(usize::MAX),
             syntax: SyntaxLimits::default(),
             large_files: LargeFileStrategy::default(),
         }
@@ -2261,6 +2345,7 @@ impl WorkspaceIndex {
                 &root,
                 contents.sorted(),
                 limits.declarations_max(),
+                limits.relationships_max(),
                 previous.map(|index| index.semantics.graph()),
             )
         })?;
@@ -2277,6 +2362,9 @@ impl WorkspaceIndex {
             &declarations,
             &documentation_selection(text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
+            &rift_analysis::documentation::DocumentationLimits::from_configuration(
+                text_inclusion.documentation(),
+            )?,
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
         let (symbol_documents, symbol_document_entry_count, symbol_document_entry_count_reading) =
@@ -2369,6 +2457,7 @@ impl WorkspaceIndex {
             &self.root,
             contents.sorted(),
             self.limits.declarations_max(),
+            self.limits.relationships_max(),
             Some(self.semantics.graph()),
         )?;
         check_cancelled(cancelled)?;
@@ -2380,6 +2469,9 @@ impl WorkspaceIndex {
             &declarations,
             &documentation_selection(&self.text_inclusion)?,
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
+            &rift_analysis::documentation::DocumentationLimits::from_configuration(
+                self.text_inclusion.documentation(),
+            )?,
             Some((&self.documentation, &self.notebooks)),
         )?;
         check_cancelled(cancelled)?;
@@ -2493,6 +2585,7 @@ impl WorkspaceIndex {
             &root,
             contents.sorted(),
             limits.declarations_max(),
+            limits.relationships_max(),
             previous.map(|index| index.semantics.graph()),
         )?;
         let declarations = accepted_declarations(&files, &semantics);
@@ -2502,6 +2595,9 @@ impl WorkspaceIndex {
             &declarations,
             &documentation_selection(&text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
+            &rift_analysis::documentation::DocumentationLimits::from_configuration(
+                text_inclusion.documentation(),
+            )?,
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
         let (symbol_documents, symbol_document_entry_count, symbol_document_entry_count_reading) =
@@ -2579,7 +2675,16 @@ impl WorkspaceIndex {
                     component = "documentation",
                     operation = "documentation.layer",
                     corpus = "project",
-                    { DocumentationLayer::shared([Arc::clone(&self.documentation)]) }
+                    {
+                        let limits =
+                            rift_analysis::documentation::DocumentationLimits::from_configuration(
+                                self.text_inclusion.documentation(),
+                            )?;
+                        DocumentationLayer::shared_with_limits(
+                            [Arc::clone(&self.documentation)],
+                            &limits,
+                        )
+                    }
                 )
             })
             .as_ref()
@@ -3555,6 +3660,7 @@ fn built_contents(
     root: &Path,
     mut contents: IndexContents,
     declarations_max: usize,
+    relationships_max: usize,
     previous: Option<&NormalizedGraph>,
 ) -> Result<BuiltContents, RiftError> {
     let passes_max = contents.files.len().saturating_add(1);
@@ -3576,12 +3682,13 @@ fn built_contents(
                     phase = "WorkspaceSemantics::build_project_facts",
                     files = contents.files.len(),
                     {
-                        WorkspaceSemantics::build_project_facts(
+                        WorkspaceSemantics::build_project_facts_with_relationships(
                             contents
                                 .files
                                 .values()
                                 .map(|file| (file.syntax(), file.path())),
                             declarations_max,
+                            relationships_max,
                             fingerprint.revision_number(),
                             previous,
                         )
@@ -5518,6 +5625,7 @@ fn text_document(
 
 #[cfg(test)]
 mod tests {
+    use rift_core::constants::{READ_RESULTS_MAX_DEFAULT, WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT};
     use std::fmt::Write as _;
 
     use super::*;
@@ -6729,6 +6837,7 @@ mod tests {
                 enabled: true,
                 exclude: vec![PathPattern("README.md".to_owned())],
                 force_include: vec![PathPattern("CHANGELOG.md".to_owned())],
+                ..DocumentationConfiguration::default()
             });
         let index = indexed(root, &overridden);
         assert_eq!(
@@ -10155,6 +10264,22 @@ mod tests {
     }
 
     #[test]
+    fn test_read_bounds_replace_depth_and_results_and_refuse_zero() {
+        let base = WorkspaceIndexLimits::new(8, 16, 1_024, 4, 32).expect("bounds");
+        let bounded = base.with_read_bounds(2, 3).expect("positive bounds");
+        assert_eq!(bounded.directory_depth_max(), 2);
+        assert_eq!(bounded.results_max(), 3);
+        assert_eq!(bounded.files_max(), base.files_max());
+        assert_eq!(bounded.declarations_max(), base.declarations_max());
+        for error in [base.with_read_bounds(0, 3), base.with_read_bounds(2, 0)] {
+            assert_eq!(
+                error.expect_err("zero bound").slug(),
+                errors::index::workspace_zero_limit::SLUG
+            );
+        }
+    }
+
+    #[test]
     fn test_source_bound_refusals_name_the_configuration_key() {
         let directory = tempfile::tempdir().expect("workspace");
         fs::write(directory.path().join("one.rs"), "pub fn one() {}\n").expect("source");
@@ -10268,8 +10393,14 @@ mod tests {
                 )
                 .expect("the catalog holds the file");
         }
-        let built = built_contents(root.path(), contents.sorted(), 4, None)
-            .expect("the build publishes the files that fit");
+        let built = built_contents(
+            root.path(),
+            contents.sorted(),
+            4,
+            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            None,
+        )
+        .expect("the build publishes the files that fit");
         assert_eq!(
             built
                 .files
@@ -10319,8 +10450,14 @@ mod tests {
                 )
                 .expect("the catalog holds the file");
         }
-        let built = built_contents(root.path(), contents.sorted(), 6, None)
-            .expect("the build publishes every file");
+        let built = built_contents(
+            root.path(),
+            contents.sorted(),
+            6,
+            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            None,
+        )
+        .expect("the build publishes every file");
         assert_eq!(built.files.len(), 2);
         assert!(built.left_out.is_empty());
         assert!(built.warnings.is_empty());
@@ -10381,10 +10518,22 @@ mod tests {
                 )
             );
         }
-        let built = built_contents(root.path(), contents.sorted(), 10, None)
-            .expect("all refused declarations leave out together");
-        let expected = built_contents(root.path(), expected.sorted(), 10, None)
-            .expect("valid source alone builds");
+        let built = built_contents(
+            root.path(),
+            contents.sorted(),
+            10,
+            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            None,
+        )
+        .expect("all refused declarations leave out together");
+        let expected = built_contents(
+            root.path(),
+            expected.sorted(),
+            10,
+            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            None,
+        )
+        .expect("valid source alone builds");
         assert_eq!(built.left_out.len(), 2);
         assert!(matches!(built.warnings.as_slice(), [
             WorkspaceIndexWarning::Contribution { path: first, error: first_error },
@@ -10406,9 +10555,15 @@ mod tests {
     #[test]
     fn a_refused_semantics_build_names_the_index_build_and_the_workspace() {
         let root = tempfile::tempdir().expect("temporary workspace");
-        let error = built_contents(root.path(), IndexContents::default(), 0, None)
-            .err()
-            .expect("a zero declaration bound refuses the publication");
+        let error = built_contents(
+            root.path(),
+            IndexContents::default(),
+            0,
+            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            None,
+        )
+        .err()
+        .expect("a zero declaration bound refuses the publication");
         assert_eq!(error.slug(), errors::provider::publication_zero_limit::SLUG);
         let context: Vec<(String, String)> = error
             .context()

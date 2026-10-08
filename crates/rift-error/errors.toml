@@ -1541,3 +1541,13 @@ fields = { operation = { type = "string" }, path = { type = "path", format = "di
 message = "We were not able to clean up the old binary at `{path}`: {source}: delete the file manually"
 action = "delete the file manually"
 fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.analysis.package_retained_source_limits_invalid]
+message = "retained source limits are invalid"
+action = "choose a positive record bound at or below its ceiling and a total at least as large"
+fields = { record_bytes_max = { type = "unsigned" }, total_bytes_max = { type = "unsigned" }, record_bytes_ceiling = { type = "unsigned" } }
+
+[error.analysis.package_retained_source_bytes_exceeded]
+message = "retained source strings and their copies exceed their accepted byte limit"
+action = "raise the retained source total within the caller's memory bound or reduce retained source bytes"
+fields = { bound = { type = "unsigned" }, observed = { type = "unsigned" } }

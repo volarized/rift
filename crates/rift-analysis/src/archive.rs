@@ -30,11 +30,12 @@ pub enum ArchiveDigest {
 }
 
 /// Work and allocation bounds for one archive.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveLimits {
     compressed_bytes: usize,
     expanded_bytes: usize,
     member_bytes: usize,
+    extension_bytes: usize,
     members: usize,
     expansion_ratio: usize,
 }
@@ -44,6 +45,21 @@ impl ArchiveLimits {
     #[must_use]
     pub const fn compressed_bytes_max(self) -> usize {
         self.compressed_bytes
+    }
+
+    /// Replaces the byte bound for one GNU or PAX extended header.
+    ///
+    /// Extended headers also pass the member byte bound before their contents are allocated.
+    ///
+    /// # Errors
+    /// Returns [`ArchiveError::InvalidLimits`] for zero or an unsupported byte bound.
+    pub fn with_extension_size(mut self, extension_bytes: usize) -> Result<Self, ArchiveError> {
+        let bytes = u64::try_from(extension_bytes).map_err(|_| ArchiveError::InvalidLimits)?;
+        if !(1..=rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_MAX).contains(&bytes) {
+            return Err(ArchiveError::InvalidLimits);
+        }
+        self.extension_bytes = extension_bytes;
+        Ok(self)
     }
 
     /// Creates limits below the shared archive ceilings.
@@ -57,27 +73,49 @@ impl ArchiveLimits {
         members: usize,
         expansion_ratio: usize,
     ) -> Result<Self, ArchiveError> {
-        let maximum = Self::default();
-        if compressed_bytes == 0
-            || compressed_bytes > maximum.compressed_bytes
-            || expanded_bytes == 0
-            || expanded_bytes > maximum.expanded_bytes
-            || member_bytes == 0
-            || member_bytes > expanded_bytes
-            || member_bytes > maximum.member_bytes
-            || members == 0
-            || members > maximum.members
-            || expansion_ratio == 0
-            || expansion_ratio > maximum.expansion_ratio
-        {
-            return Err(ArchiveError::InvalidLimits);
-        }
+        use rift_protocol::configuration::{ArchiveConfiguration, ByteSize};
+
+        Self::from_configuration(&ArchiveConfiguration {
+            compressed_size: ByteSize::from_bytes(
+                u64::try_from(compressed_bytes).map_err(|_| ArchiveError::InvalidLimits)?,
+            ),
+            expanded_size: ByteSize::from_bytes(
+                u64::try_from(expanded_bytes).map_err(|_| ArchiveError::InvalidLimits)?,
+            ),
+            member_size: ByteSize::from_bytes(
+                u64::try_from(member_bytes).map_err(|_| ArchiveError::InvalidLimits)?,
+            ),
+            extension_size: ByteSize::from_bytes(TAR_EXTENSION_BYTES_MAX),
+            members: u32::try_from(members).map_err(|_| ArchiveError::InvalidLimits)?,
+            expansion_ratio: u32::try_from(expansion_ratio)
+                .map_err(|_| ArchiveError::InvalidLimits)?,
+        })
+    }
+
+    /// Uses the archive acquisition bounds accepted from configuration and environment.
+    ///
+    /// # Errors
+    /// Returns [`ArchiveError::InvalidLimits`] for zero, unordered, excessive,
+    /// or unrepresentable bounds.
+    pub fn from_configuration(
+        configuration: &rift_protocol::configuration::ArchiveConfiguration,
+    ) -> Result<Self, ArchiveError> {
+        configuration
+            .validate()
+            .map_err(|_| ArchiveError::InvalidLimits)?;
         Ok(Self {
-            compressed_bytes,
-            expanded_bytes,
-            member_bytes,
-            members,
-            expansion_ratio,
+            compressed_bytes: usize::try_from(configuration.compressed_size.bytes())
+                .map_err(|_| ArchiveError::InvalidLimits)?,
+            expanded_bytes: usize::try_from(configuration.expanded_size.bytes())
+                .map_err(|_| ArchiveError::InvalidLimits)?,
+            member_bytes: usize::try_from(configuration.member_size.bytes())
+                .map_err(|_| ArchiveError::InvalidLimits)?,
+            extension_bytes: usize::try_from(configuration.extension_size.bytes())
+                .map_err(|_| ArchiveError::InvalidLimits)?,
+            members: usize::try_from(configuration.members)
+                .map_err(|_| ArchiveError::InvalidLimits)?,
+            expansion_ratio: usize::try_from(configuration.expansion_ratio)
+                .map_err(|_| ArchiveError::InvalidLimits)?,
         })
     }
 }
@@ -88,6 +126,8 @@ impl Default for ArchiveLimits {
             compressed_bytes: 64 * 1024 * 1024,
             expanded_bytes: 512 * 1024 * 1024,
             member_bytes: 64 * 1024 * 1024,
+            extension_bytes: usize::try_from(TAR_EXTENSION_BYTES_MAX)
+                .expect("default extension bytes fit usize"),
             members: 100_000,
             expansion_ratio: 200,
         }
@@ -225,7 +265,7 @@ pub fn read_archive(
     })
 }
 
-const TAR_EXTENSION_BYTES_MAX: u64 = 16 * 1024;
+const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_DEFAULT;
 
 /// Regular files and skipped-link paths extracted from one archive container.
 type ArchiveContents = (BTreeMap<ProjectPath, Vec<u8>>, Vec<ProjectPath>);
@@ -265,7 +305,10 @@ fn read_tar(
         }
         if entry.size()
             > u64::try_from(limits.member_bytes).map_err(|_| ArchiveError::MemberLimit)?
-            || (extension && entry.size() > TAR_EXTENSION_BYTES_MAX)
+            || (extension
+                && entry.size()
+                    > u64::try_from(limits.extension_bytes)
+                        .map_err(|_| ArchiveError::MemberLimit)?)
         {
             return Err(ArchiveError::MemberLimit);
         }

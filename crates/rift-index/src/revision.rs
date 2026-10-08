@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use rift_core::constants::WORKSPACE_IGNORED_DIRECTORIES;
 use rift_core::{CompositionId, ProjectPath, SourceVisibility};
 use rift_error::{RiftError, errors};
-use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile};
+use rift_history::{Repository, ResolvedRevision, TreeFile};
 use rift_protocol::source::SOURCE_FILES_FIELD;
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
@@ -151,7 +151,8 @@ impl WorkspaceIndex {
         )?);
         let visible = RevisionPaths::build(&root, visibility)?;
         let includes = |path: &str| visible.includes(path) && selection(path);
-        let listed = repository.tree_files(revision, &includes, REVISION_TREE_ENTRIES_MAX)?;
+        let listed =
+            repository.tree_files(revision, &includes, limits.revision_tree_entries_max())?;
         let mut catalog_bytes = 0_usize;
         let mut contents = IndexContents::default();
         for tree_file in &listed {

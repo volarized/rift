@@ -16,6 +16,7 @@ use crate::resolver::{
 /// `/workspace\bun.lock`.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedInspector {
+    collection: rift_protocol::dependencies::DependenciesCollectionConfiguration,
     files: BTreeMap<PathBuf, Vec<u8>>,
     directories: BTreeSet<PathBuf>,
     commands: BTreeMap<String, Result<CommandOutput, CommandFailure>>,
@@ -25,6 +26,15 @@ pub(crate) struct RecordedInspector {
 }
 
 impl RecordedInspector {
+    /// Uses the accepted collection bounds while answering recorded file and directory reads.
+    pub(crate) fn with_collection(
+        mut self,
+        collection: rift_protocol::dependencies::DependenciesCollectionConfiguration,
+    ) -> Self {
+        self.collection = collection;
+        self
+    }
+
     /// Scripts one file's content; its parent directories exist too.
     pub(crate) fn with_file(
         mut self,
@@ -117,6 +127,10 @@ fn spelled(path: &Path) -> String {
 }
 
 impl StaticInputs for RecordedInspector {
+    fn collection(&self) -> rift_protocol::dependencies::DependenciesCollectionConfiguration {
+        self.collection
+    }
+
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
         self.asked.push(format!("read {}", spelled(path)));
         match self.files.get(path) {

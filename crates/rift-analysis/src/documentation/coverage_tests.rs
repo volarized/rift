@@ -262,7 +262,8 @@ fn invalid_source_and_block_cases() -> Vec<InvalidPublicationCase> {
         (
             "heading bound",
             |index| {
-                index.blocks[0].heading_path = (1..=514)
+                index.blocks[0].heading_path = (1
+                    ..=rift_protocol::documentation::DOCUMENTATION_HEADING_DEPTH_CEILING + 1)
                     .map(|level| DocumentationHeading {
                         level,
                         name: "Guide".to_owned(),
@@ -300,19 +301,15 @@ fn invalid_chunk_cases() -> Vec<InvalidPublicationCase> {
             Violation::Range,
         ),
         (
-            "chunk bound",
+            "chunk ordering",
             |index| {
                 let chunk = DocumentationChunk {
                     identity: "guide.md#0".to_owned(),
                     range: TextRange { start: 0, end: 1 },
                 };
-                index.blocks[0].chunks =
-                    vec![
-                        chunk;
-                        rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX as usize + 1
-                    ];
+                index.blocks[0].chunks = vec![chunk; 2];
             },
-            Violation::LimitExceeded,
+            Violation::Range,
         ),
     ];
     cases

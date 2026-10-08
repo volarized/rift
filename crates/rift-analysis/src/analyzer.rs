@@ -17,7 +17,7 @@ use crate::documentation::{
     DocumentationDeclaration, DocumentationInput, DocumentationSourceSet, collect_documentation,
     content_chunk_identity, content_digest,
 };
-use crate::input::ExactPackageInput;
+use crate::input::{ExactPackageInput, RetainedSourceLimits};
 use crate::revision::analyzer_revision;
 use crate::selection::documentation_format;
 use crate::semantic::{PlacedFacts, WorkspaceSemantics};
@@ -31,22 +31,18 @@ use rift_core::{
 use rift_error::{RiftError, errors};
 use rift_protocol::canonical::canonical_json;
 use rift_protocol::documentation::{
-    DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX, DocumentationChunk,
-    DocumentationContentIdentity, DocumentationSelectionReason, DocumentationSource,
-    DocumentationSourceFormat, DocumentationSourceIdentity, DocumentationWarningKind,
-    NotebookCellKind,
+    DocumentationChunk, DocumentationContentIdentity, DocumentationSelectionReason,
+    DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
+    DocumentationWarningKind, NotebookCellKind,
 };
 use rift_protocol::index::{
-    PACKAGE_DOCUMENTS_MAX, PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
-    PACKAGE_SOURCE_BYTES_MAX, PACKAGE_SYMBOLS_MAX, PACKAGE_UNITS_MAX, PACKAGE_WARNINGS_MAX,
-    PackageAnalysisWarning, PackageDocument, PackageDocumentKind, PackagePublication,
-    PackageSourceUnit, PackageSymbol,
+    PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning,
+    PackageDocument, PackageDocumentKind, PackagePublication, PackageSourceUnit, PackageSymbol,
 };
 use rift_protocol::read::{
     Digest, ExactKind, Language, PackageIdentity, ProjectPath, SourceLocationKind, SourceUnitId,
     SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
-use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -58,6 +54,10 @@ mod fixture;
 mod join;
 #[cfg(test)]
 mod join_tests;
+#[cfg(test)]
+mod limits_tests;
+#[cfg(test)]
+mod retained_tests;
 
 use join::ModuleRole;
 pub use join::StubForm;
@@ -162,7 +162,7 @@ impl PackageAnalysis {
 pub struct PackageAnalyzer;
 
 fn analyzed_file(
-    input: ExactPackageInput<'_>,
+    input: &ExactPackageInput<'_>,
     file: crate::PackageSource<'_>,
     supplied: &mut impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     work: &mut crate::PackageSyntaxWork,
@@ -255,7 +255,7 @@ impl PackageAnalyzer {
         let mut analyzed = Vec::with_capacity(input.files().len());
         for file in input.files() {
             analyzed.push(analyzed_file(
-                input,
+                &input,
                 *file,
                 &mut supplied,
                 &mut syntax_work,
@@ -271,9 +271,10 @@ impl PackageAnalyzer {
                 placement: held.placement.clone(),
             })
             .collect::<Vec<_>>();
-        let built = WorkspaceSemantics::build_facts_placed(
+        let built = WorkspaceSemantics::build_facts_placed_with_relationships(
             &placed,
-            CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT,
+            input.limits().declarations_max(),
+            input.limits().relationships_max(),
             revision,
             None,
         )
@@ -295,6 +296,7 @@ impl PackageAnalyzer {
             input.language(),
             &analyzed,
             &built.semantics,
+            input.limits(),
         )?;
         Ok(PackageAnalysis {
             publication,
@@ -318,6 +320,7 @@ fn publish(
     package_language: &Language,
     analyzed: &[AnalyzedFile],
     semantics: &WorkspaceSemantics,
+    limits: crate::ExactPackageLimits,
 ) -> Result<
     (
         PackagePublication,
@@ -326,10 +329,15 @@ fn publish(
     RiftError,
 > {
     let origin = symbol_origin(package, source_origin)?;
-    let mut records = Records::default();
+    let mut records = Records {
+        retained_source: limits.retained_source(),
+        publication: limits.publication(),
+        documentation: limits.documentation(),
+        ..Records::default()
+    };
     for held in analyzed {
-        if records.units.len() >= bound(PACKAGE_UNITS_MAX) {
-            records.warn(truncation("units", u64::from(PACKAGE_UNITS_MAX)));
+        if records.units.len() >= bound(records.publication.units) {
+            records.warn(truncation("units", u64::from(records.publication.units)));
             break;
         }
         records.file(package, &origin, semantics, held)?;
@@ -387,7 +395,7 @@ fn package_documentation(
     let DecodedPackageNotebooks {
         notebooks,
         omissions,
-    } = decode_package_notebooks(analyzed).map_err(|error| {
+    } = decode_package_notebooks(analyzed, &records.documentation).map_err(|error| {
         errors::analysis::package_provider_failed()
             .package(package_label(package))
             .cause(error)
@@ -397,6 +405,12 @@ fn package_documentation(
         inputs: Vec::new(),
         omissions,
         input_bytes: 0,
+        limits: records.documentation,
+        retained_bytes_max: u64::from(
+            records
+                .retained_source
+                .map_or(PACKAGE_SOURCE_BYTES_MAX, |limits| limits.record_bytes_max),
+        ),
     };
     append_notebook_inputs(
         package,
@@ -409,12 +423,13 @@ fn package_documentation(
     )?;
     append_regular_inputs(package, origin, analyzed, &mut inputs)?;
     append_attached_comment_inputs(analyzed, origin, package, &mut inputs)?;
-    let sources = DocumentationSourceSet::new(inputs.inputs).map_err(|error| {
-        errors::analysis::package_provider_failed()
-            .package(package_label(package))
-            .cause(error)
-            .error()
-    })?;
+    let sources =
+        DocumentationSourceSet::with_limits(inputs.inputs, &inputs.limits).map_err(|error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(package))
+                .cause(error)
+                .error()
+        })?;
     let declarations = package_declarations(package, analyzed, records)?;
     let notebook_cells = package_notebook_cells(analyzed, &notebooks);
     let collection = collect_documentation(&sources, &declarations)
@@ -438,11 +453,13 @@ struct PackageDocumentationInputs<'source> {
     inputs: Vec<DocumentationInput<'source>>,
     omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     input_bytes: u64,
+    limits: crate::documentation::DocumentationLimits,
+    retained_bytes_max: u64,
 }
 
 impl PackageDocumentationInputs<'_> {
     fn ensure_next(&self) -> Result<(), RiftError> {
-        crate::documentation::check_documentation_source_count(
+        self.limits.check_source_count(
             self.inputs
                 .len()
                 .saturating_add(self.omissions.len())
@@ -510,8 +527,8 @@ fn append_notebook_cell<'source>(
         cell: Some(cell.cell().clone()),
     };
     let source_bytes = u64::try_from(cell.text().len()).unwrap_or(u64::MAX);
-    if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
-        || inputs.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+    if source_bytes > inputs.limits.source_bytes_max()
+        || inputs.input_bytes.saturating_add(source_bytes) > inputs.limits.total_bytes_max()
     {
         inputs
             .omit(identity, DocumentationWarningKind::SourceUnavailable)
@@ -531,7 +548,7 @@ fn append_notebook_cell<'source>(
         cell.declared_language().cloned(),
         cell.physical_ranges().to_vec(),
     );
-    let mut input = match DocumentationInput::new(source, cell.text()) {
+    let mut input = match DocumentationInput::with_limits(source, cell.text(), &inputs.limits) {
         Ok(input) => input,
         Err(error) => {
             inputs
@@ -559,7 +576,7 @@ fn append_notebook_cell<'source>(
             return Ok(());
         }
     };
-    if cell.text().len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !cell.text().is_empty() {
+    if source_bytes <= inputs.retained_bytes_max && !cell.text().is_empty() {
         input = match input.with_chunks(vec![DocumentationChunk {
             identity: document_id.clone(),
             range: TextRange {
@@ -603,6 +620,10 @@ fn add_notebook_document(
     document_id: String,
     records: &mut Records,
 ) -> Result<(), RiftError> {
+    if !records.document_capacity() {
+        records.warn_document_full();
+        return Ok(());
+    }
     let language = match cell.cell().kind {
         NotebookCellKind::Markdown => ShippedLanguage::Markdown.language(),
         NotebookCellKind::Code => cell
@@ -611,7 +632,7 @@ fn add_notebook_document(
             .unwrap_or_else(|| package_language.clone()),
     };
     let path = wire_path(held.file.path());
-    let retained = records.retained(cell.text(), &path);
+    let retained = records.retained(cell.text(), &path, 1)?;
     let name = file_name(&path);
     records.document(PackageDocument {
         identity: document_id,
@@ -620,7 +641,10 @@ fn add_notebook_document(
         language,
         package: package.clone(),
         content_digest: text_digest(&retained.text),
-        identifier_terms: identifier_terms(&[&name]),
+        identifier_terms: identifier_terms_with_limit(
+            &[&name],
+            records.publication.identifier_terms,
+        ),
         name,
         qualified_name: None,
         signature: None,
@@ -657,8 +681,8 @@ fn append_regular_inputs<'source>(
             cell: None,
         };
         let source_bytes = u64::try_from(held.file.source().len()).unwrap_or(u64::MAX);
-        if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
-            || inputs.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+        if source_bytes > inputs.limits.source_bytes_max()
+            || inputs.input_bytes.saturating_add(source_bytes) > inputs.limits.total_bytes_max()
         {
             inputs
                 .omit(identity, DocumentationWarningKind::SourceUnavailable)
@@ -670,7 +694,13 @@ fn append_regular_inputs<'source>(
                 })?;
             continue;
         }
-        match package_file_input(origin, held, format) {
+        match package_file_input(
+            origin,
+            held,
+            format,
+            &inputs.limits,
+            inputs.retained_bytes_max,
+        ) {
             Ok(input) => {
                 inputs.inputs.push(input);
                 inputs.input_bytes = inputs.input_bytes.saturating_add(source_bytes);
@@ -692,6 +722,8 @@ fn package_file_input<'source>(
     origin: &SymbolOrigin,
     held: &'source AnalyzedFile,
     format: DocumentationSourceFormat,
+    limits: &crate::documentation::DocumentationLimits,
+    retained_bytes_max: u64,
 ) -> Result<DocumentationInput<'source>, RiftError> {
     let unit = wire_unit(held.placement.unit());
     let identity = DocumentationContentIdentity {
@@ -700,14 +732,14 @@ fn package_file_input<'source>(
     };
     let text = held.file.source();
     let source = documentation_source(identity, text, origin, format, None, Vec::new());
-    let mut input = DocumentationInput::new(source, text)?;
+    let mut input = DocumentationInput::with_limits(source, text, limits)?;
     if matches!(
         format,
         DocumentationSourceFormat::Markdown | DocumentationSourceFormat::Mdx
     ) {
         input = input.with_indexed_syntax(held.file.path(), held.file.syntax_facts())?;
     }
-    if text.len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !text.is_empty() {
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) <= retained_bytes_max && !text.is_empty() {
         input = input.with_chunks(vec![DocumentationChunk {
             identity: unit.0,
             range: TextRange {
@@ -726,6 +758,7 @@ struct DecodedPackageNotebooks {
 
 fn decode_package_notebooks(
     analyzed: &[AnalyzedFile],
+    limits: &crate::documentation::DocumentationLimits,
 ) -> Result<DecodedPackageNotebooks, RiftError> {
     let mut notebooks = Vec::with_capacity(analyzed.len());
     let mut omissions = Vec::new();
@@ -743,15 +776,19 @@ fn decode_package_notebooks(
             },
             cell: None,
         };
-        match crate::documentation::notebook::decode_notebook(held.file.source(), &identity) {
+        match crate::documentation::notebook::decode_notebook_with_limits(
+            held.file.source(),
+            &identity,
+            limits,
+        ) {
             Ok(notebook) => {
                 selected = selected.saturating_add(notebook.cells().len());
-                crate::documentation::check_documentation_source_count(selected)?;
+                limits.check_source_count(selected)?;
                 notebooks.push(Some(notebook));
             }
             Err(error) => {
                 selected = selected.saturating_add(1);
-                crate::documentation::check_documentation_source_count(selected)?;
+                limits.check_source_count(selected)?;
                 omissions.push((identity, documentation_warning_kind(&error)));
                 notebooks.push(None);
             }
@@ -803,8 +840,8 @@ fn append_attached_comment<'source>(
         cell: None,
     };
     let source_bytes = u64::try_from(source_text.len()).unwrap_or(u64::MAX);
-    if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
-        || inputs.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+    if source_bytes > inputs.limits.source_bytes_max()
+        || inputs.input_bytes.saturating_add(source_bytes) > inputs.limits.total_bytes_max()
     {
         inputs
             .omit(identity, DocumentationWarningKind::SourceUnavailable)
@@ -824,7 +861,7 @@ fn append_attached_comment<'source>(
         Some(held.file.syntax().language().clone()),
         Vec::new(),
     );
-    let mut input = match DocumentationInput::new(source, source_text)
+    let mut input = match DocumentationInput::with_limits(source, source_text, &inputs.limits)
         .and_then(|input| input.with_indexed_syntax(held.file.path(), held.file.syntax_facts()))
     {
         Ok(input) => input,
@@ -840,7 +877,7 @@ fn append_attached_comment<'source>(
             return Ok(());
         }
     };
-    if source_text.len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !source_text.is_empty() {
+    if source_bytes <= inputs.retained_bytes_max && !source_text.is_empty() {
         input = match input.with_chunks(vec![DocumentationChunk {
             identity: unit.0,
             range: TextRange {
@@ -1004,13 +1041,17 @@ struct Records {
     warnings: Vec<PackageAnalysisWarning>,
     symbols_truncated: bool,
     documents_truncated: bool,
+    retained_source: Option<RetainedSourceLimits>,
+    retained_source_bytes: u64,
+    publication: rift_protocol::configuration::PackageConfiguration,
+    documentation: crate::documentation::DocumentationLimits,
 }
 
 impl Records {
     /// Records one warning, dropping it once the publication's warning bound is reached:
     /// the bound is what a reader can act on, and the log carries the rest.
     fn warn(&mut self, warning: PackageAnalysisWarning) {
-        if self.warnings.len() < bound(PACKAGE_WARNINGS_MAX) {
+        if self.warnings.len() < bound(self.publication.warnings) {
             self.warnings.push(warning);
         }
     }
@@ -1027,24 +1068,31 @@ impl Records {
         let path = wire_path(held.file.path());
         let unit = wire_unit(held.placement.unit());
         let source = held.file.source();
-        let retained = self.retained(source, &path);
+        let needs_document = documentation_format(held.file.path().as_str())
+            != Some(DocumentationSourceFormat::Notebook);
+        let publishes_document = needs_document && self.document_capacity();
+        let mut retained = self.retained(source, &path, if publishes_document { 2 } else { 1 })?;
         let content_digest = text_digest(source);
         let mut record = PackageSourceUnit {
             unit: unit.clone(),
             path: path.clone(),
             language: language.clone(),
             content_digest: content_digest.clone(),
-            source: retained.text.clone(),
+            source: if publishes_document {
+                retained.text.clone()
+            } else {
+                std::mem::take(&mut retained.text)
+            },
             source_complete: retained.complete,
             digest: Digest(String::new()),
         };
         record.digest = digest_of(&record, package)?;
         self.units.push(record);
-        if documentation_format(held.file.path().as_str())
-            != Some(DocumentationSourceFormat::Notebook)
-        {
+        if publishes_document {
             let document_digest = text_digest(&retained.text);
             self.file_document(package, &language, &unit, &path, retained, document_digest)?;
+        } else if needs_document {
+            self.warn_document_full();
         }
         let context = FileContext {
             language: &language,
@@ -1076,7 +1124,10 @@ impl Records {
             language: language.clone(),
             package: package.clone(),
             content_digest,
-            identifier_terms: identifier_terms(&[&name]),
+            identifier_terms: identifier_terms_with_limit(
+                &[&name],
+                self.publication.identifier_terms,
+            ),
             name,
             qualified_name: None,
             signature: None,
@@ -1090,6 +1141,8 @@ impl Records {
 
     /// Emits one declaration's record, and its search document when the package exports
     /// it.
+    // The record and its document share one retained-source budget decision.
+    #[allow(clippy::too_many_lines)]
     fn declaration(
         &mut self,
         package: &PackageIdentity,
@@ -1108,10 +1161,10 @@ impl Records {
         if held.role.answers_elsewhere(&declaration.qualified_name) {
             return Ok(());
         }
-        if self.symbols.len() >= bound(PACKAGE_SYMBOLS_MAX) {
+        if self.symbols.len() >= bound(self.publication.symbols) {
             if !self.symbols_truncated {
                 self.symbols_truncated = true;
-                self.warn(truncation("symbols", u64::from(PACKAGE_SYMBOLS_MAX)));
+                self.warn(truncation("symbols", u64::from(self.publication.symbols)));
             }
             return Ok(());
         }
@@ -1122,7 +1175,9 @@ impl Records {
                 .path(Path::new(held.file.path().as_str()))
                 .error()
         })?;
-        let retained = self.retained(declared, path);
+        let public = held.is_public(&declaration.qualified_name);
+        let publishes_document = public && self.document_capacity();
+        let retained = self.retained(declared, path, if publishes_document { 2 } else { 1 })?;
         let content_digest = text_digest(&retained.text);
         let symbol = SymbolId(symbol_identity(
             &language.identity_segment(),
@@ -1164,11 +1219,11 @@ impl Records {
             documentation: declaration.documentation.first().cloned(),
             source: retained.text,
             source_complete: retained.complete,
-            public: held.is_public(&declaration.qualified_name),
+            public,
             digest: Digest(String::new()),
         };
         record.digest = digest_of(&record, package)?;
-        if record.public {
+        if publishes_document {
             let document = PackageDocument {
                 identity: record.symbol.0.clone(),
                 kind: PackageDocumentKind::Symbol,
@@ -1176,7 +1231,10 @@ impl Records {
                 language: language.clone(),
                 package: package.clone(),
                 content_digest,
-                identifier_terms: identifier_terms(&[&record.name, &record.qualified_name]),
+                identifier_terms: identifier_terms_with_limit(
+                    &[&record.name, &record.qualified_name],
+                    self.publication.identifier_terms,
+                ),
                 name: record.name.clone(),
                 qualified_name: Some(record.qualified_name.clone()),
                 signature: record
@@ -1192,6 +1250,8 @@ impl Records {
                 digest: Digest(String::new()),
             };
             self.document(document)?;
+        } else if public {
+            self.warn_document_full();
         }
         self.symbols.push(record);
         Ok(())
@@ -1199,11 +1259,8 @@ impl Records {
 
     /// Takes one document, or reports the bound once the collection reaches it.
     fn document(&mut self, mut document: PackageDocument) -> Result<(), RiftError> {
-        if self.documents.len() >= bound(PACKAGE_DOCUMENTS_MAX) {
-            if !self.documents_truncated {
-                self.documents_truncated = true;
-                self.warn(truncation("documents", u64::from(PACKAGE_DOCUMENTS_MAX)));
-            }
+        if !self.document_capacity() {
+            self.warn_document_full();
             return Ok(());
         }
         document.digest = digest_of(&document, &document.package.clone())?;
@@ -1211,27 +1268,60 @@ impl Records {
         Ok(())
     }
 
-    /// The bytes one record retains, reporting a cut once for the record that made it.
-    fn retained(&mut self, source: &str, path: &ProjectPath) -> RetainedSource {
-        let bound = bound(PACKAGE_SOURCE_BYTES_MAX);
-        if source.len() <= bound {
-            return RetainedSource {
-                text: source.to_owned(),
-                complete: true,
-            };
+    fn document_capacity(&self) -> bool {
+        self.documents.len() < bound(self.publication.documents)
+    }
+
+    fn warn_document_full(&mut self) {
+        if !self.documents_truncated {
+            self.documents_truncated = true;
+            self.warn(truncation(
+                "documents",
+                u64::from(self.publication.documents),
+            ));
         }
-        let mut kept = bound;
+    }
+
+    /// The bytes one record retains, reporting a cut once for the record that made it.
+    fn retained(
+        &mut self,
+        source: &str,
+        path: &ProjectPath,
+        copies: u64,
+    ) -> Result<RetainedSource, RiftError> {
+        let maximum = self
+            .retained_source
+            .map_or(PACKAGE_SOURCE_BYTES_MAX, |limits| limits.record_bytes_max);
+        let mut kept = source.len().min(bound(maximum));
         while kept > 0 && !source.is_char_boundary(kept) {
             kept -= 1;
         }
-        self.warn(PackageAnalysisWarning::SourceTruncated {
-            path: path.clone(),
-            dropped: u64::try_from(source.len() - kept).unwrap_or(u64::MAX),
-        });
-        RetainedSource {
-            text: source[..kept].to_owned(),
-            complete: false,
+        if let Some(limits) = self.retained_source {
+            let observed = u64::try_from(kept)
+                .ok()
+                .and_then(|bytes| bytes.checked_mul(copies))
+                .and_then(|bytes| self.retained_source_bytes.checked_add(bytes));
+            let bytes = observed
+                .filter(|bytes| *bytes <= limits.total_bytes_max)
+                .ok_or_else(|| {
+                    errors::analysis::package_retained_source_bytes_exceeded()
+                        .bound(limits.total_bytes_max)
+                        .observed(observed.unwrap_or(u64::MAX))
+                        .error()
+                })?;
+            self.retained_source_bytes = bytes;
         }
+        let complete = kept == source.len();
+        if !complete {
+            self.warn(PackageAnalysisWarning::SourceTruncated {
+                path: path.clone(),
+                dropped: u64::try_from(source.len() - kept).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(RetainedSource {
+            text: source[..kept].to_owned(),
+            complete,
+        })
     }
 }
 
@@ -1287,13 +1377,19 @@ fn file_name(path: &ProjectPath) -> String {
 
 /// The words a ranking splits identifiers into: each name split on case and separator
 /// boundaries, lowercased, deduplicated, in first-seen order, at most
-/// [`PACKAGE_IDENTIFIER_TERMS_MAX`] of them.
+/// `PACKAGE_IDENTIFIER_TERMS_MAX` of them by default.
 ///
 /// The cut is a work bound, not a decision: the terms a ranking reads come from a
 /// declaration's own name, and a name splitting into more than a thousand words ranks on
 /// the first thousand.
+#[cfg(test)]
 fn identifier_terms(names: &[&str]) -> Vec<String> {
-    let terms_max = bound(PACKAGE_IDENTIFIER_TERMS_MAX);
+    identifier_terms_with_limit(names, rift_protocol::index::PACKAGE_IDENTIFIER_TERMS_MAX)
+}
+
+/// Splits identifier words under the accepted publication bound.
+fn identifier_terms_with_limit(names: &[&str], maximum: u32) -> Vec<String> {
+    let terms_max = bound(maximum);
     let mut terms: Vec<String> = Vec::new();
     for name in names {
         for word in split_identifier_words(name) {
@@ -1708,7 +1804,7 @@ mod tests {
     fn a_package_past_the_declaration_bound_names_the_limit() {
         use std::fmt::Write as _;
 
-        let per_file = super::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT / 2 + 1;
+        let per_file = rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT / 2 + 1;
         let source = (0..per_file).fold(String::new(), |mut source, index| {
             writeln!(source, "def f{index}():\n    pass").expect("a string write succeeds");
             source

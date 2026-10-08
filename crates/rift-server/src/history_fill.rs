@@ -16,28 +16,32 @@ use std::path::{Path, PathBuf};
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_error::errors;
-use rift_history::{
-    ChangedBlob, REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile,
-};
+use rift_history::{ChangedBlob, Repository, ResolvedRevision, TreeFile};
 use rift_history_store::{
     ChangedPath, CommitRecord, DeclarationChange, HeldCommit, MovedDeclaration,
 };
 use rift_index::{RevisionPaths, WorkspaceLanguagePolicy};
-use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration, HistoryStrategy};
+use rift_protocol::configuration::{
+    ConfigurationViolation, HISTORY_MOVE_DELETIONS_DEFAULT, HISTORY_MOVE_DELETIONS_MAX,
+    HISTORY_RELEASE_TAGS_DEFAULT, HISTORY_RELEASE_TAGS_MAX, HISTORY_REVISIONS_MAX,
+    HISTORY_TREE_ENTRIES_DEFAULT, HISTORY_TREE_ENTRIES_MAX, HistoryConfiguration, HistoryStrategy,
+};
 use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
 use rift_syntax::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::RiftError;
 
-/// Tags one release selection reads, at most.
+/// Default bound for tags one release selection reads.
 pub const RELEASE_TAGS_MAX: usize = 65_536;
+const _: () = assert!(RELEASE_TAGS_MAX as u64 == HISTORY_RELEASE_TAGS_DEFAULT);
 
-/// Deleted files one commit compares its added files' declarations against, at
-/// most, counted after the pure renames are paired: past it the commit pairs no
+/// Default bound for deleted files one commit compares its added files' declarations
+/// against, counted after the pure renames are paired: past it the commit pairs no
 /// move by declaration, as git's `diff.renameLimit` bounds its exhaustive rename
 /// search.
 pub(crate) const MOVE_DELETIONS_MAX: usize = 1_000;
+const _: () = assert!(MOVE_DELETIONS_MAX as u64 == HISTORY_MOVE_DELETIONS_DEFAULT);
 
 /// The characters that open a wildcard in a tag pattern: the literal text a
 /// release selection strips ends before the first of them.
@@ -231,6 +235,8 @@ pub struct HistoryAnalysis {
     strategy: HistoryStrategy,
     revisions_max: usize,
     releases: Option<ReleasePatterns>,
+    tree_entries_max: usize,
+    release_tags_max: usize,
     move_deletions_max: usize,
 }
 
@@ -243,7 +249,7 @@ impl HistoryAnalysis {
     ///
     /// Returns [`RiftError`] when no repository versions `root`, a
     /// `[source]` or language pattern does not compile, or a release
-    /// pattern is no tag pattern.
+    /// pattern is no tag pattern, or a collection bound is outside its accepted range.
     pub fn open(
         root: &Path,
         history: &HistoryConfiguration,
@@ -264,7 +270,7 @@ impl HistoryAnalysis {
         };
         let revisions_max =
             usize::try_from(history.max_revisions.min(HISTORY_REVISIONS_MAX)).unwrap_or(usize::MAX);
-        Ok(Self {
+        Self {
             root: repository.root().to_path_buf(),
             common_directory: repository.common_directory().to_path_buf(),
             visible,
@@ -273,8 +279,61 @@ impl HistoryAnalysis {
             strategy: history.strategy,
             revisions_max,
             releases,
+            tree_entries_max: usize::try_from(HISTORY_TREE_ENTRIES_DEFAULT).unwrap_or(usize::MAX),
+            release_tags_max: RELEASE_TAGS_MAX,
             move_deletions_max: MOVE_DELETIONS_MAX,
-        })
+        }
+        .with_collection_bounds(
+            usize::try_from(history.tree_entries).unwrap_or(usize::MAX),
+            usize::try_from(history.release_tags).unwrap_or(usize::MAX),
+            usize::try_from(history.move_deletions).unwrap_or(usize::MAX),
+        )
+    }
+
+    /// Replaces the entry, tag, and deleted-file bounds one history collection runs under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when a bound is outside the accepted history range.
+    pub fn with_collection_bounds(
+        mut self,
+        tree_entries_max: usize,
+        release_tags_max: usize,
+        move_deletions_max: usize,
+    ) -> Result<Self, RiftError> {
+        for (field, value, maximum) in [
+            (
+                "providers.history.tree_entries",
+                tree_entries_max,
+                HISTORY_TREE_ENTRIES_MAX,
+            ),
+            (
+                "providers.history.release_tags",
+                release_tags_max,
+                HISTORY_RELEASE_TAGS_MAX,
+            ),
+            (
+                "providers.history.move_deletions",
+                move_deletions_max,
+                HISTORY_MOVE_DELETIONS_MAX,
+            ),
+        ] {
+            let value = u64::try_from(value).unwrap_or(u64::MAX);
+            if !(1..=maximum).contains(&value) {
+                return Err(rift_core::configuration_violation_error(
+                    &ConfigurationViolation::LimitOutOfRange {
+                        field,
+                        value,
+                        min: 1,
+                        max: maximum,
+                    },
+                ));
+            }
+        }
+        self.tree_entries_max = tree_entries_max;
+        self.release_tags_max = release_tags_max;
+        self.move_deletions_max = move_deletions_max;
+        Ok(self)
     }
 
     /// The same analysis pairing moves in commits with at most
@@ -342,7 +401,7 @@ impl HistoryAnalysis {
     /// The newest `max_revisions` releases `releases` selects, each compared
     /// with the one before it in version order, the oldest with nothing.
     fn selected_releases(&self, releases: &ReleasePatterns) -> Result<FillPlan, RiftError> {
-        let tagged = self.repository()?.tagged_commits(RELEASE_TAGS_MAX)?;
+        let tagged = self.repository()?.tagged_commits(self.release_tags_max)?;
         let mut plan = FillPlan::default();
         let mut versioned: Vec<(semver::Version, String, ResolvedRevision)> = Vec::new();
         for tag in tagged {
@@ -381,7 +440,7 @@ impl HistoryAnalysis {
     /// `None`, so a stopping server waits on one path's parse at most.
     ///
     /// A commit compared with nothing writes its facts and no path. A commit
-    /// whose changed paths pass `REVISION_TREE_ENTRIES_MAX` writes none of
+    /// whose changed paths pass `providers.history.tree_entries` writes none of
     /// them and is marked a boundary: a timeline through it cannot tell what
     /// it changed.
     ///
@@ -423,7 +482,7 @@ impl HistoryAnalysis {
             pending.base.as_ref(),
             &pending.revision,
             &includes,
-            REVISION_TREE_ENTRIES_MAX,
+            self.tree_entries_max,
         )?;
         if changed.is_truncated() {
             record.boundary = true;

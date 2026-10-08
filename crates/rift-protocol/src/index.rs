@@ -38,10 +38,23 @@ pub const PACKAGE_SYMBOLS_MAX: u32 = 1_000_000;
 pub const PACKAGE_DOCUMENTS_MAX: u32 = 1_100_000;
 /// Analysis warnings one publication may carry.
 pub const PACKAGE_WARNINGS_MAX: u32 = 256;
-/// Bytes one record's retained source may hold.
+/// Default bytes one record's retained source may hold.
 pub const PACKAGE_SOURCE_BYTES_MAX: u32 = 1 << 20;
+/// Largest supported retained source, matching the package archive member ceiling.
+pub const PACKAGE_SOURCE_BYTES_CEILING: u32 = 64 << 20;
 /// Ranking terms one search document may carry.
 pub const PACKAGE_IDENTIFIER_TERMS_MAX: u32 = 1_024;
+
+/// Supported source-unit capacity; the default remains [`PACKAGE_UNITS_MAX`].
+pub const PACKAGE_UNITS_CEILING: u32 = 5_000_000;
+/// Supported declaration capacity; the default remains [`PACKAGE_SYMBOLS_MAX`].
+pub const PACKAGE_SYMBOLS_CEILING: u32 = 50_000_000;
+/// Supported search-document capacity; the default remains [`PACKAGE_DOCUMENTS_MAX`].
+pub const PACKAGE_DOCUMENTS_CEILING: u32 = PACKAGE_UNITS_CEILING + PACKAGE_SYMBOLS_CEILING;
+/// Supported warning capacity; the default remains [`PACKAGE_WARNINGS_MAX`].
+pub const PACKAGE_WARNINGS_CEILING: u32 = 65_536;
+/// Supported identifier-term capacity; the default remains [`PACKAGE_IDENTIFIER_TERMS_MAX`].
+pub const PACKAGE_IDENTIFIER_TERMS_CEILING: u32 = 65_536;
 
 /// One package's analyzed source, as the analyzer publishes it.
 ///
@@ -63,21 +76,21 @@ pub struct PackagePublication {
     /// unit's path and content in unit order.
     pub source_digest: Digest,
     /// Every analyzed source unit, in unit identity order.
-    #[schemars(length(max = 100_000))]
+    #[schemars(length(max = 5_000_000))]
     pub units: Vec<PackageSourceUnit>,
     /// Every parsed declaration, in symbol identity order. Container declarations are
     /// kept whatever their visibility, so a consumer can assemble a read.
-    #[schemars(length(max = 1_000_000))]
+    #[schemars(length(max = 50_000_000))]
     pub symbols: Vec<PackageSymbol>,
     /// Every search document, in document identity order.
-    #[schemars(length(max = 1_100_000))]
+    #[schemars(length(max = 55_000_000))]
     pub documents: Vec<PackageDocument>,
     /// Documentation facts over the selected source units.
     pub documentation: DocumentationIndex,
     /// What the analyzer could not do, in the order it met each. Absent when the run
     /// analyzed every selected file whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 256))]
+    #[schemars(length(max = 65_536))]
     pub warnings: Vec<PackageAnalysisWarning>,
 }
 
@@ -94,7 +107,7 @@ pub struct PackageSourceUnit {
     /// The digest of the file's whole bytes, whatever `source` retained.
     pub content_digest: Digest,
     /// The file's source, cut at the analyzer's retained-source bound.
-    #[schemars(length(max = 1_048_576))]
+    #[schemars(length(max = 67_108_864))]
     pub source: String,
     /// Whether `source` holds the whole file. `false` means the bytes were cut at the
     /// bound; `content_digest` still covers the whole file.
@@ -135,8 +148,8 @@ pub struct PackageSymbol {
     /// The documentation attached to the declaration, when the grammar attaches any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documentation: Option<Documentation>,
-    /// The declaration's own source, cut at [`PACKAGE_SOURCE_BYTES_MAX`].
-    #[schemars(length(max = 1_048_576))]
+    /// The declaration's own source, cut at the analyzer's retained-source bound.
+    #[schemars(length(max = 67_108_864))]
     pub source: String,
     /// Whether `source` holds the whole declaration.
     pub source_complete: bool,
@@ -186,10 +199,10 @@ pub struct PackageDocument {
     pub qualified_name: Option<String>,
     /// The words `name` and `qualified_name` split into on case and separator boundaries,
     /// lowercased, deduplicated, in first-seen order, at most
-    /// [`PACKAGE_IDENTIFIER_TERMS_MAX`] of them. Kept apart from the names so a ranking
+    /// [`PACKAGE_IDENTIFIER_TERMS_CEILING`] of them. Kept apart from the names so a ranking
     /// counts each term once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 1_024))]
+    #[schemars(length(max = 65_536))]
     pub identifier_terms: Vec<String>,
     /// The rendered signature, when the declaration has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,11 +212,11 @@ pub struct PackageDocument {
     pub documentation: Option<String>,
     /// The declaration's own source. Absent on a file document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 1_048_576))]
+    #[schemars(length(max = 67_108_864))]
     pub declaration_source: Option<String>,
     /// The file's content. Absent on a symbol document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 1_048_576))]
+    #[schemars(length(max = 67_108_864))]
     pub file_content: Option<String>,
     /// The digest of this record's canonical content.
     pub digest: Digest,
@@ -244,9 +257,9 @@ pub enum PackageAnalysisWarning {
 #[cfg(test)]
 mod tests {
     use super::{
-        PACKAGE_DOCUMENTS_MAX, PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_SOURCE_BYTES_MAX,
-        PACKAGE_SYMBOLS_MAX, PACKAGE_UNITS_MAX, PACKAGE_WARNINGS_MAX, PackageAnalysisWarning,
-        PackageDocumentKind, PackagePublication,
+        PACKAGE_DOCUMENTS_CEILING, PACKAGE_IDENTIFIER_TERMS_CEILING, PACKAGE_SOURCE_BYTES_CEILING,
+        PACKAGE_SYMBOLS_CEILING, PACKAGE_UNITS_CEILING, PACKAGE_WARNINGS_CEILING,
+        PackageAnalysisWarning, PackageDocumentKind, PackagePublication,
     };
     use crate::read::ProjectPath;
     use serde_json::json;
@@ -259,37 +272,52 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(PackagePublication)).expect("schema");
         let properties = &schema["properties"];
         let cases = [
-            ("units", &properties["units"]["maxItems"], PACKAGE_UNITS_MAX),
+            (
+                "units",
+                &properties["units"]["maxItems"],
+                PACKAGE_UNITS_CEILING,
+            ),
             (
                 "symbols",
                 &properties["symbols"]["maxItems"],
-                PACKAGE_SYMBOLS_MAX,
+                PACKAGE_SYMBOLS_CEILING,
             ),
             (
                 "documents",
                 &properties["documents"]["maxItems"],
-                PACKAGE_DOCUMENTS_MAX,
+                PACKAGE_DOCUMENTS_CEILING,
             ),
             (
                 "warnings",
                 &properties["warnings"]["maxItems"],
-                PACKAGE_WARNINGS_MAX,
+                PACKAGE_WARNINGS_CEILING,
             ),
         ];
         for (field, found, expected) in cases {
             assert_eq!(*found, json!(expected), "{field}");
         }
         assert_eq!(properties["format_revision"]["minimum"], json!(1));
-        let unit = &schema["$defs"]["PackageSourceUnit"]["properties"];
-        assert_eq!(
-            unit["source"]["maxLength"],
-            json!(PACKAGE_SOURCE_BYTES_MAX),
-            "a retained source carries the publication's own byte bound"
-        );
+        for (record, field) in [
+            ("PackageSourceUnit", "source"),
+            ("PackageSymbol", "source"),
+            ("PackageDocument", "declaration_source"),
+            ("PackageDocument", "file_content"),
+        ] {
+            let property = &schema["$defs"][record]["properties"][field];
+            let retained = property["anyOf"]
+                .as_array()
+                .and_then(|variants| variants.iter().find(|variant| variant["type"] == "string"))
+                .unwrap_or(property);
+            assert_eq!(
+                retained["maxLength"],
+                json!(PACKAGE_SOURCE_BYTES_CEILING),
+                "{record}.{field} carries the supported retained-source bound"
+            );
+        }
         let document = &schema["$defs"]["PackageDocument"]["properties"];
         assert_eq!(
             document["identifier_terms"]["maxItems"],
-            json!(PACKAGE_IDENTIFIER_TERMS_MAX),
+            json!(PACKAGE_IDENTIFIER_TERMS_CEILING),
             "the ranking terms carry the bound the analyzer cuts them at"
         );
     }

@@ -1,6 +1,7 @@
 //! Validates explicit source sets without source acquisition or filesystem access.
 
 use std::collections::BTreeSet;
+#[cfg(feature = "collector")]
 use std::sync::Arc;
 
 use rift_core::{ProjectPath, SourceUnitId};
@@ -8,13 +9,14 @@ use rift_protocol::documentation::{
     DOCUMENTATION_LICENSE_FILES_MAX, NOTEBOOK_CELL_ID_BYTES_MAX, NOTEBOOK_SOURCE_RANGES_MAX,
 };
 use rift_protocol::documentation::{
-    DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TEXT_BYTES_MAX,
-    DOCUMENTATION_TOTAL_BYTES_MAX, DocumentationContentIdentity, DocumentationDigest,
-    DocumentationSelectionReason, DocumentationSource, DocumentationSourceFormat,
-    DocumentationSourceIdentity, NotebookCellIdentity,
+    DOCUMENTATION_SOURCE_BYTES_CEILING, DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TEXT_BYTES_MAX,
+    DocumentationContentIdentity, DocumentationDigest, DocumentationSelectionReason,
+    DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
+    NotebookCellIdentity,
 };
 use rift_protocol::read::{Language, SourceKind, SourceLocationKind};
 
+use super::DocumentationLimits;
 use super::identity::{canonical_digest, content_digest, is_digest};
 use rift_error::{RiftError, errors};
 
@@ -47,6 +49,7 @@ pub struct DocumentationInput<'source> {
     #[cfg(feature = "collector")]
     syntax: Option<Arc<rift_syntax::SyntaxFacts>>,
     chunks: Vec<rift_protocol::documentation::DocumentationChunk>,
+    limits: DocumentationLimits,
 }
 
 impl<'source> DocumentationInput<'source> {
@@ -59,6 +62,24 @@ impl<'source> DocumentationInput<'source> {
     ///
     /// Returns a typed refusal for invalid identities, origins, formats, digests, or bounds.
     pub fn new(source: DocumentationSource, text: &'source str) -> Result<Self, RiftError> {
+        Self::with_limits(source, text, &DocumentationLimits::default())
+    }
+
+    /// Validates source facts against exact bytes under accepted collection bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registered error for invalid source facts or a source past its bound.
+    pub fn with_limits(
+        source: DocumentationSource,
+        text: &'source str,
+        limits: &DocumentationLimits,
+    ) -> Result<Self, RiftError> {
+        if text.len() as u64 > limits.source_bytes_max() {
+            return errors::analysis::documentation_limit_exceeded()
+                .field("source_bytes")
+                .fail();
+        }
         validate_source(&source, text)?;
         Ok(Self {
             source,
@@ -66,7 +87,13 @@ impl<'source> DocumentationInput<'source> {
             #[cfg(feature = "collector")]
             syntax: None,
             chunks: Vec::new(),
+            limits: *limits,
         })
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) const fn limits(&self) -> DocumentationLimits {
+        self.limits
     }
 
     /// Returns the accepted source facts.
@@ -129,7 +156,7 @@ impl<'source> DocumentationInput<'source> {
         mut self,
         chunks: Vec<rift_protocol::documentation::DocumentationChunk>,
     ) -> Result<Self, RiftError> {
-        if chunks.len() > rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX as usize {
+        if chunks.len() > self.limits.blocks_max as usize {
             return errors::analysis::documentation_limit_exceeded()
                 .field("chunks")
                 .fail();
@@ -204,6 +231,8 @@ fn syntax_matches_source(
 pub struct DocumentationSourceSet<'source> {
     sources: Vec<DocumentationInput<'source>>,
     selection_digest: DocumentationDigest,
+    #[cfg(feature = "collector")]
+    limits: DocumentationLimits,
 }
 
 /// Validates one aggregate count of selected documentation sources.
@@ -230,15 +259,40 @@ impl<'source> DocumentationSourceSet<'source> {
     /// # Errors
     ///
     /// Returns a typed refusal for duplicate identities or aggregate bounds.
-    pub fn new(mut sources: Vec<DocumentationInput<'source>>) -> Result<Self, RiftError> {
-        check_documentation_source_count(sources.len())?;
+    pub fn new(sources: Vec<DocumentationInput<'source>>) -> Result<Self, RiftError> {
+        Self::with_limits(sources, &DocumentationLimits::default())
+    }
+
+    /// Validates selected sources under one accepted collection policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registered error for duplicate sources or accepted bounds exceeded.
+    pub fn with_limits(
+        mut sources: Vec<DocumentationInput<'source>>,
+        limits: &DocumentationLimits,
+    ) -> Result<Self, RiftError> {
+        limits.check_source_count(sources.len())?;
+        for source in &mut sources {
+            if source.chunks.len() > limits.blocks_max as usize {
+                return errors::analysis::documentation_limit_exceeded()
+                    .field("chunks")
+                    .fail();
+            }
+            if source.text.len() as u64 > limits.source_bytes_max() {
+                return errors::analysis::documentation_limit_exceeded()
+                    .field("source_bytes")
+                    .fail();
+            }
+            source.limits = *limits;
+        }
         sources.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
         let mut bytes = 0_u64;
         let mut previous = None;
         for source in &sources {
             bytes = bytes
                 .checked_add(source.source.byte_length)
-                .filter(|total| *total <= DOCUMENTATION_TOTAL_BYTES_MAX)
+                .filter(|total| *total <= limits.total_bytes_max())
                 .ok_or_else(|| {
                     errors::analysis::documentation_limit_exceeded()
                         .field("source_bytes")
@@ -255,7 +309,14 @@ impl<'source> DocumentationSourceSet<'source> {
         Ok(Self {
             sources,
             selection_digest,
+            #[cfg(feature = "collector")]
+            limits: *limits,
         })
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) const fn limits(&self) -> DocumentationLimits {
+        self.limits
     }
 
     /// Returns selected sources in canonical identity order.
@@ -273,7 +334,7 @@ impl<'source> DocumentationSourceSet<'source> {
 
 fn validate_source(source: &DocumentationSource, text: &str) -> Result<(), RiftError> {
     validate_source_metadata(source)?;
-    let size_accepted = text.len() <= DOCUMENTATION_SOURCE_BYTES_MAX as usize;
+    let size_accepted = text.len() <= DOCUMENTATION_SOURCE_BYTES_CEILING as usize;
     let length_matches = source.byte_length == text.len() as u64;
     let digest_matches = source.content_digest == content_digest(text.as_bytes());
     match () {
@@ -296,7 +357,7 @@ pub(super) fn validate_source_metadata(source: &DocumentationSource) -> Result<(
     validate_format(source)?;
     validate_selection(source)?;
     validate_license(source)?;
-    if source.byte_length > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX) {
+    if source.byte_length > u64::from(DOCUMENTATION_SOURCE_BYTES_CEILING) {
         return errors::analysis::documentation_limit_exceeded()
             .field("source_bytes")
             .fail();
@@ -556,7 +617,7 @@ fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), RiftErro
     for range in &source.physical_ranges {
         let ordered = range.start >= previous_end;
         let nonempty = range.end > range.start;
-        let bounded = range.end <= u64::from(DOCUMENTATION_SOURCE_BYTES_MAX);
+        let bounded = range.end <= u64::from(DOCUMENTATION_SOURCE_BYTES_CEILING);
         if !ordered || !nonempty || !bounded {
             return errors::analysis::documentation_range_invalid()
                 .field("physical_ranges")
@@ -949,6 +1010,68 @@ mod tests {
             crate::documentation::failure::context_value(&error, "field").as_deref(),
             Some("chunks")
         );
+    }
+
+    #[test]
+    fn test_source_set_revalidates_chunks_and_bytes_under_narrower_limits() {
+        use crate::documentation::DocumentationLimits;
+        use rift_protocol::configuration::ByteSize;
+        use rift_protocol::documentation::{DocumentationChunk, DocumentationConfiguration};
+
+        let text = "body";
+        let configuration = DocumentationConfiguration {
+            max_blocks: 2,
+            max_file: ByteSize::from_bytes(4),
+            ..DocumentationConfiguration::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&configuration).expect("input bounds");
+        let input = DocumentationInput::with_limits(source("guide.md", text), text, &limits)
+            .expect("accepted source")
+            .with_chunks(vec![
+                DocumentationChunk {
+                    identity: "guide.md#0".to_owned(),
+                    range: TextRange { start: 0, end: 2 },
+                },
+                DocumentationChunk {
+                    identity: "guide.md#1".to_owned(),
+                    range: TextRange { start: 2, end: 4 },
+                },
+            ])
+            .expect("exact chunk bound");
+        assert!(DocumentationSourceSet::with_limits(vec![input.clone()], &limits).is_ok());
+
+        for (configuration, field) in [
+            (
+                DocumentationConfiguration {
+                    max_blocks: 1,
+                    ..configuration.clone()
+                },
+                "chunks",
+            ),
+            (
+                DocumentationConfiguration {
+                    max_file: ByteSize::from_bytes(3),
+                    ..configuration
+                },
+                "source_bytes",
+            ),
+        ] {
+            let limits = DocumentationLimits::from_configuration(&configuration)
+                .expect("narrower collection bounds");
+            let error = DocumentationSourceSet::with_limits(vec![input.clone()], &limits)
+                .expect_err("input exceeds selected collection bound");
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.analysis.documentation_limit_exceeded"
+            );
+            assert_eq!(
+                crate::documentation::failure::context_value(&error, "field").as_deref(),
+                Some(field),
+            );
+        }
+        let defaults = DocumentationSourceSet::new(vec![input]).expect("default collection bounds");
+        assert_eq!(defaults.sources().len(), 1);
+        assert_eq!(defaults.sources()[0].chunks.len(), 2);
     }
 
     #[test]

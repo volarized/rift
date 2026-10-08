@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use rift_core::line::{lines_inclusive, without_ending};
 
 use super::NORMALIZED_SEPARATOR;
-use crate::resolver::{DIRECTORY_ENTRIES_MAX, FileObservation, StaticInputs};
+use crate::resolver::{FileObservation, StaticInputs};
 
 /// The project environment directory uv creates beside the lockfile's manifest when
 /// `UV_PROJECT_ENVIRONMENT` does not name another, which a static pass cannot read.
@@ -34,6 +34,7 @@ const DIST_INFO_SUFFIX: &str = ".dist-info";
 const RECORD_FILE_NAME: &str = "RECORD";
 /// Bytes one `RECORD` may hold before it is left unread. A large distribution lists tens
 /// of thousands of files, each on one line of a few hundred bytes at most.
+#[cfg(test)]
 const RECORD_BYTES_MAX: u64 = 4 << 20;
 /// The quote opening a `RECORD` path that holds a comma, as CSV writes it.
 const RECORD_QUOTE: char = '"';
@@ -68,27 +69,29 @@ impl SitePackages {
     /// The `site-packages` of the environment beside `directory`, the folder holding the
     /// lockfile: below `lib/python<X.Y>`, else below `Lib`. Absent when neither stands.
     ///
-    /// The work is at most three listings of [`DIRECTORY_ENTRIES_MAX`] entries each.
+    /// The work is at most three listings, each within `dependencies.collection.directory_entries`.
     #[must_use]
     pub fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Option<Self> {
+        let entries_max =
+            usize::try_from(inputs.collection().directory_entries).unwrap_or(usize::MAX);
         let environment = directory.join(PROJECT_ENVIRONMENT_DIRECTORY);
         let library = environment.join(LIBRARY_DIRECTORY_NAME);
         let posix = inputs
-            .list_directory(&library, DIRECTORY_ENTRIES_MAX)
+            .list_directory(&library, entries_max)
             .into_iter()
             .find(|entry| entry.starts_with(PYTHON_DIRECTORY_PREFIX))
             .map(|python| library.join(python).join(SITE_PACKAGES_DIRECTORY_NAME));
         let windows = || {
             let library = environment.join(WINDOWS_LIBRARY_DIRECTORY_NAME);
             inputs
-                .list_directory(&library, DIRECTORY_ENTRIES_MAX)
+                .list_directory(&library, entries_max)
                 .iter()
                 .any(|entry| entry == SITE_PACKAGES_DIRECTORY_NAME)
                 .then(|| library.join(SITE_PACKAGES_DIRECTORY_NAME))
         };
         let directory = posix.or_else(windows)?;
         let by_lowercase = inputs
-            .list_directory(&directory, DIRECTORY_ENTRIES_MAX)
+            .list_directory(&directory, entries_max)
             .into_iter()
             .map(|entry| (entry.to_ascii_lowercase(), entry))
             .collect();
@@ -111,7 +114,7 @@ impl SitePackages {
     ///
     /// The metadata directory matches without regard to case, since a wheel keeps the
     /// project's own spelling (`PyYAML-6.0.3.dist-info`). The work is one read of at most
-    /// `RECORD_BYTES_MAX` bytes and one pass over its lines.
+    /// `dependencies.collection.record_size` bytes and one pass over its lines.
     pub(super) fn import_roots(
         &self,
         normalized: &str,
@@ -123,7 +126,8 @@ impl SitePackages {
             return BTreeSet::new();
         };
         let record = self.directory.join(dist_info).join(RECORD_FILE_NAME);
-        let text = match inputs.read_file(&record, RECORD_BYTES_MAX) {
+        let maximum = inputs.collection().record_size.bytes();
+        let text = match inputs.read_file(&record, maximum) {
             FileObservation::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             FileObservation::Absent | FileObservation::OverBound { .. } => return BTreeSet::new(),
         };
@@ -299,6 +303,49 @@ mod tests {
                 .import_roots("pyjwt", "2.9.0", &mut inputs)
                 .is_empty(),
             "another version is not installed here"
+        );
+    }
+
+    #[test]
+    fn configured_directory_and_record_bounds_reach_installed_distribution_reads() {
+        use rift_protocol::configuration::ByteSize;
+        use rift_protocol::dependencies::DependenciesCollectionConfiguration;
+
+        let record = "jwt/__init__.py,,\n";
+        let recorded = || {
+            RecordedInspector::default()
+                .with_file(
+                    format!("{SITE_PACKAGES}/PyJWT-2.10.1.dist-info/RECORD"),
+                    record,
+                )
+                .with_directory(format!("{SITE_PACKAGES}/AAA"))
+        };
+        let mut low = recorded().with_collection(DependenciesCollectionConfiguration {
+            directory_entries: 1,
+            ..Default::default()
+        });
+        let site = SitePackages::observe(Path::new(ROOT), &mut low).expect("POSIX environment");
+        assert!(site.import_roots("pyjwt", "2.10.1", &mut low).is_empty());
+
+        let mut short = recorded().with_collection(DependenciesCollectionConfiguration {
+            directory_entries: 2,
+            record_size: ByteSize::from_bytes(
+                u64::try_from(record.len() - 1).expect("fixture size"),
+            ),
+            ..Default::default()
+        });
+        let site = SitePackages::observe(Path::new(ROOT), &mut short).expect("POSIX environment");
+        assert!(site.import_roots("pyjwt", "2.10.1", &mut short).is_empty());
+
+        let mut exact = recorded().with_collection(DependenciesCollectionConfiguration {
+            directory_entries: 2,
+            record_size: ByteSize::from_bytes(u64::try_from(record.len()).expect("fixture size")),
+            ..Default::default()
+        });
+        let site = SitePackages::observe(Path::new(ROOT), &mut exact).expect("POSIX environment");
+        assert_eq!(
+            Vec::from_iter(site.import_roots("pyjwt", "2.10.1", &mut exact)),
+            ["jwt"]
         );
     }
 

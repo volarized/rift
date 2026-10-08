@@ -221,6 +221,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Code::ConfigurationInvalid,
             Retry::OperatorAction,
             &[
+                "rift.analysis.package_retained_source_limits_invalid",
                 "rift.analysis.source_pattern_invalid",
                 "rift.index.workspace_composition",
                 "rift.index.workspace_invalid_root",
@@ -422,6 +423,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.analysis.package_declarations_exceeded",
                 "rift.analysis.package_input_too_many_bytes",
                 "rift.analysis.package_input_too_many_files",
+                "rift.analysis.package_retained_source_bytes_exceeded",
                 "rift.history.blob_too_large",
                 "rift.history.too_many_tags",
                 "rift.history.tree_too_large",
@@ -628,6 +630,14 @@ mod tests {
         use wire::{ErrorCode as Code, RetryDirective as Retry};
 
         for (slug, expected) in [
+            (
+                "rift.analysis.package_retained_source_limits_invalid",
+                (Code::ConfigurationInvalid, Retry::OperatorAction),
+            ),
+            (
+                "rift.analysis.package_retained_source_bytes_exceeded",
+                (Code::LimitExceeded, Retry::Never),
+            ),
             (
                 "rift.lsp.uri_outside_root",
                 (Code::PermissionDenied, Retry::Never),

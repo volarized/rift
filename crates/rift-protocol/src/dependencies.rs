@@ -19,6 +19,13 @@ pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN: u64 = 1_000;
 /// Milliseconds one version probe may take before it is killed, at most: one hour.
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX: u64 = 3_600_000;
+mod collection;
+pub use collection::{
+    DEPENDENCIES_COLLECTION_BYTES_MAX, DEPENDENCIES_COLLECTION_COUNT_MAX,
+    DEPENDENCIES_COLLECTION_MANIFESTS_MAX, DEPENDENCIES_COLLECTION_NESTING_MAX,
+    DEPENDENCIES_COLLECTION_OUTPUT_MAX, DependenciesCollectionConfiguration,
+};
+
 /// Entries the configured package list may hold, at most.
 pub const DEPENDENCIES_PACKAGES_MAX: usize = 20_000;
 /// Entries one read's `packages` argument may hold, at most.
@@ -333,6 +340,8 @@ fn selector_violation(
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_dependencies_ranges)]
 pub struct DependenciesConfiguration {
+    /// File, directory, manifest, package, and version probe collection bounds.
+    pub collection: DependenciesCollectionConfiguration,
     /// Whether a standard library version probe runs: `auto` runs `rustc --version` or
     /// `node --version` when no pin names the version, `static` reads the pins and project
     /// files alone and runs no program.
@@ -352,6 +361,7 @@ impl Default for DependenciesConfiguration {
     fn default() -> Self {
         Self {
             resolution: default_dependencies_resolution(),
+            collection: DependenciesCollectionConfiguration::default(),
             packages: Vec::new(),
             command_timeout: default_dependencies_command_timeout(),
         }
@@ -377,6 +387,7 @@ impl DependenciesConfiguration {
             ),
         ])
         .or_else(|| configured_package_violation(&self.packages))
+        .or_else(|| self.collection.violation())
     }
 }
 

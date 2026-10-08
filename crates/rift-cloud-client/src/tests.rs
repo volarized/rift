@@ -1,6 +1,7 @@
 use super::*;
 
 mod cache;
+mod collection;
 mod declaration;
 mod documentation;
 mod pages;
@@ -50,6 +51,10 @@ enum OperationFixture {
     TightBounds,
     TightRequestBound,
     TightSourceBound,
+    CollectionBounds {
+        source_bytes: usize,
+        source_bytes_max: usize,
+    },
     CandidateBound,
     PartialFailure,
     RetrySearch,
@@ -341,7 +346,13 @@ fn operation_response(
         return json_response(&declaration::declaration_response_json(), None);
     }
     if path.ends_with("/patterns") {
-        return json_response(&pattern::pattern_page_json(query_cursor(query)), None);
+        let mut page = pattern::pattern_page_json(query_cursor(query));
+        if let OperationFixture::CollectionBounds { source_bytes, .. } = mode {
+            page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
+            page["items"][0]["declaration"]["source"] =
+                serde_json::json!("x".repeat(*source_bytes));
+        }
+        return json_response(&page, None);
     }
     status_response(StatusCode::NOT_FOUND)
 }
@@ -368,6 +379,17 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         }
         OperationFixture::TightSourceBound => {
             value["bounds"]["source_bytes_max"] = serde_json::json!(1);
+        }
+        OperationFixture::CollectionBounds {
+            source_bytes_max, ..
+        } => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "patterns"]);
+            value["bounds"]["request_body_bytes_max"] =
+                serde_json::json!(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX);
+            value["bounds"]["response_body_bytes_max"] =
+                serde_json::json!(rift_protocol::configuration::GLOBAL_RESPONSE_BYTES_MAX);
+            value["bounds"]["source_bytes_max"] = serde_json::json!(source_bytes_max);
         }
         OperationFixture::CandidateBound => {
             value["bounds"]["candidate_pool_max"] = serde_json::json!(1);
@@ -483,6 +505,11 @@ fn operation_search_response(
             page["items"][0]["source"] = serde_json::json!("too large");
             page
         }
+        OperationFixture::CollectionBounds { source_bytes, .. } => {
+            let mut page = search_page_json("demo", None, "analyzer-v1", "first");
+            page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
+            page
+        }
         OperationFixture::AdditiveResponse => {
             let mut page = search_page_json("demo", None, "analyzer-v2", "first");
             page["items"][0]["symbol"]["future_field"] =
@@ -528,6 +555,11 @@ fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Re
     let cursor = query_cursor(query);
     let followed = cursor.is_some();
     let body = match mode {
+        OperationFixture::CollectionBounds { source_bytes, .. } => {
+            let mut page = symbol_page_json("demo", None, "analyzer-v1", "first");
+            page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
+            page
+        }
         OperationFixture::BodyBoundStop => pages::body_bound_page(
             symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
             symbol_page_json("demo", None, "analyzer-v2", "second"),
@@ -1127,7 +1159,7 @@ async fn test_fixture_accepts_additive_nested_symbol_field() {
 fn test_serialize_body_rejects_oversized_request() {
     let value = "x".repeat(REQUEST_BODY_BYTES_MAX + 1);
     assert!(matches!(
-        serialize_body(&value),
+        serialize_body(&value, REQUEST_BODY_BYTES_MAX),
         Err(ClientError::RequestBodyTooLarge { bytes }) if bytes > REQUEST_BODY_BYTES_MAX
     ));
 }

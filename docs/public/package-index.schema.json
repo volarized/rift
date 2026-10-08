@@ -1085,7 +1085,7 @@
         },
         "declaration_source": {
           "description": "The declaration's own source. Absent on a file document.",
-          "maxLength": 1048576,
+          "maxLength": 67108864,
           "type": "string"
         },
         "digest": {
@@ -1098,15 +1098,15 @@
         },
         "file_content": {
           "description": "The file's content. Absent on a symbol document.",
-          "maxLength": 1048576,
+          "maxLength": 67108864,
           "type": "string"
         },
         "identifier_terms": {
-          "description": "The words `name` and `qualified_name` split into on case and separator boundaries,\nlowercased, deduplicated, in first-seen order, at most\n[`PACKAGE_IDENTIFIER_TERMS_MAX`] of them. Kept apart from the names so a ranking\ncounts each term once.",
+          "description": "The words `name` and `qualified_name` split into on case and separator boundaries,\nlowercased, deduplicated, in first-seen order, at most\n[`PACKAGE_IDENTIFIER_TERMS_CEILING`] of them. Kept apart from the names so a ranking\ncounts each term once.",
           "items": {
             "type": "string"
           },
-          "maxItems": 1024,
+          "maxItems": 65536,
           "type": "array"
         },
         "identity": {
@@ -1218,7 +1218,7 @@
         },
         "source": {
           "description": "The file's source, cut at the analyzer's retained-source bound.",
-          "maxLength": 1048576,
+          "maxLength": 67108864,
           "type": "string"
         },
         "source_complete": {
@@ -1292,8 +1292,8 @@
           "description": "The rendered signature, when the declaration has one."
         },
         "source": {
-          "description": "The declaration's own source, cut at [`PACKAGE_SOURCE_BYTES_MAX`].",
-          "maxLength": 1048576,
+          "description": "The declaration's own source, cut at the analyzer's retained-source bound.",
+          "maxLength": 67108864,
           "type": "string"
         },
         "source_complete": {
@@ -1980,7 +1980,7 @@
       "items": {
         "$ref": "#/$defs/PackageDocument"
       },
-      "maxItems": 1100000,
+      "maxItems": 55000000,
       "type": "array"
     },
     "format_revision": {
@@ -2002,7 +2002,7 @@
       "items": {
         "$ref": "#/$defs/PackageSymbol"
       },
-      "maxItems": 1000000,
+      "maxItems": 50000000,
       "type": "array"
     },
     "units": {
@@ -2010,7 +2010,7 @@
       "items": {
         "$ref": "#/$defs/PackageSourceUnit"
       },
-      "maxItems": 100000,
+      "maxItems": 5000000,
       "type": "array"
     },
     "warnings": {
@@ -2018,7 +2018,7 @@
       "items": {
         "$ref": "#/$defs/PackageAnalysisWarning"
       },
-      "maxItems": 256,
+      "maxItems": 65536,
       "type": "array"
     }
   },

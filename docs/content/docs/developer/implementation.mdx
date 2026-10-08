@@ -543,9 +543,11 @@ collector feature enables syntax parsers; readers can validate stored metadata a
 identities without linking parsers or storage code.
 
 Documentation adapters record source warnings when selected input is malformed or exceeds the
-4 MiB source limit or remaining 512 MiB collection limit. Other accepted sources remain available.
-A selection above 100,000 content owners, including notebook cells and omitted sources, is refused
-before publication.
+selected `documentation.max_file` or remaining `documentation.max_total` bytes. Their defaults
+are 4 MiB per source and 512 MiB per collection; other accepted sources remain available.
+
+`documentation.max_sources` counts content owners, including notebook cells and omitted sources.
+The default is 100,000, and a selection above the configured bound is refused before publication.
 
 The index database stores the documentation metadata beside the lexical rows, one row per
 source: the source's facts, blocks, links, references, and unresolved spellings, under the digest
@@ -1382,6 +1384,29 @@ providers, places each file under `rift://source/<manager>/<name>@<version>/<pat
 the declarations, and renders one `PackagePublication`. That publication is the logical package
 index global ingestion consumes. The local server runs no package analysis; its package facts
 come from the global index.
+
+`ExactPackageLimits::with_declarations` sets the declaration bound for semantic assembly;
+stub and implementation declarations both count.
+`ExactPackageLimits::from_configuration` validates the configuration and uses the file, aggregate
+byte, declaration, and relationship bounds from [`[source]`](/docs/developer/configuration#source).
+
+The adapter also applies per-file parsing bounds from
+[`[providers.syntax]`](/docs/developer/configuration#providerssyntax), documentation collection
+bounds from [`[documentation]`](/docs/developer/configuration#documentation), and publication
+bounds from [`[package]`](/docs/developer/configuration#package).
+Callers accept the configuration through `rift_core::acceptance::accept_configuration` to apply
+the same environment overrides as the local server, such as `RIFT_SOURCE_DECLARATIONS`.
+
+`ExactPackageLimits::new` keeps the provider's 100,000-declaration default unless the caller
+sets an override. The configuration adapter leaves file selection to the caller.
+
+`package.retained_source` bounds each retained source string; `package.retained_total`, when set,
+bounds their aggregate bytes. Units, symbols, and search documents each count their own source
+copy, and the analyzer checks the aggregate before allocation.
+
+`ArchiveLimits::from_configuration` applies `[package.archive]` when the caller decodes an archive
+before constructing package input. Archive admission and package input each enforce their selected
+bounds; increasing compressed bytes alone does not raise expanded bytes or declaration capacity.
 
 <VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
 

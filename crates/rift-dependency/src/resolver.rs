@@ -173,6 +173,11 @@ pub enum FileObservation {
 /// `&mut dyn StaticInputs` for exactly that reason. The server supplies filesystem-backed
 /// inputs; tests supply recorded ones.
 pub trait StaticInputs {
+    /// The collection bounds accepted from workspace configuration and environment.
+    fn collection(&self) -> rift_protocol::dependencies::DependenciesCollectionConfiguration {
+        rift_protocol::dependencies::DependenciesCollectionConfiguration::default()
+    }
+
     /// The content of one file, refused past `bytes_max`.
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation;
 

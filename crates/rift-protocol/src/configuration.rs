@@ -19,6 +19,15 @@ use crate::retry::{
 };
 use crate::search::path_pattern_violation;
 use crate::source::SourceConfiguration;
+
+mod archive;
+mod package;
+
+#[cfg(test)]
+mod collection_tests;
+
+pub use archive::*;
+pub use package::PackageConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +120,18 @@ pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
 /// Revisions [`HistoryConfiguration::max_revisions`] defaults to.
 pub const HISTORY_REVISIONS_DEFAULT: u64 = 100;
+/// Tree entries and changed paths one history read collects when the key is absent.
+pub const HISTORY_TREE_ENTRIES_DEFAULT: u64 = 65_536;
+/// Tree entries and changed paths one history read accepts, at most.
+pub const HISTORY_TREE_ENTRIES_MAX: u64 = 5_000_000;
+/// Tags a release selection reads when the key is absent.
+pub const HISTORY_RELEASE_TAGS_DEFAULT: u64 = 65_536;
+/// Tags a release selection accepts, at most.
+pub const HISTORY_RELEASE_TAGS_MAX: u64 = 5_000_000;
+/// Deleted files a history commit pairs for moves when the key is absent.
+pub const HISTORY_MOVE_DELETIONS_DEFAULT: u64 = 1_000;
+/// Deleted files a history commit pairs for moves, at most.
+pub const HISTORY_MOVE_DELETIONS_MAX: u64 = 65_536;
 /// Commits one history store batch writes when `providers.history.batch_commits` is absent.
 pub const HISTORY_BATCH_COMMITS_DEFAULT: u64 = 25;
 /// Commits `providers.history.batch_commits` may allow, at most.
@@ -491,6 +512,8 @@ pub struct WorkspaceConfiguration {
     /// Which files below the workspace root the index and reads consider visible, and how
     /// many files and bytes the index holds together.
     pub source: SourceConfiguration,
+    /// Exact-package publication and archive admission bounds.
+    pub package: PackageConfiguration,
     /// Which documentation files the index collects beside the source.
     pub documentation: DocumentationConfiguration,
     /// Whether the dependency context runs the standard library version probes, how long
@@ -550,6 +573,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.providers.syntax.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
+            .or_else(|| self.package.violation())
             .or_else(|| self.documentation.violation())
             .or_else(|| self.dependencies.violation())
             .or_else(|| self.logs.violation())
@@ -557,6 +581,25 @@ impl WorkspaceConfiguration {
             .or_else(|| lsp_configurations_violation(&self.lsp))
     }
 }
+
+/// Bytes in a global request body when the key is absent.
+pub const GLOBAL_REQUEST_BYTES_DEFAULT: u64 = 4 << 20;
+/// Global request body bytes, at least.
+pub const GLOBAL_REQUEST_BYTES_MIN: u64 = 1;
+/// Global request body bytes, at most.
+pub const GLOBAL_REQUEST_BYTES_MAX: u64 = 64 << 20;
+/// Bytes in a global response body when the key is absent.
+pub const GLOBAL_RESPONSE_BYTES_DEFAULT: u64 = 32 << 20;
+/// Global response body bytes, at least.
+pub const GLOBAL_RESPONSE_BYTES_MIN: u64 = 1;
+/// Global response body bytes, at most.
+pub const GLOBAL_RESPONSE_BYTES_MAX: u64 = 1 << 30;
+/// Bytes in a global source payload when the key is absent.
+pub const GLOBAL_SOURCE_BYTES_DEFAULT: u64 = 1 << 20;
+/// Global source payload bytes, at least.
+pub const GLOBAL_SOURCE_BYTES_MIN: u64 = 1;
+/// Global source payload bytes, at most.
+pub const GLOBAL_SOURCE_BYTES_MAX: u64 = 64 << 20;
 
 /// The `[global]` table: global REST API access, request bounds, and cache lifetimes.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -579,6 +622,13 @@ pub struct GlobalConfiguration {
     /// Global API requests running at once, 1 to 32.
     #[schemars(range(min = 1, max = 32))]
     pub max_in_flight: u64,
+    /// Most bytes in one global API request body. A larger body is refused before sending.
+    pub max_request: ByteSize,
+    /// Most bytes in one global API response body. A larger body is refused while reading.
+    pub max_response: ByteSize,
+    /// Most UTF-8 bytes in one source payload from the global API. The client also applies the
+    /// advertised source bound, using the smaller value.
+    pub max_source: ByteSize,
     /// Capabilities cache lifetime, 1m to 24h.
     pub capabilities_ttl: Duration,
     /// Package-resolution cache lifetime, 1m to 24h.
@@ -597,6 +647,9 @@ impl Default for GlobalConfiguration {
             request_timeout: Duration::from_millis(GLOBAL_REQUEST_TIMEOUT_MS_DEFAULT),
             attempts: 3,
             max_in_flight: 4,
+            max_request: ByteSize::from_bytes(GLOBAL_REQUEST_BYTES_DEFAULT),
+            max_response: ByteSize::from_bytes(GLOBAL_RESPONSE_BYTES_DEFAULT),
+            max_source: ByteSize::from_bytes(GLOBAL_SOURCE_BYTES_DEFAULT),
             capabilities_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
             resolution_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
             failure_ttl: Duration::from_millis(GLOBAL_FAILURE_TTL_MS_DEFAULT),
@@ -633,6 +686,24 @@ impl GlobalConfiguration {
                 GLOBAL_MAX_IN_FLIGHT_MAX,
             ),
             (
+                "global.max_request",
+                self.max_request.bytes(),
+                GLOBAL_REQUEST_BYTES_MIN,
+                GLOBAL_REQUEST_BYTES_MAX,
+            ),
+            (
+                "global.max_response",
+                self.max_response.bytes(),
+                GLOBAL_RESPONSE_BYTES_MIN,
+                GLOBAL_RESPONSE_BYTES_MAX,
+            ),
+            (
+                "global.max_source",
+                self.max_source.bytes(),
+                GLOBAL_SOURCE_BYTES_MIN,
+                GLOBAL_SOURCE_BYTES_MAX,
+            ),
+            (
                 "global.capabilities_ttl",
                 self.capabilities_ttl.milliseconds(),
                 GLOBAL_CAPABILITIES_TTL_MS_MIN,
@@ -654,7 +725,7 @@ impl GlobalConfiguration {
     }
 }
 
-/// Adds `rift:range` annotations for `GlobalConfiguration` duration fields.
+/// Adds `rift:range` annotations for `GlobalConfiguration` quantity fields.
 pub fn declare_global_ranges(schema: &mut Schema) {
     let ranges = [
         (
@@ -700,6 +771,36 @@ pub fn declare_global_ranges(schema: &mut Schema) {
                 serde_json::json!({
                     "min": String::from(Duration::from_millis(min)),
                     "max": String::from(Duration::from_millis(max)),
+                }),
+            );
+        }
+    }
+    for (field, min, max) in [
+        (
+            "max_request",
+            GLOBAL_REQUEST_BYTES_MIN,
+            GLOBAL_REQUEST_BYTES_MAX,
+        ),
+        (
+            "max_response",
+            GLOBAL_RESPONSE_BYTES_MIN,
+            GLOBAL_RESPONSE_BYTES_MAX,
+        ),
+        (
+            "max_source",
+            GLOBAL_SOURCE_BYTES_MIN,
+            GLOBAL_SOURCE_BYTES_MAX,
+        ),
+    ] {
+        if let Some(property) = properties
+            .get_mut(field)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            property.insert(
+                "rift:range".to_owned(),
+                serde_json::json!({
+                    "min": String::from(ByteSize::from_bytes(min)),
+                    "max": String::from(ByteSize::from_bytes(max)),
                 }),
             );
         }
@@ -1106,6 +1207,20 @@ pub struct HistoryConfiguration {
     /// `selective`.
     #[schemars(range(min = 1, max = 100_000))]
     pub max_revisions: u64,
+    /// Tree entries one revision read visits and changed paths one history commit collects,
+    /// 1 to 5000000. A larger revision tree is refused; a larger changed-path set makes the
+    /// history commit a boundary whose changes are unknown.
+    #[schemars(range(min = 1, max = 5_000_000))]
+    pub tree_entries: u64,
+    /// Tags one release selection reads, 1 to 5000000, including tags that name no commit
+    /// or match no release pattern. A larger tag set is refused.
+    #[schemars(range(min = 1, max = 5_000_000))]
+    pub release_tags: u64,
+    /// Deleted files one history commit pairs for declaration moves, after pure renames,
+    /// 1 to 65536. A commit past this bound keeps introduced declarations without pairing
+    /// moves. Raising the bound increases the work to find each moved declaration.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub move_deletions: u64,
     /// Which revisions the history store analyzes.
     pub strategy: HistoryStrategy,
     /// Tag names or tag patterns naming the releases `selective` analyzes, such as `v1.*`,
@@ -1131,6 +1246,9 @@ impl Default for HistoryConfiguration {
         Self {
             enabled: true,
             max_revisions: HISTORY_REVISIONS_DEFAULT,
+            tree_entries: HISTORY_TREE_ENTRIES_DEFAULT,
+            release_tags: HISTORY_RELEASE_TAGS_DEFAULT,
+            move_deletions: HISTORY_MOVE_DELETIONS_DEFAULT,
             strategy: HistoryStrategy::Everything,
             releases: Vec::new(),
             batch_commits: HISTORY_BATCH_COMMITS_DEFAULT,
@@ -1162,6 +1280,24 @@ impl HistoryConfiguration {
                 self.max_revisions,
                 1,
                 HISTORY_REVISIONS_MAX,
+            ),
+            (
+                "providers.history.tree_entries",
+                self.tree_entries,
+                1,
+                HISTORY_TREE_ENTRIES_MAX,
+            ),
+            (
+                "providers.history.release_tags",
+                self.release_tags,
+                1,
+                HISTORY_RELEASE_TAGS_MAX,
+            ),
+            (
+                "providers.history.move_deletions",
+                self.move_deletions,
+                1,
+                HISTORY_MOVE_DELETIONS_MAX,
             ),
             (
                 "providers.history.releases",
@@ -1307,6 +1443,10 @@ impl ExecutionConfiguration {
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
 pub struct SearchConfiguration {
+    /// Most results one local search or symbol lookup collects, 1 to 10000.
+    /// An answer that reaches this bound warns `results_truncated`.
+    #[schemars(range(min = 1, max = 10_000))]
+    pub results: u64,
     /// Chunking policy for visible text files in lexical search.
     pub text: TextSearchConfiguration,
     /// How many units the lexical index holds.
@@ -1357,6 +1497,7 @@ pub struct SearchConfiguration {
 impl Default for SearchConfiguration {
     fn default() -> Self {
         Self {
+            results: SEARCH_RESULTS_DEFAULT,
             text: TextSearchConfiguration::default(),
             lexical: LexicalSearchConfiguration::default(),
             ranking: RankingConfiguration::default(),
@@ -1384,6 +1525,12 @@ impl SearchConfiguration {
             .or_else(|| self.text.violation())
             .or_else(|| {
                 first_out_of_range([
+                    (
+                        "search.results",
+                        self.results,
+                        SEARCH_RESULTS_MIN,
+                        SEARCH_RESULTS_MAX,
+                    ),
                     (
                         "search.pool_slots",
                         self.pool_slots,
@@ -1572,12 +1719,47 @@ fn is_repository_word(word: &str) -> bool {
         })
 }
 
+/// Results one local read collects, by default.
+pub const SEARCH_RESULTS_DEFAULT: u64 = 1_000;
+/// Results one local read collects, at least.
+pub const SEARCH_RESULTS_MIN: u64 = 1;
+/// Results one local read collects, at most.
+pub const SEARCH_RESULTS_MAX: u64 = 10_000;
+/// Bytes one lexical document content field holds, by default.
+pub const LEXICAL_CONTENT_BYTES_DEFAULT: u64 = 16 << 20;
+/// Bytes one lexical document content field holds, at least.
+pub const LEXICAL_CONTENT_BYTES_MIN: u64 = 1 << 10;
+/// Bytes one lexical document content field holds, at most.
+pub const LEXICAL_CONTENT_BYTES_MAX: u64 = 1 << 30;
+/// Matches one lexical ranking collects, by default.
+pub const LEXICAL_MATCHES_DEFAULT: u64 = 1_000;
+/// Matches one lexical ranking collects, at least.
+pub const LEXICAL_MATCHES_MIN: u64 = 1;
+/// Matches one lexical ranking collects, at most.
+pub const LEXICAL_MATCHES_MAX: u64 = 1_000_000;
+/// Encoded documentation metadata bytes one lexical commit stores, by default.
+pub const LEXICAL_DOCUMENTATION_BYTES_DEFAULT: u64 = 256 << 20;
+/// Encoded documentation metadata bytes one lexical commit stores, at least.
+pub const LEXICAL_DOCUMENTATION_BYTES_MIN: u64 = 1 << 10;
+/// Encoded documentation metadata bytes one lexical commit stores, at most.
+pub const LEXICAL_DOCUMENTATION_BYTES_MAX: u64 = 4 << 30;
+
 /// The `[search.lexical]` table: how many units the lexical index holds, how many one
 /// transaction writes, and how much of the store file a connection memory-maps.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_lexical_ranges)]
 pub struct LexicalSearchConfiguration {
+    /// Most bytes one lexical document content field holds, 1kb to 1gb.
+    /// A document past this bound refuses the lexical write.
+    pub max_content: ByteSize,
+    /// Most matches one lexical ranking collects, 1 to 1000000.
+    /// An answer past this bound carries `lexical_ranking_truncated`.
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub max_matches: u64,
+    /// Most encoded documentation metadata one commit stores, 1kb to 4gb.
+    /// A larger collection commits lexical documents without the metadata.
+    pub max_documentation: ByteSize,
     /// Most units the lexical index holds: one per indexed file, text chunk,
     /// and declaration, 1000 to 50000000. A workspace past it refuses its
     /// rebuild naming this key.
@@ -1605,6 +1787,9 @@ pub struct LexicalSearchConfiguration {
 impl Default for LexicalSearchConfiguration {
     fn default() -> Self {
         Self {
+            max_content: ByteSize::from_bytes(LEXICAL_CONTENT_BYTES_DEFAULT),
+            max_matches: LEXICAL_MATCHES_DEFAULT,
+            max_documentation: ByteSize::from_bytes(LEXICAL_DOCUMENTATION_BYTES_DEFAULT),
             units_max: LEXICAL_UNITS_MAX_DEFAULT,
             transaction_units: LEXICAL_TRANSACTION_UNITS_DEFAULT,
             transaction_size: ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_DEFAULT),
@@ -1617,6 +1802,24 @@ impl LexicalSearchConfiguration {
     /// This table's numeric bounds, in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
+            (
+                "search.lexical.max_content",
+                self.max_content.bytes(),
+                LEXICAL_CONTENT_BYTES_MIN,
+                LEXICAL_CONTENT_BYTES_MAX,
+            ),
+            (
+                "search.lexical.max_matches",
+                self.max_matches,
+                LEXICAL_MATCHES_MIN,
+                LEXICAL_MATCHES_MAX,
+            ),
+            (
+                "search.lexical.max_documentation",
+                self.max_documentation.bytes(),
+                LEXICAL_DOCUMENTATION_BYTES_MIN,
+                LEXICAL_DOCUMENTATION_BYTES_MAX,
+            ),
             (
                 "search.lexical.units_max",
                 self.units_max,
@@ -3587,6 +3790,9 @@ mod tests {
             HistoryConfiguration {
                 enabled: true,
                 max_revisions: HISTORY_REVISIONS_DEFAULT,
+                tree_entries: HISTORY_TREE_ENTRIES_DEFAULT,
+                release_tags: HISTORY_RELEASE_TAGS_DEFAULT,
+                move_deletions: HISTORY_MOVE_DELETIONS_DEFAULT,
                 strategy: HistoryStrategy::Everything,
                 releases: Vec::new(),
                 batch_commits: HISTORY_BATCH_COMMITS_DEFAULT,
@@ -3908,7 +4114,7 @@ mod tests {
         type BoundCase = (&'static str, u64, u64, fn(&mut GlobalConfiguration, u64));
 
         let mut configuration = WorkspaceConfiguration::default();
-        let cases: [BoundCase; 7] = [
+        let cases: [BoundCase; 10] = [
             (
                 "global.connect_timeout",
                 GLOBAL_CONNECT_TIMEOUT_MS_MIN,
@@ -3932,6 +4138,24 @@ mod tests {
                 GLOBAL_MAX_IN_FLIGHT_MIN,
                 GLOBAL_MAX_IN_FLIGHT_MAX,
                 |global, value| global.max_in_flight = value,
+            ),
+            (
+                "global.max_request",
+                GLOBAL_REQUEST_BYTES_MIN,
+                GLOBAL_REQUEST_BYTES_MAX,
+                |global, value| global.max_request = ByteSize::from_bytes(value),
+            ),
+            (
+                "global.max_response",
+                GLOBAL_RESPONSE_BYTES_MIN,
+                GLOBAL_RESPONSE_BYTES_MAX,
+                |global, value| global.max_response = ByteSize::from_bytes(value),
+            ),
+            (
+                "global.max_source",
+                GLOBAL_SOURCE_BYTES_MIN,
+                GLOBAL_SOURCE_BYTES_MAX,
+                |global, value| global.max_source = ByteSize::from_bytes(value),
             ),
             (
                 "global.capabilities_ttl",
@@ -3996,6 +4220,9 @@ mod tests {
             "request_timeout",
             "attempts",
             "max_in_flight",
+            "max_request",
+            "max_response",
+            "max_source",
             "capabilities_ttl",
             "resolution_ttl",
             "failure_ttl",
@@ -4009,6 +4236,17 @@ mod tests {
             properties["connect_timeout"]["rift:range"],
             json!({ "min": "100ms", "max": "30s" })
         );
+        for (field, default, maximum) in [
+            ("max_request", "4mb", "64mb"),
+            ("max_response", "32mb", "1gb"),
+            ("max_source", "1mb", "64mb"),
+        ] {
+            assert_eq!(properties[field]["default"], json!(default));
+            assert_eq!(
+                properties[field]["rift:range"],
+                json!({ "min": "1b", "max": maximum })
+            );
+        }
         assert_eq!(
             properties["request_timeout"]["rift:range"],
             json!({ "min": "1s", "max": "5m" })
@@ -4571,6 +4809,59 @@ mod tests {
         assert!(!validator.is_valid(&selective_without_releases));
         assert!(!validator.is_valid(&releases_without_selective));
         assert!(validator.is_valid(&selective));
+    }
+
+    #[test]
+    fn test_history_collection_bounds_match_schema_and_runtime() {
+        type Setter = fn(&mut HistoryConfiguration, u64);
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let properties = &schema["$defs"]["HistoryConfiguration"]["properties"];
+        for (key, field, default, maximum, set) in [
+            (
+                "tree_entries",
+                "providers.history.tree_entries",
+                HISTORY_TREE_ENTRIES_DEFAULT,
+                HISTORY_TREE_ENTRIES_MAX,
+                (|history, value| history.tree_entries = value) as Setter,
+            ),
+            (
+                "release_tags",
+                "providers.history.release_tags",
+                HISTORY_RELEASE_TAGS_DEFAULT,
+                HISTORY_RELEASE_TAGS_MAX,
+                (|history, value| history.release_tags = value) as Setter,
+            ),
+            (
+                "move_deletions",
+                "providers.history.move_deletions",
+                HISTORY_MOVE_DELETIONS_DEFAULT,
+                HISTORY_MOVE_DELETIONS_MAX,
+                (|history, value| history.move_deletions = value) as Setter,
+            ),
+        ] {
+            assert_eq!(properties[key]["default"], json!(default));
+            assert_eq!(properties[key]["minimum"], json!(1));
+            assert_eq!(properties[key]["maximum"], json!(maximum));
+            for value in [1, maximum] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.providers.history, value);
+                assert_eq!(configuration.validate(), Ok(()));
+            }
+            for value in [0, maximum + 1] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.providers.history, value);
+                assert_eq!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field,
+                        value,
+                        min: 1,
+                        max: maximum
+                    })
+                );
+            }
+        }
     }
 
     #[test]

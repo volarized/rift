@@ -459,3 +459,35 @@ fn rewrite_references(value: &mut Value) {
         _ => {}
     }
 }
+
+#[test]
+fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult {
+    for (property, old_default) in [
+        ("request_body_bytes_max", 4 << 20),
+        ("response_body_bytes_max", 32 << 20),
+        ("source_bytes_max", 1 << 20),
+    ] {
+        let mut document = contract()?;
+        document["components"]["schemas"]["CapabilityBounds"]["properties"][property]["maximum"] =
+            json!(old_default);
+        assert_invalid(
+            &document,
+            &format!("CapabilityBounds/properties/{property}/maximum"),
+        )?;
+    }
+    for component in [
+        "PackageSearchHit",
+        "PackageSymbol",
+        "PackagePatternDeclaration",
+        "PackagePatternHit",
+    ] {
+        let mut document = contract()?;
+        document["components"]["schemas"][component]["properties"]["source"]["maxLength"] =
+            json!(1 << 20);
+        assert_invalid(
+            &document,
+            &format!("{component}/properties/source/maxLength"),
+        )?;
+    }
+    Ok(())
+}

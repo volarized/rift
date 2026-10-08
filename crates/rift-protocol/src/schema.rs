@@ -1153,9 +1153,32 @@ pub fn declare_text_ranges(schema: &mut Schema) {
 /// schema carries them for readers.
 pub fn declare_lexical_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        ByteSize, LEXICAL_MMAP_BYTES_MAX, LEXICAL_TRANSACTION_BYTES_MAX,
-        LEXICAL_TRANSACTION_BYTES_MIN, LexicalSearchConfiguration,
+        ByteSize, LEXICAL_CONTENT_BYTES_MAX, LEXICAL_CONTENT_BYTES_MIN,
+        LEXICAL_DOCUMENTATION_BYTES_MAX, LEXICAL_DOCUMENTATION_BYTES_MIN, LEXICAL_MMAP_BYTES_MAX,
+        LEXICAL_TRANSACTION_BYTES_MAX, LEXICAL_TRANSACTION_BYTES_MIN, LexicalSearchConfiguration,
     };
+    for (property, minimum, maximum) in [
+        (
+            property!(LexicalSearchConfiguration, max_content),
+            LEXICAL_CONTENT_BYTES_MIN,
+            LEXICAL_CONTENT_BYTES_MAX,
+        ),
+        (
+            property!(LexicalSearchConfiguration, max_documentation),
+            LEXICAL_DOCUMENTATION_BYTES_MIN,
+            LEXICAL_DOCUMENTATION_BYTES_MAX,
+        ),
+    ] {
+        annotate_property(
+            schema,
+            property,
+            RIFT_RANGE,
+            range(
+                &ByteSize::from_bytes(minimum),
+                &ByteSize::from_bytes(maximum),
+            ),
+        );
+    }
     annotate_property(
         schema,
         property!(LexicalSearchConfiguration, transaction_size),
@@ -1176,6 +1199,68 @@ pub fn declare_lexical_ranges(schema: &mut Schema) {
     );
 }
 
+/// Advertises the accepted archive byte bounds on each quantity key.
+pub fn declare_archive_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ARCHIVE_BYTES_MAX, ARCHIVE_EXTENSION_BYTES_MAX, ArchiveConfiguration, ByteSize,
+    };
+    for (property, maximum) in [
+        (
+            property!(ArchiveConfiguration, compressed_size),
+            ARCHIVE_BYTES_MAX,
+        ),
+        (
+            property!(ArchiveConfiguration, expanded_size),
+            ARCHIVE_BYTES_MAX,
+        ),
+        (
+            property!(ArchiveConfiguration, member_size),
+            ARCHIVE_BYTES_MAX,
+        ),
+        (
+            property!(ArchiveConfiguration, extension_size),
+            ARCHIVE_EXTENSION_BYTES_MAX,
+        ),
+    ] {
+        annotate_property(
+            schema,
+            property,
+            RIFT_RANGE,
+            range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(maximum)),
+        );
+    }
+}
+
+/// Advertises the accepted documentation byte bounds on each quantity key.
+pub fn declare_documentation_ranges(schema: &mut Schema) {
+    use crate::configuration::ByteSize;
+    use crate::documentation::{
+        DOCUMENTATION_SOURCE_BYTES_CEILING, DOCUMENTATION_TEXT_BYTES_CEILING,
+        DOCUMENTATION_TOTAL_BYTES_CEILING, DocumentationConfiguration,
+    };
+    for (property, maximum) in [
+        (
+            property!(DocumentationConfiguration, max_file),
+            u64::from(DOCUMENTATION_SOURCE_BYTES_CEILING),
+        ),
+        (
+            property!(DocumentationConfiguration, max_total),
+            DOCUMENTATION_TOTAL_BYTES_CEILING,
+        ),
+        (
+            property!(DocumentationConfiguration, max_text),
+            u64::from(DOCUMENTATION_TEXT_BYTES_CEILING),
+        ),
+    ] {
+        annotate_property(
+            schema,
+            property,
+            RIFT_RANGE,
+            range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(maximum)),
+        );
+    }
+}
+
 /// A [`SourceConfiguration`](crate::source::SourceConfiguration) states its `ByteSize`
 /// bound as `rift:range` on the key: schema validation alone cannot compare `"512mb"`
 /// against a ceiling, so the server enforces the bound at load and the schema carries it
@@ -1192,6 +1277,61 @@ pub fn declare_source_ranges(schema: &mut Schema) {
         range(
             &ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN),
             &ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX),
+        ),
+    );
+}
+
+/// Advertises retained-source quantities accepted by exact-package publication.
+pub fn declare_package_ranges(schema: &mut Schema) {
+    use crate::configuration::{ByteSize, PackageConfiguration};
+    use crate::index::PACKAGE_SOURCE_BYTES_CEILING;
+    annotate_property(
+        schema,
+        property!(PackageConfiguration, retained_source),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(1),
+            &ByteSize::from_bytes(u64::from(PACKAGE_SOURCE_BYTES_CEILING)),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(PackageConfiguration, retained_total),
+        RIFT_RANGE,
+        range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(u64::MAX)),
+    );
+}
+
+/// Advertises dependency file and toolchain-output admission ranges.
+pub fn declare_dependencies_collection_ranges(schema: &mut Schema) {
+    use crate::configuration::ByteSize;
+    use crate::dependencies::{
+        DEPENDENCIES_COLLECTION_BYTES_MAX, DEPENDENCIES_COLLECTION_OUTPUT_MAX,
+        DependenciesCollectionConfiguration,
+    };
+    for field in [
+        property!(DependenciesCollectionConfiguration, lockfile_size),
+        property!(DependenciesCollectionConfiguration, pin_size),
+        property!(DependenciesCollectionConfiguration, project_size),
+        property!(DependenciesCollectionConfiguration, record_size),
+    ] {
+        annotate_property(
+            schema,
+            field,
+            RIFT_RANGE,
+            range(
+                &ByteSize::from_bytes(1),
+                &ByteSize::from_bytes(DEPENDENCIES_COLLECTION_BYTES_MAX),
+            ),
+        );
+    }
+    annotate_property(
+        schema,
+        property!(DependenciesCollectionConfiguration, toolchain_output),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(1),
+            &ByteSize::from_bytes(DEPENDENCIES_COLLECTION_OUTPUT_MAX),
         ),
     );
 }

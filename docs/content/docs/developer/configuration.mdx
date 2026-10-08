@@ -21,6 +21,9 @@ the server's OS permissions on its first request. Inspect the file before runnin
 
 Each section states its defaults below its example. Durations take `ms`, `s`, `m`, `h`, or `d`;
 byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
+The collection settings keep the existing defaults and collection algorithms. Their examples
+show those defaults; the stated ranges are the supported bounds, so a limit can be lowered or
+raised within its range. A value outside that range fails configuration validation.
 
 ## Environment variables
 
@@ -198,6 +201,8 @@ respect_gitignore = true
 files = 100000
 workspace_size = "512mb"
 declarations = 1000000
+relationships = 10000000
+directory_depth = 64
 ```
 
 The four glob lists decide in one order:
@@ -235,6 +240,10 @@ leaves the rest out, and reports each one as an unavailable source naming this k
 holds a full index in about 5 GiB, which is room for a workspace twice the size of the largest
 Rift is tested against - raise it on a machine with memory to spare, lower it on one without.
 
+`relationships` bounds relationship edges retained together, 1 to 500000000. The index keeps the
+edges that fit and counts the omitted edges. `directory_depth` bounds the directory levels scanned
+below the workspace root, 1 to 4096; a deeper directory refuses the rebuild naming this key.
+
 `source` shapes what the index walks: a file it excludes stops reaching `search` and
 [`get_symbol`](/docs/mcp#tool-get_symbol) results. A single `search` request can still
 reach one such file on demand, through the request-side `force_include` override on `search`'s
@@ -265,6 +274,19 @@ The table overrides that default:
 enabled = true
 exclude = []
 force_include = []
+max_sources = 100000
+max_file = "4mb"
+max_total = "512mb"
+max_blocks = 250000
+max_references = 250000
+max_text = "4kb"
+max_heading_depth = 512
+max_warnings = 256
+max_nodes = 250000
+max_depth = 512
+max_progress = 131072
+max_layer_blocks = 2000000
+max_mappings = 6000000
 ```
 
 - `enabled` defaults to `true`; `false` collects no documentation file, while the documentation
@@ -281,9 +303,41 @@ whose change log belongs in search adds it back:
 force_include = ["CHANGELOG.md"]
 ```
 
-A change to the table rebuilds the index, and the `RIFT_DOCUMENTATION_ENABLED`,
-`RIFT_DOCUMENTATION_EXCLUDE`, and `RIFT_DOCUMENTATION_FORCE_INCLUDE` variables override it like
-any other key.
+The collection bounds apply to local documentation and exact-package documentation:
+
+- `max_sources` caps selected sources, 1 to 5000000
+- `max_file` caps one source's bytes, 1b to 64mb; `max_total` caps their bytes together, 1b to 64gb
+- `max_blocks` caps retained blocks, 1 to 50000000
+- `max_references` caps each collection's links, fragments, and reference candidates, 1 to 50000000
+- `max_text` caps one heading, language, destination, or reference spelling, 1b to 1mb
+- `max_heading_depth` caps a block's heading path and heading levels, 1 to 65536
+- `max_warnings` caps retained collection warnings, 1 to 65536
+- `max_nodes` caps a documentation parser's syntax nodes, 1 to 100000000; `max_depth` caps its
+  nesting, 1 to 65536
+- `max_progress` caps one reStructuredText parser's progress callbacks, 1 to 4294967295
+- `max_layer_blocks` caps blocks held across a documentation layer's collections, 1 to 100000000
+- `max_mappings` caps the ranking identity mappings that layer holds, 1 to 300000000
+
+The collector leaves out a source whose parsing or facts pass a bound and retains a warning within
+`max_warnings`. A selected-source count past `max_sources` refuses collection. Attached comments
+use the declaration syntax pass, whose parsing bounds come from [`[providers.syntax]`](#providers).
+
+A documentation layer maps ranking identities to their documentation blocks. Its block and mapping
+bounds apply when the index builds that layer; an accepted configuration change also changes the
+keys used to reuse cached parser facts.
+
+Collection bounds do not change the exact-symbol response shape: documentation context returns at
+most 32 references and 16kb of excerpts. Notebook cell identity and source-range validation, and
+license metadata validation, retain their protocol bounds.
+
+A change to the table rebuilds the index. Every key has its `RIFT_DOCUMENTATION_*` variable, such
+as `RIFT_DOCUMENTATION_MAX_FILE` and `RIFT_DOCUMENTATION_MAX_NODES`, under the
+[environment variable rules](#environment-variables). To raise documentation parser bounds for the
+next server start:
+
+```sh
+RIFT_DOCUMENTATION_MAX_FILE=16mb RIFT_DOCUMENTATION_MAX_NODES=5000000 rift server start
+```
 
 ## Dependencies
 
@@ -325,6 +379,117 @@ name = "typescript"
 requirement = "^5.9.0"
 ```
 
+### Dependency collection
+
+Dependency manifests, lockfiles, installed environment listings, and version probes use
+`[dependencies.collection]`. Its defaults are:
+
+```toml
+[dependencies.collection]
+lockfile_size = "16mb"
+toolchain_output = "64kb"
+manifests = 256
+packages = 20000
+directory_entries = 16384
+pin_size = "64kb"
+project_size = "1mb"
+record_size = "4mb"
+nesting_depth = 32
+```
+
+- `lockfile_size` caps one manifest or lockfile read, 1b to 64mb
+- `toolchain_output` caps retained bytes from each version probe stream, 1b to 1mb
+- `manifests` caps manifests read by one resolver, 1 to 4096; ancestor comparisons take at most
+  `manifests` squared work
+- `packages` caps packages held in one dependency context, 1 to 20000, within the global API's
+  package bound
+- `directory_entries` caps entries in one installed environment directory listing, 1 to 5000000
+- `pin_size` caps one toolchain or version pin file, 1b to 64mb
+- `project_size` caps one standard library project file, 1b to 64mb
+- `record_size` caps one installed distribution's `RECORD` file, 1b to 64mb
+- `nesting_depth` caps package names nested in one Bun package key, 1 to 1024
+
+These keys use variables such as `RIFT_DEPENDENCIES_COLLECTION_LOCKFILE_SIZE` and
+`RIFT_DEPENDENCIES_COLLECTION_MANIFESTS`. They pass the same merged configuration validation as
+the other dependency keys.
+
+## Package collection
+
+Exact-package collection separates input and parsing bounds from publication capacity.
+[`[source]`](#source) bounds selected files, source bytes, declarations, and relationships;
+[`[providers.syntax]`](#providers) bounds each syntax parse; [`[documentation]`](#documentation)
+bounds collected documentation. `[package]` bounds the records that analysis publishes:
+
+```toml
+[package]
+units = 100000
+symbols = 1000000
+documents = 1100000
+warnings = 256
+identifier_terms = 1024
+retained_source = "1mb"
+```
+
+- `units` caps published source units, 1 to 5000000
+- `symbols` caps published declaration records, 1 to 50000000
+- `documents` caps published search documents, 1 to 55000000
+- `warnings` caps retained publication warnings, 1 to 65536
+- `identifier_terms` caps identifier terms retained per search document, 1 to 65536
+- `retained_source` caps source bytes retained per record, 1b to 64mb. Analysis cuts larger source
+  at a UTF-8 boundary and reports the dropped bytes
+- `retained_total`, absent by default, caps retained source bytes across units, symbols, and
+  documents together. It accepts `retained_source` to 18446744073709551615b; a smaller total
+  fails validation
+
+The total counts every published copy before allocation. A file retained in both its source unit
+and its search document counts twice; a declaration with a published search document also counts
+twice. A record without that search document counts once, and each published notebook cell document
+counts its retained decoded source once.
+
+An omitted `retained_total` keeps the existing aggregate behavior. To bound retained copies
+together while allowing larger records:
+
+```toml
+[package]
+retained_source = "8mb"
+retained_total = "2gb"
+```
+
+Collection refuses before allocating a retained copy that would pass the total. Source input
+bytes, parser input bytes, and retained publication bytes are independent limits, so raising
+`retained_source` alone does not raise the parser's `max_file`.
+
+Every package key uses the [environment variable rules](#environment-variables), including
+`RIFT_PACKAGE_SYMBOLS`, `RIFT_PACKAGE_RETAINED_SOURCE`, and `RIFT_PACKAGE_RETAINED_TOTAL`.
+
+### Archives
+
+Archive acquisition runs before source selection and package analysis. The defaults are:
+
+```toml
+[package.archive]
+compressed_size = "64mb"
+expanded_size = "512mb"
+member_size = "64mb"
+extension_size = "16kb"
+members = 100000
+expansion_ratio = 200
+```
+
+- `compressed_size` caps compressed archive bytes, 1b to 64gb
+- `expanded_size` caps expanded bytes together, 1b to 64gb
+- `member_size` caps one member's bytes, 1b to `expanded_size`, at most 64gb
+- `extension_size` caps one GNU or PAX extended header, 1b to 64mb, checked before allocating
+  its contents; that header must also fit `member_size`
+- `members` caps all archive members, including directories, links, and extended headers,
+  1 to 5000000
+- `expansion_ratio` caps expanded bytes per compressed byte, 1 to 4294967295; `expanded_size`
+  still bounds the result
+
+These keys use variables such as `RIFT_PACKAGE_ARCHIVE_COMPRESSED_SIZE` and
+`RIFT_PACKAGE_ARCHIVE_EXPANSION_RATIO`. Archive limits apply before the selected source budgets,
+so raising a publication limit does not raise archive admission.
+
 ## Global
 
 <VersionBadge version="v0.0.43" />
@@ -341,6 +506,9 @@ connect_timeout = "3s"
 request_timeout = "15s"
 attempts = 3
 max_in_flight = 4
+max_request = "4mb"
+max_response = "32mb"
+max_source = "1mb"
 capabilities_ttl = "15m"
 resolution_ttl = "15m"
 failure_ttl = "30s"
@@ -357,6 +525,11 @@ failure_ttl = "30s"
   retry delays, and every attempt
 - `attempts` defaults to `3` and accepts `1` to `5`
 - `max_in_flight` defaults to `4` and accepts `1` to `32`
+- `max_request` caps one request body before sending, 1b to 64mb, default `4mb`
+- `max_response` caps one response body while reading, 1b to 1gb, default `32mb`
+- `max_source` caps one source payload, including documentation source and excerpts, 1b to 64mb,
+  default `1mb`; the client applies the smaller of this value and the source bound the global
+  API advertises. Documentation excerpts also keep their separate response bound
 - `capabilities_ttl` and `resolution_ttl` default to `"15m"` and accept `1m` to `24h`
 - `failure_ttl` defaults to `"30s"` and accepts `1s` to `1h`
 
@@ -685,6 +858,7 @@ include = ["**/*.md", "**/*.mdx", "**/*.txt"]
 max_chunk = "1mb"
 
 [search]
+results = 1000
 pool_slots = 4
 busy_timeout = "5s"
 journal_size_limit = "64mb"
@@ -695,6 +869,8 @@ journal_size_limit = "64mb"
   empty list leaves only language-selected files and required documentation sources
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
+- `results` caps results collected by one local search or symbol lookup, 1 to 10000, default
+  `1000`; an answer that reaches it reports `results_truncated`
 - `pool_slots` bounds SQLite connections the index database may hold open at once, and
   separately the vectors database, 1 to 16
 - `busy_timeout` bounds how long a read or write waits for one of those connections to come

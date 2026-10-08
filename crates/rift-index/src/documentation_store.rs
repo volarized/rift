@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use rift_analysis::documentation::{DocumentationCollection, keyed_changes};
 use rift_protocol::documentation::{
-    DOCUMENTATION_SOURCES_MAX, DocumentationBlock, DocumentationContentIdentity,
+    DOCUMENTATION_SOURCES_CEILING, DocumentationBlock, DocumentationContentIdentity,
     DocumentationCoverage, DocumentationDigest, DocumentationIndex, DocumentationLink,
     DocumentationReference, DocumentationReferenceCandidate, DocumentationSource,
     DocumentationWarning,
@@ -27,7 +27,12 @@ use rift_error::{RiftError, errors};
 /// The fastapi corpus tree, whose documentation is translated into a dozen languages,
 /// encodes 103 MB for 124,000 blocks; the bound holds it with room for the collection's
 /// block bound to fill.
-pub(crate) const METADATA_BYTES_MAX: usize = 256 * 1_024 * 1_024;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the shared default is 256 MiB and fits 32-bit usize"
+)]
+pub(crate) const METADATA_BYTES_MAX: usize =
+    rift_protocol::configuration::LEXICAL_DOCUMENTATION_BYTES_DEFAULT as usize;
 const MANIFEST_ID: i64 = 1;
 
 /// What describes the whole collection: its revisions, its coverage, and its warnings.
@@ -364,20 +369,26 @@ async fn recorded_sources(
 async fn stored_source_rows(
     executor: &mut dyn Executor,
 ) -> Result<Vec<DocumentationSourceRecord>, RiftError> {
-    let bound = DOCUMENTATION_SOURCES_MAX as usize;
+    let bound = DOCUMENTATION_SOURCES_CEILING as usize;
     let rows = DocumentationSourceRecord::all()
         .limit(bound + 1)
         .exec(executor)
         .await
         .map_err(|source| errors::index::lexical_storage().source(source).error())?;
-    if rows.len() > bound {
+    validate_stored_source_count(rows.len())?;
+    Ok(rows)
+}
+
+/// Checks stored source count against the supported collection ceiling.
+fn validate_stored_source_count(count: usize) -> Result<(), RiftError> {
+    if count > DOCUMENTATION_SOURCES_CEILING as usize {
         return errors::index::lexical_record_limit()
             .field("documentation.sources")
-            .observed(rows.len() as u64)
-            .maximum(u64::from(DOCUMENTATION_SOURCES_MAX))
+            .observed(u64::try_from(count).unwrap_or(u64::MAX))
+            .maximum(u64::from(DOCUMENTATION_SOURCES_CEILING))
             .fail();
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Deletes one source's row and every reverse reference it filed.
@@ -517,8 +528,8 @@ fn assembled(
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentationCollection, DocumentationReferenceRecord, EncodedDocumentation,
-        METADATA_BYTES_MAX, replace,
+        DOCUMENTATION_SOURCES_CEILING, DocumentationCollection, DocumentationReferenceRecord,
+        EncodedDocumentation, METADATA_BYTES_MAX, validate_stored_source_count,
     };
     use crate::LexicalStamp;
 
@@ -605,36 +616,30 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn metadata_replace_refuses_excess_stored_source_rows()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let database = crate::WorkspaceDatabase::open(
-            &directory.path().join("index.db"),
-            crate::DatabaseName::Index,
-            crate::DatabasePool::new(2, 1000),
-        )
-        .await?;
-        let encoded = EncodedDocumentation::within(&collection("Guide.\n"), METADATA_BYTES_MAX)?;
-        let mut access = database.writing().await?;
-        let mut transaction = access.transaction().await?;
-        let row_limit = i64::from(rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX);
-        toasty::sql::statement(
-            "WITH RECURSIVE rows(number) AS (\
-               SELECT 1 UNION ALL SELECT number + 1 FROM rows WHERE number < ?1\
-             ) \
-             INSERT INTO documentation_sources(identity, digest, payload) \
-             SELECT 'source-' || number, x'00', '{}' FROM rows",
-        )
-        .bind(row_limit + 1)
-        .exec(&mut transaction)
-        .await?;
-
-        let error = replace(&mut transaction, Some(&encoded))
-            .await
-            .expect_err("replacement must refuse more stored sources than a collection holds");
+    #[test]
+    fn metadata_cleanup_accepts_configured_sources_past_default_and_refuses_past_ceiling() {
+        let mut configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        let past_default = rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX + 1;
+        configuration.documentation.max_sources = past_default;
+        assert_eq!(configuration.validate(), Ok(()));
+        for count in [
+            0,
+            past_default as usize,
+            DOCUMENTATION_SOURCES_CEILING as usize,
+        ] {
+            assert!(
+                validate_stored_source_count(count).is_ok(),
+                "{count} stored sources"
+            );
+        }
+        let error = validate_stored_source_count(DOCUMENTATION_SOURCES_CEILING as usize + 1)
+            .expect_err("stored sources past the supported ceiling must refuse");
         assert_eq!(error.slug().as_str(), "rift.index.lexical_record_limit");
-        Ok(())
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "maximum" && value == "5000000")
+        );
     }
 
     fn collection(text: &str) -> rift_analysis::documentation::DocumentationCollection {

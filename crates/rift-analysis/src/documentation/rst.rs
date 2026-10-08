@@ -9,9 +9,13 @@ use tree_sitter::{Language, Node, ParseOptions, ParseState, Parser, Point, Tree}
 
 use rift_error::{RiftError, errors};
 
+#[cfg(test)]
 const SOURCE_BYTES_MAX: usize = 4 * 1_024 * 1_024;
+#[cfg(test)]
 const SYNTAX_NODES_MAX: usize = 250_000;
+#[cfg(test)]
 const SYNTAX_DEPTH_MAX: usize = 512;
+#[cfg(test)]
 const PROGRESS_CALLBACKS_MAX: usize = 131_072;
 
 /// Prose or code range carried by one reStructuredText block.
@@ -100,8 +104,28 @@ pub(crate) struct RstFacts {
 }
 
 /// Extracts supported reStructuredText facts without executing directives.
+#[cfg(test)]
 pub(super) fn extract_rst_facts(text: &str, path: &ProjectPath) -> Result<RstFacts, RiftError> {
     extract_rst_facts_with_bounds(text, path, RstParseBounds::default())
+}
+
+pub(super) fn extract_rst_facts_with_limits(
+    text: &str,
+    path: &ProjectPath,
+    limits: super::DocumentationLimits,
+) -> Result<RstFacts, RiftError> {
+    let source_bytes = usize::try_from(limits.source_bytes_max).map_err(|_| {
+        errors::analysis::documentation_limit_exceeded()
+            .field("source_bytes")
+            .error()
+    })?;
+    let bounds = RstParseBounds {
+        source_bytes,
+        node_count: limits.nodes_max as usize,
+        depth: limits.depth_max as usize,
+        progress_callbacks: limits.progress_callbacks_max as usize,
+    };
+    extract_rst_facts_with_bounds(text, path, bounds)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +136,7 @@ struct RstParseBounds {
     progress_callbacks: usize,
 }
 
+#[cfg(test)]
 impl RstParseBounds {
     const fn default() -> Self {
         Self {

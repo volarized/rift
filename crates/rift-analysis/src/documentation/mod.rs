@@ -10,6 +10,9 @@ mod coverage_tests;
 pub(crate) mod failure;
 mod identity;
 mod input;
+mod limits;
+#[cfg(all(test, feature = "collector"))]
+mod limits_tests;
 mod links;
 #[cfg(feature = "collector")]
 pub mod notebook;
@@ -24,6 +27,7 @@ mod rst;
 #[cfg(test)]
 pub use failure::DocumentationViolation;
 pub use input::{DocumentationInput, DocumentationSourceSet, check_documentation_source_count};
+pub use limits::DocumentationLimits;
 pub use links::{DocumentationFragment, linked_blocks, resolve_links};
 pub use projection::{
     DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget, LAYER_BLOCKS_MAX,

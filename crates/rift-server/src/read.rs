@@ -666,6 +666,9 @@ impl ReadService {
         }
         let repository = Repository::open(root)?;
         let resolved = repository.resolve(&rev.0)?;
+        let limits = limits.with_revision_tree_entries(
+            usize::try_from(history.tree_entries).unwrap_or(usize::MAX),
+        )?;
         let index = WorkspaceIndex::at_revision_with_languages(
             &repository,
             &resolved,
