@@ -428,6 +428,27 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             serde_json::Number::from(crate::PAGE_LIMIT_MAX),
         )?;
     }
+    for (property, maximum) in [
+        (
+            "request_body_bytes_max",
+            rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX,
+        ),
+        (
+            "response_body_bytes_max",
+            rift_protocol::configuration::GLOBAL_RESPONSE_BYTES_MAX,
+        ),
+        (
+            "source_bytes_max",
+            rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX,
+        ),
+    ] {
+        let schema = property_schema(spec, "CapabilityBounds", property)?;
+        expect_bound(
+            &format!("CapabilityBounds/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(maximum),
+        )?;
+    }
     let cursor = parameter_schema(spec, "Cursor")?;
     expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
     for property in ["line", "character"] {
@@ -443,7 +464,19 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
 
 /// Pins each string bound the client enforces to the contract's `maxLength` for it.
 fn validate_max_lengths(spec: &Spec) -> Result<(), String> {
+    let source_max = usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
+        .map_err(|error| error.to_string())?;
     let expected_max_lengths = [
+        ("PackageSearchHit", "source", source_max),
+        ("PackageSymbol", "source", source_max),
+        ("PackagePatternDeclaration", "source", source_max),
+        ("PackagePatternHit", "source", source_max),
+        (
+            "PackageDocumentationHit",
+            "source",
+            usize::try_from(rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX)
+                .map_err(|error| error.to_string())?,
+        ),
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
         ("PackagePatternRequest", "pattern", SEARCH_PATTERN_CHARS_MAX),

@@ -123,6 +123,7 @@ pub fn validate_documentation_context(
 /// A validated documentation index with exact-symbol reverse references.
 #[derive(Debug)]
 pub struct DocumentationCollection {
+    #[cfg(feature = "collector")]
     limits: super::DocumentationLimits,
     index: DocumentationIndex,
     references: BTreeMap<SymbolId, Vec<usize>>,
@@ -248,6 +249,7 @@ impl DocumentationCollection {
             .map(|(position, source)| (source.identity.clone(), position))
             .collect();
         Ok(Self {
+            #[cfg(feature = "collector")]
             limits: limits.unwrap_or_default(),
             index,
             references,

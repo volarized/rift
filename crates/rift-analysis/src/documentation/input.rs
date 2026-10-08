@@ -1,6 +1,7 @@
 //! Validates explicit source sets without source acquisition or filesystem access.
 
 use std::collections::BTreeSet;
+#[cfg(feature = "collector")]
 use std::sync::Arc;
 
 use rift_core::{ProjectPath, SourceUnitId};

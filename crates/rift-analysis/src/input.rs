@@ -221,6 +221,7 @@ impl ExactPackageLimits {
         })
     }
 
+    #[cfg(feature = "collector")]
     pub(crate) fn relationships_max(self) -> usize {
         self.relationships_max.unwrap_or_else(|| {
             usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
@@ -237,6 +238,7 @@ impl ExactPackageLimits {
         }
     }
 
+    #[cfg(feature = "collector")]
     pub(crate) fn documentation(self) -> crate::documentation::DocumentationLimits {
         self.documentation.unwrap_or_default()
     }
