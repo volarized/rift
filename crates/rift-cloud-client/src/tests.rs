@@ -2184,6 +2184,33 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
     );
 }
 
+/// A padded name keeps its original spelling when the admitted request validates a page.
+#[test]
+fn test_symbol_lookup_accepts_padded_original_names() {
+    let capabilities: Capabilities =
+        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+    for name in ["SearchHit", "searchHit"] {
+        let mut request = symbol_request();
+        request.name = format!(" \t{name}\n ");
+        assert_eq!(validate_symbol_request(&request), Ok(()));
+        let mut value = symbol_page_json("demo", None, "analyzer-v1", "first");
+        value["items"][0]["symbol"]["name"] = serde_json::json!(name);
+        let qualified_name = format!("Module::{name}");
+        value["items"][0]["symbol"]["id"] = serde_json::json!(rift_core::symbol_identity(
+            "rust",
+            "cargo/demo@1.0.0/src/first.rs",
+            &qualified_name,
+        ));
+        value["items"][0]["match_class"] = serde_json::json!("name_exact");
+        let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol page fixture");
+        assert_eq!(
+            validate_symbol_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX),
+            Ok(())
+        );
+        assert_eq!(page.items[0].symbol.name, name);
+    }
+}
+
 #[test]
 fn test_symbol_lookup_refuses_unknown_match_class() {
     let hit: PackageSymbol = serde_json::from_value(serde_json::json!({

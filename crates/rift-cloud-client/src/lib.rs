@@ -2263,8 +2263,9 @@ fn validate_symbol_match_class(
     qualified_name: &str,
 ) -> Result<(), ClientError> {
     let actual = ranking_match_class(&hit.match_class)?;
-    let expected = rift_ranking::identifier_match(&request.name, &hit.symbol.name, qualified_name)
-        .map(rift_ranking::IdentifierMatch::class);
+    let expected =
+        rift_ranking::identifier_match(request.name.trim(), &hit.symbol.name, qualified_name)
+            .map(rift_ranking::IdentifierMatch::class);
     if expected != Some(actual) {
         return Err(ClientError::InvalidResponseField {
             field: "match_class",
