@@ -227,7 +227,8 @@ impl SyntaxProvider for JsonSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_source_witness(source.text))
+        .with_source_witness(source.text)
+        .with_syntax_limits(limits))
     }
 
     /// Portable structural facets for one JSON grammar node kind. The
@@ -246,7 +247,7 @@ impl SyntaxProvider for JsonSyntaxProvider {
     }
 }
 
-fn json_grammar() -> tree_sitter::Language {
+pub(crate) fn json_grammar() -> tree_sitter::Language {
     tree_sitter_json::LANGUAGE.into()
 }
 
@@ -254,6 +255,10 @@ fn json_grammar() -> tree_sitter::Language {
 fn json_kinds() -> &'static JsonKinds {
     static KINDS: OnceLock<JsonKinds> = OnceLock::new();
     KINDS.get_or_init(|| JsonKinds::resolve(&json_grammar()))
+}
+
+pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
+    [MEMBER_KIND_WORD].into_iter().find(|word| *word == name)
 }
 
 #[cfg(test)]

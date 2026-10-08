@@ -521,7 +521,7 @@ macro_rules! __rift_traced_block {
             // The arm passes the caller's expected type on to the work, and keeps a block's
             // braces out of the argument position.
             match () {
-                () => $crate::__private::__rift_traced_work!((__rift_entered, $work)),
+                () => $crate::__private::__rift_traced_work!([$crate] (__rift_entered, $work)),
             },
         )
     }};

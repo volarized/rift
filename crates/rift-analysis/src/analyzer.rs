@@ -21,14 +21,14 @@ use crate::input::ExactPackageInput;
 use crate::revision::analyzer_revision;
 use crate::selection::documentation_format;
 use crate::semantic::{PlacedFacts, WorkspaceSemantics};
-use crate::source::{FileDigest, IndexedFile};
+use crate::source::IndexedFile;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::line::{line_of, line_starts};
 use rift_core::{
     ContributionOrigin, ProjectPath as CoreProjectPath, SourceKind,
     SourceUnitId as CoreSourceUnitId, symbol_identity,
 };
-use rift_error::{ErrorContext, ErrorValue, RiftError, errors};
+use rift_error::{RiftError, errors};
 use rift_protocol::canonical::canonical_json;
 use rift_protocol::documentation::{
     DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX, DocumentationChunk,
@@ -47,9 +47,7 @@ use rift_protocol::read::{
     SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
-use rift_syntax::{
-    DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxFacts, SyntaxLimits, SyntaxSymbol,
-};
+use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -64,7 +62,7 @@ mod join_tests;
 use join::ModuleRole;
 pub use join::StubForm;
 
-fn package_label(package: &PackageIdentity) -> String {
+pub(super) fn package_label(package: &PackageIdentity) -> String {
     format!("{}/{}@{}", package.manager, package.name, package.version)
 }
 
@@ -118,6 +116,7 @@ pub struct PackageAnalysis {
     files: Vec<AnalyzedFile>,
     semantics: WorkspaceSemantics,
     notebook_cells: BTreeMap<DocumentationContentIdentity, String>,
+    syntax_work: crate::PackageSyntaxWork,
 }
 
 impl PackageAnalysis {
@@ -125,6 +124,12 @@ impl PackageAnalysis {
     #[must_use]
     pub const fn publication(&self) -> &PackagePublication {
         &self.publication
+    }
+
+    /// Returns actual syntax provider calls and accepted reuse for this analysis.
+    #[must_use]
+    pub const fn syntax_work(&self) -> crate::PackageSyntaxWork {
+        self.syntax_work
     }
 
     /// Every analyzed file, in path order.
@@ -156,6 +161,48 @@ impl PackageAnalysis {
 #[derive(Debug, Default)]
 pub struct PackageAnalyzer;
 
+fn analyzed_file(
+    input: ExactPackageInput<'_>,
+    file: crate::PackageSource<'_>,
+    supplied: &mut impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
+    work: &mut crate::PackageSyntaxWork,
+) -> Result<AnalyzedFile, RiftError> {
+    let source = crate::PackageSyntaxSource::new(
+        file,
+        input.package(),
+        input.language(),
+        input.limits().syntax(),
+    );
+    let candidate = supplied(&source).filter(|facts| source.accepts(facts));
+    let accepted = candidate.is_some();
+    let syntax = match candidate {
+        Some(syntax) => syntax,
+        None => source.parse()?,
+    };
+    work.provider_calls = work
+        .provider_calls
+        .checked_add(source.provider_calls())
+        .expect("package syntax provider call count must fit u64");
+    if accepted && source.provider_calls() == 0 {
+        work.reused_files += 1;
+    }
+    let parsed = IndexedFile::new_with_shared_syntax(
+        file.path().clone(),
+        file.text().to_owned().into(),
+        source.identity().source_digest,
+        false,
+        std::sync::Arc::clone(syntax.facts()),
+    );
+    let placement = placement_of(input.package(), input.origin(), file.path())?;
+    let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
+    Ok(AnalyzedFile {
+        file: parsed,
+        placement,
+        public_names,
+        role: ModuleRole::Unpaired,
+    })
+}
+
 impl PackageAnalyzer {
     /// Analyzes one exact package's selected files.
     ///
@@ -181,18 +228,38 @@ impl PackageAnalyzer {
         input: ExactPackageInput<'_>,
         revision: u64,
     ) -> Result<PackageAnalysis, RiftError> {
+        Self::analyze_with_syntax(input, revision, |_| None)
+    }
+
+    /// Assembles a package with optional per-file syntax supplied by the caller.
+    ///
+    /// The hook runs once per selected file in input order. Its source exposes the actual
+    /// provider identity and bounds before parsing. A missing or incompatible value runs
+    /// the current provider. Call `source.parse()` inside the hook to retain successful
+    /// file work before a later failure; parser calls remain included in `syntax_work()`.
+    ///
+    /// Every call rebuilds current placement, module joins, semantics, documentation
+    /// relationships, and publication. Retention, encoding, and lookup remain caller-owned.
+    /// The work is proportional to selected bytes and declarations plus caller hook work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source and assembly failures as [`Self::analyze`].
+    pub fn analyze_with_syntax(
+        input: ExactPackageInput<'_>,
+        revision: u64,
+        mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
+    ) -> Result<PackageAnalysis, RiftError> {
         let package = input.package();
+        let mut syntax_work = crate::PackageSyntaxWork::default();
         let mut analyzed = Vec::with_capacity(input.files().len());
         for file in input.files() {
-            let parsed = parsed_file(*file, package, input.language(), input.limits().syntax())?;
-            let placement = placement_of(package, input.origin(), file.path())?;
-            let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
-            analyzed.push(AnalyzedFile {
-                file: parsed,
-                placement,
-                public_names,
-                role: ModuleRole::Unpaired,
-            });
+            analyzed.push(analyzed_file(
+                input,
+                *file,
+                &mut supplied,
+                &mut syntax_work,
+            )?);
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
         join::join_modules(&mut analyzed);
@@ -234,6 +301,7 @@ impl PackageAnalyzer {
             files: analyzed,
             semantics: built.semantics,
             notebook_cells,
+            syntax_work,
         })
     }
 }
@@ -1323,58 +1391,27 @@ fn wire_path(path: &CoreProjectPath) -> ProjectPath {
 }
 
 /// One package file parsed by the provider its extension names, under `syntax_limits`.
+#[cfg(test)]
 fn parsed_file(
     file: crate::input::PackageSource<'_>,
     package: &PackageIdentity,
     package_language: &Language,
-    syntax_limits: SyntaxLimits,
+    syntax_limits: rift_syntax::SyntaxLimits,
 ) -> Result<IndexedFile, RiftError> {
-    let context = Path::new(file.path().as_str());
-    let extension = context
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default();
-    let language = source_language(extension, package_language);
-    let syntax = if matches!(extension, "rst" | "txt" | "ipynb") {
-        SyntaxDocument::empty(language, file.path().clone())
-    } else {
-        let provider =
-            rift_syntax::registry::provider_for_extension(extension).ok_or_else(|| {
-                errors::analysis::package_syntax_unavailable()
-                    .package(package_label(package))
-                    .path(file.path().as_str())
-                    .error()
-            })?;
-        provider
-            .analyze(
-                rift_syntax::SyntaxSource {
-                    path: file.path(),
-                    text: file.text(),
-                },
-                syntax_limits,
-            )
-            .map_err(|error| {
-                error
-                    .with(ErrorContext::new(
-                        "package",
-                        ErrorValue::formatted(package_label(package)),
-                    ))
-                    .with(ErrorContext::new(
-                        "path",
-                        ErrorValue::path(file.path().as_str()),
-                    ))
-            })?
-    };
-    Ok(IndexedFile::new(
+    Ok(IndexedFile::new_with_shared_syntax(
         file.path().clone(),
         file.text().to_owned().into(),
-        FileDigest::of(file.text().as_bytes()),
+        crate::FileDigest::of(file.text().as_bytes()),
         false,
-        syntax,
+        std::sync::Arc::clone(
+            crate::PackageSyntaxSource::new(file, package, package_language, syntax_limits)
+                .parse()?
+                .facts(),
+        ),
     ))
 }
 
-fn source_language(extension: &str, package_language: &Language) -> Language {
+pub(super) fn source_language(extension: &str, package_language: &Language) -> Language {
     match extension {
         "md" | "markdown" | "mdx" => ShippedLanguage::Markdown.language(),
         "rst" => Language {

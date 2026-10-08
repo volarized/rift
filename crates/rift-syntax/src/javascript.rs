@@ -54,13 +54,13 @@ impl SyntaxProvider for JavaScriptSyntaxProvider {
     }
 }
 
-fn javascript_grammar() -> tree_sitter::Language {
+pub(crate) fn javascript_grammar() -> tree_sitter::Language {
     tree_sitter_javascript::LANGUAGE.into()
 }
 
 /// Returns the process-wide resolved JavaScript kind table, computing it
 /// once.
-fn javascript_kinds() -> &'static EcmaScriptKinds {
+pub(crate) fn javascript_kinds() -> &'static EcmaScriptKinds {
     static KINDS: OnceLock<EcmaScriptKinds> = OnceLock::new();
     KINDS.get_or_init(|| EcmaScriptKinds::resolve_javascript(&javascript_grammar()))
 }

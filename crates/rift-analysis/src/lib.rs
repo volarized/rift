@@ -46,3 +46,10 @@ pub use selection::{
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
+
+#[cfg(feature = "collector")]
+mod package_syntax;
+#[cfg(feature = "collector")]
+pub use package_syntax::{
+    PackageSyntax, PackageSyntaxIdentity, PackageSyntaxSource, PackageSyntaxWork,
+};

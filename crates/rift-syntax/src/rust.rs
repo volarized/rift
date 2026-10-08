@@ -16,7 +16,7 @@ use crate::failure::{RiftError, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Rust declaration kind emitted by the Tree-sitter provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::VariantArray)]
 enum RustSymbolKind {
     /// Function or method.
     Function,
@@ -370,7 +370,8 @@ impl SyntaxProvider for RustSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_source_witness(source.text))
+        .with_source_witness(source.text)
+        .with_syntax_limits(limits))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
@@ -464,7 +465,7 @@ impl GrammarRules for RustGrammarRules {
     }
 }
 
-fn rust_grammar() -> tree_sitter::Language {
+pub(crate) fn rust_grammar() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
@@ -634,6 +635,13 @@ fn body_range(node: Node<'_>, kind: RustSymbolKind) -> Result<Option<ByteRange>,
         return Ok(None);
     };
     extract::byte_range(body).map(Some)
+}
+
+pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
+    <RustSymbolKind as strum::VariantArray>::VARIANTS
+        .iter()
+        .map(|kind| kind.word())
+        .find(|word| *word == name)
 }
 
 #[cfg(test)]

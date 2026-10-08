@@ -40,3 +40,6 @@ pub use yaml::YamlSyntaxProvider;
 /// Compile-time marker for syntax-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxLayer;
+
+mod restore;
+pub use restore::{MarkdownFactsParts, SyntaxFactsParts, SyntaxNames};

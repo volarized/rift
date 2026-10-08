@@ -964,7 +964,8 @@ pub(crate) fn analyze(
         symbols,
         tree.root_node().has_error(),
     )
-    .with_source_witness(source.text))
+    .with_source_witness(source.text)
+    .with_syntax_limits(limits))
 }
 
 /// Portable structural facets for one ECMAScript grammar node kind, shared
@@ -1015,6 +1016,14 @@ fn suffix_facets(kind: &str) -> Vec<NodeFacet> {
         facets.push(NodeFacet::TypeExpression);
     }
     facets
+}
+
+pub(crate) fn restored_symbol_kind(kinds: &EcmaScriptKinds, name: &str) -> Option<&'static str> {
+    kinds
+        .declarations
+        .iter()
+        .map(|(_, kind)| kind.word())
+        .find(|word| *word == name)
 }
 
 #[cfg(test)]

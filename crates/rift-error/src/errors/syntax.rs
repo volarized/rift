@@ -1,6 +1,94 @@
 use rift_error::__rift_error_definition;
 
 __rift_error_definition!(
+    facts_count_exceeded,
+    slug = "rift.syntax.facts_count_exceeded",
+    message = "syntax facts exceed their node bound",
+    action = "reduce facts below the accepted node bound and parse again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_depth_exceeded,
+    slug = "rift.syntax.facts_depth_exceeded",
+    message = "syntax facts exceed their parent depth bound",
+    action = "reduce parent depth below the accepted syntax bound and parse again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_kind_invalid,
+    slug = "rift.syntax.facts_kind_invalid",
+    message = "syntax facts carry an unknown provider kind",
+    action = "parse the source with the selected provider again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_name_invalid,
+    slug = "rift.syntax.facts_name_invalid",
+    message = "syntax facts carry an invalid declaration name",
+    action = "parse the supplied source again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_order_invalid,
+    slug = "rift.syntax.facts_order_invalid",
+    message = "syntax facts are not in source order",
+    action = "parse the supplied source again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_range_invalid,
+    slug = "rift.syntax.facts_range_invalid",
+    message = "syntax facts carry an invalid source range",
+    action = "parse the supplied source again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_reference_invalid,
+    slug = "rift.syntax.facts_reference_invalid",
+    message = "syntax facts carry an invalid parent or reference",
+    action = "parse the supplied source again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_source_mismatch,
+    slug = "rift.syntax.facts_source_mismatch",
+    message = "syntax facts source digest does not match",
+    action = "parse the supplied source again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_source_too_large,
+    slug = "rift.syntax.facts_source_too_large",
+    message = "syntax facts source exceeds its byte bound",
+    action = "reduce source bytes below the accepted bound and parse again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_structure_invalid,
+    slug = "rift.syntax.facts_structure_invalid",
+    message = "syntax facts carry an invalid source structure",
+    action = "parse the supplied source again",
+    fields = {},
+);
+
+__rift_error_definition!(
+    facts_text_exceeded,
+    slug = "rift.syntax.facts_text_exceeded",
+    message = "syntax facts text exceeds its source byte bound",
+    action = "reduce text below the accepted source byte bound and parse again",
+    fields = {},
+);
+
+__rift_error_definition!(
     incompatible_grammar,
     slug = "rift.syntax.incompatible_grammar",
     message = "grammar ABI {grammar_abi_version} is outside runtime range {runtime_abi_min} to {runtime_abi_max}",

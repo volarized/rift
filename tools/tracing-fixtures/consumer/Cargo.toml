@@ -1,0 +1,8 @@
+[package]
+name = "rift-tracing-consumer-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+facade = { package = "rift-tracing-facade-fixture", path = "../facade" }

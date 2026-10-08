@@ -1,0 +1,9 @@
+[package]
+name = "rift-tracing-facade-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rift-tracing = { path = "../../../crates/rift-tracing" }
+rift-error = { path = "../../../crates/rift-error" }

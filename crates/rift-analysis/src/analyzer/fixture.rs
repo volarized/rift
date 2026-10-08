@@ -18,6 +18,26 @@ pub(super) fn identity() -> PackageIdentity {
     }
 }
 
+#[test]
+fn parsed_file_preserves_source_path_digest_and_declarations() {
+    let path = ProjectPath::new("src/lib.rs").expect("path");
+    let text = "/// Opens a file.\npub fn café() {}\n";
+    let file = super::parsed_file(
+        PackageSource::new(&path, text),
+        &identity(),
+        &language(ShippedLanguage::Rust),
+        SyntaxLimits::default(),
+    )
+    .expect("supported source");
+    assert_eq!(file.path(), &path);
+    assert_eq!(file.source(), text);
+    assert_eq!(file.digest(), rift_core::FileDigest::of(text.as_bytes()));
+    assert!(!file.executable());
+    assert_eq!(file.syntax().symbols().len(), 1);
+    assert_eq!(file.syntax().symbols()[0].name, "café");
+    assert_eq!(file.syntax().source_digest(), Some(&file.digest()));
+}
+
 pub(super) fn language(shipped: ShippedLanguage) -> Language {
     shipped.language()
 }

@@ -42,7 +42,7 @@ impl TypeScriptDialect {
         }
     }
 
-    fn grammar(self) -> tree_sitter::Language {
+    pub(crate) fn grammar(self) -> tree_sitter::Language {
         match self {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
@@ -52,7 +52,7 @@ impl TypeScriptDialect {
     /// Returns this dialect's process-wide resolved kind table, computing it
     /// once. The two grammars number their kinds independently, so each
     /// dialect resolves its own table.
-    fn kinds(self) -> &'static EcmaScriptKinds {
+    pub(crate) fn kinds(self) -> &'static EcmaScriptKinds {
         static TYPESCRIPT_KINDS: OnceLock<EcmaScriptKinds> = OnceLock::new();
         static TSX_KINDS: OnceLock<EcmaScriptKinds> = OnceLock::new();
         let cache = match self {

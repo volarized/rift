@@ -378,7 +378,8 @@ impl SyntaxProvider for TomlSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_source_witness(source.text))
+        .with_source_witness(source.text)
+        .with_syntax_limits(limits))
     }
 
     /// Portable structural facets for one TOML grammar node kind. The
@@ -406,7 +407,7 @@ impl SyntaxProvider for TomlSyntaxProvider {
     }
 }
 
-fn toml_grammar() -> tree_sitter::Language {
+pub(crate) fn toml_grammar() -> tree_sitter::Language {
     tree_sitter_toml_ng::LANGUAGE.into()
 }
 
@@ -414,6 +415,12 @@ fn toml_grammar() -> tree_sitter::Language {
 fn toml_kinds() -> &'static TomlKinds {
     static KINDS: OnceLock<TomlKinds> = OnceLock::new();
     KINDS.get_or_init(|| TomlKinds::resolve(&toml_grammar()))
+}
+
+pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
+    [MEMBER_KIND_WORD, TABLE_KIND_WORD]
+        .into_iter()
+        .find(|word| *word == name)
 }
 
 #[cfg(test)]

@@ -28,4 +28,5 @@ tree-sitter-typescript.workspace = true
 tree-sitter-yaml.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 rift-tracing.workspace = true
