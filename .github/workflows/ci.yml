@@ -107,7 +107,7 @@ jobs:
           shared-key: checks
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -201,7 +201,7 @@ jobs:
           shared-key: rust-build
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -260,7 +260,7 @@ jobs:
         with:
           name: fast-build
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -348,7 +348,7 @@ jobs:
         with:
           name: fast-build
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -403,7 +403,7 @@ jobs:
         with:
           name: native-live
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -449,7 +449,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -511,7 +511,7 @@ jobs:
           shared-key: native-${{ matrix.target }}
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -628,7 +628,7 @@ jobs:
           shared-key: integration
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -688,7 +688,7 @@ jobs:
           shared-key: integration-cli
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -763,7 +763,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -843,7 +843,7 @@ jobs:
         with:
           name: integration-cli
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
