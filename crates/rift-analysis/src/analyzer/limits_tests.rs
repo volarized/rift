@@ -224,26 +224,31 @@ fn test_declaration_limit_accepts_exact_count_and_refuses_one_more() {
 }
 
 #[test]
-fn test_declaration_limit_preserves_default_and_accepts_larger_package() {
+fn test_declaration_limit_preserves_default_and_uses_configured_bound() {
     // Issue #561: raising syntax bounds alone cannot raise the package declaration bound.
     let syntax = SyntaxLimits::new(8 << 20, 4_000_000, 512).expect("syntax bounds");
     let limits = ExactPackageLimits::new(2, 16 << 20).with_syntax(syntax);
     assert_eq!(limits.declarations_max(), 100_000);
-    let first = source(50_000);
-    let second = source(50_001);
+    let first = source(1);
+    let second = source(2);
     let source_max = rift_protocol::index::PACKAGE_SOURCE_BYTES_MAX as usize;
     assert!(first.len() <= source_max && second.len() <= source_max);
-    let error = analyze(limits, &first, &second).expect_err("default declaration bound");
+    let baseline = analyze(limits, &first, &second).expect("default declaration bound");
+    assert_eq!(baseline.publication().symbols.len(), 3);
+    let selected = limits
+        .with_declarations(2)
+        .expect("selected declaration bound");
+    let error = analyze(selected, &first, &second).expect_err("selected declaration bound");
     assert_eq!(
         error.slug().as_str(),
         "rift.analysis.package_declarations_exceeded"
     );
 
-    let raised = limits
-        .with_declarations(100_001)
+    let raised = selected
+        .with_declarations(3)
         .expect("raised declaration bound");
     let analysis = analyze(raised, &first, &second).expect("larger package");
-    assert_eq!(analysis.publication().symbols.len(), 100_001);
+    assert_eq!(analysis.publication().symbols.len(), 3);
     assert!(analysis.publication().warnings.is_empty());
 }
 
