@@ -84,6 +84,21 @@ impl IdentifierMatch {
     pub const fn class(self) -> IdentifierMatchClass {
         self.class
     }
+
+    /// Whether the candidate equals an original name or qualified name.
+    #[must_use]
+    pub fn is_original_exact(self) -> bool {
+        self.spelling == IdentifierSpelling::Original
+    }
+}
+
+impl From<IdentifierMatchClass> for IdentifierMatch {
+    fn from(class: IdentifierMatchClass) -> Self {
+        Self {
+            spelling: IdentifierSpelling::Normalized,
+            class,
+        }
+    }
 }
 
 /// Classifies one candidate against names using case-insensitive comparison.
@@ -403,11 +418,7 @@ impl IdentifierRanking {
         class: IdentifierMatchClass,
         candidate: &IdentifierCandidate,
     ) {
-        let matched = IdentifierMatch {
-            spelling: IdentifierSpelling::Normalized,
-            class,
-        };
-        self.observe_match(identity, candidate.position(), matched);
+        self.observe_match(identity, candidate.position(), class.into());
     }
 
     /// Records a match, retaining original spelling preference before candidate position.
@@ -450,7 +461,10 @@ impl IdentifierRanking {
         placed.truncate(bound);
         placed
             .into_iter()
-            .map(|(identity, placement)| RankedIdentity::new(identity, placement.fields))
+            .map(|(identity, placement)| {
+                RankedIdentity::new(identity, placement.fields)
+                    .with_identifier_match(placement.matched)
+            })
             .collect()
     }
 
