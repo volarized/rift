@@ -685,6 +685,59 @@ fn supplied_markdown_syntax_produces_same_metadata_as_owned_parse() {
 }
 
 #[test]
+fn supplied_markdown_syntax_keeps_selected_parser_bounds() {
+    let text = "# Notes\n\nOne paragraph.\n\n## Notes\nTwo.\n";
+    let path = rift_core::ProjectPath::new("README.md").expect("path");
+    let syntax = MarkdownSyntaxProvider::default()
+        .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
+        .expect("syntax");
+    let shared = input("README.md", text)
+        .with_syntax(&syntax)
+        .expect("matching syntax");
+    let sources = DocumentationSourceSet::new(vec![shared.clone()]).expect("default sources");
+    let default = collect_documentation(&sources, &[]).expect("default collection");
+    assert_eq!(default.index().coverage.parsed, 1);
+    assert!(!default.index().blocks.is_empty());
+
+    for configuration in [
+        DocumentationConfiguration {
+            max_nodes: 1,
+            ..DocumentationConfiguration::default()
+        },
+        DocumentationConfiguration {
+            max_depth: 1,
+            ..DocumentationConfiguration::default()
+        },
+    ] {
+        let limits = DocumentationLimits::from_configuration(&configuration)
+            .expect("selected parser bounds");
+        let shared_sources = DocumentationSourceSet::with_limits(vec![shared.clone()], &limits)
+            .expect("shared source");
+        let owned_sources =
+            DocumentationSourceSet::with_limits(vec![input("README.md", text)], &limits)
+                .expect("owned source");
+        let shared_collection =
+            collect_documentation(&shared_sources, &[]).expect("bounded shared collection");
+        let owned_collection =
+            collect_documentation(&owned_sources, &[]).expect("bounded owned collection");
+        let index = shared_collection.index();
+        assert_eq!(index, owned_collection.index());
+        assert_eq!(index.coverage.selected, 1);
+        assert_eq!(index.coverage.parsed, 0);
+        assert_eq!(index.coverage.omitted, 1);
+        assert!(index.blocks.is_empty());
+        assert!(matches!(
+            index.warnings.as_slice(),
+            [DocumentationWarning {
+                kind: DocumentationWarningKind::MalformedSource,
+                count: 1,
+                ..
+            }]
+        ));
+    }
+}
+
+#[test]
 fn rst_references_resolve_local_targets_and_keep_missing_or_ambiguous_names() {
     let text = concat!(
         "See target_ and external_ and missing_ and repeated_.\n\n",
