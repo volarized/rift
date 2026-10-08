@@ -107,7 +107,7 @@ jobs:
           shared-key: checks
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -201,7 +201,7 @@ jobs:
           shared-key: rust-build
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -226,7 +226,7 @@ jobs:
 
       - name: Archive unit tests
         run: just fast-archive
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: fast-build
           path: |
@@ -242,7 +242,8 @@ jobs:
     needs: rust-build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Artifact download and setup have their own allowance outside the test budget.
+    timeout-minutes: 25
     permissions:
       contents: read
 
@@ -256,11 +257,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: fast-build
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -285,7 +286,7 @@ jobs:
           NEXTEST_PROFILE: ci
       - name: Preserve Rust coverage and test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v6.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fast-results
           path: |
@@ -344,11 +345,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: fast-build
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -372,7 +373,7 @@ jobs:
         id: live
         timeout-minutes: 15
         run: just live-test target/fast.tar.zst
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
         with:
           name: live-results
@@ -399,11 +400,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: native-live
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -427,7 +428,7 @@ jobs:
         id: live
         timeout-minutes: 15
         run: just live-test target/native-live.tar.zst
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
         with:
           name: live-results-macos
@@ -449,7 +450,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -511,7 +512,7 @@ jobs:
           shared-key: native-${{ matrix.target }}
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -553,7 +554,7 @@ jobs:
           --workspace --all-targets --all-features
           --archive-file target/native-live.tar.zst
           -E 'not binary(/^corpus_/)'
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ matrix.live }}
         with:
           name: native-live
@@ -575,7 +576,7 @@ jobs:
           rift-dev test nextest run --locked
           --workspace --all-targets --all-features --profile ${{ matrix.profile || 'ci' }} --no-tests fail
           -E 'not test(/_probe$/)'
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: native-tests-${{ matrix.target }}
@@ -600,7 +601,7 @@ jobs:
           --workspace --all-targets --all-features --profile ci-windows-update --no-tests fail
           --run-ignored all
           -E 'binary_id(=rift::bin/rift) and test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)'
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ always() && runner.os == 'Windows' }}
         with:
           name: native-update-tests-${{ matrix.target }}
@@ -628,7 +629,7 @@ jobs:
           shared-key: integration
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -665,7 +666,7 @@ jobs:
         if: steps.integration-archive-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
         run: just integration-archive
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: integration-archive
           path: target/integration.tar.zst
@@ -688,7 +689,7 @@ jobs:
           shared-key: integration-cli
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -720,7 +721,7 @@ jobs:
         if: steps.integration-cli-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
         run: just integration-cli
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: integration-cli
           path: target/integration-cli.tar.zst
@@ -763,11 +764,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: integration-archive
           path: target
@@ -816,7 +817,7 @@ jobs:
           name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           report_type: test_results
           token: ${{ secrets.CODECOV_TOKEN }}
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: corpus-${{ matrix.repository }}-${{ matrix.case }}
@@ -839,11 +840,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: integration-cli
           path: target
-      - uses: astral-sh/setup-uv@v7.6.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -874,7 +875,7 @@ jobs:
           just conformance --binary target/integration-cli/rift
       - name: Validate cold first use
         run: just coldstart-test --binary target/integration-cli/rift --junit target/integration/coldstart.xml
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: artifact-results
