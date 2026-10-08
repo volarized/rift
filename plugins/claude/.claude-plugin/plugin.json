@@ -1,7 +1,7 @@
 {
   "name": "rift",
   "displayName": "Rift",
-  "version": "0.0.64",
+  "version": "0.0.65",
   "description": "Rift is an agentic development toolkit for reading and discovering codebases.",
   "author": {
     "name": "volar.sh",

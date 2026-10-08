@@ -41,6 +41,226 @@ fn page() -> Value {
     value
 }
 
+fn stored_pages() -> (Value, Value) {
+    let mut search = page();
+    search["items"][0]["documentation"]["documentation_revision"] = json!("abcdef01");
+    let mut current = search["items"][0].clone();
+    current["package"] = package_json("other");
+    current["documentation"]["documentation_revision"] = json!("0123abcd");
+    current["documentation"]["block"]["identity"] = json!("6".repeat(64));
+    current["documentation"]["source"]["origin"]["package"] = package_json("other");
+    current["documentation"]["source"]["identity"]["source"]["unit"] =
+        json!("rift://source/cargo/other@1.0.0/README.md");
+    current["documentation"]["block"]["source"] =
+        current["documentation"]["source"]["identity"].clone();
+    search["items"]
+        .as_array_mut()
+        .expect("documentation items")
+        .push(current);
+
+    let mut symbols = symbol_page_json("demo", None, "analyzer-v1", "first");
+    symbols["documentation_revision"] = json!("0123abcd");
+    symbols["items"][0]["source"] = json!("demo");
+    let mut old_context = context();
+    old_context["documentation_revision"] = json!("abcdef01");
+    old_context["references"][0]["documentation"]["documentation_revision"] = json!("abcdef01");
+    symbols["items"][0]["documentation"] = old_context;
+    let mut current_symbol =
+        symbol_page_json("other", None, "analyzer-v1", "second")["items"][0].clone();
+    current_symbol["source"] = json!("demo");
+    let mut current_context = context();
+    current_context["references"][0]["reference"]["target"] =
+        current_symbol["symbol"]["id"].clone();
+    current_context["references"][0]["reference"]["block"] =
+        search["items"][1]["documentation"]["block"]["identity"].clone();
+    current_context["references"][0]["documentation"] = search["items"][1]["documentation"].clone();
+    current_symbol["documentation"] = current_context;
+    symbols["items"]
+        .as_array_mut()
+        .expect("symbol items")
+        .push(current_symbol);
+    (search, symbols)
+}
+
+fn mixed_search_request() -> PackageSearchRequest {
+    let mut request = request();
+    let mut other = package_request();
+    other.name = "other".to_owned();
+    request.packages.push(other);
+    request
+}
+
+fn mixed_symbol_request() -> PackageSymbolRequest {
+    let mut request = symbol_request();
+    request.include = Some(vec![
+        PackageSymbolRequestInclude::Source,
+        PackageSymbolRequestInclude::Documentation,
+    ]);
+    request.packages = mixed_search_request().packages;
+    request
+}
+
+#[tokio::test]
+async fn native_http_reads_preserve_old_and_current_documentation() {
+    let (search, symbols) = stored_pages();
+    let expected_search: PackageSearchPage =
+        serde_json::from_value(search.clone()).expect("stored search");
+    let expected_symbols: PackageSymbolPage =
+        serde_json::from_value(symbols.clone()).expect("stored symbols");
+    let (_server, client) =
+        operation_client(OperationFixture::Documentation { search, symbols }).await;
+    let read = client
+        .search_packages(&mixed_search_request(), 20, None)
+        .await
+        .expect("old and current search");
+    assert_eq!(read, expected_search);
+    let symbols = client
+        .list_package_symbols(&mixed_symbol_request(), 20, None)
+        .await
+        .expect("stored source and reverse references");
+    assert_eq!(symbols, expected_symbols);
+    for item in &symbols.items {
+        assert_eq!(item.source.as_deref(), Some("demo"));
+        assert_eq!(
+            item.documentation
+                .as_ref()
+                .expect("requested context")
+                .references
+                .len(),
+            1
+        );
+        PackageSymbolCandidate::try_from(item).expect("source and context convert");
+    }
+    assert_eq!(
+        symbols.items[0]
+            .documentation
+            .as_ref()
+            .expect("old context")
+            .documentation_revision,
+        "abcdef01"
+    );
+    assert_eq!(
+        symbols.items[1]
+            .documentation
+            .as_ref()
+            .expect("current context")
+            .documentation_revision,
+        "0123abcd"
+    );
+}
+
+#[tokio::test]
+async fn native_http_all_search_keeps_lexical_source_beside_stored_documentation() {
+    let (mut search, symbols) = stored_pages();
+    let mut lexical = search_page_json("demo", None, "analyzer-v1", "first")["items"][0].clone();
+    lexical["source"] = json!("demo");
+    search["items"]
+        .as_array_mut()
+        .expect("search items")
+        .push(lexical);
+    let expected: PackageSearchPage =
+        serde_json::from_value(search.clone()).expect("mixed target page");
+    let (_server, client) =
+        operation_client(OperationFixture::Documentation { search, symbols }).await;
+    let mut request = mixed_search_request();
+    request.target = Some(PackageSearchRequestTarget::All);
+    let actual = client
+        .search_packages(&request, 20, None)
+        .await
+        .expect("lexical and documentation reads");
+    assert_eq!(actual, expected);
+    for item in actual.items {
+        let candidate = PackageSearchCandidate::try_from(item).expect("candidate converts");
+        assert!(candidate.hit.source.is_some());
+    }
+}
+
+#[tokio::test]
+async fn native_http_stored_documentation_refuses_foreign_origins_and_invalid_revisions() {
+    for (pointer, replacement, field) in [
+        (
+            "/items/0/documentation/source/origin/package/name",
+            json!("foreign"),
+            "documentation",
+        ),
+        (
+            "/items/0/documentation/documentation_revision",
+            json!("invalid"),
+            "documentation",
+        ),
+        (
+            "/documentation_revision",
+            json!("abcdef01"),
+            "documentation_revision",
+        ),
+        (
+            "/items/0/documentation/block/range/end",
+            json!(41),
+            "documentation",
+        ),
+    ] {
+        let (mut search, symbols) = stored_pages();
+        *search.pointer_mut(pointer).expect("stored field") = replacement;
+        let (_server, client) =
+            operation_client(OperationFixture::Documentation { search, symbols }).await;
+        assert!(
+            matches!(client.search_packages(&mixed_search_request(), 20, None).await,
+            Err(ClientError::InvalidResponseField { field: actual }) if actual == field)
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_http_stored_context_refuses_wrong_targets_revisions_and_duplicate_references() {
+    for (pointer, replacement) in [
+        (
+            "/items/0/documentation/references/0/documentation/documentation_revision",
+            json!("0123abcd"),
+        ),
+        (
+            "/items/0/documentation/references/0/reference/target",
+            symbol_json("other", "second")["id"].clone(),
+        ),
+        (
+            "/items/0/documentation/references/0/documentation/source/origin/package/name",
+            json!("foreign"),
+        ),
+        (
+            "/items/0/documentation/references/0/reference/range/end",
+            json!(41),
+        ),
+        (
+            "/items/0/documentation/documentation_revision",
+            json!("invalid"),
+        ),
+    ] {
+        let (search, mut symbols) = stored_pages();
+        *symbols.pointer_mut(pointer).expect("stored field") = replacement;
+        let (_server, client) =
+            operation_client(OperationFixture::Documentation { search, symbols }).await;
+        assert!(
+            client
+                .list_package_symbols(&mixed_symbol_request(), 20, None)
+                .await
+                .is_err()
+        );
+    }
+    let (search, mut symbols) = stored_pages();
+    let reference = symbols["items"][0]["documentation"]["references"][0].clone();
+    symbols["items"][0]["documentation"]["references"]
+        .as_array_mut()
+        .expect("references")
+        .push(reference);
+    let (_server, client) =
+        operation_client(OperationFixture::Documentation { search, symbols }).await;
+    assert!(
+        client
+            .list_package_symbols(&mixed_symbol_request(), 20, None)
+            .await
+            .is_err()
+    );
+}
+
 fn request() -> PackageSearchRequest {
     let mut value = search_request();
     value.target = Some(PackageSearchRequestTarget::Documentation);
@@ -101,12 +321,12 @@ fn documentation_pages_validate_identity_fields_and_requested_source() {
 }
 
 #[test]
-fn documentation_pages_refuse_mixed_packages_revisions_and_invalid_metadata() {
+fn documentation_pages_refuse_foreign_packages_and_invalid_metadata() {
     for (pointer, replacement, field) in [
         ("/items/0/package/name", json!("other"), "documentation"),
         (
             "/items/0/documentation/documentation_revision",
-            json!("abcdef01"),
+            json!("invalid"),
             "documentation",
         ),
         (
@@ -202,27 +422,23 @@ fn symbol_context_matches_requested_symbol_and_revision() {
         );
     }
 
-    let mut mismatched_revision = value;
-    *mismatched_revision
+    let mut stored_revision = value;
+    *stored_revision
         .pointer_mut("/items/0/documentation/documentation_revision")
         .expect("symbol context revision") = json!("abcdef01");
-    *mismatched_revision
+    *stored_revision
         .pointer_mut("/items/0/documentation/references/0/documentation/documentation_revision")
         .expect("referenced documentation revision") = json!("abcdef01");
-    let mismatched_revision = serde_json::from_value(mismatched_revision)
+    let stored_revision = serde_json::from_value(stored_revision)
         .expect("generated symbol page with internally matching documentation revision");
-    assert!(matches!(
-        validate_symbol_page(
-            &request,
-            &capabilities(),
-            &mismatched_revision,
-            None,
-            SOURCE_BYTES_MAX
-        ),
-        Err(ClientError::InvalidResponseField {
-            field: "documentation_revision"
-        })
-    ));
+    validate_symbol_page(
+        &request,
+        &capabilities(),
+        &stored_revision,
+        None,
+        SOURCE_BYTES_MAX,
+    )
+    .expect("stored revision matches its references");
 }
 
 #[test]

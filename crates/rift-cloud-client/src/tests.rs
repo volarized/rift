@@ -40,6 +40,10 @@ enum FixtureMode {
 #[derive(Clone)]
 enum OperationFixture {
     Valid,
+    Documentation {
+        search: serde_json::Value,
+        symbols: serde_json::Value,
+    },
     EchoResolution,
     InvalidResolutionAccounting,
     SearchPages,
@@ -362,6 +366,16 @@ const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
+        OperationFixture::Documentation { .. } => {
+            value["supported_features"] = serde_json::json!([
+                "resolutions",
+                "search",
+                "symbols",
+                "documentation_search",
+                "symbol_documentation"
+            ]);
+            value["documentation_revision"] = serde_json::json!("0123abcd");
+        }
         OperationFixture::InvalidPublication => {
             value["publication_format"] = serde_json::json!("other");
         }
@@ -488,6 +502,7 @@ fn operation_search_response(
     }
     let cursor = query_cursor(query);
     let body = match mode {
+        OperationFixture::Documentation { search, .. } => search.clone(),
         OperationFixture::UnrequestedPackage => {
             search_page_json("other", None, "analyzer-v1", "first")
         }
@@ -555,6 +570,7 @@ fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Re
     let cursor = query_cursor(query);
     let followed = cursor.is_some();
     let body = match mode {
+        OperationFixture::Documentation { symbols, .. } => symbols.clone(),
         OperationFixture::CollectionBounds { source_bytes, .. } => {
             let mut page = symbol_page_json("demo", None, "analyzer-v1", "first");
             page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
