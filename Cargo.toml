@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
+exclude = [
+    "tools/tracing-fixtures/consumer",
+    "tools/tracing-fixtures/facade",
+]
 
 [workspace.package]
 version = "0.0.63"

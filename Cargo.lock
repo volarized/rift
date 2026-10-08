@@ -4948,6 +4948,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-tracing-consumer-fixture"
+version = "0.0.0"
+dependencies = [
+ "rift-tracing-facade-fixture",
+]
+
+[[package]]
+name = "rift-tracing-facade-fixture"
+version = "0.0.0"
+dependencies = [
+ "rift-error",
+ "rift-tracing",
+]
+
+[[package]]
 name = "rift-tracing-macros"
 version = "0.0.63"
 dependencies = [
@@ -4955,6 +4970,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rift-tracing",
+ "rift-tracing-consumer-fixture",
  "syn 2.0.119",
  "tokio",
 ]

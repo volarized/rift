@@ -121,6 +121,8 @@ EXPECTED_EDGES = {
     "rift-tracing -> rift-tracing-macros",
     # Development edge only: the attribute's suite compiles against rift-tracing renamed.
     "rift-tracing-macros -> rift-tracing",
+    # Development edge only: the consumer's suite reaches tracing through a re-export.
+    "rift-tracing-macros -> rift-tracing-consumer-fixture",
 }
 
 

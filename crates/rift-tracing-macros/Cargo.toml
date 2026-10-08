@@ -24,3 +24,4 @@ syn = { workspace = true, features = ["fold"] }
 # proves the attribute finds a renamed dependency.
 tracer = { package = "rift-tracing", path = "../rift-tracing", features = ["fixtures"] }
 tokio.workspace = true
+consumer = { package = "rift-tracing-consumer-fixture", path = "../../tools/tracing-fixtures/consumer" }

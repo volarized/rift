@@ -16,8 +16,13 @@ use proc_macro::TokenStream;
 #[proc_macro]
 pub fn __rift_traced_work(item: TokenStream) -> TokenStream {
     let item = proc_macro2::TokenStream::from(item);
-    expand::tracing_path(proc_macro_crate::crate_name(expand::TRACING_PACKAGE))
-        .and_then(|path| exits::instrument(&path, item))
+    let parser = |input: syn::parse::ParseStream<'_>| {
+        let path;
+        syn::bracketed!(path in input);
+        let path = path.parse::<proc_macro2::TokenStream>()?;
+        exits::instrument(&path, input.parse()?)
+    };
+    syn::parse::Parser::parse2(parser, item)
         .unwrap_or_else(|error| error.to_compile_error())
         .into()
 }
