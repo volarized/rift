@@ -575,6 +575,54 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     Ok(())
 }
 
+/// Ordinary prose keeps the broad full-text order before the requested result limit.
+#[tokio::test]
+async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    for limit in [1_usize, 2] {
+        let request = json!({
+            "query": global_api::BROAD_BODY_MATCH_QUERY,
+            "scope": "global",
+            "limit": limit,
+            "include": ["source", "score"]
+        });
+        let answer = call_tool(&client, "search", request).await?;
+        let results = answer["results"]
+            .as_array()
+            .ok_or("search carries results")?;
+        assert_eq!(results.len(), limit, "{answer:#}");
+        for (hit, name) in results.iter().zip(["helper_beacon", "beacon"]) {
+            assert_eq!(hit["hit"]["symbol"]["name"], name, "{answer:#}");
+            let identity = rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/lib.rs", name);
+            assert_eq!(hit["hit"]["symbol"]["id"], identity, "{answer:#}");
+            assert_eq!(hit["source"], format!("pub fn {name}() {{}}"), "{answer:#}");
+            assert!(hit["score"].is_number(), "{answer:#}");
+        }
+    }
+    let requests = search_requests(&fixture).await;
+    assert_eq!(requests.len(), 4, "{requests:#?}");
+    for (request, phase) in requests
+        .iter()
+        .zip(["precise", "broad", "precise", "broad"])
+    {
+        let body = request.body.as_ref().ok_or("search body is recorded")?;
+        assert_eq!(body["identifiers"], json!([]));
+        assert_eq!(body["phase"], phase);
+        assert_eq!(body["query"], global_api::BROAD_BODY_MATCH_QUERY);
+    }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// The search requests `fixture` received, in order.
 async fn search_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRequest> {
     fixture
@@ -1964,12 +2012,8 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let source = "/// searchHit searchHit searchHit searchHit\npub fn SearchHit() {}\npub fn searchHit() {}\n";
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
-    let answer = call_tool(
-        &client,
-        "search",
-        json!({"query": "searchHit", "limit": 1, "include": ["source"]}),
-    )
-    .await?;
+    let request = json!({"query": "searchHit", "limit": 1, "include": ["source"]});
+    let answer = workspace_client::search_after_population(&client, &request).await?;
     assert_eq!(
         answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
         "{answer:#}"

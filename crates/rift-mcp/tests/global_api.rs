@@ -72,6 +72,9 @@ pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 /// declaration name holds, so the hit claims the `unknown` class and `file_content`.
 pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
 
+/// The prose query the fixture answers only in the broad phase, in full-text order.
+pub(crate) const BROAD_BODY_MATCH_QUERY: &str = "network handshake";
+
 /// The Python standard library release a Python collection holds: every `stdlib/python`
 /// entry resolves to it, as the nearest release when it names another.
 pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) = ("stdlib", "python", "3.12.9");
@@ -561,19 +564,27 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
 /// its identifiers matches, at the best class any of them reaches, with a `query_narrowed`
-/// page warning; the broad phase answers no further declaration. [`BODY_MATCH_QUERY`]
-/// answers `beacon` as a body match. A page stopped at the response body bound adds
-/// `result_truncated` and [`BODY_BOUND_CURSOR`].
+/// page warning; the broad phase answers no further declaration unless the query is
+/// [`BROAD_BODY_MATCH_QUERY`]. That query answers every declaration as a body match in
+/// source order. [`BODY_MATCH_QUERY`] answers `beacon` as a body match. A page stopped
+/// at the response body bound adds `result_truncated` and [`BODY_BOUND_CURSOR`].
 fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: bool) -> Value {
+    if request["query"] == BROAD_BODY_MATCH_QUERY {
+        let items = if request["phase"] == "broad" {
+            DECLARATIONS
+                .into_iter()
+                .map(|declaration| body_match_hit(fixture, declaration, request))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        return page(&items, &json!([]));
+    }
     if request["phase"] != "precise" {
         return page(&[], &json!([]));
     }
     if request["query"] == BODY_MATCH_QUERY {
-        let mut hit = collected_hit(fixture, "beacon", includes_source(request));
-        hit["target"] = json!("symbol");
-        hit["match_class"] = json!("unknown");
-        hit["contributing_fields"] = json!(["file_content"]);
-        return page(&[hit], &json!([]));
+        return page(&[body_match_hit(fixture, "beacon", request)], &json!([]));
     }
     let identifiers: Vec<String> = request["identifiers"]
         .as_array()
@@ -607,6 +618,15 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
     let mut stopped = page(&items, &json!([narrowed, truncated]));
     stopped["next_cursor"] = json!(BODY_BOUND_CURSOR);
     stopped
+}
+
+/// One body match retaining the declaration's original identity and source.
+fn body_match_hit(fixture: SymbolFixture, declaration: &str, request: &Value) -> Value {
+    let mut hit = collected_hit(fixture, declaration, includes_source(request));
+    hit["target"] = json!("symbol");
+    hit["match_class"] = json!("unknown");
+    hit["contributing_fields"] = json!(["file_content"]);
+    hit
 }
 
 /// The pattern page for `request`: each match of its pattern in the collected source, in
