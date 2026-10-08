@@ -13,6 +13,18 @@ description = "The metrics database and the instrumentation Rift crates emit thr
 # collect from the SDK reader; the dev appliance receives standard OTLP in Python.
 fixtures = ["dep:shutdown_hooks", "opentelemetry_sdk/testing"]
 
+[[test]]
+name = "install"
+required-features = ["fixtures"]
+
+[[test]]
+name = "shutdown"
+required-features = ["fixtures"]
+
+[[test]]
+name = "subscriptions"
+required-features = ["fixtures"]
+
 [lints]
 workspace = true
 

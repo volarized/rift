@@ -1,5 +1,6 @@
 use super::*;
 
+mod cache;
 mod declaration;
 mod documentation;
 mod pages;

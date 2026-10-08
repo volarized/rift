@@ -140,14 +140,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let serves = cli.records_logs();
     let logs = serves.then(|| rift_mcp::logs_configuration(&logs_root(&cli, Path::new("."))));
-    let mut tracing_builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
-    if let Some(logs) = &logs {
-        let stall_delay = Duration::from_millis(logs.stall_delay.milliseconds());
-        tracing_builder = tracing_builder
-            .capture(&logs.capture)
-            .stall_delay(stall_delay)
-            .stderr_limit(logs.stderr_limit.bytes());
-    }
+    let tracing_builder = tracing_builder(serves, logs.as_ref());
     // `main` installs once; a refusal means something installed tracing before it, and
     // that installation stays in place while the process reports the refusal and leaves.
     let (tracing_runtime, drain) = match tracing_builder.install() {
@@ -337,6 +330,31 @@ impl fmt::Display for CliOutcome {
     }
 }
 
+/// Applies the accepted process-wide log table before any startup record is emitted.
+fn tracing_builder(
+    serves: bool,
+    logs: Option<&rift_protocol::configuration::LogsConfiguration>,
+) -> rift_tracing::TracingRuntimeBuilder {
+    let builder = TracingRuntime::builder().stderr(StderrPolicy::of_process(serves));
+    let Some(logs) = logs else {
+        return builder;
+    };
+    builder
+        .capture(&logs.capture)
+        .queue_records(
+            usize::try_from(logs.queue_records).expect("accepted logs.queue_records fits usize"),
+        )
+        .flush_interval(Duration::from_millis(logs.flush_interval.milliseconds()))
+        .retry_interval(Duration::from_millis(logs.retry_interval.milliseconds()))
+        .settle_timeout(Duration::from_millis(logs.settle_timeout.milliseconds()))
+        .cardinality_limit(
+            u32::try_from(logs.cardinality_limit)
+                .expect("accepted logs.cardinality_limit fits u32"),
+        )
+        .stall_delay(Duration::from_millis(logs.stall_delay.milliseconds()))
+        .stderr_limit(logs.stderr_limit.bytes())
+}
+
 async fn run(
     cli: Cli,
     drain: Option<rift_tracing::LogDrain>,
@@ -393,6 +411,44 @@ mod tests {
             .expect_err("--version prints and exits")
             .to_string();
         assert_eq!(printed.trim(), concat!("rift ", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[tokio::test]
+    async fn accepted_log_configuration_bounds_the_startup_queue() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("rift.toml"),
+            concat!(
+                "[logs]\nqueue_records = 1\ncapture = \"rift=info\"\n",
+                "flush_interval = \"17ms\"\nretry_interval = \"19ms\"\n",
+                "settle_timeout = \"23ms\"\ncardinality_limit = 2\n",
+            ),
+        )
+        .expect("log configuration");
+        let logs = rift_mcp::logs_configuration(directory.path());
+        assert_eq!(logs.queue_records, 1);
+        assert_eq!(logs.flush_interval.milliseconds(), 17);
+        assert_eq!(logs.retry_interval.milliseconds(), 19);
+        assert_eq!(logs.settle_timeout.milliseconds(), 23);
+        assert_eq!(logs.cardinality_limit, 2);
+        let (runtime, drain) = super::tracing_builder(true, Some(&logs))
+            .install()
+            .expect("runtime");
+        let mut drain = drain.expect("capture returns a drain");
+        rift_tracing::info!("filling the queue");
+        rift_tracing::info!("filling the queue");
+        assert_eq!(
+            drain.lane().unwritten(),
+            2,
+            "one queued record and one loss"
+        );
+        assert_eq!(
+            drain.queued_records().len(),
+            1,
+            "the accepted queue bound reaches startup capture"
+        );
+        drop(drain);
+        runtime.shutdown().await.expect("runtime stops");
     }
 
     /// One git command in `root` with a fixed identity and signing off.

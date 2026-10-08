@@ -31,7 +31,7 @@ pub(crate) fn install(provider: Option<SdkMeterProvider>, reader: Option<Arc<dyn
             } else {
                 local_provider()
             };
-        crate::metrics::install_meter(provider.clone());
+        crate::metrics::install_meter(provider.clone(), crate::metrics::CARDINALITY_LIMIT);
         RecorderMeters { reader, exporter }
     });
 }
@@ -39,7 +39,7 @@ pub(crate) fn install(provider: Option<SdkMeterProvider>, reader: Option<Arc<dyn
 fn meters() -> &'static RecorderMeters {
     RECORDER_METERS.get_or_init(|| {
         let (provider, reader, exporter) = local_provider();
-        crate::metrics::install_meter(provider.clone());
+        crate::metrics::install_meter(provider.clone(), crate::metrics::CARDINALITY_LIMIT);
         RecorderMeters { reader, exporter }
     })
 }

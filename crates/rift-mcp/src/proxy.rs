@@ -1443,7 +1443,7 @@ impl ServerHandler for RiftProxy {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let measured = McpRequest::tool_call(&request.name);
         let span = rift_tracing::info_span!(
@@ -1451,6 +1451,7 @@ impl ServerHandler for RiftProxy {
             component = "mcp",
             operation = "tools/call",
             request_id = rift_tracing::empty!(),
+            caller_request_id = %context.id,
             tool = %request.name
         );
         let answered;
@@ -2837,6 +2838,15 @@ mod tests {
         assert_ne!(
             server_id, caller_id,
             "the forwarding span carries the id the server sees, not the caller's"
+        );
+        let forwarded = records
+            .iter()
+            .find(|record| record.message() == "forwarded request awaiting response")
+            .ok_or("the proxy records its pending request")?;
+        let fields: serde_json::Value = serde_json::from_str(forwarded.fields())?;
+        assert_eq!(
+            fields["root_span"]["fields"]["caller_request_id"],
+            caller_id
         );
         assert_forward_joins_server_request(records, &server_id)?;
         for event in [

@@ -721,7 +721,7 @@
     },
     "LogsConfiguration": {
       "additionalProperties": false,
-      "description": "The `[logs]` table. The server records its own diagnostics in the metrics\ndatabase at `.rift/metrics`, where `rift://logs` reads them back, and this\ntable bounds how many records the store keeps, how many one read returns,\nwhich targets are captured at all, when an operation still open is reported,\nand how much it writes to a standard error that is not a terminal. The server\nreads the table at startup, so a change applies on the next start.",
+      "description": "The `[logs]` table bounds log delivery, retention, capture, and metric attribute sets.\n\nThe server records diagnostics in `.rift/metrics`, where `rift://logs` reads them.\nThe table also bounds stall reports and standard error that is not a terminal.\nThe server reads the table at startup, so a change applies on the next start.",
       "properties": {
         "capture": {
           "default": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
@@ -729,11 +729,36 @@
           "maxLength": 512,
           "type": "string"
         },
+        "cardinality_limit": {
+          "default": 2000,
+          "description": "Attribute sets one metric instrument holds before overflow, 1 to 65536.",
+          "format": "uint64",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "flush_interval": {
+          "$ref": "#/$defs/Duration",
+          "default": "250ms",
+          "description": "Wait before the drain writes a partial batch, 1ms to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1ms"
+          }
+        },
         "page_records": {
           "default": 500,
           "description": "Records one `rift://logs` read returns at most, 1 to 5000.",
           "format": "uint64",
           "maximum": 5000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "queue_records": {
+          "default": 4096,
+          "description": "Records one log subscription holds before it drops and counts, 1 to 65536.",
+          "format": "uint64",
+          "maximum": 65536,
           "minimum": 1,
           "type": "integer"
         },
@@ -744,6 +769,24 @@
           "maximum": 1000000,
           "minimum": 100,
           "type": "integer"
+        },
+        "retry_interval": {
+          "$ref": "#/$defs/Duration",
+          "default": "500ms",
+          "description": "Wait before the drain retries a batch the store refused, 1ms to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1ms"
+          }
+        },
+        "settle_timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "2s",
+          "description": "Longest a persisted-log read waits for its records to be written, 1ms to 1h.",
+          "rift:range": {
+            "max": "1h",
+            "min": "1ms"
+          }
         },
         "stall_delay": {
           "$ref": "#/$defs/Duration",
@@ -1530,8 +1573,13 @@
       "$ref": "#/$defs/LogsConfiguration",
       "default": {
         "capture": "rift=info,rift_mcp=info,rift_server=info,rift_index=warn",
+        "cardinality_limit": 2000,
+        "flush_interval": "250ms",
         "page_records": 500,
+        "queue_records": 4096,
         "retention_records": 50000,
+        "retry_interval": "500ms",
+        "settle_timeout": "2s",
         "stall_delay": "10s",
         "stderr_limit": "1mb"
       },

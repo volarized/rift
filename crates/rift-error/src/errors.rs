@@ -314,7 +314,10 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.syntax.unknown_node_kind",
     "rift.syntax.zero_limit",
     "rift.tracing.log_batch_limit",
+    "rift.tracing.log_queue_limit",
     "rift.tracing.log_store_failed",
+    "rift.tracing.log_stream_unavailable",
+    "rift.tracing.log_subscription_limit",
 ];
 
 /// Registered errors under `rift.analysis`.

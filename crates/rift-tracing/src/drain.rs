@@ -20,13 +20,13 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use rift_error::{RiftError, causes};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -35,15 +35,36 @@ use crate::capture::{LOG_QUEUE_DROPPED, LogSink, QUEUE_FULL, UNWRITTEN, now_ms};
 use crate::record::{LOG_BATCH_RECORDS_MAX, LogRecord};
 use crate::stderr::StderrBound;
 use crate::store::LogStore;
+use crate::subscriptions::{LOG_SUBSCRIPTION_BYTES_MAX, RecordBudget};
 
 /// Wall-clock span the drain waits for more records before writing what it holds.
-const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// Longest a `rift://logs` read waits for the drain to write through the sequence the
 /// sink had stamped when the read began. A read past this answers with what the store
 /// holds: a log read never fails, and never hangs, because the log drain is slow.
 pub const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Wall-clock span between two attempts at a batch the store refused.
-const LOG_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const LOG_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Accepted delivery limits shared by a capture and its workspace consumers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogDeliveryOptions {
+    pub(crate) queue_records: usize,
+    pub(crate) flush_interval: Duration,
+    pub(crate) retry_interval: Duration,
+    pub(crate) settle_timeout: Duration,
+}
+
+impl Default for LogDeliveryOptions {
+    fn default() -> Self {
+        Self {
+            queue_records: crate::LOG_QUEUE_RECORDS,
+            flush_interval: LOG_FLUSH_INTERVAL,
+            retry_interval: LOG_WRITE_RETRY_INTERVAL,
+            settle_timeout: LOG_SETTLE_TIMEOUT,
+        }
+    }
+}
 /// Records one workspace consumer's queue holds before a routed record is dropped, and the
 /// most records one of its batches carries.
 ///
@@ -71,6 +92,8 @@ const WORKSPACE_FIELD_POINTERS: [&str; 3] = [
 pub(crate) struct QueuedRecord {
     pub(crate) sequence: u64,
     pub(crate) record: LogRecord,
+    /// Retained bytes until the batch commits or is discarded; notices carry none.
+    pub(crate) bytes: Option<OwnedSemaphorePermit>,
 }
 
 /// How far the drain has got through the sequence the sink stamps.
@@ -98,6 +121,7 @@ pub(crate) struct LogSettlement {
     draining: AtomicBool,
     /// The workspace consumers of a routing drain, set when one starts on this lane.
     routes: OnceLock<Arc<LogRoutes>>,
+    options: LogDeliveryOptions,
 }
 
 impl Default for LogSettlement {
@@ -108,11 +132,19 @@ impl Default for LogSettlement {
             flush: Notify::new(),
             draining: AtomicBool::new(false),
             routes: OnceLock::new(),
+            options: LogDeliveryOptions::default(),
         }
     }
 }
 
 impl LogSettlement {
+    pub(crate) fn with_options(options: LogDeliveryOptions) -> Self {
+        Self {
+            options,
+            ..Self::default()
+        }
+    }
+
     /// Stamps one record on its way into the queue and answers its sequence. Stamped
     /// before the send, so a read taken immediately after a traced call cannot observe a
     /// sequence that misses it.
@@ -180,7 +212,8 @@ impl LogSettlement {
 /// under `cargo test` every test is a thread of one process and builds its own - and the
 /// dispatcher is what decides where a thread's records go. A process that records
 /// nothing - every command but the foreground server - installs no sink, and its log
-/// reads wait for nothing. Both waits together end by [`LOG_SETTLE_TIMEOUT`].
+/// reads wait for nothing. Both waits share the accepted `[logs] settle_timeout`,
+/// [`LOG_SETTLE_TIMEOUT`] by default.
 ///
 /// # Cancel safety
 ///
@@ -189,7 +222,7 @@ pub async fn settle_for_read(workspace: &str) {
     let Some(settlement) = installed_settlement() else {
         return;
     };
-    let deadline = Instant::now() + LOG_SETTLE_TIMEOUT;
+    let deadline = Instant::now() + settlement.options.settle_timeout;
     settlement.settle_by(deadline).await;
     let consumer = settlement
         .routes
@@ -253,6 +286,15 @@ pub struct LogDrain {
     /// Most records one write carries: [`LOG_BATCH_RECORDS_MAX`], or
     /// [`LOG_WORKSPACE_QUEUE_RECORDS`] for a workspace consumer.
     batch_records_max: usize,
+    budget: RecordBudget,
+}
+
+/// Why the next persistence flush may begin.
+enum FlushReady {
+    /// The flush interval elapsed or a read requested a flush.
+    Due,
+    /// Cancellation ends collection and closes the receiving end.
+    Cancelled,
 }
 
 impl LogDrain {
@@ -268,6 +310,7 @@ impl LogDrain {
             settlement,
             stderr: None,
             batch_records_max: LOG_BATCH_RECORDS_MAX,
+            budget: RecordBudget::new(LOG_SUBSCRIPTION_BYTES_MAX),
         }
     }
 
@@ -275,6 +318,12 @@ impl LogDrain {
     /// bytes discarded there.
     pub(crate) fn with_stderr(mut self, bound: Arc<StderrBound>) -> Self {
         self.stderr = Some(bound);
+        self
+    }
+
+    /// Shares the queue's byte capacity with retained batches and drop notices.
+    pub(crate) fn with_budget(mut self, budget: RecordBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -294,6 +343,7 @@ impl LogDrain {
     /// # Errors
     ///
     /// Returns the queue's own answer when it holds no record or is closed.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn try_recv_record(&mut self) -> Result<LogRecord, mpsc::error::TryRecvError> {
         self.receiver.try_recv().map(|queued| queued.record)
     }
@@ -313,10 +363,10 @@ impl LogDrain {
     /// cancellation.
     ///
     /// Records are written in batches: the task takes what the queue holds, waits
-    /// `LOG_FLUSH_INTERVAL` for more, and writes at most [`LOG_BATCH_RECORDS_MAX`] per
+    /// `[logs] flush_interval` for more, and writes at most [`LOG_BATCH_RECORDS_MAX`] per
     /// call, `LOG_WORKSPACE_QUEUE_RECORDS` for a workspace consumer. Each write trims the
     /// store back to `retention_records`. A batch the store refuses is kept and retried
-    /// every `LOG_WRITE_RETRY_INTERVAL` until it lands; the first refusal of a batch is
+    /// every `[logs] retry_interval` until it lands; the first refusal of a batch is
     /// reported once to stderr, never into the queue the drain is failing to write.
     ///
     /// # Cancel safety
@@ -346,15 +396,14 @@ impl LogDrain {
             if received == 0 {
                 break;
             }
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled(), if !closing => {
-                    self.receiver.close();
-                    closing = true;
-                }
-                () = self.settlement.flush.notified(), if !closing => {}
-                () = tokio::time::sleep(LOG_FLUSH_INTERVAL), if !closing => {}
-                else => {}
+            if !closing
+                && matches!(
+                    self.wait_for_flush(&cancellation).await,
+                    FlushReady::Cancelled
+                )
+            {
+                self.receiver.close();
+                closing = true;
             }
             while batch.len() < self.batch_records_max {
                 match self.receiver.try_recv() {
@@ -366,6 +415,16 @@ impl LogDrain {
         }
         self.write_turn(&store, &mut batch, retention_records).await;
         self.settlement.draining.store(false, Ordering::SeqCst);
+    }
+
+    /// Waits for the accepted flush interval, a requesting read, or cancellation.
+    async fn wait_for_flush(&self, cancellation: &CancellationToken) -> FlushReady {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => FlushReady::Cancelled,
+            () = self.settlement.flush.notified() => FlushReady::Due,
+            () = tokio::time::sleep(self.settlement.options.flush_interval) => FlushReady::Due,
+        }
     }
 
     /// Writes one batch, and reports how far through the sequence the lane now is.
@@ -393,12 +452,22 @@ impl LogDrain {
         // it among the records finished with would let `finished` pass `accepted`, and a
         // read waiting on a record still queued would be released by that overshoot.
         let stamped = batch.iter().filter(|queued| queued.sequence != 0).count() as u64;
-        let records: Arc<[LogRecord]> = batch.drain(..).map(|queued| queued.record).collect();
-        write_retained(records.len(), || {
-            store.append(Arc::clone(&records), retention_records)
-        })
+        let (records, bytes): (Vec<_>, Vec<_>) = batch
+            .drain(..)
+            .map(|queued| (queued.record, queued.bytes))
+            .unzip();
+        let records = Arc::new(crate::store::RetainedLogBatch {
+            records: records.into(),
+            _bytes: bytes,
+        });
+        write_retained_with(
+            records.records.len(),
+            self.settlement.options.retry_interval,
+            || store.append_retained(Arc::clone(&records), retention_records),
+        )
         .await;
         self.settlement.finish_written(stamped, written_through);
+        drop(records);
     }
 
     /// Appends one record naming the drops so far, when there are any. The count is what
@@ -407,24 +476,30 @@ impl LogDrain {
         if batch.len() == self.batch_records_max {
             return;
         }
-        let dropped = self.dropped.swap(0, Ordering::Relaxed);
-        if dropped == 0 {
+        if self.dropped.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let mut notice = LogRecord::new(
+            now_ms(),
+            "warn",
+            module_path!(),
+            "logs",
+            "logs.drain",
+            "the log queue was full and dropped records",
+            &format!("{{\"dropped\":{}}}", u64::MAX),
+        );
+        let Some(bytes) = self.budget.reserve(&notice) else {
+            return;
+        };
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        notice.fields = format!("{{\"dropped\":{dropped}}}");
         // The drain mints this one, so it carries no sequence of its own: sequence zero
         // is below every stamped record and never raises what the lane has written
         // through.
         batch.push(QueuedRecord {
             sequence: 0,
-            record: LogRecord::new(
-                now_ms(),
-                "warn",
-                module_path!(),
-                "logs",
-                "logs.drain",
-                "the log queue was full and dropped records",
-                &format!("{{\"dropped\":{dropped}}}"),
-            ),
+            bytes: Some(bytes),
+            record: notice,
         });
     }
 }
@@ -478,12 +553,21 @@ impl LogDrain {
 
 /// The workspace consumers of one routing drain, by the workspace each writes for.
 ///
-/// At most [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumers are kept. The map's
+/// At most [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumer budgets are retained,
+/// including replaced consumers and their queued records or writer batches. The map's
 /// lock is held for a lookup and a `try_send`, never across an await.
 #[derive(Debug)]
 struct LogRoutes {
     retention_records: u64,
-    consumers: Mutex<BTreeMap<String, WorkspaceRoute>>,
+    consumers: Mutex<WorkspaceConsumers>,
+    options: LogDeliveryOptions,
+}
+
+/// Active routes and retained consumer budgets, admitted under the same lock.
+#[derive(Debug, Default)]
+struct WorkspaceConsumers {
+    routes: BTreeMap<String, WorkspaceRoute>,
+    budgets: Vec<Weak<Semaphore>>,
 }
 
 /// The sending end of one workspace consumer's queue, and its lane.
@@ -492,6 +576,7 @@ struct WorkspaceRoute {
     sender: Sender<QueuedRecord>,
     dropped: Arc<AtomicU64>,
     settlement: Arc<LogSettlement>,
+    budget: RecordBudget,
 }
 
 impl WorkspaceRoute {
@@ -503,7 +588,17 @@ impl WorkspaceRoute {
     /// `log.queue.dropped` with `error.type` `queue_full`.
     fn send(&self, record: LogRecord) {
         let sequence = self.settlement.accept();
-        match self.sender.try_send(QueuedRecord { sequence, record }) {
+        let Some(bytes) = self.budget.reserve(&record) else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.settlement.finish_dropped();
+            LOG_QUEUE_DROPPED.labeled([QUEUE_FULL]).add(1);
+            return;
+        };
+        match self.sender.try_send(QueuedRecord {
+            sequence,
+            record,
+            bytes: Some(bytes),
+        }) {
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 self.settlement.finish_dropped();
@@ -516,14 +611,20 @@ impl WorkspaceRoute {
 }
 
 impl LogRoutes {
+    #[cfg(test)]
     fn new(retention_records: u64) -> Self {
+        Self::with_options(retention_records, LogDeliveryOptions::default())
+    }
+
+    fn with_options(retention_records: u64, options: LogDeliveryOptions) -> Self {
         Self {
             retention_records,
-            consumers: Mutex::new(BTreeMap::new()),
+            consumers: Mutex::new(WorkspaceConsumers::default()),
+            options,
         }
     }
 
-    fn consumers(&self) -> MutexGuard<'_, BTreeMap<String, WorkspaceRoute>> {
+    fn consumers(&self) -> MutexGuard<'_, WorkspaceConsumers> {
         self.consumers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -535,7 +636,7 @@ impl LogRoutes {
         let Some(workspace) = workspace_of(&record) else {
             return;
         };
-        if let Some(route) = self.consumers().get(&workspace) {
+        if let Some(route) = self.consumers().routes.get(&workspace) {
             route.send(record);
         }
     }
@@ -544,35 +645,41 @@ impl LogRoutes {
     /// workspace's records to it from now on.
     ///
     /// A consumer already routed for `workspace` stops receiving: the new one replaces it.
-    /// Answers `None` when [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumers of other
-    /// workspaces are routed.
+    /// Answers `None` when [`RunningLogDrain::WORKSPACE_CONSUMERS_MAX`] consumer budgets
+    /// are retained, including replaced consumers, queued records, and writer batches.
+    /// A refusal leaves the current route unchanged.
     fn admit(
         self: &Arc<Self>,
         upstream: &Arc<LogSettlement>,
         workspace: &str,
         store: Arc<LogStore>,
     ) -> Option<RunningLogDrain> {
-        let (sender, receiver) = mpsc::channel(LOG_WORKSPACE_QUEUE_RECORDS);
+        let queue_records = self.options.queue_records.min(LOG_WORKSPACE_QUEUE_RECORDS);
+        let (sender, receiver) = mpsc::channel(queue_records);
         let dropped = Arc::new(AtomicU64::new(0));
-        let settlement = Arc::new(LogSettlement::default());
+        let settlement = Arc::new(LogSettlement::with_options(self.options));
+        let budget = RecordBudget::new(LOG_SUBSCRIPTION_BYTES_MAX / 8);
         {
             let mut consumers = self.consumers();
-            if consumers.len() >= RunningLogDrain::WORKSPACE_CONSUMERS_MAX
-                && !consumers.contains_key(workspace)
-            {
+            consumers
+                .budgets
+                .retain(|budget| budget.upgrade().is_some());
+            if consumers.budgets.len() >= RunningLogDrain::WORKSPACE_CONSUMERS_MAX {
                 return None;
             }
-            consumers.insert(
+            consumers.budgets.push(budget.downgrade());
+            consumers.routes.insert(
                 workspace.to_owned(),
                 WorkspaceRoute {
                     sender,
                     dropped: Arc::clone(&dropped),
                     settlement: Arc::clone(&settlement),
+                    budget: budget.clone(),
                 },
             );
         }
-        let mut consumer = LogDrain::new(receiver, dropped, settlement);
-        consumer.batch_records_max = LOG_WORKSPACE_QUEUE_RECORDS;
+        let mut consumer = LogDrain::new(receiver, dropped, settlement).with_budget(budget);
+        consumer.batch_records_max = queue_records;
         let mut running = RunningLogDrain::spawn(consumer, store, self.retention_records);
         running.route = Some(RouteBinding {
             routes: Arc::clone(self),
@@ -585,6 +692,7 @@ impl LogRoutes {
     /// The lane of the consumer routed for `workspace`.
     fn settlement_of(&self, workspace: &str) -> Option<Arc<LogSettlement>> {
         self.consumers()
+            .routes
             .get(workspace)
             .map(|route| Arc::clone(&route.settlement))
     }
@@ -595,10 +703,11 @@ impl LogRoutes {
     fn release(&self, workspace: &str, settlement: &Arc<LogSettlement>) {
         let mut consumers = self.consumers();
         if consumers
+            .routes
             .get(workspace)
             .is_some_and(|route| Arc::ptr_eq(&route.settlement, settlement))
         {
-            consumers.remove(workspace);
+            consumers.routes.remove(workspace);
         }
     }
 }
@@ -628,8 +737,21 @@ struct RouteBinding {
 /// Runs `append` until one attempt lands, waiting [`LOG_WRITE_RETRY_INTERVAL`] after
 /// each refusal. The first refusal of the batch of `records` records is reported to
 /// stderr; the later ones repeat it.
-async fn write_retained<Append, Attempt>(records: usize, mut append: Append)
+#[cfg(test)]
+async fn write_retained<Append, Attempt>(records: usize, append: Append)
 where
+    Append: FnMut() -> Attempt,
+    Attempt: Future<Output = Result<u64, RiftError>>,
+{
+    write_retained_with(records, LOG_WRITE_RETRY_INTERVAL, append).await;
+}
+
+/// Retries one retained batch under the accepted interval until a write succeeds.
+async fn write_retained_with<Append, Attempt>(
+    records: usize,
+    retry_interval: Duration,
+    mut append: Append,
+) where
     Append: FnMut() -> Attempt,
     Attempt: Future<Output = Result<u64, RiftError>>,
 {
@@ -640,11 +762,11 @@ where
             eprintln!(
                 "rift: the log store refused a batch of {records}; the log drain keeps it \
                  and retries every {retry} ms: {error}{cause}",
-                retry = LOG_WRITE_RETRY_INTERVAL.as_millis(),
+                retry = retry_interval.as_millis(),
                 cause = caused_by(&error)
             );
         }
-        tokio::time::sleep(LOG_WRITE_RETRY_INTERVAL).await;
+        tokio::time::sleep(retry_interval).await;
     }
 }
 
@@ -672,8 +794,9 @@ pub struct RunningLogDrain {
 }
 
 impl RunningLogDrain {
-    /// Most workspace consumers one routing drain keeps at once: at least the workspaces
-    /// one repository process retains, `SERVER_WORKSPACES_MAX`.
+    /// Most consumer budgets one routing drain retains at once, including replaced
+    /// consumers, queued records, and writer batches: at least the workspaces one
+    /// repository process retains, `SERVER_WORKSPACES_MAX`.
     pub const WORKSPACE_CONSUMERS_MAX: usize = 64;
 
     /// Starts `drain` writing into `store`, trimming it back to `retention_records`.
@@ -703,7 +826,10 @@ impl RunningLogDrain {
     pub fn spawn_routed(drain: LogDrain, retention_records: u64) -> Self {
         let lane = drain.lane();
         let stop = CancellationToken::new();
-        let routes = Arc::new(LogRoutes::new(retention_records));
+        let routes = Arc::new(LogRoutes::with_options(
+            retention_records,
+            drain.settlement.options,
+        ));
         let _ = drain.settlement.routes.set(Arc::clone(&routes));
         // Set before the task first runs, so a read or a consumer stop that comes first
         // still waits for it.
@@ -722,7 +848,7 @@ impl RunningLogDrain {
     ///
     /// `workspace` is spelled as the `workspace` field carries it: the workspace root's
     /// display form. Answers `None` when that dispatcher has no routing drain, and when
-    /// [`Self::WORKSPACE_CONSUMERS_MAX`] consumers of other workspaces run. The consumer's
+    /// [`Self::WORKSPACE_CONSUMERS_MAX`] consumer budgets remain retained. The consumer's
     /// [`Self::stop`] first waits, by its deadline, for the routing drain to hand on what
     /// it had taken, then ends the route and flushes.
     #[must_use]

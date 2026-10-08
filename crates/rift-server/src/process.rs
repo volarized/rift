@@ -118,11 +118,49 @@ pub(crate) fn run_bounded(
     let deadline = Instant::now() + timeout;
     let (mut child, tree) = ProcessTree::spawn(command)?;
     let pid = child.id();
+    rift_tracing::info!(
+        component = "process",
+        pid,
+        stdin = "null",
+        stdout = "piped",
+        stderr = "piped",
+        "child spawned"
+    );
     let mut readers = [
         StreamReader::start(child.stdout.take(), capture_bytes, stdout_slot),
         StreamReader::start(child.stderr.take(), capture_bytes, stderr_slot),
     ];
-    let (exit, mut ending) = wait_bounded(&mut child, deadline, cancelled);
+    let (exit, mut ending) = rift_tracing::traced!(
+        component = "process",
+        operation = "process.wait",
+        open = true,
+        pid = pid,
+        stdin = "null",
+        stdout = "piped",
+        stderr = "piped",
+        outcome = rift_tracing::empty!(),
+        {
+            let waited = wait_bounded(&mut child, deadline, cancelled);
+            let outcome = match waited.1 {
+                RunEnding::Exited if waited.0.is_ok() => "ok",
+                RunEnding::Exited => "refused",
+                RunEnding::TimedOut => "timeout",
+                RunEnding::Cancelled => "cancelled",
+            };
+            rift_tracing::Span::current().record("outcome", outcome);
+            waited
+        }
+    );
+    let exit_code = exit.as_ref().ok().and_then(ExitStatus::code);
+    rift_tracing::info!(
+        component = "process",
+        pid,
+        exit_code,
+        stdin = "null",
+        stdout = "piped",
+        stderr = "piped",
+        "child exited"
+    );
     tree.end();
     let reaped = Instant::now();
     let collected = match ending {
@@ -830,6 +868,9 @@ mod tests {
 
     #[test]
     fn test_run_bounded_reports_the_exit_and_both_streams() {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .install()
+            .expect("recorder");
         let run = run_bounded(
             &mut fixture_command(FixtureMode::Print),
             FIXTURE_SLEEP,
@@ -843,6 +884,20 @@ mod tests {
         assert!(run.stdout.text.contains(PRINTED_STDOUT), "{:?}", run.stdout);
         assert_eq!(run.stderr.text, PRINTED_STDERR);
         assert!(!run.stdout.truncated);
+        drop(recorder);
+        let records = drain.queued_records();
+        for message in ["child spawned", "process.wait", "child exited"] {
+            let record = records
+                .iter()
+                .find(|record| record.message() == message)
+                .expect("child lifecycle record");
+            let fields: serde_json::Value =
+                serde_json::from_str(record.fields()).expect("record fields");
+            assert_eq!(fields["pid"], run.pid.to_string());
+            assert_eq!(fields["stdin"], "null");
+            assert_eq!(fields["stdout"], "piped");
+            assert_eq!(fields["stderr"], "piped");
+        }
     }
 
     #[test]
