@@ -189,16 +189,18 @@ impl IdentifierCandidate {
 /// Extracts the identifiers a query carries, best first, at most
 /// [`IDENTIFIER_CANDIDATES_MAX`] of them.
 ///
-/// Three shapes qualify, in this order:
+/// Four shapes qualify, in this order:
 ///
 /// 1. the whole query, when it is one identifier-shaped token;
 /// 2. a qualified name embedded in prose, spelled with `.` or `::`, together
 ///    with its final segment;
 /// 3. a token that splits into more than one word: snake case, camel case,
 ///    Pascal case, or an acronym run.
+/// 4. a token with a distinct case spelling elsewhere in the query, including
+///    the final segment of a qualified name.
 ///
-/// A plain prose word contributes nothing: it reaches the full-text ranking
-/// through its own input, and adding it here would rank every declaration
+/// A plain prose word with no case counterpart contributes nothing: it reaches
+/// the full-text ranking through its own input, and adding it here would rank every declaration
 /// whose qualified name happens to carry it.
 #[must_use]
 pub fn identifier_candidates(query: &str) -> Vec<IdentifierCandidate> {
@@ -222,12 +224,26 @@ pub fn identifier_candidates(query: &str) -> Vec<IdentifierCandidate> {
             }
             continue;
         }
-        if split_identifier_words(token).len() > 1 {
+        if split_identifier_words(token).len() > 1 || has_case_counterpart(trimmed, token) {
             push_candidate(&mut candidates, token);
         }
     }
     candidates.truncate(IDENTIFIER_CANDIDATES_MAX);
     candidates
+}
+
+/// Whether another query token or qualified-name final segment differs only in case.
+///
+/// No tokens are retained beside the candidates. Parsed queries bound this scan at
+/// [`crate::QUERY_BYTES_MAX`] bytes, and extraction stops at
+/// [`IDENTIFIER_CANDIDATES_MAX`] candidates.
+fn has_case_counterpart(query: &str, token: &str) -> bool {
+    let normalized = token.to_lowercase();
+    query
+        .split(|character: char| !is_identifier_character(character))
+        .map(|other| other.trim_matches(|character| IDENTIFIER_JOINERS.contains(&character)))
+        .filter_map(|other| other.rsplit(QUALIFIER_SEPARATORS).next())
+        .any(|other| other != token && other.to_lowercase() == normalized)
 }
 
 /// Accepts original candidates or the deduplicated lowercase list older callers send.
@@ -664,6 +680,49 @@ mod tests {
             candidate_texts("SearchHit and searchHit and SearchHit"),
             ["SearchHit", "searchHit"]
         );
+    }
+
+    #[test]
+    fn test_case_only_counterparts_are_candidates_beside_prose() {
+        for (query, expected) in [
+            (
+                "find valueBeacon and valuebeacon here",
+                ["valueBeacon", "valuebeacon"],
+            ),
+            (
+                "find valuebeacon and valueBeacon here",
+                ["valuebeacon", "valueBeacon"],
+            ),
+            ("find Foo and foo here", ["Foo", "foo"]),
+            ("find foo and Foo here", ["foo", "Foo"]),
+        ] {
+            assert_eq!(candidate_texts(query), expected, "{query}");
+        }
+        assert!(candidate_texts("find foo and foo here").is_empty());
+        assert!(candidate_texts("Find foo here").is_empty());
+        assert_eq!(candidate_texts("pkg::Foo foo"), ["pkg::Foo", "Foo", "foo"]);
+        assert_eq!(candidate_texts("foo pkg::Foo"), ["foo", "pkg::Foo", "Foo"]);
+        let query = (0..IDENTIFIER_CANDIDATES_MAX)
+            .map(|index| format!("Name{index} name{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let candidates = identifier_candidates(&query);
+        assert_eq!(candidates.len(), IDENTIFIER_CANDIDATES_MAX);
+        assert!(
+            candidates
+                .iter()
+                .enumerate()
+                .all(|(index, candidate)| candidate.position() == index)
+        );
+        let candidates = identifier_candidates("Foo foo");
+        assert!(super::identifier_candidates_match(
+            &candidates,
+            &["Foo".to_owned(), "foo".to_owned()]
+        ));
+        assert!(super::identifier_candidates_match(
+            &candidates,
+            &["foo".to_owned()]
+        ));
     }
 
     #[test]
