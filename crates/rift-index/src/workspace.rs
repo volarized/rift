@@ -10910,13 +10910,21 @@ mod tests {
     fn test_a_capture_record_prints_its_counts() {
         let (directory, _) = two_file_workspace();
         let root = directory.path();
-        let (_, last) = captured_after(root, &LastCapture::default());
+        let (first, last) = captured_after(root, &LastCapture::default());
         assert_eq!(format!("{last:?}"), "LastCapture { paths: 2, read: 2, .. }");
-        let (_, next) = captured_after(root, &last);
+        let (second, next) = captured_after(root, &last);
         assert!(
-            [0, 2].contains(&next.read_paths()),
-            "capture record counts reuse or full-read fallback"
+            next.read_paths() <= 2,
+            "capture record counts each path independently"
         );
+        assert_eq!(
+            format!("{next:?}"),
+            format!(
+                "LastCapture {{ paths: 2, read: {}, .. }}",
+                next.read_paths()
+            )
+        );
+        assert_eq!(second.fingerprint(), first.fingerprint());
     }
 
     /// A request-time capture refuses a language selection the build refuses, before it
