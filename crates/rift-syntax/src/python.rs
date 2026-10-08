@@ -387,7 +387,8 @@ impl SyntaxProvider for PythonSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_source_witness(source.text))
+        .with_source_witness(source.text)
+        .with_syntax_limits(limits))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
@@ -406,6 +407,12 @@ impl SyntaxProvider for PythonSyntaxProvider {
         }
         facets
     }
+}
+
+pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
+    [FUNCTION_KIND_WORD, CLASS_KIND_WORD, VARIABLE_KIND_WORD]
+        .into_iter()
+        .find(|word| *word == name)
 }
 
 #[cfg(test)]

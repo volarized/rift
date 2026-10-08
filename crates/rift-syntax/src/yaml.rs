@@ -371,7 +371,8 @@ impl SyntaxProvider for YamlSyntaxProvider {
             symbols,
             tree.root_node().has_error(),
         )
-        .with_source_witness(source.text))
+        .with_source_witness(source.text)
+        .with_syntax_limits(limits))
     }
 
     /// Portable structural facets for one YAML grammar node kind. The
@@ -407,7 +408,7 @@ impl SyntaxProvider for YamlSyntaxProvider {
     }
 }
 
-fn yaml_grammar() -> tree_sitter::Language {
+pub(crate) fn yaml_grammar() -> tree_sitter::Language {
     tree_sitter_yaml::LANGUAGE.into()
 }
 
@@ -415,6 +416,12 @@ fn yaml_grammar() -> tree_sitter::Language {
 fn yaml_kinds() -> &'static YamlKinds {
     static KINDS: OnceLock<YamlKinds> = OnceLock::new();
     KINDS.get_or_init(|| YamlKinds::resolve(&yaml_grammar()))
+}
+
+pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
+    [MAPPING_ENTRY_KIND_WORD, DOCUMENT_KIND_WORD]
+        .into_iter()
+        .find(|word| *word == name)
 }
 
 #[cfg(test)]

@@ -66,7 +66,7 @@ const SETEXT_HEADING_KIND: &str = "setext_heading";
 const HEADING_CONTENT_FIELD: &str = "heading_content";
 
 /// The kind word a markdown heading carries on the wire.
-const HEADING_KIND_WORD: &str = "heading";
+pub(crate) const HEADING_KIND_WORD: &str = "heading";
 
 /// The separator markdown qualified names join nested headings with.
 const HEADING_QUALIFICATION_SEPARATOR: &str = " > ";
@@ -321,7 +321,8 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
             symbols,
             trees.block.root_node().has_error(),
         )
-        .with_source_witness(source.text);
+        .with_source_witness(source.text)
+        .with_syntax_limits(limits);
         let markdown_facts = facts::extract_markdown_facts(source, &trees, &syntax, limits)?;
         Ok(syntax.with_markdown_facts(markdown_facts))
     }
@@ -349,7 +350,7 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
     }
 }
 
-fn markdown_grammar() -> tree_sitter::Language {
+pub(crate) fn markdown_grammar() -> tree_sitter::Language {
     tree_sitter_md::LANGUAGE.into()
 }
 
@@ -357,6 +358,10 @@ fn markdown_grammar() -> tree_sitter::Language {
 fn markdown_kinds() -> &'static MarkdownKinds {
     static KINDS: OnceLock<MarkdownKinds> = OnceLock::new();
     KINDS.get_or_init(|| MarkdownKinds::resolve(&markdown_grammar()))
+}
+
+pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
+    [HEADING_KIND_WORD].into_iter().find(|word| *word == name)
 }
 
 #[cfg(test)]

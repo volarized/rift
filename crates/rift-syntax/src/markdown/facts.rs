@@ -1312,6 +1312,33 @@ fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
     ranges
 }
 
+impl MarkdownFacts {
+    /// Validates and restores complete Markdown facts for the supplied declarations.
+    ///
+    /// Collections fit the syntax node bound. Parent indices must precede children;
+    /// ranges and references must address the supplied UTF-8 source and declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rift_error::RiftError`] for invalid structure or exceeded bounds.
+    pub fn from_parts(
+        source: &str,
+        symbols: &[crate::SyntaxSymbol],
+        limits: crate::SyntaxLimits,
+        parts: crate::MarkdownFactsParts,
+    ) -> Result<Self, rift_error::RiftError> {
+        crate::restore::validate_markdown(source, symbols, limits, parts.view())?;
+        Ok(Self {
+            blocks: parts.blocks,
+            headings: parts.headings,
+            links: parts.links,
+            reference_candidates: parts.reference_candidates,
+            error_ranges: parts.error_ranges,
+            omitted_ranges: parts.omitted_ranges,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

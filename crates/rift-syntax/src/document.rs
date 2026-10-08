@@ -100,6 +100,7 @@ pub struct SyntaxFacts {
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
     source_digest: Option<FileDigest>,
+    syntax_limits: Option<crate::SyntaxLimits>,
 }
 
 /// Immutable syntax facts for one source file and its project path.
@@ -239,6 +240,7 @@ impl SyntaxDocument {
                 left_out_declarations,
                 markdown_facts: None,
                 source_digest: None,
+                syntax_limits: None,
             }),
             nodes: Arc::new(nodes),
         }
@@ -402,6 +404,33 @@ fn declaration_node_kinds(
         }
     }
     declaration_nodes
+}
+
+impl SyntaxDocument {
+    pub(crate) fn with_syntax_limits(mut self, limits: crate::SyntaxLimits) -> Self {
+        Arc::make_mut(&mut self.facts).syntax_limits = Some(limits);
+        self
+    }
+}
+
+impl SyntaxFacts {
+    /// Returns the effective syntax bounds recorded by the provider.
+    #[must_use]
+    pub const fn syntax_limits(&self) -> Option<crate::SyntaxLimits> {
+        self.syntax_limits
+    }
+
+    pub(crate) fn restored(parts: crate::SyntaxFactsParts, limits: crate::SyntaxLimits) -> Self {
+        Self {
+            language: parts.language,
+            symbols: parts.symbols,
+            has_errors: parts.has_errors,
+            left_out_declarations: parts.left_out_declarations,
+            markdown_facts: parts.markdown_facts,
+            source_digest: Some(parts.source_digest),
+            syntax_limits: Some(limits),
+        }
+    }
 }
 
 #[cfg(test)]
