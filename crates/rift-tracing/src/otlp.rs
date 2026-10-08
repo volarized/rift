@@ -121,6 +121,7 @@ struct Providers {
     meters: Option<SdkMeterProvider>,
     logs: Option<LoggerExport>,
     recorder_metric_reader: Option<Arc<dyn MetricReader>>,
+    cardinality_limit: usize,
 }
 
 /// The logger provider and the gate the log record layer emits through.
@@ -200,6 +201,7 @@ impl OtlpExport {
                 meters,
                 logs,
                 recorder_metric_reader: None,
+                cardinality_limit: crate::metrics::CARDINALITY_LIMIT,
             }))),
         }
     }
@@ -209,6 +211,7 @@ impl OtlpExport {
         meters: Option<SdkMeterProvider>,
         logs: Option<LoggerExport>,
         recorder_metric_reader: Option<Arc<dyn MetricReader>>,
+        cardinality_limit: u32,
     ) -> Self {
         let export = Self::holding(tracer, meters, logs);
         if let Some(providers) = export
@@ -218,6 +221,7 @@ impl OtlpExport {
             .as_mut()
         {
             providers.recorder_metric_reader = recorder_metric_reader;
+            providers.cardinality_limit = cardinality_limit as usize;
         }
         export
     }
@@ -229,8 +233,10 @@ impl OtlpExport {
             .providers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(meters) = providers.as_ref().and_then(|held| held.meters.as_ref()) {
-            crate::metrics::install_meter(meters.clone());
+        if let Some(held) = providers.as_ref()
+            && let Some(meters) = held.meters.as_ref()
+        {
+            crate::metrics::install_meter(meters.clone(), held.cardinality_limit);
         }
     }
 
@@ -612,11 +618,12 @@ fn instance_id() -> Option<String> {
 /// `http://localhost:4318`.
 pub(crate) fn layer<S>(
     log_filter: tracing_subscriber::EnvFilter,
+    cardinality_limit: u32,
 ) -> (impl Layer<S> + Send + Sync, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(log_filter, true, false)
+    layer_inner(log_filter, true, false, cardinality_limit)
 }
 
 /// The test process uses the same SDK processors and periodic reader as the application.
@@ -627,7 +634,12 @@ pub(crate) fn test_process_layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(otlp_filter(log_filter), true, true)
+    layer_inner(
+        otlp_filter(log_filter),
+        true,
+        true,
+        crate::metrics::LOGS_CARDINALITY_LIMIT_DEFAULT,
+    )
 }
 
 /// A scoped test exports logs and spans; its process owns the shared SDK meter.
@@ -638,13 +650,19 @@ pub(crate) fn recorder_layer<S>(
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    layer_inner(otlp_filter(log_filter), false, false)
+    layer_inner(
+        otlp_filter(log_filter),
+        false,
+        false,
+        crate::metrics::LOGS_CARDINALITY_LIMIT_DEFAULT,
+    )
 }
 
 fn layer_inner<S>(
     log_filter: tracing_subscriber::EnvFilter,
     include_metrics: bool,
     retain_metric_reader: bool,
+    cardinality_limit: u32,
 ) -> (impl Layer<S> + Send + Sync, OtlpExport)
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
@@ -683,7 +701,8 @@ where
             .build()
         {
             Ok(exporter) => {
-                let (provider, reader) = meter_provider_with_reader(exporter, resource.clone());
+                let (provider, reader) =
+                    meter_provider_with_reader(exporter, resource.clone(), cardinality_limit);
                 (Some(provider), retain_metric_reader.then_some(reader))
             }
             Err(error) => {
@@ -718,7 +737,13 @@ where
     let log_layer = logs.as_ref().map(|logs| log_record_layer(logs, log_filter));
     (
         Layer::<S>::and_then(log_layer, span_layer),
-        OtlpExport::holding_with_recorder_metric_reader(tracer, meters, logs, reader),
+        OtlpExport::holding_with_recorder_metric_reader(
+            tracer,
+            meters,
+            logs,
+            reader,
+            cardinality_limit,
+        ),
     )
 }
 
@@ -948,12 +973,18 @@ fn meter_provider<E>(exporter: E, resource: Resource) -> SdkMeterProvider
 where
     E: opentelemetry_sdk::metrics::exporter::PushMetricExporter,
 {
-    meter_provider_with_reader(exporter, resource).0
+    meter_provider_with_reader(
+        exporter,
+        resource,
+        crate::metrics::LOGS_CARDINALITY_LIMIT_DEFAULT,
+    )
+    .0
 }
 
 fn meter_provider_with_reader<E>(
     exporter: E,
     resource: Resource,
+    cardinality_limit: u32,
 ) -> (SdkMeterProvider, Arc<dyn MetricReader>)
 where
     E: opentelemetry_sdk::metrics::exporter::PushMetricExporter + 'static,
@@ -969,9 +1000,7 @@ where
     let provider = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(reader)
-        .with_view(crate::metrics::cardinality_view(
-            crate::metrics::CARDINALITY_LIMIT,
-        ))
+        .with_view(crate::metrics::cardinality_view(cardinality_limit as usize))
         .build();
     (provider, handle)
 }
@@ -1342,6 +1371,48 @@ mod tests {
             Ok(()),
             "a second shutdown finds nothing to shut down"
         );
+    }
+
+    #[test]
+    fn configured_cardinality_reaches_the_runtime_meter_provider() {
+        use opentelemetry::KeyValue;
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let exporter = InMemoryMetricExporter::default();
+        let (provider, _) = super::meter_provider_with_reader(exporter.clone(), resource(), 2);
+        let counter = provider
+            .meter("cardinality test")
+            .u64_counter("test.view")
+            .build();
+        for key in ["a", "b", "c"] {
+            counter.add(1, &[KeyValue::new("test.key", key)]);
+        }
+        provider.force_flush().expect("the provider flushes");
+        let finished = exporter.get_finished_metrics().expect("an export");
+        let metric = finished
+            .last()
+            .expect("one export")
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == "test.view")
+            .expect("the counter exports");
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+            panic!("a counter exports a sum");
+        };
+        assert_eq!(sum.data_points().count(), 3, "two series and overflow");
+        assert_eq!(
+            sum.data_points()
+                .filter(|point| point
+                    .attributes()
+                    .any(|pair| pair.key.as_str() == "otel.metric.overflow"))
+                .count(),
+            1
+        );
+        provider.shutdown().expect("the provider stops");
     }
 
     #[test]
@@ -2061,7 +2132,10 @@ mod tests {
                 .any(|variable| configured(variable)),
             "the test process sets no OTLP log endpoint variable"
         );
-        let (_, export) = super::layer::<tracing_subscriber::Registry>(EnvFilter::new("rift=info"));
+        let (_, export) = super::layer::<tracing_subscriber::Registry>(
+            EnvFilter::new("rift=info"),
+            crate::metrics::LOGS_CARDINALITY_LIMIT_DEFAULT,
+        );
         let holds_logs = export
             .providers
             .lock()

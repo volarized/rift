@@ -519,10 +519,18 @@ impl EngineSession {
                 .spawn()
                 .map_err(|source| errors::lsp::engine_launch_failed().source(source).error())
         )?;
+        rift_tracing::info!(
+            component = "engine",
+            pid = child.id(),
+            stdin = "piped",
+            stdout = "piped",
+            stderr = "piped",
+            "engine child spawned"
+        );
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
-            let _ = child.kill().await;
+            kill_child(&mut child).await;
             return errors::lsp::engine_launch_failed()
                 .source(std::io::Error::other("child pipes were not handed over"))
                 .fail();
@@ -1209,12 +1217,7 @@ impl EngineSession {
         if !self.ended {
             let _exit = self.notify::<Exit>(&()).await;
             if let Some(child) = self.child.as_mut() {
-                let waited = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
-                if !matches!(waited, Ok(Ok(_))) {
-                    // The child overstayed shutdown or cannot be observed:
-                    // kill and reap it rather than leave it running.
-                    let _ = child.kill().await;
-                }
+                wait_child(child).await;
             }
             self.ended = true;
         }
@@ -1583,7 +1586,7 @@ impl EngineSession {
         if let Some(child) = self.child.as_mut() {
             // A kill on an already-exited child only re-observes it; the
             // result carries nothing actionable beyond the error in flight.
-            let _ = child.kill().await;
+            kill_child(child).await;
         }
     }
 }
@@ -1706,6 +1709,71 @@ async fn drain(mut stream: impl AsyncRead + Unpin, capture_bytes: usize) -> Capt
         total_bytes,
         truncated: total_bytes > kept.len() as u64,
     }
+}
+
+/// Waits for the engine's exit under the shutdown timeout, then kills and reaps it.
+async fn wait_child(child: &mut Child) {
+    let pid = child.id();
+    rift_tracing::traced!(
+        component = "engine",
+        operation = "engine.child.wait",
+        open = true,
+        pid = pid,
+        stdin = "piped",
+        stdout = "piped",
+        stderr = "piped",
+        async {
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => {
+                    let exit_code = status.code();
+                    rift_tracing::info!(
+                        component = "engine",
+                        pid,
+                        exit_code,
+                        stdin = "piped",
+                        stdout = "piped",
+                        stderr = "piped",
+                        "engine child exited"
+                    );
+                }
+                waited => {
+                    let outcome = if waited.is_err() {
+                        "timeout"
+                    } else {
+                        "refused"
+                    };
+                    rift_tracing::Span::current().record("error.type", outcome);
+                    kill_child(child).await;
+                }
+            }
+        }
+    )
+    .await;
+}
+
+/// Kills and reaps the child; the exit record retains the pid read before the kill.
+async fn kill_child(child: &mut Child) {
+    let pid = child.id();
+    rift_tracing::traced!(
+        component = "engine",
+        operation = "engine.child.kill",
+        open = true,
+        pid = pid,
+        stdin = "piped",
+        stdout = "piped",
+        stderr = "piped",
+        async {
+            match child.kill().await {
+                Ok(()) => {
+                    rift_tracing::info!(component = "engine", pid, stdin = "piped", stdout = "piped", stderr = "piped", "engine child exited");
+                }
+                Err(error) => {
+                    rift_tracing::Span::current().record("error.type", "refused");
+                    rift_tracing::warn!(component = "engine", pid, %error, "engine child kill failed");
+                }
+            }
+        }
+    ).await;
 }
 
 #[cfg(test)]

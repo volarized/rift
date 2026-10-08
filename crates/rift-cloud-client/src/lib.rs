@@ -1,11 +1,20 @@
 //! Bounded client for Rift global package data.
 
+mod cache;
 pub mod contract;
 mod declaration;
 mod pattern;
 mod response;
 
-use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use percent_encoding::percent_decode_str;
 use reqwest::{
@@ -399,6 +408,8 @@ struct Inner {
     resolution: RwLock<Option<CachedResolution>>,
     resolutions_flight: Mutex<()>,
     failure: RwLock<Option<CachedFailure>>,
+    cache_entry_counts: Arc<[AtomicU64; cache::COUNTS]>,
+    _cache_entry_reading: Option<rift_tracing::ObservationGuard>,
 }
 
 #[derive(Clone)]
@@ -541,6 +552,8 @@ impl GlobalClient {
             .map_err(|error| ConfigError::HttpClient(error.to_string()))?;
         let enabled = config.enabled;
         let max_in_flight = config.max_in_flight;
+        let cache_entry_counts = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let cache_entry_reading = cache::observe(&cache_entry_counts);
         Ok(Self {
             inner: Arc::new(Inner {
                 http,
@@ -552,6 +565,8 @@ impl GlobalClient {
                 resolution: RwLock::new(None),
                 resolutions_flight: Mutex::new(()),
                 failure: RwLock::new(None),
+                cache_entry_counts,
+                _cache_entry_reading: cache_entry_reading,
                 config,
             }),
         })
@@ -621,8 +636,14 @@ impl GlobalClient {
                         etag: meta.etag,
                         expires: Instant::now() + ttl,
                     };
-                    *self.inner.capabilities.write().await = Some(cached);
-                    *self.inner.failure.write().await = None;
+                    let mut capabilities = self.inner.capabilities.write().await;
+                    *capabilities = Some(cached);
+                    self.inner.cache_entry_counts[cache::CAPABILITIES].store(1, Ordering::Relaxed);
+                    drop(capabilities);
+                    let mut failure = self.inner.failure.write().await;
+                    *failure = None;
+                    self.inner.cache_entry_counts[cache::FAILURE].store(0, Ordering::Relaxed);
+                    drop(failure);
                     Ok(value)
                 }
                 Err(error) => Err(error),
@@ -711,13 +732,16 @@ impl GlobalClient {
             return self.observed(Err(error)).await;
         }
         let ttl = bounded_resolution_ttl(&self.inner.config, &meta);
-        *self.inner.resolution.write().await = Some(CachedResolution {
+        let mut resolution = self.inner.resolution.write().await;
+        *resolution = Some(CachedResolution {
             analyzer_revision: capabilities.analyzer_revision.clone(),
             corpus_revision: capabilities.corpus_revision.clone(),
             request_digest: prepared.digest,
             value: value.clone(),
             expires: Instant::now() + ttl,
         });
+        self.inner.cache_entry_counts[cache::RESOLUTION].store(1, Ordering::Relaxed);
+        drop(resolution);
         Ok(value)
     }
 
@@ -1176,10 +1200,13 @@ impl GlobalClient {
     /// for `failure_ttl`.
     async fn observed<T>(&self, result: Result<T, ClientError>) -> Result<T, ClientError> {
         if let Err(error) = &result {
-            *self.inner.failure.write().await = Some(CachedFailure {
+            let mut failure = self.inner.failure.write().await;
+            *failure = Some(CachedFailure {
                 error: error.clone(),
                 expires: Instant::now() + self.inner.config.failure_ttl,
             });
+            self.inner.cache_entry_counts[cache::FAILURE].store(1, Ordering::Relaxed);
+            drop(failure);
         }
         result
     }

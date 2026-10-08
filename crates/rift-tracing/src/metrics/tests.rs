@@ -379,6 +379,180 @@ fn refused() -> rift_error::RiftError {
     crate::store::store_failure("open", std::path::Path::new("metrics"), "refused")
 }
 
+#[test]
+fn inline_registered_exits_keep_their_identity_and_control_flow()
+-> Result<(), Box<dyn std::error::Error>> {
+    fn question() -> Result<u8, rift_error::RiftError> {
+        crate::traced!("test.question_error", {
+            let _child =
+                tracing::info_span!("test.question_child", error.type = "timeout").entered();
+            Err::<(), _>(refused())?;
+        });
+        Ok(9)
+    }
+    fn returned() -> Result<u8, rift_error::RiftError> {
+        crate::traced!("test.return_error", {
+            let _child = tracing::info_span!("test.return_child", error.type = "timeout").entered();
+            return Err(SourceError(refused()).into());
+        });
+    }
+    struct SourceError(rift_error::RiftError);
+    impl From<SourceError> for rift_error::RiftError {
+        fn from(source: SourceError) -> Self {
+            assert_eq!(
+                source.0.slug(),
+                rift_error::errors::tracing::log_store_failed::SLUG
+            );
+            let failed: Result<(), rift_error::RiftError> =
+                rift_error::errors::tracing::log_batch_limit()
+                    .observed(2_u64)
+                    .maximum(1_u64)
+                    .fail();
+            failed.expect_err("the builder returns its registered error")
+        }
+    }
+    fn converted() -> Result<u8, rift_error::RiftError> {
+        crate::traced!("test.converted_error", {
+            let _child =
+                tracing::info_span!("test.converted_child", error.type = "timeout").entered();
+            let __rift_entered = tracing::Span::none();
+            assert!(__rift_entered.is_disabled());
+            Err::<(), _>(SourceError(refused()))?;
+        });
+        Ok(9)
+    }
+    let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
+    assert!(question().is_err());
+    assert!(returned().is_err());
+    assert_eq!(
+        converted().expect_err("conversion fails").slug(),
+        rift_error::errors::tracing::log_batch_limit::SLUG
+    );
+    let snapshot = recorder.metrics();
+    drop(recorder);
+    let identity = rift_error::errors::tracing::log_store_failed::SLUG.as_str();
+    let records = drain.queued_records();
+    for (operation, identity) in [
+        ("test.question_error", identity),
+        (
+            "test.return_error",
+            rift_error::errors::tracing::log_batch_limit::SLUG.as_str(),
+        ),
+        (
+            "test.converted_error",
+            rift_error::errors::tracing::log_batch_limit::SLUG.as_str(),
+        ),
+    ] {
+        assert_eq!(
+            calls(
+                &snapshot,
+                operation,
+                &[("status.code", "Error"), ("error.type", identity)]
+            ),
+            Some(1.0)
+        );
+        let record = records
+            .iter()
+            .find(|record| record.message() == operation)
+            .ok_or("the operation closes")?;
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert_eq!(fields["error.type"], identity);
+        assert_eq!(fields["status.code"], "Error");
+    }
+    for child in [
+        "test.question_child",
+        "test.return_child",
+        "test.converted_child",
+    ] {
+        let record = records
+            .iter()
+            .find(|record| record.message() == child)
+            .ok_or("the child closes")?;
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert_eq!(fields["error.type"], "timeout");
+    }
+    Ok(())
+}
+
+#[test]
+fn inline_polled_exits_keep_their_registered_identity() -> Result<(), Box<dyn std::error::Error>> {
+    fn polled() -> Poll<Result<u8, rift_error::RiftError>> {
+        crate::traced!("test.poll_error", {
+            let _ = Poll::Ready(Err::<(), _>(refused()))?;
+        });
+        Poll::Ready(Ok(9))
+    }
+    fn polled_option() -> Poll<Option<Result<u8, rift_error::RiftError>>> {
+        crate::traced!("test.poll_option_error", {
+            let _ = Poll::Ready(Some(Err::<(), _>(refused())))?;
+        });
+        Poll::Ready(Some(Ok(9)))
+    }
+    let (recorder, mut drain) = crate::ScopedRecorder::builder().install()?;
+    assert!(matches!(polled(), Poll::Ready(Err(_))));
+    assert!(matches!(polled_option(), Poll::Ready(Some(Err(_)))));
+    let snapshot = recorder.metrics();
+    drop(recorder);
+    let records = drain.queued_records();
+    let identity = rift_error::errors::tracing::log_store_failed::SLUG.as_str();
+    for operation in ["test.poll_error", "test.poll_option_error"] {
+        assert_eq!(
+            calls(
+                &snapshot,
+                operation,
+                &[("status.code", "Error"), ("error.type", identity)]
+            ),
+            Some(1.0)
+        );
+        let record = records
+            .iter()
+            .find(|record| record.message() == operation)
+            .ok_or("the operation closes")?;
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert_eq!(fields["error.type"], identity);
+        assert_eq!(fields["status.code"], "Error");
+    }
+    Ok(())
+}
+
+#[test]
+fn inline_exits_keep_nested_functions_and_option_control_flow() {
+    fn option() -> Option<u8> {
+        crate::traced!("test.option_exit", {
+            None::<u8>?;
+        });
+        Some(9)
+    }
+    fn control() -> std::ops::ControlFlow<u8, ()> {
+        crate::traced!("test.control_exit", {
+            std::ops::ControlFlow::<u8, ()>::Break(4)?;
+        });
+        std::ops::ControlFlow::Continue(())
+    }
+    let recorder = recorder();
+    assert_eq!(option(), None);
+    assert_eq!(control(), std::ops::ControlFlow::Break(4));
+    let value = crate::traced!("test.nested_exits", {
+        fn nested(early: bool) -> Result<(), rift_error::RiftError> {
+            if early {
+                return Err(refused());
+            }
+            Ok(())
+        }
+        let closure = || -> Result<(), rift_error::RiftError> {
+            Err::<(), _>(refused())?;
+            Ok(())
+        };
+        assert!(nested(true).is_err());
+        assert!(closure().is_err());
+        7
+    });
+    assert_eq!(value, 7);
+    for operation in ["test.option_exit", "test.control_exit", "test.nested_exits"] {
+        assert_eq!(calls(&recorder.metrics(), operation, &OK), Some(1.0));
+    }
+}
+
 /// A block whose value is `Err(RiftError)` records the error's registered identity as its
 /// `error.type` label; `Ok`, an error of another type, and a value whose type the caller's
 /// annotation infers record a finished call.
@@ -634,6 +808,7 @@ fn a_scope_past_the_bound_is_refused_and_recorded_once() -> Result<(), Box<dyn s
         "test-scope-4",
         "test-scope-5",
         "test-scope-6",
+        "test-scope-7",
     ];
     let (recorder, mut drain) = ScopedRecorder::builder().install()?;
     assert_eq!(
@@ -675,7 +850,7 @@ fn a_scope_past_the_bound_is_refused_and_recorded_once() -> Result<(), Box<dyn s
         .collect::<Vec<_>>();
     assert_eq!(refusals.len(), 1, "the refusal is recorded once");
     assert_eq!(refusals[0].level(), "warn");
-    assert!(refusals[0].fields().contains("test-scope-5"));
+    assert!(refusals[0].fields().contains(NAMES[SCOPES_MAX - 1]));
     PLAIN.add(1);
     assert!(
         recorder.metrics().find("test.plain", &[]).is_some(),

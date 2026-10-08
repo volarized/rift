@@ -21,6 +21,78 @@ const STOP_DEADLINE: Duration = Duration::from_secs(4);
 /// twice the longest of these.
 const THREAD_WAIT_MAX: Duration = Duration::from_secs(10);
 
+#[tokio::test(start_paused = true)]
+async fn accepted_flush_interval_drives_batch_collection_and_reads_can_flush_early() {
+    let interval = Duration::from_millis(17);
+    let (sink, drain) = crate::capture::log_capture_with(super::LogDeliveryOptions {
+        flush_interval: interval,
+        ..super::LogDeliveryOptions::default()
+    });
+    let cancellation = CancellationToken::new();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        drain.wait_for_flush(&cancellation).await,
+        super::FlushReady::Due
+    ));
+    assert_eq!(started.elapsed(), interval);
+    sink.settlement.flush.notify_one();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        drain.wait_for_flush(&cancellation).await,
+        super::FlushReady::Due
+    ));
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "a read requests an immediate flush"
+    );
+    cancellation.cancel();
+    assert!(matches!(
+        drain.wait_for_flush(&cancellation).await,
+        super::FlushReady::Cancelled
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_settlement_timeout_bounds_the_dispatchers_unwritten_record() {
+    let timeout = Duration::from_millis(23);
+    let (sink, _drain) = crate::capture::log_capture_with(super::LogDeliveryOptions {
+        settle_timeout: timeout,
+        ..super::LogDeliveryOptions::default()
+    });
+    sink.settlement.draining.store(true, Ordering::SeqCst);
+    sink.send(record("unwritten"));
+    let _subscriber = tracing::subscriber::set_default(crate::capture::registry().with(sink));
+    let started = tokio::time::Instant::now();
+    super::settle_for_read("/workspace").await;
+    assert_eq!(started.elapsed(), timeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_retry_interval_keeps_refused_records_until_success() {
+    let interval = Duration::from_millis(31);
+    let attempts = std::cell::Cell::new(0_u32);
+    let started = tokio::time::Instant::now();
+    super::write_retained_with(1, interval, || {
+        let attempt = attempts.get() + 1;
+        attempts.set(attempt);
+        async move {
+            if attempt < 3 {
+                Err(rift_error::errors::tracing::log_store_failed()
+                    .operation("append")
+                    .path(std::path::Path::new(".rift/metrics"))
+                    .detail(std::io::Error::other("database is locked"))
+                    .error())
+            } else {
+                Ok(1)
+            }
+        }
+    })
+    .await;
+    assert_eq!(attempts.get(), 3);
+    assert_eq!(started.elapsed(), interval * 2);
+}
+
 /// One lane with `accepted` sequences stamped, the drain written through
 /// `written_through`, and a drain that is running or is not.
 fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlement {
@@ -33,6 +105,7 @@ fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlem
         flush: tokio::sync::Notify::new(),
         draining: AtomicBool::new(draining),
         routes: std::sync::OnceLock::new(),
+        options: super::LogDeliveryOptions::default(),
     }
 }
 
@@ -783,7 +856,7 @@ async fn a_full_workspace_queue_counts_each_drop_in_log_queue_dropped() {
 }
 
 /// A routing drain keeps at most `WORKSPACE_CONSUMERS_MAX` consumers: one more workspace
-/// starts none, and a workspace already routed is replaced, not refused.
+/// starts none. Replacing a routed workspace also needs a free retained budget.
 #[tokio::test]
 async fn routes_past_the_consumer_bound_start_no_consumer() {
     let routes = Arc::new(LogRoutes::new(10_000));
@@ -803,16 +876,172 @@ async fn routes_past_the_consumer_bound_start_no_consumer() {
             .is_none(),
         "the bound refuses one more workspace"
     );
+    let current = routes
+        .settlement_of("/w0")
+        .expect("the route remains admitted");
+    assert!(routes.admit(&upstream, "/w0", Arc::clone(&store)).is_none());
+    assert!(Arc::ptr_eq(
+        &current,
+        &routes
+            .settlement_of("/w0")
+            .expect("refusal preserves the route")
+    ));
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    assert_eq!(consumers.remove(0).stop(deadline).await, None);
     let replaced = routes
         .admit(&upstream, "/w0", Arc::clone(&store))
-        .expect("a routed workspace is replaced at the bound");
+        .expect("a released budget admits the workspace again");
     consumers.push(replaced);
 
-    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
     for consumer in consumers {
         assert_eq!(consumer.stop(deadline).await, None);
     }
-    assert!(routes.consumers().is_empty(), "every stop left the routes");
+    assert!(
+        routes.consumers().routes.is_empty(),
+        "every stop left the routes"
+    );
+}
+
+/// Replaced consumers still count while their sending ends keep the tasks alive.
+#[tokio::test]
+async fn repeated_workspace_replacements_keep_the_retained_consumer_bound() {
+    let routes = Arc::new(LogRoutes::new(10_000));
+    let upstream = Arc::new(LogSettlement::default());
+    let (_directory, store) = store().await;
+    let mut consumers = Vec::new();
+    let mut retained = Vec::new();
+    for _ in 0..RunningLogDrain::WORKSPACE_CONSUMERS_MAX {
+        consumers.push(
+            routes
+                .admit(&upstream, "/same", Arc::clone(&store))
+                .expect("a retained consumer under the bound is admitted"),
+        );
+        retained.push(
+            routes
+                .consumers()
+                .routes
+                .get("/same")
+                .expect("the admitted route is present")
+                .clone(),
+        );
+    }
+    assert_eq!(routes.consumers().routes.len(), 1);
+    let current = routes
+        .settlement_of("/same")
+        .expect("the current route is present");
+    assert!(
+        routes
+            .admit(&upstream, "/same", Arc::clone(&store))
+            .is_none()
+    );
+    assert!(Arc::ptr_eq(
+        &current,
+        &routes
+            .settlement_of("/same")
+            .expect("refusal preserves the route")
+    ));
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    drop(retained.remove(0));
+    assert_eq!(consumers.remove(0).stop(deadline).await, None);
+    consumers.push(
+        routes
+            .admit(&upstream, "/same", store)
+            .expect("release admits a replacement"),
+    );
+    assert!(!Arc::ptr_eq(
+        &current,
+        &routes
+            .settlement_of("/same")
+            .expect("replacement changes the route")
+    ));
+    retained.clear();
+    for consumer in consumers {
+        assert_eq!(consumer.stop(deadline).await, None);
+    }
+    assert!(routes.consumers().routes.is_empty());
+}
+
+/// Queued records and writer batches keep retired budgets admitted until released.
+#[tokio::test]
+async fn queued_and_writer_batches_keep_retired_consumer_budgets_admitted() {
+    let routes = Arc::new(LogRoutes::new(10_000));
+    let upstream = Arc::new(LogSettlement::default());
+    let (_directory, store) = store().await;
+    let mut queues = Vec::new();
+    for _ in 0..RunningLogDrain::WORKSPACE_CONSUMERS_MAX {
+        let running = routes
+            .admit(&upstream, "/same", Arc::clone(&store))
+            .expect("a retained budget under the bound is admitted");
+        let route = routes
+            .consumers()
+            .routes
+            .get("/same")
+            .expect("the current route is present")
+            .clone();
+        let value = record("retained");
+        let bytes = route
+            .budget
+            .reserve(&value)
+            .expect("one record fits the budget");
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(super::QueuedRecord {
+                sequence: 1,
+                record: value,
+                bytes: Some(bytes),
+            })
+            .expect("one record fits the queue");
+        drop(sender);
+        queues.push(receiver);
+        running.task.abort();
+        assert!(running.task.await.is_err());
+    }
+    let current = routes
+        .settlement_of("/same")
+        .expect("the current route is present");
+    assert!(
+        routes
+            .admit(&upstream, "/same", Arc::clone(&store))
+            .is_none()
+    );
+    assert!(Arc::ptr_eq(
+        &current,
+        &routes
+            .settlement_of("/same")
+            .expect("queued records preserve admission")
+    ));
+    let mut batches = queues
+        .into_iter()
+        .map(|mut receiver| {
+            let item = receiver.try_recv().expect("the queue retains its record");
+            Arc::new(crate::store::RetainedLogBatch {
+                records: Arc::from([item.record]),
+                _bytes: vec![item.bytes],
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        routes
+            .admit(&upstream, "/same", Arc::clone(&store))
+            .is_none()
+    );
+    assert!(Arc::ptr_eq(
+        &current,
+        &routes
+            .settlement_of("/same")
+            .expect("writer batches preserve admission")
+    ));
+    drop(batches.remove(0));
+    let replacement = routes
+        .admit(&upstream, "/same", store)
+        .expect("a released writer batch admits a replacement");
+    drop(batches);
+    assert_eq!(
+        replacement
+            .stop(tokio::time::Instant::now() + STOP_DEADLINE)
+            .await,
+        None
+    );
 }
 
 /// A dispatcher whose lane does not route starts no workspace consumer.

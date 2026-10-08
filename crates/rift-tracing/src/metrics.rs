@@ -10,7 +10,8 @@
 //! A recording hands the value and its labels to the OpenTelemetry instrument the
 //! declaration holds, built on the first recording after a meter provider was installed,
 //! from the provider's meter for the declaring crate's [`InstrumentScope`]. The OpenTelemetry
-//! SDK aggregates, bounds the series, and exports; this module holds no value. The process
+//! SDK aggregates, bounds the series, and exports. Observable collections sum their owners
+//! before export and retain no series values between collections. The process
 //! installs at most one meter provider: the OTLP export's when an endpoint is configured, or
 //! a test's `ScopedRecorder`'s. Before that, and in a process that installs none, a
 //! recording reads two atomics and records nothing.
@@ -98,13 +99,14 @@ pub(crate) const SCOPE: InstrumentScope =
     InstrumentScope::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
 /// Instrumentation scopes, and so meters, one process builds, at most: one per emitting
-/// crate. `rift-tracing`, `rift-index`, `rift-history-store`, and `rift-mcp` declare
-/// instruments; `rift-server` emits the span metrics of its `traced!` operations. The
+/// crate. `rift-tracing`, `rift-index`, `rift-history-store`, `rift-mcp`, and
+/// `rift-cloud-client` declare instruments; `rift-server` and `rift-lsp` emit the span
+/// metrics of their `traced!` operations. The
 /// architecture check `rift-dev rust-architecture` counts the crates whose shipped source
 /// declares a `SCOPE` or opens a `traced!` operation and refuses more than this bound. An
 /// instrument whose scope arrives past the bound records nothing,
 /// and the first such refusal is recorded once as a `WARN` record naming the scope.
-pub const SCOPES_MAX: usize = 6;
+pub const SCOPES_MAX: usize = 7;
 
 const _: () = assert!(
     SCOPES_MAX >= 1,
@@ -112,7 +114,7 @@ const _: () = assert!(
 );
 
 /// The meter provider every scope's meter is built from, installed at most once.
-static PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
+static PROVIDER: OnceLock<(SdkMeterProvider, usize)> = OnceLock::new();
 
 /// The meter of each scope built so far, filled in order from the first slot.
 static METERS: [OnceLock<ScopeMeter>; SCOPES_MAX] = [const { OnceLock::new() }; SCOPES_MAX];
@@ -134,13 +136,14 @@ struct ScopeMeter {
     operation_calls: Counter<4>,
 }
 
-/// Series one instrument aggregates, at most: the explicit cardinality bound every Rift
-/// instrument carries. A measurement that would add a series past it joins the series the
-/// SDK labels `otel.metric.overflow` = `true`.
+/// Series one instrument aggregates by default, before recording into the overflow series.
 ///
-/// The figure is the OpenTelemetry SDK's own default, 2,000, stated here so the bound is
-/// Rift's declaration rather than the SDK's choice.
-pub const CARDINALITY_LIMIT: usize = 2_000;
+/// `[logs] cardinality_limit` configures the runtime's bound. A measurement past it joins
+/// the series the SDK labels `otel.metric.overflow` = `true`.
+pub const CARDINALITY_LIMIT: usize = LOGS_CARDINALITY_LIMIT_DEFAULT as usize;
+
+/// Default attribute-set bound in the SDK's accepted integer type.
+pub(crate) const LOGS_CARDINALITY_LIMIT_DEFAULT: u32 = 2_000;
 
 /// The view every meter provider Rift builds applies to each instrument: the stream the
 /// instrument names, bounded at `limit` series.
@@ -170,8 +173,8 @@ pub(crate) fn cardinality_view(
 /// It then builds the counters a `tracing` layer records into, which record through
 /// [`Counter::add_built`] alone: `log.queue.dropped` and `operation.untracked`. Their
 /// scope, `rift-tracing`'s, takes the first slot of [`METERS`].
-pub(crate) fn install_meter(provider: SdkMeterProvider) {
-    let _ = PROVIDER.set(provider);
+pub(crate) fn install_meter(provider: SdkMeterProvider, cardinality_limit: usize) {
+    let _ = PROVIDER.set((provider, cardinality_limit));
     crate::capture::LOG_QUEUE_DROPPED.build();
     crate::flight::OPERATION_UNTRACKED.build();
 }
@@ -195,7 +198,7 @@ pub(crate) fn with_meter(register: impl FnOnce(&Meter)) -> bool {
 /// such refusal is recorded once as a `WARN` record. A lookup reads at most
 /// [`SCOPES_MAX`] slots; the first use of a scope takes [`METERS_CLAIM`] once.
 fn scope_meter(scope: InstrumentScope) -> Option<&'static ScopeMeter> {
-    let provider = PROVIDER.get()?;
+    let (provider, _) = PROVIDER.get()?;
     if let Some(found) = held_scope_meter(scope) {
         return Some(found);
     }
@@ -685,6 +688,9 @@ type Read<const LABELS: usize> = dyn Fn(&Observation<'_, LABELS>) + Send + Sync;
 /// The instrument registers one SDK callback, when its first read registers with a meter
 /// installed. A collection takes the list's lock to copy out its reads, at most
 /// [`OBSERVATIONS_MAX`] `Arc` clones, and runs them with the lock released.
+/// Reads with identical labels contribute to one sum. Each collection holds at most
+/// `[logs] cardinality_limit` attributed series and one series without labels; excess
+/// labels contribute to the SDK's overflow series, and the first overflow records a warning.
 pub struct ObservableUpDownCounter<const LABELS: usize> {
     scope: InstrumentScope,
     name: &'static str,
@@ -698,6 +704,8 @@ pub struct ObservableUpDownCounter<const LABELS: usize> {
     callback: OnceLock<()>,
     /// Whether a read past [`OBSERVATIONS_MAX`] was refused and recorded.
     refusal_recorded: AtomicBool,
+    /// Whether a collection exceeded its configured series bound and recorded a warning.
+    series_refusal_recorded: AtomicBool,
 }
 
 impl<const LABELS: usize> std::fmt::Debug for ObservableUpDownCounter<LABELS> {
@@ -730,6 +738,7 @@ impl<const LABELS: usize> ObservableUpDownCounter<LABELS> {
             next: AtomicU64::new(0),
             callback: OnceLock::new(),
             refusal_recorded: AtomicBool::new(false),
+            series_refusal_recorded: AtomicBool::new(false),
         }
     }
 
@@ -803,13 +812,30 @@ impl<const LABELS: usize> ObservableUpDownCounter<LABELS> {
             .iter()
             .map(|(_, read)| Arc::clone(read))
             .collect();
+        let cardinality_limit = PROVIDER
+            .get()
+            .map_or(CARDINALITY_LIMIT, |(_, limit)| *limit);
         let observation = Observation {
-            instrument,
+            values: Mutex::new(observation::ObservationValues::new(cardinality_limit)),
             label_keys: self.label_keys,
+            _collection: PhantomData,
         };
         for read in reads {
             read(&observation);
         }
+        let values = observation
+            .values
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        if values.has_overflow() && !self.series_refusal_recorded.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "rift_tracing::metrics",
+                instrument = self.name,
+                cardinality_limit,
+                "observable instrument recorded series past its bound into overflow"
+            );
+        }
+        values.publish(instrument, self.label_keys);
     }
 
     /// The reads registered now.
@@ -839,19 +865,20 @@ impl<const LABELS: usize> Unregister for ObservableUpDownCounter<LABELS> {
 /// One collection's view of an [`ObservableUpDownCounter`]; [`Self::observe`] reports a
 /// value.
 pub struct Observation<'collection, const LABELS: usize> {
-    instrument: &'collection dyn AsyncInstrument<i64>,
+    values: Mutex<observation::ObservationValues<LABELS>>,
     label_keys: &'static [&'static str; LABELS],
+    _collection: PhantomData<&'collection ()>,
 }
 
 impl<const LABELS: usize> Observation<'_, LABELS> {
-    /// Reports `value` for the series the label `values` name, in declaration order. A
-    /// value past `i64::MAX` reports `i64::MAX`.
+    /// Reports `value` for `labels`, in declaration order.
+    /// Values with identical labels add within one collection. A sum past `i64::MAX`
+    /// reports `i64::MAX`; excess label sets join the SDK's overflow series.
     pub fn observe(&self, labels: [&'static str; LABELS], value: u64) {
-        let (attributes, count) = attributes(self.label_keys, labels);
-        self.instrument.observe(
-            i64::try_from(value).unwrap_or(i64::MAX),
-            &attributes[..count],
-        );
+        self.values
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(labels, value);
     }
 }
 
@@ -1039,3 +1066,5 @@ fn started(scope: InstrumentScope, operation: &'static str, ending: Ending) -> C
 
 #[cfg(test)]
 mod tests;
+
+mod observation;

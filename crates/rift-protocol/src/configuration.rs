@@ -80,6 +80,24 @@ pub const LOGS_STDERR_BYTES_MIN: u64 = 1 << 10;
 pub const LOGS_STDERR_BYTES_MAX: u64 = 1 << 30;
 /// Bytes `logs.stderr_limit` holds when the key is absent.
 pub const LOGS_STDERR_BYTES_DEFAULT: u64 = 1 << 20;
+/// Records one log subscription keeps, at most.
+pub const LOGS_QUEUE_RECORDS_MAX: u64 = 65_536;
+/// Records one log subscription keeps by default.
+pub const LOGS_QUEUE_RECORDS_DEFAULT: u64 = 4_096;
+/// Milliseconds a log delivery interval or settlement wait holds, at least.
+pub const LOGS_DELIVERY_MS_MIN: u64 = 1;
+/// Milliseconds a log delivery interval or settlement wait holds, at most.
+pub const LOGS_DELIVERY_MS_MAX: u64 = 3_600_000;
+/// Milliseconds the drain waits before writing a partial batch by default.
+pub const LOGS_FLUSH_INTERVAL_MS_DEFAULT: u64 = 250;
+/// Milliseconds the drain waits before retrying a refused batch by default.
+pub const LOGS_RETRY_INTERVAL_MS_DEFAULT: u64 = 500;
+/// Milliseconds a persisted-log read waits for settlement by default.
+pub const LOGS_SETTLE_TIMEOUT_MS_DEFAULT: u64 = 2_000;
+/// Attribute sets one metric instrument keeps, at most.
+pub const LOGS_CARDINALITY_LIMIT_MAX: u64 = 65_536;
+/// Attribute sets one metric instrument keeps by default.
+pub const LOGS_CARDINALITY_LIMIT_DEFAULT: u64 = 2_000;
 
 /// Bytes one submitted execution block may hold, at most.
 pub const EXECUTION_CODE_BYTES_MAX: u64 = 32 << 10;
@@ -872,12 +890,11 @@ impl PortRange {
     }
 }
 
-/// The `[logs]` table. The server records its own diagnostics in the metrics
-/// database at `.rift/metrics`, where `rift://logs` reads them back, and this
-/// table bounds how many records the store keeps, how many one read returns,
-/// which targets are captured at all, when an operation still open is reported,
-/// and how much it writes to a standard error that is not a terminal. The server
-/// reads the table at startup, so a change applies on the next start.
+/// The `[logs]` table bounds log delivery, retention, capture, and metric attribute sets.
+///
+/// The server records diagnostics in `.rift/metrics`, where `rift://logs` reads them.
+/// The table also bounds stall reports and standard error that is not a terminal.
+/// The server reads the table at startup, so a change applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_logs_ranges)]
@@ -888,6 +905,18 @@ pub struct LogsConfiguration {
     /// Records one `rift://logs` read returns at most, 1 to 5000.
     #[schemars(range(min = 1, max = 5_000))]
     pub page_records: u64,
+    /// Records one log subscription holds before it drops and counts, 1 to 65536.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub queue_records: u64,
+    /// Wait before the drain writes a partial batch, 1ms to 1h.
+    pub flush_interval: Duration,
+    /// Wait before the drain retries a batch the store refused, 1ms to 1h.
+    pub retry_interval: Duration,
+    /// Longest a persisted-log read waits for its records to be written, 1ms to 1h.
+    pub settle_timeout: Duration,
+    /// Attribute sets one metric instrument holds before overflow, 1 to 65536.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub cardinality_limit: u64,
     /// Which targets are recorded, in the `RUST_LOG` spelling `tracing` takes:
     /// comma-separated `target=level` pairs. A target this filter excludes
     /// never reaches the store, whatever the stderr diagnostics carry.
@@ -907,6 +936,11 @@ impl Default for LogsConfiguration {
         Self {
             retention_records: LOGS_RETENTION_RECORDS_DEFAULT,
             page_records: LOGS_PAGE_RECORDS_DEFAULT,
+            queue_records: LOGS_QUEUE_RECORDS_DEFAULT,
+            flush_interval: Duration::from_millis(LOGS_FLUSH_INTERVAL_MS_DEFAULT),
+            retry_interval: Duration::from_millis(LOGS_RETRY_INTERVAL_MS_DEFAULT),
+            settle_timeout: Duration::from_millis(LOGS_SETTLE_TIMEOUT_MS_DEFAULT),
+            cardinality_limit: LOGS_CARDINALITY_LIMIT_DEFAULT,
             capture: LOGS_CAPTURE_DEFAULT.to_owned(),
             stall_delay: Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT),
             stderr_limit: ByteSize::from_bytes(LOGS_STDERR_BYTES_DEFAULT),
@@ -930,10 +964,40 @@ impl LogsConfiguration {
                 1,
                 LOGS_PAGE_RECORDS_MAX,
             ),
+            (
+                "logs.queue_records",
+                self.queue_records,
+                1,
+                LOGS_QUEUE_RECORDS_MAX,
+            ),
+            (
+                "logs.cardinality_limit",
+                self.cardinality_limit,
+                1,
+                LOGS_CARDINALITY_LIMIT_MAX,
+            ),
         ])
         .or_else(|| self.capture_violation())
         .or_else(|| {
             first_out_of_range([
+                (
+                    "logs.flush_interval",
+                    self.flush_interval.milliseconds(),
+                    LOGS_DELIVERY_MS_MIN,
+                    LOGS_DELIVERY_MS_MAX,
+                ),
+                (
+                    "logs.retry_interval",
+                    self.retry_interval.milliseconds(),
+                    LOGS_DELIVERY_MS_MIN,
+                    LOGS_DELIVERY_MS_MAX,
+                ),
+                (
+                    "logs.settle_timeout",
+                    self.settle_timeout.milliseconds(),
+                    LOGS_DELIVERY_MS_MIN,
+                    LOGS_DELIVERY_MS_MAX,
+                ),
                 (
                     "logs.stall_delay",
                     self.stall_delay.milliseconds(),
@@ -4037,6 +4101,54 @@ mod tests {
         for value in [LOGS_STDERR_BYTES_MIN, LOGS_STDERR_BYTES_MAX] {
             configuration.logs.stderr_limit = ByteSize::from_bytes(value);
             assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_logs_delivery_bounds_are_enforced() {
+        for field in ["queue_records", "cardinality_limit"] {
+            for value in [0, 65_537] {
+                let configuration = WorkspaceConfiguration {
+                    logs: serde_json::from_value(json!({field: value})).expect("log settings"),
+                    ..WorkspaceConfiguration::default()
+                };
+                assert!(
+                    matches!(
+                        configuration.validate(),
+                        Err(ConfigurationViolation::LimitOutOfRange { .. })
+                    ),
+                    "{field}={value}"
+                );
+            }
+            for value in [1, 65_536] {
+                let configuration = WorkspaceConfiguration {
+                    logs: serde_json::from_value(json!({field: value})).expect("log settings"),
+                    ..WorkspaceConfiguration::default()
+                };
+                assert_eq!(configuration.validate(), Ok(()), "{field}={value}");
+            }
+        }
+        for field in ["flush_interval", "retry_interval", "settle_timeout"] {
+            for value in [0, LOGS_DELIVERY_MS_MAX + 1] {
+                let duration = Duration::from_millis(value);
+                let configuration = WorkspaceConfiguration {
+                    logs: serde_json::from_value(json!({field: duration})).expect("log settings"),
+                    ..WorkspaceConfiguration::default()
+                };
+                let failure = configuration.validate();
+                assert!(
+                    matches!(failure, Err(ConfigurationViolation::LimitOutOfRange { .. })),
+                    "{field}={duration:?}: {failure:?}"
+                );
+            }
+            for value in [LOGS_DELIVERY_MS_MIN, LOGS_DELIVERY_MS_MAX] {
+                let duration = Duration::from_millis(value);
+                let configuration = WorkspaceConfiguration {
+                    logs: serde_json::from_value(json!({field: duration})).expect("log settings"),
+                    ..WorkspaceConfiguration::default()
+                };
+                assert_eq!(configuration.validate(), Ok(()), "{field}={duration:?}");
+            }
         }
     }
 
