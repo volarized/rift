@@ -4511,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "axum",
  "clap",
@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "flate2",
  "ignore",
@@ -4582,7 +4582,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "anyhow",
  "axum",
@@ -4609,7 +4609,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "percent-encoding",
  "rift-error",
@@ -4626,7 +4626,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "ignore",
  "rift-core",
@@ -4640,14 +4640,14 @@ dependencies = [
 
 [[package]]
 name = "rift-error"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "rift-error-macros",
 ]
 
 [[package]]
 name = "rift-error-codegen"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "rift-error",
  "serde",
@@ -4658,11 +4658,11 @@ dependencies = [
 
 [[package]]
 name = "rift-error-macros"
-version = "0.0.62"
+version = "0.0.63"
 
 [[package]]
 name = "rift-history"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "gix",
  "rift-core",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history-store"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4690,7 +4690,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "async-trait",
  "ignore",
@@ -4722,7 +4722,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4739,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4782,7 +4782,7 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
@@ -4796,7 +4796,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4807,7 +4807,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "data-encoding",
  "regex",
@@ -4821,7 +4821,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "jsonschema",
  "rift-analysis",
@@ -4835,7 +4835,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "axum",
  "candle-core",
@@ -4860,7 +4860,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "globset",
  "ignore",
@@ -4902,7 +4902,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4910,6 +4910,7 @@ dependencies = [
  "rift-provider",
  "rift-tracing",
  "serde",
+ "serde_json",
  "strum",
  "tree-sitter",
  "tree-sitter-javascript",
@@ -4924,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "getrandom 0.4.3",
  "jiff",
@@ -4948,7 +4949,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing-macros"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -7584,7 +7585,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.62"
+version = "0.0.63"
 dependencies = [
  "rift-error-codegen",
  "tempfile",
