@@ -28,10 +28,21 @@ pub const SOURCE_WORKSPACE_BYTES_MAX: u64 = 64 << 30;
 /// 5 GiB. bun v1.4.2 declares 402,812 from 14,654 files and Next.js v16.3.5 declares
 /// 439,749 from 26,162, so the default leaves room for a workspace twice either one.
 pub const SOURCE_DECLARATIONS_DEFAULT: u64 = 1_000_000;
+
+/// Default adjacency capacity for source relationships.
+pub const SOURCE_RELATIONSHIPS_DEFAULT: u64 = 10_000_000;
+/// Supported adjacency capacity for source relationships.
+pub const SOURCE_RELATIONSHIPS_MAX: u64 = 500_000_000;
 /// Declarations the index may hold, at least.
 pub const SOURCE_DECLARATIONS_MIN: u64 = 10_000;
 /// Declarations the index may hold, at most.
 pub const SOURCE_DECLARATIONS_MAX: u64 = 50_000_000;
+/// Directory depth the index scans below the root, by default.
+pub const SOURCE_DIRECTORY_DEPTH_DEFAULT: u64 = 64;
+/// Directory depth the index scans below the root, at least.
+pub const SOURCE_DIRECTORY_DEPTH_MIN: u64 = 1;
+/// Directory depth the index scans below the root, at most.
+pub const SOURCE_DIRECTORY_DEPTH_MAX: u64 = 4_096;
 /// The key path acceptance and the index build both name when the file count bound is
 /// crossed.
 pub const SOURCE_FILES_FIELD: &str = "source.files";
@@ -41,6 +52,8 @@ pub const SOURCE_WORKSPACE_SIZE_FIELD: &str = "source.workspace_size";
 /// The key path acceptance names when the declaration bound is crossed, and the key the
 /// index build reports a file left out past that bound against.
 pub const SOURCE_DECLARATIONS_FIELD: &str = "source.declarations";
+/// The key path the index names when a directory exceeds the configured depth.
+pub const SOURCE_DIRECTORY_DEPTH_FIELD: &str = "source.directory_depth";
 
 /// The `[source]` table: which files below the workspace root the index and reads consider
 /// visible, and how many files, bytes, and declarations the index holds together. `.git`,
@@ -80,6 +93,14 @@ pub struct SourceConfiguration {
     #[schemars(range(min = 10_000, max = 50_000_000))]
     #[serde(default = "default_source_declarations")]
     pub declarations: u64,
+    /// Most relationship edges held together, 1 to 500000000.
+    #[schemars(range(min = 1, max = 500_000_000))]
+    pub relationships: u64,
+    /// Most directory levels scanned below the workspace root, 1 to 4096.
+    /// A deeper directory refuses the rebuild naming this key.
+    #[schemars(range(min = 1, max = 4_096))]
+    #[serde(default = "default_source_directory_depth")]
+    pub directory_depth: u64,
 }
 
 impl Default for SourceConfiguration {
@@ -92,6 +113,8 @@ impl Default for SourceConfiguration {
             files: default_source_files(),
             workspace_size: default_source_workspace_size(),
             declarations: default_source_declarations(),
+            relationships: SOURCE_RELATIONSHIPS_DEFAULT,
+            directory_depth: default_source_directory_depth(),
         }
     }
 }
@@ -131,6 +154,18 @@ impl SourceConfiguration {
                 SOURCE_DECLARATIONS_MIN,
                 SOURCE_DECLARATIONS_MAX,
             ),
+            (
+                "source.relationships",
+                self.relationships,
+                1,
+                SOURCE_RELATIONSHIPS_MAX,
+            ),
+            (
+                SOURCE_DIRECTORY_DEPTH_FIELD,
+                self.directory_depth,
+                SOURCE_DIRECTORY_DEPTH_MIN,
+                SOURCE_DIRECTORY_DEPTH_MAX,
+            ),
         ])
         .or_else(|| pattern_list_violation("source.include", &self.include))
         .or_else(|| pattern_list_violation("source.exclude", &self.exclude))
@@ -147,6 +182,10 @@ fn default_source_workspace_size() -> ByteSize {
 
 fn default_source_declarations() -> u64 {
     SOURCE_DECLARATIONS_DEFAULT
+}
+
+fn default_source_directory_depth() -> u64 {
+    SOURCE_DIRECTORY_DEPTH_DEFAULT
 }
 
 /// The first pattern in `patterns` breaking [`PathPattern`]'s forward-slash-only contract,
@@ -320,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_source_numeric_bounds_are_enforced_naming_the_field() {
-        let cases: [(&str, Setter, [u64; 2]); 3] = [
+        let cases: [(&str, Setter, [u64; 2]); 4] = [
             (
                 SOURCE_FILES_FIELD,
                 |table, value| table.files = value,
@@ -338,6 +377,14 @@ mod tests {
                 SOURCE_DECLARATIONS_FIELD,
                 |table, value| table.declarations = value,
                 [SOURCE_DECLARATIONS_MIN - 1, SOURCE_DECLARATIONS_MAX + 1],
+            ),
+            (
+                SOURCE_DIRECTORY_DEPTH_FIELD,
+                |table, value| table.directory_depth = value,
+                [
+                    SOURCE_DIRECTORY_DEPTH_MIN - 1,
+                    SOURCE_DIRECTORY_DEPTH_MAX + 1,
+                ],
             ),
         ];
         for (field, set, values) in cases {
@@ -365,10 +412,12 @@ mod tests {
         configuration.source.workspace_size = ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MAX);
         assert_eq!(configuration.validate(), Ok(()));
         configuration.source.declarations = SOURCE_DECLARATIONS_MIN;
+        configuration.source.directory_depth = SOURCE_DIRECTORY_DEPTH_MIN;
         assert_eq!(configuration.validate(), Ok(()));
         configuration.source.files = SOURCE_FILES_MAX;
         configuration.source.workspace_size = ByteSize::from_bytes(SOURCE_WORKSPACE_BYTES_MIN);
         configuration.source.declarations = SOURCE_DECLARATIONS_MAX;
+        configuration.source.directory_depth = SOURCE_DIRECTORY_DEPTH_MAX;
         assert_eq!(configuration.validate(), Ok(()));
     }
 
@@ -395,6 +444,21 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let table = &schema["$defs"]["SourceConfiguration"]["properties"];
         let cases = [
+            (
+                "directory depth default",
+                &table["directory_depth"]["default"],
+                json!(SOURCE_DIRECTORY_DEPTH_DEFAULT),
+            ),
+            (
+                "directory depth min",
+                &table["directory_depth"]["minimum"],
+                json!(SOURCE_DIRECTORY_DEPTH_MIN),
+            ),
+            (
+                "directory depth max",
+                &table["directory_depth"]["maximum"],
+                json!(SOURCE_DIRECTORY_DEPTH_MAX),
+            ),
             (
                 "files default",
                 &table["files"]["default"],

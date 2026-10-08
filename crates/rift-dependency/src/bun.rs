@@ -24,6 +24,7 @@ const WORKSPACE_VERSION_PREFIX: &str = "workspace:";
 /// scope and its name.
 const NESTING_SEPARATOR: char = '/';
 /// Names one `packages` key may nest, at most; a deeper key spells no install path.
+#[cfg(test)]
 const NESTING_DEPTH_MAX: usize = 32;
 
 /// The resolver for npm packages Bun installed, answering from `bun.lock`.
@@ -140,8 +141,13 @@ fn pinned<'a>(spelled: &'a str, version: &'a str) -> Pin<'a> {
 /// and `node_modules/<parent>/node_modules/<name>` below each parent for a nested one.
 ///
 /// The key alone spells the location, whether or not the parent is itself a key.
+#[cfg(test)]
 fn install_path(key: &str) -> Option<String> {
-    let names = nested_names(key)?;
+    install_path_with_limit(key, NESTING_DEPTH_MAX)
+}
+
+fn install_path_with_limit(key: &str, nesting_depth_max: usize) -> Option<String> {
+    let names = nested_names_with_limit(key, nesting_depth_max)?;
     let nesting = format!("{NESTING_SEPARATOR}{NODE_MODULES_DIRECTORY_NAME}{NESTING_SEPARATOR}");
     Some(format!(
         "{NODE_MODULES_DIRECTORY_NAME}{NESTING_SEPARATOR}{}",
@@ -153,11 +159,16 @@ fn install_path(key: &str) -> Option<String> {
 ///
 /// Absent when a segment is empty, a scope has no name after it, or the key nests more
 /// than `NESTING_DEPTH_MAX` names.
+#[cfg(test)]
 fn nested_names(key: &str) -> Option<Vec<String>> {
+    nested_names_with_limit(key, NESTING_DEPTH_MAX)
+}
+
+fn nested_names_with_limit(key: &str, nesting_depth_max: usize) -> Option<Vec<String>> {
     let mut names = Vec::new();
     let mut segments = key.split(NESTING_SEPARATOR);
     while let Some(segment) = segments.next() {
-        if names.len() == NESTING_DEPTH_MAX {
+        if names.len() >= nesting_depth_max {
             return None;
         }
         names.push(nested_name(segment, &mut segments)?);

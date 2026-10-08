@@ -62,6 +62,7 @@ fn check(
         capabilities,
         limit: 20,
         cursor,
+        source_bytes_max: SOURCE_BYTES_MAX,
     }
     .validate(&page)
 }
@@ -352,6 +353,7 @@ fn test_pattern_pages_refuse_past_their_bounds() {
         capabilities: &capabilities,
         limit: PAGE_LIMIT_MAX,
         cursor: None,
+        source_bytes_max: SOURCE_BYTES_MAX,
     };
     for (count, expected) in [
         (PATTERN_PAGE_FILES_MAX, Ok(())),

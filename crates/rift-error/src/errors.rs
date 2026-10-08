@@ -26,6 +26,8 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.analysis.package_input_too_many_bytes",
     "rift.analysis.package_input_too_many_files",
     "rift.analysis.package_provider_failed",
+    "rift.analysis.package_retained_source_bytes_exceeded",
+    "rift.analysis.package_retained_source_limits_invalid",
     "rift.analysis.package_syntax_unavailable",
     "rift.analysis.source_pattern_invalid",
     "rift.cli.install_home_unresolved",

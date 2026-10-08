@@ -342,6 +342,7 @@ mod tests {
             enabled: true,
             exclude: patterns(&["docs/internal/**", "CHANGELOG.md"]),
             force_include: patterns(&["CHANGELOG.md", "docs/archive/**"]),
+            ..DocumentationConfiguration::default()
         };
         let selection = compiled(&configuration);
         assert_eq!(

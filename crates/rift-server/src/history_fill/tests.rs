@@ -12,6 +12,8 @@ use rift_syntax::SyntaxLimits;
 
 use super::{HistoryAnalysis, release_version};
 
+mod collection;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn write(root: &Path, path: &str, text: &str) -> TestResult {

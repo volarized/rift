@@ -277,8 +277,8 @@ impl Repository {
     /// whose workspace-relative path passes `includes`, sorted by path.
     ///
     /// Symbolic links and submodules are never listed. The traversal counts
-    /// every visited tree entry against `entries_max` - callers pass
-    /// [`REVISION_TREE_ENTRIES_MAX`] - stops descending once the budget is
+    /// every visited tree entry against `entries_max`, which defaults to
+    /// [`REVISION_TREE_ENTRIES_MAX`], and stops descending once the budget is
     /// spent, and refuses the listing rather than truncating it.
     ///
     /// # Errors

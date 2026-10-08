@@ -202,9 +202,10 @@ impl RelationshipStore {
         Self::build_capped(graph, RELATIONSHIP_EDGES_MAX)
     }
 
-    /// Builds the adjacency under an explicit edge cap, so a test can force truncation
-    /// without a graph sized past [`RELATIONSHIP_EDGES_MAX`].
-    fn build_capped(graph: &NormalizedGraph, edges_max: usize) -> Self {
+    /// Builds adjacency under the caller's edge cap, reporting every omitted edge.
+    /// A zero cap publishes no edges.
+    #[must_use]
+    pub fn build_capped(graph: &NormalizedGraph, edges_max: usize) -> Self {
         let enclosing = UnitDefinitions::build(graph);
         let mut outgoing: BTreeMap<SymbolId, Vec<RelationshipEdge>> = BTreeMap::new();
         let mut incoming: BTreeMap<SymbolId, Vec<RelationshipEdge>> = BTreeMap::new();

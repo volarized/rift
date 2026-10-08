@@ -3,7 +3,7 @@
 //! A resolver receives its manifests as project paths. From each it derives the
 //! directory the manifest stands in, the files beside it, and whether a listed
 //! manifest in an ancestor directory covers it, and reads each of those files within
-//! [`LOCKFILE_BYTES_MAX`]. Each format's model and parse step stay with the resolver
+//! `dependencies.collection.lockfile_size`. Each format's model and parse step stay with the resolver
 //! that owns the format: each maps its parser's error to
 //! [`StaticFileFailure::unparsable`].
 
@@ -12,7 +12,9 @@ use std::path::{Component, Path, PathBuf};
 
 use rift_protocol::read::ProjectPath;
 
-use crate::resolver::{FileObservation, LOCKFILE_BYTES_MAX, MANIFESTS_MAX, StaticInputs};
+use crate::resolver::{FileObservation, StaticInputs};
+#[cfg(test)]
+use crate::resolver::{LOCKFILE_BYTES_MAX, MANIFESTS_MAX};
 
 /// The separator between the segments of a project path.
 const PATH_SEPARATOR: char = '/';
@@ -29,7 +31,7 @@ pub(crate) fn file_name(path: &ProjectPath) -> &str {
 /// The manifests one resolver reads, and what the manifest bound left out.
 pub(crate) struct ClaimedManifests {
     /// The visible paths carrying the resolver's manifest file name, at most
-    /// [`MANIFESTS_MAX`] of them in path order.
+    /// `dependencies.collection.manifests` of them in path order.
     pub(crate) manifests: Vec<ProjectPath>,
     /// What the bound dropped, absent when every claimed manifest is read.
     pub(crate) dropped: Option<String>,
@@ -39,9 +41,19 @@ pub(crate) struct ClaimedManifests {
 ///
 /// Every resolver claims its manifests the same way, so the static context reads one
 /// list per resolver and reports one drop.
+#[cfg(test)]
 pub(crate) fn claimed_manifests(
     visible: &[ProjectPath],
     manifest_file_name: &str,
+) -> ClaimedManifests {
+    claimed_manifests_with_limit(visible, manifest_file_name, MANIFESTS_MAX)
+}
+
+/// The visible paths carrying `manifest_file_name`, cut to the accepted manifest bound.
+pub(crate) fn claimed_manifests_with_limit(
+    visible: &[ProjectPath],
+    manifest_file_name: &str,
+    manifests_max: usize,
 ) -> ClaimedManifests {
     let mut manifests: Vec<ProjectPath> = visible
         .iter()
@@ -49,12 +61,12 @@ pub(crate) fn claimed_manifests(
         .cloned()
         .collect();
     let claimed_count = manifests.len();
-    manifests.truncate(MANIFESTS_MAX);
-    let dropped = (claimed_count > MANIFESTS_MAX).then(|| {
+    manifests.truncate(manifests_max);
+    let dropped = (claimed_count > manifests_max).then(|| {
         format!(
             "{} of {claimed_count} {manifest_file_name} manifests were not read: at most \
-             {MANIFESTS_MAX} are read per workspace",
-            claimed_count - MANIFESTS_MAX
+             {manifests_max} are read per workspace",
+            claimed_count - manifests_max
         )
     });
     ClaimedManifests { manifests, dropped }
@@ -63,7 +75,7 @@ pub(crate) fn claimed_manifests(
 /// The manifests with no other listed manifest in an ancestor directory, in path order.
 ///
 /// Every manifest pair is compared, so the work is quadratic in the manifest count,
-/// which `MANIFESTS_MAX` bounds.
+/// which `dependencies.collection.manifests` bounds, at most 4096 manifests.
 #[must_use]
 pub(crate) fn top_level_manifests(manifests: &[ProjectPath]) -> Vec<&ProjectPath> {
     manifests
@@ -176,8 +188,8 @@ pub(crate) struct StaticFileFailure {
 enum StaticFileFailureCause {
     /// No such file stands beside the manifest.
     Absent,
-    /// The file holds more bytes than `LOCKFILE_BYTES_MAX`.
-    OverBound { bytes: u64 },
+    /// The file holds more bytes than its accepted bound.
+    OverBound { bytes: u64, maximum: u64 },
     /// The file is not the document its tool writes; carries the parser's message.
     Unparsable(String),
 }
@@ -204,9 +216,9 @@ impl fmt::Display for StaticFileFailure {
         let file_name = self.file_name;
         match &self.cause {
             StaticFileFailureCause::Absent => write!(formatter, "no {file_name} beside it"),
-            StaticFileFailureCause::OverBound { bytes } => write!(
+            StaticFileFailureCause::OverBound { bytes, maximum } => write!(
                 formatter,
-                "{file_name} holds {bytes} bytes, past the {LOCKFILE_BYTES_MAX} byte bound"
+                "{file_name} holds {bytes} bytes, past the {maximum} byte bound"
             ),
             StaticFileFailureCause::Unparsable(message) => {
                 write!(formatter, "{file_name} could not be parsed: {message}")
@@ -215,17 +227,20 @@ impl fmt::Display for StaticFileFailure {
     }
 }
 
-/// Reads the file named `file_name` in `directory`, within `LOCKFILE_BYTES_MAX`.
+/// Reads the file named `file_name` in `directory`, within `dependencies.collection.lockfile_size`.
 pub(crate) fn read_static_file(
     directory: &Path,
     file_name: &'static str,
     inputs: &mut dyn StaticInputs,
 ) -> Result<Vec<u8>, StaticFileFailure> {
     let path = directory.join(file_name);
-    let cause = match inputs.read_file(&path, LOCKFILE_BYTES_MAX) {
+    let maximum = inputs.collection().lockfile_size.bytes();
+    let cause = match inputs.read_file(&path, maximum) {
         FileObservation::Bytes(bytes) => return Ok(bytes),
         FileObservation::Absent => StaticFileFailureCause::Absent,
-        FileObservation::OverBound { bytes } => StaticFileFailureCause::OverBound { bytes },
+        FileObservation::OverBound { bytes } => {
+            StaticFileFailureCause::OverBound { bytes, maximum }
+        }
     };
     Err(StaticFileFailure { file_name, cause })
 }
@@ -271,6 +286,21 @@ mod tests {
         let claimed = claimed_manifests(&probe_manifests(MANIFESTS_MAX), "probe.toml");
         assert_eq!(claimed.manifests.len(), MANIFESTS_MAX);
         assert_eq!(claimed.dropped, None);
+    }
+
+    #[test]
+    fn configured_manifest_bound_accepts_exact_and_reports_one_over() {
+        let raised = MANIFESTS_MAX + 1;
+        let exact = claimed_manifests_with_limit(&probe_manifests(raised), "probe.toml", raised);
+        assert_eq!(exact.manifests.len(), raised);
+        assert_eq!(exact.dropped, None);
+        let over = claimed_manifests_with_limit(&probe_manifests(raised + 1), "probe.toml", raised);
+        assert_eq!(over.manifests.len(), raised);
+        assert!(
+            over.dropped
+                .expect("one manifest dropped")
+                .contains(&format!("at most {raised}"))
+        );
     }
 
     #[test]

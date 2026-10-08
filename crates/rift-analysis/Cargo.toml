@@ -39,4 +39,5 @@ zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 jsonschema.workspace = true
+schemars.workspace = true
 tempfile.workspace = true

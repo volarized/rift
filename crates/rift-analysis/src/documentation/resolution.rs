@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_protocol::documentation::{
-    DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_REFERENCES_MAX, DOCUMENTATION_SOURCES_MAX,
+    DOCUMENTATION_BLOCKS_CEILING, DOCUMENTATION_REFERENCES_CEILING, DOCUMENTATION_SOURCES_CEILING,
     DocumentationBlock, DocumentationContentIdentity, DocumentationDigest, DocumentationLink,
     DocumentationReference, DocumentationReferenceCandidate, DocumentationReferenceEvidence,
     DocumentationSource, DocumentationUnresolvedReason,
@@ -16,7 +16,7 @@ use super::links::{DeclarationLinkMatch, DeclarationLinkNames, Destination, loca
 use super::references::{DeclarationNames, DocumentationDeclaration};
 use rift_error::{RiftError, errors};
 
-const RESOLUTION_DEPENDENCIES_MAX: usize = DOCUMENTATION_REFERENCES_MAX as usize * 5;
+const RESOLUTION_DEPENDENCIES_MAX: usize = DOCUMENTATION_REFERENCES_CEILING as usize * 5;
 
 /// Current facts consumed by documentation link and declaration resolution.
 pub(super) struct ResolutionInput<'a> {
@@ -330,7 +330,7 @@ fn valid_previous<'a>(
         cache.revision.as_ref() == Some(revision)
             && cache.complete
             && cacheable
-            && cache.blocks.len() <= DOCUMENTATION_BLOCKS_MAX as usize
+            && cache.blocks.len() <= DOCUMENTATION_BLOCKS_CEILING as usize
             && cache.states.len() <= RESOLUTION_DEPENDENCIES_MAX
             && cache.reverse.len() <= RESOLUTION_DEPENDENCIES_MAX
             && reverse_membership_count(&cache.reverse) <= RESOLUTION_DEPENDENCIES_MAX
@@ -617,16 +617,16 @@ fn assemble_output(
 }
 
 fn validate_input(input: &ResolutionInput<'_>) -> Result<(), RiftError> {
-    if input.sources.len() > DOCUMENTATION_SOURCES_MAX as usize
-        || input.blocks.len() > DOCUMENTATION_BLOCKS_MAX as usize
+    super::references::validate_reference_counts(input.declarations.len(), 0)?;
+    if input.sources.len() > DOCUMENTATION_SOURCES_CEILING as usize
+        || input.blocks.len() > DOCUMENTATION_BLOCKS_CEILING as usize
         || input
             .resolvable_links
             .len()
             .saturating_add(input.fixed_unresolved_links.len())
-            > DOCUMENTATION_REFERENCES_MAX as usize
-        || input.candidates.len() > DOCUMENTATION_REFERENCES_MAX as usize
-        || input.fragments.len() > DOCUMENTATION_REFERENCES_MAX as usize
-        || input.declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_MAX as usize
+            > DOCUMENTATION_REFERENCES_CEILING as usize
+        || input.candidates.len() > DOCUMENTATION_REFERENCES_CEILING as usize
+        || input.fragments.len() > DOCUMENTATION_REFERENCES_CEILING as usize
     {
         return errors::analysis::documentation_limit_exceeded()
             .field("resolution")

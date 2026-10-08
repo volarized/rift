@@ -5,9 +5,8 @@ use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use rift_protocol::documentation::{
-    DOCUMENTATION_SOURCE_BYTES_MAX, DocumentationContentIdentity, DocumentationCoverage,
-    DocumentationWarning, NOTEBOOK_CELL_ID_BYTES_MAX, NotebookCell, NotebookCellIdentity,
-    NotebookCellKind,
+    DocumentationContentIdentity, DocumentationCoverage, DocumentationWarning,
+    NOTEBOOK_CELL_ID_BYTES_MAX, NotebookCell, NotebookCellIdentity, NotebookCellKind,
 };
 use rift_protocol::read::{Language, TextRange};
 use tree_sitter::{Language as Grammar, Node, Parser, Tree};
@@ -22,7 +21,9 @@ const STRING_KIND: &str = "string";
 const KEY_FIELD: &str = "key";
 const VALUE_FIELD: &str = "value";
 
+#[cfg(test)]
 const SOURCE_NODES_MAX: usize = 250_000;
+#[cfg(test)]
 const SOURCE_DEPTH_MAX: usize = 512;
 
 #[derive(Debug)]
@@ -156,16 +157,34 @@ pub fn decode_notebook(
     source: &str,
     notebook_identity: &DocumentationContentIdentity,
 ) -> Result<NotebookContent, RiftError> {
-    validate_input(source, notebook_identity)?;
-    let tree = parse_tree(source)?;
+    decode_notebook_with_limits(
+        source,
+        notebook_identity,
+        &super::DocumentationLimits::default(),
+    )
+}
+
+/// Decodes selected notebook cell sources within accepted documentation bounds.
+///
+/// # Errors
+///
+/// Returns a typed refusal for malformed JSON, unsupported notebook shape, or a bound.
+pub fn decode_notebook_with_limits(
+    source: &str,
+    notebook_identity: &DocumentationContentIdentity,
+    limits: &super::DocumentationLimits,
+) -> Result<NotebookContent, RiftError> {
+    validate_input(source, notebook_identity, limits)?;
+    let tree = parse_tree(source, limits)?;
     decode_tree(tree.root_node(), source)
 }
 
 fn validate_input(
     source: &str,
     notebook_identity: &DocumentationContentIdentity,
+    limits: &super::DocumentationLimits,
 ) -> Result<(), RiftError> {
-    if source.len() > DOCUMENTATION_SOURCE_BYTES_MAX as usize {
+    if source.len() as u64 > limits.source_bytes_max {
         return errors::analysis::documentation_limit_exceeded()
             .field("notebook.source_bytes")
             .fail();
@@ -178,7 +197,7 @@ fn validate_input(
     Ok(())
 }
 
-fn parse_tree(source: &str) -> Result<Tree, RiftError> {
+fn parse_tree(source: &str, limits: &super::DocumentationLimits) -> Result<Tree, RiftError> {
     let kinds = json_kinds();
     let mut parser = Parser::new();
     let grammar: Grammar = tree_sitter_json::LANGUAGE.into();
@@ -193,7 +212,7 @@ fn parse_tree(source: &str) -> Result<Tree, RiftError> {
             .error()
     })?;
     let root = tree.root_node();
-    validate_tree(root)?;
+    validate_tree(root, limits)?;
     if root.has_error() || root.kind_id() != kinds.document {
         return errors::analysis::documentation_notebook_invalid()
             .field("notebook.json")
@@ -284,7 +303,7 @@ fn decode_cell(
     })
 }
 
-fn validate_tree(root: Node<'_>) -> Result<(), RiftError> {
+fn validate_tree(root: Node<'_>, limits: &super::DocumentationLimits) -> Result<(), RiftError> {
     let mut pending = vec![(root, 0_usize)];
     let mut nodes_seen = 0_usize;
     let mut cursor = root.walk();
@@ -294,12 +313,12 @@ fn validate_tree(root: Node<'_>) -> Result<(), RiftError> {
                 .field("notebook.nodes")
                 .error()
         })?;
-        if nodes_seen > SOURCE_NODES_MAX {
+        if nodes_seen > limits.nodes_max as usize {
             return errors::analysis::documentation_limit_exceeded()
                 .field("notebook.nodes")
                 .fail();
         }
-        if depth > SOURCE_DEPTH_MAX {
+        if depth > limits.depth_max as usize {
             return errors::analysis::documentation_limit_exceeded()
                 .field("notebook.depth")
                 .fail();
@@ -709,7 +728,11 @@ mod tests {
             r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"text","id":"\uD800"}]}"#,
             r#"{"cells":[{"cell_type":"markdown","source":"kept"}],"metadata":{"language_info":{"name":"\uD800"}}}"#,
         ] {
-            super::parse_tree(source).expect("lexical JSON parser accepts the escape");
+            super::parse_tree(
+                source,
+                &crate::documentation::DocumentationLimits::default(),
+            )
+            .expect("lexical JSON parser accepts the escape");
             assert_notebook_refusal(source, "notebook.string");
         }
         let paired = decode_notebook(

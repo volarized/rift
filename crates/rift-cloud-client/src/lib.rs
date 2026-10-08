@@ -76,10 +76,16 @@ pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
 pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
 pub use pattern::PATTERN_PAGE_FILES_MAX;
 
-/// Most bytes one encoded request body carries.
-pub const REQUEST_BODY_BYTES_MAX: usize = 4 * 1024 * 1024;
-/// Most bytes one response body carries.
-pub const RESPONSE_BODY_BYTES_MAX: usize = 32 * 1024 * 1024;
+/// Default bound for bytes one encoded request body carries.
+// The 4 MiB configuration default fits a 32-bit usize.
+#[allow(clippy::cast_possible_truncation)]
+pub const REQUEST_BODY_BYTES_MAX: usize =
+    rift_protocol::configuration::GLOBAL_REQUEST_BYTES_DEFAULT as usize;
+/// Default bound for bytes one response body carries.
+// The 32 MiB configuration default fits a 32-bit usize.
+#[allow(clippy::cast_possible_truncation)]
+pub const RESPONSE_BODY_BYTES_MAX: usize =
+    rift_protocol::configuration::GLOBAL_RESPONSE_BYTES_DEFAULT as usize;
 /// Fewest attempts one request allows.
 pub const ATTEMPTS_MIN: u32 = 1;
 /// Most attempts one request allows.
@@ -134,8 +140,11 @@ pub const WARNING_DETAIL_CHARS_MAX: usize = rift_protocol::read::GLOBAL_WARNING_
 /// What a `requirement_unsatisfied` detail writes between the requirement and the version
 /// that answers it.
 pub(crate) const ANSWERED_BY: &str = " answered by ";
-/// Most UTF-8 bytes one source payload carries.
-pub const SOURCE_BYTES_MAX: usize = 1024 * 1024;
+/// Default bound for UTF-8 bytes one source payload carries.
+// The 1 MiB configuration default fits a 32-bit usize.
+#[allow(clippy::cast_possible_truncation)]
+pub const SOURCE_BYTES_MAX: usize =
+    rift_protocol::configuration::GLOBAL_SOURCE_BYTES_DEFAULT as usize;
 /// Most candidates one page assembly retains.
 pub const CANDIDATE_POOL_MAX: usize = 1_000;
 /// Most UTF-8 bytes one retained response header carries.
@@ -197,6 +206,12 @@ pub struct Config {
     pub attempts: u32,
     /// Most HTTP requests this client runs at once.
     pub max_in_flight: usize,
+    /// Most bytes one encoded request body carries, also bounded by capabilities.
+    pub max_request: usize,
+    /// Most bytes one response body carries, also bounded by capabilities.
+    pub max_response: usize,
+    /// Most UTF-8 bytes one source payload carries, also bounded by capabilities.
+    pub max_source: usize,
     /// Local ceiling for capability cache lifetime.
     pub capabilities_ttl: Duration,
     /// Local ceiling for package resolution cache lifetime.
@@ -215,6 +230,9 @@ impl Default for Config {
             request_timeout: Duration::from_secs(15),
             attempts: 3,
             max_in_flight: 4,
+            max_request: REQUEST_BODY_BYTES_MAX,
+            max_response: RESPONSE_BODY_BYTES_MAX,
+            max_source: SOURCE_BYTES_MAX,
             capabilities_ttl: Duration::from_mins(15),
             resolution_ttl: Duration::from_mins(15),
             failure_ttl: Duration::from_secs(30),
@@ -240,6 +258,12 @@ impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
             request_timeout: Duration::from_millis(value.request_timeout.milliseconds()),
             attempts,
             max_in_flight,
+            max_request: usize::try_from(value.max_request.bytes())
+                .map_err(|_| ConfigError::OutOfRange("max_request"))?,
+            max_response: usize::try_from(value.max_response.bytes())
+                .map_err(|_| ConfigError::OutOfRange("max_response"))?,
+            max_source: usize::try_from(value.max_source.bytes())
+                .map_err(|_| ConfigError::OutOfRange("max_source"))?,
             capabilities_ttl: Duration::from_millis(value.capabilities_ttl.milliseconds()),
             resolution_ttl: Duration::from_millis(value.resolution_ttl.milliseconds()),
             failure_ttl: Duration::from_millis(value.failure_ttl.milliseconds()),
@@ -441,14 +465,17 @@ impl PreparedPackageResolutionRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request breaks a contract bound or its JSON body limit.
+    /// Returns [`ClientError`] when the request breaks a contract bound or the supported JSON
+    /// body ceiling. The client applies its configured request bound before sending the bytes.
     pub fn new(request: PackageResolutionRequest) -> Result<Self, ClientError> {
         validate_resolution_request(&request)?;
         Self::from_validated(request)
     }
 
     fn from_validated(request: PackageResolutionRequest) -> Result<Self, ClientError> {
-        let body = serialize_body(&request)?;
+        let maximum = usize::try_from(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX)
+            .map_err(|_| ClientError::Config(ConfigError::OutOfRange("max_request")))?;
+        let body = serialize_body(&request, maximum)?;
         let digest = FileDigest::of(&body);
         Ok(Self {
             request,
@@ -610,7 +637,7 @@ impl GlobalClient {
                 contract::Endpoint::Capabilities,
                 None,
                 etag.as_deref(),
-                RESPONSE_BODY_BYTES_MAX,
+                self.inner.config.max_response,
             )
             .await;
         let result = match response {
@@ -670,7 +697,11 @@ impl GlobalClient {
         let capabilities = self.get_capabilities().await?;
         validate_resolution_request_for_capabilities(request, &capabilities)?;
         let prepared = PreparedPackageResolutionRequest::from_validated(request.clone())?;
-        validate_body_for_capabilities(&prepared.body, &capabilities)?;
+        validate_body_for_capabilities(
+            &prepared.body,
+            &capabilities,
+            self.inner.config.max_request,
+        )?;
         self.resolve_prepared_package_context(&prepared).await
     }
 
@@ -688,7 +719,11 @@ impl GlobalClient {
         }
         let capabilities = self.get_capabilities().await?;
         validate_resolution_request_for_capabilities(&prepared.request, &capabilities)?;
-        validate_body_for_capabilities(&prepared.body, &capabilities)?;
+        validate_body_for_capabilities(
+            &prepared.body,
+            &capabilities,
+            self.inner.config.max_request,
+        )?;
         if let Some(value) = self.inner.resolution.read().await.as_ref()
             && value.analyzer_revision == capabilities.analyzer_revision
             && value.corpus_revision == capabilities.corpus_revision
@@ -713,7 +748,7 @@ impl GlobalClient {
                 contract::Endpoint::Resolutions,
                 Some(prepared.body.to_vec()),
                 None,
-                active_response_body_bytes_max(&capabilities),
+                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
             )
             .await
         {
@@ -764,8 +799,8 @@ impl GlobalClient {
         validate_page(limit, cursor)?;
         let capabilities = self.get_capabilities().await?;
         validate_search_request_for_capabilities(request, limit, cursor, &capabilities)?;
-        let body = serialize_body(request)?;
-        validate_body_for_capabilities(&body, &capabilities)?;
+        let body = serialize_body(request, self.inner.config.max_request)?;
+        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
         let query = SearchPackagesRequestQuery {
             limit: Some(limit),
             cursor: cursor.map(str::to_owned),
@@ -775,7 +810,7 @@ impl GlobalClient {
                 contract::Endpoint::Search,
                 body,
                 &query,
-                active_response_body_bytes_max(&capabilities),
+                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
             )
             .await
         {
@@ -790,7 +825,13 @@ impl GlobalClient {
                 return self.observed(Err(error)).await;
             }
         };
-        if let Err(error) = validate_search_page(request, &capabilities, &page, cursor) {
+        if let Err(error) = validate_search_page(
+            request,
+            &capabilities,
+            &page,
+            cursor,
+            self.inner.config.max_source,
+        ) {
             return self.observed(Err(error)).await;
         }
         Ok(page)
@@ -815,8 +856,8 @@ impl GlobalClient {
         validate_page(limit, cursor)?;
         let capabilities = self.get_capabilities().await?;
         validate_symbol_request_for_capabilities(request, limit, cursor, &capabilities)?;
-        let body = serialize_body(request)?;
-        validate_body_for_capabilities(&body, &capabilities)?;
+        let body = serialize_body(request, self.inner.config.max_request)?;
+        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
         let query = ListPackageSymbolsRequestQuery {
             limit: Some(limit),
             cursor: cursor.map(str::to_owned),
@@ -826,7 +867,7 @@ impl GlobalClient {
                 contract::Endpoint::Symbols,
                 body,
                 &query,
-                active_response_body_bytes_max(&capabilities),
+                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
             )
             .await
         {
@@ -841,7 +882,13 @@ impl GlobalClient {
                 return self.observed(Err(error)).await;
             }
         };
-        if let Err(error) = validate_symbol_page(request, &capabilities, &page, cursor) {
+        if let Err(error) = validate_symbol_page(
+            request,
+            &capabilities,
+            &page,
+            cursor,
+            self.inner.config.max_source,
+        ) {
             return self.observed(Err(error)).await;
         }
         Ok(page)
@@ -1309,8 +1356,10 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         });
     }
     let bounds = &value.bounds;
-    let bounds_ok = positive_within(bounds.request_body_bytes_max, REQUEST_BODY_BYTES_MAX)
-        && positive_within(bounds.response_body_bytes_max, RESPONSE_BODY_BYTES_MAX)
+    let bounds_ok = usize::try_from(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX)
+        .is_ok_and(|maximum| positive_within(bounds.request_body_bytes_max, maximum))
+        && usize::try_from(rift_protocol::configuration::GLOBAL_RESPONSE_BYTES_MAX)
+            .is_ok_and(|maximum| positive_within(bounds.response_body_bytes_max, maximum))
         && positive_within(bounds.dependency_entries_max, DEPENDENCY_ENTRIES_MAX)
         && positive_within(bounds.query_bytes_max, QUERY_BYTES_MAX)
         && positive_within(bounds.query_terms_max, QUERY_TERMS_MAX)
@@ -1324,7 +1373,8 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         && positive_within(bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
         && positive_within(bounds.candidate_pool_max, CANDIDATE_POOL_MAX)
         && positive_within(bounds.warnings_max, WARNINGS_MAX)
-        && positive_within(bounds.source_bytes_max, SOURCE_BYTES_MAX)
+        && usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
+            .is_ok_and(|maximum| positive_within(bounds.source_bytes_max, maximum))
         && bounds.page_limit_min <= bounds.page_limit_max
         && bounds.page_limit_default >= bounds.page_limit_min
         && bounds.page_limit_default <= bounds.page_limit_max;
@@ -1806,6 +1856,7 @@ fn validate_search_page(
     capabilities: &Capabilities,
     page: &PackageSearchPage,
     cursor: Option<&str>,
+    source_bytes_max: usize,
 ) -> Result<(), ClientError> {
     let target = request
         .target
@@ -1846,7 +1897,7 @@ fn validate_search_page(
                         source: hit.source.as_deref(),
                     },
                     &packages,
-                    smaller_bound(capabilities.bounds.source_bytes_max, SOURCE_BYTES_MAX),
+                    smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
                 )?;
                 validate_search_match_class(request, hit, &qualified_name)?;
             }
@@ -1855,6 +1906,10 @@ fn validate_search_page(
                     return Err(ClientError::InvalidResponseField { field: "source" });
                 }
                 documentation_bytes += hit.source.as_ref().map_or(0, String::len);
+                validate_documentation_source_bytes(
+                    hit.source.as_ref().map_or(0, String::len),
+                    smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
+                )?;
                 validate_documentation_bytes(documentation_bytes)?;
                 if !documentation_requested
                     || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
@@ -1894,6 +1949,7 @@ fn validate_symbol_page(
     capabilities: &Capabilities,
     page: &PackageSymbolPage,
     cursor: Option<&str>,
+    source_bytes_max: usize,
 ) -> Result<(), ClientError> {
     let documentation_requested = request
         .include
@@ -1937,12 +1993,16 @@ fn validate_symbol_page(
                 source: hit.source.as_deref(),
             },
             &packages,
-            smaller_bound(capabilities.bounds.source_bytes_max, SOURCE_BYTES_MAX),
+            smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
         )?;
         validate_symbol_match_class(request, hit, &qualified_name)?;
         if let Some(context) = &hit.documentation {
             for reference in &context.references {
                 documentation_bytes += reference.excerpt.as_ref().map_or(0, String::len);
+                validate_documentation_source_bytes(
+                    reference.excerpt.as_ref().map_or(0, String::len),
+                    smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
+                )?;
                 validate_documentation_bytes(documentation_bytes)?;
             }
             let symbol_id = hit
@@ -1977,6 +2037,13 @@ fn validate_symbol_page(
         return Err(ClientError::InvalidResponseField {
             field: "cursor_progress",
         });
+    }
+    Ok(())
+}
+
+fn validate_documentation_source_bytes(bytes: usize, maximum: usize) -> Result<(), ClientError> {
+    if bytes > maximum {
+        return Err(ClientError::InvalidResponseField { field: "source" });
     }
     Ok(())
 }
@@ -2427,6 +2494,27 @@ fn symbol_hit_identity(hit: &PackageSymbol) -> (String, String, String, String) 
 }
 
 fn validate_config(config: &Config) -> Result<(), ConfigError> {
+    for (field, value, maximum) in [
+        (
+            "max_request",
+            config.max_request,
+            rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX,
+        ),
+        (
+            "max_response",
+            config.max_response,
+            rift_protocol::configuration::GLOBAL_RESPONSE_BYTES_MAX,
+        ),
+        (
+            "max_source",
+            config.max_source,
+            rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX,
+        ),
+    ] {
+        if value == 0 || u64::try_from(value).map_or(true, |value| value > maximum) {
+            return Err(ConfigError::OutOfRange(field));
+        }
+    }
     if !(Duration::from_millis(100)..=Duration::from_secs(30)).contains(&config.connect_timeout) {
         return Err(ConfigError::OutOfRange("connect_timeout"));
     }
@@ -2509,9 +2597,12 @@ fn make_url(endpoint: &Url, path: &str) -> Url {
     url
 }
 
-fn serialize_body<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
+fn serialize_body<T: Serialize>(
+    value: &T,
+    request_body_bytes_max: usize,
+) -> Result<Vec<u8>, ClientError> {
     let body = serde_json::to_vec(value).map_err(|_| ClientError::Decode { status: 0 })?;
-    if body.len() > REQUEST_BODY_BYTES_MAX {
+    if body.len() > request_body_bytes_max {
         return Err(ClientError::RequestBodyTooLarge { bytes: body.len() });
     }
     Ok(body)
@@ -2520,10 +2611,11 @@ fn serialize_body<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
 fn validate_body_for_capabilities(
     body: &[u8],
     capabilities: &Capabilities,
+    request_body_bytes_max: usize,
 ) -> Result<(), ClientError> {
     let maximum = smaller_bound(
         capabilities.bounds.request_body_bytes_max,
-        REQUEST_BODY_BYTES_MAX,
+        request_body_bytes_max,
     );
     if body.len() > maximum {
         return Err(ClientError::RequestBodyTooLarge { bytes: body.len() });
@@ -2588,10 +2680,13 @@ fn parse_max_age(value: &str) -> Option<Duration> {
             .map(Duration::from_secs)
     })
 }
-fn active_response_body_bytes_max(capabilities: &Capabilities) -> usize {
+fn active_response_body_bytes_max(
+    capabilities: &Capabilities,
+    response_body_bytes_max: usize,
+) -> usize {
     smaller_bound(
         capabilities.bounds.response_body_bytes_max,
-        RESPONSE_BODY_BYTES_MAX,
+        response_body_bytes_max,
     )
 }
 

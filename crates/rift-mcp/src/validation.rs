@@ -798,10 +798,7 @@ impl ConfigurationState {
             .unwrap_or_default()
     }
 
-    /// The bounds the index builds under: `base` with its file count, aggregate byte, and
-    /// declaration bounds replaced by the `[source]` table's `files`, `workspace_size`,
-    /// and `declarations`, and its syntax and per-file bounds by `[providers.syntax]`. The
-    /// depth and result bounds stay as `base` carries them.
+    /// Applies accepted source, syntax, and read collection bounds to the index.
     pub(crate) fn index_limits(
         &self,
         base: WorkspaceIndexLimits,
@@ -811,9 +808,18 @@ impl ConfigurationState {
         let workspace_bytes_max =
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
         let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
+        let relationships_max = usize::try_from(source.relationships).unwrap_or(usize::MAX);
+        let revision_tree_entries_max =
+            usize::try_from(self.history_configuration().tree_entries).unwrap_or(usize::MAX);
+        let directory_depth_max = usize::try_from(source.directory_depth).unwrap_or(usize::MAX);
+        let results_max =
+            usize::try_from(self.search_configuration().results).unwrap_or(usize::MAX);
         let syntax = self.syntax_configuration();
         let large_files = self.text_inclusion().large_files();
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
+            .and_then(|limits| limits.with_relationships(relationships_max))
+            .and_then(|limits| limits.with_revision_tree_entries(revision_tree_entries_max))
+            .and_then(|limits| limits.with_read_bounds(directory_depth_max, results_max))
             .and_then(|limits| limits.with_syntax_configuration(&syntax))
             .map(|limits| limits.with_large_files(large_files))
     }
@@ -854,6 +860,7 @@ impl ConfigurationState {
     /// index collects as documentation.
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_configuration() != other.source_configuration()
+            || self.search_configuration().results != other.search_configuration().results
             || self.text_inclusion() != other.text_inclusion()
             || self.language_file_selections() != other.language_file_selections()
             || self.dependencies_configuration() != other.dependencies_configuration()
@@ -874,6 +881,7 @@ impl ConfigurationState {
             "text": configuration.search.text,
             "documentation": configuration.documentation,
             "lexical": configuration.search.lexical,
+            "results": configuration.search.results,
             "languages": configuration.languages,
             "dependencies": configuration.dependencies,
             "syntax": configuration.providers.syntax,
@@ -10765,6 +10773,24 @@ pub(crate) mod tests {
         let after = super::ConfigurationState::accept(directory.path());
         assert!(after.accepted.is_ok());
         assert!(before.index_configuration_differs(&after));
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_result_bound_change_rebuilds_index_and_changes_digest() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let before = super::ConfigurationState::accept(directory.path());
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[search]\nresults = 2\n",
+        )?;
+        let after = super::ConfigurationState::accept(directory.path());
+        assert!(after.accepted.is_ok());
+        assert!(before.index_configuration_differs(&after));
+        assert_ne!(
+            before.index_configuration_digest(),
+            after.index_configuration_digest()
+        );
         Ok(())
     }
 

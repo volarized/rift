@@ -5,18 +5,15 @@ use std::sync::Arc;
 
 use rift_core::line::{line_of, line_starts, lines_inclusive};
 use rift_protocol::documentation::{
-    DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_REFERENCES_MAX, DOCUMENTATION_WARNINGS_MAX,
     DocumentationBlock, DocumentationBlockKind, DocumentationCoverage, DocumentationDigest,
     DocumentationHeading, DocumentationIndex, DocumentationLink, DocumentationLinkResolution,
     DocumentationReference, DocumentationReferenceCandidate, DocumentationSourceFormat,
     DocumentationStage, DocumentationUnresolvedReason, DocumentationWarning,
     DocumentationWarningKind, NotebookCellKind,
 };
-use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
 use rift_protocol::read::TextRange;
 use rift_syntax::{
-    ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxFacts, SyntaxLimits,
-    SyntaxProvider, SyntaxSource,
+    ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxFacts, SyntaxProvider, SyntaxSource,
 };
 
 use super::identity::{canonical_digest, content_digest};
@@ -55,11 +52,7 @@ pub fn collect_documentation_incremental(
     sources: &DocumentationSourceSet<'_>,
     declarations: &[DocumentationDeclaration<'_>],
 ) -> Result<DocumentationCollection, RiftError> {
-    if declarations.len() > PACKAGE_SYMBOLS_MAX as usize {
-        return errors::analysis::documentation_limit_exceeded()
-            .field("references")
-            .fail();
-    }
+    super::references::validate_reference_counts(declarations.len(), 0)?;
     let attached = attached_declaration_facts(declarations);
     let (mut output, cache) = collect_source_facts(previous, sources, &attached)?;
     let records = sources
@@ -123,7 +116,10 @@ fn collect_source_facts(
     sources: &DocumentationSourceSet<'_>,
     attached: &AttachedDeclarations,
 ) -> Result<(Collected<DocumentationBlock>, ExtractionCache), RiftError> {
-    let mut output = Collected::<DocumentationBlock>::default();
+    let mut output = Collected::<DocumentationBlock> {
+        limits: sources.limits(),
+        ..Collected::default()
+    };
     let mut cache = ExtractionCache::default();
     let extracted = extract_sources(previous, sources.sources(), attached);
     for (input, extracted) in sources.sources().iter().zip(extracted) {
@@ -132,7 +128,7 @@ fn collect_source_facts(
             && cache
                 .warning_count
                 .checked_add(facts.warnings.len())
-                .is_some_and(|count| count <= DOCUMENTATION_WARNINGS_MAX as usize)
+                .is_some_and(|count| count <= sources.limits().warnings_max as usize)
         {
             cache.warning_count += facts.warnings.len();
             cache
@@ -200,22 +196,25 @@ fn build_collection(
         .iter()
         .map(|input| input.source().clone())
         .collect::<Vec<_>>();
-    DocumentationCollection::new(DocumentationIndex {
-        documentation_revision: super::documentation_revision(),
-        selection_digest: sources.selection_digest().clone(),
-        sources: records,
-        blocks: output.blocks,
-        links: output.links,
-        references: output.references,
-        unresolved_references: output.unresolved_references,
-        coverage: DocumentationCoverage {
-            selected,
-            parsed: selected - output.omitted,
-            omitted: output.omitted,
-            truncated: 0,
+    DocumentationCollection::new_with_limits(
+        DocumentationIndex {
+            documentation_revision: super::documentation_revision(),
+            selection_digest: sources.selection_digest().clone(),
+            sources: records,
+            blocks: output.blocks,
+            links: output.links,
+            references: output.references,
+            unresolved_references: output.unresolved_references,
+            coverage: DocumentationCoverage {
+                selected,
+                parsed: selected - output.omitted,
+                omitted: output.omitted,
+                truncated: 0,
+            },
+            warnings: output.warnings,
         },
-        warnings: output.warnings,
-    })
+        Some(sources.limits()),
+    )
     .map(|collection| {
         collection
             .with_extraction_cache(cache)
@@ -225,6 +224,7 @@ fn build_collection(
 
 #[derive(Clone, Debug)]
 pub(super) struct Collected<B = CollectedBlock> {
+    limits: super::DocumentationLimits,
     blocks: Vec<B>,
     links: Vec<DocumentationLink>,
     unresolved_links: Vec<DocumentationLink>,
@@ -239,6 +239,7 @@ pub(super) struct Collected<B = CollectedBlock> {
 impl<B> Default for Collected<B> {
     fn default() -> Self {
         Self {
+            limits: super::DocumentationLimits::default(),
             blocks: Vec::new(),
             links: Vec::new(),
             unresolved_links: Vec::new(),
@@ -313,6 +314,7 @@ fn extraction_key(
     canonical_digest(&(
         input.source(),
         input.chunks(),
+        input.limits(),
         super::documentation_revision(),
         attached,
         syntax_facts,
@@ -379,12 +381,18 @@ fn extract_source_facts(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
 ) -> Result<Arc<Collected>, RiftError> {
-    let mut facts = Collected::default();
+    let mut facts = Collected {
+        limits: input.limits(),
+        ..Collected::default()
+    };
     if let Err(error) = extract_source(input, symbols, &mut facts) {
         let Some(kind) = recoverable_source_error(input, &error) else {
             return error.fail();
         };
-        facts = Collected::default();
+        facts = Collected {
+            limits: input.limits(),
+            ..Collected::default()
+        };
         facts.omitted = 1;
         warn(input, &mut facts, kind, 1);
     }
@@ -397,21 +405,21 @@ fn merge_source(
     facts: &Collected,
 ) -> bool {
     let fits = output.blocks.len().saturating_add(facts.blocks.len())
-        <= DOCUMENTATION_BLOCKS_MAX as usize
+        <= output.limits.blocks_max as usize
         && output
             .links
             .len()
             .saturating_add(output.unresolved_links.len())
             .saturating_add(facts.links.len())
             .saturating_add(facts.unresolved_links.len())
-            <= DOCUMENTATION_REFERENCES_MAX as usize
+            <= output.limits.references_max as usize
         && output.fragments.len().saturating_add(facts.fragments.len())
-            <= DOCUMENTATION_REFERENCES_MAX as usize
+            <= output.limits.references_max as usize
         && output
             .candidates
             .len()
             .saturating_add(facts.candidates.len())
-            <= DOCUMENTATION_REFERENCES_MAX as usize;
+            <= output.limits.references_max as usize;
     if !fits {
         output.omitted = output.omitted.saturating_add(1);
         warn(input, output, DocumentationWarningKind::LimitExceeded, 1);
@@ -523,7 +531,7 @@ fn extract_attached_comments(
 
 fn extract_rst(input: &DocumentationInput<'_>, output: &mut Collected) -> Result<(), RiftError> {
     let path = source_file_path(input.source())?;
-    let facts = super::rst::extract_rst_facts(input.text(), &path)?;
+    let facts = super::rst::extract_rst_facts_with_limits(input.text(), &path, input.limits())?;
     let mut ordinals = BTreeMap::new();
     let mut blocks = BTreeMap::new();
     for fact in facts.blocks {
@@ -589,7 +597,7 @@ fn append_rst_targets_and_links(
             .and_modify(|value| *value = RstReferenceTarget::Ambiguous)
             .or_insert(value);
         if target.destination.is_none() {
-            if output.fragments.len() >= DOCUMENTATION_REFERENCES_MAX as usize {
+            if output.fragments.len() >= output.limits.references_max as usize {
                 return errors::analysis::documentation_limit_exceeded()
                     .field("fragments")
                     .fail();
@@ -606,7 +614,7 @@ fn append_rst_targets_and_links(
             continue;
         };
         if output.links.len() + output.unresolved_links.len()
-            >= DOCUMENTATION_REFERENCES_MAX as usize
+            >= output.limits.references_max as usize
         {
             return errors::analysis::documentation_limit_exceeded()
                 .field("links")
@@ -703,7 +711,14 @@ fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, Ri
                 .field("syntax")
                 .fail();
         }
-        return Ok(Arc::clone(syntax));
+        let accepted = input.limits();
+        let bounds_accepted = syntax.syntax_limits().is_some_and(|bounds| {
+            bounds.syntax_nodes_max() <= accepted.nodes_max as usize
+                && bounds.syntax_depth_max() <= accepted.depth_max as usize
+        });
+        if bounds_accepted {
+            return Ok(Arc::clone(syntax));
+        }
     }
     let path = source_file_path(input.source())?;
     let document = MarkdownSyntaxProvider::default()
@@ -712,7 +727,7 @@ fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, Ri
                 path: &path,
                 text: input.text(),
             },
-            SyntaxLimits::default(),
+            input.limits().syntax()?,
         )
         .map_err(|error| {
             errors::analysis::documentation_format_invalid()
@@ -817,7 +832,7 @@ fn append_markdown_references(
         else {
             continue;
         };
-        if output.candidates.len() >= DOCUMENTATION_REFERENCES_MAX as usize {
+        if output.candidates.len() >= output.limits.references_max as usize {
             return errors::analysis::documentation_limit_exceeded()
                 .field("references")
                 .fail();
@@ -851,7 +866,7 @@ fn append_markdown_link(
     let Some(authored) = authored else {
         return Ok(());
     };
-    if output.links.len() + output.unresolved_links.len() >= DOCUMENTATION_REFERENCES_MAX as usize {
+    if output.links.len() + output.unresolved_links.len() >= output.limits.references_max as usize {
         return errors::analysis::documentation_limit_exceeded()
             .field("links")
             .fail();
@@ -940,7 +955,7 @@ fn append_block(
     ordinals: &mut BTreeMap<String, u32>,
 ) -> Result<DocumentationDigest, RiftError> {
     let exact = slice(input.text(), &draft.range)?;
-    if output.blocks.len() >= DOCUMENTATION_BLOCKS_MAX as usize {
+    if output.blocks.len() >= output.limits.blocks_max as usize {
         return errors::analysis::documentation_limit_exceeded()
             .field("blocks")
             .fail();
@@ -1032,7 +1047,7 @@ fn warn<B>(
         existing.count = existing.count.saturating_add(count);
         return;
     }
-    if output.warnings.len() >= DOCUMENTATION_WARNINGS_MAX as usize {
+    if output.warnings.len() >= output.limits.warnings_max as usize {
         return;
     }
     output.warnings.push(DocumentationWarning {

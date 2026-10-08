@@ -6,7 +6,7 @@ use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 
 use crate::{
     Capabilities, ClientError, GlobalClient, HitLocation, PackagePatternHit, PackagePatternPage,
-    PackagePatternRequest, PageMetadata, SOURCE_BYTES_MAX, SearchPackagePatternsRequestQuery,
+    PackagePatternRequest, PageMetadata, SearchPackagePatternsRequestQuery,
     active_response_body_bytes_max, advertised_page_limit, bounded_nonempty_characters, contract,
     includes_source, package_key, package_source_path, response, serialize_body, smaller_bound,
     supports_feature, validate_body_for_capabilities, validate_hit_common, validate_packages,
@@ -52,13 +52,14 @@ impl GlobalClient {
         let capabilities = self.get_capabilities().await?;
         let limit = advertised_page_limit(limit, &capabilities);
         validate_pattern_request_for_capabilities(request, limit, cursor, &capabilities)?;
-        let body = serialize_body(request)?;
-        validate_body_for_capabilities(&body, &capabilities)?;
+        let body = serialize_body(request, self.inner.config.max_request)?;
+        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
         let query = SearchPackagePatternsRequestQuery {
             limit: Some(limit),
             cursor: cursor.map(str::to_owned),
         };
-        let response_body_bytes_max = active_response_body_bytes_max(&capabilities);
+        let response_body_bytes_max =
+            active_response_body_bytes_max(&capabilities, self.inner.config.max_response);
         let raw = self
             .request_with_query(
                 contract::Endpoint::Patterns,
@@ -75,6 +76,7 @@ impl GlobalClient {
             capabilities: &capabilities,
             limit,
             cursor,
+            source_bytes_max: self.inner.config.max_source,
         }
         .validate(&page);
         self.observed(checked).await?;
@@ -115,6 +117,7 @@ pub(crate) struct PatternPageCheck<'a> {
     pub(crate) capabilities: &'a Capabilities,
     pub(crate) limit: i64,
     pub(crate) cursor: Option<&'a str>,
+    pub(crate) source_bytes_max: usize,
 }
 
 impl PatternPageCheck<'_> {
@@ -172,8 +175,10 @@ impl PatternPageCheck<'_> {
         if hit.line < 1 || hit.range.end < hit.range.start || !inside_the_file {
             return Err(ClientError::InvalidResponseField { field: "location" });
         }
-        let source_bytes_max =
-            smaller_bound(self.capabilities.bounds.source_bytes_max, SOURCE_BYTES_MAX);
+        let source_bytes_max = smaller_bound(
+            self.capabilities.bounds.source_bytes_max,
+            self.source_bytes_max,
+        );
         let source_allowed = includes_source(self.request.include.as_deref());
         if hit
             .source

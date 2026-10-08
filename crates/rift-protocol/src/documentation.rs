@@ -4,7 +4,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::configuration::{ConfigurationViolation, first_out_of_range};
+use crate::configuration::{ByteSize, ConfigurationViolation, first_out_of_range};
 use crate::read::{
     Digest, Language, PathPattern, ProjectPath, SourceUnitId, SymbolId, SymbolOrigin, TextRange,
 };
@@ -23,28 +23,52 @@ pub struct DocumentationDigest(
 
 /// Selected sources one collection accepts.
 pub const DOCUMENTATION_SOURCES_MAX: u32 = 100_000;
+/// Supported selected sources one documentation collection accepts.
+pub const DOCUMENTATION_SOURCES_CEILING: u32 = 5_000_000;
 /// Source bytes one parser accepts.
 pub const DOCUMENTATION_SOURCE_BYTES_MAX: u32 = 4 << 20;
+/// Supported source bytes one documentation parser accepts.
+pub const DOCUMENTATION_SOURCE_BYTES_CEILING: u32 = 64 << 20;
 /// Source bytes one collection accepts together.
 pub const DOCUMENTATION_TOTAL_BYTES_MAX: u64 = 512 << 20;
+/// Supported source bytes one documentation collection accepts together.
+pub const DOCUMENTATION_TOTAL_BYTES_CEILING: u64 = 64 << 30;
 /// Blocks one collection retains. The fastapi corpus tree's translated documentation
 /// alone holds 124,000.
 pub const DOCUMENTATION_BLOCKS_MAX: u32 = 250_000;
+/// Supported blocks one documentation collection retains.
+pub const DOCUMENTATION_BLOCKS_CEILING: u32 = 50_000_000;
 /// Links or reference candidates one collection retains. The fastapi corpus tree holds
 /// 21,000 links and 52,000 unresolved reference spellings.
 pub const DOCUMENTATION_REFERENCES_MAX: u32 = 250_000;
+/// Supported links or reference candidates one documentation collection retains.
+pub const DOCUMENTATION_REFERENCES_CEILING: u32 = 50_000_000;
 /// Heading levels one block retains.
 pub const DOCUMENTATION_HEADING_DEPTH_MAX: u32 = 512;
+/// Supported heading levels one documentation block retains.
+pub const DOCUMENTATION_HEADING_DEPTH_CEILING: u32 = 65_536;
 /// Bytes one authored heading, destination, or reference spelling retains.
 pub const DOCUMENTATION_TEXT_BYTES_MAX: u32 = 4_096;
+/// Supported bytes one authored documentation spelling retains.
+pub const DOCUMENTATION_TEXT_BYTES_CEILING: u32 = 1 << 20;
 /// Warnings one collection retains.
 pub const DOCUMENTATION_WARNINGS_MAX: u32 = 256;
+/// Supported warnings one documentation collection retains.
+pub const DOCUMENTATION_WARNINGS_CEILING: u32 = 65_536;
 /// References one symbol read retains.
 pub const DOCUMENTATION_SYMBOL_REFERENCES_MAX: u32 = 32;
 /// Bytes one documentation excerpt retains.
 pub const DOCUMENTATION_EXCERPT_BYTES_MAX: u32 = 16 << 10;
 /// License files one selected source may name.
 pub const DOCUMENTATION_LICENSE_FILES_MAX: u32 = 256;
+/// Default blocks one documentation layer holds.
+pub const DOCUMENTATION_LAYER_BLOCKS_MAX: u32 = 2_000_000;
+/// Supported blocks one documentation layer holds.
+pub const DOCUMENTATION_LAYER_BLOCKS_CEILING: u32 = 100_000_000;
+/// Default ranking identity mappings one documentation layer holds.
+pub const DOCUMENTATION_MAPPINGS_MAX: u32 = 6_000_000;
+/// Supported ranking identity mappings one documentation layer holds.
+pub const DOCUMENTATION_MAPPINGS_CEILING: u32 = 300_000_000;
 /// Bytes an authored notebook cell identifier may carry.
 pub const NOTEBOOK_CELL_ID_BYTES_MAX: u32 = 64;
 /// Physical JSON string ranges one selected cell may carry.
@@ -507,12 +531,14 @@ pub struct DocumentationContext {
     pub truncated: bool,
     /// Incomplete source conditions for requested excerpts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 256))]
+    #[schemars(length(max = 65_536))]
     pub warnings: Vec<DocumentationWarning>,
 }
 
 /// Entries `documentation.exclude` or `documentation.force_include` may hold, at most.
 pub const DOCUMENTATION_PATTERNS_MAX: usize = 512;
+/// Parser progress callbacks one documentation source may consume.
+pub const DOCUMENTATION_PROGRESS_CALLBACKS_MAX: u32 = 131_072;
 
 /// The `[documentation]` table: which documentation files the index collects beside the
 /// source. By default every Markdown, MDX, reStructuredText, plain text, and notebook file is
@@ -520,6 +546,7 @@ pub const DOCUMENTATION_PATTERNS_MAX: usize = 512;
 /// translated copies.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_documentation_ranges)]
 pub struct DocumentationConfiguration {
     /// Whether documentation files are collected at all. `false` collects none; the
     /// documentation comments attached to declarations stay.
@@ -532,6 +559,42 @@ pub struct DocumentationConfiguration {
     /// [`PathPattern`] syntax. A match `exclude` also names is still left out.
     #[schemars(length(max = 512))]
     pub force_include: Vec<PathPattern>,
+    /// Selected documentation sources one collection accepts.
+    #[schemars(range(min = 1, max = 5_000_000))]
+    pub max_sources: u32,
+    /// Source bytes one documentation parser accepts.
+    pub max_file: ByteSize,
+    /// Source bytes one documentation collection accepts together.
+    pub max_total: ByteSize,
+    /// Documentation blocks one collection retains.
+    #[schemars(range(min = 1, max = 50_000_000))]
+    pub max_blocks: u32,
+    /// Links, fragments, or reference candidates one collection retains.
+    #[schemars(range(min = 1, max = 50_000_000))]
+    pub max_references: u32,
+    /// Bytes one heading, language, destination, or reference spelling retains.
+    pub max_text: ByteSize,
+    /// Heading levels one documentation block retains.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub max_heading_depth: u32,
+    /// Warnings one documentation collection retains.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub max_warnings: u32,
+    /// Syntax nodes one documentation parser accepts.
+    #[schemars(range(min = 1, max = 100_000_000))]
+    pub max_nodes: u32,
+    /// Nesting one documentation parser accepts.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub max_depth: u32,
+    /// Progress callbacks one reStructuredText parser accepts.
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
+    pub max_progress: u32,
+    /// Blocks one documentation layer holds across its collections.
+    #[schemars(range(min = 1, max = 100_000_000))]
+    pub max_layer_blocks: u32,
+    /// Ranking identity mappings one documentation layer holds.
+    #[schemars(range(min = 1, max = 300_000_000))]
+    pub max_mappings: u32,
 }
 
 impl Default for DocumentationConfiguration {
@@ -540,15 +603,117 @@ impl Default for DocumentationConfiguration {
             enabled: true,
             exclude: Vec::new(),
             force_include: Vec::new(),
+            max_sources: DOCUMENTATION_SOURCES_MAX,
+            max_file: ByteSize::from_bytes(u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)),
+            max_total: ByteSize::from_bytes(DOCUMENTATION_TOTAL_BYTES_MAX),
+            max_blocks: DOCUMENTATION_BLOCKS_MAX,
+            max_references: DOCUMENTATION_REFERENCES_MAX,
+            max_text: ByteSize::from_bytes(u64::from(DOCUMENTATION_TEXT_BYTES_MAX)),
+            max_heading_depth: DOCUMENTATION_HEADING_DEPTH_MAX,
+            max_warnings: DOCUMENTATION_WARNINGS_MAX,
+            max_nodes: u32::try_from(crate::configuration::SYNTAX_NODES_DEFAULT)
+                .expect("syntax node default fits u32"),
+            max_depth: u32::try_from(crate::configuration::SYNTAX_DEPTH_DEFAULT)
+                .expect("syntax depth default fits u32"),
+            max_progress: DOCUMENTATION_PROGRESS_CALLBACKS_MAX,
+            max_layer_blocks: DOCUMENTATION_LAYER_BLOCKS_MAX,
+            max_mappings: DOCUMENTATION_MAPPINGS_MAX,
         }
     }
 }
 
 impl DocumentationConfiguration {
+    /// Validates documentation selection and collection bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first key outside its supported range or carrying an invalid pattern.
+    pub fn validate(&self) -> Result<(), ConfigurationViolation> {
+        self.violation().map_or(Ok(()), Err)
+    }
+
     /// The table's list-length bounds, then each pattern's forward-slash-only contract, in
     /// key then list order.
     pub(crate) fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
+            (
+                "documentation.max_sources",
+                u64::from(self.max_sources),
+                1,
+                u64::from(DOCUMENTATION_SOURCES_CEILING),
+            ),
+            (
+                "documentation.max_file",
+                self.max_file.bytes(),
+                1,
+                u64::from(DOCUMENTATION_SOURCE_BYTES_CEILING),
+            ),
+            (
+                "documentation.max_total",
+                self.max_total.bytes(),
+                1,
+                DOCUMENTATION_TOTAL_BYTES_CEILING,
+            ),
+            (
+                "documentation.max_blocks",
+                u64::from(self.max_blocks),
+                1,
+                u64::from(DOCUMENTATION_BLOCKS_CEILING),
+            ),
+            (
+                "documentation.max_references",
+                u64::from(self.max_references),
+                1,
+                u64::from(DOCUMENTATION_REFERENCES_CEILING),
+            ),
+            (
+                "documentation.max_text",
+                self.max_text.bytes(),
+                1,
+                u64::from(DOCUMENTATION_TEXT_BYTES_CEILING),
+            ),
+            (
+                "documentation.max_heading_depth",
+                u64::from(self.max_heading_depth),
+                1,
+                u64::from(DOCUMENTATION_HEADING_DEPTH_CEILING),
+            ),
+            (
+                "documentation.max_warnings",
+                u64::from(self.max_warnings),
+                1,
+                u64::from(DOCUMENTATION_WARNINGS_CEILING),
+            ),
+            (
+                "documentation.max_nodes",
+                u64::from(self.max_nodes),
+                1,
+                crate::configuration::SYNTAX_NODES_MAX,
+            ),
+            (
+                "documentation.max_depth",
+                u64::from(self.max_depth),
+                1,
+                crate::configuration::SYNTAX_DEPTH_MAX,
+            ),
+            (
+                "documentation.max_progress",
+                u64::from(self.max_progress),
+                1,
+                u64::from(u32::MAX),
+            ),
+            (
+                "documentation.max_layer_blocks",
+                u64::from(self.max_layer_blocks),
+                1,
+                u64::from(DOCUMENTATION_LAYER_BLOCKS_CEILING),
+            ),
+            (
+                "documentation.max_mappings",
+                u64::from(self.max_mappings),
+                1,
+                u64::from(DOCUMENTATION_MAPPINGS_CEILING),
+            ),
             (
                 "documentation.exclude",
                 self.exclude.len() as u64,

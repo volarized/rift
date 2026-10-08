@@ -4,16 +4,35 @@ use std::collections::BTreeSet;
 
 use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation, SourceUnitId};
 use rift_error::{RiftError, errors};
-use rift_protocol::index::PACKAGE_UNITS_MAX;
+#[cfg(feature = "collector")]
+use rift_protocol::configuration::WorkspaceConfiguration;
+use rift_protocol::index::PACKAGE_SOURCE_BYTES_CEILING;
 use rift_protocol::read::{Language, PackageIdentity};
 #[cfg(feature = "collector")]
+use rift_provider::{
+    CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, PROVIDERS_MAX_DEFAULT, PublicationLimits,
+};
+#[cfg(feature = "collector")]
 use rift_syntax::SyntaxLimits;
+
+/// Checked retained-source bounds supplied by the package caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetainedSourceLimits {
+    pub(crate) record_bytes_max: u32,
+    pub(crate) total_bytes_max: u64,
+}
 
 /// Bounds accepted for one exact-package input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExactPackageLimits {
     files_max: u32,
     bytes_max: u64,
+    retained_source: Option<RetainedSourceLimits>,
+    publication: Option<rift_protocol::configuration::PackageConfiguration>,
+    relationships_max: Option<usize>,
+    documentation: Option<crate::documentation::DocumentationLimits>,
+    #[cfg(feature = "collector")]
+    declarations_max: Option<u32>,
     #[cfg(feature = "collector")]
     syntax: Option<SyntaxLimits>,
 }
@@ -25,9 +44,54 @@ impl ExactPackageLimits {
         Self {
             files_max,
             bytes_max,
+            retained_source: None,
+            publication: None,
+            relationships_max: None,
+            documentation: None,
+            #[cfg(feature = "collector")]
+            declarations_max: None,
             #[cfg(feature = "collector")]
             syntax: None,
         }
+    }
+
+    /// Retains up to `record_bytes_max` source bytes in each publication record.
+    ///
+    /// `total_bytes_max` counts source strings in units, symbols and search documents,
+    /// including their copies. The analyzer refuses before allocating a string that
+    /// passes that total. Without this override, records keep the default source bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registered error for zero bounds, a total below the record bound, or
+    /// a record bound above the publication's supported source ceiling.
+    pub fn with_retained_source_bytes(
+        self,
+        record_bytes_max: u32,
+        total_bytes_max: u64,
+    ) -> Result<Self, RiftError> {
+        let record_accepted =
+            record_bytes_max > 0 && record_bytes_max <= PACKAGE_SOURCE_BYTES_CEILING;
+        let total_accepted = total_bytes_max >= u64::from(record_bytes_max);
+        if !record_accepted || !total_accepted {
+            return errors::analysis::package_retained_source_limits_invalid()
+                .record_bytes_max(u64::from(record_bytes_max))
+                .total_bytes_max(total_bytes_max)
+                .record_bytes_ceiling(u64::from(PACKAGE_SOURCE_BYTES_CEILING))
+                .fail();
+        }
+        Ok(Self {
+            retained_source: Some(RetainedSourceLimits {
+                record_bytes_max,
+                total_bytes_max,
+            }),
+            ..self
+        })
+    }
+
+    #[cfg(feature = "collector")]
+    pub(crate) const fn retained_source(self) -> Option<RetainedSourceLimits> {
+        self.retained_source
     }
 
     /// Parses every source under `syntax` in place of the default bounds.
@@ -41,6 +105,140 @@ impl ExactPackageLimits {
             syntax: Some(syntax),
             ..self
         }
+    }
+
+    /// Applies a positive declaration bound to semantic assembly.
+    ///
+    /// Package publication bounds still apply after assembly and module joining.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when `declarations_max` is zero.
+    #[cfg(feature = "collector")]
+    pub fn with_declarations(self, declarations_max: u32) -> Result<Self, RiftError> {
+        let maximum = declarations_max as usize;
+        PublicationLimits::new(PROVIDERS_MAX_DEFAULT, maximum, maximum)?;
+        Ok(Self {
+            declarations_max: Some(declarations_max),
+            ..self
+        })
+    }
+
+    /// Maximum parsed declarations admitted to semantic assembly, or the provider's default bound.
+    #[cfg(feature = "collector")]
+    #[must_use]
+    pub fn declarations_max(self) -> usize {
+        self.declarations_max
+            .map_or(CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, |maximum| {
+                maximum as usize
+            })
+    }
+
+    /// Uses the `[source]` and `[providers.syntax]` bounds for one package analysis.
+    ///
+    /// Callers may accept it with `rift_core::acceptance::accept_configuration`, which
+    /// applies `RIFT_SOURCE_*` and `RIFT_PROVIDERS_SYNTAX_*` environment overrides.
+    /// This method validates the configuration before constructing the analysis bounds.
+    /// Source selection remains the caller's responsibility; package publication bounds
+    /// still apply to the assembled records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the configuration violates its advertised bounds.
+    #[cfg(feature = "collector")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "configuration validation bounds files and declarations below u32::MAX"
+    )]
+    pub fn from_configuration(configuration: &WorkspaceConfiguration) -> Result<Self, RiftError> {
+        configuration
+            .validate()
+            .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
+        let source = &configuration.source;
+        let syntax = SyntaxLimits::from_configuration(&configuration.providers.syntax)?;
+        let documentation = crate::documentation::DocumentationLimits::from_configuration(
+            &configuration.documentation,
+        )?;
+        Self::new(source.files as u32, source.workspace_size.bytes())
+            .with_syntax(syntax)
+            .with_documentation(documentation)
+            .with_declarations(source.declarations as u32)?
+            .with_relationships(source.relationships as usize)?
+            .with_publication(configuration.package)
+    }
+
+    /// Applies validated `[package]` publication counts and retained-source bounds.
+    /// Archive admission uses `archive::ArchiveLimits::from_configuration` separately.
+    ///
+    /// # Errors
+    /// Returns a registered configuration error for an unsupported or unordered bound.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "validation bounds retained source below u32::MAX"
+    )]
+    pub fn with_publication(
+        self,
+        configuration: rift_protocol::configuration::PackageConfiguration,
+    ) -> Result<Self, RiftError> {
+        configuration
+            .validate()
+            .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
+        let limits = self.with_retained_source_bytes(
+            configuration.retained_source.bytes() as u32,
+            configuration
+                .retained_total
+                .map_or(u64::MAX, rift_protocol::configuration::ByteSize::bytes),
+        )?;
+        Ok(Self {
+            publication: Some(configuration),
+            ..limits
+        })
+    }
+
+    pub(crate) fn publication(self) -> rift_protocol::configuration::PackageConfiguration {
+        self.publication.unwrap_or_default()
+    }
+
+    /// Sets the relationship edge capacity used by semantic assembly.
+    ///
+    /// # Errors
+    /// Returns a configuration error for zero or capacity above the supported range.
+    pub fn with_relationships(self, maximum: usize) -> Result<Self, RiftError> {
+        let source = rift_protocol::source::SourceConfiguration {
+            relationships: maximum as u64,
+            ..rift_protocol::source::SourceConfiguration::default()
+        };
+        let configuration = rift_protocol::configuration::WorkspaceConfiguration {
+            source,
+            ..rift_protocol::configuration::WorkspaceConfiguration::default()
+        };
+        configuration
+            .validate()
+            .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
+        Ok(Self {
+            relationships_max: Some(maximum),
+            ..self
+        })
+    }
+
+    pub(crate) fn relationships_max(self) -> usize {
+        self.relationships_max.unwrap_or_else(|| {
+            usize::try_from(rift_protocol::source::SOURCE_RELATIONSHIPS_DEFAULT)
+                .expect("default relationship count fits usize")
+        })
+    }
+
+    /// Applies accepted documentation collection bounds.
+    #[must_use]
+    pub fn with_documentation(self, limits: crate::documentation::DocumentationLimits) -> Self {
+        Self {
+            documentation: Some(limits),
+            ..self
+        }
+    }
+
+    pub(crate) fn documentation(self) -> crate::documentation::DocumentationLimits {
+        self.documentation.unwrap_or_default()
     }
 
     /// Syntax bounds every source parses under: the caller's, or the default bounds.
@@ -119,7 +317,7 @@ impl<'input> ExactPackageInput<'input> {
     ) -> Result<Self, RiftError> {
         validate_origin(package, origin)?;
         validate_package_identity(package)?;
-        let files_bound = limits.files_max.min(PACKAGE_UNITS_MAX);
+        let files_bound = limits.files_max.min(limits.publication().units);
         let observed_files = u32::try_from(files.len()).unwrap_or(u32::MAX);
         if observed_files > files_bound {
             return errors::analysis::package_input_too_many_files()

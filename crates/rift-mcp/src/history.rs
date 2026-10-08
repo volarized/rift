@@ -82,7 +82,7 @@ impl FillBounds {
 
 /// The derivation revision one store file is keyed on: what decides the
 /// lexical rows - the analyzer revision, corpus shape, and index-owned tables -
-/// beside the strategy and the releases it selects, since
+/// beside collection bounds, the strategy and the releases it selects, since
 /// a commit analyzed under one strategy is compared with another commit than
 /// under the other.
 pub(crate) fn store_revision(
@@ -94,6 +94,14 @@ pub(crate) fn store_revision(
     hasher.update(derivation_revision(analyzer_revision, configuration).as_bytes());
     hasher.update([0]);
     hasher.update(format!("{:?}", history.strategy).as_bytes());
+    for bound in [
+        history.tree_entries,
+        history.release_tags,
+        history.move_deletions,
+    ] {
+        hasher.update([0]);
+        hasher.update(bound.to_le_bytes());
+    }
     for release in &history.releases {
         hasher.update([0]);
         hasher.update(release.as_bytes());
@@ -695,3 +703,52 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod collection_tests {
+    use super::store_revision;
+    use crate::validation::ConfigurationState;
+    use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+    use rift_protocol::configuration::WorkspaceConfiguration;
+
+    #[test]
+    fn changed_history_collection_bounds_key_distinct_store_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let base = ConfigurationState::accept(directory.path());
+        let revision = store_revision("analyzer", &base);
+        for (key, variable) in [
+            ("tree_entries", "RIFT_PROVIDERS_HISTORY_TREE_ENTRIES"),
+            ("release_tags", "RIFT_PROVIDERS_HISTORY_RELEASE_TAGS"),
+            ("move_deletions", "RIFT_PROVIDERS_HISTORY_MOVE_DELETIONS"),
+        ] {
+            let document = format!("[providers.history]\n{key} = 2\n");
+            let accepted = accept_configuration::<WorkspaceConfiguration>(
+                Some(&document),
+                &ConfigurationEnvironment::default(),
+            )?;
+            accepted
+                .configuration()
+                .validate()
+                .expect("accepted collection bounds");
+            let mut changed = base.clone();
+            changed.accepted = Ok(accepted.configuration().clone());
+            assert_ne!(revision, store_revision("analyzer", &changed), "{key}");
+            let environment = ConfigurationEnvironment::from_variables([(variable, "3")]);
+            let accepted =
+                accept_configuration::<WorkspaceConfiguration>(Some(&document), &environment)?;
+            accepted
+                .configuration()
+                .validate()
+                .expect("accepted environment bounds");
+            let mut overridden = base.clone();
+            overridden.accepted = Ok(accepted.configuration().clone());
+            assert_ne!(
+                store_revision("analyzer", &changed),
+                store_revision("analyzer", &overridden),
+                "{variable}"
+            );
+        }
+        Ok(())
+    }
+}

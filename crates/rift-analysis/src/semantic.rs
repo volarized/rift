@@ -19,7 +19,7 @@ use crate::relationship::RelationshipStore;
 ///
 /// The workspace index publishes one provider, so the set bound is the per-provider bound.
 /// The caller states the capacity it owns: a workspace build passes the `[source]` table's
-/// `declarations`, a package analysis the provider crate's own default.
+/// `declarations`, a package analysis its accepted `ExactPackageLimits` bound.
 ///
 /// # Errors
 ///
@@ -139,6 +139,26 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
+        Self::build_project_facts_with_relationships(
+            documents,
+            declarations_max,
+            crate::RELATIONSHIP_EDGES_MAX,
+            revision,
+            previous,
+        )
+    }
+
+    /// Builds project semantics under caller-selected declaration and relationship bounds.
+    ///
+    /// # Errors
+    /// Returns a typed error when source placement, publication, or graph validation fails.
+    pub fn build_project_facts_with_relationships<'a>(
+        documents: impl IntoIterator<Item = (&'a SyntaxFacts, &'a ProjectPath)>,
+        declarations_max: usize,
+        relationships_max: usize,
+        revision: u64,
+        previous: Option<&NormalizedGraph>,
+    ) -> Result<BuiltSemantics, RiftError> {
         let placed = documents
             .into_iter()
             .map(|(facts, path)| {
@@ -149,7 +169,14 @@ impl WorkspaceSemantics {
                 })
             })
             .collect::<Result<Vec<_>, RiftError>>()?;
-        Self::build_facts_placed_inner(&placed, declarations_max, revision, previous, true)
+        Self::build_facts_placed_inner(
+            &placed,
+            declarations_max,
+            relationships_max,
+            revision,
+            previous,
+            true,
+        )
     }
 
     /// Builds one publication and graph over compact syntax facts with explicit source paths.
@@ -163,12 +190,40 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
-        Self::build_facts_placed_inner(documents, declarations_max, revision, previous, false)
+        Self::build_facts_placed_with_relationships(
+            documents,
+            declarations_max,
+            crate::RELATIONSHIP_EDGES_MAX,
+            revision,
+            previous,
+        )
+    }
+
+    /// Builds placed facts under caller-selected declaration and relationship bounds.
+    ///
+    /// # Errors
+    /// Returns a typed error when publication or graph validation fails.
+    pub fn build_facts_placed_with_relationships(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        relationships_max: usize,
+        revision: u64,
+        previous: Option<&NormalizedGraph>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        Self::build_facts_placed_inner(
+            documents,
+            declarations_max,
+            relationships_max,
+            revision,
+            previous,
+            false,
+        )
     }
 
     fn build_facts_placed_inner(
         documents: &[PlacedFacts<'_>],
         declarations_max: usize,
+        relationships_max: usize,
         revision: u64,
         previous: Option<&NormalizedGraph>,
         collect_refused_contributions: bool,
@@ -225,7 +280,7 @@ impl WorkspaceSemantics {
             &publications,
             previous,
         )?;
-        let relationships = RelationshipStore::build(&graph);
+        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
         Ok(BuiltSemantics {
             semantics: Self {
                 graph,

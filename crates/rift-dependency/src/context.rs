@@ -15,7 +15,7 @@ use rift_protocol::dependencies::{
 };
 use rift_protocol::read::{PackageIdentity, ProjectPath};
 
-use crate::manifest::claimed_manifests;
+use crate::manifest::claimed_manifests_with_limit;
 use crate::resolver::{
     ContextRequest, DependencyResolver, PACKAGES_MAX, ResolverName, StaticInputs,
 };
@@ -165,6 +165,7 @@ impl EnvironmentObservation {
 /// dropped: the pin is the stronger answer.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DependencyContext {
+    entries_max: Option<usize>,
     entries: Vec<PackageContextEntry>,
     install_folders: Vec<InstallFolder>,
     inputs: BTreeSet<ProjectPath>,
@@ -272,7 +273,7 @@ impl DependencyContext {
     /// plus the ones requested.
     #[must_use]
     pub fn with_requested(&self, requested: &[RequestedPackage], entries_max: usize) -> Self {
-        let entries_max = entries_max.min(PACKAGES_MAX);
+        let entries_max = entries_max.min(self.entries_max.unwrap_or(PACKAGES_MAX));
         let named: BTreeSet<(&str, &str)> = requested
             .iter()
             .map(|package| (package.manager.as_str(), package.name.as_str()))
@@ -304,6 +305,7 @@ impl DependencyContext {
         entries.sort();
         Self {
             entries,
+            entries_max: self.entries_max,
             install_folders: self.install_folders.clone(),
             inputs: self.inputs.clone(),
             degradations,
@@ -324,7 +326,7 @@ impl DependencyContext {
             .collect();
         for entry in answer.entries {
             if held.contains(&(entry.manager.clone(), entry.name.clone()))
-                || self.entries.len() >= PACKAGES_MAX
+                || self.entries.len() >= self.entries_max.unwrap_or(PACKAGES_MAX)
             {
                 continue;
             }
@@ -417,10 +419,18 @@ pub fn resolve_context(
     inputs: &mut dyn StaticInputs,
     configured: &[ConfiguredPackage],
 ) -> DependencyContext {
-    let mut merge = ContextMerge::default();
+    let collection = inputs.collection();
+    let mut merge = ContextMerge {
+        entries_max: Some(usize::try_from(collection.packages).unwrap_or(usize::MAX)),
+        ..ContextMerge::default()
+    };
     merge.configured(configured);
     for resolver in resolvers {
-        let claimed = claimed_manifests(visible, resolver.manifest_file_name());
+        let claimed = claimed_manifests_with_limit(
+            visible,
+            resolver.manifest_file_name(),
+            usize::try_from(collection.manifests).unwrap_or(usize::MAX),
+        );
         if claimed.manifests.is_empty() {
             continue;
         }
@@ -471,6 +481,7 @@ type EntryKey = (String, String, Option<String>, Option<String>);
 /// Every resolver's answer folded into one context, under [`PACKAGES_MAX`].
 #[derive(Default)]
 struct ContextMerge {
+    entries_max: Option<usize>,
     entries: BTreeMap<EntryKey, PackageContextEntry>,
     install_folders: Vec<InstallFolder>,
     inputs: BTreeSet<ProjectPath>,
@@ -518,17 +529,18 @@ impl ContextMerge {
                 reason,
             }));
         if dropped_count > 0 {
+            let maximum = self.entries_max.unwrap_or(PACKAGES_MAX);
             self.degradations.push(Degradation {
                 resolver: resolver.into(),
                 reason: format!(
                     "{dropped_count} of {offered_count} packages were not reported: at most \
-                     {PACKAGES_MAX} are carried per workspace"
+                     {maximum} are carried per workspace"
                 ),
             });
         }
     }
 
-    /// Takes one entry, or answers `false` once [`PACKAGES_MAX`] entries stand. An entry
+    /// Takes one entry, or answers `false` once the accepted package bound is reached. An entry
     /// whose key already stands merges into it, and the standing availability wins.
     fn insert(&mut self, entry: PackageContextEntry) -> bool {
         let key = (
@@ -540,7 +552,7 @@ impl ContextMerge {
         if self.entries.contains_key(&key) {
             return true;
         }
-        if self.entries.len() >= PACKAGES_MAX {
+        if self.entries.len() >= self.entries_max.unwrap_or(PACKAGES_MAX) {
             return false;
         }
         self.entries.insert(key, entry);
@@ -566,6 +578,7 @@ impl ContextMerge {
             .collect();
         let mut context = DependencyContext {
             entries,
+            entries_max: self.entries_max,
             install_folders: Vec::new(),
             inputs: self.inputs,
             degradations: self.degradations,
@@ -837,6 +850,74 @@ mod tests {
             PACKAGES_MAX,
             rift_protocol::dependencies::DEPENDENCIES_PACKAGES_MAX
         );
+    }
+
+    #[test]
+    fn configured_package_bound_applies_to_merge_standard_libraries_and_requests() {
+        let resolver = ProbeResolver {
+            entries: vec![pinned("alpha", "1.0.0"), pinned("beta", "1.0.0")],
+            degradations: Vec::new(),
+        };
+        let mut inputs = RecordedInspector::default().with_collection(
+            rift_protocol::dependencies::DependenciesCollectionConfiguration {
+                packages: 1,
+                ..Default::default()
+            },
+        );
+        let mut context = resolve_context(
+            Path::new(ROOT),
+            &[project("probe.toml")],
+            &[&resolver],
+            &mut inputs,
+            &[],
+        );
+        assert_eq!(context.entries().len(), 1);
+        assert!(context.degradations()[0].reason.contains("at most 1"));
+        let answer = crate::stdlib::standard_library_answer(
+            &crate::stdlib::StandardLibraryRequest {
+                root: Path::new(ROOT),
+                libraries: &[crate::StandardLibrary::Python],
+                execution: false,
+            },
+            &mut inputs,
+        );
+        context.add_standard_libraries(answer);
+        assert_eq!(context.entries().len(), 1);
+        let requested = context.with_requested(
+            &[requested("gamma", None), requested("delta", None)],
+            PACKAGES_MAX,
+        );
+        assert_eq!(requested.entries().len(), 1);
+        assert_eq!(requested.entries()[0].name, "delta");
+    }
+
+    #[test]
+    fn configured_packages_at_capacity_stay_and_one_over_preserves_existing_drop_behavior() {
+        let mut inputs = RecordedInspector::default().with_collection(
+            rift_protocol::dependencies::DependenciesCollectionConfiguration {
+                packages: 1,
+                ..Default::default()
+            },
+        );
+        let configured = [configured_package("alpha", Some("1.0.0"))];
+        let exact = resolve_context(Path::new(ROOT), &[], &[], &mut inputs, &configured);
+        assert_eq!(exact.entries().len(), 1);
+        assert!(!exact.is_degraded());
+        let over = resolve_context(
+            Path::new(ROOT),
+            &[],
+            &[],
+            &mut inputs,
+            &[
+                configured[0].clone(),
+                configured_package("alpha", Some("1.0.0")),
+                configured_package("beta", Some("1.0.0")),
+                configured_package("gamma", Some("1.0.0")),
+            ],
+        );
+        assert_eq!(over.entries().len(), 1);
+        assert_eq!(over.entries()[0].name, "alpha");
+        assert!(!over.is_degraded());
     }
 
     #[test]

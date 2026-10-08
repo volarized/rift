@@ -41,12 +41,13 @@ pub fn resolve_links(
     fragments: &[DocumentationFragment],
 ) -> Result<(), RiftError> {
     use rift_protocol::documentation::{
-        DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_REFERENCES_MAX, DOCUMENTATION_SOURCES_MAX,
+        DOCUMENTATION_BLOCKS_CEILING, DOCUMENTATION_REFERENCES_CEILING,
+        DOCUMENTATION_SOURCES_CEILING,
     };
-    if sources.len() > DOCUMENTATION_SOURCES_MAX as usize
-        || blocks.len() > DOCUMENTATION_BLOCKS_MAX as usize
-        || links.len() > DOCUMENTATION_REFERENCES_MAX as usize
-        || fragments.len() > DOCUMENTATION_REFERENCES_MAX as usize
+    if sources.len() > DOCUMENTATION_SOURCES_CEILING as usize
+        || blocks.len() > DOCUMENTATION_BLOCKS_CEILING as usize
+        || links.len() > DOCUMENTATION_REFERENCES_CEILING as usize
+        || fragments.len() > DOCUMENTATION_REFERENCES_CEILING as usize
     {
         return errors::analysis::documentation_limit_exceeded()
             .field("links")
@@ -168,7 +169,7 @@ pub(super) fn resolve_declaration_links(
     declarations: &[super::DocumentationDeclaration<'_>],
 ) -> Result<Vec<rift_protocol::documentation::DocumentationReference>, RiftError> {
     use rift_protocol::documentation::{DocumentationReference, DocumentationReferenceEvidence};
-    if declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_MAX as usize {
+    if declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_CEILING as usize {
         return errors::analysis::documentation_limit_exceeded()
             .field("declarations")
             .fail();
@@ -238,7 +239,7 @@ pub(super) fn fragment_index(
         super::input::validate_identity(&fragment.source)?;
         let valid_name = !fragment.name.is_empty()
             && fragment.name.len()
-                <= rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize;
+                <= rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_CEILING as usize;
         if !valid_name || fragment.range.end <= fragment.range.start {
             return errors::analysis::documentation_range_invalid()
                 .field("fragment")
@@ -298,7 +299,8 @@ pub(super) fn local_destination(
 ) -> Result<Destination, RiftError> {
     use DocumentationUnresolvedReason as Reason;
     let authored_valid = !authored.is_empty()
-        && authored.len() <= rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize
+        && authored.len()
+            <= rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_CEILING as usize
         && !authored.chars().any(char::is_control);
     if !authored_valid {
         return Ok(Destination::Unresolved(Reason::Invalid));

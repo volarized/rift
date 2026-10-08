@@ -3510,7 +3510,7 @@
             "items": {
               "$ref": "#/components/schemas/DocumentationWarning"
             },
-            "maxItems": 256,
+            "maxItems": 65536,
             "type": "array"
           }
         },

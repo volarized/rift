@@ -74,9 +74,19 @@ pub fn is_connection_unavailable(error: &RiftError) -> bool {
 /// Default maximum content bytes accepted for one lexical document: the largest chunk
 /// `[search.text] max_chunk` accepts (16 MiB), so the store takes every row the
 /// configuration can derive, whatever `max_chunk` a later reload sets.
-const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 = 16 << 20;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the shared default is 16 MiB and fits u32"
+)]
+const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 =
+    rift_protocol::configuration::LEXICAL_CONTENT_BYTES_DEFAULT as u32;
 /// Default maximum search results returned per query.
-const LEXICAL_MATCHES_MAX_DEFAULT: u32 = 1_000;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the shared default is 1000 and fits u32"
+)]
+const LEXICAL_MATCHES_MAX_DEFAULT: u32 =
+    rift_protocol::configuration::LEXICAL_MATCHES_DEFAULT as u32;
 /// Default pooled `SQLite` connection slots.
 const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 /// Default busy-wait budget, in milliseconds, `SQLite` grants a connection
@@ -436,9 +446,8 @@ impl LexicalIndexLimits {
 }
 
 impl Default for LexicalIndexLimits {
-    /// Defaults accept the `[search.lexical] units_max` default of 1,000,000
-    /// documents, 1 MiB per content field, 1,000 returned matches, 4 pooled
-    /// connections, and a 5,000ms busy timeout.
+    /// Uses the default collection bounds from `[search.lexical]`, with the default
+    /// `[search]` connection pool and busy timeout.
     ///
     /// The query's own bounds are not here: [`ParsedQuery`] owns them, and
     /// every reader parses the caller's text through it before this store

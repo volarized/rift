@@ -607,6 +607,8 @@ fn validate_location(
     source: Option<&str>,
 ) -> Result<(String, rift_core::SourceUnitId, u64), ClientError> {
     let packages = HashSet::from([crate::package_key(package)]);
+    let source_bytes_max = usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
+        .map_err(|_| invalid("source"))?;
     let qualified_name = crate::validate_hit_common(
         package,
         symbol,
@@ -617,7 +619,7 @@ fn validate_location(
             source,
         },
         &packages,
-        crate::SOURCE_BYTES_MAX,
+        source_bytes_max,
     )?;
     let source_unit =
         rift_core::SourceUnitId::parse(unit).map_err(|_| invalid("source_identity"))?;

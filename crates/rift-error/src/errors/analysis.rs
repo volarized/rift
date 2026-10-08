@@ -273,6 +273,29 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    package_retained_source_bytes_exceeded,
+    slug = "rift.analysis.package_retained_source_bytes_exceeded",
+    message = "retained source strings and their copies exceed their accepted byte limit",
+    action = "raise the retained source total within the caller's memory bound or reduce retained source bytes",
+    fields = {
+        bound: required(unsigned),
+        observed: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
+    package_retained_source_limits_invalid,
+    slug = "rift.analysis.package_retained_source_limits_invalid",
+    message = "retained source limits are invalid",
+    action = "choose a positive record bound at or below its ceiling and a total at least as large",
+    fields = {
+        record_bytes_ceiling: required(unsigned),
+        record_bytes_max: required(unsigned),
+        total_bytes_max: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
     package_syntax_unavailable,
     slug = "rift.analysis.package_syntax_unavailable",
     message = "no shipped syntax provider accepts package file extension",

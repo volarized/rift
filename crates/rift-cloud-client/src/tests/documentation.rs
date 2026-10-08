@@ -51,7 +51,7 @@ fn request() -> PackageSearchRequest {
 fn refuses_search(value: Value, field: &'static str) {
     let value = serde_json::from_value(value).expect("generated page");
     assert!(
-        matches!(validate_search_page(&request(), &capabilities(), &value, None),
+        matches!(validate_search_page(&request(), &capabilities(), &value, None, SOURCE_BYTES_MAX),
         Err(ClientError::InvalidResponseField {field: actual}) if actual == field),
         "expected {field}"
     );
@@ -60,7 +60,7 @@ fn refuses_search(value: Value, field: &'static str) {
 #[test]
 fn documentation_pages_validate_identity_fields_and_requested_source() {
     let value: PackageSearchPage = serde_json::from_value(page()).expect("generated page");
-    validate_search_page(&request(), &capabilities(), &value, None)
+    validate_search_page(&request(), &capabilities(), &value, None, SOURCE_BYTES_MAX)
         .expect("valid documentation page");
     let candidate = PackageSearchCandidate::try_from(value.items[0].clone()).expect("candidate");
     assert_eq!(
@@ -74,15 +74,30 @@ fn documentation_pages_validate_identity_fields_and_requested_source() {
     let mut without_source = request();
     without_source.include = None;
     assert!(matches!(
-        validate_search_page(&without_source, &capabilities(), &value, None),
+        validate_search_page(
+            &without_source,
+            &capabilities(),
+            &value,
+            None,
+            SOURCE_BYTES_MAX
+        ),
         Err(ClientError::InvalidResponseField { field: "source" })
     ));
-    assert!(validate_search_page(&search_request(), &capabilities(), &value, None).is_err());
+    assert!(
+        validate_search_page(
+            &search_request(),
+            &capabilities(),
+            &value,
+            None,
+            SOURCE_BYTES_MAX
+        )
+        .is_err()
+    );
     let mut no_feature = capabilities();
     no_feature
         .supported_features
         .retain(|feature| feature != "documentation_search");
-    assert!(validate_search_page(&request(), &no_feature, &value, None).is_err());
+    assert!(validate_search_page(&request(), &no_feature, &value, None, SOURCE_BYTES_MAX).is_err());
 }
 
 #[test]
@@ -152,9 +167,19 @@ fn symbol_context_matches_requested_symbol_and_revision() {
     let page: PackageSymbolPage = serde_json::from_value(value.clone()).expect("symbol page");
     let mut request = symbol_request();
     request.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
-    validate_symbol_page(&request, &capabilities(), &page, None).expect("valid symbol context");
+    validate_symbol_page(&request, &capabilities(), &page, None, SOURCE_BYTES_MAX)
+        .expect("valid symbol context");
     PackageSymbolCandidate::try_from(&page.items[0]).expect("context converts with symbol");
-    assert!(validate_symbol_page(&symbol_request(), &capabilities(), &page, None).is_err());
+    assert!(
+        validate_symbol_page(
+            &symbol_request(),
+            &capabilities(),
+            &page,
+            None,
+            SOURCE_BYTES_MAX
+        )
+        .is_err()
+    );
     for (pointer, replacement) in [
         (
             "/items/0/documentation/documentation_revision",
@@ -172,7 +197,9 @@ fn symbol_context_matches_requested_symbol_and_revision() {
         let mut invalid = value.clone();
         *invalid.pointer_mut(pointer).expect("fixture field") = replacement;
         let page = serde_json::from_value(invalid).expect("generated symbol page");
-        assert!(validate_symbol_page(&request, &capabilities(), &page, None).is_err());
+        assert!(
+            validate_symbol_page(&request, &capabilities(), &page, None, SOURCE_BYTES_MAX).is_err()
+        );
     }
 
     let mut mismatched_revision = value;
@@ -185,7 +212,13 @@ fn symbol_context_matches_requested_symbol_and_revision() {
     let mismatched_revision = serde_json::from_value(mismatched_revision)
         .expect("generated symbol page with internally matching documentation revision");
     assert!(matches!(
-        validate_symbol_page(&request, &capabilities(), &mismatched_revision, None),
+        validate_symbol_page(
+            &request,
+            &capabilities(),
+            &mismatched_revision,
+            None,
+            SOURCE_BYTES_MAX
+        ),
         Err(ClientError::InvalidResponseField {
             field: "documentation_revision"
         })
@@ -200,11 +233,12 @@ fn symbol_source_requires_source_include() {
 
     let mut request = symbol_request();
     request.include = Some(vec![PackageSymbolRequestInclude::Source]);
-    validate_symbol_page(&request, &capabilities(), &page, None).expect("requested symbol source");
+    validate_symbol_page(&request, &capabilities(), &page, None, SOURCE_BYTES_MAX)
+        .expect("requested symbol source");
 
     request.include = None;
     assert!(matches!(
-        validate_symbol_page(&request, &capabilities(), &page, None),
+        validate_symbol_page(&request, &capabilities(), &page, None, SOURCE_BYTES_MAX),
         Err(ClientError::InvalidResponseField { field: "source" })
     ));
 }

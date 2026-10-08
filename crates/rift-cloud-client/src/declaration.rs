@@ -45,9 +45,10 @@ impl GlobalClient {
         validate_declaration_request(request)?;
         let capabilities = self.get_capabilities().await?;
         validate_declaration_request_for_capabilities(request, &capabilities)?;
-        let body = serialize_body(request)?;
-        validate_body_for_capabilities(&body, &capabilities)?;
-        let response_body_bytes_max = active_response_body_bytes_max(&capabilities);
+        let body = serialize_body(request, self.inner.config.max_request)?;
+        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
+        let response_body_bytes_max =
+            active_response_body_bytes_max(&capabilities, self.inner.config.max_response);
         let raw = self
             .request(
                 contract::Endpoint::Declarations,

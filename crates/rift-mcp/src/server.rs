@@ -407,11 +407,8 @@ fn absolute_root(root: &Path) -> Result<PathBuf, RiftError> {
     Ok(segments.iter().collect())
 }
 
-/// Sizes the lexical search index's unit bound, connection pool, and busy-wait budget from
-/// one accepted `[search]` table, keeping this release's fixed unit-byte, query-term, and
-/// match-count bounds.
+/// Applies accepted lexical collection, connection pool, and transaction bounds.
 fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
-    let defaults = LexicalIndexLimits::default();
     // Acceptance bounds pool_slots to 1..=SEARCH_POOL_SLOTS_MAX and busy_timeout to
     // SEARCH_BUSY_TIMEOUT_MS_MIN..=SEARCH_BUSY_TIMEOUT_MS_MAX, so these clamps only guard the
     // narrowing conversion into the adapter's `u32` fields.
@@ -427,10 +424,13 @@ fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
     .unwrap_or(1_000);
     LexicalIndexLimits::new(
         LexicalIndexLimits::accepted_units_max(search.lexical.units_max),
-        defaults.unit_bytes_max(),
-        defaults.matches_max(),
+        u32::try_from(search.lexical.max_content.bytes()).unwrap_or(u32::MAX),
+        u32::try_from(search.lexical.max_matches).unwrap_or(u32::MAX),
         pool_slots,
         busy_timeout_ms,
+    )
+    .with_documentation_bytes_max(
+        usize::try_from(search.lexical.max_documentation.bytes()).unwrap_or(usize::MAX),
     )
     .with_transaction_bounds(
         usize::try_from(search.lexical.transaction_units).unwrap_or(usize::MAX),
@@ -10566,6 +10566,146 @@ done
                 .any(|warning| matches!(warning, ReadWarning::LexicalRankingUnavailable { .. })),
             "an absent index must say so on the answer: {result:#?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_collection_configuration_and_environment_reach_index_limits() -> TestResult {
+        use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+        use rift_protocol::configuration::WorkspaceConfiguration;
+
+        let document = "[source]\ndirectory_depth = 1\n[search]\nresults = 2\n\
+                        [search.lexical]\nmax_content = \"2kb\"\nmax_matches = 3\n\
+                        max_documentation = \"4kb\"\n";
+        let accepted = accept_configuration::<WorkspaceConfiguration>(
+            Some(document),
+            &ConfigurationEnvironment::default(),
+        )?;
+        accepted
+            .configuration()
+            .validate()
+            .expect("validated collection configuration");
+        let lexical = super::lexical_index_limits(&accepted.configuration().search);
+        assert_eq!(lexical.unit_bytes_max(), 2 << 10);
+        assert_eq!(lexical.matches_max(), 3);
+        assert_eq!(lexical.documentation_bytes_max(), 4 << 10);
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("one/two"))?;
+        fs::write(
+            directory.path().join("one/two/beacon.rs"),
+            "pub fn beacon() {}\n",
+        )?;
+        let mut configuration = crate::validation::ConfigurationState::accept(directory.path());
+        configuration.accepted = Ok(accepted.configuration().clone());
+        let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
+        assert_eq!(limits.results_max(), 2);
+        let visibility = rift_core::SourceVisibility::default();
+        let text = rift_core::TextFileInclusion::default();
+        let refused =
+            rift_index::WorkspaceIndex::build(directory.path(), limits, &visibility, &text)
+                .expect_err("directory beyond configured depth");
+        assert_eq!(refused.slug(), errors::index::workspace_too_deep::SLUG);
+
+        let environment = ConfigurationEnvironment::from_variables([
+            ("RIFT_SOURCE_DIRECTORY_DEPTH", "2"),
+            ("RIFT_SEARCH_RESULTS", "4"),
+            ("RIFT_SEARCH_LEXICAL_MAX_CONTENT", "8kb"),
+            ("RIFT_SEARCH_LEXICAL_MAX_MATCHES", "5"),
+            ("RIFT_SEARCH_LEXICAL_MAX_DOCUMENTATION", "16kb"),
+        ]);
+        let accepted =
+            accept_configuration::<WorkspaceConfiguration>(Some(document), &environment)?;
+        accepted
+            .configuration()
+            .validate()
+            .expect("validated collection configuration");
+        let lexical = super::lexical_index_limits(&accepted.configuration().search);
+        assert_eq!(lexical.unit_bytes_max(), 8 << 10);
+        assert_eq!(lexical.matches_max(), 5);
+        assert_eq!(lexical.documentation_bytes_max(), 16 << 10);
+        let before = configuration.clone();
+        configuration.accepted = Ok(accepted.configuration().clone());
+        assert_ne!(
+            before.index_configuration_digest(),
+            configuration.index_configuration_digest()
+        );
+        let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
+        assert_eq!(limits.results_max(), 4);
+        let index =
+            rift_index::WorkspaceIndex::build(directory.path(), limits, &visibility, &text)?;
+        assert!(
+            index
+                .file(&CoreProjectPath::new("one/two/beacon.rs")?)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configured_read_and_lexical_bounds_reach_search_warnings() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        for index in 0..3 {
+            fs::write(
+                directory.path().join(format!("beacon_{index}.rs")),
+                "pub fn beacon() {}\n",
+            )?;
+        }
+        super::hermetic_workspace(
+            directory.path(),
+            "[search]\nresults = 2\n[search.lexical]\nmax_matches = 2\n",
+        )?;
+        let server =
+            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let answer = search_after_population(&server, "beacon").await?;
+        assert_eq!(answer.results.len(), 2);
+        assert!(
+            answer
+                .warnings
+                .contains(&ReadWarning::ResultsTruncated { results_max: 2 })
+        );
+        assert!(
+            answer
+                .warnings
+                .contains(&ReadWarning::LexicalRankingTruncated { matches_max: 2 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_collection_environment_outside_supported_bounds_names_the_field() -> TestResult {
+        use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+        use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
+
+        for (variable, value, field) in [
+            ("RIFT_SOURCE_DIRECTORY_DEPTH", "0", "source.directory_depth"),
+            ("RIFT_SEARCH_RESULTS", "10001", "search.results"),
+            (
+                "RIFT_SEARCH_LEXICAL_MAX_CONTENT",
+                "1b",
+                "search.lexical.max_content",
+            ),
+            (
+                "RIFT_SEARCH_LEXICAL_MAX_MATCHES",
+                "1000001",
+                "search.lexical.max_matches",
+            ),
+            (
+                "RIFT_SEARCH_LEXICAL_MAX_DOCUMENTATION",
+                "1b",
+                "search.lexical.max_documentation",
+            ),
+        ] {
+            let environment = ConfigurationEnvironment::from_variables([(variable, value)]);
+            let accepted = accept_configuration::<WorkspaceConfiguration>(None, &environment)?;
+            assert!(
+                matches!(
+                    accepted.configuration().validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange { field: refused, .. }) if refused == field
+                ),
+                "{variable}={value}"
+            );
+        }
         Ok(())
     }
 

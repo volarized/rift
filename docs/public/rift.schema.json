@@ -1,5 +1,64 @@
 {
   "$defs": {
+    "ArchiveConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[package.archive]` table bounds archive acquisition before package analysis.",
+      "properties": {
+        "compressed_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64mb",
+          "description": "Most compressed archive bytes accepted, 1b to 64gb.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1b"
+          }
+        },
+        "expanded_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "512mb",
+          "description": "Most expanded archive bytes accepted, 1b to 64gb.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1b"
+          }
+        },
+        "expansion_ratio": {
+          "default": 200,
+          "description": "Most expanded bytes per compressed byte, before `expanded_size` bounds the result.",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "extension_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16kb",
+          "description": "Most bytes accepted in one GNU or PAX extended header, 1b to 64mb, checked before\nthe archive reader allocates its contents. An extended header must also fit `member_size`.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "member_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64mb",
+          "description": "Most bytes accepted in one member, 1b to `expanded_size`, at most 64gb.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1b"
+          }
+        },
+        "members": {
+          "default": 100000,
+          "description": "Most archive members accepted, including directories, links, and extended headers.",
+          "format": "uint32",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ByteSize": {
       "description": "A byte size: an integer magnitude with a required unit suffix `b`, `kb`, `mb`, `gb`, or `tb`; units are binary, so `1kb` is 1024 bytes.",
       "pattern": "^(?:0|[1-9][0-9]*)(?:b|kb|mb|gb|tb)$",
@@ -83,10 +142,109 @@
       ],
       "type": "object"
     },
+    "DependenciesCollectionConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[dependencies.collection]` table bounds dependency input reads and package collection.",
+      "properties": {
+        "directory_entries": {
+          "default": 16384,
+          "description": "Most entries returned by one installed environment directory listing.",
+          "format": "uint32",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "lockfile_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16mb",
+          "description": "Most bytes read from one dependency manifest or lockfile, 1b to 64mb.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "manifests": {
+          "default": 256,
+          "description": "Most manifests read by one resolver; ancestor comparisons use at most `manifests` squared work.",
+          "format": "uint32",
+          "maximum": 4096,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "nesting_depth": {
+          "default": 32,
+          "description": "Most package names one Bun package key nests.",
+          "format": "uint32",
+          "maximum": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "packages": {
+          "default": 20000,
+          "description": "Most packages held in one dependency context, within the global API's 20,000 package ceiling.",
+          "format": "uint32",
+          "maximum": 20000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pin_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64kb",
+          "description": "Most bytes read from one toolchain or version pin file, 1b to 64mb.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "project_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Most bytes read from one standard library project file, 1b to 64mb.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "record_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Most bytes read from one installed distribution's `RECORD`, 1b to 64mb.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "toolchain_output": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64kb",
+          "description": "Most bytes kept from one version probe stream, 1b to 1mb.",
+          "rift:range": {
+            "max": "1mb",
+            "min": "1b"
+          }
+        }
+      },
+      "type": "object"
+    },
     "DependenciesConfiguration": {
       "additionalProperties": false,
       "description": "The `[dependencies]` table. It states whether the dependency context runs the\nstandard library version probes, how long one probe may take, and which packages the\noperator names beside the ones the workspace's manifests and lockfiles state.",
       "properties": {
+        "collection": {
+          "$ref": "#/$defs/DependenciesCollectionConfiguration",
+          "default": {
+            "directory_entries": 16384,
+            "lockfile_size": "16mb",
+            "manifests": 256,
+            "nesting_depth": 32,
+            "packages": 20000,
+            "pin_size": "64kb",
+            "project_size": "1mb",
+            "record_size": "4mb",
+            "toolchain_output": "64kb"
+          },
+          "description": "File, directory, manifest, package, and version probe collection bounds."
+        },
         "command_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "2m",
@@ -154,6 +312,113 @@
           },
           "maxItems": 512,
           "type": "array"
+        },
+        "max_blocks": {
+          "default": 250000,
+          "description": "Documentation blocks one collection retains.",
+          "format": "uint32",
+          "maximum": 50000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_depth": {
+          "default": 512,
+          "description": "Nesting one documentation parser accepts.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_file": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Source bytes one documentation parser accepts.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "max_heading_depth": {
+          "default": 512,
+          "description": "Heading levels one documentation block retains.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_layer_blocks": {
+          "default": 2000000,
+          "description": "Blocks one documentation layer holds across its collections.",
+          "format": "uint32",
+          "maximum": 100000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_mappings": {
+          "default": 6000000,
+          "description": "Ranking identity mappings one documentation layer holds.",
+          "format": "uint32",
+          "maximum": 300000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_nodes": {
+          "default": 250000,
+          "description": "Syntax nodes one documentation parser accepts.",
+          "format": "uint32",
+          "maximum": 100000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_progress": {
+          "default": 131072,
+          "description": "Progress callbacks one reStructuredText parser accepts.",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_references": {
+          "default": 250000,
+          "description": "Links, fragments, or reference candidates one collection retains.",
+          "format": "uint32",
+          "maximum": 50000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_sources": {
+          "default": 100000,
+          "description": "Selected documentation sources one collection accepts.",
+          "format": "uint32",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_text": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4kb",
+          "description": "Bytes one heading, language, destination, or reference spelling retains.",
+          "rift:range": {
+            "max": "1mb",
+            "min": "1b"
+          }
+        },
+        "max_total": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "512mb",
+          "description": "Source bytes one documentation collection accepts together.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1b"
+          }
+        },
+        "max_warnings": {
+          "default": 256,
+          "description": "Warnings one documentation collection retains.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -451,6 +716,33 @@
           "minimum": 1,
           "type": "integer"
         },
+        "max_request": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Most bytes in one global API request body. A larger body is refused before sending.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "max_response": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "32mb",
+          "description": "Most bytes in one global API response body. A larger body is refused while reading.",
+          "rift:range": {
+            "max": "1gb",
+            "min": "1b"
+          }
+        },
+        "max_source": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Most UTF-8 bytes in one source payload from the global API. The client also applies the\nadvertised source bound, using the smaller value.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
         "request_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "15s",
@@ -564,6 +856,22 @@
           "minimum": 1,
           "type": "integer"
         },
+        "move_deletions": {
+          "default": 1000,
+          "description": "Deleted files one history commit pairs for declaration moves, after pure renames,\n1 to 65536. A commit past this bound keeps introduced declarations without pairing\nmoves. Raising the bound increases the work to find each moved declaration.",
+          "format": "uint64",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "release_tags": {
+          "default": 65536,
+          "description": "Tags one release selection reads, 1 to 5000000, including tags that name no commit\nor match no release pattern. A larger tag set is refused.",
+          "format": "uint64",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        },
         "releases": {
           "default": [],
           "description": "Tag names or tag patterns naming the releases `selective` analyzes, such as `v1.*`,\nat most 64. The releases order by the version each tag name spells once the\npattern's literal text up to its first digit or wildcard is removed; a tag whose\nrest is no version is left out. Only `selective` reads them.",
@@ -577,6 +885,14 @@
           "$ref": "#/$defs/HistoryStrategy",
           "default": "everything",
           "description": "Which revisions the history store analyzes."
+        },
+        "tree_entries": {
+          "default": 65536,
+          "description": "Tree entries one revision read visits and changed paths one history commit collects,\n1 to 5000000. A larger revision tree is refused; a larger changed-path set makes the\nhistory commit a boundary whose changes are unknown.",
+          "format": "uint64",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -682,6 +998,32 @@
       "additionalProperties": false,
       "description": "The `[search.lexical]` table: how many units the lexical index holds, how many one\ntransaction writes, and how much of the store file a connection memory-maps.",
       "properties": {
+        "max_content": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16mb",
+          "description": "Most bytes one lexical document content field holds, 1kb to 1gb.\nA document past this bound refuses the lexical write.",
+          "rift:range": {
+            "max": "1gb",
+            "min": "1kb"
+          }
+        },
+        "max_documentation": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256mb",
+          "description": "Most encoded documentation metadata one commit stores, 1kb to 4gb.\nA larger collection commits lexical documents without the metadata.",
+          "rift:range": {
+            "max": "4gb",
+            "min": "1kb"
+          }
+        },
+        "max_matches": {
+          "default": 1000,
+          "description": "Most matches one lexical ranking collects, 1 to 1000000.\nAn answer past this bound carries `lexical_ranking_truncated`.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
         "mmap_size": {
           "$ref": "#/$defs/ByteSize",
           "default": "1gb",
@@ -920,6 +1262,89 @@
       },
       "type": "object"
     },
+    "PackageConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[package]` table: publication capacity for exact-package collection.\nInput files, bytes and declarations use `[source]`; parsing uses `[providers.syntax]`.",
+      "properties": {
+        "archive": {
+          "$ref": "#/$defs/ArchiveConfiguration",
+          "default": {
+            "compressed_size": "64mb",
+            "expanded_size": "512mb",
+            "expansion_ratio": 200,
+            "extension_size": "16kb",
+            "member_size": "64mb",
+            "members": 100000
+          },
+          "description": "Compressed archive admission before source selection and package analysis."
+        },
+        "documents": {
+          "default": 1100000,
+          "description": "Most search documents published, 1 to 55000000.",
+          "format": "uint32",
+          "maximum": 55000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "identifier_terms": {
+          "default": 1024,
+          "description": "Most identifier terms retained per search document, 1 to 65536.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "retained_source": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Most source bytes retained per record, 1b to 64mb; larger source is cut.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "retained_total": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Most retained source bytes across units, symbols and documents, including copies.\nAbsent preserves the existing aggregate behavior; a selected total must cover one\ncomplete record bound, and collection refuses before allocation passes it.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "symbols": {
+          "default": 1000000,
+          "description": "Most declaration records published, 1 to 50000000.",
+          "format": "uint32",
+          "maximum": 50000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "units": {
+          "default": 100000,
+          "description": "Most source units published, 1 to 5000000.",
+          "format": "uint32",
+          "maximum": 5000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "warnings": {
+          "default": 256,
+          "description": "Most publication warnings retained, 1 to 65536.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "PathPattern": {
       "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
       "examples": [
@@ -965,8 +1390,11 @@
             "cpu_share": 0.25,
             "enabled": true,
             "max_revisions": 100,
+            "move_deletions": 1000,
+            "release_tags": 65536,
             "releases": [],
-            "strategy": "everything"
+            "strategy": "everything",
+            "tree_entries": 65536
           },
           "description": "The history provider's budget."
         },
@@ -1103,6 +1531,9 @@
         "lexical": {
           "$ref": "#/$defs/LexicalSearchConfiguration",
           "default": {
+            "max_content": "16mb",
+            "max_documentation": "256mb",
+            "max_matches": 1000,
             "mmap_size": "1gb",
             "transaction_size": "16mb",
             "transaction_units": 5000,
@@ -1161,6 +1592,14 @@
             "vector_weight": 0.3
           },
           "description": "What each ranking input contributes to a fused score."
+        },
+        "results": {
+          "default": 1000,
+          "description": "Most results one local search or symbol lookup collects, 1 to 10000.\nAn answer that reaches this bound warns `results_truncated`.",
+          "format": "uint64",
+          "maximum": 10000,
+          "minimum": 1,
+          "type": "integer"
         },
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
@@ -1322,6 +1761,14 @@
           "minimum": 10000,
           "type": "integer"
         },
+        "directory_depth": {
+          "default": 64,
+          "description": "Most directory levels scanned below the workspace root, 1 to 4096.\nA deeper directory refuses the rebuild naming this key.",
+          "format": "uint64",
+          "maximum": 4096,
+          "minimum": 1,
+          "type": "integer"
+        },
         "exclude": {
           "default": [],
           "description": "Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match\nhere is dropped even when `include` also matches it.",
@@ -1356,6 +1803,14 @@
           },
           "maxItems": 512,
           "type": "array"
+        },
+        "relationships": {
+          "default": 10000000,
+          "description": "Most relationship edges held together, 1 to 500000000.",
+          "format": "uint64",
+          "maximum": 500000000,
+          "minimum": 1,
+          "type": "integer"
         },
         "respect_gitignore": {
           "default": true,
@@ -1516,6 +1971,17 @@
     "dependencies": {
       "$ref": "#/$defs/DependenciesConfiguration",
       "default": {
+        "collection": {
+          "directory_entries": 16384,
+          "lockfile_size": "16mb",
+          "manifests": 256,
+          "nesting_depth": 32,
+          "packages": 20000,
+          "pin_size": "64kb",
+          "project_size": "1mb",
+          "record_size": "4mb",
+          "toolchain_output": "64kb"
+        },
         "command_timeout": "2m",
         "packages": [],
         "resolution": "auto"
@@ -1527,7 +1993,20 @@
       "default": {
         "enabled": true,
         "exclude": [],
-        "force_include": []
+        "force_include": [],
+        "max_blocks": 250000,
+        "max_depth": 512,
+        "max_file": "4mb",
+        "max_heading_depth": 512,
+        "max_layer_blocks": 2000000,
+        "max_mappings": 6000000,
+        "max_nodes": 250000,
+        "max_progress": 131072,
+        "max_references": 250000,
+        "max_sources": 100000,
+        "max_text": "4kb",
+        "max_total": "512mb",
+        "max_warnings": 256
       },
       "description": "Which documentation files the index collects beside the source."
     },
@@ -1551,6 +2030,9 @@
         "endpoint": "https://api.volar.sh/rift/rest",
         "failure_ttl": "30s",
         "max_in_flight": 4,
+        "max_request": "4mb",
+        "max_response": "32mb",
+        "max_source": "1mb",
         "request_timeout": "15s",
         "resolution_ttl": "15m",
         "token_env": "RIFT_API_TOKEN"
@@ -1597,6 +2079,26 @@
       },
       "type": "object"
     },
+    "package": {
+      "$ref": "#/$defs/PackageConfiguration",
+      "default": {
+        "archive": {
+          "compressed_size": "64mb",
+          "expanded_size": "512mb",
+          "expansion_ratio": 200,
+          "extension_size": "16kb",
+          "member_size": "64mb",
+          "members": 100000
+        },
+        "documents": 1100000,
+        "identifier_terms": 1024,
+        "retained_source": "1mb",
+        "symbols": 1000000,
+        "units": 100000,
+        "warnings": 256
+      },
+      "description": "Exact-package publication and archive admission bounds."
+    },
     "providers": {
       "$ref": "#/$defs/ProvidersConfiguration",
       "default": {
@@ -1606,8 +2108,11 @@
           "cpu_share": 0.25,
           "enabled": true,
           "max_revisions": 100,
+          "move_deletions": 1000,
+          "release_tags": 65536,
           "releases": [],
-          "strategy": "everything"
+          "strategy": "everything",
+          "tree_entries": 65536
         },
         "syntax": {
           "max_depth": 512,
@@ -1623,6 +2128,9 @@
         "busy_timeout": "5s",
         "journal_size_limit": "64mb",
         "lexical": {
+          "max_content": "16mb",
+          "max_documentation": "256mb",
+          "max_matches": 1000,
           "mmap_size": "1gb",
           "transaction_size": "16mb",
           "transaction_units": 5000,
@@ -1639,6 +2147,7 @@
           "lexical_weight": 0.35,
           "vector_weight": 0.3
         },
+        "results": 1000,
         "text": {
           "excluded_lockfiles": [
             "Cargo.lock",
@@ -1696,10 +2205,12 @@
       "$ref": "#/$defs/SourceConfiguration",
       "default": {
         "declarations": 1000000,
+        "directory_depth": 64,
         "exclude": [],
         "files": 100000,
         "force_include": [],
         "include": [],
+        "relationships": 10000000,
         "respect_gitignore": true,
         "workspace_size": "512mb"
       },

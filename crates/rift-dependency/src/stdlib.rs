@@ -28,10 +28,6 @@ use crate::uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER};
 
 /// The manager every standard library entry names, as local reads minted it.
 pub const STANDARD_LIBRARY_MANAGER: &str = "stdlib";
-/// Bytes one pin file may hold before the pass leaves it unread.
-const PIN_FILE_BYTES_MAX: u64 = 64 << 10;
-/// Bytes one `package.json` or `pyproject.toml` may hold before the pass leaves it unread.
-const PROJECT_FILE_BYTES_MAX: u64 = 1 << 20;
 /// The arguments of the version probe every program answers.
 const VERSION_ARGUMENTS: [&str; 1] = ["--version"];
 /// The arguments naming the toolchain's sysroot, which holds the standard library source.
@@ -408,9 +404,9 @@ fn node_version(
     for file in NODE_PIN_FILES {
         read.push(ProjectPath(file.to_owned()));
         let bytes_max = if file == "package.json" {
-            PROJECT_FILE_BYTES_MAX
+            inputs.collection().project_size.bytes()
         } else {
-            PIN_FILE_BYTES_MAX
+            inputs.collection().pin_size.bytes()
         };
         let Some(text) = file_text(inputs, &request.root.join(file), bytes_max) else {
             continue;
@@ -550,7 +546,8 @@ fn python_version(
                 .and_then(|text| python_pin_line(&text))
         })
         .or_else(|| {
-            file_text(inputs, &root.join(PYPROJECT_FILE), PROJECT_FILE_BYTES_MAX)
+            let maximum = inputs.collection().project_size.bytes();
+            file_text(inputs, &root.join(PYPROJECT_FILE), maximum)
                 .and_then(|text| requires_python(&text))
         });
     VersionOutcome::read(pin.map_or_else(any, Pin::selector))
@@ -631,7 +628,8 @@ fn probe_command(
 }
 
 fn pin_text(inputs: &mut dyn StaticInputs, path: &Path) -> Option<String> {
-    file_text(inputs, path, PIN_FILE_BYTES_MAX)
+    let maximum = inputs.collection().pin_size.bytes();
+    file_text(inputs, path, maximum)
 }
 
 fn file_text(inputs: &mut dyn StaticInputs, path: &Path, bytes_max: u64) -> Option<String> {

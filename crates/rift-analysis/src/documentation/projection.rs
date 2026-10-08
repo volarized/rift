@@ -24,14 +24,16 @@ use rift_error::{RiftError, errors};
 /// A layer joins every collection it is built over, and one dependency package's
 /// collection holds up to `DOCUMENTATION_BLOCKS_MAX` blocks by itself. The dependency
 /// packages of the Next.js corpus tree hold 722,000 blocks together.
-pub const LAYER_BLOCKS_MAX: usize = 2_000_000;
+pub const LAYER_BLOCKS_MAX: usize =
+    rift_protocol::documentation::DOCUMENTATION_LAYER_BLOCKS_MAX as usize;
 
 /// Ranking identities one layer maps onto blocks, counted before duplicates collapse.
 ///
 /// A block takes one mapping per chunk it overlaps, one per Markdown heading on its path,
 /// and one or two for its owning declaration, so mappings outnumber blocks about three to
 /// one: the dependency packages of the Next.js corpus tree hold 2.15 million.
-pub const LAYER_MAPPINGS_MAX: usize = 6_000_000;
+pub const LAYER_MAPPINGS_MAX: usize =
+    rift_protocol::documentation::DOCUMENTATION_MAPPINGS_MAX as usize;
 
 /// The bounds one layer is built under.
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +44,14 @@ struct LayerBounds {
 }
 
 impl LayerBounds {
+    fn accepted(limits: &super::DocumentationLimits) -> Self {
+        Self {
+            sources: limits.sources_max as usize,
+            blocks: limits.layer_blocks_max as usize,
+            mappings: limits.mappings_max as usize,
+        }
+    }
+
     const DEFAULT: Self = Self {
         sources: DOCUMENTATION_SOURCES_MAX as usize,
         blocks: LAYER_BLOCKS_MAX,
@@ -112,6 +122,24 @@ pub struct DocumentationLayer<'collection> {
 }
 
 impl DocumentationLayer<'static> {
+    /// Builds one layer over shared collections within accepted bounds.
+    ///
+    /// # Errors
+    ///
+    /// Refuses duplicate identities and source, block, or mapping counts over their bounds.
+    pub fn shared_with_limits(
+        collections: impl IntoIterator<Item = Arc<DocumentationCollection>>,
+        limits: &super::DocumentationLimits,
+    ) -> Result<Self, RiftError> {
+        Self::build(
+            collections
+                .into_iter()
+                .map(HeldCollection::Shared)
+                .collect(),
+            LayerBounds::accepted(limits),
+        )
+    }
+
     /// Builds one layer over collections shared with their owners.
     ///
     /// # Errors
@@ -147,6 +175,25 @@ impl<'collection> DocumentationLayer<'collection> {
                 .map(HeldCollection::Borrowed)
                 .collect(),
             LayerBounds::DEFAULT,
+        )
+    }
+
+    /// Builds one layer over borrowed collections within accepted bounds.
+    ///
+    /// # Errors
+    ///
+    /// Refuses duplicate identities and source, block, or mapping counts over their bounds.
+    pub fn borrowed_with_limits(
+        collections: &[&'collection DocumentationCollection],
+        limits: &super::DocumentationLimits,
+    ) -> Result<Self, RiftError> {
+        Self::build(
+            collections
+                .iter()
+                .copied()
+                .map(HeldCollection::Borrowed)
+                .collect(),
+            LayerBounds::accepted(limits),
         )
     }
 

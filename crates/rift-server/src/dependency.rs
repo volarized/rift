@@ -6,10 +6,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(test)]
+use rift_dependency::TOOLCHAIN_OUTPUT_BYTES_MAX;
 use rift_dependency::{
     CommandFailure, CommandOutput, ContextInputs, DependencyContext, FileObservation,
-    StandardLibrary, StandardLibraryRequest, StaticInputs, TOOLCHAIN_OUTPUT_BYTES_MAX,
-    ToolchainCommand,
+    StandardLibrary, StandardLibraryRequest, StaticInputs, ToolchainCommand,
 };
 use rift_protocol::dependencies::{
     ConfiguredPackage, DependenciesConfiguration, DependencyResolution,
@@ -31,6 +32,7 @@ const CANCELLED_REASON: &str = "cancelled";
 /// take. Read from the `[dependencies]` table's `resolution` and `command_timeout`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResolutionPolicy {
+    collection: rift_protocol::dependencies::DependenciesCollectionConfiguration,
     /// Whether a probe runs. `false` refuses every run before anything spawns.
     execution: bool,
     /// Wall clock one run may take before the inputs kill it.
@@ -41,6 +43,7 @@ impl From<&DependenciesConfiguration> for ResolutionPolicy {
     fn from(configuration: &DependenciesConfiguration) -> Self {
         Self {
             execution: configuration.resolution == DependencyResolution::Auto,
+            collection: configuration.collection,
             command_timeout: Duration::from_millis(configuration.command_timeout.milliseconds()),
         }
     }
@@ -87,6 +90,10 @@ const fn never_cancelled() -> bool {
 }
 
 impl StaticInputs for FilesystemInputs<'_> {
+    fn collection(&self) -> rift_protocol::dependencies::DependenciesCollectionConfiguration {
+        self.policy.collection
+    }
+
     /// The regular file at `path` when it fits `bytes_max`. A larger file
     /// answers its size, and anything else answers absent.
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
@@ -126,7 +133,7 @@ impl ContextInputs for FilesystemInputs<'_> {
     /// Runs the program from `PATH` under the policy's bounds.
     ///
     /// The run is cut at the policy's `command_timeout`, or once the inputs' cancellation
-    /// answers true, and its standard output at [`TOOLCHAIN_OUTPUT_BYTES_MAX`]; the
+    /// answers true, and its streams at `dependencies.collection.toolchain_output`; the
     /// command's environment overlay wins over the inherited value. A program spelled as
     /// a path, every program while the policy runs no toolchain, and every program once
     /// the inputs are cancelled, is refused before anything spawns.
@@ -156,6 +163,7 @@ impl ContextInputs for FilesystemInputs<'_> {
             program,
             &mut process,
             self.policy.command_timeout,
+            usize::try_from(self.policy.collection.toolchain_output.bytes()).unwrap_or(usize::MAX),
             self.cancelled,
         )
         .map_err(|io| failure(program, format!("failed to launch: {io}")))?;
@@ -178,6 +186,7 @@ fn run_recorded(
     program: &str,
     process: &mut Command,
     timeout: Duration,
+    capture_bytes: usize,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<BoundedRun> {
     let name = Path::new(program)
@@ -195,7 +204,7 @@ fn run_recorded(
         outcome = rift_tracing::empty!(),
         {
             let span = rift_tracing::Span::current();
-            let run = run_bounded(process, timeout, toolchain_capture_bytes(), cancelled);
+            let run = run_bounded(process, timeout, capture_bytes, cancelled);
             record_probe(&span, &run);
             run
         }
@@ -239,6 +248,7 @@ fn is_bare_program(program: &str) -> bool {
 
 /// [`TOOLCHAIN_OUTPUT_BYTES_MAX`] as a capture size. A target too narrow to
 /// hold it captures up to the drain ceiling instead.
+#[cfg(test)]
 fn toolchain_capture_bytes() -> usize {
     usize::try_from(TOOLCHAIN_OUTPUT_BYTES_MAX).unwrap_or(usize::MAX)
 }
@@ -413,6 +423,89 @@ mod tests {
     }
 
     #[test]
+    fn dependency_collection_configuration_and_environment_reach_real_inputs() {
+        use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+        use rift_protocol::configuration::{ByteSize, WorkspaceConfiguration};
+
+        let document = "[dependencies]\nresolution = 'static'\n[dependencies.collection]\nlockfile_size = '32mb'\ntoolchain_output = '128kb'\nmanifests = 257\npackages = 2\ndirectory_entries = 16385\npin_size = '128kb'\nproject_size = '2mb'\nrecord_size = '8mb'\nnesting_depth = 33\n";
+        let accepted = accept_configuration::<WorkspaceConfiguration>(
+            Some(document),
+            &ConfigurationEnvironment::default(),
+        )
+        .expect("collection table");
+        assert_eq!(accepted.configuration().validate(), Ok(()));
+        let policy = ResolutionPolicy::from(&accepted.configuration().dependencies);
+        let configured = FilesystemInputs::new(policy).collection();
+        assert_eq!(configured.lockfile_size, ByteSize::from_bytes(32 << 20));
+        assert_eq!(configured.manifests, 257);
+        assert_eq!(configured.packages, 2);
+        let environment = ConfigurationEnvironment::from_variables([
+            ("RIFT_DEPENDENCIES_COLLECTION_LOCKFILE_SIZE", "33mb"),
+            ("RIFT_DEPENDENCIES_COLLECTION_TOOLCHAIN_OUTPUT", "129kb"),
+            ("RIFT_DEPENDENCIES_COLLECTION_MANIFESTS", "258"),
+            ("RIFT_DEPENDENCIES_COLLECTION_PACKAGES", "1"),
+            ("RIFT_DEPENDENCIES_COLLECTION_DIRECTORY_ENTRIES", "16386"),
+            ("RIFT_DEPENDENCIES_COLLECTION_PIN_SIZE", "129kb"),
+            ("RIFT_DEPENDENCIES_COLLECTION_PROJECT_SIZE", "3mb"),
+            ("RIFT_DEPENDENCIES_COLLECTION_RECORD_SIZE", "9mb"),
+            ("RIFT_DEPENDENCIES_COLLECTION_NESTING_DEPTH", "34"),
+        ]);
+        let overridden =
+            accept_configuration::<WorkspaceConfiguration>(Some(document), &environment)
+                .expect("collection variables");
+        assert_eq!(overridden.configuration().validate(), Ok(()));
+        assert_eq!(overridden.variables().len(), 9);
+        let policy = ResolutionPolicy::from(&overridden.configuration().dependencies);
+        let actual = FilesystemInputs::new(policy).collection();
+        assert_eq!(actual.lockfile_size, ByteSize::from_bytes(33 << 20));
+        assert_eq!(actual.toolchain_output, ByteSize::from_bytes(129 << 10));
+        assert_eq!(actual.manifests, 258);
+        assert_eq!(actual.packages, 1);
+        assert_eq!(actual.directory_entries, 16_386);
+        assert_eq!(actual.pin_size, ByteSize::from_bytes(129 << 10));
+        assert_eq!(actual.project_size, ByteSize::from_bytes(3 << 20));
+        assert_eq!(actual.record_size, ByteSize::from_bytes(9 << 20));
+        assert_eq!(actual.nesting_depth, 34);
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let visible = write_locked_project(directory.path());
+        let lockfile_size = fs::metadata(directory.path().join("Cargo.lock"))
+            .expect("lockfile")
+            .len();
+        let mut dependencies = overridden.configuration().dependencies.clone();
+        dependencies.collection.packages = 2;
+        dependencies.collection.lockfile_size = ByteSize::from_bytes(lockfile_size - 1);
+        let low = read_workspace_context(
+            directory.path(),
+            &visible,
+            &[],
+            ResolutionPolicy::from(&dependencies),
+            &[],
+            &|| false,
+        )
+        .expect("dependency context");
+        assert!(low.is_degraded());
+        assert!(low.degradations().iter().any(|failure| {
+            failure
+                .reason
+                .contains(&format!("past the {} byte bound", lockfile_size - 1))
+        }));
+        dependencies.collection.lockfile_size = ByteSize::from_bytes(lockfile_size);
+        let exact = read_workspace_context(
+            directory.path(),
+            &visible,
+            &[],
+            ResolutionPolicy::from(&dependencies),
+            &[],
+            &|| false,
+        )
+        .expect("dependency context");
+        assert!(!exact.is_degraded(), "{:?}", exact.degradations());
+        assert_eq!(exact.entries().len(), 1);
+        assert_eq!(exact.entries()[0].version.as_deref(), Some("1.0.228"));
+    }
+
+    #[test]
     fn test_read_file_answers_absent_bytes_and_over_bound() {
         let directory = tempfile::tempdir().expect("tempdir");
         let manifest = directory.path().join("Cargo.toml");
@@ -447,6 +540,67 @@ mod tests {
         assert!(inputs.list_directory(directory.path(), 0).is_empty());
         let missing = inputs.list_directory(&directory.path().join("missing"), 10);
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn configured_probe_output_bound_accepts_exact_and_marks_one_over() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let probe = command("sh", &["-c", "printf abc"], directory.path());
+        for (maximum, expected, truncated) in [(2, "ab", true), (3, "abc", false)] {
+            let mut configuration = DependenciesConfiguration::default();
+            configuration.collection.toolchain_output =
+                rift_protocol::configuration::ByteSize::from_bytes(maximum);
+            let mut inputs = FilesystemInputs::new(ResolutionPolicy::from(&configuration));
+            let output = inputs.run(&probe).expect("probe runs");
+            assert_eq!(output.stdout, expected);
+            assert_eq!(output.stdout_truncated, truncated);
+        }
+    }
+
+    #[test]
+    fn configured_pin_and_project_bounds_reach_standard_library_reads() {
+        use rift_protocol::configuration::ByteSize;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let pin = "3.12.3\n";
+        fs::write(directory.path().join(".python-version"), pin).expect("pin fixture");
+        let project = "{\"engines\":{\"node\":\">=22\"}}";
+        fs::write(directory.path().join("package.json"), project).expect("project fixture");
+        for exact in [false, true] {
+            let mut configuration = DependenciesConfiguration {
+                resolution: DependencyResolution::Static,
+                ..Default::default()
+            };
+            let dropped = u64::from(!exact);
+            configuration.collection.pin_size =
+                ByteSize::from_bytes(u64::try_from(pin.len()).expect("pin size") - dropped);
+            configuration.collection.project_size =
+                ByteSize::from_bytes(u64::try_from(project.len()).expect("project size") - dropped);
+            let mut inputs = FilesystemInputs::new(ResolutionPolicy::from(&configuration));
+            let answer = rift_dependency::standard_library_answer(
+                &StandardLibraryRequest {
+                    root: directory.path(),
+                    libraries: &[StandardLibrary::Node, StandardLibrary::Python],
+                    execution: false,
+                },
+                &mut inputs,
+            );
+            let python = answer
+                .entries
+                .iter()
+                .find(|entry| entry.name == "python")
+                .expect("Python library");
+            let node = answer
+                .entries
+                .iter()
+                .find(|entry| entry.name == "node")
+                .expect("Node library");
+            assert_eq!(python.version.as_deref(), exact.then_some("3.12.3"));
+            assert_eq!(
+                node.requirement.as_deref(),
+                Some(if exact { ">=22" } else { ">=0" })
+            );
+        }
     }
 
     #[test]
@@ -913,6 +1067,7 @@ mod fixture_tests {
             "fixture",
             &mut holding_command(&pid_file),
             FIXTURE_SLEEP,
+            toolchain_capture_bytes(),
             &cancelled,
         )
         .expect("the fixture launches");

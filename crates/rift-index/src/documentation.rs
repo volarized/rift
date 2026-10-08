@@ -5,17 +5,16 @@ use std::sync::Arc;
 
 use rift_analysis::DocumentationSelection;
 use rift_analysis::documentation::notebook::{
-    NotebookCellContent, NotebookContent, decode_notebook,
+    NotebookCellContent, NotebookContent, decode_notebook_with_limits,
 };
 use rift_analysis::documentation::{
-    DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
-    check_documentation_source_count, collect_documentation_incremental, content_chunk_identity,
+    DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationLimits,
+    DocumentationSourceSet, collect_documentation_incremental, content_chunk_identity,
     content_digest,
 };
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_error::{RiftError, errors};
 use rift_protocol::documentation::{
-    DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX,
     DocumentationChunk, DocumentationContentIdentity, DocumentationDigest,
     DocumentationSelectionReason, DocumentationSource, DocumentationSourceFormat,
     DocumentationSourceIdentity, DocumentationWarningKind,
@@ -38,6 +37,7 @@ pub(crate) type NotebookFiles = BTreeMap<CoreProjectPath, HeldNotebook>;
 #[derive(Clone, Debug)]
 pub(crate) struct HeldNotebook {
     digest: DocumentationDigest,
+    limits: DocumentationLimits,
     outcome: Arc<NotebookOutcome>,
 }
 
@@ -86,6 +86,7 @@ pub(crate) fn build(
     declarations: &[DeclarationFacts],
     selection: &DocumentationSelection,
     chunk_bytes_max: usize,
+    limits: &DocumentationLimits,
     previous: Option<(&DocumentationCollection, &NotebookFiles)>,
 ) -> Result<(DocumentationCollection, NotebookFiles), RiftError> {
     rift_tracing::traced!(
@@ -93,15 +94,17 @@ pub(crate) fn build(
         operation = "documentation.collect",
         sources = text_files.len(),
         {
-            check_regular_source_count(text_files, selection)?;
+            check_regular_source_count(text_files, selection, limits)?;
             let mut omissions = Vec::new();
             let notebooks = decode_notebooks(
                 text_files,
                 selection,
                 previous.map(|(_, notebooks)| notebooks),
                 &mut omissions,
+                limits,
             )?;
             let mut collected = CollectedInputs {
+                limits: *limits,
                 input_bytes: 0,
                 inputs: Vec::new(),
                 omissions,
@@ -141,6 +144,7 @@ pub(crate) fn build(
                 &mut collected.input_bytes,
                 &mut collected.omissions,
                 &mut collected.inputs,
+                limits,
             )?;
 
             let collection = finish_collection(
@@ -148,6 +152,7 @@ pub(crate) fn build(
                 declarations,
                 collected.omissions,
                 previous.map(|(documentation, _)| documentation),
+                limits,
             )?;
             Ok((collection, notebooks))
         }
@@ -156,6 +161,7 @@ pub(crate) fn build(
 
 #[derive(Default)]
 struct CollectedInputs<'source> {
+    limits: DocumentationLimits,
     input_bytes: u64,
     inputs: Vec<DocumentationInput<'source>>,
     omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
@@ -172,10 +178,16 @@ fn append_notebook_inputs<'source>(
     for cell in notebook.cells() {
         let identity = project_owner(path, Some(cell.cell().clone()));
         let source = source(&identity, cell, source_format, file.content());
-        check_next_source_count(path, collected.inputs.len(), collected.omissions.len())?;
+        check_next_source_count(
+            path,
+            collected.inputs.len(),
+            collected.omissions.len(),
+            &collected.limits,
+        )?;
         let source_bytes = u64::try_from(cell.text().len()).unwrap_or(u64::MAX);
-        if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
-            || collected.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+        if source_bytes > collected.limits.source_bytes_max()
+            || collected.input_bytes.saturating_add(source_bytes)
+                > collected.limits.total_bytes_max()
         {
             collected
                 .omissions
@@ -183,7 +195,7 @@ fn append_notebook_inputs<'source>(
             continue;
         }
         let chunks = content_chunks(&identity, cell.text(), chunk_bytes_max)?;
-        match DocumentationInput::new(source, cell.text())
+        match DocumentationInput::with_limits(source, cell.text(), &collected.limits)
             .and_then(|input| input.with_chunks(chunks))
         {
             Ok(input) => {
@@ -206,10 +218,15 @@ fn append_regular_input<'source>(
 ) -> Result<(), RiftError> {
     let identity = project_owner(path, None);
     let text = file.content();
-    check_next_source_count(path, collected.inputs.len(), collected.omissions.len())?;
+    check_next_source_count(
+        path,
+        collected.inputs.len(),
+        collected.omissions.len(),
+        &collected.limits,
+    )?;
     let source_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
-    if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
-        || collected.input_bytes.saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+    if source_bytes > collected.limits.source_bytes_max()
+        || collected.input_bytes.saturating_add(source_bytes) > collected.limits.total_bytes_max()
     {
         collected
             .omissions
@@ -218,14 +235,15 @@ fn append_regular_input<'source>(
     }
     let source = source_text(&identity, text, source_format);
     let chunks = regular_chunks(path, text, chunk_bytes_max);
-    let mut input =
-        match DocumentationInput::new(source, text).and_then(|input| input.with_chunks(chunks)) {
-            Ok(input) => input,
-            Err(error) => {
-                collected.omissions.push((identity, warning_kind(&error)));
-                return Ok(());
-            }
-        };
+    let mut input = match DocumentationInput::with_limits(source, text, &collected.limits)
+        .and_then(|input| input.with_chunks(chunks))
+    {
+        Ok(input) => input,
+        Err(error) => {
+            collected.omissions.push((identity, warning_kind(&error)));
+            return Ok(());
+        }
+    };
     if matches!(
         source_format,
         DocumentationSourceFormat::Markdown | DocumentationSourceFormat::Mdx
@@ -249,8 +267,9 @@ fn finish_collection(
     declarations: &[DeclarationFacts],
     omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     previous: Option<&DocumentationCollection>,
+    limits: &DocumentationLimits,
 ) -> Result<DocumentationCollection, RiftError> {
-    let sources = DocumentationSourceSet::new(inputs)?;
+    let sources = DocumentationSourceSet::with_limits(inputs, limits)?;
     let declarations = declarations
         .iter()
         .map(DeclarationFacts::validated)
@@ -271,6 +290,7 @@ fn decode_notebooks(
     selection: &DocumentationSelection,
     previous: Option<&NotebookFiles>,
     omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
+    limits: &DocumentationLimits,
 ) -> Result<NotebookFiles, RiftError> {
     let mut notebooks = NotebookFiles::new();
     for (path, file) in text_files.iter().filter(|(path, _)| {
@@ -280,33 +300,35 @@ fn decode_notebooks(
         let digest = content_digest(file.content().as_bytes());
         if let Some(previous) = previous
             .and_then(|notebooks| notebooks.get(path))
-            .filter(|notebook| notebook.digest == digest)
+            .filter(|notebook| notebook.digest == digest && notebook.limits == *limits)
         {
             notebooks.insert(path.clone(), previous.clone());
             if let NotebookOutcome::Omitted(kind) = previous.outcome.as_ref() {
-                check_next_source_count(path, 0, omissions.len())?;
+                check_next_source_count(path, 0, omissions.len(), limits)?;
                 omissions.push((identity, *kind));
             }
             continue;
         }
-        match decode_notebook(file.content(), &identity) {
+        match decode_notebook_with_limits(file.content(), &identity, limits) {
             Ok(notebook) => {
                 notebooks.insert(
                     path.clone(),
                     HeldNotebook {
                         digest,
+                        limits: *limits,
                         outcome: Arc::new(NotebookOutcome::Decoded(notebook)),
                     },
                 );
             }
             Err(error) => {
                 let kind = warning_kind(&error);
-                check_next_source_count(path, 0, omissions.len())?;
+                check_next_source_count(path, 0, omissions.len(), limits)?;
                 omissions.push((identity, kind));
                 notebooks.insert(
                     path.clone(),
                     HeldNotebook {
                         digest,
+                        limits: *limits,
                         outcome: Arc::new(NotebookOutcome::Omitted(kind)),
                     },
                 );
@@ -323,6 +345,7 @@ fn append_attached_inputs<'source>(
     input_bytes: &mut u64,
     omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
     inputs: &mut Vec<DocumentationInput<'source>>,
+    limits: &DocumentationLimits,
 ) -> Result<(), RiftError> {
     let attached_symbols = attached_symbols(declarations);
     for (path, file) in files {
@@ -330,11 +353,11 @@ fn append_attached_inputs<'source>(
         if !has_attached_declaration(file, path, &identity, &attached_symbols) {
             continue;
         }
-        check_next_source_count(path, inputs.len(), omissions.len())?;
+        check_next_source_count(path, inputs.len(), omissions.len(), limits)?;
         let text = file.source();
         let source_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        if source_bytes > u64::from(DOCUMENTATION_SOURCE_BYTES_MAX)
-            || (*input_bytes).saturating_add(source_bytes) > DOCUMENTATION_TOTAL_BYTES_MAX
+        if source_bytes > limits.source_bytes_max()
+            || (*input_bytes).saturating_add(source_bytes) > limits.total_bytes_max()
         {
             omissions.push((identity, DocumentationWarningKind::SourceUnavailable));
             continue;
@@ -342,7 +365,7 @@ fn append_attached_inputs<'source>(
         let mut source = source_text(&identity, text, DocumentationSourceFormat::AttachedComment);
         source.language = Some(file.syntax().language().clone());
         let chunks = regular_chunks(path, text, chunk_bytes_max);
-        let input = DocumentationInput::new(source, text)
+        let input = DocumentationInput::with_limits(source, text, limits)
             .and_then(|input| input.with_chunks(chunks))
             .and_then(|input| input.with_indexed_syntax(file.path(), file.syntax_facts()));
         match input {
@@ -395,6 +418,7 @@ fn has_attached_declaration(
 fn check_regular_source_count(
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
     selection: &DocumentationSelection,
+    limits: &DocumentationLimits,
 ) -> Result<(), RiftError> {
     let mut count = 0_usize;
     for path in text_files.keys().filter(|path| {
@@ -403,12 +427,12 @@ fn check_regular_source_count(
             .is_some_and(|source_format| source_format != DocumentationSourceFormat::Notebook)
     }) {
         count = count.saturating_add(1);
-        check_documentation_source_count(count).map_err(|_| {
+        limits.check_source_count(count).map_err(|_| {
             errors::index::workspace_documentation_limit()
                 .path(path)
                 .field("sources")
                 .observed(count)
-                .maximum(DOCUMENTATION_SOURCES_MAX as usize)
+                .maximum(limits.sources_max() as usize)
                 .error()
         })?;
     }
@@ -419,14 +443,15 @@ fn check_next_source_count(
     path: &CoreProjectPath,
     inputs: usize,
     omissions: usize,
+    limits: &DocumentationLimits,
 ) -> Result<(), RiftError> {
     let count = inputs.saturating_add(omissions).saturating_add(1);
-    check_documentation_source_count(count).map_err(|_| {
+    limits.check_source_count(count).map_err(|_| {
         errors::index::workspace_documentation_limit()
             .path(path)
             .field("sources")
             .observed(count)
-            .maximum(DOCUMENTATION_SOURCES_MAX as usize)
+            .maximum(limits.sources_max() as usize)
             .error()
     })
 }
@@ -724,12 +749,24 @@ mod tests {
 
         let selection = default_selection();
         let mut first_omissions = Vec::new();
-        let first =
-            decode_notebooks(&files, &selection, None, &mut first_omissions).expect("first decode");
+        let first = decode_notebooks(
+            &files,
+            &selection,
+            None,
+            &mut first_omissions,
+            &rift_analysis::documentation::DocumentationLimits::default(),
+        )
+        .expect("first decode");
         assert_eq!(first_omissions.len(), 1);
         let mut next_omissions = Vec::new();
-        let next = decode_notebooks(&files, &selection, Some(&first), &mut next_omissions)
-            .expect("cached decode");
+        let next = decode_notebooks(
+            &files,
+            &selection,
+            Some(&first),
+            &mut next_omissions,
+            &rift_analysis::documentation::DocumentationLimits::default(),
+        )
+        .expect("cached decode");
 
         assert_eq!(next_omissions, first_omissions);
         for path in files.keys() {
@@ -776,6 +813,87 @@ mod tests {
     }
 
     #[test]
+    fn documentation_build_uses_accepted_file_and_notebook_bounds() {
+        use rift_analysis::documentation::DocumentationLimits;
+        use rift_protocol::configuration::ByteSize;
+        use rift_protocol::documentation::DocumentationConfiguration;
+        let path = rift_core::ProjectPath::new("guide.md").expect("path");
+        let text_files = BTreeMap::from([(
+            path.clone(),
+            Arc::new(TextSourceFile::from_content(path, "body!".into())),
+        )]);
+        let lowered = DocumentationConfiguration {
+            max_file: ByteSize::from_bytes(4),
+            ..Default::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&lowered).expect("bounds");
+        let (collection, _) = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            1_024,
+            &limits,
+            None,
+        )
+        .expect("bounded omission");
+        assert_eq!(collection.index().coverage.omitted, 1);
+        let raised = DocumentationConfiguration {
+            max_file: ByteSize::from_bytes(5),
+            ..lowered
+        };
+        let limits = DocumentationLimits::from_configuration(&raised).expect("bounds");
+        let (collection, _) = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            1_024,
+            &limits,
+            None,
+        )
+        .expect("exact byte bound");
+        assert_eq!(collection.index().coverage.omitted, 0);
+
+        let path = rift_core::ProjectPath::new("guide.ipynb").expect("path");
+        let files = BTreeMap::from([(
+            path.clone(),
+            Arc::new(TextSourceFile::from_content(
+                path.clone(),
+                r#"{"cells":[],"metadata":{}}"#.into(),
+            )),
+        )]);
+        let mut omissions = Vec::new();
+        let first = decode_notebooks(
+            &files,
+            &default_selection(),
+            None,
+            &mut omissions,
+            &DocumentationLimits::default(),
+        )
+        .expect("notebook");
+        let lowered = DocumentationConfiguration {
+            max_nodes: 1,
+            ..Default::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&lowered).expect("bounds");
+        let next = decode_notebooks(
+            &files,
+            &default_selection(),
+            Some(&first),
+            &mut omissions,
+            &limits,
+        )
+        .expect("bounded notebook omission");
+        assert_eq!(omissions.len(), 1);
+        assert!(!Arc::ptr_eq(&first[&path].outcome, &next[&path].outcome));
+        assert!(matches!(
+            next[&path].outcome.as_ref(),
+            super::NotebookOutcome::Omitted(_)
+        ));
+    }
+
+    #[test]
     fn malformed_notebook_build_keeps_omission_and_emits_no_cell_documents() {
         let path = rift_core::ProjectPath::new("broken.ipynb").expect("valid path");
         let text_file = Arc::new(TextSourceFile::from_content(path.clone(), "{".into()));
@@ -786,6 +904,7 @@ mod tests {
             &[],
             &default_selection(),
             1_024,
+            &rift_analysis::documentation::DocumentationLimits::default(),
             None,
         )
         .expect("malformed notebook remains a bounded omission");
@@ -830,6 +949,7 @@ mod tests {
             &[],
             &default_selection(),
             1_024,
+            &rift_analysis::documentation::DocumentationLimits::default(),
             None,
         )
         .expect_err("source count over bound refuses collection");

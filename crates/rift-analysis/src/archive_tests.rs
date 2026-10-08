@@ -424,10 +424,141 @@ fn decompressed_bytes_ratio_and_truncated_payloads_are_refused() -> TestResult {
 
 #[test]
 fn archive_limits_reject_zero_and_excessive_values() {
-    assert!(ArchiveLimits::new(0, 1, 1, 1, 1).is_err());
-    assert!(ArchiveLimits::new(1, 1, 2, 1, 1).is_err());
-    assert!(ArchiveLimits::new(1, 1, 1, 100_001, 1).is_err());
-    assert!(ArchiveLimits::new(1, 1, 1, 1, 201).is_err());
+    use rift_protocol::configuration::{ARCHIVE_BYTES_MAX, ARCHIVE_MEMBERS_MAX};
+
+    for limits in [
+        (0, 1, 1, 1, 1),
+        (1, 0, 1, 1, 1),
+        (1, 1, 0, 1, 1),
+        (1, 1, 1, 0, 1),
+        (1, 1, 1, 1, 0),
+        (1, 1, 2, 1, 1),
+        (
+            1,
+            1,
+            1,
+            usize::try_from(ARCHIVE_MEMBERS_MAX).expect("supported archive count") + 1,
+            1,
+        ),
+    ] {
+        assert_eq!(
+            ArchiveLimits::new(limits.0, limits.1, limits.2, limits.3, limits.4),
+            Err(ArchiveError::InvalidLimits)
+        );
+    }
+    if let Ok(excessive) = usize::try_from(ARCHIVE_BYTES_MAX + 1) {
+        assert_eq!(
+            ArchiveLimits::new(excessive, 1, 1, 1, 1),
+            Err(ArchiveError::InvalidLimits)
+        );
+        assert_eq!(
+            ArchiveLimits::new(1, excessive, 1, 1, 1),
+            Err(ArchiveError::InvalidLimits)
+        );
+        assert_eq!(
+            ArchiveLimits::new(1, excessive, excessive, 1, 1),
+            Err(ArchiveError::InvalidLimits)
+        );
+    }
+    if let Ok(excessive) = usize::try_from(u64::from(u32::MAX) + 1) {
+        assert_eq!(
+            ArchiveLimits::new(1, 1, 1, 1, excessive),
+            Err(ArchiveError::InvalidLimits)
+        );
+    }
+}
+
+#[test]
+fn archive_limits_above_defaults_are_accepted() -> TestResult {
+    use rift_protocol::configuration::{
+        ARCHIVE_BYTES_MAX, ARCHIVE_EXPANSION_RATIO_MAX, ARCHIVE_MEMBERS_MAX, ArchiveConfiguration,
+    };
+
+    assert_eq!(
+        ArchiveLimits::from_configuration(&ArchiveConfiguration::default())?,
+        ArchiveLimits::default()
+    );
+    let limits = ArchiveLimits::new(65 << 20, 513 << 20, 65 << 20, 100_001, 201)?;
+    assert_eq!(limits.expanded_bytes, 513 << 20);
+    assert_eq!(limits.member_bytes, 65 << 20);
+    assert_eq!(limits.members, 100_001);
+    assert_eq!(limits.expansion_ratio, 201);
+    if let Ok(bytes) = usize::try_from(ARCHIVE_BYTES_MAX) {
+        let maximum = ArchiveLimits::new(
+            bytes,
+            bytes,
+            bytes,
+            usize::try_from(ARCHIVE_MEMBERS_MAX)?,
+            usize::try_from(ARCHIVE_EXPANSION_RATIO_MAX)?,
+        )?;
+        assert_eq!(maximum.compressed_bytes_max(), bytes);
+        assert_eq!(maximum.expanded_bytes, bytes);
+    }
+    Ok(())
+}
+
+#[test]
+fn archive_configuration_and_environment_reach_acquisition() -> TestResult {
+    use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+    use rift_protocol::configuration::WorkspaceConfiguration;
+
+    let document = r#"
+        [package.archive]
+        compressed_size = "65mb"
+        expanded_size = "513mb"
+        member_size = "65mb"
+        members = 100001
+        expansion_ratio = 201
+    "#;
+    let accepted = accept_configuration::<WorkspaceConfiguration>(
+        Some(document),
+        &ConfigurationEnvironment::default(),
+    )?;
+    assert_eq!(accepted.configuration().validate(), Ok(()));
+    let configured = ArchiveLimits::from_configuration(&accepted.configuration().package.archive)?;
+    assert_eq!(
+        configured,
+        ArchiveLimits::new(65 << 20, 513 << 20, 65 << 20, 100_001, 201)?
+    );
+
+    let environment = ConfigurationEnvironment::from_variables([
+        ("RIFT_PACKAGE_ARCHIVE_COMPRESSED_SIZE", "66mb"),
+        ("RIFT_PACKAGE_ARCHIVE_EXPANDED_SIZE", "514mb"),
+        ("RIFT_PACKAGE_ARCHIVE_MEMBER_SIZE", "66mb"),
+        ("RIFT_PACKAGE_ARCHIVE_MEMBERS", "100002"),
+        ("RIFT_PACKAGE_ARCHIVE_EXPANSION_RATIO", "202"),
+    ]);
+    let accepted = accept_configuration::<WorkspaceConfiguration>(Some(document), &environment)?;
+    assert_eq!(accepted.configuration().validate(), Ok(()));
+    let overridden = ArchiveLimits::from_configuration(&accepted.configuration().package.archive)?;
+    assert_eq!(
+        overridden,
+        ArchiveLimits::new(66 << 20, 514 << 20, 66 << 20, 100_002, 202)?
+    );
+    assert_eq!(accepted.variables().len(), 5);
+
+    let bytes = tar_bytes(&[("release/guide.md", b"guide", tar::EntryType::Regular)])?;
+    let low = accept_configuration::<WorkspaceConfiguration>(
+        Some("[package.archive]\nmember_size = '4b'\n"),
+        &ConfigurationEnvironment::default(),
+    )?;
+    assert!(matches!(
+        read(
+            &bytes,
+            ArchiveLimits::from_configuration(&low.configuration().package.archive)?
+        ),
+        Err(ArchiveError::MemberLimit)
+    ));
+    let raised = accept_configuration::<WorkspaceConfiguration>(
+        Some("[package.archive]\nmember_size = '4b'\n"),
+        &ConfigurationEnvironment::from_variables([("RIFT_PACKAGE_ARCHIVE_MEMBER_SIZE", "5b")]),
+    )?;
+    let files = read(
+        &bytes,
+        ArchiveLimits::from_configuration(&raised.configuration().package.archive)?,
+    )?;
+    assert_eq!(files.files().len(), 1);
+    Ok(())
 }
 
 fn zip_bytes(path: &str, content: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -546,6 +677,107 @@ fn tar_extended_headers_are_bounded_before_library_allocation() -> TestResult {
         read(&bytes, ArchiveLimits::default()).expect_err("extended header size"),
         ArchiveError::MemberLimit
     );
+    Ok(())
+}
+
+#[test]
+fn configured_tar_extension_bytes_accept_exact_and_refuse_one_over_before_allocation() -> TestResult
+{
+    use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+    use rift_protocol::configuration::{ARCHIVE_EXTENSION_BYTES_MAX, WorkspaceConfiguration};
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let comment = vec![b'x'; usize::try_from(TAR_EXTENSION_BYTES_MAX)? + 1];
+    builder.append_pax_extensions([("comment", comment.as_slice())])?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder.append_data(&mut header, "release/a", b"text".as_slice())?;
+    let tar = builder.into_inner()?;
+    let mut raw = tar::Archive::new(tar.as_slice());
+    let extension_bytes = usize::try_from(
+        raw.entries()?
+            .raw(true)
+            .next()
+            .ok_or("extended header")??
+            .size(),
+    )?;
+    assert!(extension_bytes > usize::try_from(TAR_EXTENSION_BYTES_MAX)?);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&tar)?;
+    let bytes = gzip.finish()?;
+    assert_eq!(
+        read(&bytes, ArchiveLimits::default()).expect_err("default extension byte bound"),
+        ArchiveError::MemberLimit
+    );
+
+    let document = format!(
+        "[package.archive]\nextension_size = '{}b'\n",
+        extension_bytes - 1
+    );
+    let configured = accept_configuration::<WorkspaceConfiguration>(
+        Some(&document),
+        &ConfigurationEnvironment::default(),
+    )?;
+    let limits = ArchiveLimits::from_configuration(&configured.configuration().package.archive)?;
+    assert_eq!(
+        read(&bytes, limits).expect_err("one byte past extension bound"),
+        ArchiveError::MemberLimit
+    );
+    let environment = ConfigurationEnvironment::from_variables([(
+        "RIFT_PACKAGE_ARCHIVE_EXTENSION_SIZE",
+        format!("{extension_bytes}b"),
+    )]);
+    let configured = accept_configuration::<WorkspaceConfiguration>(Some(&document), &environment)?;
+    let limits = ArchiveLimits::from_configuration(&configured.configuration().package.archive)?;
+    assert_eq!(
+        read(&bytes, limits)?
+            .files()
+            .get(&ProjectPath::new("a")?)
+            .map(Vec::as_slice),
+        Some(b"text".as_slice())
+    );
+    assert_eq!(
+        read(
+            &bytes,
+            ArchiveLimits::default().with_extension_size(extension_bytes)?
+        )?
+        .files()
+        .len(),
+        1
+    );
+
+    let member_bound = ArchiveLimits::new(bytes.len(), 1 << 20, extension_bytes - 1, 10, 200)?
+        .with_extension_size(extension_bytes)?;
+    assert_eq!(
+        read(&bytes, member_bound).expect_err("extension still passes member byte bound"),
+        ArchiveError::MemberLimit
+    );
+    for value in [1, usize::try_from(ARCHIVE_EXTENSION_BYTES_MAX)?] {
+        assert!(ArchiveLimits::default().with_extension_size(value).is_ok());
+    }
+    for value in [0, usize::try_from(ARCHIVE_EXTENSION_BYTES_MAX)? + 1] {
+        assert_eq!(
+            ArchiveLimits::default().with_extension_size(value),
+            Err(ArchiveError::InvalidLimits)
+        );
+    }
+    let invalid = ConfigurationEnvironment::from_variables([(
+        "RIFT_PACKAGE_ARCHIVE_EXTENSION_SIZE",
+        "67108865b",
+    )]);
+    let configured = accept_configuration::<WorkspaceConfiguration>(None, &invalid)?;
+    assert!(matches!(
+        configured.configuration().validate(),
+        Err(
+            rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange {
+                field: "package.archive.extension_size",
+                ..
+            }
+        )
+    ));
     Ok(())
 }
 

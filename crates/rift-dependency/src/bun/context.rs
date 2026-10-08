@@ -5,7 +5,7 @@ use std::path::Path;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 use rift_protocol::read::ProjectPath;
 
-use super::{BUN_LOCK_FILE_NAME, LockedPackage, Pin, install_path, parse_lockfile};
+use super::{BUN_LOCK_FILE_NAME, LockedPackage, Pin, install_path_with_limit, parse_lockfile};
 use crate::context::ContextAnswer;
 use crate::manifest::{WorkspacePaths, file_beside, manifest_directory_path, read_static_file};
 use crate::node::{NPM_MANAGER, installed_folder, npm_selector, version_availability};
@@ -72,7 +72,11 @@ fn pin_lockfile(
             continue;
         };
         let selector = npm_selector(version);
-        if let (PackageSelector::Version(exact), Some(path)) = (&selector, install_path(key)) {
+        let nesting_depth_max =
+            usize::try_from(inputs.collection().nesting_depth).unwrap_or(usize::MAX);
+        if let (PackageSelector::Version(exact), Some(path)) =
+            (&selector, install_path_with_limit(key, nesting_depth_max))
+        {
             answer
                 .install_folders
                 .push(installed_folder(&directory, &path, (name, exact), inputs));
@@ -149,6 +153,36 @@ mod tests {
             manifests: &manifests,
         };
         BunResolver::new().context(&request, inspector)
+    }
+
+    #[test]
+    fn configured_bun_nesting_bound_controls_installed_folders() {
+        use rift_protocol::dependencies::DependenciesCollectionConfiguration;
+
+        let recorded =
+            || RecordedInspector::default().with_file(format!("{ROOT}/bun.lock"), LOCKFILE);
+        let mut low = recorded().with_collection(DependenciesCollectionConfiguration {
+            nesting_depth: 1,
+            ..Default::default()
+        });
+        let answer = context(&["package.json"], &mut low);
+        assert!(
+            answer
+                .install_folders
+                .iter()
+                .all(|folder| folder.package.name != "@types/node")
+        );
+        let mut exact = recorded().with_collection(DependenciesCollectionConfiguration {
+            nesting_depth: 2,
+            ..Default::default()
+        });
+        let answer = context(&["package.json"], &mut exact);
+        assert!(
+            answer
+                .install_folders
+                .iter()
+                .any(|folder| folder.package.name == "@types/node")
+        );
     }
 
     #[test]

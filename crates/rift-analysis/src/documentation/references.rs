@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use rift_core::symbol_identity;
 use rift_protocol::documentation::{
-    DOCUMENTATION_REFERENCES_MAX, DOCUMENTATION_TEXT_BYTES_MAX, DocumentationContentIdentity,
-    DocumentationReference, DocumentationReferenceCandidate, DocumentationReferenceEvidence,
-    DocumentationSourceIdentity, DocumentationUnresolvedReason,
+    DOCUMENTATION_REFERENCES_CEILING, DOCUMENTATION_TEXT_BYTES_CEILING,
+    DocumentationContentIdentity, DocumentationReference, DocumentationReferenceCandidate,
+    DocumentationReferenceEvidence, DocumentationSourceIdentity, DocumentationUnresolvedReason,
 };
-use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
+use rift_protocol::index::PACKAGE_SYMBOLS_CEILING;
 use rift_protocol::read::{Language, SymbolId, TextRange};
 
 use super::identity::canonical_digest;
@@ -43,7 +43,7 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
         validate_identity(source)?;
         let accepted_name = |text: &str| {
             !text.is_empty()
-                && text.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize
+                && text.len() <= DOCUMENTATION_TEXT_BYTES_CEILING as usize
                 && !text.chars().any(char::is_control)
         };
         if !accepted_name(name) || !accepted_name(qualified_name) {
@@ -157,13 +157,7 @@ pub fn resolve_references(
     declarations: &[DocumentationDeclaration<'_>],
     candidates: &[DocumentationReferenceCandidate],
 ) -> Result<ResolvedDocumentationReferences, RiftError> {
-    if declarations.len() > PACKAGE_SYMBOLS_MAX as usize
-        || candidates.len() > DOCUMENTATION_REFERENCES_MAX as usize
-    {
-        return errors::analysis::documentation_limit_exceeded()
-            .field("references")
-            .fail();
-    }
+    validate_reference_counts(declarations.len(), candidates.len())?;
     let index = DeclarationNames::new(declarations);
     let mut references = Vec::new();
     let mut unresolved = Vec::new();
@@ -212,11 +206,25 @@ pub fn resolve_references(
     })
 }
 
+pub(super) fn validate_reference_counts(
+    declarations: usize,
+    candidates: usize,
+) -> Result<(), RiftError> {
+    if declarations > PACKAGE_SYMBOLS_CEILING as usize
+        || candidates > DOCUMENTATION_REFERENCES_CEILING as usize
+    {
+        return errors::analysis::documentation_limit_exceeded()
+            .field("references")
+            .fail();
+    }
+    Ok(())
+}
+
 pub(super) fn validate_candidate(
     candidate: &DocumentationReferenceCandidate,
 ) -> Result<(), RiftError> {
     let spelling_accepted = !candidate.authored.is_empty()
-        && candidate.authored.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize;
+        && candidate.authored.len() <= DOCUMENTATION_TEXT_BYTES_CEILING as usize;
     let range_accepted = candidate.range.end > candidate.range.start;
     if !spelling_accepted || !range_accepted || !super::identity::is_digest(&candidate.block) {
         return errors::analysis::documentation_identity_invalid()
@@ -578,12 +586,15 @@ mod tests {
             Some("declaration.range")
         );
 
-        let candidates =
-            vec![candidate("open", 0); super::DOCUMENTATION_REFERENCES_MAX as usize + 1];
-        let error = resolve_references(&[], &candidates).expect_err("candidate bound");
+        let maximum = super::DOCUMENTATION_REFERENCES_CEILING as usize;
+        assert!(super::validate_reference_counts(0, maximum).is_ok());
+        let error = super::validate_reference_counts(0, maximum + 1).expect_err("candidate bound");
         assert_eq!(
             crate::documentation::failure::context_value(&error, "field").as_deref(),
             Some("references")
         );
+        let maximum = super::PACKAGE_SYMBOLS_CEILING as usize;
+        assert!(super::validate_reference_counts(maximum, 0).is_ok());
+        assert!(super::validate_reference_counts(maximum + 1, 0).is_err());
     }
 }

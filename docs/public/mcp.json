@@ -389,7 +389,7 @@
                 "items": {
                   "$ref": "#/$defs/DocumentationWarning"
                 },
-                "maxItems": 256,
+                "maxItems": 65536,
                 "type": "array"
               }
             },
