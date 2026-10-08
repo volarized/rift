@@ -35,8 +35,9 @@ use rift_provider::{
 };
 use rift_ranking::{
     DOCUMENTATION_BYTES_MAX, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
-    IDENTIFIER_TERMS_BYTES_MAX, IdentifierMatch, IdentifierRanking, IndexDocument, ParsedQuery,
-    RankingInput, SIGNATURE_BYTES_MAX, SearchableField, identifier_terms,
+    IDENTIFIER_TERMS_BYTES_MAX, IdentifierMatch, IdentifierMatcher, IdentifierRanking,
+    IndexDocument, ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField,
+    identifier_terms,
 };
 use rift_syntax::{SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -3523,6 +3524,7 @@ pub fn symbol_matches<'a>(
     query: &str,
     limit: usize,
 ) -> Vec<SymbolMatch<'a>> {
+    let identifier = IdentifierMatcher::new(query);
     let mut matches = files
         .into_iter()
         .flat_map(|file| {
@@ -3535,7 +3537,7 @@ pub fn symbol_matches<'a>(
             Some(SymbolMatch {
                 file,
                 symbol,
-                rank: symbol_rank(symbol, query)?,
+                rank: symbol_rank(symbol, &identifier)?,
             })
         })
         .collect::<Vec<_>>();
@@ -5259,8 +5261,8 @@ pub fn relative_path(path: &Path) -> Result<ProjectPath, RiftError> {
 ///
 /// The classing itself lives in `rift-ranking`, so the global API client checks a
 /// package hit's class under the same rule this index orders by.
-fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatch> {
-    rift_ranking::identifier_match(query, &symbol.name, &symbol.qualified_name)
+fn symbol_rank(symbol: &SyntaxSymbol, matcher: &IdentifierMatcher<'_>) -> Option<IdentifierMatch> {
+    matcher.matches(&symbol.name, &symbol.qualified_name)
 }
 
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a

@@ -33,8 +33,8 @@ pub use fusion::{
 };
 pub use identifier::{
     IDENTIFIER_CANDIDATES_MAX, IdentifierCandidate, IdentifierMatch, IdentifierMatchClass,
-    IdentifierRanking, identifier_candidates, identifier_match, identifier_terms, match_class,
-    split_identifier_words,
+    IdentifierMatcher, IdentifierRanking, identifier_candidates, identifier_match,
+    identifier_terms, match_class, split_identifier_words,
 };
 pub use pattern::{
     CLASS_EXPANSION_MAX, EXACT_STRINGS_MAX, Pattern, Prefilter, ROW_EXPRESSION_DEPTH_MAX, prefilter,

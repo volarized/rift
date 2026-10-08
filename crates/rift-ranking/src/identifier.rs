@@ -124,17 +124,61 @@ pub fn identifier_match(
     name: &str,
     qualified_name: &str,
 ) -> Option<IdentifierMatch> {
-    let original_exact = candidate == name || candidate == qualified_name;
-    let spelling = if original_exact {
-        IdentifierSpelling::Original
-    } else {
-        IdentifierSpelling::Normalized
-    };
-    let candidate = candidate.to_lowercase();
-    let name = name.to_lowercase();
-    let qualified_name = qualified_name.to_lowercase();
-    normalized_match_class(&candidate, &name, &qualified_name)
-        .map(|class| IdentifierMatch { spelling, class })
+    if candidate == qualified_name {
+        return Some(IdentifierMatch {
+            spelling: IdentifierSpelling::Original,
+            class: IdentifierMatchClass::QualifiedExact,
+        });
+    }
+    IdentifierMatcher::new(candidate).matches(name, qualified_name)
+}
+
+/// Matches one original candidate across declarations, normalizing the candidate once.
+#[derive(Debug)]
+pub struct IdentifierMatcher<'a> {
+    original: &'a str,
+    normalized: String,
+}
+
+impl<'a> IdentifierMatcher<'a> {
+    /// Borrows the original spelling and retains its Unicode lowercase comparison.
+    #[must_use]
+    pub fn new(candidate: &'a str) -> Self {
+        Self {
+            original: candidate,
+            normalized: candidate.to_lowercase(),
+        }
+    }
+
+    /// Matches declaration names with original spelling before normalized fallback.
+    #[must_use]
+    pub fn matches(&self, name: &str, qualified_name: &str) -> Option<IdentifierMatch> {
+        if self.original == qualified_name {
+            return Some(IdentifierMatch {
+                spelling: IdentifierSpelling::Original,
+                class: IdentifierMatchClass::QualifiedExact,
+            });
+        }
+        let qualified_name = qualified_name.to_lowercase();
+        if self.original == name {
+            let class = if self.normalized == qualified_name {
+                IdentifierMatchClass::QualifiedExact
+            } else {
+                IdentifierMatchClass::NameExact
+            };
+            return Some(IdentifierMatch {
+                spelling: IdentifierSpelling::Original,
+                class,
+            });
+        }
+        let name = name.to_lowercase();
+        normalized_match_class(&self.normalized, &name, &qualified_name).map(|class| {
+            IdentifierMatch {
+                spelling: IdentifierSpelling::Normalized,
+                class,
+            }
+        })
+    }
 }
 
 /// Classifies names whose comparison spelling is already lowercase.
@@ -466,8 +510,9 @@ impl Placement {
 #[cfg(test)]
 mod tests {
     use super::{
-        IDENTIFIER_CANDIDATES_MAX, IdentifierMatchClass, IdentifierRanking, identifier_candidates,
-        identifier_match, identifier_terms, match_class, split_identifier_words,
+        IDENTIFIER_CANDIDATES_MAX, IdentifierMatchClass, IdentifierMatcher, IdentifierRanking,
+        identifier_candidates, identifier_match, identifier_terms, match_class,
+        split_identifier_words,
     };
     use crate::document::{DocumentIdentity, SearchableField};
 
@@ -697,6 +742,105 @@ mod tests {
         assert!(original < normalized);
         assert_eq!(original.class(), IdentifierMatchClass::NameExact);
         assert_eq!(normalized.class(), IdentifierMatchClass::QualifiedExact);
+    }
+
+    #[test]
+    fn test_identifier_matcher_preserves_original_spelling_and_class_order() {
+        let identifier = IdentifierMatcher::new("SearchHit");
+        for (name, qualified_name, class, original) in [
+            (
+                "SearchHit",
+                "SearchHit",
+                IdentifierMatchClass::QualifiedExact,
+                true,
+            ),
+            (
+                "SearchHit",
+                "searchhit",
+                IdentifierMatchClass::QualifiedExact,
+                true,
+            ),
+            (
+                "SearchHit",
+                "index::SearchHit",
+                IdentifierMatchClass::NameExact,
+                true,
+            ),
+            (
+                "searchhit",
+                "searchhit",
+                IdentifierMatchClass::QualifiedExact,
+                false,
+            ),
+            (
+                "SEARCHHIT",
+                "index::SEARCHHIT",
+                IdentifierMatchClass::NameExact,
+                false,
+            ),
+            (
+                "SearchHitExtra",
+                "index::SearchHitExtra",
+                IdentifierMatchClass::NamePrefix,
+                false,
+            ),
+            (
+                "Other",
+                "SearchHit::Other",
+                IdentifierMatchClass::Substring,
+                false,
+            ),
+        ] {
+            let matched = identifier
+                .matches(name, qualified_name)
+                .expect("the identifier matches");
+            assert_eq!(matched.class(), class, "{name}: {qualified_name}");
+            assert_eq!(
+                matched.is_original_exact(),
+                original,
+                "{name}: {qualified_name}"
+            );
+            assert_eq!(
+                identifier_match("SearchHit", name, qualified_name),
+                Some(matched)
+            );
+        }
+        assert_eq!(identifier.matches("Other", "index::Other"), None);
+    }
+
+    #[test]
+    fn test_identifier_matcher_preserves_context_and_expansion_in_unicode_lowercase() {
+        for (original, lowercase) in [("ΒΑΣΟΣ", "βασος"), ("İ", "i\u{307}")] {
+            let matcher = IdentifierMatcher::new(original);
+            let exact = matcher
+                .matches(original, original)
+                .expect("original qualified name");
+            assert!(exact.is_original_exact());
+            assert_eq!(exact.class(), IdentifierMatchClass::QualifiedExact);
+            let fallback = matcher
+                .matches(lowercase, lowercase)
+                .expect("Unicode lowercase name");
+            assert!(!fallback.is_original_exact());
+            assert_eq!(fallback.class(), IdentifierMatchClass::QualifiedExact);
+            assert!(exact < fallback);
+            let qualified = format!("module::{original}");
+            let name = IdentifierMatcher::new(lowercase)
+                .matches(original, &qualified)
+                .expect("Unicode lowercase short name");
+            assert_eq!(name.class(), IdentifierMatchClass::NameExact);
+            assert!(!name.is_original_exact());
+        }
+        assert_eq!(
+            IdentifierMatcher::new("βασοσ").matches("ΒΑΣΟΣ", "ΒΑΣΟΣ"),
+            None
+        );
+        assert_eq!(
+            IdentifierMatcher::new("i")
+                .matches("İ", "İ")
+                .expect("expanded prefix")
+                .class(),
+            IdentifierMatchClass::NamePrefix
+        );
     }
 
     #[test]
