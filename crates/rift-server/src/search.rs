@@ -1349,11 +1349,11 @@ fn resolve_declaration<'a>(
 /// One resolved declaration as a match. The class is the strongest one, because
 /// resolution answers the identity fusion already placed rather than classing a
 /// name again.
-const fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> SymbolMatch<'a> {
+fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> SymbolMatch<'a> {
     SymbolMatch {
         file,
         symbol,
-        rank: IdentifierMatchClass::QualifiedExact,
+        rank: IdentifierMatchClass::QualifiedExact.into(),
     }
 }
 

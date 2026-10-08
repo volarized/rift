@@ -633,7 +633,7 @@ fn changed_hit(
         file: declaration.file,
         symbol: declaration.symbol,
         // This lane reads no identifier rank: nothing here was matched by name.
-        rank: IdentifierMatchClass::Substring,
+        rank: IdentifierMatchClass::Substring.into(),
     };
     let matched_by = vec![MatchedField::Change];
     let mut hit = build_symbol_hit(declaration.index, matched, None, matched_by, payloads)?;

@@ -2244,13 +2244,11 @@ fn validate_search_match_class(
     if claimed.is_some() && request.identifiers.is_empty() {
         return Ok(());
     }
-    let name = hit.symbol.name.to_lowercase();
-    let qualified_name = qualified_name.to_lowercase();
     let expected = request
         .identifiers
         .iter()
         .filter_map(|candidate| {
-            rift_ranking::match_class(&candidate.to_lowercase(), &name, &qualified_name)
+            rift_ranking::match_class(candidate, &hit.symbol.name, qualified_name)
         })
         .min();
     if expected != claimed {
@@ -2267,11 +2265,7 @@ fn validate_symbol_match_class(
     qualified_name: &str,
 ) -> Result<(), ClientError> {
     let actual = ranking_match_class(&hit.match_class)?;
-    let expected = rift_ranking::match_class(
-        &request.name.to_lowercase(),
-        &hit.symbol.name.to_lowercase(),
-        &qualified_name.to_lowercase(),
-    );
+    let expected = rift_ranking::match_class(&request.name, &hit.symbol.name, qualified_name);
     if expected != Some(actual) {
         return Err(ClientError::InvalidResponseField {
             field: "match_class",

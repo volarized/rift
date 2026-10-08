@@ -1957,3 +1957,234 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
     server_task.await?;
     Ok(())
 }
+
+/// Exact original spelling wins before full-text frequency chooses a different spelling.
+#[tokio::test]
+async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
+    let source = "/// searchHit searchHit searchHit searchHit\npub fn SearchHit() {}\npub fn searchHit() {}\n";
+    let (_directory, client, server_task) =
+        served_workspace(&[("src/lib.rs", source)], None).await?;
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({"query": "searchHit", "limit": 1, "include": ["source"]}),
+    )
+    .await?;
+    assert_eq!(
+        answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
+        "{answer:#}"
+    );
+    assert_eq!(
+        answer["results"][0]["source"], "pub fn searchHit() {}",
+        "{answer:#}"
+    );
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({"query": "searchHit", "limit": 10}),
+    )
+    .await?;
+    let wrong_case = answer["results"]
+        .as_array()
+        .ok_or("search carries results")?
+        .iter()
+        .find(|hit| hit["hit"]["symbol"]["name"] == "SearchHit")
+        .ok_or("full-text search keeps the other spelling")?;
+    assert!(
+        wrong_case["matched_by"]
+            .as_array()
+            .is_some_and(|fields| fields.contains(&json!("documentation"))),
+        "{answer:#}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Exact original spelling wins through MCP before a one-result page is selected (#597).
+#[tokio::test]
+async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::CasePairs).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let source = global_api::CASE_SOURCE;
+    let (_directory, client, server_task) =
+        served_workspace(&[("src/lib.rs", source)], Some(configuration)).await?;
+    for scope in ["local", "global", "all"] {
+        for name in [
+            "SearchHit",
+            "searchHit",
+            "createProgram",
+            "createprogram",
+            "load_config",
+            "Load_config",
+        ] {
+            assert_original_identifier(&client, scope, name).await?;
+        }
+        let args =
+            json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": ["source"]});
+        let answer = call_tool(&client, "search", args).await?;
+        let hits = answer["results"]
+            .as_array()
+            .ok_or("search carries results")?;
+        let names: Vec<_> = hits
+            .iter()
+            .filter_map(|hit| hit["hit"]["symbol"]["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"SearchHit") && names.contains(&"searchHit"),
+            "{answer:#}"
+        );
+    }
+    let args = json!({"query": "SearchHit and searchHit", "scope": "global", "limit": 10});
+    let answer = call_tool(&client, "search", args).await?;
+    assert_eq!(
+        answer["results"]
+            .as_array()
+            .ok_or("search carries results")?
+            .len(),
+        2,
+        "{answer:#}"
+    );
+    let requests = search_requests(&fixture).await;
+    let identifiers = requests
+        .iter()
+        .filter_map(|request| request.body.as_ref())
+        .find(|body| body["query"] == "SearchHit and searchHit" && body["phase"] == "precise")
+        .ok_or("both original candidates reach the global request")?;
+    assert_eq!(
+        identifiers["identifiers"],
+        json!(["SearchHit", "searchHit"])
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Checks search and symbol lookup spelling, source, and identity on one page.
+async fn assert_original_identifier(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    scope: &str,
+    name: &str,
+) -> TestResult {
+    let args = json!({"query": name, "scope": scope, "limit": 1, "include": ["source"]});
+    let answer = call_tool(client, "search", args).await?;
+    let hits = answer["results"]
+        .as_array()
+        .ok_or("search carries results")?;
+    assert_eq!(hits.len(), 1, "{scope}: {answer:#}");
+    let hit = &hits[0];
+    assert_eq!(hit["hit"]["symbol"]["name"], name, "{scope}: {answer:#}");
+    let expected_source = format!("pub fn {name}() {{}}");
+    assert_eq!(hit["source"], expected_source, "{scope}: {answer:#}");
+    let id = hit["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("symbol carries identity")?;
+    assert!(id.ends_with(&format!("/{name}")), "{id}");
+    let args = json!({"name": name, "scope": scope, "limit": 1, "include": ["source"]});
+    let answer = get_symbol(client, args).await?;
+    assert_eq!(
+        answer["hits"][0]["symbol"]["name"], name,
+        "{scope}: {answer:#}"
+    );
+    assert_eq!(
+        answer["hits"][0]["source"], expected_source,
+        "{scope}: {answer:#}"
+    );
+    Ok(())
+}
+
+/// Native validation accepts both original candidates and legacy normalized candidates (#597).
+#[tokio::test]
+async fn test_native_client_accepts_original_and_normalized_identifier_candidates() -> TestResult {
+    use rift_cloud_client::{Config, GlobalClient, QueryTerm};
+    let fixture = GlobalFixture::start(SymbolFixture::CasePairs).await?;
+    let client = GlobalClient::new(Config {
+        endpoint: fixture.endpoint.clone(),
+        ..Config::default()
+    })?;
+    let mut request = case_search_request("SearchHit and searchHit")?;
+    for identifiers in [vec!["SearchHit", "searchHit"], vec!["searchhit"]] {
+        request.identifiers = identifiers.into_iter().map(str::to_owned).collect();
+        let page = client.search_packages(&request, 10, None).await?;
+        assert_eq!(page.items.len(), 2);
+    }
+    for name in ["SearchHit", "searchHit", "createProgram", "load_config"] {
+        request.query = name.to_owned();
+        request.terms = vec![QueryTerm {
+            text: name.to_owned(),
+            phrase: false,
+            prefix: false,
+        }];
+        request.identifiers = vec![name.to_owned()];
+        let page = client.search_packages(&request, 1, None).await?;
+        let hit = rift_cloud_client::PackageSearchCandidate::try_from(page.items[0].clone())?;
+        let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit.hit else {
+            return Err("search returns a declaration".into());
+        };
+        assert_eq!(symbol.name, name);
+        assert_eq!(
+            hit.hit.source.as_deref(),
+            Some(format!("pub fn {name}() {{}}").as_str())
+        );
+    }
+    Ok(())
+}
+
+/// Builds the package request from the same parser the MCP path uses.
+fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSearchRequest> {
+    use rift_cloud_client::{PackageSearchRequest, PackageSearchRequestPhase, QueryTerm};
+    let parsed = rift_ranking::ParsedQuery::parse(query)?;
+    Ok(PackageSearchRequest {
+        query: query.to_owned(),
+        terms: parsed
+            .members()
+            .iter()
+            .map(|member| QueryTerm {
+                text: member.text().to_owned(),
+                phrase: member.is_phrase(),
+                prefix: false,
+            })
+            .collect(),
+        identifiers: parsed
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.text().to_owned())
+            .collect(),
+        include: Some(vec!["source".to_owned()]),
+        packages: vec![rift_cloud_client::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+        }],
+        phase: PackageSearchRequestPhase::Precise,
+        target: None,
+    })
+}
+
+/// Qualified-name comparison keeps original spelling through the local caller surface (#597).
+#[tokio::test]
+async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult {
+    let source =
+        "pub struct Vault;\nimpl Vault { pub fn createProgram() {} pub fn createprogram() {} }\n";
+    let (_directory, client, server_task) =
+        served_workspace(&[("src/lib.rs", source)], None).await?;
+    for name in ["createProgram", "createprogram"] {
+        let args = json!({"query": format!("Vault::{name}"), "limit": 1, "include": ["source"]});
+        let answer = call_tool(&client, "search", args).await?;
+        assert_eq!(
+            answer["results"][0]["hit"]["symbol"]["name"], name,
+            "{answer:#}"
+        );
+        assert_eq!(
+            answer["results"][0]["source"],
+            format!("pub fn {name}() {{}}"),
+            "{answer:#}"
+        );
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}

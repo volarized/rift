@@ -317,7 +317,7 @@ impl<'a> FileMatches<'a> {
             symbol,
             // A pattern hit carries no score, so the identifier rank no reader weighs is
             // the one class a text match reaches a declaration through.
-            rank: IdentifierMatchClass::Substring,
+            rank: IdentifierMatchClass::Substring.into(),
         };
         build_symbol_hit(owner, matched, None, vec![MatchedField::Content], payloads).map(Some)
     }

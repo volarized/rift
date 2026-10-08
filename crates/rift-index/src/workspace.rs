@@ -35,8 +35,8 @@ use rift_provider::{
 };
 use rift_ranking::{
     DOCUMENTATION_BYTES_MAX, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
-    IDENTIFIER_TERMS_BYTES_MAX, IdentifierMatchClass, IdentifierRanking, IndexDocument,
-    ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField, identifier_terms, match_class,
+    IDENTIFIER_TERMS_BYTES_MAX, IdentifierMatch, IdentifierRanking, IndexDocument, ParsedQuery,
+    RankingInput, SIGNATURE_BYTES_MAX, SearchableField, identifier_terms,
 };
 use rift_syntax::{SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -400,7 +400,7 @@ pub struct SymbolMatch<'a> {
     /// Matched declaration.
     pub symbol: &'a SyntaxSymbol,
     /// Stable semantic match priority.
-    pub rank: IdentifierMatchClass,
+    pub rank: IdentifierMatch,
 }
 
 /// Normalized symbol fields required by read results.
@@ -2970,7 +2970,11 @@ impl WorkspaceIndex {
                 if !included(matched.file) {
                     continue;
                 }
-                ranking.observe(declaration_identity(matched), matched.rank, &candidate);
+                ranking.observe_match(
+                    declaration_identity(matched),
+                    candidate.position(),
+                    matched.rank,
+                );
             }
         }
         Ok(())
@@ -3510,15 +3514,15 @@ impl WorkspaceIndex {
     }
 }
 
-/// Declaration matches for `query` across `files`, ranked qualified-exact first, then
-/// name-exact, name-prefix, and qualified-name substring. Shared so an on-demand file set
-/// (search's `force_include`) scores identically to the index.
+/// Declaration matches for `query` across `files`, ranked original name or qualified-name
+/// spelling first. Case-insensitive fallback ranks qualified-exact, name-exact, name-prefix,
+/// then qualified-name substring. An on-demand file set (search's `force_include`) scores
+/// identically to the index.
 pub fn symbol_matches<'a>(
     files: impl IntoIterator<Item = &'a IndexedFile>,
     query: &str,
     limit: usize,
 ) -> Vec<SymbolMatch<'a>> {
-    let query = query.to_lowercase();
     let mut matches = files
         .into_iter()
         .flat_map(|file| {
@@ -3531,7 +3535,7 @@ pub fn symbol_matches<'a>(
             Some(SymbolMatch {
                 file,
                 symbol,
-                rank: symbol_rank(symbol, &query)?,
+                rank: symbol_rank(symbol, query)?,
             })
         })
         .collect::<Vec<_>>();
@@ -5251,16 +5255,12 @@ pub fn relative_path(path: &Path) -> Result<ProjectPath, RiftError> {
     })
 }
 
-/// The class one declaration's names reach against a lowercase query.
+/// The match one declaration's original names reach against the query.
 ///
 /// The classing itself lives in `rift-ranking`, so the global API client checks a
 /// package hit's class under the same rule this index orders by.
-fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClass> {
-    match_class(
-        query,
-        &symbol.name.to_lowercase(),
-        &symbol.qualified_name.to_lowercase(),
-    )
+fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatch> {
+    rift_ranking::identifier_match(query, &symbol.name, &symbol.qualified_name)
 }
 
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a
@@ -5629,6 +5629,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+    use rift_ranking::IdentifierMatchClass;
     use rift_syntax::SyntaxDocument;
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
 
@@ -8284,17 +8285,23 @@ mod tests {
 
         let exact = index.symbols("Rift::update", 5).expect("qualified match");
         assert_eq!(exact[0].symbol.qualified_name, "Rift::update");
-        assert_eq!(exact[0].rank, IdentifierMatchClass::QualifiedExact);
+        assert_eq!(exact[0].rank.class(), IdentifierMatchClass::QualifiedExact);
         assert_eq!(
-            index.symbols("update", 5).expect("name match")[0].rank,
+            index.symbols("update", 5).expect("name match")[0]
+                .rank
+                .class(),
             IdentifierMatchClass::NameExact
         );
         assert_eq!(
-            index.symbols("upd", 5).expect("prefix match")[0].rank,
+            index.symbols("upd", 5).expect("prefix match")[0]
+                .rank
+                .class(),
             IdentifierMatchClass::NamePrefix
         );
         assert_eq!(
-            index.symbols("pda", 5).expect("substring match")[0].rank,
+            index.symbols("pda", 5).expect("substring match")[0]
+                .rank
+                .class(),
             IdentifierMatchClass::Substring
         );
         assert_eq!(
