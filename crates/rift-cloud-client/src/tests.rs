@@ -2136,25 +2136,27 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
     }
 }
 
-/// The reported class keeps the normalized contract across original and legacy candidates.
+/// Original name matching chooses the reported class before a qualified case fallback.
 #[test]
-fn test_search_match_class_preserves_legacy_class_order() {
+fn test_search_match_class_uses_original_spelling_before_class() {
     let mut request = search_request();
     request.query = "module::searchhit SearchHit".to_owned();
     let mut value = search_hit_json("demo", "first");
     value["symbol"]["name"] = serde_json::json!("SearchHit");
-    value["match_class"] = serde_json::json!("qualified_exact");
+    value["match_class"] = serde_json::json!("name_exact");
     let hit: PackageSearchHit = serde_json::from_value(value).expect("search hit fixture");
-    for identifiers in [
-        vec!["module::searchhit".to_owned(), "SearchHit".to_owned()],
-        vec!["module::searchhit".to_owned(), "searchhit".to_owned()],
-    ] {
-        request.identifiers = identifiers;
-        assert_eq!(
-            super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
-            Ok(())
-        );
-    }
+    request.identifiers = vec!["module::searchhit".to_owned(), "SearchHit".to_owned()];
+    assert_eq!(
+        super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
+        Ok(())
+    );
+    request.identifiers.clear();
+    assert_eq!(
+        super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
+        Err(ClientError::InvalidResponseField {
+            field: "match_class"
+        })
+    );
 }
 
 /// A hit found by its text or its vector reports `unknown`, and the page reaches the caller when

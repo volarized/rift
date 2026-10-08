@@ -37,16 +37,18 @@ pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/demo@1.0.0/src/lib.
 const COLLECTED_SOURCE: &str = "pub fn helper_beacon() {}\npub fn beacon() {}\n";
 
 /// The case-distinct declarations served by the identifier regression.
-pub(crate) const CASE_SOURCE: &str = "pub fn SearchHit() {}\npub fn searchHit() {}\npub fn createProgram() {}\npub fn createprogram() {}\npub fn load_config() {}\npub fn Load_config() {}\n";
+pub(crate) const CASE_SOURCE: &str = "pub fn SearchHit() {}\npub fn searchHit() {}\npub fn createProgram() {}\npub fn createprogram() {}\npub fn load_config() {}\npub fn Load_config() {}\npub fn Foo() {}\npub fn foo() {}\n";
 
 /// The declarations in [`CASE_SOURCE`], in source order.
-const CASE_DECLARATIONS: [&str; 6] = [
+const CASE_DECLARATIONS: [&str; 8] = [
     "SearchHit",
     "searchHit",
     "createProgram",
     "createprogram",
     "load_config",
     "Load_config",
+    "Foo",
+    "foo",
 ];
 
 /// The declarations [`COLLECTED_SOURCE`] carries, in source order.

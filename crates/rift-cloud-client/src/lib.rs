@@ -2234,23 +2234,21 @@ fn validate_symbol_identity(
 
 /// Checks a search hit's class against the request's identifiers. A hit reporting `unknown`,
 /// found by its text or its vector, matches none of them; a hit claiming an identifier class
-/// carries the best class `rift_ranking::match_class` gives it.
+/// carries the best match `rift_ranking::identifier_match` gives it.
 fn validate_search_match_class(
     request: &PackageSearchRequest,
     hit: &PackageSearchHit,
     qualified_name: &str,
 ) -> Result<(), ClientError> {
     let claimed = search_match_class(&hit.match_class)?;
-    if claimed.is_some() && request.identifiers.is_empty() {
-        return Ok(());
-    }
     let expected = request
         .identifiers
         .iter()
         .filter_map(|candidate| {
-            rift_ranking::match_class(candidate, &hit.symbol.name, qualified_name)
+            rift_ranking::identifier_match(candidate, &hit.symbol.name, qualified_name)
         })
-        .min();
+        .min()
+        .map(rift_ranking::IdentifierMatch::class);
     if expected != claimed {
         return Err(ClientError::InvalidResponseField {
             field: "match_class",
@@ -2265,7 +2263,8 @@ fn validate_symbol_match_class(
     qualified_name: &str,
 ) -> Result<(), ClientError> {
     let actual = ranking_match_class(&hit.match_class)?;
-    let expected = rift_ranking::match_class(&request.name, &hit.symbol.name, qualified_name);
+    let expected = rift_ranking::identifier_match(&request.name, &hit.symbol.name, qualified_name)
+        .map(rift_ranking::IdentifierMatch::class);
     if expected != Some(actual) {
         return Err(ClientError::InvalidResponseField {
             field: "match_class",

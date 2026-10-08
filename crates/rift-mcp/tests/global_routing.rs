@@ -2020,6 +2020,8 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
             "createprogram",
             "load_config",
             "Load_config",
+            "Foo",
+            "foo",
         ] {
             assert_original_identifier(&client, scope, name).await?;
         }
@@ -2038,8 +2040,27 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
             "{answer:#}"
         );
     }
-    let args = json!({"query": "SearchHit and searchHit", "scope": "global", "limit": 10});
-    let answer = call_tool(&client, "search", args).await?;
+    for (query, identifiers) in [
+        ("SearchHit and searchHit", ["SearchHit", "searchHit"]),
+        ("Foo foo", ["Foo", "foo"]),
+        ("foo Foo", ["foo", "Foo"]),
+    ] {
+        assert_identifier_request(&client, &fixture, query, identifiers).await?;
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Both original spellings reach the package request in query order.
+async fn assert_identifier_request(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    fixture: &GlobalFixture,
+    query: &str,
+    expected: [&str; 2],
+) -> TestResult {
+    let args = json!({"query": query, "scope": "global", "limit": 10});
+    let answer = call_tool(client, "search", args).await?;
     assert_eq!(
         answer["results"]
             .as_array()
@@ -2048,18 +2069,13 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
         2,
         "{answer:#}"
     );
-    let requests = search_requests(&fixture).await;
+    let requests = search_requests(fixture).await;
     let identifiers = requests
         .iter()
         .filter_map(|request| request.body.as_ref())
-        .find(|body| body["query"] == "SearchHit and searchHit" && body["phase"] == "precise")
+        .find(|body| body["query"] == query && body["phase"] == "precise")
         .ok_or("both original candidates reach the global request")?;
-    assert_eq!(
-        identifiers["identifiers"],
-        json!(["SearchHit", "searchHit"])
-    );
-    client.cancel().await?;
-    server_task.await?;
+    assert_eq!(identifiers["identifiers"], json!(expected));
     Ok(())
 }
 
@@ -2096,9 +2112,9 @@ async fn assert_original_identifier(
     Ok(())
 }
 
-/// Native validation accepts both original candidates and legacy normalized candidates (#597).
+/// Native validation accepts original candidates and package results (#597).
 #[tokio::test]
-async fn test_native_client_accepts_original_and_normalized_identifier_candidates() -> TestResult {
+async fn test_native_client_accepts_original_identifier_candidates() -> TestResult {
     use rift_cloud_client::{Config, GlobalClient, QueryTerm};
     let fixture = GlobalFixture::start(SymbolFixture::CasePairs).await?;
     let client = GlobalClient::new(Config {
@@ -2106,11 +2122,8 @@ async fn test_native_client_accepts_original_and_normalized_identifier_candidate
         ..Config::default()
     })?;
     let mut request = case_search_request("SearchHit and searchHit")?;
-    for identifiers in [vec!["SearchHit", "searchHit"], vec!["searchhit"]] {
-        request.identifiers = identifiers.into_iter().map(str::to_owned).collect();
-        let page = client.search_packages(&request, 10, None).await?;
-        assert_eq!(page.items.len(), 2);
-    }
+    let page = client.search_packages(&request, 10, None).await?;
+    assert_eq!(page.items.len(), 2);
     for name in ["SearchHit", "searchHit", "createProgram", "load_config"] {
         request.query = name.to_owned();
         request.terms = vec![QueryTerm {

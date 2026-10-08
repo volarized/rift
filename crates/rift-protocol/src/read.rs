@@ -366,10 +366,10 @@ pub enum GetSymbolInclude {
 ]))]
 pub struct GetSymbolParams {
     /// The declaration name to look up - a name, not a full `SymbolId` or free-text
-    /// query; `search` takes free text. Matching is case-insensitive. An exact symbol
-    /// name ranks first, then prefix matches, then qualified-name substrings; every tier
-    /// joins the result set, so a substring match still answers, after the exact and
-    /// prefix matches.
+    /// query; `search` takes free text. The server ranks exact original name or qualified-name
+    /// spelling first, followed by case-insensitive exact, prefix, and qualified-name substring
+    /// matches. Every tier joins the result set, so a substring match still answers after
+    /// the exact and prefix matches.
     #[schemars(length(min = 1, max = 4096))]
     pub name: String,
     /// Narrows the answer to one language. Omitted searches every served language.
