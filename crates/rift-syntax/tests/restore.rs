@@ -202,6 +202,49 @@ fn invalid_ranges_names_order_and_source_witness_are_refused() {
 }
 
 #[test]
+fn symbol_ranges_must_stay_inside_the_declaration() {
+    let text = "pub fn open() {}\npub fn close() {}\n";
+    let document = parsed(ShippedLanguage::Rust, text);
+    let original = parts(document.facts());
+    let outside = original.symbols[1].range;
+    for field in 0..4 {
+        let mut invalid = original.clone();
+        match field {
+            0 => invalid.symbols[0].item_range = outside,
+            1 => invalid.symbols[0].name_range = Some(outside),
+            2 => invalid.symbols[0].body_range = Some(outside),
+            3 => invalid.symbols[0].documentation_ranges = vec![outside],
+            _ => unreachable!("four declaration ranges"),
+        }
+        assert_eq!(
+            SyntaxFacts::from_parts(text, SyntaxLimits::default(), invalid)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_range_invalid::SLUG),
+            "field {field}"
+        );
+    }
+}
+
+#[test]
+fn authored_containers_need_portable_names_but_may_be_unresolved() {
+    let text = "pub mod client { pub fn open() {} }\n";
+    let document = parsed(ShippedLanguage::Rust, text);
+    let original = parts(document.facts());
+    let mut invalid = original.clone();
+    invalid.symbols[1].container = Some("bad\nname".to_owned());
+    assert_eq!(
+        SyntaxFacts::from_parts(text, SyntaxLimits::default(), invalid)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_name_invalid::SLUG)
+    );
+    let mut authored = original;
+    authored.symbols[1].container = Some("client::authored".to_owned());
+    let restored = SyntaxFacts::from_parts(text, SyntaxLimits::default(), authored.clone())
+        .expect("unresolved authored container");
+    assert_eq!(restored.symbols(), authored.symbols);
+}
+
+#[test]
 fn symbol_parent_cycles_and_exceeded_bounds_are_refused() {
     let text = "pub mod client { pub fn open() {} }\n";
     let document = parsed(ShippedLanguage::Rust, text);
@@ -398,6 +441,149 @@ fn markdown_collections_source_and_depth_bounds_are_enforced() {
         )
         .map_err(|error| error.slug()),
         Err(errors::syntax::facts_depth_exceeded::SLUG)
+    );
+}
+
+#[test]
+fn markdown_headings_must_match_declarations_and_precede_their_blocks() {
+    let text = "# Beacon\n\nOpen a file.\n\n## Client\n\nClose a file.\n";
+    let document = parsed(ShippedLanguage::Markdown, text);
+    let original = markdown_parts(document.markdown_facts().expect("Markdown facts"));
+    for field in 0..3 {
+        let mut invalid = original.clone();
+        let mut symbols = document.symbols().to_vec();
+        match field {
+            0 => symbols[invalid.headings[0].symbol_index].kind = "function",
+            1 => {
+                symbols[invalid.headings[0].symbol_index].range = ByteRange { start: 0, end: 0 };
+            }
+            2 => invalid.headings[0].level = 0,
+            _ => unreachable!("three heading fields"),
+        }
+        assert_eq!(
+            MarkdownFacts::from_parts(text, &symbols, SyntaxLimits::default(), invalid)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_structure_invalid::SLUG),
+            "field {field}"
+        );
+    }
+    for heading in [usize::MAX, 1] {
+        let mut invalid = original.clone();
+        invalid.blocks[0].heading = Some(heading);
+        assert_eq!(
+            MarkdownFacts::from_parts(text, document.symbols(), SyntaxLimits::default(), invalid)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_reference_invalid::SLUG)
+        );
+    }
+}
+
+#[test]
+fn markdown_candidates_and_link_fields_need_containing_ranges() {
+    let text = "# Beacon\n\nSee [Client](guide.md#client) and `Client`.\n";
+    let document = parsed(ShippedLanguage::Markdown, text);
+    let original = markdown_parts(document.markdown_facts().expect("Markdown facts"));
+    let mut unordered = original.clone();
+    let mut later = unordered.reference_candidates[0];
+    later.range.start += 1;
+    unordered.reference_candidates.insert(0, later);
+    assert_eq!(
+        MarkdownFacts::from_parts(text, document.symbols(), SyntaxLimits::default(), unordered)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_order_invalid::SLUG)
+    );
+    let mut invalid = original.clone();
+    invalid.reference_candidates[0].block_range = ByteRange { start: 0, end: 0 };
+    assert_eq!(
+        MarkdownFacts::from_parts(text, document.symbols(), SyntaxLimits::default(), invalid)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG)
+    );
+    let mut invalid = original.clone();
+    invalid.reference_candidates[0].block_range = original.blocks[0].range;
+    assert_eq!(
+        MarkdownFacts::from_parts(text, document.symbols(), SyntaxLimits::default(), invalid)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_reference_invalid::SLUG)
+    );
+    for field in 0..3 {
+        let mut invalid = original.clone();
+        let outside = Some(ByteRange { start: 0, end: 1 });
+        match field {
+            0 => invalid.links[0].destination_range = outside,
+            1 => invalid.links[0].fragment_range = outside,
+            2 => invalid.links[0].label_range = outside,
+            _ => unreachable!("three link fields"),
+        }
+        assert_eq!(
+            MarkdownFacts::from_parts(text, document.symbols(), SyntaxLimits::default(), invalid)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_range_invalid::SLUG),
+            "field {field}"
+        );
+    }
+}
+
+#[test]
+fn markdown_blocks_before_first_heading_keep_no_heading_context() {
+    let text = "Open a file.\n\n# Beacon\n\nClose a file.\n";
+    let document = parsed(ShippedLanguage::Markdown, text);
+    let original = document.markdown_facts().expect("Markdown facts");
+    assert_eq!(original.blocks()[0].heading, None);
+    let restored = MarkdownFacts::from_parts(
+        text,
+        document.symbols(),
+        SyntaxLimits::default(),
+        markdown_parts(original),
+    )
+    .expect("prose before first heading");
+    assert_eq!(&restored, original);
+}
+
+#[test]
+fn markdown_omitted_ranges_preserve_source_order() {
+    let text = "# Beacon\n\nOpen a file.\n";
+    let document = parsed(ShippedLanguage::Markdown, text);
+    let mut original = markdown_parts(document.markdown_facts().expect("Markdown facts"));
+    original.omitted_ranges = vec![
+        ByteRange { start: 0, end: 1 },
+        ByteRange { start: 2, end: 3 },
+    ];
+    let restored = MarkdownFacts::from_parts(
+        text,
+        document.symbols(),
+        SyntaxLimits::default(),
+        original.clone(),
+    )
+    .expect("ordered omitted ranges");
+    assert_eq!(restored.omitted_ranges(), original.omitted_ranges);
+    original.omitted_ranges.reverse();
+    assert_eq!(
+        MarkdownFacts::from_parts(text, document.symbols(), SyntaxLimits::default(), original)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_order_invalid::SLUG)
+    );
+}
+
+#[test]
+fn markdown_facts_are_required_only_for_markdown_language() {
+    let text = "# Beacon\n";
+    let markdown = parsed(ShippedLanguage::Markdown, text);
+    let mut missing = parts(markdown.facts());
+    missing.markdown_facts = None;
+    assert_eq!(
+        SyntaxFacts::from_parts(text, SyntaxLimits::default(), missing)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_structure_invalid::SLUG)
+    );
+    let rust_text = "pub fn open() {}\n";
+    let rust = parsed(ShippedLanguage::Rust, rust_text);
+    let mut invalid = parts(rust.facts());
+    invalid.markdown_facts = markdown.markdown_facts().cloned();
+    assert_eq!(
+        SyntaxFacts::from_parts(rust_text, SyntaxLimits::default(), invalid)
+            .map_err(|error| error.slug()),
+        Err(errors::syntax::facts_structure_invalid::SLUG)
     );
 }
 

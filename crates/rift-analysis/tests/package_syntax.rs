@@ -119,6 +119,9 @@ fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
             |source| {
                 if source.path().as_str() == path {
                     assert_eq!(source.identity().language, shipped.language());
+                    assert_eq!(source.text(), text);
+                } else {
+                    assert_eq!(source.text(), files[1].1);
                 }
                 capture(source, &mut retained)
             },
