@@ -3861,12 +3861,14 @@ pub fn compute() -> i32 {
 
     #[test]
     fn documentation_error_keeps_its_identity_and_evidence() {
-        let failure = rift_index::DocumentationCollection::from_candidate_blocks(
+        let candidate = rift_index::DocumentationCollection::from_candidate_blocks(
             rift_protocol::read::Digest("00000000".to_owned()),
             Vec::new(),
             Vec::new(),
         )
-        .expect_err("incompatible documentation revision");
+        .expect("stored documentation revision");
+        let failure = rift_index::DocumentationCollection::new(candidate.index().clone())
+            .expect_err("incompatible documentation revision");
         let error = failure;
 
         assert_eq!(

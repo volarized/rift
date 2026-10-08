@@ -139,12 +139,13 @@ impl DocumentationCollection {
     /// Validates a bounded set of stored blocks and their source facts for search projection.
     ///
     /// The caller reads every record from one immutable publication set and checks its
-    /// revision before this call. This view contains no links or reverse references;
+    /// captured revision before this call. That revision can differ from this build.
+    /// This view contains no links or reverse references;
     /// it does not replace the persisted complete collection or its selection digest.
     ///
     /// # Errors
     ///
-    /// Refuses incompatible revisions, duplicate identities, invalid ranges, or bounds.
+    /// Refuses invalid revisions, duplicate identities, invalid ranges, or bounds.
     pub fn from_candidate_blocks(
         documentation_revision: Digest,
         mut sources: Vec<DocumentationSource>,
@@ -172,7 +173,7 @@ impl DocumentationCollection {
                 .error()
         })?;
         let selection_digest = source_selection_digest(sources.iter())?;
-        Self::new(DocumentationIndex {
+        let index = DocumentationIndex {
             documentation_revision,
             selection_digest,
             sources,
@@ -187,7 +188,9 @@ impl DocumentationCollection {
                 truncated: 0,
             },
             warnings: Vec::new(),
-        })
+        };
+        validate_counts(&index, None)?;
+        Self::from_index(index, None)
     }
 
     /// Validates a complete candidate before its caller publishes it.
@@ -202,7 +205,17 @@ impl DocumentationCollection {
         Self::new_with_limits(index, None)
     }
 
-    pub(super) fn new_with_limits(
+    /// Validates a complete candidate under its accepted collection bounds.
+    ///
+    /// The candidate must use this build's documentation revision. `None` applies
+    /// the protocol ceilings; supplied limits come from checked configuration.
+    /// The caller keeps its prior collection when this candidate is refused.
+    ///
+    /// # Errors
+    ///
+    /// Refuses incompatible revisions, invalid identities, ranges, ordering,
+    /// relationships, or collection bounds.
+    pub fn new_with_limits(
         index: DocumentationIndex,
         limits: Option<super::DocumentationLimits>,
     ) -> Result<Self, RiftError> {
@@ -212,6 +225,13 @@ impl DocumentationCollection {
                 .field("documentation_revision")
                 .fail();
         }
+        Self::from_index(index, limits)
+    }
+
+    fn from_index(
+        index: DocumentationIndex,
+        limits: Option<super::DocumentationLimits>,
+    ) -> Result<Self, RiftError> {
         let sources = validate_sources(&index)?;
         let selection_digest = source_selection_digest(index.sources.iter())?;
         if index.selection_digest != selection_digest {
@@ -1331,6 +1351,159 @@ mod tests {
                 reason: DocumentationUnresolvedReason::Missing,
             },
         }
+    }
+
+    #[test]
+    fn fresh_publication_applies_accepted_source_count() {
+        use crate::documentation::DocumentationLimits;
+        use rift_protocol::documentation::DocumentationConfiguration;
+
+        let mut candidate = index(vec![
+            source("first.md", "hello world"),
+            source("second.md", "hello there"),
+        ]);
+        candidate.blocks[1].identity = content_digest(b"second block");
+        let configuration = DocumentationConfiguration {
+            max_sources: 1,
+            ..DocumentationConfiguration::default()
+        };
+        let limits = DocumentationLimits::from_configuration(&configuration)
+            .expect("accepted documentation limits");
+        let failure = DocumentationCollection::new_with_limits(candidate.clone(), Some(limits))
+            .expect_err("candidate exceeds accepted source count");
+        assert_refusal(&failure, DocumentationViolation::LimitExceeded, "sources");
+        let configuration = DocumentationConfiguration {
+            max_sources: 2,
+            ..configuration
+        };
+        let limits = DocumentationLimits::from_configuration(&configuration)
+            .expect("accepted documentation limits");
+        let accepted = DocumentationCollection::new_with_limits(candidate.clone(), Some(limits))
+            .expect("candidate fits accepted source count");
+        assert_eq!(accepted.index(), &candidate);
+        let accepted = DocumentationCollection::new_with_limits(candidate.clone(), None)
+            .expect("candidate fits protocol ceilings");
+        assert_eq!(accepted.index(), &candidate);
+    }
+
+    #[test]
+    fn stored_projection_keeps_old_and_current_revisions() {
+        use crate::documentation::DocumentationProjection;
+
+        let old_revision = Digest("0123abcd".to_owned());
+        assert_ne!(old_revision, documentation_revision());
+        let mut old_index = index(vec![source("old.md", "hello world")]);
+        old_index.documentation_revision = old_revision.clone();
+        let error = DocumentationCollection::new(old_index.clone())
+            .expect_err("fresh publication refuses stored revision");
+        assert_refusal(
+            &error,
+            DocumentationViolation::Revision,
+            "documentation_revision",
+        );
+        let error = DocumentationCollection::new_with_limits(
+            old_index.clone(),
+            Some(crate::documentation::DocumentationLimits::default()),
+        )
+        .expect_err("fresh limits constructor refuses stored revision");
+        assert_refusal(
+            &error,
+            DocumentationViolation::Revision,
+            "documentation_revision",
+        );
+        let old = DocumentationCollection::from_candidate_blocks(
+            old_revision.clone(),
+            old_index.sources.clone(),
+            old_index.blocks.clone(),
+        )
+        .expect("stored projection accepts captured revision");
+        assert_eq!(old.index(), &old_index);
+
+        let mut current_index = index(vec![source("current.md", "hello there")]);
+        current_index.blocks[0].identity = content_digest(b"current block");
+        let current =
+            DocumentationCollection::new(current_index.clone()).expect("current publication");
+        let held = [&old, &current];
+        let projection = DocumentationProjection::from_collections(&held).expect("mixed revisions");
+        for expected in [&old_index, &current_index] {
+            let identity = rift_ranking::DocumentIdentity::for_documentation_block(
+                &expected.blocks[0].identity.0,
+            )
+            .expect("stored block identity");
+            let hit = projection.hit(&identity).expect("projected stored block");
+            assert_eq!(hit.documentation_revision, expected.documentation_revision);
+            assert_eq!(hit.block, expected.blocks[0]);
+            assert_eq!(hit.source, expected.sources[0]);
+            super::validate_documentation_hit(&hit).expect("stored hit validates");
+        }
+        assert!(DocumentationProjection::from_collections(&[&old, &old]).is_err());
+    }
+
+    #[test]
+    fn stored_projection_preserves_structural_refusals() {
+        let base = index(vec![source("README.md", "hello world")]);
+        let old = Digest("0123abcd".to_owned());
+        for revision in [Digest("invalid".to_owned()), Digest("ABCDEF01".to_owned())] {
+            let error = DocumentationCollection::from_candidate_blocks(
+                revision,
+                base.sources.clone(),
+                base.blocks.clone(),
+            )
+            .expect_err("invalid stored revision");
+            assert_refusal(
+                &error,
+                DocumentationViolation::Revision,
+                "documentation_revision",
+            );
+        }
+        let mut invalid_origin = base.clone();
+        invalid_origin.sources[0].origin.location = None;
+        let mut invalid_range = base.clone();
+        invalid_range.blocks[0].range.end = 12;
+        let mut missing_source = base.clone();
+        missing_source.blocks[0].source = source("missing.md", "hello world").identity;
+        let mut duplicate_source = base.clone();
+        duplicate_source
+            .sources
+            .push(duplicate_source.sources[0].clone());
+        let mut duplicate_block = base.clone();
+        duplicate_block
+            .blocks
+            .push(duplicate_block.blocks[0].clone());
+        let mut source_bytes = base.clone();
+        source_bytes.sources[0].byte_length =
+            u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_CEILING) + 1;
+        for refused in [
+            invalid_origin,
+            invalid_range,
+            missing_source,
+            duplicate_source,
+            duplicate_block,
+            source_bytes,
+        ] {
+            assert!(
+                DocumentationCollection::from_candidate_blocks(
+                    old.clone(),
+                    refused.sources,
+                    refused.blocks,
+                )
+                .is_err()
+            );
+        }
+        let ceiling = u64::from(rift_protocol::documentation::DOCUMENTATION_SOURCE_BYTES_CEILING);
+        let count = usize::try_from(
+            rift_protocol::documentation::DOCUMENTATION_TOTAL_BYTES_CEILING / ceiling,
+        )
+        .expect("bounded source count")
+            + 1;
+        let sources = (0..count)
+            .map(|position| {
+                let mut retained = source(&format!("docs/{position}.md"), "hello world");
+                retained.byte_length = ceiling;
+                retained
+            })
+            .collect();
+        assert!(DocumentationCollection::from_candidate_blocks(old, sources, Vec::new()).is_err());
     }
 
     fn refused_field(candidate: DocumentationIndex, expected: &str) {

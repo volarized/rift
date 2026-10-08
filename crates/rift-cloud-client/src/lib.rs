@@ -1914,8 +1914,6 @@ fn validate_search_page(
                 if !documentation_requested
                     || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
                     || !packages.contains(&package_key(&hit.package))
-                    || page.documentation_revision.as_deref()
-                        != Some(hit.documentation.documentation_revision.as_str())
                 {
                     return Err(ClientError::InvalidResponseField {
                         field: "documentation",
@@ -2019,13 +2017,6 @@ fn validate_symbol_page(
                 &symbol_id,
                 &domain::package_identity(&hit.package),
             )?;
-            if page.documentation_revision.as_deref()
-                != Some(context.documentation_revision.as_str())
-            {
-                return Err(ClientError::InvalidResponseField {
-                    field: "documentation_revision",
-                });
-            }
         }
         if !seen.insert(symbol_hit_identity(hit)) {
             return Err(ClientError::InvalidResponseField {
