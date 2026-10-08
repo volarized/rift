@@ -161,7 +161,6 @@ fn normalized_match_class(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IdentifierCandidate {
     text: String,
-    normalized_text: String,
     position: usize,
 }
 
@@ -170,12 +169,6 @@ impl IdentifierCandidate {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
-    }
-
-    /// The candidate lowercased for case-insensitive comparison.
-    #[must_use]
-    pub fn normalized_text(&self) -> &str {
-        &self.normalized_text
     }
 
     /// The candidate's place in the query, counting from the front. Two
@@ -200,8 +193,8 @@ impl IdentifierCandidate {
 ///    the final segment of a qualified name.
 ///
 /// A plain prose word with no case counterpart contributes nothing: it reaches
-/// the full-text ranking through its own input, and adding it here would rank every declaration
-/// whose qualified name happens to carry it.
+/// the full-text ranking through its own input, and adding it here would rank
+/// every declaration whose qualified name happens to carry it.
 #[must_use]
 pub fn identifier_candidates(query: &str) -> Vec<IdentifierCandidate> {
     let mut candidates: Vec<IdentifierCandidate> = Vec::new();
@@ -246,36 +239,6 @@ fn has_case_counterpart(query: &str, token: &str) -> bool {
         .any(|other| other != token && other.to_lowercase() == normalized)
 }
 
-/// Accepts original candidates or the deduplicated lowercase list older callers send.
-///
-/// Each list retains candidate order. A mixed list or an unrelated identifier is refused.
-#[must_use]
-pub fn identifier_candidates_match(
-    candidates: &[IdentifierCandidate],
-    supplied: &[String],
-) -> bool {
-    if candidates.len() == supplied.len()
-        && candidates
-            .iter()
-            .zip(supplied)
-            .all(|(candidate, text)| candidate.text() == text)
-    {
-        return true;
-    }
-    let mut normalized: Vec<&str> = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let text = candidate.normalized_text();
-        if !normalized.contains(&text) {
-            normalized.push(text);
-        }
-    }
-    normalized.len() == supplied.len()
-        && normalized
-            .iter()
-            .zip(supplied)
-            .all(|(candidate, text)| *candidate == text)
-}
-
 /// Appends one original spelling, keeping its first candidate position.
 fn push_candidate(candidates: &mut Vec<IdentifierCandidate>, value: &str) {
     let text = value.to_owned();
@@ -283,12 +246,7 @@ fn push_candidate(candidates: &mut Vec<IdentifierCandidate>, value: &str) {
         return;
     }
     let position = candidates.len();
-    let normalized_text = value.to_lowercase();
-    candidates.push(IdentifierCandidate {
-        text,
-        normalized_text,
-        position,
-    });
+    candidates.push(IdentifierCandidate { text, position });
 }
 
 /// Whether the whole value is one identifier token: no whitespace, at least
@@ -714,15 +672,6 @@ mod tests {
                 .enumerate()
                 .all(|(index, candidate)| candidate.position() == index)
         );
-        let candidates = identifier_candidates("Foo foo");
-        assert!(super::identifier_candidates_match(
-            &candidates,
-            &["Foo".to_owned(), "foo".to_owned()]
-        ));
-        assert!(super::identifier_candidates_match(
-            &candidates,
-            &["foo".to_owned()]
-        ));
     }
 
     #[test]
@@ -775,7 +724,6 @@ mod tests {
         ] {
             let candidates = identifier_candidates(spelling);
             assert_eq!(candidates[0].text(), spelling);
-            assert_eq!(candidates[0].normalized_text(), spelling.to_lowercase());
             let matched =
                 identifier_match(spelling, spelling, spelling).expect("the identifier matches");
             assert_eq!(matched.class(), IdentifierMatchClass::QualifiedExact);
@@ -806,21 +754,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["SearchHit", "searchHit"]
         );
-    }
-
-    #[test]
-    fn test_candidate_lists_accept_original_or_legacy_normalized_spelling() {
-        let candidates = identifier_candidates("SearchHit and searchHit");
-        let originals = vec!["SearchHit".to_owned(), "searchHit".to_owned()];
-        let legacy = vec!["searchhit".to_owned()];
-        let mixed = vec!["SearchHit".to_owned(), "searchhit".to_owned()];
-        let unrelated = vec!["OtherName".to_owned()];
-        assert!(super::identifier_candidates_match(&candidates, &originals));
-        assert!(super::identifier_candidates_match(&candidates, &legacy));
-        assert!(!super::identifier_candidates_match(&candidates, &mixed));
-        assert!(!super::identifier_candidates_match(&candidates, &unrelated));
-        assert!(!super::identifier_candidates_match(&candidates, &[]));
-        assert!(super::identifier_candidates_match(&[], &[]));
     }
 
     #[test]
