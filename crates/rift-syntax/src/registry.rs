@@ -93,7 +93,7 @@ pub fn shipped_languages()
 }
 
 /// The provider claiming `extension` (without its leading dot); `None` when
-/// no shipped definition claims it.
+/// no shipped definition claims it. Matching ignores ASCII case.
 #[must_use]
 pub fn provider_for_extension(extension: &str) -> Option<&'static dyn SyntaxProvider> {
     entry_for_extension(extension).map(|entry| entry.provider.as_ref())
@@ -104,7 +104,7 @@ fn entry_for_extension(extension: &str) -> Option<&'static RegisteredLanguage> {
     registry()
         .entries
         .iter()
-        .find(|entry| entry.definition.extensions().contains(&extension))
+        .find(|entry| entry.definition.matches_extension(extension))
 }
 
 /// The provider filing facts under `language`; `None` when no shipped
@@ -172,7 +172,9 @@ mod tests {
             source_file_extensions(),
             [
                 "rs", "js", "jsx", "mjs", "cjs", "ts", "mts", "cts", "tsx", "md", "markdown",
-                "mdx", "json", "yaml", "yml", "toml", "py", "pyi"
+                "mdx", "json", "yaml", "yml", "toml", "py", "pyi", "html", "htm", "css", "vue",
+                "svelte", "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "pyx",
+                "pxd", "pxi", "jsonc"
             ]
         );
     }
@@ -184,13 +186,15 @@ mod tests {
         for (definition, _provider) in shipped_languages() {
             let language = definition.shipped().language();
             for extension in definition.extensions() {
-                let claimed = provider_for_extension(extension)
-                    .unwrap_or_else(|| panic!("a shipped definition claims {extension}"));
-                assert_eq!(
-                    claimed.language(),
-                    &language,
-                    "extension {extension} must route to its own language"
-                );
+                for extension in [(*extension).to_owned(), extension.to_ascii_uppercase()] {
+                    let claimed = provider_for_extension(&extension)
+                        .unwrap_or_else(|| panic!("a shipped definition claims {extension}"));
+                    assert_eq!(
+                        claimed.language(),
+                        &language,
+                        "extension {extension} must route to its own language"
+                    );
+                }
             }
         }
     }

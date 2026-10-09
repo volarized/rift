@@ -986,6 +986,15 @@ impl WorkspaceSourcePolicy {
 /// One file the build left out of the index.
 #[derive(Debug, Clone)]
 pub enum WorkspaceIndexWarning {
+    /// Captured package or component evidence could not resolve framework syntax.
+    FrameworkContextUnresolved {
+        /// Workspace-relative source path.
+        path: ProjectPath,
+        /// Framework whose interpretation is unresolved.
+        framework: rift_protocol::read::SyntaxFramework,
+        /// Missing or dynamic source evidence.
+        detail: String,
+    },
     /// File bytes are not valid UTF-8.
     InvalidUtf8Source {
         /// Workspace-relative path.
@@ -1030,6 +1039,18 @@ impl PartialEq for WorkspaceIndexWarning {
                 && left.context().collect::<Vec<_>>() == right.context().collect::<Vec<_>>()
         };
         match (self, other) {
+            (
+                Self::FrameworkContextUnresolved {
+                    path: left,
+                    framework: left_framework,
+                    detail: left_detail,
+                },
+                Self::FrameworkContextUnresolved {
+                    path: right,
+                    framework: right_framework,
+                    detail: right_detail,
+                },
+            ) => left == right && left_framework == right_framework && left_detail == right_detail,
             (
                 Self::InvalidUtf8Source {
                     path: left_path,
@@ -1168,6 +1189,8 @@ pub struct IndexedFileNodes {
     pub file: IndexedFile,
     /// Nodes that cover the requested position.
     pub nodes: Vec<SyntaxNode>,
+    /// Framework context unresolved for these captured source bytes.
+    pub warnings: Vec<rift_protocol::read::ReadWarning>,
 }
 
 impl<File> IndexRead<File> {
@@ -1245,8 +1268,182 @@ impl LeftOutFileState {
 pub(crate) struct IndexContents {
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    framework_sources: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     warnings: Vec<WorkspaceIndexWarning>,
+}
+
+impl IndexContents {
+    fn build_with_frameworks(
+        mut self,
+        root: &Path,
+        language: &WorkspaceLanguagePolicy,
+        limits: WorkspaceIndexLimits,
+        previous: Option<&WorkspaceIndex>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(BuiltContents, rift_analysis::FrameworkContext), RiftError> {
+        let context =
+            self.apply_frameworks(root, language, limits.syntax(), previous, cancelled)?;
+        built_contents(
+            root,
+            self.sorted(),
+            limits.declarations_max(),
+            limits.relationships_max(),
+            previous.map(|index| index.semantics.graph()),
+        )
+        .map(|built| (built, context))
+    }
+
+    fn resolve_frameworks(
+        &mut self,
+        language: &WorkspaceLanguagePolicy,
+        limits: SyntaxLimits,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<rift_analysis::FrameworkContext, RiftError> {
+        let sources = self
+            .text_files
+            .values()
+            .chain(self.framework_sources.values())
+            .map(|file| rift_analysis::PackageSource::new(file.path(), file.content()))
+            .collect::<Vec<_>>();
+        let context = rift_analysis::FrameworkContext::resolve(
+            &sources,
+            language.frameworks(),
+            limits,
+            cancelled,
+        )?;
+        for source in &sources {
+            self.warnings
+                .extend(framework_warnings(source.path(), context.warnings()));
+        }
+        Ok(context)
+    }
+
+    fn apply_frameworks(
+        &mut self,
+        root: &Path,
+        language: &WorkspaceLanguagePolicy,
+        limits: SyntaxLimits,
+        previous: Option<&WorkspaceIndex>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<rift_analysis::FrameworkContext, RiftError> {
+        let context = self.resolve_frameworks(language, limits, cancelled)?;
+        let paths = self
+            .files
+            .keys()
+            .filter(|path| {
+                context.for_path(path).is_some()
+                    || previous.is_some_and(|previous| previous.frameworks.for_path(path).is_some())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            check_cancelled(cancelled)?;
+            let Some(file) = self.files.get(&path).cloned() else {
+                continue;
+            };
+            let absolute = root.join(path.as_str());
+            let Some(ClassifiedPath::Source(provider)) = language.classifies(&absolute)? else {
+                continue;
+            };
+            let retained = previous
+                .and_then(|index| index.raw_syntax.get(&path))
+                .filter(|facts| {
+                    facts.source_digest() == Some(&file.digest())
+                        && facts.syntax_limits() == Some(limits)
+                        && facts.language() == provider.language()
+                });
+            let raw = retained.map_or_else(|| Arc::clone(file.syntax_facts()), Arc::clone);
+            if context.for_path(&path).is_some() {
+                self.raw_syntax.insert(path.clone(), Arc::clone(&raw));
+            } else {
+                self.raw_syntax.remove(&path);
+                self.files.insert(
+                    path.clone(),
+                    Arc::new(IndexedFile::new_with_shared_syntax(
+                        path,
+                        Arc::clone(file.source_content()),
+                        file.digest(),
+                        file.executable(),
+                        raw,
+                    )),
+                );
+                continue;
+            }
+
+            let result = analyze_source(&path, file.source(), &absolute, provider, limits)
+                .and_then(|document| {
+                    context
+                        .apply(
+                            SyntaxSource {
+                                path: &path,
+                                text: file.source(),
+                            },
+                            limits,
+                            document,
+                        )
+                        .map_err(|error| {
+                            errors::index::workspace_syntax()
+                                .path(&absolute)
+                                .cause(error)
+                                .error()
+                        })
+                });
+            match result {
+                Ok((document, warnings, _)) => {
+                    self.warnings.extend(framework_warnings(&path, &warnings));
+                    self.files.insert(
+                        path.clone(),
+                        Arc::new(IndexedFile::new(
+                            path,
+                            file.source().to_owned().into(),
+                            file.digest(),
+                            file.executable(),
+                            document,
+                        )),
+                    );
+                }
+                Err(error) => {
+                    let Some(warning) = left_out_file(error, path.clone())? else {
+                        continue;
+                    };
+                    self.files.remove(&path);
+                    if let Some(text_file) = self.text_files.remove(&path) {
+                        self.hold_parsed_source((*text_file).clone(), IndexRead::Skipped(warning));
+                    }
+                }
+            }
+        }
+        self.raw_syntax
+            .retain(|path, _| self.files.contains_key(path) && context.for_path(path).is_some());
+        Ok(context)
+    }
+}
+
+fn framework_warnings(
+    path: &ProjectPath,
+    warnings: &[rift_protocol::read::ReadWarning],
+) -> Vec<WorkspaceIndexWarning> {
+    let unit = rift_protocol::read::FileId(format!(
+        "rift://file/{}",
+        rift_core::encode_path(path.as_str())
+    ));
+    warnings
+        .iter()
+        .filter_map(|warning| match warning {
+            rift_protocol::read::ReadWarning::FrameworkContextUnresolved {
+                unit: observed,
+                framework,
+                detail,
+            } if observed == &unit => Some(WorkspaceIndexWarning::FrameworkContextUnresolved {
+                path: path.clone(),
+                framework: *framework,
+                detail: detail.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Project-relative paths selected for one workspace map.
@@ -1757,6 +1954,8 @@ impl IndexContents {
         Self {
             files: index.files.clone(),
             text_files: index.text_files.clone(),
+            framework_sources: index.framework_sources.clone(),
+            raw_syntax: index.raw_syntax.clone(),
             left_out: index.left_out.clone(),
             warnings: index.warnings.clone(),
         }
@@ -1769,17 +1968,27 @@ impl IndexContents {
         let mut contents = Self {
             files: index.files.clone(),
             text_files: index.text_files.clone(),
+            framework_sources: index.framework_sources.clone(),
+            raw_syntax: index.raw_syntax.clone(),
             left_out: index.left_out.clone(),
             warnings: index
                 .warnings
                 .iter()
-                .filter(|warning| !touched.contains(warning.path()))
+                .filter(|warning| {
+                    !touched.contains(warning.path())
+                        && !matches!(
+                            warning,
+                            WorkspaceIndexWarning::FrameworkContextUnresolved { .. }
+                        )
+                })
                 .cloned()
                 .collect(),
         };
         for path in changes.paths() {
             contents.files.remove(path);
             contents.text_files.remove(path);
+            contents.framework_sources.remove(path);
+            contents.raw_syntax.remove(path);
             contents.left_out.remove(path);
         }
         contents
@@ -2077,6 +2286,10 @@ impl IndexContents {
     /// Keeps one lockfile search leaves out by its digests alone: the index serves nothing
     /// from it, and the capture and the dependency context still see it move.
     pub(crate) fn hold_lockfile(&mut self, text_file: &TextSourceFile) {
+        if text_file.path().as_str().rsplit('/').next() == Some("package-lock.json") {
+            self.framework_sources
+                .insert(text_file.path().clone(), Arc::new(text_file.clone()));
+        }
         self.left_out
             .insert(text_file.path().clone(), LeftOutFileState::of(text_file));
     }
@@ -2140,7 +2353,8 @@ impl WorkspaceIndexWarning {
     #[must_use]
     pub fn path(&self) -> &ProjectPath {
         match self {
-            Self::InvalidUtf8Source { path, .. }
+            Self::FrameworkContextUnresolved { path, .. }
+            | Self::InvalidUtf8Source { path, .. }
             | Self::BinarySource(path)
             | Self::FileTooLarge { path, .. }
             | Self::SyntaxTooLarge { path, .. }
@@ -2154,6 +2368,7 @@ impl WorkspaceIndexWarning {
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
+            Self::FrameworkContextUnresolved { detail, .. } => detail.clone(),
             Self::InvalidUtf8Source { .. } => "holds bytes that are not valid UTF-8".to_owned(),
             Self::BinarySource(_) => "contains a NUL byte".to_owned(),
             Self::FileTooLarge { error, .. }
@@ -2178,10 +2393,13 @@ pub struct WorkspaceIndex {
     root: PathBuf,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    framework_sources: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     composition: ProviderComposition,
     limits: WorkspaceIndexLimits,
     language: Arc<WorkspaceLanguagePolicy>,
+    frameworks: Arc<rift_analysis::FrameworkContext>,
     content_cache: WorkspaceContentCache,
     symbol_documents: RwLock<BTreeMap<ProjectPath, CachedSymbolDocuments>>,
     symbol_document_entry_count: Arc<AtomicU64>,
@@ -2387,14 +2605,19 @@ impl WorkspaceIndex {
             rift_tracing::traced!(component = "index", operation = "index.discover", {
                 discover_cancellable(&root, limits, visibility, &language, cancelled)
             })?;
-        let BuiltContents {
-            files,
-            text_files,
-            left_out,
-            warnings,
-            fingerprint,
-            semantics,
-        } = rift_tracing::traced!(component = "index", operation = "index.parse", {
+        let (
+            BuiltContents {
+                files,
+                text_files,
+                framework_sources,
+                raw_syntax,
+                left_out,
+                warnings,
+                fingerprint,
+                semantics,
+            },
+            frameworks,
+        ) = rift_tracing::traced!(component = "index", operation = "index.parse", {
             let mut workspace_bytes = 0_usize;
             let mut contents = IndexContents::default();
             contents.hold_parsed_sources(
@@ -2421,13 +2644,7 @@ impl WorkspaceIndex {
                 cancelled,
             )?;
             check_cancelled(cancelled)?;
-            built_contents(
-                &root,
-                contents.sorted(),
-                limits.declarations_max(),
-                limits.relationships_max(),
-                previous.map(|index| index.semantics.graph()),
-            )
+            contents.build_with_frameworks(&root, &language, limits, previous, cancelled)
         })?;
         let declarations = rift_tracing::traced!(
             component = "documentation",
@@ -2453,10 +2670,13 @@ impl WorkspaceIndex {
             root,
             files,
             text_files,
+            framework_sources,
+            raw_syntax,
             left_out,
             composition,
             limits,
             language,
+            frameworks: Arc::new(frameworks),
             content_cache: content_cache.clone(),
             symbol_documents,
             symbol_document_entry_count,
@@ -2503,8 +2723,8 @@ impl WorkspaceIndex {
     }
 
     /// Builds the named-path index, checking `cancelled` between paths and at each phase
-    /// boundary after them: before the semantics graph, before the declarations, before
-    /// the documentation collection, and before the symbol documents.
+    /// boundary after them: during framework context, before the semantics graph,
+    /// before declarations, documentation collection, and symbol documents.
     ///
     /// The phases after the named paths cover every held file, so they are where a
     /// one-path rebuild spends its time, and a caller that no longer wants the result
@@ -2526,9 +2746,18 @@ impl WorkspaceIndex {
             self.read_indexed_path(path, &mut contents, &mut workspace_bytes)?;
         }
         check_cancelled(cancelled)?;
+        let frameworks = contents.apply_frameworks(
+            &self.root,
+            &self.language,
+            self.limits.syntax(),
+            Some(self),
+            cancelled,
+        )?;
         let BuiltContents {
             files,
             text_files,
+            framework_sources,
+            raw_syntax,
             left_out,
             warnings,
             fingerprint,
@@ -2561,10 +2790,13 @@ impl WorkspaceIndex {
             root: self.root.clone(),
             files,
             text_files,
+            framework_sources,
+            raw_syntax,
             left_out,
             composition: composition()?,
             limits: self.limits,
             language: Arc::clone(&self.language),
+            frameworks: Arc::new(frameworks),
             content_cache: self.content_cache.clone(),
             symbol_documents,
             symbol_document_entry_count,
@@ -2646,7 +2878,7 @@ impl WorkspaceIndex {
     )]
     pub(crate) fn from_parts(
         root: PathBuf,
-        contents: IndexContents,
+        mut contents: IndexContents,
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
         language: Arc<WorkspaceLanguagePolicy>,
@@ -2654,9 +2886,13 @@ impl WorkspaceIndex {
         content_cache: WorkspaceContentCache,
         previous: Option<&Self>,
     ) -> Result<Self, RiftError> {
+        let frameworks =
+            contents.apply_frameworks(&root, &language, limits.syntax(), previous, &|| false)?;
         let BuiltContents {
             files,
             text_files,
+            framework_sources,
+            raw_syntax,
             left_out,
             warnings,
             fingerprint,
@@ -2686,10 +2922,13 @@ impl WorkspaceIndex {
             root,
             files,
             text_files,
+            framework_sources,
+            raw_syntax,
             left_out,
             composition,
             limits,
             language,
+            frameworks: Arc::new(frameworks),
             content_cache,
             symbol_documents,
             symbol_document_entry_count,
@@ -3256,13 +3495,31 @@ impl WorkspaceIndex {
                 IndexRead::Included(file) => file,
                 IndexRead::Skipped(warning) => return Ok(Some(IndexRead::Skipped(warning))),
             };
-        let syntax = match analyze_source(
+        let (syntax, warnings) = match analyze_source(
             path,
             text_file.content(),
             &absolute,
             provider,
             self.limits.syntax(),
-        ) {
+        )
+        .and_then(|document| {
+            self.frameworks
+                .apply(
+                    SyntaxSource {
+                        path,
+                        text: text_file.content(),
+                    },
+                    self.limits.syntax(),
+                    document,
+                )
+                .map(|(document, warnings, _)| (document, warnings))
+                .map_err(|error| {
+                    errors::index::workspace_syntax()
+                        .path(&absolute)
+                        .cause(error)
+                        .error()
+                })
+        }) {
             Ok(syntax) => syntax,
             Err(error) => match left_out_file(error, path.clone()) {
                 Ok(Some(warning)) if warning.holds_text() => {
@@ -3281,7 +3538,11 @@ impl WorkspaceIndex {
             text_file.executable(),
             syntax,
         );
-        Ok(Some(IndexRead::Included(IndexedFileNodes { file, nodes })))
+        Ok(Some(IndexRead::Included(IndexedFileNodes {
+            file,
+            nodes,
+            warnings,
+        })))
     }
 
     /// Returns one baseline text file by canonical project path.
@@ -3380,6 +3641,22 @@ impl WorkspaceIndex {
             provider,
             self.limits.syntax(),
         )?;
+        let (syntax, _, _) = self
+            .frameworks
+            .apply(
+                SyntaxSource {
+                    path,
+                    text: file.source(),
+                },
+                self.limits.syntax(),
+                syntax,
+            )
+            .map_err(|error| {
+                errors::index::workspace_syntax()
+                    .path(&absolute)
+                    .cause(error)
+                    .error()
+            })?;
         Ok(Some(
             syntax.nodes_at(position).into_iter().cloned().collect(),
         ))
@@ -3723,6 +4000,8 @@ pub(crate) fn component<Input: 'static, Output: 'static>(
 struct BuiltContents {
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    framework_sources: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     warnings: Vec<WorkspaceIndexWarning>,
     fingerprint: WorkspaceFingerprint,
@@ -3803,12 +4082,16 @@ fn built_contents(
                         let IndexContents {
                             files,
                             text_files,
+                            framework_sources,
+                            raw_syntax,
                             left_out,
                             warnings,
                         } = contents;
                         return Ok(BuiltContents {
                             files,
                             text_files,
+                            framework_sources,
+                            raw_syntax,
                             left_out,
                             warnings,
                             fingerprint,
@@ -5731,7 +6014,8 @@ mod tests {
             | WorkspaceIndexWarning::SyntaxTooLarge { path, error }
             | WorkspaceIndexWarning::Contribution { path, error } => (path, error),
             WorkspaceIndexWarning::BinarySource(_)
-            | WorkspaceIndexWarning::DeclarationsBeyondBound(_) => return false,
+            | WorkspaceIndexWarning::DeclarationsBeyondBound(_)
+            | WorkspaceIndexWarning::FrameworkContextUnresolved { .. } => return false,
         };
         warning_path == path
             && (error.slug() == slug
@@ -11640,10 +11924,10 @@ mod tests {
             .expect("changed source");
         let changes = resolved(&index, directory.path(), &["a.rs"]);
         assert_eq!(changes.len(), 1, "the named path needs replacement");
-        // One changed path is checked before its read and once after the loop. The three
-        // checks after those stand before the declarations, the documentation collection,
-        // and the symbol documents.
-        for passed in 2..=4_usize {
+        // One changed path is checked before its read and once after the loop. Four
+        // later checks cover framework context, declarations, documentation collection,
+        // and symbol documents.
+        for passed in 2..=5_usize {
             let checks = AtomicUsize::new(0);
             let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= passed;
             let error = index
@@ -11667,8 +11951,8 @@ mod tests {
         assert_eq!(rebuilt.file_count(), 1);
         assert_eq!(
             checks.load(Ordering::SeqCst),
-            5,
-            "one changed path meets five checks"
+            6,
+            "one changed path meets six checks"
         );
     }
 
@@ -11925,5 +12209,76 @@ mod tests {
             Some(index.tree_revision().as_str()),
             "a syntax-indexed file's bytes move the tree revision"
         );
+    }
+}
+
+#[cfg(test)]
+mod framework_cache_tests {
+    use super::*;
+
+    #[test]
+    fn framework_facts_keep_raw_cache_alive_across_publications() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"tailwindcss":"3.4.0"}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(root.join("tailwind.config.js"), "export default {};")
+            .expect("configuration");
+        std::fs::write(root.join("view.html"), "<div class=\"flex\"></div>").expect("source");
+        let limits = WorkspaceIndexLimits::default();
+        let cache = WorkspaceContentCache::default();
+        let first = WorkspaceIndex::build_with_languages_cancellable_and_cache(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &cache,
+            &|| false,
+        )
+        .expect("index");
+        let path = ProjectPath::new("view.html").expect("path");
+        let provider = registry::provider_for_extension("html").expect("HTML provider");
+        let (_, raw) = cache.get(
+            first.file(&path).expect("file").digest(),
+            limits.syntax(),
+            provider,
+        );
+        let raw = raw.expect("raw facts remain alive after contextual facts replace file");
+        assert!(raw.symbols().iter().all(|symbol| symbol.kind != "utility"));
+        assert!(
+            first
+                .file(&path)
+                .expect("file")
+                .syntax()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.kind == "utility")
+        );
+        let second = first
+            .rescanned(&SourceVisibility::default())
+            .expect("rescan");
+        drop(first);
+        let (_, retained) = cache.get(
+            second.file(&path).expect("file").digest(),
+            limits.syntax(),
+            provider,
+        );
+        assert!(Arc::ptr_eq(
+            &raw,
+            &retained.expect("next publication retains raw facts")
+        ));
+        std::fs::write(root.join("package.json"), "{}").expect("remove evidence");
+        let ordinary = second
+            .rescanned(&SourceVisibility::default())
+            .expect("ordinary rescan");
+        drop(second);
+        assert!(Arc::ptr_eq(
+            &raw,
+            ordinary.file(&path).expect("file").syntax_facts()
+        ));
     }
 }

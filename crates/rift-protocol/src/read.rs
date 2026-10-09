@@ -1045,11 +1045,32 @@ pub const GLOBAL_WARNING_DETAIL_CHARS_MAX: usize = 12_431;
 /// counts the rest.
 pub const SOURCE_WARNINGS_MAX: usize = 8;
 
+/// Frameworks whose syntax depends on package or component context.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxFramework {
+    /// Angular templates owned by an imported `Component` decorator.
+    Angular,
+    /// Tailwind directives and classes under a known major version.
+    Tailwind,
+}
+
 /// One warning attached to a read result. The answer stands; the warning carries evidence
 /// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
 pub enum ReadWarning {
+    /// Framework context could not be resolved for one source. Ordinary syntax stands;
+    /// framework-specific facts whose context is missing are left out.
+    FrameworkContextUnresolved {
+        /// The source whose framework context is unresolved.
+        unit: FileId,
+        /// The framework whose context could not be established.
+        framework: SyntaxFramework,
+        /// The missing package version, configuration, or template source.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// The lookup found no declaration under its name, language, and scope.
     /// `alternatives` names up to three project declarations, ordered by the smallest
     /// case-insensitive Unicode Levenshtein distance to their short or qualified names.

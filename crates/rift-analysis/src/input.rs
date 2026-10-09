@@ -297,6 +297,8 @@ pub struct ExactPackageInput<'input> {
     language: &'input Language,
     origin: &'input ContributionOrigin,
     files: &'input [PackageSource<'input>],
+    context_sources: &'input [PackageSource<'input>],
+    frameworks: &'input [rift_protocol::configuration::SyntaxFrameworkConfiguration],
     limits: ExactPackageLimits,
 }
 
@@ -363,6 +365,8 @@ impl<'input> ExactPackageInput<'input> {
             language,
             origin,
             files,
+            context_sources: &[],
+            frameworks: &[],
             limits,
         })
     }
@@ -389,6 +393,60 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub const fn files(self) -> &'input [PackageSource<'input>] {
         self.files
+    }
+
+    /// Adds bounded package metadata and explicit framework selections.
+    ///
+    /// Selected files already belong to context. Additional sources must have distinct
+    /// paths and share the same aggregate source count and byte bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source validation failures as [`Self::new`].
+    pub fn with_framework_context(
+        mut self,
+        sources: &'input [PackageSource<'input>],
+        frameworks: &'input [rift_protocol::configuration::SyntaxFrameworkConfiguration],
+    ) -> Result<Self, RiftError> {
+        let observed = self.files.len().saturating_add(sources.len());
+        let bound = self.limits.files_max.min(self.limits.publication().units);
+        if observed > bound as usize {
+            return errors::analysis::package_input_too_many_files()
+                .field("package_files_max")
+                .bound(u64::from(bound))
+                .observed(u64::try_from(observed).unwrap_or(u64::MAX))
+                .fail();
+        }
+        let combined = self
+            .files
+            .iter()
+            .chain(sources)
+            .copied()
+            .collect::<Vec<_>>();
+        ExactPackageInput::new(
+            self.package,
+            self.language,
+            self.origin,
+            &combined,
+            self.limits,
+        )?;
+        self.context_sources = sources;
+        self.frameworks = frameworks;
+        Ok(self)
+    }
+
+    /// Additional captured package context sources.
+    #[must_use]
+    pub const fn context_sources(self) -> &'input [PackageSource<'input>] {
+        self.context_sources
+    }
+
+    /// Explicit source framework selections.
+    #[must_use]
+    pub const fn frameworks(
+        self,
+    ) -> &'input [rift_protocol::configuration::SyntaxFrameworkConfiguration] {
+        self.frameworks
     }
 
     /// Bounds validated for this input.

@@ -110,6 +110,51 @@ fn installed_package<'a>(key: &'a str, package: &'a LockedPackage) -> Option<Ins
     }
 }
 
+/// Reads installed npm package versions keyed by their lockfile installation path.
+/// Workspace links and entries without a version are left out.
+///
+/// # Errors
+///
+/// Returns the JSON parser's error when the lockfile is invalid.
+pub fn npm_package_versions(bytes: &[u8]) -> Result<BTreeMap<String, String>, serde_json::Error> {
+    let lockfile: Lockfile = serde_json::from_slice(bytes)?;
+    Ok(lockfile
+        .packages
+        .iter()
+        .filter_map(|(key, package)| {
+            installed_package(key, package).map(|package| (key.clone(), package.version.to_owned()))
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod framework_tests {
+    #[test]
+    fn installed_framework_versions_preserve_workspace_installation_paths() {
+        let versions = super::npm_package_versions(
+            br#"{"packages":{
+            "node_modules/tailwindcss":{"version":"3.4.0"},
+            "apps/new/node_modules/tailwindcss":{"version":"4.0.0"},
+            "node_modules/linked":{"link":true,"resolved":"apps/linked"},
+            "apps/linked":{"version":"1.0.0"},
+            "node_modules/missing":{}
+        }}"#,
+        )
+        .expect("valid lockfile");
+        assert_eq!(
+            versions.get("node_modules/tailwindcss").map(String::as_str),
+            Some("3.4.0")
+        );
+        assert_eq!(
+            versions
+                .get("apps/new/node_modules/tailwindcss")
+                .map(String::as_str),
+            Some("4.0.0")
+        );
+        assert_eq!(versions.len(), 2);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

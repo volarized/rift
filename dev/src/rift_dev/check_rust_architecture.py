@@ -52,6 +52,7 @@ EXPECTED_EDGES = {
     "rift-history-store -> rift-ranking",
     "rift-history-store -> rift-tracing",
     "rift-analysis -> rift-core",
+    "rift-analysis -> rift-dependency",
     "rift-analysis -> rift-error",
     "rift-cloud-client -> rift-analysis",
     "rift-analysis -> rift-protocol",

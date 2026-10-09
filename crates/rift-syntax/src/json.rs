@@ -192,6 +192,12 @@ impl Default for JsonSyntaxProvider {
     }
 }
 
+impl JsonSyntaxProvider {
+    pub(crate) fn with_language(language: Language) -> Self {
+        Self { language }
+    }
+}
+
 impl SyntaxProvider for JsonSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language

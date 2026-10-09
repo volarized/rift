@@ -11,7 +11,7 @@ use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
 use rift_error::RiftError;
 use rift_protocol::canonical::canonical_json;
 use rift_protocol::read::PackageIdentity;
-use rift_syntax::{ShippedLanguage, SyntaxLimits};
+use rift_syntax::{ShippedLanguage, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames};
 
 fn analyze(
     version: &str,
@@ -79,36 +79,124 @@ fn lookup(source: &PackageSyntaxSource<'_>, retained: &[PackageSyntax]) -> Optio
         .cloned()
 }
 
+fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
+    let facts = syntax.facts();
+    let names = SyntaxNames::new(facts.language()).expect("recorded provider");
+    let mut symbols = facts.symbols().to_vec();
+    for symbol in &mut symbols {
+        let kind = symbol.kind.to_owned();
+        symbol.kind = names.symbol_kind(&kind).expect("restored provider kind");
+        symbol.node_kind = symbol.node_kind.map(|kind| {
+            let captured = kind.to_owned();
+            names.node_kind(&captured).expect("restored grammar kind")
+        });
+    }
+    let digest = rift_core::FileDigest::of(text.as_bytes());
+    assert_eq!(syntax.identity().source_digest, digest);
+    let restored = SyntaxFacts::from_parts(
+        text,
+        syntax.identity().limits,
+        SyntaxFactsParts {
+            origin: facts.origin(),
+            language: facts.language().clone(),
+            symbols,
+            has_errors: facts.has_errors(),
+            left_out_declarations: facts.left_out_declaration_count(),
+            markdown_facts: facts.markdown_facts().cloned(),
+            source_digest: digest,
+        },
+    )
+    .expect("checked restored facts");
+    assert_eq!(&restored, facts.as_ref());
+    PackageSyntax::new(syntax.identity().clone(), Arc::new(restored))
+}
+
+const PACKAGE_PROVIDER_CASES: [(ShippedLanguage, &str, &str); 16] = [
+    (
+        ShippedLanguage::Rust,
+        "src/lib.rs",
+        "/// Opens a file.\npub fn open() {}\n",
+    ),
+    (
+        ShippedLanguage::Python,
+        "module.py",
+        "def open():\n    return 1\n",
+    ),
+    (
+        ShippedLanguage::JavaScript,
+        "index.js",
+        "export function open() {}\n",
+    ),
+    (
+        ShippedLanguage::TypeScript,
+        "index.ts",
+        "export function open(): void {}\n",
+    ),
+    (
+        ShippedLanguage::TypeScriptTsx,
+        "index.tsx",
+        "export function open(): null { return null; }\n",
+    ),
+    (
+        ShippedLanguage::Html,
+        "client.html",
+        "<main id=\"client\"><script>function open() { return 1; }</script><style>.client { color: blue; }</style></main>",
+    ),
+    (
+        ShippedLanguage::HtmlAngular,
+        "client.html",
+        "@if (ready) { <main>{{ client }}</main> }",
+    ),
+    (
+        ShippedLanguage::Css,
+        "client.css",
+        ".client { --client-color: blue; color: var(--client-color); }",
+    ),
+    (
+        ShippedLanguage::Vue,
+        "client.vue",
+        "<script lang=\"ts\">export function open(): number { return 1; }</script><template><main>{{ open() }}</main></template><style>.client { color: blue; }</style>",
+    ),
+    (
+        ShippedLanguage::Svelte,
+        "client.svelte",
+        "<script lang=\"ts\">export function open(): number { return 1; }</script><main>{open()}</main><style>.client { color: blue; }</style>",
+    ),
+    (
+        ShippedLanguage::C,
+        "client.h",
+        "#include \"base.h\"\nstruct Client { int port; };\nint open_client(void) { return 1; }\n",
+    ),
+    (
+        ShippedLanguage::Cpp,
+        "client.H",
+        "namespace client { class Client { public: int open() { return 1; } }; }",
+    ),
+    (
+        ShippedLanguage::Cython,
+        "client.pxd",
+        "include \"base.pxi\"\ncdef int open_client(int port)\n",
+    ),
+    (
+        ShippedLanguage::Cython,
+        "client.pyx",
+        "include \"base.pxi\"\ncdef class Client:\n    cpdef int open(self):\n        return 1\n",
+    ),
+    (
+        ShippedLanguage::Cython,
+        "client.pxi",
+        "cdef int client_port = 8080\n",
+    ),
+    (
+        ShippedLanguage::Jsonc,
+        "client.jsonc",
+        "// client\n{\"port\": 8080}",
+    ),
+];
+
 #[test]
 fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
-    let cases = [
-        (
-            ShippedLanguage::Rust,
-            "src/lib.rs",
-            "/// Opens a file.\npub fn open() {}\n",
-        ),
-        (
-            ShippedLanguage::Python,
-            "module.py",
-            "def open():\n    return 1\n",
-        ),
-        (
-            ShippedLanguage::JavaScript,
-            "index.js",
-            "export function open() {}\n",
-        ),
-        (
-            ShippedLanguage::TypeScript,
-            "index.ts",
-            "export function open(): void {}\n",
-        ),
-        (
-            ShippedLanguage::TypeScriptTsx,
-            "index.tsx",
-            "export function open(): null { return null; }\n",
-        ),
-    ];
-    for (shipped, path, text) in cases {
+    for (shipped, path, text) in PACKAGE_PROVIDER_CASES {
         let files = [(path, text), ("README.md", "# Beacon\n\nOpen a file.\n")];
         let mut retained = Vec::new();
         let first = analyze(
@@ -144,6 +232,22 @@ fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
         assert_eq!(reused.syntax_work().provider_calls, 0, "{path}");
         assert_eq!(reused.syntax_work().reused_files, 2, "{path}");
         assert_eq!(fresh.syntax_work().provider_calls, 2, "{path}");
+        let restored: Vec<_> = retained
+            .iter()
+            .zip(files)
+            .map(|(syntax, (_, source))| checked_restored(syntax, source))
+            .collect();
+        let restored_reused = analyze(
+            "1.0.0",
+            shipped,
+            &files,
+            SyntaxLimits::default(),
+            |source| lookup(source, &restored),
+        )
+        .expect("restored supplied package");
+        assert_eq!(canonical(&restored_reused), canonical(&fresh), "{path}");
+        assert_eq!(restored_reused.syntax_work().provider_calls, 0, "{path}");
+        assert_eq!(restored_reused.syntax_work().reused_files, 2, "{path}");
         assert!(Arc::ptr_eq(
             reused.files()[0].file().syntax_facts(),
             retained[1].facts()
@@ -580,4 +684,56 @@ fn changed_typescript_companion_keeps_current_joined_signatures() {
             .display
             .contains("string")
     );
+}
+
+#[test]
+fn explicit_package_dialect_refuses_facts_from_default_extension_provider() {
+    for (default, selected, path, text) in [
+        (
+            ShippedLanguage::C,
+            ShippedLanguage::Cpp,
+            "client.h",
+            "struct Client { int port; };",
+        ),
+        (
+            ShippedLanguage::Html,
+            ShippedLanguage::HtmlAngular,
+            "client.html",
+            "<main>{{ client }}</main>",
+        ),
+    ] {
+        let files = [(path, text)];
+        let mut retained = Vec::new();
+        analyze(
+            "1.0.0",
+            default,
+            &files,
+            SyntaxLimits::default(),
+            |source| capture(source, &mut retained),
+        )
+        .expect("default provider");
+        let changed = analyze(
+            "1.0.0",
+            selected,
+            &files,
+            SyntaxLimits::default(),
+            |source| {
+                assert_eq!(source.identity().language, selected.language());
+                Some(PackageSyntax::new(
+                    source.identity().clone(),
+                    Arc::clone(retained[0].facts()),
+                ))
+            },
+        )
+        .expect("current explicit provider");
+        let fresh = analyze("1.0.0", selected, &files, SyntaxLimits::default(), |_| None)
+            .expect("fresh explicit provider");
+        assert_eq!(canonical(&changed), canonical(&fresh));
+        assert_eq!(changed.syntax_work().provider_calls, 1);
+        assert_eq!(changed.syntax_work().reused_files, 0);
+        assert_eq!(
+            changed.files()[0].file().syntax().language(),
+            &selected.language()
+        );
+    }
 }

@@ -934,6 +934,18 @@ pub(crate) fn analyze(
     limits: SyntaxLimits,
     source: SyntaxSource<'_>,
 ) -> Result<SyntaxDocument, RiftError> {
+    analyze_included(language, grammar, kinds, limits, source, &[])
+}
+
+/// Parses original source bytes within ordered ranges supplied by the host grammar.
+pub(crate) fn analyze_included(
+    language: &Language,
+    grammar: &tree_sitter::Language,
+    kinds: &'static EcmaScriptKinds,
+    limits: SyntaxLimits,
+    source: SyntaxSource<'_>,
+    ranges: &[tree_sitter::Range],
+) -> Result<SyntaxDocument, RiftError> {
     if source.text.len() > limits.source_bytes_max() {
         return errors::syntax::source_too_large()
             .path(source.path)
@@ -949,6 +961,10 @@ pub(crate) fn analyze(
             .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
             .error()
     })?;
+    assert!(
+        parser.set_included_ranges(ranges).is_ok(),
+        "host grammar ranges must be ordered and non-overlapping: ranges={ranges:?}",
+    );
     let tree = parser
         .parse(source.text, None)
         .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;

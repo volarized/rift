@@ -13,11 +13,11 @@
 mod context7;
 mod documentation;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use rift_core::ProjectPath;
 use rift_protocol::read::PathPattern;
+use rift_syntax::ShippedLanguage;
 
 use crate::analyzer::PackageLanguage;
 use crate::glob::PathMatcher;
@@ -43,7 +43,7 @@ const PACKAGE_ROOT: &str = "/";
 /// documentation selection.
 #[derive(Debug)]
 pub struct PackageFileSelection {
-    extensions: BTreeSet<&'static str>,
+    source_languages: &'static [ShippedLanguage],
     exclude: PathMatcher,
     documentation: DocumentationSelection,
 }
@@ -54,7 +54,8 @@ impl PackageFileSelection {
     /// The source extensions are the ones the language's shipped definitions claim: `rs`
     /// for Rust, `py` and `pyi` for Python, and every JavaScript and TypeScript extension
     /// for a TypeScript package, whose builds ship `.js`, `.mjs`, and `.cjs` beside their
-    /// declaration files.
+    /// declaration files. Source extensions match without regard to ASCII case;
+    /// selected paths and source bytes keep their original spelling.
     ///
     /// # Errors
     ///
@@ -68,13 +69,8 @@ impl PackageFileSelection {
             .iter()
             .map(|pattern| pattern.0.clone())
             .collect::<Vec<_>>();
-        let extensions = language
-            .source_languages()
-            .iter()
-            .flat_map(|shipped| shipped.definition().extensions().iter().copied())
-            .collect();
         Ok(Self {
-            extensions,
+            source_languages: language.source_languages(),
             exclude: PathMatcher::build(Path::new(PACKAGE_ROOT), &[], &exclude)?,
             documentation,
         })
@@ -111,7 +107,11 @@ impl PackageFileSelection {
         Path::new(path.as_str())
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| self.extensions.contains(extension))
+            .is_some_and(|extension| {
+                self.source_languages
+                    .iter()
+                    .any(|language| language.definition().matches_extension(extension))
+            })
     }
 }
 
@@ -306,6 +306,63 @@ mod tests {
             names(files.source()),
             ["attr/__init__.py", "attr/__init__.pyi"]
         );
+    }
+
+    #[test]
+    fn native_and_web_package_sources_keep_case_and_refuse_unknown_extensions() {
+        let cases = [
+            (
+                PackageLanguage::TypeScript,
+                &[
+                    "index.TS",
+                    "client.VUE",
+                    "client.SVELTE",
+                    "client.HTML",
+                    "client.CSS",
+                ][..],
+            ),
+            (
+                PackageLanguage::Cpp,
+                &["client.H", "client.HPP", "client.CPP", "base.C"][..],
+            ),
+            (PackageLanguage::C, &["client.H", "client.C"][..]),
+            (
+                PackageLanguage::Cython,
+                &["client.PYX", "client.PXD", "client.PXI", "client.PY"][..],
+            ),
+            (
+                PackageLanguage::Python,
+                &["client.PY", "client.PYX", "client.PXD", "client.PXI"][..],
+            ),
+            (PackageLanguage::Jsonc, &["settings.JSONC"][..]),
+            (
+                PackageLanguage::HtmlAngular,
+                &["client.HTML", "client.CSS"][..],
+            ),
+            (
+                PackageLanguage::Vue,
+                &["client.VUE", "client.CSS", "client.TS"][..],
+            ),
+            (
+                PackageLanguage::Svelte,
+                &["client.SVELTE", "client.CSS", "client.TS"][..],
+            ),
+            (PackageLanguage::Html, &["client.HTML", "client.CSS"][..]),
+            (PackageLanguage::Css, &["client.CSS"][..]),
+        ];
+        for (language, expected) in cases {
+            let mut candidates = expected.to_vec();
+            candidates.extend([
+                "client.unknown",
+                "node_modules/client.CSS",
+                "target/client.CPP",
+            ]);
+            let files = selected(language, &[], &candidates);
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(names(files.source()), expected, "{language:?}");
+            assert!(files.documentation().is_empty());
+        }
     }
 
     #[test]

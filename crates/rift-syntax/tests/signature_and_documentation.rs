@@ -49,7 +49,7 @@ fn fixtures_for(language: &Language) -> ProviderFixtures {
             header: None,
             documentation: None,
         },
-        ("json", _) => ProviderFixtures {
+        ("json" | "jsonc", _) => ProviderFixtures {
             neither: "{\"beacon\": 1}\n",
             header: None,
             documentation: None,
@@ -68,6 +68,33 @@ fn fixtures_for(language: &Language) -> ProviderFixtures {
             neither: "BEACON = 1\n",
             header: Some("def beacon():\n    return 1\n"),
             documentation: Some("def beacon():\n    \"Beacon docs.\"\n    return 1\n"),
+        },
+        ("html", _) => ProviderFixtures {
+            neither: "<main></main>",
+            header: None,
+            documentation: None,
+        },
+        ("css", _) => ProviderFixtures {
+            neither: ".beacon { color: blue; }",
+            header: None,
+            documentation: None,
+        },
+        ("vue" | "svelte", _) => ProviderFixtures {
+            neither: "<script>const beacon = 1;</script><main></main>",
+            header: Some("<script>function beacon() { return 1; }</script>"),
+            documentation: Some(
+                "<script>/** Beacon docs. */ function beacon() { return 1; }</script>",
+            ),
+        },
+        ("c" | "cpp", _) => ProviderFixtures {
+            neither: "int beacon = 1;",
+            header: Some("int beacon() { return 1; }"),
+            documentation: None,
+        },
+        ("cython", _) => ProviderFixtures {
+            neither: "cdef int beacon = 1\n",
+            header: Some("def beacon():\n    return 1\n"),
+            documentation: None,
         },
         (name, dialect) => panic!(
             "a registered provider has no signature/documentation fixture: \
@@ -105,6 +132,16 @@ fn every_provider_fixture_with_neither_fact_attached_returns_two_empty_lists() {
     for provider in registry::providers() {
         let fixtures = fixtures_for(provider.language());
         let document = analyze(provider, fixtures.neither);
+        if provider.language().name == "html"
+            && provider.language().dialect.as_deref() == Some("angular")
+        {
+            assert!(
+                document.symbols().is_empty(),
+                "Angular template facts contain structural nodes"
+            );
+            assert!(!document.nodes().is_empty());
+            continue;
+        }
         let symbol = declared_symbol(&document);
         assert!(
             symbol.signatures.is_empty(),

@@ -66,6 +66,10 @@ strum.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
+name = "additional_languages"
+path = "tests/additional_languages.rs"
+
+[[test]]
 name = "body_matches"
 path = "tests/body_matches.rs"
 

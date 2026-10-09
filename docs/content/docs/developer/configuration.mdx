@@ -584,6 +584,33 @@ matches from the effective list. `enabled` defaults to `true`, `exclude` default
 and `lsp` is absent by default. A bare language and each of its dialect entries are independent.
 `enabled = false` turns off syntax and LSP service for paths the entry matches.
 
+<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
+
+Shipped providers select `.html`, `.htm`, `.css`, `.vue`, `.svelte`, `.c`, C++ source and header
+extensions, `.pyx`, `.pxd`, `.pxi`, and `.jsonc`. Extension selection ignores ASCII case;
+configured path patterns retain their own matching rules. Rift selects C for `.h` files by
+default; that extension does not establish whether a header contains C or C++. Select C++
+headers explicitly, and give C an `include` list that leaves those paths to C++:
+
+```toml
+[languages.c]
+include = ["**/*.c", "include/c/**/*.h"]
+
+[languages.cpp]
+include = ["**/*.cpp", "**/*.hpp", "include/cpp/**/*.h"]
+```
+
+The `html:angular` provider claims no extension by default. Explicit Angular template selection
+uses an exact dialect entry and removes the same paths from ordinary HTML selection:
+
+```toml
+[languages.html]
+exclude = ["src/components/**/*.html"]
+
+[languages."html:angular"]
+include = ["src/components/**/*.html"]
+```
+
 A language no shipped syntax provider knows must carry a nonempty `include` list. It can still
 select an LSP process. One visible path may match one exact language; a current path two entries
 claim refuses the workspace candidate, naming the path and both identities. The previously
@@ -824,6 +851,39 @@ generated file of deeply nested literals answers no [`search`](/docs/mcp#tool-se
 every other file still does. The server records each such file under
 `rift server logs --component index`, with the path and the bound it crossed; raise that key to
 index the file.
+
+<VersionBadge version="v0.0.66" languages={["Angular", "Tailwind"]} />
+
+Framework context is separate from language selection. Angular component imports establish
+ownership for literal inline and external templates; Tailwind requires a captured package
+version and applicable configuration or stylesheet evidence. An unresolved version or dynamic
+expression appears as `framework_context_unresolved` in read warnings, with its source and
+framework.
+
+`providers.syntax.frameworks` supplies explicit context for selected paths:
+
+```toml
+[[providers.syntax.frameworks]]
+include = ["src/components/**/*.html", "src/components/**/*.ts"]
+angular = true
+
+[[providers.syntax.frameworks]]
+include = ["src/styles/**/*.css", "src/views/**/*.vue", "src/views/**/*.svelte"]
+tailwind = "v4"
+```
+
+The list defaults empty and holds at most 256 entries. Each `include` list holds at most 256
+patterns; an empty list selects no source. `angular` defaults `false`; `tailwind` is absent by
+default and accepts `"v3"` or `"v4"`. One entry can supply both frameworks. More than one entry
+matching a source leaves context unresolved and records warnings, so combined selections belong
+in one entry.
+
+Explicit Tailwind selection supplies the supported major version without package or stylesheet
+evidence. Explicit Angular selection applies to matched HTML and templates owned by matched
+TypeScript components. It does not change the TypeScript class's parser identity. Paths outside
+selected or established context retain ordinary syntax. Static classes and supported CSS
+directives publish authored names; dynamic expressions retain source ranges and warnings.
+Compiler resolution remains outside syntax analysis.
 
 Provider configuration does not set merge order or freshness. A provider rebuilding after a file
 change can serve its previous immutable revision; the result then carries a `stale_index` entry

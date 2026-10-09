@@ -41,10 +41,11 @@ pub struct PackageSyntax {
 }
 
 impl PackageSyntax {
-    /// Associates immutable facts with their recorded producer inputs.
+    /// Associates raw provider facts with their recorded producer inputs.
     ///
     /// Package analysis compares both the identity and the facts' source witness before
-    /// accepting them. A mismatch runs the current provider.
+    /// accepting them. A mismatch runs the current provider. Facts with framework origin
+    /// are refused because framework context applies after raw parsing.
     #[must_use]
     pub fn new(identity: PackageSyntaxIdentity, facts: Arc<SyntaxFacts>) -> Self {
         Self { identity, facts }
@@ -90,7 +91,20 @@ impl<'source> PackageSyntaxSource<'source> {
             .unwrap_or_default();
         let documentation = matches!(extension, "rst" | "txt" | "ipynb");
         let provider = (!documentation)
-            .then(|| rift_syntax::registry::provider_for_extension(extension))
+            .then(|| {
+                let cpp_header = package_language == &rift_syntax::ShippedLanguage::Cpp.language()
+                    && extension.eq_ignore_ascii_case("h");
+                let angular_template = package_language
+                    == &rift_syntax::ShippedLanguage::HtmlAngular.language()
+                    && rift_syntax::ShippedLanguage::Html
+                        .definition()
+                        .matches_extension(extension);
+                if cpp_header || angular_template {
+                    rift_syntax::registry::provider_for_language(package_language)
+                } else {
+                    rift_syntax::registry::provider_for_extension(extension)
+                }
+            })
             .flatten();
         let language = provider.map_or_else(
             || crate::analyzer::source_language(extension, package_language),
@@ -149,6 +163,23 @@ impl<'source> PackageSyntaxSource<'source> {
     /// Panics if this source invokes its provider more than `u64::MAX` times.
     pub fn parse(&self) -> Result<PackageSyntax, RiftError> {
         let facts = match self.provider {
+            Some(_) => self.parse_document()?.into_facts(),
+            None if self.documentation => {
+                SyntaxDocument::empty(self.identity.language.clone(), self.file.path().clone())
+                    .into_facts()
+            }
+            None => {
+                return errors::analysis::package_syntax_unavailable()
+                    .package(crate::analyzer::package_label(self.package))
+                    .path(self.file.path().as_str())
+                    .fail();
+            }
+        };
+        Ok(PackageSyntax::new(self.identity.clone(), facts))
+    }
+
+    pub(crate) fn parse_document(&self) -> Result<SyntaxDocument, RiftError> {
+        match self.provider {
             Some(provider) => {
                 self.provider_calls.set(
                     self.provider_calls
@@ -174,25 +205,18 @@ impl<'source> PackageSyntaxSource<'source> {
                                 "path",
                                 ErrorValue::path(self.file.path().as_str()),
                             ))
-                    })?
-                    .into_facts()
+                    })
             }
-            None if self.documentation => {
-                SyntaxDocument::empty(self.identity.language.clone(), self.file.path().clone())
-                    .into_facts()
-            }
-            None => {
-                return errors::analysis::package_syntax_unavailable()
-                    .package(crate::analyzer::package_label(self.package))
-                    .path(self.file.path().as_str())
-                    .fail();
-            }
-        };
-        Ok(PackageSyntax::new(self.identity.clone(), facts))
+            None => errors::analysis::package_syntax_unavailable()
+                .package(crate::analyzer::package_label(self.package))
+                .path(self.file.path().as_str())
+                .fail(),
+        }
     }
 
     pub(crate) fn accepts(&self, syntax: &PackageSyntax) -> bool {
         self.provider.is_some()
+            && syntax.facts.origin() == rift_syntax::SyntaxOrigin::Provider
             && self.identity == syntax.identity
             && syntax.facts.language() == &self.identity.language
             && syntax.facts.syntax_limits() == Some(self.identity.limits)

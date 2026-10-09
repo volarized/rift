@@ -157,6 +157,7 @@ impl LanguageFileSelection {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LanguageFileSelections {
     entries: Vec<LanguageFileSelection>,
+    frameworks: Vec<rift_protocol::configuration::SyntaxFrameworkConfiguration>,
 }
 
 impl LanguageFileSelections {
@@ -164,6 +165,12 @@ impl LanguageFileSelections {
     #[must_use]
     pub fn entries(&self) -> &[LanguageFileSelection] {
         &self.entries
+    }
+
+    /// Explicit framework context inherited from `[providers.syntax]`.
+    #[must_use]
+    pub fn frameworks(&self) -> &[rift_protocol::configuration::SyntaxFrameworkConfiguration] {
+        &self.frameworks
     }
 }
 
@@ -175,6 +182,7 @@ impl From<&WorkspaceConfiguration> for LanguageFileSelections {
                 .iter()
                 .map(|(identity, entry)| LanguageFileSelection::from_entry(identity, entry))
                 .collect(),
+            frameworks: configuration.providers.syntax.frameworks.clone(),
         }
     }
 }

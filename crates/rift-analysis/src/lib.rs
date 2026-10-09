@@ -8,6 +8,8 @@ mod chunk;
 pub mod documentation;
 mod enclosing;
 #[cfg(feature = "collector")]
+mod framework;
+#[cfg(feature = "collector")]
 mod glob;
 mod input;
 #[cfg(feature = "collector")]
@@ -27,6 +29,8 @@ pub use analyzer::{
 };
 pub use chunk::{TextChunk, text_chunks};
 pub use enclosing::EnclosingDefinitions;
+#[cfg(feature = "collector")]
+pub use framework::{FrameworkContext, ResolvedFramework};
 #[cfg(feature = "collector")]
 pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use input::{ExactPackageInput, ExactPackageLimits, PackageSource};

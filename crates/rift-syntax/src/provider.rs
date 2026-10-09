@@ -259,6 +259,7 @@ mod tests {
             max_file: ByteSize::from_bytes(16 << 20),
             max_nodes: 5_000_000,
             max_depth: 2_048,
+            ..SyntaxConfiguration::default()
         })
         .expect("positive bounds");
         assert_eq!(

@@ -302,6 +302,30 @@ pub(crate) fn parse_package_manifest(bytes: &[u8]) -> Result<PackageManifest, St
     })
 }
 
+/// Reads declared Node dependency names and version text through the same manifest
+/// model used by npm and Bun context resolution.
+///
+/// # Errors
+///
+/// Returns the JSON parser's error when the manifest is invalid.
+pub fn node_package_dependencies(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, String>, serde_json::Error> {
+    let manifest: PackageManifest = serde_json::from_slice(bytes)?;
+    Ok([
+        manifest.dependencies,
+        manifest.dev_dependencies,
+        manifest.optional_dependencies,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(name, version)| {
+        let (name, version) = declared_version(&name, &version);
+        (name.to_owned(), version.to_owned())
+    })
+    .collect())
+}
+
 /// The package name and version text one `package.json` dependency value declares. An
 /// `npm:` value aliases another package, and the pair names the package it aliases.
 fn declared_version<'a>(key: &'a str, version: &'a str) -> (&'a str, &'a str) {
@@ -309,4 +333,29 @@ fn declared_version<'a>(key: &'a str, version: &'a str) -> (&'a str, &'a str) {
         .strip_prefix(ALIAS_VERSION_PREFIX)
         .and_then(split_reference)
         .unwrap_or((key, version))
+}
+
+#[cfg(test)]
+mod framework_tests {
+    #[test]
+    fn declared_framework_versions_use_existing_alias_and_dependency_rules() {
+        let versions = super::node_package_dependencies(
+            br#"{
+            "dependencies":{"styles":"npm:tailwindcss@4.0.0"},
+            "devDependencies":{"@angular/core":"19.0.0"},
+            "optionalDependencies":{"plugin":"1.0.0"}
+        }"#,
+        )
+        .expect("valid manifest");
+        assert_eq!(
+            versions.get("tailwindcss").map(String::as_str),
+            Some("4.0.0")
+        );
+        assert_eq!(
+            versions.get("@angular/core").map(String::as_str),
+            Some("19.0.0")
+        );
+        assert_eq!(versions.get("plugin").map(String::as_str), Some("1.0.0"));
+        assert!(!versions.contains_key("styles"));
+    }
 }

@@ -117,6 +117,7 @@ pub struct PackageAnalysis {
     semantics: WorkspaceSemantics,
     notebook_cells: BTreeMap<DocumentationContentIdentity, String>,
     syntax_work: crate::PackageSyntaxWork,
+    warnings: Vec<rift_protocol::read::ReadWarning>,
 }
 
 impl PackageAnalysis {
@@ -130,6 +131,12 @@ impl PackageAnalysis {
     #[must_use]
     pub const fn syntax_work(&self) -> crate::PackageSyntaxWork {
         self.syntax_work
+    }
+
+    /// Framework context that could not be resolved from captured sources.
+    #[must_use]
+    pub fn warnings(&self) -> &[rift_protocol::read::ReadWarning] {
+        &self.warnings
     }
 
     /// Every analyzed file, in path order.
@@ -166,6 +173,8 @@ fn analyzed_file(
     file: crate::PackageSource<'_>,
     supplied: &mut impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     work: &mut crate::PackageSyntaxWork,
+    context: &crate::FrameworkContext,
+    warnings: &mut Vec<rift_protocol::read::ReadWarning>,
 ) -> Result<AnalyzedFile, RiftError> {
     let source = crate::PackageSyntaxSource::new(
         file,
@@ -183,15 +192,31 @@ fn analyzed_file(
         .provider_calls
         .checked_add(source.provider_calls())
         .expect("package syntax provider call count must fit u64");
-    if accepted && source.provider_calls() == 0 {
+    if accepted && source.provider_calls() == 0 && context.for_path(file.path()).is_none() {
         work.reused_files += 1;
     }
+    let facts = if context.for_path(file.path()).is_some() {
+        let document = source.parse_document()?;
+        let (document, found, calls) = context.apply(
+            rift_syntax::SyntaxSource {
+                path: file.path(),
+                text: file.text(),
+            },
+            input.limits().syntax(),
+            document,
+        )?;
+        work.provider_calls += 1 + calls;
+        warnings.extend(found);
+        document.shared_facts()
+    } else {
+        std::sync::Arc::clone(syntax.facts())
+    };
     let parsed = IndexedFile::new_with_shared_syntax(
         file.path().clone(),
         file.text().to_owned().into(),
         source.identity().source_digest,
         false,
-        std::sync::Arc::clone(syntax.facts()),
+        facts,
     );
     let placement = placement_of(input.package(), input.origin(), file.path())?;
     let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
@@ -215,9 +240,10 @@ impl PackageAnalyzer {
     /// identity order, and a collection that reaches its bound stops there and reports the
     /// stop as a warning.
     ///
-    /// The work is proportional to the selected bytes: one parse per file, one scan per
-    /// file for its line starts, one assembly pass over the parsed declarations, and one
-    /// canonical rendering per record.
+    /// The work is proportional to the selected bytes: raw parsing and framework
+    /// context passes, one scan per file for its line starts, one assembly pass over the
+    /// parsed declarations, and one canonical rendering per record. Files with framework
+    /// context parse current source before applying framework facts.
     ///
     /// # Errors
     ///
@@ -251,7 +277,23 @@ impl PackageAnalyzer {
         mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     ) -> Result<PackageAnalysis, RiftError> {
         let package = input.package();
-        let mut syntax_work = crate::PackageSyntaxWork::default();
+        let sources = input
+            .files()
+            .iter()
+            .chain(input.context_sources())
+            .copied()
+            .collect::<Vec<_>>();
+        let context = crate::FrameworkContext::resolve(
+            &sources,
+            input.frameworks(),
+            input.limits().syntax(),
+            &|| false,
+        )?;
+        let mut warnings = context.warnings().to_vec();
+        let mut syntax_work = crate::PackageSyntaxWork {
+            provider_calls: context.provider_calls(),
+            ..crate::PackageSyntaxWork::default()
+        };
         let mut analyzed = Vec::with_capacity(input.files().len());
         for file in input.files() {
             analyzed.push(analyzed_file(
@@ -259,6 +301,8 @@ impl PackageAnalyzer {
                 *file,
                 &mut supplied,
                 &mut syntax_work,
+                &context,
+                &mut warnings,
             )?);
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
@@ -304,6 +348,7 @@ impl PackageAnalyzer {
             semantics: built.semantics,
             notebook_cells,
             syntax_work,
+            warnings,
         })
     }
 }
@@ -1554,6 +1599,24 @@ pub enum PackageLanguage {
     /// TypeScript declarations exclude private and protected members. A TypeScript package
     /// ships its JavaScript builds beside its declaration files.
     TypeScript,
+    /// HTML elements and attributes are public declarations.
+    Html,
+    /// Angular template elements and attributes are public declarations.
+    HtmlAngular,
+    /// CSS selectors and properties are public declarations.
+    Css,
+    /// Vue elements and script declarations are public unless marked private or protected.
+    Vue,
+    /// Svelte elements and script declarations are public unless marked private or protected.
+    Svelte,
+    /// C declarations are public.
+    C,
+    /// C++ declarations are public.
+    Cpp,
+    /// Cython names without a leading underscore count.
+    Cython,
+    /// JSONC properties are public declarations.
+    Jsonc,
 }
 
 /// Rust container kinds whose private members a `pub` container exports: a trait's
@@ -1584,6 +1647,15 @@ impl PackageLanguage {
             ShippedLanguage::Rust => Some(Self::Rust),
             ShippedLanguage::Python => Some(Self::Python),
             ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => Some(Self::TypeScript),
+            ShippedLanguage::Html => Some(Self::Html),
+            ShippedLanguage::HtmlAngular => Some(Self::HtmlAngular),
+            ShippedLanguage::Css => Some(Self::Css),
+            ShippedLanguage::Vue => Some(Self::Vue),
+            ShippedLanguage::Svelte => Some(Self::Svelte),
+            ShippedLanguage::C => Some(Self::C),
+            ShippedLanguage::Cpp => Some(Self::Cpp),
+            ShippedLanguage::Cython => Some(Self::Cython),
+            ShippedLanguage::Jsonc => Some(Self::Jsonc),
             ShippedLanguage::JavaScript
             | ShippedLanguage::Markdown
             | ShippedLanguage::Json
@@ -1596,12 +1668,37 @@ impl PackageLanguage {
     pub(crate) const fn source_languages(self) -> &'static [ShippedLanguage] {
         match self {
             Self::Rust => &[ShippedLanguage::Rust],
-            Self::Python => &[ShippedLanguage::Python],
+            Self::Python => &[ShippedLanguage::Python, ShippedLanguage::Cython],
             Self::TypeScript => &[
                 ShippedLanguage::JavaScript,
                 ShippedLanguage::TypeScript,
                 ShippedLanguage::TypeScriptTsx,
+                ShippedLanguage::Html,
+                ShippedLanguage::Css,
+                ShippedLanguage::Vue,
+                ShippedLanguage::Svelte,
             ],
+            Self::Html | Self::HtmlAngular => &[ShippedLanguage::Html, ShippedLanguage::Css],
+            Self::Css => &[ShippedLanguage::Css],
+            Self::Vue => &[
+                ShippedLanguage::Vue,
+                ShippedLanguage::Html,
+                ShippedLanguage::Css,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+            ],
+            Self::Svelte => &[
+                ShippedLanguage::Svelte,
+                ShippedLanguage::Html,
+                ShippedLanguage::Css,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+            ],
+            Self::C | Self::Cpp => &[ShippedLanguage::C, ShippedLanguage::Cpp],
+            Self::Cython => &[ShippedLanguage::Cython, ShippedLanguage::Python],
+            Self::Jsonc => &[ShippedLanguage::Jsonc],
         }
     }
 
@@ -1619,11 +1716,12 @@ impl PackageLanguage {
                     }),
                 _ => false,
             },
-            Self::Python => !symbol.name.starts_with('_'),
-            Self::TypeScript => !symbol
+            Self::Python | Self::Cython => !symbol.name.starts_with('_'),
+            Self::TypeScript | Self::Vue | Self::Svelte => !symbol
                 .visibility
                 .as_deref()
                 .is_some_and(|visibility| matches!(visibility, "private" | "protected")),
+            Self::Html | Self::HtmlAngular | Self::Css | Self::C | Self::Cpp | Self::Jsonc => true,
         }
     }
 }

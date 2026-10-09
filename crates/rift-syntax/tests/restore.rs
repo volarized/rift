@@ -24,6 +24,7 @@ fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
 
 fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
     SyntaxFactsParts {
+        origin: facts.origin(),
         language: facts.language().clone(),
         symbols: facts.symbols().to_vec(),
         has_errors: facts.has_errors(),
@@ -74,6 +75,42 @@ fn complete_facts_restore_for_every_shipped_language() {
         (ShippedLanguage::Json, "{\"client\":{\"port\":8080}}"),
         (ShippedLanguage::Toml, "[client]\nport = 8080\n"),
         (ShippedLanguage::Yaml, "client:\n  port: 8080\n"),
+        (
+            ShippedLanguage::Html,
+            "<main id=\"client\"><script>function open() { return 1; }</script><style>.client { color: blue; }</style></main>",
+        ),
+        (
+            ShippedLanguage::Css,
+            ".client { --accent: blue; color: var(--accent); }",
+        ),
+        (
+            ShippedLanguage::C,
+            "struct Client { int port; }; int open(void) { return 1; }",
+        ),
+        (
+            ShippedLanguage::Cpp,
+            "namespace client { class Client { int open() { return 1; } }; }",
+        ),
+        (
+            ShippedLanguage::Cython,
+            "cdef class Client:\n    cpdef int open(self):\n        return 1\n",
+        ),
+        (
+            ShippedLanguage::Jsonc,
+            "// client settings\n{\"client\":{\"port\":8080}}",
+        ),
+        (
+            ShippedLanguage::HtmlAngular,
+            "@if (client) { <button (click)=\"open()\">{{ client | titlecase }}</button> }",
+        ),
+        (
+            ShippedLanguage::Vue,
+            "<script setup lang=\"ts\">function open(): number { return 1; }</script><template><button @click=\"open()\">Client</button></template><style>.client { color: blue; }</style>",
+        ),
+        (
+            ShippedLanguage::Svelte,
+            "<script lang=\"ts\">function open(): number { return 1; }</script>{#if client}<button on:click={open}>Client</button>{/if}<style>.client { color: blue; }</style>",
+        ),
     ];
     for (shipped, text) in cases {
         let document = parsed(shipped, text);

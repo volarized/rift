@@ -1384,6 +1384,7 @@
         "syntax": {
           "$ref": "#/$defs/SyntaxConfiguration",
           "default": {
+            "frameworks": [],
             "max_depth": 512,
             "max_file": "4mb",
             "max_nodes": 250000
@@ -1832,6 +1833,15 @@
       "additionalProperties": false,
       "description": "The `[providers.syntax]` table. A syntax provider's cost scales with the\nsource it parses, so each source is bounded by size, node count, and\nnesting depth; a source past any bound is left out of the index.",
       "properties": {
+        "frameworks": {
+          "default": [],
+          "description": "Explicit framework context for matching source paths. Automatic context reads\nthe source's own package and component for frameworks a selection does not supply.",
+          "items": {
+            "$ref": "#/$defs/SyntaxFrameworkConfiguration"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
         "max_depth": {
           "default": 512,
           "description": "Nesting one source's syntax tree may reach.",
@@ -1859,6 +1869,53 @@
         }
       },
       "type": "object"
+    },
+    "SyntaxFrameworkConfiguration": {
+      "additionalProperties": false,
+      "description": "One explicit framework context, selected by workspace-relative path patterns.",
+      "properties": {
+        "angular": {
+          "default": false,
+          "description": "Treat matching HTML sources and owned TypeScript templates as Angular.",
+          "type": "boolean"
+        },
+        "include": {
+          "default": [],
+          "description": "Source paths this context applies to. An empty list selects no source.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
+        "tailwind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TailwindVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Tailwind major version whose directives and static classes are interpreted."
+        }
+      },
+      "type": "object"
+    },
+    "TailwindVersion": {
+      "description": "Tailwind versions with distinct stylesheet and configuration syntax.",
+      "oneOf": [
+        {
+          "const": "v3",
+          "description": "Tailwind 3 uses configuration files and `@tailwind` directives.",
+          "type": "string"
+        },
+        {
+          "const": "v4",
+          "description": "Tailwind 4 uses stylesheet imports, theme declarations, and custom utilities.",
+          "type": "string"
+        }
+      ]
     },
     "TextSearchConfiguration": {
       "additionalProperties": false,
@@ -2112,6 +2169,7 @@
           "tree_entries": 65536
         },
         "syntax": {
+          "frameworks": [],
           "max_depth": 512,
           "max_file": "4mb",
           "max_nodes": 250000

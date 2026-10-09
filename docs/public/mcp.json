@@ -1355,6 +1355,36 @@
             "oneOf": [
               {
                 "additionalProperties": false,
+                "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
+                "properties": {
+                  "code": {
+                    "const": "framework_context_unresolved",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "The missing package version, configuration, or template source.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "framework": {
+                    "$ref": "#/$defs/SyntaxFramework",
+                    "description": "The framework whose context could not be established."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The source whose framework context is unresolved."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
+                  "framework",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
                 "properties": {
                   "alternatives": {
@@ -2937,6 +2967,21 @@
               }
             ]
           },
+          "SyntaxFramework": {
+            "description": "Frameworks whose syntax depends on package or component context.",
+            "oneOf": [
+              {
+                "const": "angular",
+                "description": "Angular templates owned by an imported `Component` decorator.",
+                "type": "string"
+              },
+              {
+                "const": "tailwind",
+                "description": "Tailwind directives and classes under a known major version.",
+                "type": "string"
+              }
+            ]
+          },
           "TextRange": {
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
             "properties": {
@@ -4005,6 +4050,36 @@
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
+                "properties": {
+                  "code": {
+                    "const": "framework_context_unresolved",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "The missing package version, configuration, or template source.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "framework": {
+                    "$ref": "#/$defs/SyntaxFramework",
+                    "description": "The framework whose context could not be established."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The source whose framework context is unresolved."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
+                  "framework",
+                  "detail"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
@@ -5108,6 +5183,21 @@
             "minLength": 17,
             "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
+          },
+          "SyntaxFramework": {
+            "description": "Frameworks whose syntax depends on package or component context.",
+            "oneOf": [
+              {
+                "const": "angular",
+                "description": "Angular templates owned by an imported `Component` decorator.",
+                "type": "string"
+              },
+              {
+                "const": "tailwind",
+                "description": "Tailwind directives and classes under a known major version.",
+                "type": "string"
+              }
+            ]
           },
           "TextRange": {
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
@@ -7043,6 +7133,36 @@
             "oneOf": [
               {
                 "additionalProperties": false,
+                "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
+                "properties": {
+                  "code": {
+                    "const": "framework_context_unresolved",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "The missing package version, configuration, or template source.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "framework": {
+                    "$ref": "#/$defs/SyntaxFramework",
+                    "description": "The framework whose context could not be established."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The source whose framework context is unresolved."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
+                  "framework",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
                 "properties": {
                   "alternatives": {
@@ -8884,6 +9004,21 @@
               {
                 "const": "decorators_changed",
                 "description": "The revision changed the annotations on the declaration.",
+                "type": "string"
+              }
+            ]
+          },
+          "SyntaxFramework": {
+            "description": "Frameworks whose syntax depends on package or component context.",
+            "oneOf": [
+              {
+                "const": "angular",
+                "description": "Angular templates owned by an imported `Component` decorator.",
+                "type": "string"
+              },
+              {
+                "const": "tailwind",
+                "description": "Tailwind directives and classes under a known major version.",
                 "type": "string"
               }
             ]

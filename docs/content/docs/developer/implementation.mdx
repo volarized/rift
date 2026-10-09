@@ -1329,6 +1329,80 @@ The registry itself assembles from one shipped definition list in `rift-syntax`:
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
 
+<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
+
+HTML preserves elements, attributes, and source references as syntax nodes. CSS publishes
+selectors, properties, custom properties, and at-rules as declarations; import and URL syntax
+retain their authored ranges. Vue and Svelte keep component structure and template expressions,
+including Vue directives and Svelte control-flow blocks.
+
+HTML, Vue, Svelte, and Angular providers parse supported script and style blocks through
+Tree-sitter included ranges. A TypeScript script retains its TypeScript signature identity,
+while the containing document keeps its HTML or component identity. Included parses share the
+original source bytes and one aggregate node and depth bound, so a script symbol's range still
+addresses its containing file.
+
+Angular template syntax uses the `html:angular` identity. Component ownership comes from a
+class decorator whose `Component` binding is imported from `@angular/core`, including named
+aliases and namespace imports. Literal `template` properties retain their original TypeScript
+byte ranges. A parameter or local variable or function binding with the imported name refuses
+ownership inside its scope; type annotations and default-value references do not create bindings. Literal
+`templateUrl` properties retain their authored paths. Dynamic and escaped
+template values remain unresolved expressions. The TypeScript class uses the existing provider.
+
+An Angular template publishes structural nodes for bindings, interpolation, pipes, and control
+flow. A template with no script or style declarations publishes no symbols. Script and style
+blocks publish declarations through their included providers.
+
+Each provider exposes parser errors through `has_errors` and node error flags, including
+missing nodes and grammar recovery. Authored source references retain their syntax ranges.
+Compiler and framework semantics remain outside these providers.
+
+Framework context follows the nearest captured `package.json`. A runtime `Component` import
+owns literal inline templates and external templates inside that component's package; an
+unrelated HTML file keeps ordinary HTML syntax. Dynamic or escaped templates, missing templates,
+and template sources outside the component package produce `framework_context_unresolved` warnings.
+
+Tailwind context requires an exact supported package version or an npm lockfile version, plus
+applicable configuration or stylesheet evidence. A captured npm lockfile pin takes precedence
+over the declared version; an invalid or unsupported pin leaves context unresolved. Version 3
+uses `tailwind.config.*` or captured
+`@tailwind` syntax; version 4 uses a captured CSS import of `tailwindcss`. Explicit
+[`providers.syntax.frameworks`](/docs/developer/configuration#providers) entries supply context
+when captured evidence leaves it unresolved.
+
+Under that context, static HTML, JSX, Angular, Vue, and Svelte classes publish authored utility
+and variant names. CSS publishes `@apply` names, version 3 custom utilities inside
+`@layer utilities`, and version 4 `@utility`, `@custom-variant`, and `@theme` names. Configuration,
+stylesheet, and theme references retain their authored ranges. Dynamic class expressions keep
+their original syntax and produce warnings; Rift does not choose a conditional branch or
+construct names from an expression. These facts do not establish whether a compiler generates
+a utility.
+
+Context applies after raw parsing. Raw cached facts keep their parser identity and source
+digest; changed package, component, configuration, or stylesheet evidence rebuilds framework
+facts over the current bytes. `SyntaxFacts` records `SyntaxOrigin::Provider` for raw facts and
+`SyntaxOrigin::Framework` for contextual facts. `SyntaxFactsParts` retains that origin through
+checked restoration; package raw reuse accepts only provider origin, including raw embedded
+HTML, Vue, and Svelte facts. Included template parsing and added declarations share the
+source, node, and depth bounds. A contextual HTML template uses `html:angular`; TypeScript,
+Vue, Svelte, CSS, and JSX files keep their existing identities.
+
+C and C++ publish functions, types, variables, macros, and include syntax. Function prototypes
+publish `function`; function pointer and array variables publish `variable`. The provider follows the
+declarator modifier nearest the declared name, so a function returning a pointer remains a
+function. Several names in one declaration retain separate symbols and name ranges; each source
+range covers the complete declaration. C++ also publishes namespaces and method prototypes.
+The native walk records each declaration's additional declarator IDs once per parse, bounded by
+the captured nodes; repeated declaration hooks reuse those IDs.
+Cython publishes Python and Cython declarations under the `cython` identity for
+`.pyx`, `.pxd`, and `.pxi` files. JSONC has its own `jsonc` identity and accepts comments;
+the existing JSON provider retains its behavior.
+
+Stored facts validate each node kind against the host grammar or its supported included
+grammars. Restoration retains the host identity, original source digest, embedded signature
+identity, and configured parsing bounds.
+
 <VersionBadge version="v0.0.46" languages={["JavaScript", "TypeScript"]} />
 
 The JavaScript and TypeScript providers publish a declaration's attached JSDoc as its
@@ -1421,6 +1495,21 @@ It skips `node_modules`, `__pycache__`, `target`, and `.git`, and the files a ca
 [`[source]`](/docs/developer/configuration#source) `exclude` patterns match, through the matcher
 the workspace's `[source]` table uses. Tests, examples, and benchmarks stay, since they show how a
 package is used.
+
+<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
+
+Package selection also accepts HTML, Angular, CSS, Vue, Svelte, C, C++, Cython, and JSONC.
+TypeScript packages include HTML, CSS, Vue, and Svelte sources beside JavaScript and TypeScript;
+Python packages include Cython sources. A C++ package selects `.h` as C++, and an Angular package
+selects `.html` and `.htm` as `html:angular`; ordinary workspace selection keeps `.h` as C and
+`.html` as HTML.
+
+`ExactPackageInput::with_framework_context` adds captured metadata and explicit framework
+selections. Selected sources already belong to context; additional metadata paths must be
+distinct. The combined sources share package file and aggregate byte bounds. Metadata informs
+analysis without becoming a published source unit. `PackageAnalysis::warnings` reports unresolved
+framework context and dynamic expressions. Fresh, supplied, and checked restored raw syntax
+produce the same contextual publication; files with framework context parse current source before applying framework facts.
 
 The stub and module join pairs a stub with the module it declares: `mod.pyi` with `mod.py`,
 `index.d.ts` with `index.js`, `.d.mts` with `.mjs`, and `.d.cts` with `.cjs`. A `.d.ts` beside no
