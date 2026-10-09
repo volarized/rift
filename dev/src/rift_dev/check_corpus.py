@@ -49,6 +49,7 @@ from rift_dev.log_records import (
     DATABASE_CLOSE,
     STAGE_ENDED,
     Line,
+    closes_span,
     instant,
     stop_measurements,
 )
@@ -484,9 +485,7 @@ class Corpus:
                 found = await observed(
                     server,
                     "dependency",
-                    lambda rows: any(
-                        row.operation == CONTEXT_SPAN and row.closes() for row in rows
-                    ),
+                    lambda rows: any(closes_span(row, CONTEXT_SPAN) for row in rows),
                 )
                 self.dependencies(found)
                 if self.pin.name == "fastapi":
@@ -516,9 +515,7 @@ class Corpus:
             else f"{count - 256} of {count} package.json manifests were not read: at most 256 are read per workspace"
         )
         exact_degradation(found, expected)
-        passes = [
-            row for row in found if row.operation == CONTEXT_SPAN and row.closes()
-        ]
+        passes = [row for row in found if closes_span(row, CONTEXT_SPAN)]
         require(
             len(passes) == 1, f"startup read the dependency context {len(passes)} times"
         )
