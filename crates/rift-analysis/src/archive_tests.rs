@@ -223,6 +223,84 @@ fn raw_zip_duplicates_validate_members_before_index_collapse() -> TestResult {
 }
 
 #[test]
+fn zip_stored_member_declared_size_must_match_payload() -> TestResult {
+    let original = zip_bytes("release/a", b"text")?;
+    let files = read_zip_fixture(&original, ArchiveLimits::default())?;
+    assert_eq!(files.files()[&ProjectPath::new("a")?], b"text");
+    let mut archive = zip::ZipArchive::new(Cursor::new(&original))?;
+    let central = usize::try_from(archive.by_index_raw(0)?.central_header_start())?;
+    for declared_size in [3_u32, 5] {
+        let mut bytes = original.clone();
+        bytes[central + 24..central + 28].copy_from_slice(&declared_size.to_le_bytes());
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("stored ZIP payload length differs from declared size"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_zip_footer_member_counts_must_agree() -> TestResult {
+    let mut bytes = zip_members_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/b", b"text", tar::EntryType::Regular),
+    ])?;
+    replace_zip_name(&mut bytes, b"release/b", b"release/a");
+    let footer = bytes.len() - 22;
+    bytes[footer + 10..footer + 12].copy_from_slice(&3_u16.to_le_bytes());
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("unequal ZIP member counts"),
+        ArchiveError::InvalidArchive
+    );
+    Ok(())
+}
+
+#[test]
+fn undeclared_repeated_zip_members_are_counted_and_refused() -> TestResult {
+    let mut bytes = zip_members_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/b", b"text", tar::EntryType::Regular),
+        ("release/c", b"text", tar::EntryType::Regular),
+    ])?;
+    replace_zip_name(&mut bytes, b"release/b", b"release/a");
+    replace_zip_name(&mut bytes, b"release/c", b"release/a");
+    let footer = bytes.len() - 22;
+    bytes[footer + 8..footer + 12].copy_from_slice(&[2, 0, 2, 0]);
+    let limits = ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?;
+    assert_eq!(
+        read_zip_fixture(&bytes, limits).expect_err("undeclared ZIP member exceeds bound"),
+        ArchiveError::MemberLimit
+    );
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("undeclared ZIP member"),
+        ArchiveError::InvalidArchive
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_zip_unsupported_compression_precedes_skipped_links() -> TestResult {
+    for kind in [tar::EntryType::Regular, tar::EntryType::Symlink] {
+        let mut bytes = zip_members_bytes(&[
+            ("release/a", b"text", kind),
+            ("release/b", b"text", tar::EntryType::Regular),
+        ])?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))?;
+        let central = usize::try_from(archive.by_index_raw(0)?.central_header_start())?;
+        bytes[central + 10..central + 12].copy_from_slice(&98_u16.to_le_bytes());
+        replace_zip_name(&mut bytes, b"release/b", b"release/a");
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("unsupported ZIP compression"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn repeated_zip_payload_reads_consume_work_bound() -> TestResult {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     writer.start_file(

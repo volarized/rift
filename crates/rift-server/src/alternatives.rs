@@ -279,4 +279,53 @@ mod tests {
         assert!(complete[0].0.ends_with("/x"));
         Ok(())
     }
+
+    #[test]
+    fn qualified_name_exhaustion_discards_short_match_and_retained_candidates() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "pub mod parent { pub fn x() {} }\n",
+        )?;
+        let index = index(directory.path())?;
+        let file = index.files().next().ok_or("parsed fixture absent")?;
+        let names = file
+            .syntax()
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.qualified_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, [("parent", "parent"), ("x", "parent::x")]);
+        let symbol = &file.syntax().symbols()[1];
+        let comparator = rapidfuzz::distance::levenshtein::BatchComparator::new("y".chars());
+        // Short x costs 14; qualified parent::x costs 126, including its distance.
+        let mut exact = Work { remaining: 140 };
+        assert_eq!(
+            super::distance(&mut exact, &comparator, 1, symbol, usize::MAX),
+            Ok(Some(1))
+        );
+        assert_eq!(exact.remaining, 0);
+        let mut exhausted = Work { remaining: 139 };
+        assert_eq!(
+            super::distance(&mut exhausted, &comparator, 1, symbol, usize::MAX),
+            Err(())
+        );
+        assert_eq!(
+            exhausted.remaining, 17,
+            "short comparison and qualified normalization succeed before 18 distance units refuse"
+        );
+        // Query/file/parent cost 138. After x's declaration unit, short comparison,
+        // and qualified normalization, 278 is one below the qualified distance bound.
+        assert!(
+            symbols_with_work(index.files(), "y", None, 278).is_err(),
+            "the retained parent candidate must not escape an incomplete ranking"
+        );
+        // Complete ranking also reserves x's 48 insertion units, ending at 327.
+        let complete = symbols_with_work(index.files(), "y", None, 327)
+            .map_err(|()| "complete qualified ranking refused")?;
+        assert_eq!(complete.len(), 2);
+        assert_eq!(complete[0].0, "rift://symbol/rust/lib.rs/parent::x");
+        assert!(UNAVAILABLE_DETAIL.contains("closest alternatives unavailable at the work bound"));
+        Ok(())
+    }
 }

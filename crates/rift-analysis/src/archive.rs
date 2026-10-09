@@ -531,6 +531,21 @@ fn repeated_zip_member_metadata(
     Ok((entry.name().to_owned(), kind))
 }
 
+enum ZipCompression {
+    Stored,
+    Deflate,
+}
+
+impl ZipCompression {
+    fn from_method(method: rawzip::CompressionMethod) -> Result<Self, ArchiveError> {
+        match method {
+            rawzip::CompressionMethod::STORE => Ok(Self::Stored),
+            rawzip::CompressionMethod::DEFLATE => Ok(Self::Deflate),
+            _ => Err(ArchiveError::InvalidArchive),
+        }
+    }
+}
+
 fn push_repeated_zip_member(
     output: &mut ArchiveOutput<'_>,
     entry: &rawzip::ZipFileHeaderRecord<'_>,
@@ -538,30 +553,22 @@ fn push_repeated_zip_member(
     path: &str,
     kind: ArchiveMemberKind,
 ) -> Result<(), ArchiveError> {
-    if ![
-        rawzip::CompressionMethod::STORE,
-        rawzip::CompressionMethod::DEFLATE,
-    ]
-    .contains(&entry.compression_method())
-    {
-        return Err(ArchiveError::InvalidArchive);
-    }
+    let compression = ZipCompression::from_method(entry.compression_method())?;
     if kind == ArchiveMemberKind::Link {
         return output.push_skipped_link(path);
     }
     let directory = kind == ArchiveMemberKind::Directory;
     let size = entry.uncompressed_size_hint();
-    match entry.compression_method() {
-        rawzip::CompressionMethod::STORE => {
+    match compression {
+        ZipCompression::Stored => {
             let mut reader = local.verifying_reader(local.data());
             output.push(path, directory, size, &mut reader)
         }
-        rawzip::CompressionMethod::DEFLATE => {
+        ZipCompression::Deflate => {
             let decoder = flate2::bufread::DeflateDecoder::new(local.data());
             let mut reader = local.verifying_reader(decoder);
             output.push(path, directory, size, &mut reader)
         }
-        _ => Err(ArchiveError::InvalidArchive),
     }
 }
 
