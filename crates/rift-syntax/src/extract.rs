@@ -135,6 +135,11 @@ pub(crate) trait GrammarRules {
     /// attached attributes and doc comments included.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize;
 
+    /// The whole declaration that contains the visited declaration name.
+    fn declaration_node<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
+        node
+    }
+
     /// The grammar's exact declaration name field, absent for providers without one.
     fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
         Ok(None)
@@ -247,7 +252,6 @@ pub(crate) fn extract(
                 visited,
                 text,
                 &qualification,
-                range,
                 language,
                 rules,
             )?);
@@ -323,11 +327,12 @@ fn qualified_symbol(
     visited: Visited<'_, '_>,
     text: &str,
     qualification: &str,
-    item_range: ByteRange,
     language: &Language,
     rules: &dyn GrammarRules,
 ) -> Result<SyntaxSymbol, RiftError> {
-    let node = visited.node();
+    let visited_node = visited.node();
+    let node = rules.declaration_node(visited_node);
+    let item_range = byte_range(node)?;
     let start = rules.declaration_start(visited, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
     let signatures: Vec<Signature> = callable_signature(&declaration, node, text, language)
@@ -350,7 +355,7 @@ fn qualified_symbol(
             end: item_range.end,
         },
         item_range,
-        name_range: rules.name_range(node)?,
+        name_range: rules.name_range(visited_node)?,
         body_range: declaration.body_range,
         signatures: Arc::from(signatures),
         documentation: Arc::from(declaration.documentation),
