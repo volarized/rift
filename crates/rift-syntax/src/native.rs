@@ -259,27 +259,29 @@ impl NativeKinds {
         None
     }
 
-    fn function_declaration(
-        &self,
-        name: Node<'_>,
-        declaration: Node<'_>,
-        depth_max: usize,
-    ) -> bool {
-        let mut node = name;
+    fn function_declaration(&self, name: Node<'_>, carrier: Node<'_>, depth_max: usize) -> bool {
+        let mut node = carrier;
+        let mut function = false;
         for _ in 0..depth_max {
-            if node == declaration {
-                return false;
+            if node == name {
+                return function;
             }
             if Some(node.kind_id()) == self.function_declarator {
-                return true;
+                function = true;
+            } else if self.value_declarators.contains(&node.kind_id()) {
+                function = false;
             }
-            if self.value_declarators.contains(&node.kind_id()) {
-                return false;
-            }
-            let Some(parent) = node.parent() else {
+            let Some(child) = node
+                .child_by_field_id(self.name.get())
+                .or_else(|| {
+                    self.declarator
+                        .and_then(|field| node.child_by_field_id(field.get()))
+                })
+                .or_else(|| node.named_child(0))
+            else {
                 return false;
             };
-            node = parent;
+            node = child;
         }
         false
     }
@@ -314,11 +316,12 @@ impl NativeRules {
             .find_map(|(id, kind)| (*id == node.kind_id()).then_some(*kind))
     }
 
-    fn declaration_parent<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+    fn declaration_parent<'tree>(&self, visited: Visited<'_, 'tree>) -> Option<Node<'tree>> {
+        let node = visited.node();
         if self.declaration_kind(node).is_some() {
             return None;
         }
-        let parent = node.parent()?;
+        let parent = visited.parent()?.node();
         let kind = self.declaration_kind(parent)?;
         if !matches!(kind, VARIABLE | TYPE) {
             return None;
@@ -399,7 +402,7 @@ impl GrammarRules for NativeRules {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let carrier = visited.node();
-        let node = self.declaration_parent(carrier).unwrap_or(carrier);
+        let node = self.declaration_parent(visited).unwrap_or(carrier);
         let Some(mut kind) = self.declaration_kind(node) else {
             return Ok(None);
         };
@@ -425,7 +428,7 @@ impl GrammarRules for NativeRules {
         } else if kind == VARIABLE
             && self
                 .kinds
-                .function_declaration(name_node, node, self.depth_max)
+                .function_declaration(name_node, carrier, self.depth_max)
         {
             kind = FUNCTION;
         }
@@ -464,11 +467,11 @@ impl GrammarRules for NativeRules {
             .flatten()
     }
     fn declaration_start(&self, visited: Visited<'_, '_>, _: &str) -> usize {
-        self.declaration_node(visited.node()).start_byte()
+        self.declaration_node(visited).start_byte()
     }
 
-    fn declaration_node<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
-        self.declaration_parent(node).unwrap_or(node)
+    fn declaration_node<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        self.declaration_parent(visited).unwrap_or(visited.node())
     }
     fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         self.kinds

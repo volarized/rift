@@ -238,6 +238,31 @@ fn every_provider_reads_a_node_with_many_children_in_linear_time() {
 }
 
 #[test]
+fn native_function_prototypes_analyze_in_linear_time() {
+    for extension in ["c", "cpp"] {
+        let provider = registry::provider_for_extension(extension).expect("native provider");
+        let (document, lines) = analyze_linearly(
+            provider,
+            |count| {
+                format!(
+                    "{}{}",
+                    "// wide node comment line\n".repeat(count),
+                    "int wide(void);\n".repeat(count),
+                )
+            },
+            WIDE_NODE_LINES_MIN,
+        );
+        assert_eq!(document.symbols().len(), lines);
+        assert!(
+            document
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.kind == "function")
+        );
+    }
+}
+
+#[test]
 fn a_declaration_after_many_attached_doc_lines_attaches_in_linear_time() {
     for provider in registry::providers() {
         let language = provider.language();

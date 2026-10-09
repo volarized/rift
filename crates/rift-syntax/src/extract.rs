@@ -136,8 +136,8 @@ pub(crate) trait GrammarRules {
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize;
 
     /// The whole declaration that contains the visited declaration name.
-    fn declaration_node<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
-        node
+    fn declaration_node<'tree>(&self, visited: Visited<'_, 'tree>) -> Node<'tree> {
+        visited.node()
     }
 
     /// The grammar's exact declaration name field, absent for providers without one.
@@ -331,7 +331,7 @@ fn qualified_symbol(
     rules: &dyn GrammarRules,
 ) -> Result<SyntaxSymbol, RiftError> {
     let visited_node = visited.node();
-    let node = rules.declaration_node(visited_node);
+    let node = rules.declaration_node(visited);
     let item_range = byte_range(node)?;
     let start = rules.declaration_start(visited, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
