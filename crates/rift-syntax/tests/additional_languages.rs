@@ -90,6 +90,7 @@ fn native_declarations_keep_names_ranges_and_language_identity() {
             source,
             SyntaxLimits::default(),
             SyntaxFactsParts {
+                origin: facts.origin(),
                 language: facts.language().clone(),
                 symbols: facts.symbols().to_vec(),
                 has_errors: facts.has_errors(),
@@ -186,6 +187,7 @@ fn embedded_signatures_restore_only_registered_host_languages() {
             source,
             SyntaxLimits::default(),
             SyntaxFactsParts {
+                origin: original.origin(),
                 language: original.language().clone(),
                 symbols,
                 has_errors: original.has_errors(),

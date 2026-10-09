@@ -1,6 +1,6 @@
 //! Angular component ownership from captured TypeScript syntax and import evidence.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{ByteRange, SyntaxDocument, SyntaxNode, SyntaxSource};
 
@@ -40,7 +40,7 @@ pub enum AngularTemplate {
 
 /// Finds Angular components from their imports and captured TypeScript declaration syntax.
 ///
-/// Work is linear in the bounded document's nodes and source text. This function performs
+/// Work follows the bounded document's nodes and ancestor depth. This function performs
 /// no parsing and preserves dynamic template expressions as unresolved source ranges.
 #[must_use]
 pub fn angular_components(
@@ -49,12 +49,13 @@ pub fn angular_components(
 ) -> Vec<AngularComponent> {
     let children = Children::new(document.nodes());
     let imports = component_imports(source.text, &children);
+    let shadows = binding_shadows(source.text, &children, &imports);
     document
         .nodes()
         .iter()
         .enumerate()
         .filter(|(_, node)| node.kind == "decorator")
-        .filter_map(|(index, _)| component(source.text, &children, &imports, index))
+        .filter_map(|(index, _)| component(source.text, &children, &imports, &shadows, index))
         .collect()
 }
 
@@ -237,6 +238,7 @@ fn component(
     text: &str,
     children: &Children<'_>,
     imports: &BTreeSet<String>,
+    shadows: &BTreeMap<usize, BTreeSet<String>>,
     decorator: usize,
 ) -> Option<AngularComponent> {
     let parent = children.nodes[decorator].parent?;
@@ -269,6 +271,17 @@ fn component(
     if !imports.contains(&callee) {
         return None;
     }
+    let root = callee.split('.').next()?;
+    let mut ancestor = children.nodes[class].parent;
+    while let Some(index) = ancestor {
+        if shadows
+            .get(&index)
+            .is_some_and(|names| names.contains(root))
+        {
+            return None;
+        }
+        ancestor = children.nodes[index].parent;
+    }
     let arguments = children.child(call, "arguments")?;
     let templates = if let Some(object) = children.child(arguments, "object") {
         children
@@ -284,6 +297,109 @@ fn component(
         range: children.nodes[class].range,
         templates,
     })
+}
+
+fn binding_shadows(
+    text: &str,
+    children: &Children<'_>,
+    imports: &BTreeSet<String>,
+) -> BTreeMap<usize, BTreeSet<String>> {
+    let roots: BTreeSet<_> = imports
+        .iter()
+        .filter_map(|name| name.split('.').next())
+        .collect();
+    let mut shadows: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+    for index in 0..children.nodes.len() {
+        let Some((scope, bindings)) = scoped_bindings(children, index) else {
+            continue;
+        };
+        let names = binding_names(text, children, bindings, &roots);
+        if !names.is_empty() {
+            shadows.entry(scope).or_default().extend(names);
+        }
+    }
+    shadows
+}
+
+fn scoped_bindings(children: &Children<'_>, index: usize) -> Option<(usize, Vec<usize>)> {
+    let node = &children.nodes[index];
+    let first_binding = |parent| {
+        children
+            .indices(parent)
+            .find(|child| binding_kind(children.nodes[*child].kind))
+    };
+    match node.kind {
+        "formal_parameters" => Some((
+            node.parent?,
+            children.indices(index).filter_map(first_binding).collect(),
+        )),
+        "arrow_function" if children.child(index, "formal_parameters").is_none() => {
+            Some((index, vec![children.child(index, "identifier")?]))
+        }
+        "variable_declarator" | "function_declaration" => {
+            let binding = if node.kind == "function_declaration" {
+                children.child(index, "identifier")?
+            } else {
+                first_binding(index)?
+            };
+            let mut ancestor = node.parent;
+            for _ in 0..children.nodes.len() {
+                let scope = ancestor?;
+                if matches!(children.nodes[scope].kind, "statement_block" | "program") {
+                    return Some((scope, vec![binding]));
+                }
+                ancestor = children.nodes[scope].parent;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn binding_names(
+    text: &str,
+    children: &Children<'_>,
+    mut pending: Vec<usize>,
+    roots: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    while let Some(binding) = pending.pop() {
+        match children.nodes[binding].kind {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                if let Some(name) = children
+                    .text(binding, text)
+                    .filter(|name| roots.contains(name))
+                {
+                    names.insert(name.to_owned());
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = children.indices(binding).next() {
+                    pending.push(left);
+                }
+            }
+            _ => pending.extend(
+                children
+                    .indices(binding)
+                    .filter(|index| binding_kind(children.nodes[*index].kind)),
+            ),
+        }
+    }
+    names
+}
+
+fn binding_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "shorthand_property_identifier_pattern"
+            | "object_pattern"
+            | "array_pattern"
+            | "pair_pattern"
+            | "rest_pattern"
+            | "assignment_pattern"
+            | "object_assignment_pattern"
+    )
 }
 
 fn template(text: &str, children: &Children<'_>, index: usize) -> Option<AngularTemplate> {

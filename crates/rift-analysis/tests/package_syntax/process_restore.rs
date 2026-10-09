@@ -140,6 +140,7 @@ impl CapturedFacts {
             SOURCE,
             limits,
             SyntaxFactsParts {
+                origin: rift_syntax::SyntaxOrigin::Provider,
                 language: self.language.clone(),
                 symbols: self
                     .symbols

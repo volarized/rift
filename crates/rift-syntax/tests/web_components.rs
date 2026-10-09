@@ -397,5 +397,21 @@ fn angular_empty_inline_template_retains_existing_typescript_facts() {
     assert_eq!(range.start, range.end);
     let combined = append_angular_templates(source, SyntaxLimits::default(), &host, &[range])
         .expect("empty inline template");
-    assert_eq!(combined, host);
+    assert_eq!(
+        combined.facts().origin(),
+        rift_syntax::SyntaxOrigin::Framework
+    );
+    assert_eq!(combined.nodes(), host.nodes());
+    assert_eq!(combined.symbols(), host.symbols());
+    assert_eq!(combined.language(), host.language());
+    assert_eq!(combined.source_digest(), host.source_digest());
+    assert_eq!(
+        combined.facts().syntax_limits(),
+        host.facts().syntax_limits()
+    );
+    assert_eq!(combined.has_errors(), host.has_errors());
+    assert_eq!(
+        combined.left_out_declaration_count(),
+        host.left_out_declaration_count()
+    );
 }

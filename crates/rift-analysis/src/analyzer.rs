@@ -117,6 +117,7 @@ pub struct PackageAnalysis {
     semantics: WorkspaceSemantics,
     notebook_cells: BTreeMap<DocumentationContentIdentity, String>,
     syntax_work: crate::PackageSyntaxWork,
+    warnings: Vec<rift_protocol::read::ReadWarning>,
 }
 
 impl PackageAnalysis {
@@ -130,6 +131,12 @@ impl PackageAnalysis {
     #[must_use]
     pub const fn syntax_work(&self) -> crate::PackageSyntaxWork {
         self.syntax_work
+    }
+
+    /// Framework context that could not be resolved from captured sources.
+    #[must_use]
+    pub fn warnings(&self) -> &[rift_protocol::read::ReadWarning] {
+        &self.warnings
     }
 
     /// Every analyzed file, in path order.
@@ -166,6 +173,8 @@ fn analyzed_file(
     file: crate::PackageSource<'_>,
     supplied: &mut impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     work: &mut crate::PackageSyntaxWork,
+    context: &crate::FrameworkContext,
+    warnings: &mut Vec<rift_protocol::read::ReadWarning>,
 ) -> Result<AnalyzedFile, RiftError> {
     let source = crate::PackageSyntaxSource::new(
         file,
@@ -183,15 +192,31 @@ fn analyzed_file(
         .provider_calls
         .checked_add(source.provider_calls())
         .expect("package syntax provider call count must fit u64");
-    if accepted && source.provider_calls() == 0 {
+    if accepted && source.provider_calls() == 0 && context.for_path(file.path()).is_none() {
         work.reused_files += 1;
     }
+    let facts = if context.for_path(file.path()).is_some() {
+        let document = source.parse_document()?;
+        let (document, found, calls) = context.apply(
+            rift_syntax::SyntaxSource {
+                path: file.path(),
+                text: file.text(),
+            },
+            input.limits().syntax(),
+            document,
+        )?;
+        work.provider_calls += 1 + calls;
+        warnings.extend(found);
+        document.shared_facts()
+    } else {
+        std::sync::Arc::clone(syntax.facts())
+    };
     let parsed = IndexedFile::new_with_shared_syntax(
         file.path().clone(),
         file.text().to_owned().into(),
         source.identity().source_digest,
         false,
-        std::sync::Arc::clone(syntax.facts()),
+        facts,
     );
     let placement = placement_of(input.package(), input.origin(), file.path())?;
     let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
@@ -215,9 +240,10 @@ impl PackageAnalyzer {
     /// identity order, and a collection that reaches its bound stops there and reports the
     /// stop as a warning.
     ///
-    /// The work is proportional to the selected bytes: one parse per file, one scan per
-    /// file for its line starts, one assembly pass over the parsed declarations, and one
-    /// canonical rendering per record.
+    /// The work is proportional to the selected bytes: raw parsing and framework
+    /// context passes, one scan per file for its line starts, one assembly pass over the
+    /// parsed declarations, and one canonical rendering per record. Files with framework
+    /// context parse current source before applying framework facts.
     ///
     /// # Errors
     ///
@@ -251,7 +277,23 @@ impl PackageAnalyzer {
         mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     ) -> Result<PackageAnalysis, RiftError> {
         let package = input.package();
-        let mut syntax_work = crate::PackageSyntaxWork::default();
+        let sources = input
+            .files()
+            .iter()
+            .chain(input.context_sources())
+            .copied()
+            .collect::<Vec<_>>();
+        let context = crate::FrameworkContext::resolve(
+            &sources,
+            input.frameworks(),
+            input.limits().syntax(),
+            &|| false,
+        )?;
+        let mut warnings = context.warnings().to_vec();
+        let mut syntax_work = crate::PackageSyntaxWork {
+            provider_calls: context.provider_calls(),
+            ..crate::PackageSyntaxWork::default()
+        };
         let mut analyzed = Vec::with_capacity(input.files().len());
         for file in input.files() {
             analyzed.push(analyzed_file(
@@ -259,6 +301,8 @@ impl PackageAnalyzer {
                 *file,
                 &mut supplied,
                 &mut syntax_work,
+                &context,
+                &mut warnings,
             )?);
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
@@ -304,6 +348,7 @@ impl PackageAnalyzer {
             semantics: built.semantics,
             notebook_cells,
             syntax_work,
+            warnings,
         })
     }
 }

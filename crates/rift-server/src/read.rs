@@ -884,7 +884,20 @@ impl ReadService {
             .index
             .nodes(&path, params.position)?
             .ok_or_else(|| self.missing_file_fault(&path))?;
-        Ok(nodes_at_file(file, &nodes, self.revisions.warnings()))
+        let mut warnings = self.revisions.warnings();
+        warnings.extend(
+            self.index
+                .warnings()
+                .iter()
+                .filter(|warning| {
+                    matches!(
+                        warning,
+                        WorkspaceIndexWarning::FrameworkContextUnresolved { .. }
+                    ) && warning.path() == &path
+                })
+                .map(wire_index_warning),
+        );
+        Ok(nodes_at_file(file, &nodes, warnings))
     }
 
     /// Reads syntax nodes for a path selected by workspace discovery but not yet included in
@@ -961,11 +974,9 @@ impl ReadService {
                 .fail();
         }
         validate_node_position(&parsed.file, params.position)?;
-        Ok(nodes_at_file(
-            &parsed.file,
-            &parsed.nodes,
-            self.revisions.warnings(),
-        ))
+        let mut warnings = self.revisions.warnings();
+        warnings.extend(parsed.warnings);
+        Ok(nodes_at_file(&parsed.file, &parsed.nodes, warnings))
     }
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
@@ -1568,6 +1579,16 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
 /// Projects one index-build warning onto its wire form.
 pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
     let path = warning.path();
+    if let WorkspaceIndexWarning::FrameworkContextUnresolved {
+        framework, detail, ..
+    } = warning
+    {
+        return ReadWarning::FrameworkContextUnresolved {
+            unit: file_id(path),
+            framework: *framework,
+            detail: detail.clone(),
+        };
+    }
     ReadWarning::SourceUnavailable {
         unit: Some(file_id(path)),
         detail: format!(
@@ -1584,8 +1605,24 @@ pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning
 /// when more were left out - one more counting the rest, which `rift server logs` names one by
 /// one; and one `large_file_unparsed` naming the files held as text alone.
 pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
-    let (unparsed, left_out): (Vec<&WorkspaceIndexWarning>, Vec<&WorkspaceIndexWarning>) =
-        warnings.iter().partition(|warning| warning.holds_text());
+    let framework = warnings
+        .iter()
+        .filter(|warning| {
+            matches!(
+                warning,
+                WorkspaceIndexWarning::FrameworkContextUnresolved { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let (unparsed, left_out): (Vec<&WorkspaceIndexWarning>, Vec<&WorkspaceIndexWarning>) = warnings
+        .iter()
+        .filter(|warning| {
+            !matches!(
+                warning,
+                WorkspaceIndexWarning::FrameworkContextUnresolved { .. }
+            )
+        })
+        .partition(|warning| warning.holds_text());
     let mut warnings: Vec<ReadWarning> = left_out
         .iter()
         .take(SOURCE_WARNINGS_MAX)
@@ -1601,6 +1638,12 @@ pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWar
         });
     }
     warnings.extend(unparsed_warning(&unparsed));
+    warnings.extend(
+        framework
+            .into_iter()
+            .take(SOURCE_WARNINGS_MAX)
+            .map(wire_index_warning),
+    );
     warnings
 }
 

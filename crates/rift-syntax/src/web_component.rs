@@ -137,13 +137,14 @@ pub fn analyze_angular_included(
     crate::restore::range(source.text, range)?;
     let range = crate::embedded::source_range(source.text, range);
     let provider = AngularSyntaxProvider::default();
-    analyze(
+    let document = analyze(
         provider.language(),
         &angular_grammar(),
         source,
         limits,
         &[range],
-    )
+    )?;
+    crate::embedded::append(source, limits, &document)
 }
 
 fn analyze(
@@ -230,7 +231,8 @@ pub fn append_angular_templates(
     }
     let mut nodes = document.nodes().to_vec();
     let mut has_errors = document.has_errors();
-    let omitted = document.left_out_declaration_count();
+    let mut symbols = document.symbols().to_vec();
+    let mut omitted = document.left_out_declaration_count();
     for range in ranges {
         if range.start == range.end {
             continue;
@@ -243,19 +245,30 @@ pub fn append_angular_templates(
             .map_err(|error| crate::embedded::aggregate_error(error, source, limits))?;
         crate::embedded::admit_depth(source, limits, depth, &template)?;
         has_errors |= template.has_errors();
+        omitted = omitted
+            .checked_add(template.left_out_declaration_count())
+            .ok_or_else(|| {
+                errors::syntax::too_many_nodes()
+                    .path(source.path)
+                    .syntax_nodes_max(limits.syntax_nodes_max())
+                    .error()
+            })?;
+        symbols.extend_from_slice(template.symbols());
         crate::embedded::append_nodes(&mut nodes, &template, parent);
     }
     crate::embedded::order_nodes(&mut nodes);
+    symbols.sort_by_key(|symbol| symbol.range.start);
     Ok(SyntaxDocument::new(
         document.language().clone(),
         source.path.clone(),
         nodes,
-        document.symbols().to_vec(),
+        symbols,
         has_errors,
     )
     .with_source_witness(source.text)
     .with_syntax_limits(limits)
-    .with_left_out_declarations(omitted))
+    .with_left_out_declarations(omitted)
+    .with_framework_context())
 }
 
 fn containing_node(document: &SyntaxDocument, range: crate::ByteRange) -> Option<usize> {

@@ -89,11 +89,21 @@ pub struct SyntaxSymbol {
     pub documentation_ranges: Vec<ByteRange>,
 }
 
+/// Origin of syntax facts before or after framework context applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntaxOrigin {
+    /// Facts returned by a shipped syntax provider, including its embedded languages.
+    Provider,
+    /// Facts assembled after framework ownership or configuration applies.
+    Framework,
+}
+
 /// Immutable syntax facts shared by documents at different paths, without complete node rows.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxFacts {
+    origin: SyntaxOrigin,
     language: Language,
     symbols: Vec<SyntaxSymbol>,
     has_errors: bool,
@@ -234,6 +244,7 @@ impl SyntaxDocument {
         Self {
             path,
             facts: Arc::new(SyntaxFacts {
+                origin: SyntaxOrigin::Provider,
                 language,
                 symbols,
                 has_errors,
@@ -352,6 +363,12 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Returns whether these facts came from a provider or framework context.
+    #[must_use]
+    pub const fn origin(&self) -> SyntaxOrigin {
+        self.origin
+    }
+
     /// Returns the language identity these facts are filed under.
     #[must_use]
     pub fn language(&self) -> &Language {
@@ -407,6 +424,11 @@ fn declaration_node_kinds(
 }
 
 impl SyntaxDocument {
+    pub(crate) fn with_framework_context(mut self) -> Self {
+        Arc::make_mut(&mut self.facts).origin = SyntaxOrigin::Framework;
+        self
+    }
+
     /// Adds declarations omitted by documents merged into this document.
     pub(crate) fn with_left_out_declarations(mut self, count: usize) -> Self {
         let facts = Arc::make_mut(&mut self.facts);
@@ -432,6 +454,7 @@ impl SyntaxFacts {
 
     pub(crate) fn restored(parts: crate::SyntaxFactsParts, limits: crate::SyntaxLimits) -> Self {
         Self {
+            origin: parts.origin,
             language: parts.language,
             symbols: parts.symbols,
             has_errors: parts.has_errors,

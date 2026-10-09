@@ -79,6 +79,7 @@ pub struct WorkspaceLanguagePolicy {
     languages: Vec<EffectiveLanguage>,
     text: Option<PathMatcher>,
     excluded_lockfiles: BTreeSet<String>,
+    frameworks: Vec<rift_protocol::configuration::SyntaxFrameworkConfiguration>,
 }
 
 impl WorkspaceLanguagePolicy {
@@ -158,6 +159,7 @@ impl WorkspaceLanguagePolicy {
             languages,
             text,
             excluded_lockfiles: text_inclusion_lockfiles(text_inclusion),
+            frameworks: selections.frameworks().to_vec(),
         })
     }
 
@@ -242,7 +244,9 @@ impl WorkspaceLanguagePolicy {
         if let Some(provider) = self.syntax_provider_for(&path)? {
             return Ok(Some(ClassifiedPath::Source(provider)));
         }
-        if is_workspace_document(path.extension().and_then(|extension| extension.to_str())) {
+        if path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+            || is_workspace_document(path.extension().and_then(|extension| extension.to_str()))
+        {
             return Ok(Some(ClassifiedPath::Text));
         }
         Ok(self
@@ -250,6 +254,12 @@ impl WorkspaceLanguagePolicy {
             .as_ref()
             .is_some_and(|matcher| matcher.includes(&path))
             .then_some(ClassifiedPath::Text))
+    }
+
+    pub(crate) fn frameworks(
+        &self,
+    ) -> &[rift_protocol::configuration::SyntaxFrameworkConfiguration] {
+        &self.frameworks
     }
 
     /// Whether the index leaves `path` out of search as a lockfile: its final path segment

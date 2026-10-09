@@ -156,6 +156,10 @@ pub const SYNTAX_NODES_MAX: u64 = 100_000_000;
 pub const SYNTAX_DEPTH_DEFAULT: u64 = 512;
 /// Nesting `providers.syntax.max_depth` may allow, at most.
 pub const SYNTAX_DEPTH_MAX: u64 = 65_536;
+/// Explicit framework selections one syntax configuration may carry.
+pub const SYNTAX_FRAMEWORKS_MAX: usize = 256;
+/// Path patterns one explicit framework selection may carry.
+pub const SYNTAX_FRAMEWORK_PATTERNS_MAX: usize = 256;
 /// Bytes an `[search.vector.embedding]` model value may hold, at most.
 pub const EMBEDDING_MODEL_BYTES_MAX: usize = 128;
 
@@ -1129,6 +1133,34 @@ pub struct SyntaxConfiguration {
     /// Nesting one source's syntax tree may reach.
     #[schemars(range(min = 1, max = 65_536))]
     pub max_depth: u64,
+    /// Explicit framework context for matching source paths. Automatic context reads
+    /// the source's own package and component for frameworks a selection does not supply.
+    #[schemars(length(max = 256))]
+    pub frameworks: Vec<SyntaxFrameworkConfiguration>,
+}
+
+/// One explicit framework context, selected by workspace-relative path patterns.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyntaxFrameworkConfiguration {
+    /// Source paths this context applies to. An empty list selects no source.
+    #[schemars(length(max = 256))]
+    pub include: Vec<crate::read::PathPattern>,
+    /// Treat matching HTML sources and owned TypeScript templates as Angular.
+    pub angular: bool,
+    /// Tailwind major version whose directives and static classes are interpreted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailwind: Option<TailwindVersion>,
+}
+
+/// Tailwind versions with distinct stylesheet and configuration syntax.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TailwindVersion {
+    /// Tailwind 3 uses configuration files and `@tailwind` directives.
+    V3,
+    /// Tailwind 4 uses stylesheet imports, theme declarations, and custom utilities.
+    V4,
 }
 
 impl Default for SyntaxConfiguration {
@@ -1137,6 +1169,7 @@ impl Default for SyntaxConfiguration {
             max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_DEFAULT),
             max_nodes: SYNTAX_NODES_DEFAULT,
             max_depth: SYNTAX_DEPTH_DEFAULT,
+            frameworks: Vec::new(),
         }
     }
 }
@@ -1164,7 +1197,29 @@ impl SyntaxConfiguration {
                 1,
                 SYNTAX_DEPTH_MAX,
             ),
+            (
+                "providers.syntax.frameworks",
+                self.frameworks.len() as u64,
+                0,
+                SYNTAX_FRAMEWORKS_MAX as u64,
+            ),
         ])
+        .or_else(|| {
+            self.frameworks.iter().find_map(|framework| {
+                first_out_of_range([(
+                    "providers.syntax.frameworks.include",
+                    framework.include.len() as u64,
+                    0,
+                    SYNTAX_FRAMEWORK_PATTERNS_MAX as u64,
+                )])
+                .or_else(|| {
+                    path_patterns_violation(
+                        "providers.syntax.frameworks.include",
+                        &framework.include,
+                    )
+                })
+            })
+        })
     }
 }
 
@@ -4034,8 +4089,61 @@ mod tests {
             max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX),
             max_nodes: SYNTAX_NODES_MAX,
             max_depth: SYNTAX_DEPTH_MAX,
+            frameworks: Vec::new(),
         };
         assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn framework_configuration_bounds_schema_and_defaults_agree() {
+        let mut configuration = WorkspaceConfiguration::default();
+        assert!(configuration.providers.syntax.frameworks.is_empty());
+        let selection = SyntaxFrameworkConfiguration {
+            include: vec![PathPattern("app/**".to_owned()); SYNTAX_FRAMEWORK_PATTERNS_MAX],
+            angular: true,
+            tailwind: Some(TailwindVersion::V4),
+        };
+        configuration.providers.syntax.frameworks = vec![selection; SYNTAX_FRAMEWORKS_MAX];
+        assert_eq!(configuration.validate(), Ok(()));
+        configuration
+            .providers
+            .syntax
+            .frameworks
+            .push(SyntaxFrameworkConfiguration::default());
+        assert!(configuration.validate().is_err());
+        configuration.providers.syntax.frameworks.pop();
+        configuration.providers.syntax.frameworks[0]
+            .include
+            .push(PathPattern("extra/**".to_owned()));
+        assert!(configuration.validate().is_err());
+        configuration.providers.syntax.frameworks = vec![SyntaxFrameworkConfiguration {
+            include: vec![PathPattern("app\\source".to_owned())],
+            ..SyntaxFrameworkConfiguration::default()
+        }];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PathPatternInvalid {
+                field: "providers.syntax.frameworks.include",
+                ..
+            })
+        ));
+        let schema = crate::schema::configuration_schema();
+        assert_eq!(
+            schema["$defs"]["SyntaxConfiguration"]["properties"]["frameworks"]["maxItems"],
+            serde_json::json!(SYNTAX_FRAMEWORKS_MAX)
+        );
+        assert_eq!(
+            schema["$defs"]["SyntaxFrameworkConfiguration"]["properties"]["include"]["maxItems"],
+            serde_json::json!(SYNTAX_FRAMEWORK_PATTERNS_MAX)
+        );
+        assert_eq!(
+            serde_json::to_value(TailwindVersion::V3).expect("version serializes"),
+            serde_json::json!("v3")
+        );
+        assert_eq!(
+            serde_json::to_value(TailwindVersion::V4).expect("version serializes"),
+            serde_json::json!("v4")
+        );
     }
 
     #[test]

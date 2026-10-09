@@ -171,6 +171,17 @@ fn classes(text: &str, children: &Children<'_>, index: usize, facts: &mut Collec
     else {
         return;
     };
+    let name = if children.nodes[index].kind == "directive_attribute" && name == "v-bind" {
+        let Some(value) = children
+            .child(index, "directive_value")
+            .and_then(|value| children.text(value, text))
+        else {
+            return;
+        };
+        value
+    } else {
+        name
+    };
     if let Some(name) = name.strip_prefix("class:") {
         let attribute = children
             .indices(index)
@@ -209,7 +220,7 @@ fn angular_class_binding(
     let name = children
         .child(binding, "binding_name")
         .and_then(|name| children.text(name, text));
-    if class.is_none() && !matches!(name, Some("class" | "ngClass")) {
+    if class.is_none() && !matches!(name, Some("class" | "ngClass" | "className" | "attr.class")) {
         return false;
     }
     if let Some(name) = class.and_then(|class| children.child(class, "class_name"))
@@ -329,16 +340,24 @@ fn directive(
     );
     match name {
         "@apply" => utilities(text, range, facts),
-        "@tailwind" | "@screen" | "@layer" if major == 3 => first_word(
-            text,
-            range,
-            if name == "@screen" {
-                VARIANT
-            } else {
-                CONFIGURATION
-            },
-            facts,
-        ),
+        "@tailwind" | "@screen" | "@layer" if major == 3 => {
+            first_word(
+                text,
+                range,
+                if name == "@screen" {
+                    VARIANT
+                } else {
+                    CONFIGURATION
+                },
+                facts,
+            );
+            if name == "@layer"
+                && text_range(text, range).and_then(|text| text.split_ascii_whitespace().next())
+                    == Some("utilities")
+            {
+                layer_utilities(text, children, range.end, facts);
+            }
+        }
         "@utility" if major == 4 => first_word(text, range, UTILITY, facts),
         "@custom-variant" | "@variant" if major == 4 => first_word(text, range, VARIANT, facts),
         "@config" if matches!(major, 3 | 4) => first_word(text, range, CONFIGURATION, facts),
@@ -386,14 +405,33 @@ fn directive_header(text: &str, range: ByteRange) -> ByteRange {
     range
 }
 
-fn theme_properties(text: &str, children: &Children<'_>, start: u64, facts: &mut Collector) {
+fn directive_block(children: &Children<'_>, start: u64) -> Option<usize> {
     let first = children
         .nodes
         .partition_point(|node| node.range.start < start);
-    let Some(block) = (first..children.nodes.len())
+    (first..children.nodes.len())
         .take_while(|index| children.nodes[*index].range.start == start)
         .find(|index| children.nodes[*index].kind == "block")
-    else {
+}
+
+fn layer_utilities(text: &str, children: &Children<'_>, start: u64, facts: &mut Collector) {
+    let Some(block) = directive_block(children, start) else {
+        return;
+    };
+    for child in
+        descendants(children, block).filter(|child| children.nodes[*child].kind == "class_name")
+    {
+        if facts.exhausted {
+            return;
+        }
+        if let Some(name) = children.text(child, text) {
+            facts.symbol(name, UTILITY, children.nodes[child].range);
+        }
+    }
+}
+
+fn theme_properties(text: &str, children: &Children<'_>, start: u64, facts: &mut Collector) {
+    let Some(block) = directive_block(children, start) else {
         return;
     };
     for child in
@@ -615,8 +653,10 @@ pub fn append_framework_symbols(
     )
     .with_source_witness(source.text)
     .with_syntax_limits(limits)
-    .with_left_out_declarations(omitted);
+    .with_left_out_declarations(omitted)
+    .with_framework_context();
     let parts = SyntaxFactsParts {
+        origin: result.facts().origin(),
         language: result.language().clone(),
         symbols: result.symbols().to_vec(),
         has_errors: result.has_errors(),

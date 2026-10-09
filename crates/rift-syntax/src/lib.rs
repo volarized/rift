@@ -31,7 +31,9 @@ pub use contribution::{
     source_unit_for_path,
 };
 pub use css::CssSyntaxProvider;
-pub use document::{ByteRange, SyntaxDocument, SyntaxFacts, SyntaxNode, SyntaxSymbol};
+pub use document::{
+    ByteRange, SyntaxDocument, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
+};
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;

@@ -19,6 +19,8 @@ use crate::{
 /// preserves them, attached documentation, parser errors, and omission counts unchanged.
 #[derive(Debug, Clone)]
 pub struct SyntaxFactsParts {
+    /// Recorded provider or framework origin, retained through checked construction.
+    pub origin: crate::SyntaxOrigin,
     /// Actual provider language and dialect.
     pub language: Language,
     /// Normalized declarations in source order.
@@ -190,6 +192,12 @@ impl SyntaxNames {
             ShippedLanguage::Toml => crate::toml::restored_symbol_kind(name),
             ShippedLanguage::Python => crate::python::restored_symbol_kind(name),
         };
+        let base = base.or_else(|| match self.shipped {
+            ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => {
+                embedded_symbol_kind(name)
+            }
+            _ => None,
+        });
         base.or_else(|| match self.shipped {
             ShippedLanguage::Html
             | ShippedLanguage::HtmlAngular
@@ -225,9 +233,12 @@ impl SyntaxNames {
                 ShippedLanguage::TypeScript,
                 ShippedLanguage::Css,
             ],
-            ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => {
-                &[ShippedLanguage::HtmlAngular]
-            }
+            ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => &[
+                ShippedLanguage::HtmlAngular,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::Css,
+            ],
             _ => &[],
         }
     }

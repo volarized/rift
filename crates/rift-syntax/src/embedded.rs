@@ -57,7 +57,12 @@ pub(crate) fn append(
         has_errors |= embedded.has_errors();
         omitted = omitted
             .checked_add(embedded.left_out_declaration_count())
-            .expect("bounded omitted declarations");
+            .ok_or_else(|| {
+                errors::syntax::too_many_nodes()
+                    .path(source.path)
+                    .syntax_nodes_max(limits.syntax_nodes_max())
+                    .error()
+            })?;
         append_nodes(&mut nodes, &embedded, index);
         symbols.extend_from_slice(embedded.symbols());
     }

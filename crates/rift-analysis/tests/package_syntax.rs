@@ -97,6 +97,7 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
         text,
         syntax.identity().limits,
         SyntaxFactsParts {
+            origin: facts.origin(),
             language: facts.language().clone(),
             symbols,
             has_errors: facts.has_errors(),

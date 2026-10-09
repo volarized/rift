@@ -24,6 +24,7 @@ fn parsed(shipped: ShippedLanguage, text: &str) -> SyntaxDocument {
 
 fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
     SyntaxFactsParts {
+        origin: facts.origin(),
         language: facts.language().clone(),
         symbols: facts.symbols().to_vec(),
         has_errors: facts.has_errors(),

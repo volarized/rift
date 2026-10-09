@@ -906,6 +906,16 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
             json!({"code": "package_context_degraded", "resolver": "cargo", "reason": "metadata read failed"}),
             "package_context_degraded · resolver cargo · reason metadata read failed",
         ),
+        (
+            json!({"code": "framework_context_unresolved", "unit": file("view.html"),
+                "framework": "tailwind", "detail": "dynamic class expression"}),
+            "framework_context_unresolved · unit rift://file/view.html · framework tailwind: dynamic class expression",
+        ),
+        (
+            json!({"code": "framework_context_unresolved", "unit": file("component.ts"),
+                "framework": "angular", "detail": "dynamic template expression"}),
+            "framework_context_unresolved · unit rift://file/component.ts · framework angular: dynamic template expression",
+        ),
     ]
 }
 

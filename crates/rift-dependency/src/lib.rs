@@ -29,7 +29,8 @@ pub use context::{
     ContextAnswer, Degradation, Degraded, DependencyContext, EnvironmentObservation, InstallFolder,
     InstallLocation, resolve_context,
 };
-pub use npm::NpmResolver;
+pub use node::node_package_dependencies;
+pub use npm::{NpmResolver, npm_package_versions};
 pub use resolver::{
     CommandFailure, CommandOutput, ContextInputs, ContextRequest, DIRECTORY_ENTRIES_MAX,
     DependencyResolver, FileObservation, LOCKFILE_BYTES_MAX, MANIFESTS_MAX, PACKAGES_MAX,

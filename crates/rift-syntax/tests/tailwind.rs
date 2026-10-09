@@ -69,6 +69,7 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
             append_framework_symbols(source, SyntaxLimits::default(), &document, facts.symbols)
                 .expect("enriched source");
         let parts = SyntaxFactsParts {
+            origin: enriched.facts().origin(),
             language: enriched.language().clone(),
             symbols: enriched.symbols().to_vec(),
             has_errors: enriched.has_errors(),
@@ -86,7 +87,7 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
 
 #[test]
 fn tailwind_version_specific_directives_and_theme_configuration_references() {
-    let text = "@import \"tailwindcss\"; @config './tailwind.config.js'; @theme { --color-beacon: red; } @utility beacon { display:flex; } @custom-variant night (&:where(.night *)); .plain { color:blue; @apply flex hover:beacon !important; margin:theme(spacing.4); }";
+    let text = "@import \"tailwindcss\"; @reference './base.css'; @config './tailwind.config.js'; @theme { --color-beacon: red; } @utility beacon { display:flex; } @custom-variant night (&:where(.night *)); .plain { color:blue; @apply flex hover:beacon !important; margin:theme(spacing.4); }";
     let path = ProjectPath::new("src/beacon.css").expect("fixture path");
     let source = SyntaxSource { path: &path, text };
     let document = CssSyntaxProvider::default()
@@ -96,6 +97,7 @@ fn tailwind_version_specific_directives_and_theme_configuration_references() {
     for (kind, name) in [
         ("configuration", "tailwindcss"),
         ("configuration", "./tailwind.config.js"),
+        ("configuration", "./base.css"),
         ("theme", "--color-beacon"),
         ("utility", "beacon"),
         ("variant", "night"),
@@ -110,6 +112,14 @@ fn tailwind_version_specific_directives_and_theme_configuration_references() {
             document.nodes()
         );
     }
+    let reference = facts
+        .symbols
+        .iter()
+        .find(|symbol| symbol.kind == "configuration" && symbol.name == "./base.css")
+        .expect("authored stylesheet reference");
+    let start = usize::try_from(reference.range.start).expect("reference offset");
+    let end = usize::try_from(reference.range.end).expect("reference offset");
+    assert_eq!(&text[start..end], "./base.css");
     assert!(
         !facts
             .symbols
@@ -118,12 +128,10 @@ fn tailwind_version_specific_directives_and_theme_configuration_references() {
     );
     let facts3 =
         tailwind_symbols(source, &document, 3, SyntaxLimits::default()).expect("Tailwind3");
-    assert!(
-        !facts3
-            .symbols
-            .iter()
-            .any(|symbol| matches!(symbol.name.as_str(), "--color-beacon" | "night"))
-    );
+    assert!(!facts3.symbols.iter().any(|symbol| matches!(
+        symbol.name.as_str(),
+        "--color-beacon" | "night" | "./base.css"
+    )));
     assert!(
         document
             .symbols()
@@ -247,4 +255,77 @@ fn tailwind_malformed_embedded_style_header_cannot_reach_other_host_bytes() {
             .iter()
             .any(|symbol| symbol.name.contains("title") || symbol.name.contains("</style>"))
     );
+}
+
+#[test]
+fn tailwind_v3_utility_layer_records_authored_class_names_only_in_v3_context() {
+    let text = "@tailwind utilities; @layer utilities { .content-auto:hover { content-visibility:auto; } } .plain { color:blue; }";
+    let path = ProjectPath::new("src/beacon.css").expect("fixture path");
+    let source = SyntaxSource { path: &path, text };
+    let document = CssSyntaxProvider::default()
+        .analyze(source, SyntaxLimits::default())
+        .expect("CSS syntax");
+    assert!(
+        !document
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.kind == "utility")
+    );
+    let facts = tailwind_symbols(source, &document, 3, SyntaxLimits::default()).expect("Tailwind3");
+    assert!(
+        facts
+            .symbols
+            .iter()
+            .any(|symbol| symbol.kind == "utility" && symbol.name == "content-auto")
+    );
+    assert!(
+        !facts
+            .symbols
+            .iter()
+            .any(|symbol| symbol.kind == "utility" && symbol.name == "plain")
+    );
+    let facts4 =
+        tailwind_symbols(source, &document, 4, SyntaxLimits::default()).expect("Tailwind4");
+    assert!(
+        !facts4
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "content-auto")
+    );
+}
+
+#[test]
+fn tailwind_vue_and_angular_dynamic_class_bindings_preserve_expression_ranges() {
+    let vue = VueSyntaxProvider::default();
+    let angular = rift_syntax::AngularSyntaxProvider::default();
+    for (provider, text) in [
+        (
+            &vue as &dyn SyntaxProvider,
+            "<template><section v-bind:class=\"classes\" /></template>",
+        ),
+        (
+            &angular,
+            "<section [attr.class]=\"classes\" [className]=\"classes\"></section>",
+        ),
+    ] {
+        let path = ProjectPath::new("src/beacon.component").expect("fixture path");
+        let source = SyntaxSource { path: &path, text };
+        let document = provider
+            .analyze(source, SyntaxLimits::default())
+            .expect("template syntax");
+        let facts = tailwind_symbols(source, &document, 4, SyntaxLimits::default())
+            .expect("Tailwind context");
+        assert!(facts.symbols.is_empty());
+        assert_eq!(
+            facts.unresolved.len(),
+            if text.contains("className") { 2 } else { 1 }
+        );
+        assert!(
+            facts
+                .unresolved
+                .iter()
+                .all(|range| range.end <= text.len() as u64)
+        );
+        assert_eq!(document.language(), provider.language());
+    }
 }
