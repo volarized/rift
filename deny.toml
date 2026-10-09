@@ -118,4 +118,8 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # ty_project and ty_ide are unpublished, so the embedded ty engine's crates
 # come from the ruff repository at a pinned revision.
-allow-git = ["https://github.com/astral-sh/ruff"]
+# The Cython grammar is unpublished and pinned in the workspace dependencies.
+allow-git = [
+  "https://github.com/astral-sh/ruff",
+  "https://github.com/b0o/tree-sitter-cython",
+]
