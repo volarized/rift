@@ -1069,6 +1069,7 @@ impl ReadService {
     /// cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, RiftError> {
         validate_common(params.rev.is_some())?;
+        accepted_symbol_name(&params.name)?;
         let limit = accepted_limit(params.limit)?;
         validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
@@ -1086,6 +1087,7 @@ impl ReadService {
             candidates
                 .retain(|matched| language_selects(language, matched.file.syntax().language()));
         }
+        let absent = candidates.is_empty();
         let (window, pagination) = page(candidates, params.page_index, limit);
         let include_source = params.include.contains(&GetSymbolInclude::Source);
         let include_history = params.include.contains(&GetSymbolInclude::History);
@@ -1115,6 +1117,9 @@ impl ReadService {
         }
         let mut warnings = self.warnings();
         warnings.extend(disagreements);
+        if absent {
+            warnings.push(self.symbol_not_found(params));
+        }
         if bound_reached {
             warnings.push(results_truncation_warning(results_max));
         }
@@ -1123,6 +1128,27 @@ impl ReadService {
             pagination,
             warnings,
         })
+    }
+
+    /// Names an absent lookup and complete alternatives, or their work-bound failure.
+    fn symbol_not_found(&self, params: &GetSymbolParams) -> ReadWarning {
+        let proposed = if params.scope == SearchScope::Global {
+            Ok(Vec::new())
+        } else {
+            crate::alternatives::symbols(self.index.files(), &params.name, params.language.as_ref())
+        };
+        let (alternatives, detail) = match proposed {
+            Ok(alternatives) => (alternatives, None),
+            Err(()) => (
+                Vec::new(),
+                Some(crate::alternatives::UNAVAILABLE_DETAIL.to_owned()),
+            ),
+        };
+        ReadWarning::SymbolNotFound {
+            name: params.name.clone(),
+            alternatives,
+            detail,
+        }
     }
 
     /// Refuses a `scope` that reaches packages on a revision read - one the request's
@@ -1200,13 +1226,24 @@ impl ReadService {
     }
 }
 
-/// Accepts a caller-supplied result limit: positive and at most `PAGE_LIMIT_MAX`. The
-/// maximum fits `usize` on every platform, so the conversion below cannot fail.
+/// Accepts a nonempty lookup name within the served character bound.
+fn accepted_symbol_name(name: &str) -> Result<(), RiftError> {
+    let maximum = rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX;
+    let characters = name.chars().take(maximum + 1).count();
+    if characters == 0 || characters > maximum {
+        return errors::server::read_invalid()
+            .field("name")
+            .violation(format!("expected 1 to {maximum} characters"))
+            .fail();
+    }
+    Ok(())
+}
+
+/// Accepts a caller-supplied page size within the served limit.
 ///
 /// # Errors
 ///
-/// Returns `invalid_request` naming `limit` for zero, or for a limit past
-/// `PAGE_LIMIT_MAX`.
+/// Returns `invalid_request` naming `limit` when the size is outside its bounds.
 pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
     if requested == 0 {
         return errors::server::read_invalid()
@@ -1495,7 +1532,7 @@ pub(crate) fn language_provider(language: &Language) -> &'static dyn SyntaxProvi
 /// A caller's `language` filter selects a document language when the names
 /// match and, where the filter states a dialect, the dialects match too. A
 /// filter without a dialect selects every dialect of its name.
-fn language_selects(filter: &Language, candidate: &Language) -> bool {
+pub(crate) fn language_selects(filter: &Language, candidate: &Language) -> bool {
     filter.name == candidate.name
         && (filter.dialect.is_none() || filter.dialect == candidate.dialect)
 }

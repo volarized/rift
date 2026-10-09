@@ -816,6 +816,11 @@ pub(crate) fn merge_symbols(
         .into_iter()
         .map(|entry| entry.hit)
         .collect::<Vec<_>>();
+    if !hits.is_empty() {
+        local
+            .warnings
+            .retain(|warning| !matches!(warning, ReadWarning::SymbolNotFound { .. }));
+    }
     let (hits, pagination) = page_window(hits, params.page_index, limit);
     Ok(GetSymbolResult {
         hits,

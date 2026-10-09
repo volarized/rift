@@ -74,3 +74,7 @@ path = "tests/engine_pool.rs"
 [[test]]
 name = "local_index_oracle"
 path = "tests/local_index_oracle.rs"
+
+[[test]]
+name = "symbol_alternatives"
+path = "tests/symbol_alternatives.rs"

@@ -265,7 +265,20 @@ async fn served_fixture() -> TestResult<(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
+    served_fixture_with_source(None).await
+}
+
+async fn served_fixture_with_source(
+    source: Option<&str>,
+) -> TestResult<(
+    surface_corpus::SurfaceFixture,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
     let fixture = surface_corpus::SurfaceFixture::start().await?;
+    if let Some(source) = source {
+        std::fs::write(fixture.root().join("alternatives.rs"), source)?;
+    }
     let server = RiftMcp::build(fixture.root(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -278,6 +291,223 @@ async fn served_fixture() -> TestResult<(
     let client = ().serve(client_transport).await?;
     workspace_client::await_workspace_ready(&client).await?;
     Ok((fixture, client, server_task))
+}
+
+/// A miss keeps the empty answer and proposes declarations the caller can retrieve (#590).
+#[tokio::test]
+async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
+    let (_fixture, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name == "get_symbol")
+        .ok_or("get_symbol absent")?;
+    let schema = Value::Object(
+        tool.output_schema
+            .as_deref()
+            .ok_or("output schema absent")?
+            .clone(),
+    );
+    let validator = jsonschema::validator_for(&schema)?;
+    assert_symbol_alternative_bounds(tool, &schema)?;
+    let request = json!({"name": "beacon_ane", "language": "rust", "include": []});
+    let result = client
+        .call_tool(tools_call_request("get_symbol", &request)?)
+        .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "a miss must remain a successful read"
+    );
+    let answer = result
+        .structured_content
+        .ok_or("structured answer absent")?;
+    assert_validates(&validator, &answer, "get_symbol miss");
+    assert_eq!(answer["hits"], json!([]));
+    let warning = answer["warnings"]
+        .as_array()
+        .and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == "symbol_not_found")
+        })
+        .ok_or("a miss must name the unavailable symbol")?;
+    assert_eq!(warning["name"], "beacon_ane");
+    assert!(warning.get("detail").is_none());
+    assert_eq!(
+        warning["alternatives"],
+        json!([
+            "rift://symbol/rust/lib.rs/beacon_one",
+            "rift://symbol/rust/lib.rs/beacon_two",
+            "rift://symbol/rust/lib.rs/beacon_three"
+        ])
+    );
+    let text = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("beacon_ane"),
+        "the missing name must reach the caller: {text}"
+    );
+    assert!(
+        text.contains("beacon_one"),
+        "the closest declaration must reach the caller: {text}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn assert_symbol_alternative_bounds(tool: &rmcp::model::Tool, schema: &Value) -> TestResult {
+    let variants = schema["$defs"]["ReadWarning"]["oneOf"]
+        .as_array()
+        .ok_or("warning variants absent")?;
+    let miss = variants
+        .iter()
+        .find(|variant| variant["properties"]["code"]["const"] == "symbol_not_found")
+        .ok_or("symbol_not_found schema absent")?;
+    assert_eq!(
+        miss["properties"]["alternatives"]["maxItems"],
+        json!(rift_protocol::read::SYMBOL_ALTERNATIVES_MAX)
+    );
+    assert_eq!(
+        miss["properties"]["name"]["maxLength"],
+        json!(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+    );
+    assert_eq!(
+        tool.input_schema["properties"]["name"]["maxLength"],
+        json!(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+    );
+    assert_eq!(miss["properties"]["detail"]["maxLength"], json!(4096));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() -> TestResult {
+    use std::fmt::Write as _;
+
+    let source = (0..160).fold(String::new(), |mut source, index| {
+        writeln!(source, "pub fn beacon_load_configuration_{index:07}() {{}}")
+            .expect("a string write succeeds");
+        source
+    });
+    let (_fixture, client, server_task) = served_fixture_with_source(Some(&source)).await?;
+    let tools = client.list_all_tools().await?;
+    let schema = tools
+        .iter()
+        .find(|tool| tool.name == "get_symbol")
+        .and_then(|tool| tool.output_schema.as_deref())
+        .ok_or("get_symbol output schema absent")?;
+    let validator = jsonschema::validator_for(&Value::Object(schema.clone()))?;
+    let name = "İ".repeat(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX);
+    for request in [
+        json!({"name": name, "language": "rust", "include": []}),
+        json!({"name": name, "language": "python", "include": []}),
+        json!({"name": name, "language": "rust", "include": [], "rev": "baseline"}),
+    ] {
+        let result = client
+            .call_tool(tools_call_request("get_symbol", &request)?)
+            .await?;
+        assert!(!result.is_error.unwrap_or(false));
+        let answer = result
+            .structured_content
+            .ok_or("structured answer absent")?;
+        assert_validates(&validator, &answer, "get_symbol work bound");
+        let warning = answer["warnings"]
+            .as_array()
+            .and_then(|warnings| {
+                warnings
+                    .iter()
+                    .find(|warning| warning["code"] == "symbol_not_found")
+            })
+            .ok_or("named miss absent")?;
+        assert_eq!(warning["name"], name);
+        let exhausted = request.get("rev").is_none() && request["language"] == "rust";
+        assert_eq!(warning.get("detail").is_some(), exhausted, "{answer:#}");
+        if exhausted {
+            assert_eq!(warning["alternatives"], json!([]));
+            let text = result
+                .content
+                .iter()
+                .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(&name));
+            assert!(text.contains("work bound"), "{text}");
+            assert!(text.contains("closest"), "{text}");
+        } else {
+            assert!(
+                !warning["alternatives"]
+                    .as_array()
+                    .ok_or("alternatives absent")?
+                    .is_empty()
+            );
+        }
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_warning() -> TestResult
+{
+    let (_fixture, client, server_task) = served_fixture().await?;
+    for (revision, expected) in [(None, true), (Some("baseline"), false)] {
+        let mut request = json!({"name": "change_witnesz", "language": "rust", "include": []});
+        if let Some(revision) = revision {
+            request["rev"] = json!(revision);
+        }
+        let result = client
+            .call_tool(tools_call_request("get_symbol", &request)?)
+            .await?;
+        let answer = result
+            .structured_content
+            .ok_or("structured answer absent")?;
+        let alternatives = answer["warnings"]
+            .as_array()
+            .and_then(|warnings| {
+                warnings
+                    .iter()
+                    .find(|warning| warning["code"] == "symbol_not_found")
+            })
+            .and_then(|warning| warning["alternatives"].as_array())
+            .ok_or("symbol alternatives absent")?;
+        let carries_current = alternatives.iter().any(|identity| {
+            identity
+                .as_str()
+                .is_some_and(|identity| identity.ends_with("/change_witness"))
+        });
+        assert_eq!(
+            carries_current, expected,
+            "revision controls which declarations can be proposed: {answer:#}"
+        );
+    }
+    for request in [
+        json!({"name": "helper_beacon", "scope": "global", "include": []}),
+        json!({"name": "helper_beacon", "scope": "all", "include": []}),
+        json!({"name": "helper_beacon", "scope": "all", "include": [], "limit": 1, "page_index": 100}),
+    ] {
+        let result = client
+            .call_tool(tools_call_request("get_symbol", &request)?)
+            .await?;
+        let answer = result
+            .structured_content
+            .ok_or("structured answer absent")?;
+        assert!(
+            !answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| warning["code"] == "symbol_not_found"),
+            "a matched remote declaration clears the miss, even past the final page: {answer:#}"
+        );
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
 }
 
 /// Result-arm coverage the corpus walk accumulates: every arm a result
