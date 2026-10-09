@@ -127,6 +127,51 @@ fn cython_multiple_names_exclude_initializer_references() {
 }
 
 #[test]
+fn qualified_cpp_prototype_and_cython_pointer_keep_declaration_and_name_ranges() {
+    let cases = [
+        (
+            ShippedLanguage::Cpp,
+            "client.hpp",
+            "int Widget::beam(void);",
+            "int Widget::beam(void);",
+            &[("beam", "function")][..],
+        ),
+        (
+            ShippedLanguage::Cython,
+            "client.pyx",
+            "cdef int first, *second\n",
+            "int first, *second",
+            &[("first", "variable"), ("second", "variable")][..],
+        ),
+    ];
+    for (shipped, path, text, declaration, expected) in cases {
+        let path = ProjectPath::new(path).expect("fixture path");
+        let document = shipped
+            .definition()
+            .syntax_provider()
+            .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
+            .expect("native declarations");
+        assert!(!document.has_errors());
+        assert_eq!(document.symbols().len(), expected.len());
+        for (name, kind) in expected {
+            let symbol = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == *name)
+                .unwrap_or_else(|| panic!("missing {name}: {:?}", document.symbols()));
+            assert_eq!(symbol.kind, *kind);
+            let name_range = symbol.name_range.expect("declarator name range");
+            let start = usize::try_from(name_range.start).expect("fixture offset");
+            let end = usize::try_from(name_range.end).expect("fixture offset");
+            assert_eq!(&text[start..end], *name);
+            let start = usize::try_from(symbol.range.start).expect("fixture offset");
+            let end = usize::try_from(symbol.range.end).expect("fixture offset");
+            assert_eq!(text[start..end].trim(), declaration);
+        }
+    }
+}
+
+#[test]
 fn wide_native_declarations_keep_every_name_without_cross_parse_state() {
     const COUNT: usize = 2048;
     let path = ProjectPath::new("wide.h").expect("fixture path");

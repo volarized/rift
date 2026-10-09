@@ -329,3 +329,81 @@ fn tailwind_vue_and_angular_dynamic_class_bindings_preserve_expression_ranges() 
         assert_eq!(document.language(), provider.language());
     }
 }
+
+#[test]
+fn tailwind_svelte_class_directives_keep_authored_names_and_dynamic_ranges() {
+    let text = "<section class:flex={selected} class:beacon={custom} />";
+    let path = ProjectPath::new("src/beacon.svelte").expect("fixture path");
+    let source = SyntaxSource { path: &path, text };
+    let document = SvelteSyntaxProvider::default()
+        .analyze(source, SyntaxLimits::default())
+        .expect("Svelte syntax");
+    assert!(!document.has_errors());
+    let facts = tailwind_symbols(source, &document, 4, SyntaxLimits::default())
+        .expect("Tailwind source facts");
+    for (name, attribute) in [
+        ("flex", "class:flex={selected}"),
+        ("beacon", "class:beacon={custom}"),
+    ] {
+        let symbol = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "utility" && symbol.name == name)
+            .unwrap_or_else(|| panic!("missing authored utility {name}: {facts:?}"));
+        let start = usize::try_from(symbol.range.start).expect("bounded source bytes");
+        let end = usize::try_from(symbol.range.end).expect("bounded source bytes");
+        assert_eq!(&text[start..end], name);
+        assert!(facts.unresolved.iter().any(|range| {
+            let start = usize::try_from(range.start).expect("bounded source bytes");
+            let end = usize::try_from(range.end).expect("bounded source bytes");
+            &text[start..end] == attribute
+        }));
+    }
+    assert_eq!(facts.symbols.len(), 2);
+    assert_eq!(facts.unresolved.len(), 2);
+}
+
+#[test]
+fn tailwind_screen_variant_keeps_version_and_escaped_configuration_unresolved() {
+    let text = r"@screen md { .beacon { display:block; } } @config './tailwind\.config.js';";
+    let path = ProjectPath::new("src/beacon.css").expect("fixture path");
+    let source = SyntaxSource { path: &path, text };
+    let document = CssSyntaxProvider::default()
+        .analyze(source, SyntaxLimits::default())
+        .expect("CSS syntax");
+    assert!(document.has_errors());
+    let errors: Vec<_> = document
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "ERROR")
+        .collect();
+    assert_eq!(errors.len(), 1);
+    let start = usize::try_from(errors[0].range.start).expect("bounded source bytes");
+    let end = usize::try_from(errors[0].range.end).expect("bounded source bytes");
+    assert_eq!(&text[start..end], r"'./tailwind\.config.js';");
+    for major in [3, 4] {
+        let facts = tailwind_symbols(source, &document, major, SyntaxLimits::default())
+            .expect("Tailwind source facts");
+        let variant = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "variant" && symbol.name == "md");
+        assert_eq!(variant.is_some(), major == 3);
+        if let Some(variant) = variant {
+            let start = usize::try_from(variant.range.start).expect("bounded source bytes");
+            let end = usize::try_from(variant.range.end).expect("bounded source bytes");
+            assert_eq!(&text[start..end], "md");
+        }
+        assert!(
+            !facts
+                .symbols
+                .iter()
+                .any(|symbol| symbol.kind == "configuration")
+        );
+        assert!(facts.unresolved.iter().any(|range| {
+            let start = usize::try_from(range.start).expect("bounded source bytes");
+            let end = usize::try_from(range.end).expect("bounded source bytes");
+            text[start..end].contains(r"'./tailwind\.config.js'")
+        }));
+    }
+}

@@ -178,3 +178,32 @@ fn assert_component_count(text: &str, count: usize) {
     let components = rift_syntax::angular_components(source, &document);
     assert_eq!(components.len(), count, "parameter binding: {text}");
 }
+
+#[test]
+fn quoted_component_template_keys_keep_import_ownership_and_original_ranges() {
+    let text = r#"import {Component} from '@angular/core'; @Component({'template':'<p>{{title}}</p>', "templateUrl": './beacon.html'}) class Beacon {}"#;
+    let path = ProjectPath::new("component.ts").expect("source path");
+    let source = SyntaxSource { path: &path, text };
+    for shipped in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
+        let document = shipped
+            .definition()
+            .syntax_provider()
+            .analyze(source, SyntaxLimits::default())
+            .expect("TypeScript source");
+        assert!(!document.has_errors());
+        let components = rift_syntax::angular_components(source, &document);
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].templates.len(), 2);
+        assert!(components[0].templates.iter().any(|template| {
+            let AngularTemplate::Inline { range } = template else {
+                return false;
+            };
+            let start = usize::try_from(range.start).expect("bounded source bytes");
+            let end = usize::try_from(range.end).expect("bounded source bytes");
+            &text[start..end] == "<p>{{title}}</p>"
+        }));
+        assert!(components[0].templates.iter().any(|template| {
+            matches!(template, AngularTemplate::External { path } if path == "./beacon.html")
+        }));
+    }
+}

@@ -1,6 +1,7 @@
 //! Syntax declarations, source fidelity, restoration, and bounds for shipped source grammars.
 
 use rift_core::ProjectPath;
+use rift_protocol::read::NodeFacet;
 use rift_syntax::{
     ShippedLanguage, SyntaxDocument, SyntaxFacts, SyntaxFactsParts, SyntaxLimits, SyntaxNames,
     SyntaxSource,
@@ -18,6 +19,53 @@ fn parsed(
         .syntax_provider()
         .analyze(SyntaxSource { path: &path, text }, limits)
         .expect("fixture parses within its bounds")
+}
+
+fn assert_node_facets(
+    shipped: ShippedLanguage,
+    text: &str,
+    expected: &[(&str, &str)],
+    facet: NodeFacet,
+) {
+    let document = parsed(shipped, "source", text, SyntaxLimits::default());
+    assert!(!document.has_errors());
+    let provider = shipped.definition().syntax_provider();
+    for (kind, source) in expected {
+        let node = document
+            .nodes()
+            .iter()
+            .find(|node| node.kind == *kind)
+            .unwrap_or_else(|| panic!("missing {kind}: {:?}", document.nodes()));
+        let start = usize::try_from(node.range.start).expect("fixture start");
+        let end = usize::try_from(node.range.end).expect("fixture end");
+        assert_eq!(&text[start..end], *source);
+        assert_eq!(provider.node_facets(node.kind), [facet]);
+    }
+}
+
+#[test]
+fn css_literal_nodes_preserve_original_values_and_facets() {
+    assert_node_facets(
+        ShippedLanguage::Css,
+        ".lamp { color: #fff; width: 12px; content: \"灯\"; }",
+        &[
+            ("color_value", "#fff"),
+            ("integer_value", "12px"),
+            ("string_value", "\"灯\""),
+        ],
+        NodeFacet::Literal,
+    );
+}
+
+#[test]
+fn html_declaration_nodes_preserve_original_elements_and_attributes() {
+    let text = "<section title=\"灯\">beacon</section>";
+    assert_node_facets(
+        ShippedLanguage::Html,
+        text,
+        &[("element", text), ("attribute", "title=\"灯\"")],
+        NodeFacet::Declaration,
+    );
 }
 
 #[test]

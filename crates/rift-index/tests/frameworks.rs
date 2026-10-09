@@ -9,6 +9,62 @@ use rift_protocol::configuration::{
     SyntaxFrameworkConfiguration, TailwindVersion, WorkspaceConfiguration,
 };
 use rift_protocol::read::{PathPattern, SyntaxFramework};
+use rift_syntax::{ShippedLanguage, SyntaxLimits, SyntaxSource};
+
+#[test]
+fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
+    let directory = tempfile::tempdir().expect("workspace directory");
+    let root = directory.path();
+    let text = "import {Component} from '@angular/core'; @Component({template:`<section><p>{{title}}</p><p>{{other}}</p></section>`}) export class Beacon {}";
+    write(root, "package.json", "{}");
+    write(root, "component.ts", text);
+    let path = ProjectPath::new("component.ts").expect("source path");
+    let raw = ShippedLanguage::TypeScript
+        .definition()
+        .syntax_provider()
+        .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
+        .expect("raw TypeScript syntax");
+    let position =
+        u64::try_from(text.find("title").expect("inline expression")).expect("source position");
+    let mut configuration = WorkspaceConfiguration::default();
+    configuration.providers.syntax.max_nodes =
+        u64::try_from(raw.nodes().len()).expect("bounded node count");
+    let limits = WorkspaceIndexLimits::default()
+        .with_syntax_configuration(&configuration.providers.syntax)
+        .expect("raw node bound");
+    let index = WorkspaceIndex::build_with_languages(
+        root,
+        limits,
+        &SourceVisibility::default(),
+        &TextFileInclusion::from(&configuration),
+        &LanguageFileSelections::from(&configuration),
+    )
+    .expect("bounded workspace index");
+    assert!(index.file(&path).is_none());
+    assert!(index.text_file(&path).is_none());
+    assert!(
+        index
+            .nodes(&path, position)
+            .expect("refused source nodes")
+            .is_none()
+    );
+    assert!(index.warnings().iter().any(|warning| {
+        matches!(warning, WorkspaceIndexWarning::SyntaxTooLarge { path: refused, .. } if refused == &path)
+    }));
+
+    let accepted = build(root, &WorkspaceConfiguration::default());
+    let file = accepted.file(&path).expect("accepted source");
+    assert_eq!(file.source(), text);
+    assert_eq!(file.syntax().language().identity_segment(), "typescript");
+    assert!(
+        accepted
+            .nodes(&path, position)
+            .expect("accepted source nodes")
+            .expect("selected source")
+            .iter()
+            .any(|node| node.kind == "interpolation")
+    );
+}
 
 fn write(root: &Path, path: &str, source: &str) {
     let target = root.join(path);
