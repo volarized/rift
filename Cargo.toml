@@ -140,7 +140,7 @@ toasty-driver-sqlite = "=0.10.0"
 # candle-core has a non-optional `tokenizers 0.22` dependency with the `onig` backend on
 # every non-wasm target, so the version is pinned to match it: a second tokenizers would
 # be a duplicate the dependency policy refuses, and could not avoid onig either.
-tokenizers = { version = "0.22.2", default-features = false }
+tokenizers = { version = "0.23.2", default-features = false }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 syn = { version = "2.0.119", features = ["full"] }
 # The process sampler reads one process: its resident and virtual memory, CPU time and usage,
