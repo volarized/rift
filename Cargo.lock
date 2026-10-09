@@ -515,7 +515,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokenizers",
  "yoke",
  "zerocopy",
@@ -535,7 +535,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1041,7 +1041,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1426,9 +1426,9 @@ dependencies = [
 
 [[package]]
 name = "fraction"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fee0259ffdc3d7bd64438b6b08437884d4df5700f9cb8a23b079c3958ae578"
+checksum = "e246562084dde8ebbcc943b261c406ce4f68e5032ec28029a251a47d6a295500"
 dependencies = [
  "num",
  "num-bigint",
@@ -1809,7 +1809,7 @@ dependencies = [
  "gix-zlib",
  "nonempty",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1836,7 +1836,7 @@ dependencies = [
  "gix-quote",
  "gix-trace",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-bom",
 ]
 
@@ -1900,7 +1900,7 @@ dependencies = [
  "gix-sec",
  "gix-utils",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-bom",
 ]
 
@@ -1914,7 +1914,7 @@ dependencies = [
  "bstr",
  "gix-path",
  "libc",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1950,7 +1950,7 @@ dependencies = [
  "gix-trace",
  "gix-traverse",
  "gix-worktree",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1970,7 +1970,7 @@ dependencies = [
  "gix-trace",
  "gix-utils",
  "gix-worktree",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1985,7 +1985,7 @@ dependencies = [
  "gix-path",
  "gix-ref",
  "gix-sec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2034,7 +2034,7 @@ dependencies = [
  "gix-trace",
  "gix-utils",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2047,7 +2047,7 @@ dependencies = [
  "gix-features",
  "gix-path",
  "gix-utils",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2071,7 +2071,7 @@ dependencies = [
  "faster-hex",
  "gix-features",
  "sha1-checked",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2105,7 +2105,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -2133,7 +2133,7 @@ dependencies = [
  "memmap2",
  "rustix",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2144,7 +2144,7 @@ checksum = "d4c69157820343bf1c6e4b88b9808e920900de02e18aaf5862b30ada43814848"
 dependencies = [
  "gix-tempfile",
  "gix-utils",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2163,7 +2163,7 @@ dependencies = [
  "gix-validate",
  "itoa",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2185,7 +2185,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2205,7 +2205,7 @@ dependencies = [
  "gix-zlib",
  "memmap2",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2217,7 +2217,7 @@ dependencies = [
  "bstr",
  "faster-hex",
  "gix-trace",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2229,7 +2229,7 @@ dependencies = [
  "bstr",
  "gix-trace",
  "gix-validate",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2244,7 +2244,7 @@ dependencies = [
  "gix-config-value",
  "gix-glob",
  "gix-path",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2263,7 +2263,7 @@ dependencies = [
  "gix-transport",
  "gix-utils",
  "nonempty",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2294,7 +2294,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "memmap2",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2310,7 +2310,7 @@ dependencies = [
  "gix-revision",
  "gix-validate",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2345,7 +2345,7 @@ dependencies = [
  "gix-hashtable",
  "gix-object",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2370,7 +2370,7 @@ dependencies = [
  "gix-hash",
  "gix-lock",
  "nonempty",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2394,7 +2394,7 @@ dependencies = [
  "gix-worktree",
  "hashbrown 0.16.1",
  "portable-atomic",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
 
@@ -2410,7 +2410,7 @@ dependencies = [
  "gix-pathspec",
  "gix-refspec",
  "gix-url",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2446,7 +2446,7 @@ dependencies = [
  "gix-quote",
  "gix-sec",
  "gix-url",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2463,7 +2463,7 @@ dependencies = [
  "gix-object",
  "gix-revwalk",
  "smallvec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2476,7 +2476,7 @@ dependencies = [
  "gix-path",
  "gix-utils",
  "percent-encoding",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2542,7 +2542,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e8813f5579b3075ff9c90f7c59cd2b62b4ebb639361f0911648b22d7446cc7c"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "zlib-rs",
 ]
 
@@ -3135,9 +3135,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.50.0"
+version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bd2225bc56c338f18465ce618e5e56fff1295fcb0a0cb338b28010193f26949"
+checksum = "ea18b8d5e1469b1bdd6b349169305141316a7c26da27f239773b65c830c0f5d6"
 dependencies = [
  "ahash",
  "bytecount",
@@ -3146,7 +3146,6 @@ dependencies = [
  "fancy-regex 0.19.0",
  "fraction",
  "getrandom 0.3.4",
- "idna",
  "itoa",
  "jsonschema-regex",
  "jsonschema-value",
@@ -3164,25 +3163,27 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.50.0"
+version = "0.58.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b11520e5257651f31068fa2c959ce28b09d8a217ffe42338bc27d690f06c0f8c"
+checksum = "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.50.0"
+version = "0.58.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccefde026ba6e6e23002c4e1e087b5f411ef5bc90f3e7febb7cf3c498ca8b169"
+checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction",
+ "getrandom 0.3.4",
  "num-cmp",
  "num-traits",
  "serde_json",
+ "zmij",
 ]
 
 [[package]]
@@ -3671,7 +3672,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_with",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "validator",
 ]
 
@@ -3781,7 +3782,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -3812,7 +3813,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "reqwest",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -3840,7 +3841,7 @@ dependencies = [
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.5",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
 ]
@@ -4400,7 +4401,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4425,9 +4426,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.50.0"
+version = "0.58.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b228fc6035ae00a9008ba156c0dfc98f0b6ebc5f3c8db7ac7006dcf8e56f15a"
+checksum = "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f"
 dependencies = [
  "ahash",
  "fluent-uri 0.4.1",
@@ -4511,7 +4512,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "axum",
  "clap",
@@ -4555,7 +4556,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "flate2",
  "ignore",
@@ -4583,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "anyhow",
  "axum",
@@ -4610,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "percent-encoding",
  "rift-error",
@@ -4627,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "ignore",
  "rift-core",
@@ -4641,29 +4642,29 @@ dependencies = [
 
 [[package]]
 name = "rift-error"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "rift-error-macros",
 ]
 
 [[package]]
 name = "rift-error-codegen"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "rift-error",
  "serde",
  "syn 2.0.119",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml",
 ]
 
 [[package]]
 name = "rift-error-macros"
-version = "0.0.65"
+version = "0.0.66"
 
 [[package]]
 name = "rift-history"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "gix",
  "rift-core",
@@ -4676,7 +4677,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history-store"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4691,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "async-trait",
  "ignore",
@@ -4723,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4740,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4783,7 +4784,7 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
@@ -4797,7 +4798,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4808,7 +4809,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "data-encoding",
  "regex",
@@ -4822,7 +4823,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "jsonschema",
  "rift-analysis",
@@ -4836,7 +4837,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "axum",
  "candle-core",
@@ -4861,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "globset",
  "ignore",
@@ -4903,7 +4904,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "rift-core",
  "rift-error",
@@ -4926,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "getrandom 0.4.3",
  "jiff",
@@ -4965,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tracing-macros"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -5002,7 +5003,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -5011,9 +5012,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.4.1"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b6317cd8c13e3ec9033cf2aa5aa92cd743f0f4f8a93cddc42ea0ae6ce3b8898"
+checksum = "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5034,7 +5035,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sse-stream",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -5045,9 +5046,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.5.0"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e66877136e969d5a2d561ee5841b17717a0619aebd64abb47a2a2f46e34683"
+checksum = "a1da498700030856ba63114bceefa30ba21f5e278cb975e5b9de3529fe842b40"
 dependencies = [
  "darling 0.24.0",
  "proc-macro2",
@@ -5063,7 +5064,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5125,7 +5126,7 @@ dependencies = [
  "serde_json",
  "similar",
  "supports-hyperlinks",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "ty_static",
  "web-time",
@@ -5188,7 +5189,7 @@ dependencies = [
  "ruff_text_size",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
@@ -5218,7 +5219,7 @@ dependencies = [
  "salsa",
  "serde",
  "thin-vec",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -6076,11 +6077,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -6096,9 +6097,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6284,7 +6285,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spm_precompiled",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
@@ -6292,9 +6293,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
  "bytes",
  "libc",
@@ -6541,13 +6542,12 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.26.13"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17ebdd3a5a7e28a1890b876fdbd0c3c0fe0a6336cffaa104f11b9f720c9daa29"
+checksum = "2038684e0058edba0d17302619f62eabce4a8e11c6ac59506996a8d79848851d"
 dependencies = [
  "cc",
  "regex",
- "regex-syntax",
  "serde_json",
  "streaming-iterator",
  "tree-sitter-language",
@@ -6575,9 +6575,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-language"
-version = "0.1.7"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
 
 [[package]]
 name = "tree-sitter-md"
@@ -6723,7 +6723,7 @@ dependencies = [
  "salsa",
  "strum",
  "strum_macros",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -6762,7 +6762,7 @@ dependencies = [
  "shellexpand",
  "strum",
  "strum_macros",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml",
  "tracing",
  "ty_combine",
@@ -6838,7 +6838,7 @@ dependencies = [
  "static_assertions",
  "strum",
  "strum_macros",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "ty_module_resolver",
  "ty_python_core",
@@ -7602,7 +7602,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.65"
+version = "0.0.66"
 dependencies = [
  "rift-error-codegen",
  "tempfile",

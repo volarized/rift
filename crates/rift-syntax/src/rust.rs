@@ -313,7 +313,7 @@ impl RustQuery {
                     .captures_max(captures_max)
                     .fail();
             }
-            let capture = query_match.captures[*capture_index];
+            let capture = query_match.captures()[*capture_index];
             captures.push(RustQueryCapture {
                 name: self.inner.capture_names()[capture.index as usize].into(),
                 range: extract::byte_range(capture.node)?,

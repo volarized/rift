@@ -532,7 +532,7 @@ fn merge_traversal_hit(
         file,
         symbol,
         // This lane supplies `score` from `distance` and never reads identifier rank.
-        rank: IdentifierMatchClass::Substring,
+        rank: IdentifierMatchClass::Substring.into(),
     };
     let mut hit = build_symbol_hit(
         index,

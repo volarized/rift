@@ -171,7 +171,7 @@ pub struct PathSelector {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ResultOrder {
-    /// Best score first, with identity breaking ties.
+    /// Exact original identifier spelling first, then best score, with identity breaking ties.
     Relevance,
     /// Project path order, with identity breaking ties.
     Path,
@@ -189,7 +189,8 @@ pub struct SearchHit {
     /// What was found. A symbol, a node, a file, a documentation block, or a commit -
     /// whichever `target` allowed.
     pub hit: SearchHitTarget,
-    /// How well this hit matched, used to order the page and merge duplicate hits.
+    /// The ranking value attached to this hit and used to merge duplicate hits.
+    /// Exact original identifier spelling ranks before this value under `relevance`.
     /// Present on the wire when `include` names `score`; comparable within one answer
     /// and nowhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,7 +417,8 @@ pub struct SymbolChange {
 pub enum SearchInclude {
     /// The source text around each hit.
     Source,
-    /// The ranking value used to order the page.
+    /// The ranking value attached to each hit. Exact original identifier spelling ranks before
+    /// this value.
     Score,
 }
 
@@ -543,9 +545,11 @@ pub struct SearchParams {
     /// answers through its file's contents, tagged `content`, when that file ranks among
     /// the first 20 files. Matching is case-insensitive and identifier-aware: the query and
     /// the indexed names split on case, acronym, and separator boundaries, so `loadConfig`
-    /// finds `load_config`. Double quotes keep a phrase together, and an identifier written
+    /// finds `load_config`. Under `relevance`, the server ranks an identifier matching the
+    /// original declaration name or qualified name before case-insensitive fallback.
+    /// Double quotes keep a phrase together, and an identifier written
     /// inside a question reaches its declaration without being quoted. A query naming
-    /// several terms is answered by the declarations carrying all of them before the ones
+    /// several terms ranks the remaining declarations carrying all of them before the ones
     /// carrying some. Scoring is server-defined and comparable within one answer. With
     /// `target: "commit"`, the text matches commit messages instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]

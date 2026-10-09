@@ -5,15 +5,15 @@ description = "Rift development commands and test support"
 requires-python = ">=3.12"
 dependencies = [
     "jsonschema==4.26.0",
-    "mcp==2.2.0",
-    "opentelemetry-proto==1.44.0",
+    "mcp==2.3.0",
+    "opentelemetry-proto==1.45.0",
     "psutil==7.2.2",
     "pywin32==312; sys_platform == 'win32'",
     "typer==0.27.2",
     "pydantic==2.13.5",
-    "dulwich==1.2.15",
-    "starlette==1.6.0",
-    "uvicorn==0.53.0",
+    "dulwich==1.2.17",
+    "starlette==1.7.0",
+    "uvicorn==0.54.0",
 ]
 
 [project.scripts]
@@ -28,10 +28,10 @@ packages = ["src/rift_dev"]
 
 [dependency-groups]
 dev = [
-    "ruff==0.16.8",
-    "ty==0.0.82",
+    "ruff==0.16.10",
+    "ty==0.0.84",
     "types-pywin32==312.0.0.20260827",
     "pre-commit==4.6.2",
-    "tree-sitter==0.25.2",
-    "tree-sitter-rust==0.24.0",
+    "tree-sitter==0.26.0",
+    "tree-sitter-rust==0.24.2",
 ]

@@ -11,6 +11,7 @@ use rift_error::errors;
 use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
 use tree_sitter::{Node, TreeCursor};
 
+use crate::SyntaxNames;
 use crate::document::{ByteRange, SyntaxNode, SyntaxSymbol};
 use crate::failure::{RiftError, position_overflow};
 use crate::provider::{SyntaxLimits, SyntaxSource};
@@ -188,6 +189,13 @@ pub(crate) fn extract(
     rules: &dyn GrammarRules,
 ) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), RiftError> {
     let text = source.text;
+    let names = SyntaxNames::new(language).expect("a syntax provider uses a shipped grammar");
+    let grammar = names.grammar();
+    assert_eq!(
+        &*root.language(),
+        grammar,
+        "a syntax provider must parse with its shipped grammar",
+    );
     let mut nodes = Vec::new();
     let mut symbols = Vec::new();
     let mut visits = Visits::default();
@@ -224,7 +232,9 @@ pub(crate) fn extract(
         let node_index = visits.visit(node, parent, follows_named_sibling);
         let range = byte_range(node)?;
         nodes.push(SyntaxNode {
-            kind: node.kind(),
+            kind: grammar
+                .node_kind_for_id(node.kind_id())
+                .expect("a parsed node kind belongs to its shipped grammar"),
             range,
             parent,
             has_error: node.is_error() || node.is_missing(),
@@ -420,18 +430,19 @@ mod tests {
     use std::cell::Cell;
 
     use rift_core::ProjectPath;
-    use rift_protocol::read::Language;
     use tree_sitter::{Node, Parser};
 
     use super::{Declaration, GrammarRules, Visited, extract};
     use crate::failure::RiftError;
     use crate::provider::{SyntaxLimits, SyntaxSource};
+    use crate::{ShippedLanguage, SyntaxNames};
 
     /// Rules that compare every visited node's recorded parent and previous
     /// sibling with the ones tree-sitter computes itself, and declare nothing.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct LinkOracle {
         compared: Cell<usize>,
+        names: SyntaxNames,
     }
 
     impl GrammarRules for LinkOracle {
@@ -442,6 +453,11 @@ mod tests {
         ) -> Result<Option<Declaration>, RiftError> {
             let node = visited.node();
             let spelling = text.get(node.byte_range()).unwrap_or_default();
+            assert_eq!(
+                self.names.grammar().node_kind_for_id(node.kind_id()),
+                Some(node.kind()),
+                "the retained grammar must preserve the parsed node's spelling: text={spelling:?}",
+            );
             assert_eq!(
                 visited.parent().map(Visited::node),
                 node.parent(),
@@ -474,7 +490,11 @@ mod tests {
 
     /// Walks `text` parsed with `grammar` and returns how many nodes the
     /// oracle compared.
-    fn compared_nodes(grammar: &tree_sitter::Language, name: &str, text: &str) -> usize {
+    fn compared_nodes(
+        grammar: &tree_sitter::Language,
+        shipped: ShippedLanguage,
+        text: &str,
+    ) -> usize {
         let mut parser = Parser::new();
         parser
             .set_language(grammar)
@@ -482,11 +502,11 @@ mod tests {
         let tree = parser.parse(text, None).expect("the fixture must parse");
         let path = ProjectPath::new("fixture").expect("valid fixture path");
         let source = SyntaxSource { path: &path, text };
-        let language = Language {
-            name: name.to_owned(),
-            dialect: None,
+        let language = shipped.language();
+        let oracle = LinkOracle {
+            compared: Cell::new(0),
+            names: SyntaxNames::new(&language).expect("a shipped grammar has names"),
         };
-        let oracle = LinkOracle::default();
         extract(
             tree.root_node(),
             source,
@@ -500,34 +520,60 @@ mod tests {
 
     #[test]
     fn recorded_parents_and_siblings_match_tree_sitter_across_grammars() {
-        let fixtures: [(tree_sitter::Language, &str, &str); 4] = [
+        let fixtures: [(tree_sitter::Language, ShippedLanguage, &str); 9] = [
             (
                 tree_sitter_rust::LANGUAGE.into(),
-                "rust",
+                ShippedLanguage::Rust,
                 "//! Crate docs.\n/// Doc.\n#[derive(Debug)]\npub struct Beacon;\n\n\
                  impl Beacon {\n    /// Method.\n    pub fn beam(&self) {}\n}\n\
                  fn broken( {\n",
             ),
             (
                 tree_sitter_javascript::LANGUAGE.into(),
-                "javascript",
+                ShippedLanguage::JavaScript,
                 "/** Doc. */\nexport const beacon = () => 1;\n// note\n\
                  class Beacon { /** Method. */ beam() {} }\nmodule.exports = { beacon };\n",
             ),
             (
                 tree_sitter_python::LANGUAGE.into(),
-                "python",
+                ShippedLanguage::Python,
                 "@decorated\ndef beacon():\n    \"Doc.\"\n    return 1\n\n\
                  class Beacon:\n    LIGHT = 1\n",
             ),
             (
                 tree_sitter_md::LANGUAGE.into(),
-                "markdown",
+                ShippedLanguage::Markdown,
                 "# Beacon\n\nText.\n\nLoose\n---\n\n- item\n- item\n",
             ),
+            (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                ShippedLanguage::TypeScript,
+                "export interface Beacon { beam<T>(value: T): T; }\nconst light = { beam: 1 };\n",
+            ),
+            (
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                ShippedLanguage::TypeScriptTsx,
+                "export const Beacon = () => <section light={1}><span>beam</span></section>;\n",
+            ),
+            (
+                tree_sitter_json::LANGUAGE.into(),
+                ShippedLanguage::Json,
+                "{\"beacon\": {\"beam\": [1, true, null]}, \"light\": 2}\n",
+            ),
+            (
+                tree_sitter_yaml::LANGUAGE.into(),
+                ShippedLanguage::Yaml,
+                "beacon:\n  beam: [one, two]\n  light: true\nother:\n  - key: value\n",
+            ),
+            (
+                tree_sitter_toml_ng::LANGUAGE.into(),
+                ShippedLanguage::Toml,
+                "[beacon]\nbeam = [1, 2]\nlight = true\n[other]\nname = \"value\"\n",
+            ),
         ];
-        for (grammar, name, text) in &fixtures {
-            let compared = compared_nodes(grammar, name, text);
+        for (grammar, shipped, text) in &fixtures {
+            let compared = compared_nodes(grammar, *shipped, text);
+            let name = shipped.language().name;
             assert!(
                 compared > 10,
                 "the oracle must compare the fixture's nodes: language={name}, \

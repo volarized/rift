@@ -6771,8 +6771,8 @@ done
 
     /// Every request the server answers lands in `mcp.server.operation.duration` under its
     /// method, its tool, and how it ended: a tool answered with `isError` as `tool_error`,
-    /// a refused read under its JSON-RPC code. Each names the session's protocol version and
-    /// the TCP transport.
+    /// a refused read under its JSON-RPC code. Initialize names the requested protocol version;
+    /// later requests name the negotiated version. Each names the TCP transport.
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -6791,7 +6791,13 @@ done
                 .expect("server must initialize");
             service.waiting().await.expect("server must stop cleanly");
         });
+        let requested_version = rmcp::ClientHandler::get_info(&()).protocol_version;
         let client = ().serve(client_transport).await?;
+        let negotiated_version = client
+            .peer_info()
+            .ok_or("initialize must advertise server information")?
+            .protocol_version
+            .clone();
         client.list_all_tools().await?;
         client.list_all_resources().await?;
         client.list_all_resource_templates().await?;
@@ -6827,13 +6833,22 @@ done
 
         let snapshot = recorder.metrics();
         let name = "mcp.server.operation.duration";
-        let version = (
-            "mcp.protocol.version",
-            rmcp::model::ProtocolVersion::LATEST.as_str(),
-        );
+        let version = ("mcp.protocol.version", negotiated_version.as_str());
         let transport = ("network.transport", "tcp");
+        assert_eq!(
+            recorded(
+                &snapshot,
+                name,
+                &[
+                    ("mcp.method.name", "initialize"),
+                    ("mcp.protocol.version", requested_version.as_str()),
+                    transport,
+                ]
+            ),
+            1,
+            "initialize: {snapshot:?}"
+        );
         for method in [
-            "initialize",
             "ping",
             "tools/list",
             "resources/list",
