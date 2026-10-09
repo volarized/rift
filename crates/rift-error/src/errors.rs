@@ -287,6 +287,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.server.read_not_found",
     "rift.server.read_source_unavailable",
     "rift.server.read_storage",
+    "rift.server.read_symbol_alternatives_unavailable",
     "rift.server.read_task",
     "rift.server.read_unavailable",
     "rift.server.read_unclaimed_extension",

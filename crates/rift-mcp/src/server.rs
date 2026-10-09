@@ -10439,7 +10439,7 @@ done
         use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
         use rift_protocol::configuration::WorkspaceConfiguration;
 
-        let document = "[source]\ndirectory_depth = 1\n[search]\nresults = 2\n\
+        let document = "[source]\ndirectory_depth = 1\n[search]\nresults = 2\nsymbol_alternatives_work = 140\nsymbol_alternatives_lowercase_work = 24\n\
                         [search.lexical]\nmax_content = \"2kb\"\nmax_matches = 3\n\
                         max_documentation = \"4kb\"\n";
         let accepted = accept_configuration::<WorkspaceConfiguration>(
@@ -10465,6 +10465,8 @@ done
         configuration.accepted = Ok(accepted.configuration().clone());
         let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
         assert_eq!(limits.results_max(), 2);
+        assert_eq!(limits.symbol_alternatives_work_max(), 140);
+        assert_eq!(limits.symbol_alternatives_lowercase_work(), 24);
         let visibility = rift_core::SourceVisibility::default();
         let text = rift_core::TextFileInclusion::default();
         let refused =
@@ -10475,6 +10477,8 @@ done
         let environment = ConfigurationEnvironment::from_variables([
             ("RIFT_SOURCE_DIRECTORY_DEPTH", "2"),
             ("RIFT_SEARCH_RESULTS", "4"),
+            ("RIFT_SEARCH_SYMBOL_ALTERNATIVES_WORK", "327"),
+            ("RIFT_SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK", "12"),
             ("RIFT_SEARCH_LEXICAL_MAX_CONTENT", "8kb"),
             ("RIFT_SEARCH_LEXICAL_MAX_MATCHES", "5"),
             ("RIFT_SEARCH_LEXICAL_MAX_DOCUMENTATION", "16kb"),
@@ -10497,6 +10501,8 @@ done
         );
         let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
         assert_eq!(limits.results_max(), 4);
+        assert_eq!(limits.symbol_alternatives_work_max(), 327);
+        assert_eq!(limits.symbol_alternatives_lowercase_work(), 12);
         let index =
             rift_index::WorkspaceIndex::build(directory.path(), limits, &visibility, &text)?;
         assert!(

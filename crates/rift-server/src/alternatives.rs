@@ -1,7 +1,8 @@
 //! Project declaration alternatives for a symbol lookup that found no match.
 
 use rapidfuzz::distance::levenshtein::{Args, BatchComparator};
-use rift_index::IndexedFile;
+use rift_error::{RiftError, errors};
+use rift_index::{IndexedFile, WorkspaceIndexLimits};
 use rift_protocol::read::{SYMBOL_ALTERNATIVES_MAX, SymbolId};
 use rift_syntax::SyntaxSymbol;
 
@@ -33,32 +34,47 @@ impl Alternative<'_> {
     }
 }
 
-/// Maximum normalization, comparison, and traversal work for one optional ranking.
-const WORK_MAX: usize = 16_777_216;
-/// Rust lowercase mappings contain at most three characters, each at most four bytes.
-/// Reserving this multiple before allocation also covers the source traversal.
-const LOWERCASE_BYTES_PER_SOURCE_BYTE: usize = 12;
-/// Explains why a named miss carries no closest declarations.
-pub(crate) const UNAVAILABLE_DETAIL: &str = "no symbols available with this name; closest alternatives unavailable at the work bound; \
-     select a language or use a shorter exact name";
-
 /// Remaining work for one complete ranking; a failed reservation stops the pass.
+///
+/// Reservation arithmetic casts before addition and multiplication. On supported 32-bit
+/// and 64-bit targets, two `usize` lengths and a query length plus one fit each `u128` product.
+/// Stable insertion sums two lengths and one before multiplying by three. Required work
+/// therefore renders exactly, in at most 39 decimal digits, even beyond `u64`.
 struct Work {
-    remaining: usize,
+    remaining: u128,
+    allowance: usize,
+    lowercase_weight: usize,
 }
 
 impl Work {
-    fn claim(&mut self, amount: usize) -> Result<(), ()> {
-        self.remaining = self.remaining.checked_sub(amount).ok_or(())?;
+    fn new(allowance: usize, lowercase_work: usize) -> Self {
+        Self {
+            remaining: allowance as u128,
+            allowance,
+            lowercase_weight: lowercase_work,
+        }
+    }
+
+    fn unavailable(&self, required: u128) -> RiftError {
+        errors::server::read_symbol_alternatives_unavailable()
+            .work(self.allowance)
+            .lowercase_work(self.lowercase_weight)
+            .remaining(self.remaining)
+            .required(required)
+            .error()
+    }
+
+    fn claim(&mut self, amount: u128) -> Result<(), RiftError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(amount)
+            .ok_or_else(|| self.unavailable(amount))?;
         Ok(())
     }
 
     /// Reserve the largest lowercase output before its allocation.
-    fn lowercase(&mut self, value: &str) -> Result<String, ()> {
-        let amount = value
-            .len()
-            .checked_mul(LOWERCASE_BYTES_PER_SOURCE_BYTE)
-            .ok_or(())?;
+    fn lowercase(&mut self, value: &str) -> Result<String, RiftError> {
+        let amount = (value.len() as u128) * (self.lowercase_weight as u128);
         self.claim(amount)?;
         Ok(value.to_lowercase())
     }
@@ -70,13 +86,9 @@ impl Work {
         query_characters: usize,
         name: &str,
         cutoff: usize,
-    ) -> Result<Option<usize>, ()> {
+    ) -> Result<Option<usize>, RiftError> {
         let name = self.lowercase(name)?;
-        let amount = name
-            .chars()
-            .count()
-            .checked_mul(query_characters + 1)
-            .ok_or(())?;
+        let amount = (name.chars().count() as u128) * (query_characters as u128 + 1);
         self.claim(amount)?;
         Ok(comparator.distance_with_args(name.chars(), &Args::default().score_cutoff(cutoff)))
     }
@@ -85,33 +97,39 @@ impl Work {
 /// Returns nearest declarations only after comparing the entire selected set.
 ///
 /// Every visited file and declaration costs one work unit, including language exclusions.
-/// Normalization reserves twelve units per source byte before allocation. Each distance
+/// Normalization reserves the configured lowercase work per source byte before allocation. Each distance
 /// reserves (Q + 1) * L units for actual lowercase query and candidate character lengths.
-/// Stable insertion reserves three times the new qualified-name and path bytes. The fixed
-/// `WORK_MAX` limits traversal to that many entries and distance cells to that many cells,
+/// Stable insertion reserves three times the new qualified-name and path bytes. The
+/// configured work limits traversal to that many entries and distance cells to that many cells,
 /// independently of publication size. Only three candidates survive. Exhaustion discards
 /// every candidate, so a prefix never claims to be the closest set.
 pub(crate) fn symbols<'source>(
     files: impl IntoIterator<Item = &'source IndexedFile>,
     name: &str,
     language: Option<&rift_protocol::read::Language>,
-) -> Result<Vec<SymbolId>, ()> {
-    symbols_with_work(files, name, language, WORK_MAX)
+    limits: WorkspaceIndexLimits,
+) -> Result<Vec<SymbolId>, RiftError> {
+    rank(
+        files,
+        name,
+        language,
+        Work::new(
+            limits.symbol_alternatives_work_max(),
+            limits.symbol_alternatives_lowercase_work(),
+        ),
+    )
 }
 
-/// The same complete ranking with an explicit allowance for boundary tests.
-fn symbols_with_work<'source>(
+/// Compares the complete selected set under the accepted work policy.
+fn rank<'source>(
     files: impl IntoIterator<Item = &'source IndexedFile>,
     name: &str,
     language: Option<&rift_protocol::read::Language>,
-    allowance: usize,
-) -> Result<Vec<SymbolId>, ()> {
-    let mut work = Work {
-        remaining: allowance,
-    };
+    mut work: Work,
+) -> Result<Vec<SymbolId>, RiftError> {
     let name = work.lowercase(name)?;
     let query_characters = name.chars().count();
-    work.claim(query_characters)?;
+    work.claim(query_characters as u128)?;
     let comparator = BatchComparator::new(name.chars());
     let mut nearest: Vec<Alternative<'_>> = Vec::with_capacity(SYMBOL_ALTERNATIVES_MAX + 1);
     for file in files {
@@ -135,7 +153,7 @@ fn select_file<'source>(
     comparator: &BatchComparator<char>,
     query_characters: usize,
     nearest: &mut Vec<Alternative<'source>>,
-) -> Result<(), ()> {
+) -> Result<(), RiftError> {
     work.claim(1)?;
     let selected = language
         .is_none_or(|language| crate::read::language_selects(language, file.syntax().language()));
@@ -156,13 +174,9 @@ fn select_file<'source>(
             symbol,
             distance,
         };
-        let ordering = symbol
-            .qualified_name
-            .len()
-            .checked_add(file.path().as_str().len())
-            .and_then(|bytes| bytes.checked_add(1))
-            .and_then(|bytes| bytes.checked_mul(SYMBOL_ALTERNATIVES_MAX))
-            .ok_or(())?;
+        let ordering =
+            (symbol.qualified_name.len() as u128 + file.path().as_str().len() as u128 + 1)
+                * SYMBOL_ALTERNATIVES_MAX as u128;
         work.claim(ordering)?;
         let position = nearest
             .iter()
@@ -181,7 +195,7 @@ fn distance(
     query_characters: usize,
     symbol: &SyntaxSymbol,
     cutoff: usize,
-) -> Result<Option<usize>, ()> {
+) -> Result<Option<usize>, RiftError> {
     let short = work.distance(comparator, query_characters, &symbol.name, cutoff)?;
     if symbol.name == symbol.qualified_name {
         return Ok(short);
@@ -202,7 +216,16 @@ mod tests {
     use rift_core::{SourceVisibility, TextFileInclusion};
     use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
 
-    use super::{UNAVAILABLE_DETAIL, Work, symbols_with_work};
+    use super::Work;
+
+    fn symbols_with_work<'source>(
+        files: impl IntoIterator<Item = &'source rift_index::IndexedFile>,
+        name: &str,
+        language: Option<&rift_protocol::read::Language>,
+        allowance: usize,
+    ) -> Result<Vec<rift_protocol::read::SymbolId>, rift_error::RiftError> {
+        super::rank(files, name, language, Work::new(allowance, 12))
+    }
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -223,7 +246,7 @@ mod tests {
         // Query normalization 13, file/declaration 2, candidate normalization 72,
         // distance 12, stable insertion 39: the complete ranking costs 138.
         let complete = symbols_with_work(index.files(), "x", None, 138)
-            .map_err(|()| "exact allowance refused")?;
+            .map_err(|_| "exact allowance refused")?;
         assert_eq!(complete.len(), 1);
         assert!(symbols_with_work(index.files(), "x", None, 137).is_err());
         // The next file is inspected even if it contains no selected declaration.
@@ -247,8 +270,8 @@ mod tests {
             dialect: None,
         };
         assert_eq!(
-            symbols_with_work(index.files(), "x", Some(&language), 15),
-            Ok(Vec::new())
+            symbols_with_work(index.files(), "x", Some(&language), 15).ok(),
+            Some(Vec::new())
         );
         assert!(symbols_with_work(index.files(), "x", Some(&language), 14).is_err());
         Ok(())
@@ -259,12 +282,150 @@ mod tests {
         let query = "İ".to_lowercase();
         assert_eq!(query.chars().count(), 2);
         let comparator = rapidfuzz::distance::levenshtein::BatchComparator::new(query.chars());
-        let mut exact = Work { remaining: 30 };
-        assert_eq!(exact.distance(&comparator, 2, "İ", usize::MAX), Ok(Some(0)));
+        let mut exact = Work::new(30, 12);
+        assert_eq!(
+            exact.distance(&comparator, 2, "İ", usize::MAX).ok(),
+            Some(Some(0))
+        );
         assert_eq!(exact.remaining, 0);
-        let mut short = Work { remaining: 29 };
+        let mut short = Work::new(29, 12);
         assert!(short.distance(&comparator, 2, "İ", usize::MAX).is_err());
-        assert!(UNAVAILABLE_DETAIL.chars().count() <= 4096);
+        let error = short.unavailable(6);
+        assert!(error.to_string().chars().count() <= 4096);
+        assert!(
+            error
+                .action()
+                .contains("search.symbol_alternatives_lowercase_work")
+        );
+    }
+
+    #[test]
+    fn configured_lowercase_weight_reserves_before_unicode_allocation() {
+        use rift_protocol::configuration::SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN;
+        // core Unicode mappings return at most three chars, each at most four UTF-8 bytes.
+        assert_eq!(SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN, 3 * 4);
+        let mut exact = Work::new(48, 24);
+        assert_eq!(exact.lowercase("İ").ok().as_deref(), Some("i\u{307}"));
+        assert_eq!(exact.remaining, 0);
+        let mut exhausted = Work::new(47, 24);
+        let error = exhausted
+            .lowercase("İ")
+            .expect_err("allocation reservation refused");
+        assert_eq!(exhausted.remaining, 47);
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_symbol_alternatives_unavailable::SLUG
+        );
+        assert!(error.message().contains("work bound 47"));
+        assert!(error.message().contains("required 48"));
+        assert!(
+            error
+                .action()
+                .contains("reserves 24 work units per input byte")
+        );
+        assert!(error.to_string().contains(error.message()));
+        assert!(error.to_string().contains(error.action()));
+    }
+
+    #[test]
+    fn large_reservations_report_exact_required_work_without_overflow() {
+        let mut work = Work::new(1, usize::MAX);
+        let normalization = work
+            .lowercase("xx")
+            .expect_err("large normalization refused");
+        assert!(
+            normalization
+                .message()
+                .contains(&format!("required {}", 2 * usize::MAX as u128))
+        );
+        assert_eq!(work.remaining, 1);
+        assert_eq!(
+            normalization.slug(),
+            rift_error::errors::server::read_symbol_alternatives_unavailable::SLUG
+        );
+        let comparator = rapidfuzz::distance::levenshtein::BatchComparator::new("x".chars());
+        let mut work = Work::new(100, 12);
+        let addition = work
+            .distance(&comparator, usize::MAX, "x", usize::MAX)
+            .expect_err("large query refused");
+        assert!(
+            addition
+                .message()
+                .contains(&format!("required {}", usize::MAX as u128 + 1))
+        );
+        assert_eq!(work.remaining, 88);
+        assert_eq!(addition.slug(), normalization.slug());
+        let mut work = Work::new(100, 12);
+        let multiplication = work
+            .distance(&comparator, usize::MAX / 2, "xx", usize::MAX)
+            .expect_err("large distance refused");
+        assert!(
+            multiplication
+                .message()
+                .contains(&format!("required {}", (usize::MAX as u128 / 2 + 1) * 2))
+        );
+        assert_eq!(work.remaining, 76);
+        assert_eq!(multiplication.slug(), normalization.slug());
+    }
+
+    #[test]
+    fn index_limits_accept_and_refuse_symbol_alternatives_configuration() -> TestResult {
+        use rift_protocol::configuration::SearchConfiguration;
+        let search = SearchConfiguration {
+            symbol_alternatives_work: 138,
+            symbol_alternatives_lowercase_work: 24,
+            ..Default::default()
+        };
+        let limits =
+            WorkspaceIndexLimits::default().with_symbol_alternatives_configuration(&search)?;
+        assert_eq!(limits.symbol_alternatives_work_max(), 138);
+        assert_eq!(limits.symbol_alternatives_lowercase_work(), 24);
+        for work in [0, (1 << 30) + 1, u64::MAX] {
+            let invalid = SearchConfiguration {
+                symbol_alternatives_work: work,
+                ..Default::default()
+            };
+            let error = limits
+                .with_symbol_alternatives_configuration(&invalid)
+                .expect_err("work out of range");
+            assert!(
+                error
+                    .to_string()
+                    .contains("search.symbol_alternatives_work")
+            );
+        }
+        for weight in [0, 11, 1025, u64::MAX] {
+            let invalid = SearchConfiguration {
+                symbol_alternatives_lowercase_work: weight,
+                ..Default::default()
+            };
+            let error = limits
+                .with_symbol_alternatives_configuration(&invalid)
+                .expect_err("weight out of range");
+            assert!(
+                error
+                    .to_string()
+                    .contains("search.symbol_alternatives_lowercase_work")
+            );
+        }
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let index = index(directory.path())?;
+        let higher_weight = super::symbols(index.files(), "x", None, limits)
+            .expect_err("higher weight exhausts allowance");
+        assert_eq!(
+            higher_weight.slug(),
+            rift_error::errors::server::read_symbol_alternatives_unavailable::SLUG
+        );
+        let accepted = SearchConfiguration {
+            symbol_alternatives_work: 138,
+            ..Default::default()
+        };
+        let accepted = limits.with_symbol_alternatives_configuration(&accepted)?;
+        let complete = super::symbols(index.files(), "x", None, accepted)?;
+        assert_eq!(complete.len(), 1);
+        assert!(complete[0].0.ends_with("/beacon"));
+        Ok(())
     }
 
     #[test]
@@ -275,7 +436,7 @@ mod tests {
         let index = index(directory.path())?;
         assert!(symbols_with_work(index.files(), "x", None, 132).is_err());
         let complete = symbols_with_work(index.files(), "x", None, 1_000)
-            .map_err(|()| "complete ranking refused")?;
+            .map_err(|_| "complete ranking refused")?;
         assert!(complete[0].0.ends_with("/x"));
         Ok(())
     }
@@ -299,16 +460,18 @@ mod tests {
         let symbol = &file.syntax().symbols()[1];
         let comparator = rapidfuzz::distance::levenshtein::BatchComparator::new("y".chars());
         // Short x costs 14; qualified parent::x costs 126, including its distance.
-        let mut exact = Work { remaining: 140 };
+        let mut exact = Work::new(140, 12);
         assert_eq!(
-            super::distance(&mut exact, &comparator, 1, symbol, usize::MAX),
-            Ok(Some(1))
+            super::distance(&mut exact, &comparator, 1, symbol, usize::MAX).ok(),
+            Some(Some(1))
         );
         assert_eq!(exact.remaining, 0);
-        let mut exhausted = Work { remaining: 139 };
+        let mut exhausted = Work::new(139, 12);
+        let error = super::distance(&mut exhausted, &comparator, 1, symbol, usize::MAX)
+            .expect_err("qualified distance refused");
         assert_eq!(
-            super::distance(&mut exhausted, &comparator, 1, symbol, usize::MAX),
-            Err(())
+            error.slug().to_string(),
+            "rift.server.read_symbol_alternatives_unavailable"
         );
         assert_eq!(
             exhausted.remaining, 17,
@@ -322,10 +485,14 @@ mod tests {
         );
         // Complete ranking also reserves x's 48 insertion units, ending at 327.
         let complete = symbols_with_work(index.files(), "y", None, 327)
-            .map_err(|()| "complete qualified ranking refused")?;
+            .map_err(|_| "complete qualified ranking refused")?;
         assert_eq!(complete.len(), 2);
         assert_eq!(complete[0].0, "rift://symbol/rust/lib.rs/parent::x");
-        assert!(UNAVAILABLE_DETAIL.contains("closest alternatives unavailable at the work bound"));
+        assert!(
+            error
+                .message()
+                .contains("closest alternatives unavailable at the work bound 139")
+        );
         Ok(())
     }
 }

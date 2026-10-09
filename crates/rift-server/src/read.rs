@@ -1135,14 +1135,16 @@ impl ReadService {
         let proposed = if params.scope == SearchScope::Global {
             Ok(Vec::new())
         } else {
-            crate::alternatives::symbols(self.index.files(), &params.name, params.language.as_ref())
+            crate::alternatives::symbols(
+                self.index.files(),
+                &params.name,
+                params.language.as_ref(),
+                self.index.limits(),
+            )
         };
         let (alternatives, detail) = match proposed {
             Ok(alternatives) => (alternatives, None),
-            Err(()) => (
-                Vec::new(),
-                Some(crate::alternatives::UNAVAILABLE_DETAIL.to_owned()),
-            ),
+            Err(error) => (Vec::new(), Some(error.to_string())),
         };
         ReadWarning::SymbolNotFound {
             name: params.name.clone(),

@@ -1355,7 +1355,7 @@
             "oneOf": [
               {
                 "additionalProperties": false,
-                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds its fixed work bound, alternatives are empty and `detail` explains why.",
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
                 "properties": {
                   "alternatives": {
                     "description": "Project declaration identities the caller can use to select another name.",
@@ -4007,7 +4007,7 @@
             "oneOf": [
               {
                 "additionalProperties": false,
-                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds its fixed work bound, alternatives are empty and `detail` explains why.",
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
                 "properties": {
                   "alternatives": {
                     "description": "Project declaration identities the caller can use to select another name.",
@@ -7043,7 +7043,7 @@
             "oneOf": [
               {
                 "additionalProperties": false,
-                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds its fixed work bound, alternatives are empty and `detail` explains why.",
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
                 "properties": {
                   "alternatives": {
                     "description": "Project declaration identities the caller can use to select another name.",

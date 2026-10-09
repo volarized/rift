@@ -1056,7 +1056,8 @@ pub enum ReadWarning {
     /// Equal distances use qualified name, then project path order. Revision reads
     /// use that revision's declarations. A `global` lookup carries no alternatives;
     /// an `all` lookup proposes project declarations alone. If complete closest ranking
-    /// exceeds its fixed work bound, alternatives are empty and `detail` explains why.
+    /// exceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`
+    /// carries the registered failure's message, recovery action, and observed work.
     SymbolNotFound {
         /// The declaration name the caller requested.
         #[schemars(length(min = 1, max = 4096))]

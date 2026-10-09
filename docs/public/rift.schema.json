@@ -1584,6 +1584,22 @@
           "minimum": 1,
           "type": "integer"
         },
+        "symbol_alternatives_lowercase_work": {
+          "default": 12,
+          "description": "Work units reserved per input byte before lowercase allocation, 12 to 1024.\nTwelve covers three lowercase characters of at most four UTF-8 bytes each.\nLarger values reserve more work without changing lowercase mappings.",
+          "format": "uint64",
+          "maximum": 1024,
+          "minimum": 12,
+          "type": "integer"
+        },
+        "symbol_alternatives_work": {
+          "default": 16777216,
+          "description": "Work units one complete closest-declaration ranking may reserve, 1 to 1073741824.\nExhaustion discards all alternatives and reports the configured bound.",
+          "format": "uint64",
+          "maximum": 1073741824,
+          "minimum": 1,
+          "type": "integer"
+        },
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
           "default": {
@@ -2129,6 +2145,8 @@
           "vector_weight": 0.3
         },
         "results": 1000,
+        "symbol_alternatives_lowercase_work": 12,
+        "symbol_alternatives_work": 16777216,
         "text": {
           "excluded_lockfiles": [
             "Cargo.lock",

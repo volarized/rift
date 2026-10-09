@@ -853,6 +853,8 @@ max_chunk = "1mb"
 
 [search]
 results = 1000
+symbol_alternatives_work = 16777216
+symbol_alternatives_lowercase_work = 12
 pool_slots = 4
 busy_timeout = "5s"
 journal_size_limit = "64mb"
@@ -865,6 +867,17 @@ journal_size_limit = "64mb"
   indexed chunks, 1kb to 16mb
 - `results` caps results collected by one local search or symbol lookup, 1 to 10000, default
   `1000`; an answer that reaches it reports `results_truncated`
+- `symbol_alternatives_work` bounds one complete closest-declaration ranking, 1 to 1073741824,
+  default `16777216`. Every visited file and declaration costs one work unit, including
+  language exclusions. Lowercase allocation reserves the configured weight per input byte;
+  a distance comparison reserves `(Q + 1) * L` units for the lowercase query and candidate
+  character counts. Stable ordering reserves three times the sum of qualified-name bytes,
+  path bytes, and one byte. Exhaustion discards all alternatives; `symbol_not_found.detail`
+  reports the configured bound, required work, remaining work, and recovery action
+- `symbol_alternatives_lowercase_work` sets that reservation weight, 12 to 1024, default `12`.
+  Rust lowercase mappings return at most three characters, each at most four UTF-8 bytes.
+  Values below 12 are refused; larger values reserve more work without changing Unicode
+  mappings. Both keys apply to local project alternatives, including a revision read
 - `pool_slots` bounds SQLite connections the index database may hold open at once, and
   separately the vectors database, 1 to 16
 - `busy_timeout` bounds how long a read or write waits for one of those connections to come

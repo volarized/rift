@@ -455,7 +455,10 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
         (
             Code::LimitExceeded,
             Retry::OperatorAction,
-            &["rift.tracing.log_subscription_limit"],
+            &[
+                "rift.server.read_symbol_alternatives_unavailable",
+                "rift.tracing.log_subscription_limit",
+            ],
         ),
         (
             Code::PermissionDenied,
@@ -668,6 +671,10 @@ mod tests {
             ),
             (
                 "rift.tracing.log_subscription_limit",
+                (Code::LimitExceeded, Retry::OperatorAction),
+            ),
+            (
+                "rift.server.read_symbol_alternatives_unavailable",
                 (Code::LimitExceeded, Retry::OperatorAction),
             ),
         ] {

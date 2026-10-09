@@ -1140,6 +1140,19 @@ global index holds no release of, so the nearest collected release, 1.0.0, answe
 
 <McpTool name="get_symbol" />
 
+A lookup with no matching declaration carries `symbol_not_found`, naming the requested
+name and up to three closest project declaration identities in `alternatives`. The complete
+ranking uses case-insensitive Unicode Levenshtein distance to short and qualified names,
+then qualified-name and path order for equal distances. A revision read uses that revision's
+declarations. `global` carries no alternatives; `all` proposes project declarations alone.
+
+The [search configuration](/docs/developer/configuration#search) bounds this optional work
+through `symbol_alternatives_work` and `symbol_alternatives_lowercase_work`. If the complete
+ranking cannot fit, alternatives are empty and `detail` carries the registered failure's
+message, recovery action, configured bound, and observed reservation. The lookup remains
+successful. A lookup with matching declarations carries no named-miss warning, including
+an empty continuation page.
+
 `include` selects the optional fields a hit carries:
 
 - `source` - the node identity and declaration excerpt

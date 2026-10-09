@@ -275,7 +275,29 @@ async fn served_fixture_with_source(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
+    served_fixture_with_configuration(source, None).await
+}
+
+async fn served_fixture_with_configuration(
+    source: Option<&str>,
+    search: Option<&rift_protocol::configuration::SearchConfiguration>,
+) -> TestResult<(
+    surface_corpus::SurfaceFixture,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
     let fixture = surface_corpus::SurfaceFixture::start().await?;
+    if let Some(search) = search {
+        let path = fixture.root().join("rift.toml");
+        let written = std::fs::read_to_string(&path)?;
+        let table = format!(
+            "[search]\nsymbol_alternatives_work = {}\nsymbol_alternatives_lowercase_work = {}\n\n[search.vector]",
+            search.symbol_alternatives_work, search.symbol_alternatives_lowercase_work
+        );
+        assert!(written.contains("[search.vector]"));
+        assert!(!written.contains("[search]\n"));
+        std::fs::write(path, written.replacen("[search.vector]", &table, 1))?;
+    }
     if let Some(source) = source {
         std::fs::write(fixture.root().join("alternatives.rs"), source)?;
     }
@@ -381,6 +403,79 @@ fn assert_symbol_alternative_bounds(tool: &rmcp::model::Tool, schema: &Value) ->
         json!(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
     );
     assert_eq!(miss["properties"]["detail"]["maxLength"], json!(4096));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> TestResult {
+    let search = rift_protocol::configuration::SearchConfiguration {
+        symbol_alternatives_work: 1,
+        symbol_alternatives_lowercase_work: 24,
+        ..Default::default()
+    };
+    let (_fixture, client, server_task) =
+        served_fixture_with_configuration(None, Some(&search)).await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (_, output) = validators
+        .get("get_symbol")
+        .ok_or("get_symbol advertised")?;
+    let expected = rift_error::errors::server::read_symbol_alternatives_unavailable()
+        .work(1_u64)
+        .lowercase_work(24_u64)
+        .remaining(1_u64)
+        .required(48_u128)
+        .error()
+        .to_string();
+    for request in [
+        json!({"name":"İ","language":"rust","include":[]}),
+        json!({"name":"İ","language":"python","include":[]}),
+        json!({"name":"İ","language":"rust","include":[],"rev":"baseline"}),
+    ] {
+        let result = client
+            .call_tool(tools_call_request("get_symbol", &request)?)
+            .await?;
+        assert!(!result.is_error.unwrap_or(false));
+        let answer = result
+            .structured_content
+            .ok_or("structured answer absent")?;
+        assert_validates(output, &answer, "configured work result");
+        let warning = answer["warnings"]
+            .as_array()
+            .and_then(|warnings| {
+                warnings
+                    .iter()
+                    .find(|warning| warning["code"] == "symbol_not_found")
+            })
+            .ok_or("named miss absent")?;
+        assert_eq!(
+            warning,
+            &json!({"code":"symbol_not_found","name":"İ","alternatives":[],"detail":expected})
+        );
+        assert_eq!(answer["hits"], json!([]));
+        assert_eq!(answer["pagination"]["total_pages"], 0);
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(&expected), "{text}");
+    }
+    let result = client
+        .call_tool(tools_call_request(
+            "get_symbol",
+            &json!({"name":"beacon_one","include":[]}),
+        )?)
+        .await?;
+    let answer = result.structured_content.ok_or("exact answer absent")?;
+    assert!(!answer["hits"].as_array().ok_or("hits absent")?.is_empty());
+    assert!(!answer["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "symbol_not_found")
+    }));
+    client.cancel().await?;
+    server_task.await?;
     Ok(())
 }
 
