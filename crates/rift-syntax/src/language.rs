@@ -98,6 +98,13 @@ pub trait LanguageDefinition: std::fmt::Debug + Send + Sync {
     /// with `[languages.<identity>] include`.
     fn extensions(&self) -> &'static [&'static str];
 
+    /// Whether this definition claims the extension, ignoring ASCII case.
+    fn matches_extension(&self, extension: &str) -> bool {
+        self.extensions()
+            .iter()
+            .any(|claimed| claimed.eq_ignore_ascii_case(extension))
+    }
+
     /// The syntax provider parsing this language's sources; each analysis
     /// receives the bounds it parses under.
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider>;

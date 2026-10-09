@@ -13,11 +13,11 @@
 mod context7;
 mod documentation;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use rift_core::ProjectPath;
 use rift_protocol::read::PathPattern;
+use rift_syntax::ShippedLanguage;
 
 use crate::analyzer::PackageLanguage;
 use crate::glob::PathMatcher;
@@ -43,7 +43,7 @@ const PACKAGE_ROOT: &str = "/";
 /// documentation selection.
 #[derive(Debug)]
 pub struct PackageFileSelection {
-    extensions: BTreeSet<&'static str>,
+    source_languages: &'static [ShippedLanguage],
     exclude: PathMatcher,
     documentation: DocumentationSelection,
 }
@@ -54,7 +54,8 @@ impl PackageFileSelection {
     /// The source extensions are the ones the language's shipped definitions claim: `rs`
     /// for Rust, `py` and `pyi` for Python, and every JavaScript and TypeScript extension
     /// for a TypeScript package, whose builds ship `.js`, `.mjs`, and `.cjs` beside their
-    /// declaration files.
+    /// declaration files. Source extensions match without regard to ASCII case;
+    /// selected paths and source bytes keep their original spelling.
     ///
     /// # Errors
     ///
@@ -68,13 +69,8 @@ impl PackageFileSelection {
             .iter()
             .map(|pattern| pattern.0.clone())
             .collect::<Vec<_>>();
-        let extensions = language
-            .source_languages()
-            .iter()
-            .flat_map(|shipped| shipped.definition().extensions().iter().copied())
-            .collect();
         Ok(Self {
-            extensions,
+            source_languages: language.source_languages(),
             exclude: PathMatcher::build(Path::new(PACKAGE_ROOT), &[], &exclude)?,
             documentation,
         })
@@ -111,7 +107,11 @@ impl PackageFileSelection {
         Path::new(path.as_str())
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| self.extensions.contains(extension))
+            .is_some_and(|extension| {
+                self.source_languages
+                    .iter()
+                    .any(|language| language.definition().matches_extension(extension))
+            })
     }
 }
 
