@@ -3,6 +3,542 @@ use std::io::Write;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+// Issue #600: compare every repeated member before retaining one normalized file.
+#[test]
+fn identical_tar_members_retain_one_file_after_normalization() -> TestResult {
+    for content in [b"pub fn value() {}\r\n".as_slice(), b""] {
+        for second in ["release/src/lib.rs", "release/./src/lib.rs"] {
+            let bytes = tar_bytes(&[
+                ("release/./src/lib.rs", content, tar::EntryType::Regular),
+                (second, content, tar::EntryType::Regular),
+            ])?;
+            let files = read(&bytes, ArchiveLimits::default())?;
+            assert_eq!(files.files().len(), 1);
+            assert_eq!(files.files()[&ProjectPath::new("src/lib.rs")?], content);
+            assert_eq!(files.digest(), FileDigest::of(&bytes));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn identical_zip_members_retain_one_file_after_normalization() -> TestResult {
+    for content in [b"pub fn value() {}\r\n".as_slice(), b""] {
+        let regular = tar::EntryType::Regular;
+        let bytes = zip_members_bytes(&[
+            ("release/./src/lib.rs", content, regular),
+            ("release/src/lib.rs", content, regular),
+        ])?;
+        let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(files.files()[&ProjectPath::new("src/lib.rs")?], content);
+        assert_eq!(files.digest(), FileDigest::of(&bytes));
+    }
+    Ok(())
+}
+
+fn zip_members_bytes(
+    entries: &[(&str, &[u8], tar::EntryType)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for &(path, content, kind) in entries {
+        let options = zip::write::SimpleFileOptions::default();
+        match kind {
+            tar::EntryType::Directory => archive.add_directory(path, options)?,
+            tar::EntryType::Symlink => archive.add_symlink(path, "target", options)?,
+            _ => {
+                archive.start_file(path, options)?;
+                archive.write_all(content)?;
+            }
+        }
+    }
+    Ok(archive.finish()?.into_inner())
+}
+
+fn replace_zip_name(bytes: &mut [u8], before: &[u8], after: &[u8]) {
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "fixture names must preserve header lengths"
+    );
+    for start in 0..=bytes.len().saturating_sub(before.len()) {
+        if bytes.get(start..start + before.len()) == Some(before) {
+            bytes[start..start + before.len()].copy_from_slice(after);
+        }
+    }
+}
+
+#[test]
+fn raw_zip_duplicates_preserve_utf8_and_cp437_names() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let mut utf8 = zip_members_bytes(&[
+        ("release/é", b"text", regular),
+        ("release/à", b"text", regular),
+    ])?;
+    replace_zip_name(&mut utf8, "release/à".as_bytes(), "release/é".as_bytes());
+    let mut cp437 = zip_members_bytes(&[
+        ("release/a", b"text", regular),
+        ("release/b", b"text", regular),
+    ])?;
+    replace_zip_name(&mut cp437, b"release/a", b"release/\x82");
+    replace_zip_name(&mut cp437, b"release/b", b"release/\x82");
+    for bytes in [utf8, cp437] {
+        let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(files.files()[&ProjectPath::new("é")?], b"text");
+    }
+    Ok(())
+}
+
+fn unicode_name_zip(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for path in ["release/a", "release/b"] {
+        let mut extra = vec![1];
+        // FileOptions validates extras against an empty filename before start_file.
+        extra.extend_from_slice(&0_u32.to_le_bytes());
+        extra.extend_from_slice(name.as_bytes());
+        let mut options = zip::write::FullFileOptions::default();
+        options.add_extra_data(0x7075, extra, true)?;
+        archive.start_file(path, options)?;
+        archive.write_all(b"text")?;
+    }
+    let mut bytes = archive.finish()?.into_inner();
+    let archive =
+        rawzip::ZipArchive::from_slice(bytes.as_slice()).map_err(|error| error.to_string())?;
+    let mut entries = archive.entries();
+    let mut corrections = Vec::new();
+    while let Some(entry) = entries.next_entry()? {
+        let path = entry.file_path();
+        let offset =
+            usize::try_from(entry.central_directory_offset())? + 46 + path.as_ref().len() + 5;
+        corrections.push((offset, rawzip::crc32(path.as_ref()).to_le_bytes()));
+    }
+    for (offset, crc) in corrections {
+        bytes[offset..offset + 4].copy_from_slice(&crc);
+    }
+    Ok(bytes)
+}
+
+#[test]
+fn repeated_zip_unicode_extra_names_share_path_validation() -> TestResult {
+    let bytes = unicode_name_zip("release/é")?;
+    let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+    assert_eq!(files.files().len(), 1);
+    assert_eq!(files.files()[&ProjectPath::new("é")?], b"text");
+    for name in ["release/../a", "/release/a", "release\\a"] {
+        let bytes = unicode_name_zip(name)?;
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("unsafe Unicode name"),
+            ArchiveError::UnsafePath
+        );
+    }
+    let bytes = unicode_name_zip("other/a")?;
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("Unicode root mismatch"),
+        ArchiveError::RootMismatch
+    );
+    let bytes = unicode_name_zip("release/a/")?;
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default())
+            .expect_err("directory with nonzero bytes"),
+        ArchiveError::UnsupportedEntry
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_zip_member_types_match_existing_decoder() -> TestResult {
+    let original = zip_members_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/b", b"text", tar::EntryType::Regular),
+    ])?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(&original))?;
+    let central = usize::try_from(archive.by_index_raw(1)?.central_header_start())?;
+    for (creator, mode, expected) in [
+        (0, 0o120_777_u32, ArchiveError::DuplicatePath),
+        (10, 0o120_777_u32, ArchiveError::DuplicatePath),
+        (3, 0o160_644_u32, ArchiveError::DuplicatePath),
+        (3, 0o030_644_u32, ArchiveError::UnsupportedEntry),
+    ] {
+        let mut bytes = original.clone();
+        bytes[central + 5] = creator;
+        bytes[central + 38..central + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+        if expected == ArchiveError::DuplicatePath {
+            let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+            assert_eq!(files.files().len(), 1);
+            assert_eq!(files.skipped_links(), &[ProjectPath::new("b")?]);
+        } else {
+            assert_eq!(
+                read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("unknown Unix type"),
+                expected
+            );
+        }
+        replace_zip_name(&mut bytes, b"release/b", b"release/a");
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("repeated ZIP member type"),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn raw_zip_duplicates_validate_members_before_index_collapse() -> TestResult {
+    let original = zip_members_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/b", b"text", tar::EntryType::Regular),
+    ])?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(&original))?;
+    let entry = archive.by_index_raw(0)?;
+    let central = usize::try_from(entry.central_header_start())?;
+    let data = usize::try_from(entry.data_start().ok_or("missing data offset")?)?;
+    drop(entry);
+    for (offset, replacement, error) in [
+        (central + 16, vec![0, 0, 0, 0], ArchiveError::InvalidArchive),
+        (
+            central + 24,
+            5_u32.to_le_bytes().to_vec(),
+            ArchiveError::InvalidArchive,
+        ),
+        (central + 10, vec![99, 0], ArchiveError::InvalidArchive),
+        (central + 8, vec![1, 0], ArchiveError::UnsupportedEntry),
+        (
+            central + 38,
+            (0o020_644_u32 << 16).to_le_bytes().to_vec(),
+            ArchiveError::UnsupportedEntry,
+        ),
+        (data, vec![255], ArchiveError::InvalidArchive),
+    ] {
+        let mut bytes = original.clone();
+        bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        replace_zip_name(&mut bytes, b"release/b", b"release/a");
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("invalid earlier ZIP member"),
+            error
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn zip_stored_member_declared_size_must_match_payload() -> TestResult {
+    let original = zip_bytes("release/a", b"text")?;
+    let files = read_zip_fixture(&original, ArchiveLimits::default())?;
+    assert_eq!(files.files()[&ProjectPath::new("a")?], b"text");
+    let mut archive = zip::ZipArchive::new(Cursor::new(&original))?;
+    let central = usize::try_from(archive.by_index_raw(0)?.central_header_start())?;
+    for declared_size in [3_u32, 5] {
+        let mut bytes = original.clone();
+        bytes[central + 24..central + 28].copy_from_slice(&declared_size.to_le_bytes());
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("stored ZIP payload length differs from declared size"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_zip_footer_member_counts_must_agree() -> TestResult {
+    let mut bytes = zip_members_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/b", b"text", tar::EntryType::Regular),
+    ])?;
+    replace_zip_name(&mut bytes, b"release/b", b"release/a");
+    let footer = bytes.len() - 22;
+    bytes[footer + 10..footer + 12].copy_from_slice(&3_u16.to_le_bytes());
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("unequal ZIP member counts"),
+        ArchiveError::InvalidArchive
+    );
+    Ok(())
+}
+
+#[test]
+fn undeclared_repeated_zip_members_are_counted_and_refused() -> TestResult {
+    let mut bytes = zip_members_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/b", b"text", tar::EntryType::Regular),
+        ("release/c", b"text", tar::EntryType::Regular),
+    ])?;
+    replace_zip_name(&mut bytes, b"release/b", b"release/a");
+    replace_zip_name(&mut bytes, b"release/c", b"release/a");
+    let footer = bytes.len() - 22;
+    bytes[footer + 8..footer + 12].copy_from_slice(&[2, 0, 2, 0]);
+    let limits = ArchiveLimits::new(bytes.len(), 8192, 1024, 2, 200)?;
+    assert_eq!(
+        read_zip_fixture(&bytes, limits).expect_err("undeclared ZIP member exceeds bound"),
+        ArchiveError::MemberLimit
+    );
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("undeclared ZIP member"),
+        ArchiveError::InvalidArchive
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_zip_unsupported_compression_precedes_skipped_links() -> TestResult {
+    for kind in [tar::EntryType::Regular, tar::EntryType::Symlink] {
+        let mut bytes = zip_members_bytes(&[
+            ("release/a", b"text", kind),
+            ("release/b", b"text", tar::EntryType::Regular),
+        ])?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))?;
+        let central = usize::try_from(archive.by_index_raw(0)?.central_header_start())?;
+        bytes[central + 10..central + 12].copy_from_slice(&98_u16.to_le_bytes());
+        replace_zip_name(&mut bytes, b"release/b", b"release/a");
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("unsupported ZIP compression"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_zip_payload_reads_consume_work_bound() -> TestResult {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file(
+        "release/a",
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )?;
+    writer.write_all(&[b'x'; 4096])?;
+    let original = writer.finish()?.into_inner();
+    let mut archive = zip::ZipArchive::new(Cursor::new(&original))?;
+    let central = usize::try_from(archive.by_index_raw(0)?.central_header_start())?;
+    let footer = original.len() - 22;
+    let record = &original[central..footer];
+    let mut bytes = original[..central].to_vec();
+    for _ in 0..10 {
+        bytes.extend_from_slice(record);
+    }
+    bytes.extend_from_slice(&original[footer..]);
+    let footer = bytes.len() - 22;
+    bytes[footer + 8..footer + 12].copy_from_slice(&[10, 0, 10, 0]);
+    bytes[footer + 12..footer + 16]
+        .copy_from_slice(&u32::try_from(record.len() * 10)?.to_le_bytes());
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default())
+            .expect_err("repeated compressed payload work"),
+        ArchiveError::WorkLimit
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_zip_duplicates_support_zip64_and_prepended_data() -> TestResult {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for path in ["release/a", "release/b"] {
+        writer.start_file(
+            path,
+            zip::write::SimpleFileOptions::default().large_file(true),
+        )?;
+        writer.write_all(b"text")?;
+    }
+    let mut bytes = writer.finish()?.into_inner();
+    replace_zip_name(&mut bytes, b"release/b", b"release/a");
+    let mut zip64 = bytes.clone();
+    let footer_position = zip64.len() - 22;
+    let mut footer = zip64.split_off(footer_position);
+    let directory_size = u32::from_le_bytes(footer[12..16].try_into()?);
+    let directory_offset = u32::from_le_bytes(footer[16..20].try_into()?);
+    zip64.extend_from_slice(b"PK\x06\x06");
+    zip64.extend_from_slice(&44_u64.to_le_bytes());
+    zip64.extend_from_slice(&45_u16.to_le_bytes());
+    zip64.extend_from_slice(&45_u16.to_le_bytes());
+    zip64.extend_from_slice(&[0; 8]);
+    zip64.extend_from_slice(&2_u64.to_le_bytes());
+    zip64.extend_from_slice(&2_u64.to_le_bytes());
+    zip64.extend_from_slice(&u64::from(directory_size).to_le_bytes());
+    zip64.extend_from_slice(&u64::from(directory_offset).to_le_bytes());
+    zip64.extend_from_slice(b"PK\x06\x07");
+    zip64.extend_from_slice(&0_u32.to_le_bytes());
+    zip64.extend_from_slice(&u64::try_from(footer_position)?.to_le_bytes());
+    zip64.extend_from_slice(&1_u32.to_le_bytes());
+    footer[8..20].fill(0xff);
+    zip64.extend_from_slice(&footer);
+    for (archive, prefix) in [
+        (&bytes, b"".as_slice()),
+        (&bytes, b"#!/bin/sh\n"),
+        (&zip64, b""),
+        (&zip64, b"#!/bin/sh\n"),
+    ] {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(archive);
+        let mut reference = zip::ZipArchive::new(Cursor::new(&bytes))?;
+        assert_eq!(reference.by_index(0)?.size(), 4);
+        let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(files.files()[&ProjectPath::new("a")?], b"text");
+        assert_eq!(files.digest(), FileDigest::of(&bytes));
+    }
+    Ok(())
+}
+
+#[test]
+fn raw_zip_duplicates_compare_every_member_and_keep_exact_bytes() -> TestResult {
+    for content in [b"exact\r\n".as_slice(), b""] {
+        let mut bytes = zip_members_bytes(&[
+            ("release/a", content, tar::EntryType::Regular),
+            ("release/b", content, tar::EntryType::Regular),
+        ])?;
+        replace_zip_name(&mut bytes, b"release/b", b"release/a");
+        let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(files.files()[&ProjectPath::new("a")?], content);
+        assert_eq!(files.digest(), FileDigest::of(&bytes));
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_files_with_conflicting_bytes_or_lengths_are_refused() -> TestResult {
+    for second in [b"tesT".as_slice(), b"texts", b""] {
+        let entries = [
+            ("release/a", b"text".as_slice(), tar::EntryType::Regular),
+            ("release/./a", second, tar::EntryType::Regular),
+        ];
+        let tar = tar_bytes(&entries)?;
+        let zip = zip_members_bytes(&entries)?;
+        assert_eq!(
+            read(&tar, ArchiveLimits::default()).expect_err("conflicting tar bytes"),
+            ArchiveError::DuplicatePath
+        );
+        assert_eq!(
+            read_zip_fixture(&zip, ArchiveLimits::default()).expect_err("conflicting ZIP bytes"),
+            ArchiveError::DuplicatePath
+        );
+        let mut raw = zip_members_bytes(&[
+            ("release/a", b"text".as_slice(), tar::EntryType::Regular),
+            ("release/b", second, tar::EntryType::Regular),
+        ])?;
+        replace_zip_name(&mut raw, b"release/b", b"release/a");
+        assert_eq!(
+            read_zip_fixture(&raw, ArchiveLimits::default())
+                .expect_err("conflicting raw ZIP bytes"),
+            ArchiveError::DuplicatePath
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_directories_and_member_type_collisions_are_refused() -> TestResult {
+    let regular = tar::EntryType::Regular;
+    let directory = tar::EntryType::Directory;
+    let link = tar::EntryType::Symlink;
+    for (first, second) in [
+        (directory, directory),
+        (directory, regular),
+        (regular, directory),
+        (link, regular),
+        (regular, link),
+        (link, link),
+    ] {
+        let first_path = if first == directory {
+            "release/a/"
+        } else {
+            "release/a"
+        };
+        let second_path = if second == directory {
+            "release/./a/"
+        } else {
+            "release/./a"
+        };
+        let entries = [
+            (first_path, b"".as_slice(), first),
+            (second_path, b"".as_slice(), second),
+        ];
+        let tar = tar_bytes(&entries)?;
+        let zip = zip_members_bytes(&entries)?;
+        assert_eq!(
+            read(&tar, ArchiveLimits::default()).expect_err("tar member type collision"),
+            ArchiveError::DuplicatePath
+        );
+        assert_eq!(
+            read_zip_fixture(&zip, ArchiveLimits::default())
+                .expect_err("ZIP member type collision"),
+            ArchiveError::DuplicatePath
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_zip_names_preserve_parent_and_link_collisions() -> TestResult {
+    for (first, second) in [("release/a", "release/a/b"), ("release/a/b", "release/a")] {
+        let bytes = zip_members_bytes(&[
+            (first, b"".as_slice(), tar::EntryType::Regular),
+            (second, b"", tar::EntryType::Regular),
+        ])?;
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("ZIP file parent collision"),
+            ArchiveError::DuplicatePath
+        );
+    }
+    for (first, second) in [
+        (tar::EntryType::Regular, tar::EntryType::Symlink),
+        (tar::EntryType::Symlink, tar::EntryType::Regular),
+    ] {
+        let mut bytes = zip_members_bytes(&[
+            ("release/a", b"".as_slice(), first),
+            ("release/b", b"", second),
+        ])?;
+        replace_zip_name(&mut bytes, b"release/b", b"release/a");
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("raw ZIP link collision"),
+            ArchiveError::DuplicatePath
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_members_consume_member_and_expanded_byte_bounds() -> TestResult {
+    let entries = [
+        ("release/a", b"text".as_slice(), tar::EntryType::Regular),
+        ("release/./a", b"text".as_slice(), tar::EntryType::Regular),
+    ];
+    let tar = tar_bytes(&entries)?;
+    let zip = zip_members_bytes(&entries)?;
+    let mut raw = zip_members_bytes(&[
+        ("release/a", b"text".as_slice(), tar::EntryType::Regular),
+        ("release/b", b"text".as_slice(), tar::EntryType::Regular),
+    ])?;
+    replace_zip_name(&mut raw, b"release/b", b"release/a");
+    for bytes in [&zip, &raw] {
+        let member_limits = ArchiveLimits::new(bytes.len(), 8192, 1024, 1, 200)?;
+        assert_eq!(
+            read_zip_fixture(bytes, member_limits).expect_err("repeated ZIP member count"),
+            ArchiveError::MemberLimit
+        );
+        let expanded_limits = ArchiveLimits::new(bytes.len(), 7, 4, 2, 200)?;
+        assert_eq!(
+            read_zip_fixture(bytes, expanded_limits).expect_err("repeated ZIP decompressed bytes"),
+            ArchiveError::ExpandedLimit
+        );
+        let exact_limits = ArchiveLimits::new(bytes.len(), 8, 4, 2, 200)?;
+        assert_eq!(read_zip_fixture(bytes, exact_limits)?.files().len(), 1);
+    }
+    let limits = ArchiveLimits::new(tar.len(), 8192, 1024, 1, 200)?;
+    assert_eq!(
+        read(&tar, limits).expect_err("repeated tar member count"),
+        ArchiveError::MemberLimit
+    );
+    let limits = ArchiveLimits::new(tar.len(), 2047, 1024, 2, 200)?;
+    assert_eq!(
+        read(&tar, limits).expect_err("repeated tar decompressed container bytes"),
+        ArchiveError::ExpandedLimit
+    );
+    Ok(())
+}
+
 fn tar_bytes(
     entries: &[(&str, &[u8], tar::EntryType)],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -782,11 +1318,11 @@ fn configured_tar_extension_bytes_accept_exact_and_refuse_one_over_before_alloca
 }
 
 #[test]
-fn zip_duplicate_raw_names_are_refused_before_index_collapse() -> TestResult {
+fn zip_conflicting_raw_names_are_refused_before_index_collapse() -> TestResult {
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for path in ["release/a", "release/b"] {
         archive.start_file(path, zip::write::SimpleFileOptions::default())?;
-        archive.write_all(b"text")?;
+        archive.write_all(path.as_bytes())?;
     }
     let mut bytes = archive.finish()?.into_inner();
     // Change both occurrences of the second name; safe writers refuse duplicate names.

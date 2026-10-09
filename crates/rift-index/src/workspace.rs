@@ -71,6 +71,8 @@ pub struct WorkspaceIndexLimits {
     revision_tree_entries_max: usize,
     directory_depth_max: usize,
     results_max: usize,
+    symbol_alternatives_work_max: usize,
+    symbol_alternatives_lowercase_work: usize,
     syntax: SyntaxLimits,
     large_files: LargeFileStrategy,
 }
@@ -105,6 +107,14 @@ impl WorkspaceIndexLimits {
             .unwrap_or(usize::MAX),
             directory_depth_max,
             results_max,
+            symbol_alternatives_work_max: usize::try_from(
+                rift_protocol::configuration::SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
+            symbol_alternatives_lowercase_work: usize::try_from(
+                rift_protocol::configuration::SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
             syntax: SyntaxLimits::default(),
             large_files: LargeFileStrategy::default(),
         }
@@ -153,7 +163,7 @@ impl WorkspaceIndexLimits {
         Ok(self)
     }
 
-    const fn bounds(self) -> [usize; 8] {
+    const fn bounds(self) -> [usize; 10] {
         [
             self.files_max,
             self.file_bytes_max,
@@ -163,6 +173,8 @@ impl WorkspaceIndexLimits {
             self.revision_tree_entries_max,
             self.directory_depth_max,
             self.results_max,
+            self.symbol_alternatives_work_max,
+            self.symbol_alternatives_lowercase_work,
         ]
     }
 
@@ -209,6 +221,65 @@ impl WorkspaceIndexLimits {
     #[must_use]
     pub const fn results_max(self) -> usize {
         self.results_max
+    }
+
+    /// Applies accepted optional symbol ranking work and lowercase reservation bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when either configured value is outside its served range.
+    pub fn with_symbol_alternatives_configuration(
+        mut self,
+        configuration: &rift_protocol::configuration::SearchConfiguration,
+    ) -> Result<Self, RiftError> {
+        use rift_protocol::configuration::{
+            SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MAX,
+            SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN, SEARCH_SYMBOL_ALTERNATIVES_WORK_MAX,
+            SEARCH_SYMBOL_ALTERNATIVES_WORK_MIN,
+        };
+        for (field, value, min, max) in [
+            (
+                "search.symbol_alternatives_work",
+                configuration.symbol_alternatives_work,
+                SEARCH_SYMBOL_ALTERNATIVES_WORK_MIN,
+                SEARCH_SYMBOL_ALTERNATIVES_WORK_MAX,
+            ),
+            (
+                "search.symbol_alternatives_lowercase_work",
+                configuration.symbol_alternatives_lowercase_work,
+                SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN,
+                SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MAX,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                return Err(rift_core::configuration_violation_error(
+                    &rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange {
+                        field,
+                        value,
+                        min,
+                        max,
+                    },
+                ));
+            }
+        }
+        // Accepted maxima fit usize on every supported target.
+        self.symbol_alternatives_work_max =
+            usize::try_from(configuration.symbol_alternatives_work).unwrap_or(usize::MAX);
+        self.symbol_alternatives_lowercase_work =
+            usize::try_from(configuration.symbol_alternatives_lowercase_work).unwrap_or(usize::MAX);
+        Ok(self)
+    }
+
+    /// Most work units one complete optional symbol ranking may reserve.
+    #[must_use]
+    pub const fn symbol_alternatives_work_max(self) -> usize {
+        self.symbol_alternatives_work_max
+    }
+
+    /// Work units reserved per source byte before lowercase allocation.
+    #[must_use]
+    pub const fn symbol_alternatives_lowercase_work(self) -> usize {
+        self.symbol_alternatives_lowercase_work
     }
 
     /// Returns maximum source files accepted per index.
@@ -328,6 +399,14 @@ impl Default for WorkspaceIndexLimits {
             .unwrap_or(usize::MAX),
             results_max: usize::try_from(rift_protocol::configuration::SEARCH_RESULTS_DEFAULT)
                 .unwrap_or(usize::MAX),
+            symbol_alternatives_work_max: usize::try_from(
+                rift_protocol::configuration::SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
+            symbol_alternatives_lowercase_work: usize::try_from(
+                rift_protocol::configuration::SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT,
+            )
+            .unwrap_or(usize::MAX),
             syntax: SyntaxLimits::default(),
             large_files: LargeFileStrategy::default(),
         }

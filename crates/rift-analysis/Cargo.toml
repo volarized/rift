@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = ["collector"]
 collector = ["dep:ignore", "dep:rift-provider", "dep:rift-syntax", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
-archive = ["dep:flate2", "dep:tar", "dep:zip"]
+archive = ["dep:flate2", "dep:rawzip", "dep:tar", "dep:zip"]
 parallel = ["dep:rayon"]
 
 [dependencies]
@@ -34,6 +34,7 @@ percent-encoding.workspace = true
 rayon = { workspace = true, optional = true }
 tree-sitter-rst = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
+rawzip = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 

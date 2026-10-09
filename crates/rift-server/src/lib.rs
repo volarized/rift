@@ -1,5 +1,6 @@
 //! Long-lived workspace application service.
 
+mod alternatives;
 mod callee;
 mod change;
 mod configuration;

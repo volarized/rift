@@ -33,7 +33,10 @@ const WARNING_NOUN: &str = "warning";
 /// Fails when the warning holds a shape inline text does not write.
 pub(super) fn line(warning: &ReadWarning) -> Result<String, TextError> {
     let mut text = String::new();
-    let mut detail = String::new();
+    let mut detail = match warning {
+        ReadWarning::SymbolNotFound { .. } => "no symbols available with this name".to_owned(),
+        _ => String::new(),
+    };
     for (index, (key, value)) in fields_of(warning)?.into_iter().enumerate() {
         match (index, key) {
             (0, CODE_FIELD) => text.push_str(&value),

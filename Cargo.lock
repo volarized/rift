@@ -4339,6 +4339,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rapidfuzz"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "270e04e5ea61d40841942bb15e451c29ee1618637bcf97fc7ede5dd4a9b1601b"
+
+[[package]]
 name = "raw-cpuid"
 version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4346,6 +4352,12 @@ checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags 2.13.1",
 ]
+
+[[package]]
+name = "rawzip"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac9999039f74cd73c03158cddfe4362991703c74efe5ce5c8073026f80a5e48c"
 
 [[package]]
 name = "rayon"
@@ -4562,6 +4574,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "percent-encoding",
+ "rawzip",
  "rayon",
  "rift-core",
  "rift-error",
@@ -4868,6 +4881,7 @@ dependencies = [
  "ignore",
  "lsp-types",
  "percent-encoding",
+ "rapidfuzz",
  "rayon",
  "rift-core",
  "rift-dependency",

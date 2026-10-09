@@ -1424,6 +1424,15 @@ pub struct SearchConfiguration {
     /// An answer that reaches this bound warns `results_truncated`.
     #[schemars(range(min = 1, max = 10_000))]
     pub results: u64,
+    /// Work units one complete closest-declaration ranking may reserve, 1 to 1073741824.
+    /// Exhaustion discards all alternatives and reports the configured bound.
+    #[schemars(range(min = 1, max = 1_073_741_824))]
+    pub symbol_alternatives_work: u64,
+    /// Work units reserved per input byte before lowercase allocation, 12 to 1024.
+    /// Twelve covers three lowercase characters of at most four UTF-8 bytes each.
+    /// Larger values reserve more work without changing lowercase mappings.
+    #[schemars(range(min = 12, max = 1024))]
+    pub symbol_alternatives_lowercase_work: u64,
     /// Chunking policy for visible text files in lexical search.
     pub text: TextSearchConfiguration,
     /// How many units the lexical index holds.
@@ -1475,6 +1484,8 @@ impl Default for SearchConfiguration {
     fn default() -> Self {
         Self {
             results: SEARCH_RESULTS_DEFAULT,
+            symbol_alternatives_work: SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT,
+            symbol_alternatives_lowercase_work: SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT,
             text: TextSearchConfiguration::default(),
             lexical: LexicalSearchConfiguration::default(),
             ranking: RankingConfiguration::default(),
@@ -1507,6 +1518,18 @@ impl SearchConfiguration {
                         self.results,
                         SEARCH_RESULTS_MIN,
                         SEARCH_RESULTS_MAX,
+                    ),
+                    (
+                        "search.symbol_alternatives_work",
+                        self.symbol_alternatives_work,
+                        SEARCH_SYMBOL_ALTERNATIVES_WORK_MIN,
+                        SEARCH_SYMBOL_ALTERNATIVES_WORK_MAX,
+                    ),
+                    (
+                        "search.symbol_alternatives_lowercase_work",
+                        self.symbol_alternatives_lowercase_work,
+                        SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN,
+                        SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MAX,
                     ),
                     (
                         "search.pool_slots",
@@ -1702,6 +1725,18 @@ pub const SEARCH_RESULTS_DEFAULT: u64 = 1_000;
 pub const SEARCH_RESULTS_MIN: u64 = 1;
 /// Results one local read collects, at most.
 pub const SEARCH_RESULTS_MAX: u64 = 10_000;
+/// Optional closest-declaration ranking work units, by default.
+pub const SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT: u64 = 16_777_216;
+/// Optional closest-declaration ranking work units, at least.
+pub const SEARCH_SYMBOL_ALTERNATIVES_WORK_MIN: u64 = 1;
+/// Optional closest-declaration ranking work units, at most.
+pub const SEARCH_SYMBOL_ALTERNATIVES_WORK_MAX: u64 = 1 << 30;
+/// Lowercase reservation work units per input byte, by default.
+pub const SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT: u64 = 12;
+/// Three lowercase characters of at most four UTF-8 bytes require this reservation.
+pub const SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN: u64 = 12;
+/// Lowercase reservation work units per input byte, at most.
+pub const SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MAX: u64 = 1024;
 /// Bytes one lexical document content field holds, by default.
 pub const LEXICAL_CONTENT_BYTES_DEFAULT: u64 = 16 << 20;
 /// Bytes one lexical document content field holds, at least.
@@ -5688,6 +5723,47 @@ mod tests {
     }
 
     #[test]
+    fn test_symbol_alternatives_defaults_ranges_and_refusals() {
+        let defaults = SearchConfiguration::default();
+        assert_eq!(defaults.symbol_alternatives_work, 16_777_216);
+        assert_eq!(defaults.symbol_alternatives_lowercase_work, 12);
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["SearchConfiguration"]["properties"];
+        let cases: [(&str, PatternSetter, u64, u64); 2] = [
+            (
+                "symbol_alternatives_work",
+                |search, value| search.symbol_alternatives_work = value,
+                SEARCH_SYMBOL_ALTERNATIVES_WORK_MIN,
+                SEARCH_SYMBOL_ALTERNATIVES_WORK_MAX,
+            ),
+            (
+                "symbol_alternatives_lowercase_work",
+                |search, value| search.symbol_alternatives_lowercase_work = value,
+                SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MIN,
+                SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_MAX,
+            ),
+        ];
+        for (key, set, min, max) in cases {
+            assert_eq!(table[key]["minimum"], json!(min));
+            assert_eq!(table[key]["maximum"], json!(max));
+            for accepted in [min, max] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, accepted);
+                assert_eq!(configuration.validate(), Ok(()));
+            }
+            for refused in [0, min - 1, max + 1, u64::MAX] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, refused);
+                assert!(
+                    matches!(configuration.validate(), Err(ConfigurationViolation::LimitOutOfRange {field, value, min: floor, max: ceiling})
+                    if field == format!("search.{key}") && value == refused && floor == min && ceiling == max)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_search_pattern_bounds_default_and_advertise_their_ranges() {
         let search = SearchConfiguration::default();
         assert_eq!(search.pattern_compiled_size, ByteSize::from_bytes(1 << 20));
@@ -5747,6 +5823,23 @@ mod tests {
             ByteSize::from_bytes(1 << 30)
         );
         assert_eq!(configuration.search.pattern_matches_per_file, 20);
+    }
+
+    #[test]
+    fn test_symbol_alternatives_accepts_configured_work_and_lowercase_weight() {
+        let written = json!({"search": {
+            "symbol_alternatives_work": 140,
+            "symbol_alternatives_lowercase_work": 24,
+        }});
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("symbol alternatives keys deserialize");
+        configuration.validate().expect("configured work accepted");
+        let written = serde_json::to_value(configuration).expect("configuration serializes");
+        assert_eq!(written["search"]["symbol_alternatives_work"], json!(140));
+        assert_eq!(
+            written["search"]["symbol_alternatives_lowercase_work"],
+            json!(24)
+        );
     }
 
     #[test]
