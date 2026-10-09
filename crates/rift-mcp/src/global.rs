@@ -30,7 +30,7 @@ use rift_protocol::read::{
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
-    RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
+    RankingInputKind, RankingWeights, SearchableField, fuse,
 };
 use rift_server::{CalleeDeclaration, CalleePackage, PackageCallee, PositionEncoding, ReadService};
 use tokio::sync::Mutex;
@@ -800,13 +800,16 @@ pub(crate) fn merge_symbols(
             remote: false,
         });
     }
-    entries.extend(remote.into_iter().map(|candidate| SymbolEntry {
-        symbol_id: candidate.symbol_identity.clone(),
-        package: Some(candidate.package.clone()),
-        class: candidate.match_class,
-        hit: candidate.hit,
-        remote: true,
-    }));
+    for candidate in remote {
+        let class = local_match_class(&params.name, &candidate.hit, &candidate.symbol_identity)?;
+        entries.push(SymbolEntry {
+            symbol_id: candidate.symbol_identity,
+            package: Some(candidate.package),
+            class,
+            hit: candidate.hit,
+            remote: true,
+        });
+    }
     entries.sort_by(|left, right| symbol_order(left, right, params.scope));
     entries.dedup_by(|left, right| left.symbol_id == right.symbol_id);
     let hits = entries
@@ -826,7 +829,7 @@ struct SymbolEntry {
     hit: rift_protocol::read::GetSymbolHit,
     symbol_id: rift_protocol::read::SymbolId,
     package: Option<PackageIdentity>,
-    class: rift_ranking::IdentifierMatchClass,
+    class: rift_ranking::IdentifierMatch,
     remote: bool,
 }
 
@@ -836,14 +839,9 @@ fn local_match_class(
     query: &str,
     hit: &rift_protocol::read::GetSymbolHit,
     identity: &SymbolId,
-) -> Result<rift_ranking::IdentifierMatchClass, RiftError> {
+) -> Result<rift_ranking::IdentifierMatch, RiftError> {
     let qualified_name = encoded_qualified_name(identity)?;
-    match_class(
-        &query.to_lowercase(),
-        &hit.symbol.name.to_lowercase(),
-        &qualified_name.to_lowercase(),
-    )
-    .ok_or_else(|| {
+    rift_ranking::identifier_match(query, &hit.symbol.name, &qualified_name).ok_or_else(|| {
         errors::mcp::project_hit_name_unmatched()
             .hit(&identity.0)
             .error()
@@ -904,11 +902,20 @@ pub(crate) fn merge_search(
     mut local: SearchResult,
     remote: GlobalSearchCandidates,
 ) -> Result<SearchResult, RiftError> {
+    let parsed = params
+        .query
+        .as_deref()
+        .and_then(|query| ParsedQuery::parse(query).ok());
     let mut payloads = std::collections::BTreeMap::new();
     let mut local_order = Vec::new();
     for hit in local.results.drain(..) {
         let identity = ranking_identity(&hit)?;
-        local_order.push(identity.clone());
+        local_order.push(ranked_search_hit(
+            identity.clone(),
+            FieldSet::of(SearchableField::Name),
+            parsed.as_ref(),
+            &hit,
+        )?);
         payloads.insert(identity, hit);
     }
     let mut precise = Vec::new();
@@ -916,31 +923,27 @@ pub(crate) fn merge_search(
         payloads
             .entry(candidate.identity.clone())
             .or_insert_with(|| candidate.hit.clone());
-        precise.push(candidate);
+        precise.push(ranked_search_hit(
+            candidate.identity.clone(),
+            candidate_fields(&candidate.hit),
+            parsed.as_ref(),
+            &candidate.hit,
+        )?);
     }
     let mut broad = Vec::new();
     for candidate in remote.broad {
         payloads
             .entry(candidate.identity.clone())
             .or_insert_with(|| candidate.hit.clone());
-        broad.push(candidate);
+        broad.push(ranked_search_hit(
+            candidate.identity.clone(),
+            candidate_fields(&candidate.hit),
+            parsed.as_ref(),
+            &candidate.hit,
+        )?);
     }
-    let local_input = RankingInput::new(
-        RankingInputKind::Identifier,
-        local_order
-            .into_iter()
-            .map(|identity| RankedIdentity::new(identity, FieldSet::of(SearchableField::Name)))
-            .collect(),
-    );
-    let remote_input = RankingInput::new(
-        RankingInputKind::Lexical,
-        precise
-            .iter()
-            .map(|candidate| {
-                RankedIdentity::new(candidate.identity.clone(), candidate_fields(&candidate.hit))
-            })
-            .collect(),
-    );
+    let local_input = RankingInput::new(RankingInputKind::Identifier, local_order);
+    let remote_input = RankingInput::new(RankingInputKind::Lexical, precise);
     let keep_max = payloads.len().max(1);
     let mut ranked = fuse(
         &[local_input, remote_input],
@@ -949,18 +952,7 @@ pub(crate) fn merge_search(
         keep_max,
     );
     if ranked.len() < keep_max {
-        let broad_input = RankingInput::new(
-            RankingInputKind::Lexical,
-            broad
-                .iter()
-                .map(|candidate| {
-                    RankedIdentity::new(
-                        candidate.identity.clone(),
-                        candidate_fields(&candidate.hit),
-                    )
-                })
-                .collect(),
-        );
+        let broad_input = RankingInput::new(RankingInputKind::Lexical, broad);
         let broad_ranked = fuse(&[broad_input], MERGE_WEIGHTS, QueryPhase::Broad, keep_max);
         ranked.append_phase(broad_ranked, keep_max);
     }
@@ -985,6 +977,34 @@ pub(crate) fn merge_search(
         results,
         pagination,
         warnings: local.warnings,
+    })
+}
+
+/// Retains the original identifier comparison beside each project or package search hit.
+fn ranked_search_hit(
+    identity: DocumentIdentity,
+    fields: FieldSet,
+    query: Option<&ParsedQuery>,
+    hit: &SearchHit,
+) -> Result<RankedIdentity, RiftError> {
+    let ranked = RankedIdentity::new(identity, fields);
+    let (Some(query), SearchHitTarget::Symbol { symbol }) = (query, &hit.hit) else {
+        return Ok(ranked);
+    };
+    let Some(symbol_id) = &symbol.id else {
+        return Ok(ranked);
+    };
+    let qualified_name = encoded_qualified_name(symbol_id)?;
+    let matched = query
+        .candidates()
+        .iter()
+        .filter_map(|candidate| {
+            rift_ranking::identifier_match(candidate.text(), &symbol.name, &qualified_name)
+        })
+        .min();
+    Ok(match matched {
+        Some(matched) => ranked.with_identifier_match(matched),
+        None => ranked,
     })
 }
 

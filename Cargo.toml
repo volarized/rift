@@ -7,7 +7,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.65"
+version = "0.0.66"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -118,7 +118,7 @@ rig-core = { version = "=0.42.0", default-features = false }
 # The version toasty-driver-sqlite 0.10.0 already builds, so the history store links no
 # second SQLite.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
-rmcp = { version = "=3.4.1", default-features = false, features = ["macros", "server", "transport-io"] }
+rmcp = { version = "=3.5.1", default-features = false, features = ["macros", "server", "transport-io"] }
 same-file = "1.0.6"
 schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
@@ -144,8 +144,8 @@ syn = { version = "2.0.119", features = ["full"] }
 # open files, and disk bytes. `system` alone; 0.39 builds against the `windows` 0.62 the
 # lock already holds.
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
-thiserror = "2.0.20"
-tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+thiserror = "2.0.21"
+tokio = { version = "=1.53.2", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
@@ -157,7 +157,7 @@ waitpid-any = "=0.3.0"
 which = "=8.0.6"
 windows-spawn = "=0.1.0"
 windows-sys = { version = "0.59.0", features = ["Win32_Foundation"] }
-tree-sitter = "=0.26.13"
+tree-sitter = "=0.27.0"
 tree-sitter-javascript = "=0.25.0"
 tree-sitter-json = "=0.24.8"
 tree-sitter-md = { version = "=0.5.3", default-features = false }
@@ -166,7 +166,7 @@ tree-sitter-rust = "=0.24.2"
 tree-sitter-toml-ng = "=0.7.0"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
-jsonschema = { version = "0.50.0", default-features = false }
+jsonschema = { version = "0.58.5", default-features = false }
 tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
 unicode-width = "0.2.2"

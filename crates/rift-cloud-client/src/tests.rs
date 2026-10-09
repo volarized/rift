@@ -2136,6 +2136,29 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
     }
 }
 
+/// Original name matching chooses the reported class before a qualified case fallback.
+#[test]
+fn test_search_match_class_uses_original_spelling_before_class() {
+    let mut request = search_request();
+    request.query = "module::searchhit SearchHit".to_owned();
+    let mut value = search_hit_json("demo", "first");
+    value["symbol"]["name"] = serde_json::json!("SearchHit");
+    value["match_class"] = serde_json::json!("name_exact");
+    let hit: PackageSearchHit = serde_json::from_value(value).expect("search hit fixture");
+    request.identifiers = vec!["module::searchhit".to_owned(), "SearchHit".to_owned()];
+    assert_eq!(
+        super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
+        Ok(())
+    );
+    request.identifiers.clear();
+    assert_eq!(
+        super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
+        Err(ClientError::InvalidResponseField {
+            field: "match_class"
+        })
+    );
+}
+
 /// A hit found by its text or its vector reports `unknown`, and the page reaches the caller when
 /// the hit matches none of the requested identifiers; `unknown` on a hit spelling a requested
 /// identifier contradicts it (#389).
@@ -2159,6 +2182,33 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
             field: "match_class"
         })
     );
+}
+
+/// A padded name keeps its original spelling when the admitted request validates a page.
+#[test]
+fn test_symbol_lookup_accepts_padded_original_names() {
+    let capabilities: Capabilities =
+        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+    for name in ["SearchHit", "searchHit"] {
+        let mut request = symbol_request();
+        request.name = format!(" \t{name}\n ");
+        assert_eq!(validate_symbol_request(&request), Ok(()));
+        let mut value = symbol_page_json("demo", None, "analyzer-v1", "first");
+        value["items"][0]["symbol"]["name"] = serde_json::json!(name);
+        let qualified_name = format!("Module::{name}");
+        value["items"][0]["symbol"]["id"] = serde_json::json!(rift_core::symbol_identity(
+            "rust",
+            "cargo/demo@1.0.0/src/first.rs",
+            &qualified_name,
+        ));
+        value["items"][0]["match_class"] = serde_json::json!("name_exact");
+        let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol page fixture");
+        assert_eq!(
+            validate_symbol_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX),
+            Ok(())
+        );
+        assert_eq!(page.items[0].symbol.name, name);
+    }
 }
 
 #[test]

@@ -36,6 +36,21 @@ pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/demo@1.0.0/src/lib.
 /// The collected package's `src/lib.rs`.
 const COLLECTED_SOURCE: &str = "pub fn helper_beacon() {}\npub fn beacon() {}\n";
 
+/// The case-distinct declarations served by the identifier regression.
+pub(crate) const CASE_SOURCE: &str = "pub fn SearchHit() {}\npub fn searchHit() {}\npub fn createProgram() {}\npub fn createprogram() {}\npub fn load_config() {}\npub fn Load_config() {}\npub fn Foo() {}\npub fn foo() {}\n";
+
+/// The declarations in [`CASE_SOURCE`], in source order.
+const CASE_DECLARATIONS: [&str; 8] = [
+    "SearchHit",
+    "searchHit",
+    "createProgram",
+    "createprogram",
+    "load_config",
+    "Load_config",
+    "Foo",
+    "foo",
+];
+
 /// The declarations [`COLLECTED_SOURCE`] carries, in source order.
 pub(crate) const DECLARATIONS: [&str; 2] = ["helper_beacon", "beacon"];
 
@@ -56,6 +71,9 @@ pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 /// The query the fixture answers with `beacon` matched inside its body: a word no
 /// declaration name holds, so the hit claims the `unknown` class and `file_content`.
 pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
+
+/// The prose query the fixture answers only in the broad phase, in full-text order.
+pub(crate) const BROAD_BODY_MATCH_QUERY: &str = "network handshake";
 
 /// The Python standard library release a Python collection holds: every `stdlib/python`
 /// entry resolves to it, as the nearest release when it names another.
@@ -115,6 +133,8 @@ pub(crate) struct GlobalFixture {
 pub(crate) enum SymbolFixture {
     /// Hits whose symbol identities name the unit they sit in.
     Valid,
+    /// Declarations differing only in case, with their original source.
+    CasePairs,
     /// Hits whose symbol identities name another file, which the client refuses.
     InvalidIdentity,
 }
@@ -262,6 +282,18 @@ async fn global_handler(
 ) -> Response {
     let uri = request.uri().to_string();
     let path = request.uri().path().to_owned();
+    let limit = request
+        .uri()
+        .query()
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|member| member.strip_prefix("limit="))
+        })
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            usize::try_from(PAGE_LIMIT_ADVERTISED).expect("advertised page bound fits usize")
+        });
     let Ok(bytes) = to_bytes(request.into_body(), REQUEST_BODY_BYTES_MAX).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -295,12 +327,15 @@ async fn global_handler(
     }
     if path.ends_with("/search") {
         state.hold_read().await;
-        let page = search_page(options.symbol, &body, options.stopped_at_body_bound);
+        let mut page = search_page(options.symbol, &body, options.stopped_at_body_bound);
+        bound_case_page(&mut page, options.symbol, limit);
         return json_response(&page);
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        return json_response(&symbols(options.symbol, &body));
+        let mut page = symbols(options.symbol, &body);
+        bound_case_page(&mut page, options.symbol, limit);
+        return json_response(&page);
     }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
@@ -334,6 +369,16 @@ fn problem_response(status: StatusCode) -> Response {
         problem.to_string(),
     )
         .into_response()
+}
+
+/// Applies the requested page bound to the case regression's already ranked declarations.
+fn bound_case_page(page: &mut Value, fixture: SymbolFixture, limit: usize) {
+    if matches!(fixture, SymbolFixture::CasePairs) {
+        page["items"]
+            .as_array_mut()
+            .expect("a page carries items")
+            .truncate(limit);
+    }
 }
 
 /// The capabilities the fixture advertises under `options`, every feature it serves but
@@ -499,9 +544,9 @@ fn page(items: &[Value], warnings: &Value) -> Value {
 /// The symbol page for `request`: each collected declaration its `name` matches, at the
 /// class that match reaches, with a `source_truncated` page warning.
 fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
-    let name = request["name"].as_str().unwrap_or_default().to_lowercase();
+    let name = request["name"].as_str().unwrap_or_default().to_owned();
     let with_source = includes_source(request);
-    let items: Vec<Value> = matched_declarations(&[name])
+    let items: Vec<Value> = matched_declarations(fixture, &[name])
         .map(|(declaration, class)| {
             let mut hit = collected_hit(fixture, declaration, with_source);
             hit["match_class"] = json!(class_wire(class).0);
@@ -519,29 +564,37 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
 /// its identifiers matches, at the best class any of them reaches, with a `query_narrowed`
-/// page warning; the broad phase answers no further declaration. [`BODY_MATCH_QUERY`]
-/// answers `beacon` as a body match. A page stopped at the response body bound adds
-/// `result_truncated` and [`BODY_BOUND_CURSOR`].
+/// page warning; the broad phase answers no further declaration unless the query is
+/// [`BROAD_BODY_MATCH_QUERY`]. That query answers every declaration as a body match in
+/// source order. [`BODY_MATCH_QUERY`] answers `beacon` as a body match. A page stopped
+/// at the response body bound adds `result_truncated` and [`BODY_BOUND_CURSOR`].
 fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: bool) -> Value {
+    if request["query"] == BROAD_BODY_MATCH_QUERY {
+        let items = if request["phase"] == "broad" {
+            DECLARATIONS
+                .into_iter()
+                .map(|declaration| body_match_hit(fixture, declaration, request))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        return page(&items, &json!([]));
+    }
     if request["phase"] != "precise" {
         return page(&[], &json!([]));
     }
     if request["query"] == BODY_MATCH_QUERY {
-        let mut hit = collected_hit(fixture, "beacon", includes_source(request));
-        hit["target"] = json!("symbol");
-        hit["match_class"] = json!("unknown");
-        hit["contributing_fields"] = json!(["file_content"]);
-        return page(&[hit], &json!([]));
+        return page(&[body_match_hit(fixture, "beacon", request)], &json!([]));
     }
     let identifiers: Vec<String> = request["identifiers"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(str::to_lowercase)
+        .map(str::to_owned)
         .collect();
     let with_source = includes_source(request);
-    let items: Vec<Value> = matched_declarations(&identifiers)
+    let items: Vec<Value> = matched_declarations(fixture, &identifiers)
         .map(|(declaration, class)| {
             let (match_class, field) = class_wire(class);
             let mut hit = collected_hit(fixture, declaration, with_source);
@@ -565,6 +618,15 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
     let mut stopped = page(&items, &json!([narrowed, truncated]));
     stopped["next_cursor"] = json!(BODY_BOUND_CURSOR);
     stopped
+}
+
+/// One body match retaining the declaration's original identity and source.
+fn body_match_hit(fixture: SymbolFixture, declaration: &str, request: &Value) -> Value {
+    let mut hit = collected_hit(fixture, declaration, includes_source(request));
+    hit["target"] = json!("symbol");
+    hit["match_class"] = json!("unknown");
+    hit["contributing_fields"] = json!(["file_content"]);
+    hit
 }
 
 /// The pattern page for `request`: each match of its pattern in the collected source, in
@@ -602,7 +664,7 @@ fn pattern_hit(matched: &std::ops::Range<usize>, with_source: bool) -> Value {
         hit["source"] = json!(&COLLECTED_SOURCE[line_start..line_end]);
     }
     let holding = DECLARATIONS.into_iter().find(|declaration| {
-        let range = declaration_range(declaration);
+        let range = declaration_range(COLLECTED_SOURCE, declaration);
         range.start <= matched.start && matched.end <= range.end
     });
     if let Some(declaration) = holding {
@@ -621,25 +683,40 @@ fn pattern_hit(matched: &std::ops::Range<usize>, with_source: bool) -> Value {
 }
 
 /// The bytes of [`COLLECTED_SOURCE`] one collected declaration spans.
-fn declaration_range(declaration: &str) -> std::ops::Range<usize> {
-    let start = COLLECTED_SOURCE
+fn declaration_range(source: &str, declaration: &str) -> std::ops::Range<usize> {
+    let start = source
         .find(&format!("pub fn {declaration}("))
         .expect("every declaration sits in the collected source");
     start..start + format!("pub fn {declaration}() {{}}").len()
 }
 
-/// Each collected declaration one of the lowercase `candidates` matches, at the best
-/// class any of them reaches: the class the client computes again to validate the hit.
+/// Collected declarations ordered by their best original or normalized identifier match.
 fn matched_declarations(
+    fixture: SymbolFixture,
     candidates: &[String],
-) -> impl Iterator<Item = (&'static str, IdentifierMatchClass)> + '_ {
-    DECLARATIONS.into_iter().filter_map(|declaration| {
-        candidates
-            .iter()
-            .filter_map(|candidate| rift_ranking::match_class(candidate, declaration, declaration))
-            .min()
-            .map(|class| (declaration, class))
-    })
+) -> impl Iterator<Item = (&'static str, IdentifierMatchClass)> {
+    let declarations = match fixture {
+        SymbolFixture::CasePairs => CASE_DECLARATIONS.as_slice(),
+        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => DECLARATIONS.as_slice(),
+    };
+    let mut matched: Vec<_> = declarations
+        .iter()
+        .filter_map(|declaration| {
+            candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(position, candidate)| {
+                    rift_ranking::identifier_match(candidate, declaration, declaration)
+                        .map(|rank| (rank, position))
+                })
+                .min()
+                .map(|rank| (*declaration, rank))
+        })
+        .collect();
+    matched.sort_by_key(|(declaration, rank)| (*rank, *declaration));
+    matched
+        .into_iter()
+        .map(|(declaration, (rank, _))| (declaration, rank.class()))
 }
 
 fn includes_source(request: &Value) -> bool {
@@ -663,11 +740,15 @@ const fn class_wire(class: IdentifierMatchClass) -> (&'static str, &'static str)
 /// `rift://symbol/rust/cargo/demo@1.0.0/<path>/<qualified name>`.
 fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -> Value {
     let file = match fixture {
-        SymbolFixture::Valid => "src/lib.rs",
+        SymbolFixture::Valid | SymbolFixture::CasePairs => "src/lib.rs",
         SymbolFixture::InvalidIdentity => "other.rs",
     };
-    let range = declaration_range(declaration);
-    let line = COLLECTED_SOURCE[..range.start].matches('\n').count() + 1;
+    let source = match fixture {
+        SymbolFixture::CasePairs => CASE_SOURCE,
+        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
+    };
+    let range = declaration_range(source, declaration);
+    let line = source[..range.start].matches('\n').count() + 1;
     let (manager, name, version) = COLLECTED;
     let package = json!({"manager": manager, "name": name, "version": version});
     let mut hit = json!({
@@ -688,7 +769,7 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
         "line": line
     });
     if with_source {
-        hit["source"] = json!(&COLLECTED_SOURCE[range]);
+        hit["source"] = json!(&source[range]);
     }
     hit
 }

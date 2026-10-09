@@ -3,6 +3,7 @@
 use rift_error::{RiftError, errors};
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use rift_core::FileDigest;
 use rift_protocol::read::Language;
@@ -92,28 +93,48 @@ impl crate::MarkdownFacts {
 #[derive(Debug)]
 pub struct SyntaxNames {
     shipped: ShippedLanguage,
-    grammar: tree_sitter::Language,
+    grammar: &'static tree_sitter::Language,
+}
+
+/// Retains each shipped grammar once so its names outlive parsed trees.
+fn grammar(shipped: ShippedLanguage) -> &'static tree_sitter::Language {
+    static RUST: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static JAVASCRIPT: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static TYPESCRIPT: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static TSX: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static MARKDOWN: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static JSON: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static YAML: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static TOML: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static PYTHON: OnceLock<tree_sitter::Language> = OnceLock::new();
+
+    match shipped {
+        ShippedLanguage::Rust => RUST.get_or_init(crate::rust::rust_grammar),
+        ShippedLanguage::JavaScript => {
+            JAVASCRIPT.get_or_init(crate::javascript::javascript_grammar)
+        }
+        ShippedLanguage::TypeScript => {
+            TYPESCRIPT.get_or_init(|| crate::TypeScriptDialect::TypeScript.grammar())
+        }
+        ShippedLanguage::TypeScriptTsx => {
+            TSX.get_or_init(|| crate::TypeScriptDialect::Tsx.grammar())
+        }
+        ShippedLanguage::Markdown => MARKDOWN.get_or_init(crate::markdown::markdown_grammar),
+        ShippedLanguage::Json => JSON.get_or_init(crate::json::json_grammar),
+        ShippedLanguage::Yaml => YAML.get_or_init(crate::yaml::yaml_grammar),
+        ShippedLanguage::Toml => TOML.get_or_init(crate::toml::toml_grammar),
+        ShippedLanguage::Python => PYTHON.get_or_init(|| tree_sitter_python::LANGUAGE.into()),
+    }
 }
 
 impl SyntaxNames {
     /// Selects the shipped grammar for an exact language and dialect.
     #[must_use]
     pub fn new(language: &Language) -> Option<Self> {
-        let shipped = crate::definitions()
-            .iter()
-            .map(|definition| definition.shipped())
-            .find(|shipped| shipped.language() == *language)?;
-        let grammar = match shipped {
-            ShippedLanguage::Rust => crate::rust::rust_grammar(),
-            ShippedLanguage::JavaScript => crate::javascript::javascript_grammar(),
-            ShippedLanguage::TypeScript => crate::TypeScriptDialect::TypeScript.grammar(),
-            ShippedLanguage::TypeScriptTsx => crate::TypeScriptDialect::Tsx.grammar(),
-            ShippedLanguage::Markdown => crate::markdown::markdown_grammar(),
-            ShippedLanguage::Json => crate::json::json_grammar(),
-            ShippedLanguage::Yaml => crate::yaml::yaml_grammar(),
-            ShippedLanguage::Toml => crate::toml::toml_grammar(),
-            ShippedLanguage::Python => tree_sitter_python::LANGUAGE.into(),
-        };
+        let shipped = crate::registry::shipped_languages()
+            .find(|(_, provider)| provider.language() == language)
+            .map(|(definition, _)| definition.shipped())?;
+        let grammar = grammar(shipped);
         Some(Self { shipped, grammar })
     }
 
@@ -147,6 +168,10 @@ impl SyntaxNames {
         self.grammar
             .node_kind_for_id(id)
             .filter(|kind| *kind == name)
+    }
+
+    pub(crate) fn grammar(&self) -> &'static tree_sitter::Language {
+        self.grammar
     }
 }
 

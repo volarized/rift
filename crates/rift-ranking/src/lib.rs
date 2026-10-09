@@ -32,8 +32,9 @@ pub use fusion::{
     RankingInput, RankingInputKind, RankingInputSet, RankingWeights, fuse,
 };
 pub use identifier::{
-    IDENTIFIER_CANDIDATES_MAX, IdentifierCandidate, IdentifierMatchClass, IdentifierRanking,
-    identifier_candidates, identifier_terms, match_class, split_identifier_words,
+    IDENTIFIER_CANDIDATES_MAX, IdentifierCandidate, IdentifierMatch, IdentifierMatchClass,
+    IdentifierMatcher, IdentifierRanking, identifier_candidates, identifier_match,
+    identifier_terms, match_class, split_identifier_words,
 };
 pub use pattern::{
     CLASS_EXPANSION_MAX, EXACT_STRINGS_MAX, Pattern, Prefilter, ROW_EXPRESSION_DEPTH_MAX, prefilter,

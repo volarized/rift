@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::document::{DocumentIdentity, FieldSet, SearchableField};
+use crate::identifier::IdentifierMatch;
 use crate::query::QueryPhase;
 use rift_error::{RiftError, errors};
 
@@ -122,6 +123,7 @@ pub struct RankedIdentity {
     identity: DocumentIdentity,
     fields: FieldSet,
     file_range: Option<Range<u64>>,
+    identifier_match: Option<IdentifierMatch>,
 }
 
 impl RankedIdentity {
@@ -132,6 +134,7 @@ impl RankedIdentity {
             identity,
             fields,
             file_range: None,
+            identifier_match: None,
         }
     }
 
@@ -140,6 +143,13 @@ impl RankedIdentity {
     #[must_use]
     pub fn with_file_range(mut self, file_range: Range<u64>) -> Self {
         self.file_range = Some(file_range);
+        self
+    }
+
+    /// Retains the identifier comparison that placed this identity.
+    #[must_use]
+    pub const fn with_identifier_match(mut self, matched: IdentifierMatch) -> Self {
+        self.identifier_match = Some(matched);
         self
     }
 
@@ -339,9 +349,16 @@ pub struct FusedCandidate {
     fields: FieldSet,
     phase: QueryPhase,
     file_range: Option<Range<u64>>,
+    identifier_match: Option<IdentifierMatch>,
 }
 
 impl FusedCandidate {
+    /// Whether an original identifier equality placed this candidate.
+    fn is_original_identifier_match(&self) -> bool {
+        self.identifier_match
+            .is_some_and(IdentifierMatch::is_original_exact)
+    }
+
     /// The identity this result belongs to.
     #[must_use]
     pub const fn identity(&self) -> &DocumentIdentity {
@@ -394,6 +411,7 @@ impl FusedCandidate {
             fields: FieldSet::of(SearchableField::FileContent),
             phase: row.phase,
             file_range: None,
+            identifier_match: None,
         }
     }
 }
@@ -544,8 +562,9 @@ impl RankedCandidates {
 /// share then splits evenly among them, so adding a second index does not
 /// double what full-text matching is worth. Every candidate is
 /// stamped with `phase` and with the fields and inputs that placed it. The
-/// order is descending fused value, ties broken by identity ascending, cut to
-/// `keep_max`.
+/// Exact original identifier spelling precedes normalized fallback. Within each
+/// group, descending fused value orders candidates, with identity ascending breaking
+/// ties. The answer is cut to `keep_max` after this ordering.
 ///
 /// No input at all, and inputs that all returned nothing, fuse to nothing
 /// rather than refusing.
@@ -592,12 +611,14 @@ pub fn fuse(
             fields: held.fields,
             phase,
             file_range: held.file_range,
+            identifier_match: held.identifier_match,
         })
         .collect();
     candidates.sort_by(|left, right| {
         right
-            .fused
-            .total_cmp(&left.fused)
+            .is_original_identifier_match()
+            .cmp(&left.is_original_identifier_match())
+            .then_with(|| right.fused.total_cmp(&left.fused))
             .then_with(|| left.identity.cmp(&right.identity))
     });
     let truncated_at = (candidates.len() > keep_max).then_some(keep_max);
@@ -616,6 +637,7 @@ struct Accumulated {
     inputs: RankingInputSet,
     fields: FieldSet,
     file_range: Option<Range<u64>>,
+    identifier_match: Option<IdentifierMatch>,
 }
 
 /// Adds one input's contribution to every identity it ranked.
@@ -635,6 +657,12 @@ fn accumulate<'a>(
         let held = accumulated.entry(entry.identity()).or_default();
         held.inputs = held.inputs.with(input.kind());
         held.fields = held.fields.union(entry.fields());
+        if let Some(matched) = entry.identifier_match {
+            held.identifier_match = Some(
+                held.identifier_match
+                    .map_or(matched, |held| held.min(matched)),
+            );
+        }
         if held.file_range.is_none() {
             held.file_range = entry.file_range().cloned();
         }
@@ -1114,6 +1142,57 @@ mod tests {
             identities(&fuse(&tied, weights(), QueryPhase::Precise, 10)),
             ["a", "b"]
         );
+    }
+
+    #[test]
+    fn test_original_identifier_spelling_precedes_stronger_lexical_fallback() {
+        // https://github.com/volarized/rift/issues/597
+        let candidates = crate::identifier_candidates("searchHit");
+        let candidate = &candidates[0];
+        let mut identifier = crate::IdentifierRanking::new();
+        for name in ["SearchHit", "searchHit"] {
+            let matched = crate::identifier_match(candidate.text(), name, name)
+                .expect("case-only names match");
+            identifier.observe_match(identity(name), candidate.position(), matched);
+        }
+        let lexical = RankingInput::new(
+            RankingInputKind::Lexical,
+            order(&["SearchHit", "searchHit"], SearchableField::Name),
+        );
+        let weights = RankingWeights::fixed(0.1, 0.9, 0.0, 60);
+        let ranked = fuse(
+            &[identifier.into_input(10), lexical],
+            weights,
+            QueryPhase::Precise,
+            1,
+        );
+        assert_eq!(identities(&ranked), ["searchHit"]);
+    }
+
+    #[test]
+    fn test_zero_identifier_share_keeps_ordinary_lexical_ranking_unchanged() {
+        let matched = crate::identifier_match("searchHit", "searchHit", "searchHit")
+            .expect("original spelling matches");
+        let identifier = RankingInput::new(
+            RankingInputKind::Identifier,
+            vec![
+                RankedIdentity::new(identity("searchHit"), FieldSet::of(SearchableField::Name))
+                    .with_identifier_match(matched),
+            ],
+        );
+        let lexical = RankingInput::new(
+            RankingInputKind::Lexical,
+            order(&["SearchHit", "searchHit"], SearchableField::Name),
+        );
+        let weights = RankingWeights::fixed(0.0, 1.0, 0.0, 60);
+        let expected = fuse(
+            std::slice::from_ref(&lexical),
+            weights,
+            QueryPhase::Precise,
+            10,
+        );
+        let actual = fuse(&[identifier, lexical], weights, QueryPhase::Precise, 10);
+        assert_eq!(actual, expected);
     }
 
     #[test]
