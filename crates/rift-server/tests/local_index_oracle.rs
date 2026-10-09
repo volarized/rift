@@ -16,7 +16,10 @@ use rift_index::{
 use rift_protocol::{
     configuration::HistoryConfiguration,
     map::WorkspaceMap,
-    read::{GetSymbolInclude, GetSymbolParams, SearchScope},
+    read::{
+        GetSymbolInclude, GetSymbolParams, GetSymbolResult, ReadWarning, SYMBOL_ALTERNATIVES_MAX,
+        SearchScope,
+    },
 };
 use rift_server::ReadService;
 use tempfile::TempDir;
@@ -145,7 +148,12 @@ fn relationship_rows(
     Ok(rows)
 }
 
-fn symbol_pages(service: &ReadService, name: &str) -> TestResult<Vec<serde_json::Value>> {
+fn symbol_pages(
+    service: &ReadService,
+    name: &str,
+    current_ids: &BTreeSet<SymbolId>,
+    current_names: &BTreeSet<String>,
+) -> TestResult<Vec<serde_json::Value>> {
     let mut pages = Vec::new();
     let mut page_index = 0;
     loop {
@@ -163,13 +171,7 @@ fn symbol_pages(service: &ReadService, name: &str) -> TestResult<Vec<serde_json:
         if total_pages > SYMBOL_PAGES_MAX {
             return Err(format!("symbol lookup exceeded {SYMBOL_PAGES_MAX} pages: {name}").into());
         }
-        if !result.warnings.is_empty() {
-            return Err(format!(
-                "symbol lookup is incomplete for {name}: {:?}",
-                result.warnings
-            )
-            .into());
-        }
+        validate_symbol_page(&result, name, current_ids, current_names)?;
         pages.push(serde_json::to_value(&result)?);
         page_index += 1;
         if page_index >= total_pages {
@@ -178,13 +180,135 @@ fn symbol_pages(service: &ReadService, name: &str) -> TestResult<Vec<serde_json:
     }
 }
 
-fn symbol_rows(service: &ReadService, names: &BTreeSet<String>) -> TestResult<BTreeSet<String>> {
+/// A complete empty lookup carries only its named miss and current declaration identities.
+/// Oracle requests use extracted short names: a name still declared must match exactly.
+fn validate_symbol_page(
+    result: &GetSymbolResult,
+    name: &str,
+    current_ids: &BTreeSet<SymbolId>,
+    current_names: &BTreeSet<String>,
+) -> TestResult {
+    match result.warnings.as_slice() {
+        [] if !result.hits.is_empty() || result.pagination.total_pages > 0 => Ok(()),
+        [
+            ReadWarning::SymbolNotFound {
+                name: requested,
+                alternatives,
+                detail,
+            },
+        ] if requested == name
+            && !current_names.contains(name)
+            && result.hits.is_empty()
+            && result.pagination.total_pages == 0
+            && result.pagination.page_index == 0
+            && detail.is_none() =>
+        {
+            let distinct = alternatives
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<BTreeSet<_>>();
+            let expected = current_ids.len().min(SYMBOL_ALTERNATIVES_MAX);
+            if alternatives.len() != expected
+                || distinct.len() != alternatives.len()
+                || distinct
+                    .iter()
+                    .any(|id| !current_ids.iter().any(|current| current.as_str() == *id))
+            {
+                return Err(format!(
+                    "symbol alternatives are invalid for {name}: {alternatives:?}"
+                )
+                .into());
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "symbol lookup is incomplete for {name}: {:?}",
+            result.warnings
+        )
+        .into()),
+    }
+}
+
+#[test]
+fn symbol_page_validation_rejects_incomplete_or_invalid_misses() -> TestResult {
+    let directory = TempDir::new()?;
+    write_tree_a(directory.path())?;
+    let service = build(directory.path())?;
+    let (current_ids, current_names) = symbol_facts(directory.path())?;
+    let request = |name: &str| -> TestResult<GetSymbolParams> {
+        Ok(serde_json::from_value(
+            serde_json::json!({"name": name, "include": []}),
+        )?)
+    };
+    let miss = service.get_symbol(&request("Absent")?)?;
+    validate_symbol_page(&miss, "Absent", &current_ids, &current_names)?;
+    let wire = serde_json::to_value(&miss)?;
+    let preparing = serde_json::json!({
+        "code": "local_index_preparing", "prepared": 0, "detail": "selected files are preparing"
+    });
+    let mut wrong_name = wire["warnings"].clone();
+    wrong_name[0]["name"] = serde_json::json!("Other");
+    let mut unavailable = wire["warnings"].clone();
+    unavailable[0]["detail"] =
+        serde_json::json!("closest alternatives unavailable at the work bound");
+    let mut unknown = wire["warnings"].clone();
+    unknown[0]["alternatives"][0] = serde_json::json!("rift://symbol/rust/src/lib.rs/Unknown");
+    let mut repeated = wire["warnings"].clone();
+    repeated[0]["alternatives"][1] = repeated[0]["alternatives"][0].clone();
+    let mut oversized = wire["warnings"].clone();
+    let extra = oversized[0]["alternatives"][0].clone();
+    oversized[0]["alternatives"]
+        .as_array_mut()
+        .ok_or("alternatives absent")?
+        .push(extra);
+    let mut mixed = wire["warnings"].clone();
+    mixed
+        .as_array_mut()
+        .ok_or("warnings absent")?
+        .push(preparing.clone());
+    for warnings in [
+        serde_json::json!([]),
+        wrong_name,
+        unavailable,
+        unknown,
+        repeated,
+        oversized,
+        serde_json::json!([preparing]),
+        mixed,
+    ] {
+        let mut invalid = wire.clone();
+        invalid["warnings"] = warnings;
+        let result: GetSymbolResult = serde_json::from_value(invalid)?;
+        assert!(
+            validate_symbol_page(&result, "Absent", &current_ids, &current_names).is_err(),
+            "{result:?}"
+        );
+    }
+    let mut nonempty = miss.clone();
+    nonempty.hits = service.get_symbol(&request("Beacon")?)?.hits;
+    assert!(validate_symbol_page(&nonempty, "Absent", &current_ids, &current_names).is_err());
+    let mut existing = wire;
+    existing["warnings"][0]["name"] = serde_json::json!("Beacon");
+    let existing: GetSymbolResult = serde_json::from_value(existing)?;
+    assert!(validate_symbol_page(&existing, "Beacon", &current_ids, &current_names).is_err());
+    let mut continuation = miss;
+    continuation.pagination.page_index = 1;
+    assert!(validate_symbol_page(&continuation, "Absent", &current_ids, &current_names).is_err());
+    Ok(())
+}
+
+fn symbol_rows(
+    service: &ReadService,
+    names: &BTreeSet<String>,
+    current_ids: &BTreeSet<SymbolId>,
+    current_names: &BTreeSet<String>,
+) -> TestResult<BTreeSet<String>> {
     names
         .iter()
         .map(|name| {
             Ok(serde_json::to_string(&(
                 name,
-                symbol_pages(service, name)?,
+                symbol_pages(service, name, current_ids, current_names)?,
             ))?)
         })
         .collect()
@@ -197,6 +321,7 @@ fn assert_matches_cold(
     symbol_names: &BTreeSet<String>,
 ) -> TestResult {
     let cold = build(root)?;
+    let (current_ids, current_names) = symbol_facts(root)?;
     assert_eq!(
         incremental.workspace_digests(),
         cold.workspace_digests(),
@@ -214,8 +339,8 @@ fn assert_matches_cold(
         "incremental derived rows must equal a cold build"
     );
     assert_eq!(
-        symbol_rows(incremental, symbol_names)?,
-        symbol_rows(&cold, symbol_names)?,
+        symbol_rows(incremental, symbol_names, &current_ids, &current_names)?,
+        symbol_rows(&cold, symbol_names, &current_ids, &current_names)?,
         "all served symbol pages and source excerpts must equal a cold build"
     );
     let incremental_documentation = incremental.documentation_snapshot();

@@ -3743,7 +3743,14 @@ pub fn compute() -> i32 {
                 total_pages: 0
             }
         );
-        assert!(global.warnings.is_empty(), "{:?}", global.warnings);
+        assert_eq!(
+            global.warnings,
+            vec![ReadWarning::SymbolNotFound {
+                name: "beacon".to_owned(),
+                alternatives: Vec::new(),
+                detail: None,
+            }]
+        );
         assert_eq!(all.hits.len(), 1);
         assert_eq!(all.hits[0].path, Some(ProjectPath("src/lib.rs".to_owned())));
         assert!(all.warnings.is_empty(), "{:?}", all.warnings);
