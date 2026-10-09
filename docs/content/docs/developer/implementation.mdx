@@ -1329,6 +1329,34 @@ The registry itself assembles from one shipped definition list in `rift-syntax`:
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
 
+<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
+
+HTML preserves elements, attributes, and source references as syntax nodes. CSS publishes
+selectors, properties, custom properties, and at-rules as declarations; import and URL syntax
+retain their authored ranges. Vue and Svelte keep component structure and template expressions,
+including Vue directives and Svelte control-flow blocks.
+
+HTML, Vue, Svelte, and Angular providers parse supported script and style blocks through
+Tree-sitter included ranges. A TypeScript script retains its TypeScript signature identity,
+while the containing document keeps its HTML or component identity. Included parses share the
+original source bytes and one aggregate node and depth bound, so a script symbol's range still
+addresses its containing file.
+
+Angular template syntax uses the `html:angular` identity. Component ownership comes from a
+class decorator whose `Component` binding is imported from `@angular/core`, including named
+aliases and namespace imports. Literal `template` properties retain their original TypeScript
+byte ranges; literal `templateUrl` properties retain their authored paths. Dynamic and escaped
+template values remain unresolved expressions. The TypeScript class uses the existing provider.
+
+C and C++ publish functions, types, variables, macros, and include syntax. C++ also publishes
+namespaces. Cython publishes Python and Cython declarations under the `cython` identity for
+`.pyx`, `.pxd`, and `.pxi` files. JSONC has its own `jsonc` identity and accepts comments;
+the existing JSON provider retains its behavior.
+
+Stored facts validate each node kind against the host grammar or its supported included
+grammars. Restoration retains the host identity, original source digest, embedded signature
+identity, and configured parsing bounds.
+
 <VersionBadge version="v0.0.46" languages={["JavaScript", "TypeScript"]} />
 
 The JavaScript and TypeScript providers publish a declaration's attached JSDoc as its

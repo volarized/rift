@@ -584,6 +584,32 @@ matches from the effective list. `enabled` defaults to `true`, `exclude` default
 and `lsp` is absent by default. A bare language and each of its dialect entries are independent.
 `enabled = false` turns off syntax and LSP service for paths the entry matches.
 
+<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
+
+Shipped providers select `.html`, `.htm`, `.css`, `.vue`, `.svelte`, `.c`, C++ source and header
+extensions, `.pyx`, `.pxd`, `.pxi`, and `.jsonc`. Extension selection ignores ASCII case;
+configured path patterns retain their own matching rules. An ambiguous `.h` file requires an
+explicit language entry because its extension cannot distinguish C from C++:
+
+```toml
+[languages.c]
+include = ["**/*.c", "include/c/**/*.h"]
+
+[languages.cpp]
+include = ["**/*.cpp", "**/*.hpp", "include/cpp/**/*.h"]
+```
+
+The `html:angular` provider claims no extension by default. Explicit Angular template selection
+uses an exact dialect entry and removes the same paths from ordinary HTML selection:
+
+```toml
+[languages.html]
+exclude = ["src/components/**/*.html"]
+
+[languages."html:angular"]
+include = ["src/components/**/*.html"]
+```
+
 A language no shipped syntax provider knows must carry a nonempty `include` list. It can still
 select an LSP process. One visible path may match one exact language; a current path two entries
 claim refuses the workspace candidate, naming the path and both identities. The previously
