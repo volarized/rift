@@ -235,7 +235,7 @@ const LANGUAGES: LanguageSummary[] = [
     local: ["Syntax", "LSP"],
     global: ["Syntax", "LSP"],
     description:
-      "Syntax providers preserve templates, styles, and embedded JavaScript or TypeScript ranges. Angular template ownership follows component declarations or explicit configuration; TypeScript classes retain their existing provider.",
+      "Syntax providers preserve templates, styles, and embedded JavaScript or TypeScript ranges. Angular template ownership follows component declarations or explicit configuration. Tailwind context publishes authored utilities and variants; dynamic expressions retain source facts and warnings. Compiler resolution remains separate.",
   },
   {
     name: "C / C++ / Cython",
@@ -243,7 +243,7 @@ const LANGUAGES: LanguageSummary[] = [
     local: ["Syntax", "LSP"],
     global: ["Syntax", "LSP"],
     description:
-      "Syntax providers extract native declarations and include syntax. Ambiguous .h files require explicit language selection. Cython keeps its own source identity for .pyx, .pxd, and .pxi files.",
+      "Syntax providers extract native declarations and include syntax. The .h extension selects C by default; C++ headers require explicit language selection. Cython keeps its own source identity for .pyx, .pxd, and .pxi files.",
   },
   {
     name: "Markdown / JSON / JSONC / YAML / TOML",
