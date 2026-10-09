@@ -9,8 +9,8 @@ use rift_mcp::OutputPolicy;
 /// its long form.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(super) enum OutputMode {
-    #[default]
     All,
+    #[default]
     Text,
 }
 
@@ -31,9 +31,12 @@ mod tests {
     use super::OutputMode;
 
     #[test]
-    fn the_default_mode_is_all() {
-        assert_eq!(OutputMode::default(), OutputMode::All);
-        assert_eq!(OutputPolicy::from(OutputMode::default()), OutputPolicy::All);
+    fn the_default_mode_is_text() {
+        assert_eq!(OutputMode::default(), OutputMode::Text);
+        assert_eq!(
+            OutputPolicy::from(OutputMode::default()),
+            OutputPolicy::Text
+        );
     }
 
     #[test]

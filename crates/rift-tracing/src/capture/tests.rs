@@ -216,7 +216,7 @@ fn a_closing_span_records_how_long_it_ran() {
 }
 
 /// A span records what it opened with and what it recorded later, so a reader of
-/// `rift://logs` sees the fields standard error shows. A field declared through the
+/// `rift server logs` sees the fields standard error shows. A field declared through the
 /// facade's [`empty!`](crate::empty) placeholder records nothing until it is given a
 /// value.
 #[test]
@@ -865,7 +865,7 @@ fn an_event_past_the_record_field_bound_records_the_members_that_fit() {
 }
 
 /// A record with nested spans and escaped members reads back from the store with the bytes
-/// the capture wrote, parses and writes again to those bytes as `rift://logs` carries them,
+/// the capture wrote, parses and writes again to those bytes as `rift server logs` carries them,
 /// and prints the same line read back as queued.
 #[tokio::test]
 async fn a_record_reads_back_with_the_bytes_the_capture_wrote()

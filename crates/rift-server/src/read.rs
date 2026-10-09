@@ -1542,7 +1542,7 @@ pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning
 /// The warnings one answer carries for the files the index left out, whole or in part:
 /// the `source_unavailable` warnings for the files left out whole, the first
 /// [`SOURCE_WARNINGS_MAX`] in project-path order, the order the index keeps them in, then -
-/// when more were left out - one more counting the rest, which `rift://logs` names one by
+/// when more were left out - one more counting the rest, which `rift server logs` names one by
 /// one; and one `large_file_unparsed` naming the files held as text alone.
 pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
     let (unparsed, left_out): (Vec<&WorkspaceIndexWarning>, Vec<&WorkspaceIndexWarning>) =
@@ -1556,7 +1556,9 @@ pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWar
     if rest > 0 {
         warnings.push(ReadWarning::SourceUnavailable {
             unit: None,
-            detail: format!("{rest} more files are absent from the index; rift://logs names each"),
+            detail: format!(
+                "{rest} more files are absent from the index; rift server logs names each"
+            ),
         });
     }
     warnings.extend(unparsed_warning(&unparsed));
@@ -3558,7 +3560,8 @@ pub fn compute() -> i32 {
             result.warnings.last(),
             Some(&ReadWarning::SourceUnavailable {
                 unit: None,
-                detail: "1 more files are absent from the index; rift://logs names each".to_owned(),
+                detail: "1 more files are absent from the index; rift server logs names each"
+                    .to_owned(),
             })
         );
 

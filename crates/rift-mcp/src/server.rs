@@ -40,7 +40,6 @@ use rift_server::{
     CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadService,
     StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
-use rift_tracing::LogStore;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::model::{
@@ -1509,7 +1508,7 @@ fn ranking_of(
                 &format!(
                     "the lexical index holds no indexed tree and no commit is under way for \
                      tree revision {tree_revision}, so the answer was ranked by identifier \
-                     matching alone; rift://logs names what the lexical lane did, and a \
+                     matching alone; rift server logs names what the lexical lane did, and a \
                      restart retries it"
                 ),
                 weights,
@@ -1775,11 +1774,6 @@ pub struct RiftMcp {
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
-    /// The workspace's recorded diagnostics, absent when the store could not be
-    /// opened at startup; `rift://logs` then answers with that reason rather
-    /// than refusing. The handle is the read side alone: the drain task that
-    /// writes records holds its own.
-    logs: Option<Arc<LogStore>>,
     engines: Arc<EngineHold>,
     /// The last request-time capture's stats and digests: the next capture reads only the
     /// paths whose stat moved since.
@@ -2059,10 +2053,6 @@ impl RiftMcp {
                 spawn_lexical(index, blocking.clone(), cancellation, analyzer_revision)
             },
         );
-        // The log store is a database of its own and waits on no index readiness. Each read
-        // opens a connection of its own on the last committed WAL snapshot, so `rift://logs`
-        // answers while a rebuild holds the index database.
-        let logs = storage.logs();
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
             failure: None,
@@ -2100,7 +2090,6 @@ impl RiftMcp {
             pattern_bounds,
             global: Arc::new(GlobalState::default()),
             lexical,
-            logs,
             engines,
             last_capture: Arc::default(),
             activity,
@@ -3441,7 +3430,7 @@ impl RiftMcp {
     ///
     /// "readiness deadline elapsed" alone sends a reader to the timeout, which
     /// is almost never the fault: the epochs say whether the index is behind
-    /// the filesystem and by how far, and `rift://logs` holds the rebuild
+    /// the filesystem and by how far, and `rift server logs` holds the rebuild
     /// records that go with them.
     async fn readiness_stall(&self, timeout: Duration) -> String {
         let observed = self.validation.observed_epoch();
@@ -3454,12 +3443,12 @@ impl RiftMcp {
         if published == observed {
             return format!(
                 "the index settled at epoch {published}, but workspace validation did not finish \
-                 within {waited_ms}ms; read rift://logs for capture and rebuild records"
+                 within {waited_ms}ms; read rift server logs for capture and rebuild records"
             );
         }
         format!(
             "the index is {behind} filesystem events behind the tree after {waited_ms}ms \
-             (published epoch {published}, observed epoch {observed}); read rift://logs for \
+             (published epoch {published}, observed epoch {observed}); read rift server logs for \
              what the index lane did",
             behind = observed.saturating_sub(published)
         )
@@ -3949,7 +3938,7 @@ impl RiftMcp {
                         "the index supervisor stopped, so the index stays {behind} filesystem \
                          events behind the tree (published epoch {published}, observed epoch \
                          {observed_epoch}); restart the workspace server, and read \
-                         rift://logs for what it did before it stopped",
+                         rift server logs for what it did before it stopped",
                         behind = observed_epoch.saturating_sub(current.epoch),
                         published = current.epoch,
                     ))
@@ -3998,46 +3987,6 @@ impl RiftMcp {
 }
 
 impl RiftMcp {
-    /// Answers one `rift://logs` read.
-    ///
-    /// The read takes no part in workspace readiness. A request that waits for
-    /// the index to settle is exactly the request whose refusal these records
-    /// explain, so making the explanation wait on the same gate would leave the
-    /// failure unreadable. The page comes from the last accepted `[logs]`
-    /// table, or the default table while `rift.toml` is invalid.
-    async fn read_logs(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
-        let page_records = {
-            let state = read_published(&self.published).await;
-            let (current, _failure) = state.snapshot();
-            current.configuration.logs_configuration().page_records
-        };
-        let query = resource::log_query(uri, page_records)?;
-        // The drain writes on a timer, so a read taken right after the request that produced a
-        // record would answer without it. This waits for the lane, and for this workspace's
-        // consumer when one process serves several, to reach what they have taken.
-        rift_tracing::settle_for_read(&self.root.display().to_string()).await;
-        let Some(store) = self.logs.as_ref() else {
-            return resource::logs_unavailable(
-                uri,
-                "the workspace log store could not be opened, so this run recorded nothing",
-            );
-        };
-        let reader = store.reader();
-        let read = tokio::task::spawn_blocking(move || reader.connect()?.recent(&query)).await;
-        match read {
-            Ok(Ok(records)) => resource::rendered_logs(uri, &records),
-            Ok(Err(error)) => {
-                ErrorData::internal_error(format!("the log store refused the read: {error}"), None)
-                    .fail()
-            }
-            Err(error) => ErrorData::internal_error(
-                format!("the log read stopped before it answered: {error}"),
-                None,
-            )
-            .fail(),
-        }
-    }
-
     /// Answers one `rift://workspace` read from the current publication.
     async fn read_workspace(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         let page_index = resource::workspace_page_index(uri)?;
@@ -4107,7 +4056,7 @@ impl RiftMcp {
     async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         self.ensure_workspace_root().await?;
         let current = Arc::clone(&read_published(&self.published).await.current);
-        resource::rendered_map(uri, &current.map)
+        Ok(resource::map_answer(uri, &current.map))
     }
 
     /// Refuses cached workspace resources after their root disappears.
@@ -4282,7 +4231,10 @@ impl ServerHandler for RiftMcp {
             } else if request.uri == resource::MAP_URI {
                 self.read_map(&request.uri).await.map(Into::into)
             } else {
-                self.read_logs(&request.uri).await.map(Into::into)
+                Err(ErrorData::resource_not_found(
+                    format!("no resource is published at {:?}", request.uri),
+                    None,
+                ))
             };
         })
         .ok()
@@ -4347,7 +4299,7 @@ impl ServerHandler for RiftMcp {
             "Read the current workspace: get_symbol and search find \
              declarations, nodes lists syntax nodes at a byte position. \
              The rift://workspace resource reads effective configuration \
-             and source files. The rift://logs resource reads the server's own diagnostics, \
+             and source files. `rift server logs` reads the server's recorded diagnostics, \
              including while a tool refuses.",
         );
         info.meta = Some(crate::identity::identity_meta(&self.identity));
@@ -7182,21 +7134,13 @@ done
             .map_err(|error| format!("corrupt database must not fail startup: {error:?}"))?;
 
         assert!(server.search_index.is_none());
-        assert!(
-            server.logs.is_some(),
-            "the metrics database opens on its own"
-        );
-        let answer = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
-        assert!(!answer.contains("could not be opened"), "{answer}");
         assert_eq!(fs::read(database_path)?, corrupt);
         Ok(())
     }
 
-    /// A corrupt metrics database leaves the run unrecorded: `rift://logs` answers an empty
-    /// set with the reason, search keeps its database, and the bytes stay for recovery.
+    /// A corrupt metrics database preserves its bytes while search keeps its database.
     #[tokio::test]
-    async fn build_preserves_a_corrupt_metrics_database_and_answers_why_logs_are_empty()
-    -> TestResult {
+    async fn build_preserves_a_corrupt_metrics_database_and_serves_search() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let state_directory = directory.path().join(".rift");
@@ -7211,47 +7155,12 @@ done
             .map_err(|error| format!("corrupt metrics must not fail startup: {error:?}"))?;
 
         assert!(server.search_index.is_some());
-        assert!(server.logs.is_none());
-        let unavailable = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
-        assert!(
-            unavailable.contains("the workspace log store could not be opened"),
-            "{unavailable}"
-        );
+
         assert_eq!(fs::read(metrics_path)?, corrupt);
         Ok(())
     }
 
-    /// A metrics file of a schema version the reader does not read answers a `rift://logs`
-    /// read with an internal error that names the refusal.
-    #[tokio::test]
-    async fn a_log_read_the_store_refuses_answers_an_internal_error() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "")?;
-        let server =
-            RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
-        assert!(
-            server.logs.is_some(),
-            "the metrics database opens on its own"
-        );
-        let metrics = directory.path().join(".rift").join("metrics");
-        rusqlite::Connection::open(metrics)?.pragma_update(None, "user_version", 7)?;
-
-        let refusal = server
-            .read_logs("rift://logs")
-            .await
-            .expect_err("a reader refuses a schema it does not read");
-
-        assert_eq!(refusal.code, ErrorCode::INTERNAL_ERROR);
-        assert!(
-            refusal.message.contains("the log store refused the read"),
-            "{}",
-            refusal.message
-        );
-        Ok(())
-    }
-
-    /// Logs record and answer while the index database is refused: `rift://logs`
+    /// Logs record and answer while the index database is refused: `rift server logs`
     /// returns the `database.open` warning the refusal produced.
     #[tokio::test]
     async fn a_refused_index_database_is_recorded_in_the_logs() -> TestResult {
@@ -7269,7 +7178,7 @@ done
             .logs()
             .ok_or("the metrics database opens on its own")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let drain_task = tokio::spawn(drain.run(Arc::clone(&store), 10_000, cancellation.clone()));
         let server = RiftMcp::build_settled_with_storage(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -7279,14 +7188,17 @@ done
         .await?;
         assert!(server.search_index.is_none());
 
-        let logs = server.read_logs("rift://logs/component/storage").await?;
-        let text = resource_json_text(&logs, "rift://logs/component/storage")?;
+        cancellation.cancel();
+        drain_task.await?;
+        let records = store
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(500).for_component("storage"))?;
+        let text = format!("{records:?}");
         assert!(
             text.contains("database.open") && text.contains("the index database failed to open"),
             "the refusal is recorded: {text}"
         );
-        cancellation.cancel();
-        drain_task.await?;
         Ok(())
     }
 
@@ -10005,31 +9917,6 @@ done
         Ok(())
     }
 
-    #[tokio::test]
-    async fn the_log_resource_answers_while_workspace_reads_refuse() -> TestResult {
-        let (_directory, server) = fixture().await?;
-        server
-            .validation
-            .observed_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        server
-            .validation
-            .supervisor_running
-            .store(false, std::sync::atomic::Ordering::Release);
-        get_symbol(&server, "beacon")
-            .await
-            .expect_err("the stalled workspace must refuse a read");
-
-        let answer = server.read_logs("rift://logs").await?;
-
-        // The read is the whole point of the resource: the request that just refused is
-        // the one whose reason lives in these records.
-        let text = resource_json_text(&answer, "rift://logs")?;
-        let body: serde_json::Value = serde_json::from_str(&text)?;
-        assert!(body["records"].is_array(), "{text}");
-        Ok(())
-    }
-
     /// Parenthesis nesting past the shipped syntax depth bound of 512.
     const DEEP_NESTING: usize = 600;
 
@@ -10075,7 +9962,7 @@ done
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let drain_task = tokio::spawn(drain.run(Arc::clone(&store), 10_000, cancellation.clone()));
         let server = RiftMcp::build_settled_with_storage(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -10094,8 +9981,11 @@ done
 
         cancellation.cancel();
         drain_task.await?;
-        let logs = server.read_logs("rift://logs").await?;
-        let text = resource_json_text(&logs, "rift://logs")?;
+        let records = store
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(500))?;
+        let text = format!("{records:?}");
         assert!(
             text.contains("file left out of the index")
                 && text.contains("src/deep.rs")
@@ -10149,7 +10039,7 @@ done
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let drain_task = tokio::spawn(drain.run(Arc::clone(&store), 10_000, cancellation.clone()));
         let server = RiftMcp::build_settled_with_storage(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -10167,15 +10057,17 @@ done
         stop_index_work(&server).await?;
         cancellation.cancel();
         drain_task.await?;
-        let logs = server.read_logs("rift://logs/component/index").await?;
-        let text = resource_json_text(&logs, "rift://logs/component/index")?;
-        let page: serde_json::Value = serde_json::from_str(&text)?;
-        let records = page["records"]
-            .as_array()
-            .ok_or("a log page carries records")?;
-        let named: Vec<&serde_json::Value> = records
+        let records = store
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(500).for_component("index"))?;
+        let text = format!("{records:?}");
+        let named: Vec<&rift_tracing::StoredLogRecord> = records
             .iter()
-            .filter(|record| record["fields"]["path"] == "src/wide.rs")
+            .filter(|stored| {
+                serde_json::from_str::<serde_json::Value>(stored.record().fields())
+                    .is_ok_and(|fields| fields["path"] == "src/wide.rs")
+            })
             .collect();
         assert_eq!(
             named.len(),
@@ -10184,17 +10076,19 @@ done
         );
         for record in named {
             assert_eq!(
-                record["message"], "file held unparsed in the index",
-                "{record:#}"
+                record.record().message(),
+                "file held unparsed in the index",
+                "{record:#?}"
             );
-            assert_eq!(record["level"], "warn", "{record:#}");
-            assert_eq!(record["operation"], "index.build", "{record:#}");
-            let reason = record["fields"]["reason"].as_str().unwrap_or_default();
+            assert_eq!(record.record().level(), "warn", "{record:#?}");
+            assert_eq!(record.record().operation(), "index.build", "{record:#?}");
+            let fields: serde_json::Value = serde_json::from_str(record.record().fields())?;
+            let reason = fields["reason"].as_str().unwrap_or_default();
             assert!(
                 reason.contains(&format!(
                     "source bytes {wide_bytes} exceed accepted limit 128"
                 )),
-                "the record names the bound the file crossed: {record:#}"
+                "the record names the bound the file crossed: {record:#?}"
             );
         }
         assert!(
@@ -10204,58 +10098,8 @@ done
         Ok(())
     }
 
-    /// A record emitted immediately before a `rift://logs` read appears in that read, with the
-    /// drain still running. The drain writes on its own timer and nothing made the read wait
-    /// for it, so a caller reading back the diagnostic behind its own refusal was answered
-    /// without it: cold first use met exactly this on `rift://logs/component/engine`.
-    ///
-    /// The sink captures under the workspace's own `[logs] capture` default, the filter a
-    /// served workspace records under. Without it the lane also takes the storage driver's own
-    /// trace records, and the read then waits out its bound behind thousands of them.
-    ///
-    /// A second lane exists in the process before the read, as it does under `cargo test`,
-    /// where every test is a thread of one process and builds its own. The read waits for the
-    /// lane its own thread records into, never the one built last.
-    #[tokio::test]
-    async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir_all(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "")?;
-
-        let capture = crate::logs::logs_configuration(directory.path()).capture;
-        let (_recorder, drain) = rift_tracing::ScopedRecorder::builder()
-            .capture(&capture)
-            .install()?;
-        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
-        let store = storage.logs().ok_or("the log store must open")?;
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server = RiftMcp::build_settled_with_storage(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            storage,
-            crate::identity::BuildCheckout::Unversioned,
-        )
-        .await?;
-        let (_other_sink, _other_drain) = rift_tracing::log_capture();
-
-        rift_tracing::warn!(component = "engine", "the beacon engine did not start");
-        let logs = server.read_logs("rift://logs/component/engine").await?;
-        let text = resource_json_text(&logs, "rift://logs/component/engine")?;
-        let answered = text.clone();
-
-        cancellation.cancel();
-        drain_task.await?;
-        assert!(
-            answered.contains("the beacon engine did not start"),
-            "the read answers with the record the same task emitted: {answered}"
-        );
-        Ok(())
-    }
-
     /// The record one ranked phase raises says what the query was shaped like and
-    /// never what it said. An operator reading `rift://logs` learns the phase, the
+    /// never what it said. An operator reading `rift server logs` learns the phase, the
     /// byte length, the member count, and whether the parser narrowed; the caller's
     /// own words stay out of the store.
     #[tokio::test]
@@ -10275,7 +10119,7 @@ done
         let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let drain_task = tokio::spawn(drain.run(Arc::clone(&store), 10_000, cancellation.clone()));
         let server = RiftMcp::build_settled_with_storage(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -10285,12 +10129,13 @@ done
         .await?;
 
         let _answered = run_search(&server, SECRET_TERM).await?;
-        let logs = server.read_logs("rift://logs/component/search").await?;
-        let text = resource_json_text(&logs, "rift://logs/component/search")?;
-        let answered = text.clone();
-
         cancellation.cancel();
         drain_task.await?;
+        let records = store
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(500).for_component("search"))?;
+        let answered = format!("{records:?}");
         assert!(
             answered.contains("ranking the full-text store for one query phase"),
             "the ranked phase raises its own record: {answered}"

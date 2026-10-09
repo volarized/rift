@@ -27,7 +27,7 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 
 ## When a call refuses
 
-Read `rift://logs` when a refusal alone does not say why; it carries the workspace's own recorded diagnostics.
+Read `rift server logs` when a refusal alone does not say why; it carries the workspace's own recorded diagnostics.
 
 See [references/tools.md](references/tools.md) for every served tool's parameters.
 

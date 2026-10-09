@@ -13,10 +13,10 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 pub enum OutputPolicy {
     /// Forwards `content` and `structuredContent`, lists `outputSchema`, and forwards every
     /// content of a resource read.
-    #[default]
     All,
     /// Forwards `content` alone, lists no `outputSchema`, and forwards the contents of a
-    /// resource read that are not JSON.
+    /// resource read that are not JSON when another representation is present.
+    #[default]
     Text,
 }
 
@@ -130,8 +130,8 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_is_all() {
-        assert_eq!(OutputPolicy::default(), OutputPolicy::All);
+    fn default_policy_is_text() {
+        assert_eq!(OutputPolicy::default(), OutputPolicy::Text);
     }
 
     #[test]

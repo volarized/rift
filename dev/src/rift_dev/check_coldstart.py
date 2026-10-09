@@ -9,6 +9,7 @@ host endpoint is reachable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -21,9 +22,11 @@ from mcp.client.stdio import stdio_client
 
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.commands import DockerCommand, owned_environment
+from rift_dev.log_records import parse_line
 from rift_dev.rift_test_client import (
     LOG_BYTES_MAX,
     LOG_FILTER,
+    POLL_SECONDS,
     RECORD_TAIL,
     Client,
     ToolFailure,
@@ -87,6 +90,24 @@ def container_command(name: str, arguments: list[str], timeout: float = 30.0) ->
     )
 
 
+async def container_logs(name: str, arguments: list[str]) -> str:
+    """Observe persisted records within the existing evidence deadline."""
+    try:
+        async with gate_deadline("cold persisted diagnostics", EVIDENCE_SECONDS):
+            while True:
+                text = await asyncio.to_thread(
+                    container_command, name, arguments, EVIDENCE_SECONDS
+                )
+                if any(parse_line(line) is not None for line in text.splitlines()):
+                    return text
+                await asyncio.sleep(POLL_SECONDS)
+    except TimeoutError as error:
+        raise TimeoutError(
+            f"cold persisted diagnostics exceeded its {EVIDENCE_SECONDS}s deadline: "
+            f"{arguments}"
+        ) from error
+
+
 def await_publication(name: str) -> int:
     """Read the server document under a startup deadline, failing on process exit."""
     timeout_seconds = remaining_seconds(START_SECONDS)
@@ -129,9 +150,11 @@ async def check_first_use(client: Client, name: str) -> None:
     require(
         hit.get("source") == SOURCE.rstrip("\n"), f"late file was not indexed: {hit}"
     )
-    logs = await client.resource("rift://logs")
+    logs = await container_logs(
+        name, ["/rift", "server", "logs", "--tail", str(RECORD_TAIL)]
+    )
     require(
-        bool(array_value(logs.get("records"), "logs.records")),
+        any(parse_line(line) is not None for line in logs.splitlines()),
         "cold startup recorded no logs",
     )
 
@@ -167,9 +190,20 @@ async def check_missing_executable(client: Client, name: str) -> None:
         (await symbol_hit(client, "beacon_cold")).get("source") == SOURCE.rstrip("\n"),
         "engine failure removed syntax reads",
     )
-    logs = await client.resource("rift://logs/component/engine")
+    logs = await container_logs(
+        name,
+        [
+            "/rift",
+            "server",
+            "logs",
+            "--tail",
+            str(RECORD_TAIL),
+            "--component",
+            "engine",
+        ],
+    )
     require(
-        bool(array_value(logs.get("records"), "engine logs")),
+        any(parse_line(line) is not None for line in logs.splitlines()),
         "engine launch failure was not recorded",
     )
 
@@ -316,6 +350,8 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                         name,
                         "/rift",
                         "mcp",
+                        "--output",
+                        "all",
                     ],
                 )
                 async with (
@@ -338,4 +374,5 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             except (RuntimeError, OSError) as cleanup_error:
                 if failure is None:
                     raise
+                failure.add_note(f"container cleanup failed: {cleanup_error}")
                 failure.add_note(f"container cleanup failed: {cleanup_error}")

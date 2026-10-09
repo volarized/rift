@@ -1,4 +1,4 @@
-//! One record as the line stderr, `rift server logs`, the text of `rift://logs`, and a
+//! One record as the line stderr, `rift server logs`, the text of `rift server logs`, and a
 //! failure window print.
 //!
 //! A line holds, in order: the time in UTC, the level, the function, the context, the
@@ -76,7 +76,7 @@ const LIVE_NESTED_NAME_WIDTH: usize = 24;
 /// The width a live stream pads the nearest span's fields to.
 const LIVE_NESTED_FIELDS_WIDTH: usize = 40;
 /// The separators the compact text of a resource splits a line on, ` · ` and `: `. A
-/// message or a field value holding one prints quoted, so a `rift://logs` reader keeps it
+/// message or a field value holding one prints quoted, so a `rift server logs` reader keeps it
 /// whole.
 const LINE_DELIMITERS: [&str; 2] = [" · ", ": "];
 
@@ -105,7 +105,7 @@ impl LogRecord {
 
 /// Prints records as lines: one record per line, a blank line between two groups.
 ///
-/// A stored page, `rift server logs`, `rift://logs`, and a failure window, holds every record of a call
+/// A stored page, `rift server logs`, `rift server logs`, and a failure window, holds every record of a call
 /// and pads each column to the widest value of its group; a live stream, stderr and
 /// `rift server logs --follow`, pads to fixed widths. Both remember the group of the last
 /// line they printed, so the records of one run printed over several calls break where

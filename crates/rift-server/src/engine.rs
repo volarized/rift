@@ -740,7 +740,7 @@ enum Answer<T> {
 /// An engine failure renders its registry text, which names the error and the
 /// caller's next step. The operating error behind it - the missing program, the
 /// refused permission - lives in the source chain alone, and that is what an
-/// operator reading `rift://logs` needs.
+/// operator reading `rift server logs` needs.
 fn start_cause(failure: &RiftError) -> String {
     rift_error::causes(failure).join(": ")
 }
@@ -1335,7 +1335,7 @@ impl EngineSlot {
     /// request already spent.
     ///
     /// Every start that fails is recorded before this returns, cause included.
-    /// The refusal reaches the caller, and `rift://logs` is where the agent
+    /// The refusal reaches the caller, and `rift server logs` is where the agent
     /// holding that refusal looks for the program that could not run.
     async fn start_within_budget(
         &self,
@@ -1737,7 +1737,7 @@ mod tests {
 
     /// A configured program that does not exist reaches the caller as `launch_failed`, and
     /// the workspace log names the program and the operating error behind it. Cold first use
-    /// read `rift://logs/component/engine` after exactly this refusal and found it empty.
+    /// read `rift server logs --component engine` after exactly this refusal and found it empty.
     #[tokio::test]
     async fn a_missing_program_is_recorded_with_its_cause() {
         let (failure, recorded) = start_refusal(MISSING_PROGRAM, 1).await;

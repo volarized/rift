@@ -1370,7 +1370,6 @@ pub fn declare_logs_ranges(schema: &mut Schema) {
     for property in [
         property!(LogsConfiguration, flush_interval),
         property!(LogsConfiguration, retry_interval),
-        property!(LogsConfiguration, settle_timeout),
     ] {
         annotate_property(
             schema,
@@ -2507,7 +2506,7 @@ mod tests {
             assert_eq!(property["maximum"], json!(maximum), "{field}");
             assert_eq!(property[keyword::DEFAULT], defaults[field], "{field}");
         }
-        for field in ["flush_interval", "retry_interval", "settle_timeout"] {
+        for field in ["flush_interval", "retry_interval"] {
             let property = &schema["properties"][field];
             assert_eq!(
                 property[RIFT_RANGE],

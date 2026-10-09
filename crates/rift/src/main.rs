@@ -43,7 +43,7 @@ enum CliCommand {
     /// Serve agents over stdio MCP by proxying this workspace's rift server.
     Mcp {
         /// Forwards text and structured tool answers with `all`, and text alone with `text`.
-        #[arg(long, value_enum, default_value_t = mcp::OutputMode::All, value_name = "MODE")]
+        #[arg(long, value_enum, default_value_t = mcp::OutputMode::Text, value_name = "MODE")]
         output: mcp::OutputMode,
     },
     /// Manage this workspace's HTTP MCP server.
@@ -346,7 +346,6 @@ fn tracing_builder(
         )
         .flush_interval(Duration::from_millis(logs.flush_interval.milliseconds()))
         .retry_interval(Duration::from_millis(logs.retry_interval.milliseconds()))
-        .settle_timeout(Duration::from_millis(logs.settle_timeout.milliseconds()))
         .cardinality_limit(
             u32::try_from(logs.cardinality_limit)
                 .expect("accepted logs.cardinality_limit fits u32"),
@@ -421,7 +420,7 @@ mod tests {
             concat!(
                 "[logs]\nqueue_records = 1\ncapture = \"rift=info\"\n",
                 "flush_interval = \"17ms\"\nretry_interval = \"19ms\"\n",
-                "settle_timeout = \"23ms\"\ncardinality_limit = 2\n",
+                "cardinality_limit = 2\n",
             ),
         )
         .expect("log configuration");
@@ -429,7 +428,6 @@ mod tests {
         assert_eq!(logs.queue_records, 1);
         assert_eq!(logs.flush_interval.milliseconds(), 17);
         assert_eq!(logs.retry_interval.milliseconds(), 19);
-        assert_eq!(logs.settle_timeout.milliseconds(), 23);
         assert_eq!(logs.cardinality_limit, 2);
         let (runtime, drain) = super::tracing_builder(true, Some(&logs))
             .install()
@@ -631,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_command_defaults_to_all_output() {
-        assert_eq!(parsed_output(&["rift", "mcp"]), mcp::OutputMode::All);
+    fn mcp_command_defaults_to_text_output() {
+        assert_eq!(parsed_output(&["rift", "mcp"]), mcp::OutputMode::Text);
     }
 
     #[test]

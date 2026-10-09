@@ -1185,7 +1185,7 @@ pub enum ReadWarning {
     /// answers changed with no declarations. Every other file in the workspace stays
     /// available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
     /// project-path order; when more files are named, one more carries no `unit` and
-    /// counts the rest. `rift://logs` names each file the index left out, and `paths`
+    /// counts the rest. `rift server logs` names each file the index left out, and `paths`
     /// narrows a comparison onto the others.
     SourceUnavailable {
         /// The file the warning names. Absent on the one warning that counts the files

@@ -3,7 +3,7 @@
 //! Stderr is where a `tracing` event goes by default, and the agent holding the MCP
 //! connection cannot read it: the server's terminal belongs to whoever started it. The
 //! layer here copies every event the process filter admits into a bounded queue, and the
-//! log drain writes that queue into the metrics database, where `rift://logs` reads it
+//! log drain writes that queue into the metrics database, where `rift server logs` reads it
 //! back.
 //!
 //! The queue is bounded and the send never blocks: a traced call site pays a `try_send`,
@@ -173,8 +173,7 @@ impl LogSink {
 
 /// Builds the layer and its first subscription, the persistence drain.
 ///
-/// A `rift://logs` read finds the settlement through the dispatcher the layer is
-/// installed in.
+/// Shutdown finds the settlement through the dispatcher the layer is installed in.
 #[must_use]
 pub fn log_capture() -> (LogSink, LogDrain) {
     log_capture_with(LogDeliveryOptions::default())

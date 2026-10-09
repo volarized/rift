@@ -18,7 +18,6 @@ use text::TextError;
 
 pub(crate) use failure::ToolFailure;
 pub use policy::OutputPolicy;
-pub(crate) use render::{LogFields, LogLine, LogsPage};
 
 /// A typed tool answer that serves as compact text and as structured content.
 ///

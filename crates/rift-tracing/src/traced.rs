@@ -1,6 +1,6 @@
 //! `traced!`: one operation timed through one `tracing` span, for a block or a future.
 //!
-//! A collector (OTLP, `rift://logs`) reads elapsed time from a span's own open
+//! A collector (OTLP, `rift server logs`) reads elapsed time from a span's own open
 //! and close; a hand-written `Instant::now()` pair beside it is a second source
 //! of the same fact that can drift from the first. The span is named by the
 //! `operation` literal and carries `operation`, `component` when given, and any

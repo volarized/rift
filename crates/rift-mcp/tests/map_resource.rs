@@ -13,7 +13,7 @@ mod workspace_client;
 
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::Value;
-use workspace_client::{TestResult, resource_json, resource_text, served_workspace};
+use workspace_client::{TestResult, resource_json, served_workspace};
 
 /// Reads one resource URI through the client and returns its JSON body.
 async fn resource_body(
@@ -26,19 +26,16 @@ async fn resource_body(
     resource_json(&answer, uri)
 }
 
-/// A read answers two contents for the requested URI: the compact text first, then the
-/// JSON body.
+/// A map read answers one JSON content for the requested URI.
 #[tokio::test]
-async fn the_map_resource_answers_compact_text_then_json() -> TestResult {
+async fn the_map_resource_answers_json_alone() -> TestResult {
     let (_directory, client, server_task) =
         served_workspace(&[("lib.rs", "pub fn beacon() {}\n")], None).await?;
 
     let answer = client
         .read_resource(ReadResourceRequestParams::new("rift://map".to_owned()))
         .await?;
-    assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
-    let text = resource_text(&answer, "rift://map")?;
-    assert!(text.starts_with("map "), "{text}");
+    assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
     let body = resource_json(&answer, "rift://map")?;
     assert!(body.is_object(), "{body}");
 

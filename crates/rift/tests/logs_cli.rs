@@ -1,15 +1,8 @@
-//! Reading the server back end to end: `rift://logs` for an agent, and
-//! `rift server logs` for an operator.
+//! Reads persisted server diagnostics through `rift server logs`.
 //!
-//! Every case here drives the compiled binary and the real `rift mcp` proxy,
-//! because the proxy is what an agent talks to and it forwards resource
-//! traffic of its own. A suite that called the server handler directly would
-//! prove nothing about the path that broke: the proxy forwarded tool calls
-//! alone until v0.0.21. The command cases drive the same binary, because a
-//! stopped server's records are exactly what an operator reads back.
+//! Cases drive the compiled CLI against serving and stopped workspaces.
 
-// The shared helper files serve every end-to-end suite in this crate; this one
-// drives the resource surface and reaches a subset of them.
+// Shared helpers also serve sibling end-to-end suites.
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod engine_fixture;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
@@ -32,19 +25,8 @@ use harness::{
 };
 use rift_mcp::{BuildCheckout, PRESENCE_POLL_INTERVAL, ServerPresence};
 use rmcp::model::ReadResourceRequestParams;
-use rmcp::service::{RoleClient, RunningService};
-use serde_json::Value;
 
-/// The whole recorded set.
-const LOGS_URI: &str = "rift://logs";
-/// Longest one case waits for a log read to answer with records, the reads included.
-///
-/// The drain writes every 250 milliseconds, and a read waits at most
-/// [`rift_tracing::LOG_SETTLE_TIMEOUT`] for it, so this covers several of those waits.
-/// With [`harness::WINDOW_READ_MAX`] and the proxy's [`rift_mcp::START_WAIT_MAX`] before
-/// it, the case stays inside nextest's one-minute deadline, so a server that records
-/// nothing, or stops answering, fails with its failure window instead of being ended
-/// silently.
+/// Longest one case waits for persisted records, including CLI reads.
 const RECORDED_WAIT_MAX: Duration = Duration::from_secs(15);
 /// Polls one case spends waiting for the follower to print a record.
 const RECORD_ATTEMPTS: u32 = 40;
@@ -53,91 +35,30 @@ const RECORD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The sentence a workspace with no recorded diagnostics prints on stderr.
 const NOTHING_RECORDED: &str = "no server diagnostics recorded for this workspace yet";
 
-/// The records one read answered with, as the wire carried them.
-fn records(body: &Value) -> TestResult<Vec<Value>> {
-    Ok(body["records"]
-        .as_array()
-        .ok_or("a log read must answer with a records array")?
-        .clone())
-}
-
-/// How the reads of one log URI went before the case gave up on them.
-#[derive(Debug, Default)]
-struct ReadHistory {
-    /// Reads that answered without a record.
-    answered_empty: u32,
-    /// The longest any of those reads took to answer.
-    longest_read: Duration,
-    /// The last of those answers, as the wire carried it.
-    last_answer: Option<String>,
-    /// Whether the read in flight when the wait ended had not answered.
-    stalled: bool,
-}
-
-/// Reads one log URI until it answers with records, or [`RECORDED_WAIT_MAX`] passes.
+/// Reads persisted records through the CLI until the store answers a non-empty set.
 ///
-/// The drain writes in batches, so a read issued the instant a call returns can
-/// legitimately find nothing yet. The bound is wall-clock and covers the reads
-/// themselves, since each one can wait for the drain on the server's side: at most
-/// `RECORDED_WAIT_MAX` over [`RECORD_POLL_INTERVAL`] reads run. A server that records
-/// nothing, or stops answering, fails here with what the reads answered; the case's
-/// [`harness::FailureWindow`] then prints what the store holds.
-async fn recorded(client: &RunningService<RoleClient, ()>, uri: &str) -> TestResult<Vec<Value>> {
+/// The wall-clock bound includes every command and poll interval.
+async fn recorded(root: &Path, filters: &[&str]) -> TestResult<Vec<String>> {
     let deadline = tokio::time::Instant::now() + RECORDED_WAIT_MAX;
-    let mut history = ReadHistory::default();
+    let arguments: Vec<&str> = ["server", "logs"]
+        .into_iter()
+        .chain(filters.iter().copied())
+        .collect();
     loop {
-        let started = tokio::time::Instant::now();
-        let Ok(read) = tokio::time::timeout_at(deadline, read_resource(client, uri)).await else {
-            history.stalled = true;
-            break;
-        };
-        let body = read?;
-        let found = records(&body)?;
-        if !found.is_empty() {
-            return Ok(found);
+        let output = tokio::time::timeout_at(deadline, run_rift(root, &arguments)).await??;
+        require_success(&output, "rift server logs")?;
+        let lines = printed_lines(&output);
+        if !lines.is_empty() {
+            return Ok(lines);
         }
-        history.answered_empty += 1;
-        history.longest_read = history.longest_read.max(started.elapsed());
-        history.last_answer = Some(body.to_string());
         if tokio::time::Instant::now() + RECORD_POLL_INTERVAL >= deadline {
-            break;
+            return Err(format!(
+                "no recorded diagnostics within {RECORDED_WAIT_MAX:?}: {output:?}"
+            )
+            .into());
         }
         tokio::time::sleep(RECORD_POLL_INTERVAL).await;
     }
-    Err(unrecorded(uri, &history).into())
-}
-
-/// Why a case's reads of `uri` ended without a record.
-fn unrecorded(uri: &str, history: &ReadHistory) -> String {
-    let answered = format!(
-        "{} reads answered without a record, the longest after {:?}",
-        history.answered_empty, history.longest_read
-    );
-    let outcome = if history.stalled {
-        format!("a read was still unanswered when the wait ended; {answered}")
-    } else {
-        answered
-    };
-    let last_answer = history.last_answer.as_deref().unwrap_or("none");
-    format!(
-        "no record reached {uri} within {RECORDED_WAIT_MAX:?}: {outcome}\nlast answer: \
-         {last_answer}"
-    )
-}
-
-/// One resource read through the proxy, returning its JSON body.
-///
-/// The first content is the compact text, whose header counts the records.
-async fn read_resource(client: &RunningService<RoleClient, ()>, uri: &str) -> TestResult<Value> {
-    let answer = client
-        .read_resource(ReadResourceRequestParams::new(uri.to_owned()))
-        .await?;
-    let text = harness::resource_text(&answer, uri)?;
-    let header = text.lines().next().unwrap_or_default();
-    if !(header.ends_with(" record") || header.ends_with(" records")) {
-        return Err(format!("{uri}: the text header must count records: {text}").into());
-    }
-    harness::resource_json(&answer, uri)
 }
 
 /// The record lines one run printed on stdout, without the blank lines between groups.
@@ -166,40 +87,49 @@ async fn awaited(transcript: &std::path::Path, needle: &str) -> bool {
 }
 
 #[tokio::test]
-async fn the_proxy_lists_the_log_resource_and_its_templates() -> TestResult {
+async fn the_proxy_omits_log_resources_and_refuses_their_reads() -> TestResult {
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let failure_window = FailureWindow::begin(directory.path());
     let client = proxy_client(directory.path()).await?;
-
     let listed = within("resources/list", client.list_resources(None)).await??;
+    assert!(
+        listed
+            .resources
+            .iter()
+            .all(|resource| !resource.uri.starts_with("rift://logs"))
+    );
     let templates = within(
         "resources/templates/list",
         client.list_resource_templates(None),
     )
     .await??;
-
     assert!(
-        listed
-            .resources
+        templates
+            .resource_templates
             .iter()
-            .any(|resource| resource.uri == LOGS_URI),
-        "{:?}",
-        listed.resources
+            .all(|template| !template.uri_template.starts_with("rift://logs"))
     );
-    let spellings: Vec<&str> = templates
-        .resource_templates
-        .iter()
-        .map(|template| template.uri_template.as_str())
-        .collect();
-    assert!(
-        spellings.contains(&"rift://logs/level/{level}"),
-        "{spellings:?}"
-    );
-    assert!(
-        spellings.contains(&"rift://logs/component/{component}"),
-        "{spellings:?}"
-    );
+    for uri in [
+        "rift://logs",
+        "rift://logs/level/error",
+        "rift://logs/component/mcp",
+    ] {
+        let error = within(
+            "removed resource",
+            client.read_resource(ReadResourceRequestParams::new(uri)),
+        )
+        .await?
+        .expect_err("removed log resources must refuse");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("removed resource returned a transport error: {error:?}").into());
+        };
+        assert_eq!(
+            error.code,
+            rmcp::model::ErrorCode::RESOURCE_NOT_FOUND,
+            "{error:?}"
+        );
+    }
     client.cancel().await?;
     failure_window.passed();
     Ok(())
@@ -214,12 +144,12 @@ async fn a_served_workspace_records_its_own_startup() -> TestResult {
     // One call proves the server is serving, so the records it wrote exist to be read.
     within("a search", client.list_tools(None)).await??;
 
-    let records = recorded(&client, LOGS_URI).await?;
+    let records = recorded(directory.path(), &[]).await?;
 
     assert!(
         records
             .iter()
-            .any(|record| record["component"] == "mcp" || record["component"] == "index"),
+            .any(|record| record.contains("component=mcp") || record.contains("component=index")),
         "{records:?}"
     );
     client.cancel().await?;
@@ -228,17 +158,17 @@ async fn a_served_workspace_records_its_own_startup() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_component_read_returns_only_that_component() -> TestResult {
+async fn a_component_filter_returns_only_that_component() -> TestResult {
     let directory = workspace()?;
     let _stop = StopOnDrop::new(directory.path());
     let failure_window = FailureWindow::begin(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
 
-    let records = recorded(&client, "rift://logs/component/mcp").await?;
+    let records = recorded(directory.path(), &["--component", "mcp"]).await?;
 
     for record in &records {
-        assert_eq!(record["component"], "mcp", "{records:?}");
+        assert!(record.contains("component=mcp"), "{records:?}");
     }
     client.cancel().await?;
     failure_window.passed();
@@ -252,12 +182,8 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
     let failure_window = FailureWindow::begin(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
-    let seen = recorded(&client, LOGS_URI).await?;
-    let oldest = seen
-        .last()
-        .and_then(|record| record["message"].as_str())
-        .ok_or("the recorded set must carry a message")?
-        .to_owned();
+    let seen = recorded(directory.path(), &[]).await?;
+    let oldest = seen.first().ok_or("the recorded set carries a line")?;
 
     let printed = run_rift(directory.path(), &["server", "logs"]).await?;
 
@@ -277,11 +203,13 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
     }
     assert!(
         lines.len() >= seen.len(),
-        "the command prints at least what the resource read answered: {lines:?}"
+        "the command prints at least what the earlier CLI read answered: {lines:?}"
     );
     assert!(
-        lines.iter().any(|line| line.contains(&oldest)),
-        "the command prints the record the resource read named oldest: \
+        lines
+            .iter()
+            .any(|line| line.split_whitespace().eq(oldest.split_whitespace())),
+        "the command prints the earlier CLI read's oldest record: \
          {oldest:?} missing from {lines:?}"
     );
     client.cancel().await?;
@@ -296,7 +224,7 @@ async fn the_logs_command_honors_its_tail_and_level() -> TestResult {
     let failure_window = FailureWindow::begin(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
-    recorded(&client, LOGS_URI).await?;
+    recorded(directory.path(), &[]).await?;
 
     let tailed = run_rift(directory.path(), &["server", "logs", "--tail", "1"]).await?;
     let failures = run_rift(directory.path(), &["server", "logs", "--level", "error"]).await?;
@@ -418,11 +346,9 @@ fn a_stop_records_the_operations_still_in_flight() -> TestResult {
 /// [`RECORDED_WAIT_MAX`], so a log read that waited on that lock would outlast its bound.
 const HELD_INDEX_BUSY_TIMEOUT: &str = "30s";
 
-/// Another process's write lock on `.rift/index` delays no log read: while a second
-/// connection holds `BEGIN IMMEDIATE` on the index database of a serving workspace,
-/// `rift://logs` and `rift server logs` both answer with records inside the bound this
-/// suite gives a log read. The index database waits `[search] busy_timeout` for that lock,
-/// and the fixture sets it past that bound.
+/// An index write lock leaves CLI log reads available under their existing bound.
+///
+/// The fixture keeps `[search] busy_timeout` longer than the log-read bound.
 #[tokio::test]
 async fn a_held_index_write_lock_delays_no_log_read() -> TestResult {
     let directory = harness::laid_out_workspace(
@@ -437,11 +363,11 @@ async fn a_held_index_write_lock_delays_no_log_read() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     within("a tool listing", client.list_tools(None)).await??;
+    recorded(root, &[]).await?;
     let holder = rusqlite::Connection::open(root.join(".rift").join("index"))?;
     holder.busy_timeout(RECORDED_WAIT_MAX)?;
     holder.execute_batch("BEGIN IMMEDIATE")?;
 
-    let read = recorded(&client, LOGS_URI).await?;
     let printed = tokio::time::timeout(
         RECORDED_WAIT_MAX,
         run_rift(root, &["server", "logs", "--tail", "5"]),
@@ -454,9 +380,8 @@ async fn a_held_index_write_lock_delays_no_log_read() -> TestResult {
 
     assert!(
         still_held,
-        "the index write lock stayed held through both reads"
+        "the index write lock stayed held through the CLI read"
     );
-    assert!(!read.is_empty(), "{read:?}");
     require_success(&printed, "rift server logs")?;
     assert!(!printed_lines(&printed).is_empty(), "{printed:?}");
     client.cancel().await?;
@@ -489,7 +414,7 @@ async fn a_followed_read_prints_a_record_the_server_writes_later() -> TestResult
     let failure_window = FailureWindow::begin(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
-    recorded(&client, LOGS_URI).await?;
+    recorded(directory.path(), &[]).await?;
     let output = tempfile::tempdir()?;
     let transcript = output.path().join("followed.txt");
     let mut command = std::process::Command::new(harness::rift_binary());
@@ -624,20 +549,9 @@ async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForegroun
     }
 }
 
-/// Whether any string inside `value` contains `text`.
-fn mentions(value: &Value, text: &str) -> bool {
-    match value {
-        Value::String(string) => string.contains(text),
-        Value::Array(items) => items.iter().any(|item| mentions(item, text)),
-        Value::Object(members) => members.values().any(|member| mentions(member, text)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
-}
-
-/// Under repository serving, each workspace's `rift://logs` answers the records its own
-/// requests produced, naming its own root and never the other workspace's; after the
-/// server stops, `rift server logs` in that root reads the same store; and the stop ends
-/// every stage, the `log drain` stage included, with the outcome `ok`.
+/// CLI reads keep repository-served records separate before and after shutdown.
+///
+/// Every stop stage, including the log drain, must finish successfully.
 #[tokio::test]
 async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
     let main = laid_out_workspace(&[("lib.rs", LIBRARY)], &harness::assigned_port_key()?)?;
@@ -681,16 +595,16 @@ async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
         assert_eq!(lookup["hits"][0]["symbol"]["name"], "beacon", "{lookup}");
         clients.push(client);
     }
-    for (index, client) in clients.iter().enumerate() {
+    for (index, root) in roots.iter().enumerate() {
         let own = roots[index].display().to_string();
         let other = roots[1 - index].display().to_string();
-        let records = recorded(client, LOGS_URI).await?;
+        let records = recorded(root, &[]).await?;
         assert!(
-            records.iter().any(|record| mentions(record, &own)),
+            records.iter().any(|record| record.contains(&own)),
             "{own} answers a record naming it: {records:?}"
         );
         assert!(
-            !records.iter().any(|record| mentions(record, &other)),
+            !records.iter().any(|record| record.contains(&other)),
             "{own} answers no record of {other}: {records:?}"
         );
     }
@@ -737,6 +651,37 @@ async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
             "the stopped workspace's store holds no record of the other: {printed}"
         );
     }
+    failure_window.passed();
+    Ok(())
+}
+
+/// A stopped workspace's persisted records remain readable with invalid configuration and a held election.
+#[tokio::test]
+async fn stopped_logs_ignore_invalid_configuration_and_a_held_election() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _stop = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    require_success(&run_rift(root, &["server", "start"]).await?, "server start")?;
+    require_success(&run_rift(root, &["server", "stop"]).await?, "server stop")?;
+    let before = run_rift(root, &["server", "logs"]).await?;
+    require_success(&before, "stopped logs")?;
+    assert!(
+        !before.stdout.is_empty(),
+        "the stopped server left persisted diagnostics"
+    );
+    std::fs::write(root.join("rift.toml"), "[invalid configuration")?;
+    let guard = rift_mcp::claim(root)?;
+    let after = run_rift(root, &["server", "logs"]).await?;
+    require_success(
+        &after,
+        "logs with invalid configuration and a held election",
+    )?;
+    assert_eq!(
+        after.stdout, before.stdout,
+        "logs read storage independently of server state"
+    );
+    drop(guard);
     failure_window.passed();
     Ok(())
 }

@@ -57,10 +57,9 @@ use std::time::Duration;
 use harness::{
     FIXTURE_READINESS_TIMEOUT, FIXTURE_WORKER_QUEUE_TIMEOUT, FailureWindow, LIBRARY,
     PROXIED_CALL_MAX, PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments,
-    await_workspace_ready, await_workspace_text, laid_out_workspace, proxied_call,
-    proxied_engine_call, proxied_result, proxy_client, proxy_client_with, relayed_proxy_client,
-    require_success, resource_json, resource_text, run_rift, rust_engine_workspace, tool_failure,
-    within, workspace,
+    await_workspace_ready, laid_out_workspace, proxied_call, proxied_engine_call, proxied_result,
+    proxy_client, proxy_client_with, relayed_proxy_client, require_success, resource_json,
+    run_rift, rust_engine_workspace, tool_failure, within, workspace,
 };
 use rift_mcp::{
     BuildCheckout, ElectionGuard, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim,
@@ -335,42 +334,33 @@ async fn repository_workspace_reads(
 async fn repository_workspace_resource_digest(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<String> {
-    let mut digest = None;
-    for uri in ["rift://workspace", "rift://logs"] {
-        let answer = within(
-            "repository resource",
-            client.read_resource(rmcp::model::ReadResourceRequestParams::new(uri)),
-        )
-        .await??;
-        let body = resource_json(&answer, uri)?;
-        assert!(body.is_object(), "{uri}: {body}");
-        if uri == "rift://workspace" {
-            let source = body["source"]
-                .as_array()
-                .ok_or("workspace carries source catalog")?
-                .iter()
-                .find(|source| source["path"] == "lib.rs")
-                .ok_or("workspace catalog carries lib.rs")?;
-            digest = Some(
-                source["digest"]
-                    .as_str()
-                    .ok_or("source carries digest")?
-                    .to_owned(),
-            );
-        }
-    }
-    digest.ok_or_else(|| "workspace source digest was read".into())
-}
-
-async fn a_competing_foreground_start_preserves_repository_logs(
-    root: &Path,
-    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-) -> TestResult {
-    let before = within(
-        "repository logs before competing start",
-        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://logs")),
+    let answer = within(
+        "repository resource",
+        client.read_resource(rmcp::model::ReadResourceRequestParams::new(
+            "rift://workspace",
+        )),
     )
     .await??;
+    let body = resource_json(&answer, "rift://workspace")?;
+    let source = body["source"]
+        .as_array()
+        .ok_or("workspace carries source catalog")?
+        .iter()
+        .find(|source| source["path"] == "lib.rs")
+        .ok_or("workspace catalog carries lib.rs")?;
+    Ok(source["digest"]
+        .as_str()
+        .ok_or("source carries digest")?
+        .to_owned())
+}
+
+async fn a_competing_foreground_start_preserves_repository_logs(root: &Path) -> TestResult {
+    let before = within(
+        "repository logs before competing start",
+        run_rift(root, &["server", "logs"]),
+    )
+    .await??;
+    require_success(&before, "repository logs before competing start")?;
     let refused = within(
         "competing foreground start",
         run_rift(root, &["server", "start", "--foreground"]),
@@ -388,12 +378,12 @@ async fn a_competing_foreground_start_preserves_repository_logs(
     );
     let after = within(
         "repository logs after competing start",
-        client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://logs")),
+        run_rift(root, &["server", "logs"]),
     )
     .await??;
+    require_success(&after, "repository logs after competing start")?;
     assert_eq!(
-        resource_json(&before, "rift://logs")?,
-        resource_json(&after, "rift://logs")?,
+        before.stdout, after.stdout,
         "a refused process cannot write diagnostics into the owner's database"
     );
     Ok(())
@@ -585,7 +575,7 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         source_digests.insert(source_digest);
         clients.push(client);
     }
-    a_competing_foreground_start_preserves_repository_logs(&roots[0], &clients[0]).await?;
+    a_competing_foreground_start_preserves_repository_logs(&roots[0]).await?;
     assert_eq!(revisions.len(), 4, "map revisions follow workspace bytes");
     assert_eq!(
         source_digests.len(),
@@ -715,11 +705,11 @@ async fn concurrent_proxies_share_one_elected_server() -> TestResult {
 
 /// The beacon lookup's whole result, once the fixture workspace answers reads.
 ///
-/// Readiness is read from the map text, which a `text` proxy returns without the JSON body.
+/// Readiness comes from the JSON map through either tool output selection.
 async fn beacon_result(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<CallToolResult> {
-    await_workspace_text(client).await?;
+    await_workspace_ready(client).await?;
     proxied_result(client, "get_symbol", &json!({"name": "beacon"})).await
 }
 
@@ -797,60 +787,50 @@ async fn text_output_proxy_lists_no_output_schema_and_returns_no_structured_cont
 }
 
 #[tokio::test]
-async fn default_proxy_lists_output_schemas_and_returns_structured_content() -> TestResult {
+async fn default_proxy_lists_no_output_schemas_and_returns_text() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
 
-    let client = proxy_client(root).await?;
+    let client = proxy_client_with(root, &[]).await?;
     let tools = listed_tools(&client).await?;
     let result = beacon_result(&client).await?;
-    assert_all_shape(&tools, &result);
+    assert_text_shape(&tools, &result);
     client.cancel().await?;
     failure_window.passed();
     Ok(())
 }
 
-/// A `rift://map` read through a `text` proxy returns the compact text alone.
+/// A map read carries one JSON payload regardless of the proxy's tool output selection.
 #[tokio::test]
-async fn text_output_proxy_returns_the_map_as_one_text_content() -> TestResult {
+async fn text_output_proxy_returns_the_map_as_one_json_content() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
-
     let client = proxy_client_with(root, &["--output=text"]).await?;
-    await_workspace_text(&client).await?;
+    await_workspace_ready(&client).await?;
     let answer = within(
         "map resource",
         client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
     )
     .await??;
-    let [content] = answer.contents.as_slice() else {
-        return Err(format!("a text proxy answers one content: {:?}", answer.contents).into());
-    };
-    let rmcp::model::ResourceContents::TextResourceContents {
-        mime_type, text, ..
-    } = content
-    else {
-        return Err(format!("the content must be text: {content:?}").into());
-    };
-    assert_eq!(mime_type.as_deref(), Some("text/plain"), "{content:?}");
-    assert!(text.starts_with("map "), "{text}");
+    assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
+    let body = resource_json(&answer, "rift://map")?;
+    assert!(body["revision"].is_string(), "{body}");
     client.cancel().await?;
     failure_window.passed();
     Ok(())
 }
 
-/// The same read through the default proxy returns the compact text, then the JSON body.
+/// A map read carries one JSON payload regardless of the proxy's tool output selection.
 #[tokio::test]
-async fn default_proxy_returns_the_map_as_text_then_json() -> TestResult {
+async fn default_proxy_returns_the_map_as_one_json_content() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
-
     let client = proxy_client_with(root, &[]).await?;
     await_workspace_ready(&client).await?;
     let answer = within(
@@ -858,9 +838,7 @@ async fn default_proxy_returns_the_map_as_text_then_json() -> TestResult {
         client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
     )
     .await??;
-    assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
-    let text = resource_text(&answer, "rift://map")?;
-    assert!(text.starts_with("map "), "{text}");
+    assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
     let body = resource_json(&answer, "rift://map")?;
     assert!(body["revision"].is_string(), "{body}");
     client.cancel().await?;
@@ -885,6 +863,20 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
     let (all_result, text_result) = (all_result?, text_result?);
     assert_all_shape(&all_tools, &all_result);
     assert_text_shape(&text_tools, &text_result);
+    let mut maps = Vec::new();
+    for client in [&all, &text] {
+        let answer = within(
+            "map resource",
+            client.read_resource(rmcp::model::ReadResourceRequestParams::new("rift://map")),
+        )
+        .await??;
+        assert_eq!(answer.contents.len(), 1, "{:?}", answer.contents);
+        maps.push(resource_json(&answer, "rift://map")?);
+    }
+    assert_eq!(
+        maps[0], maps[1],
+        "both output modes carry the same JSON map"
+    );
 
     let serving = serving_document(root).ok_or("one elected server must serve both")?;
     all.cancel().await?;
@@ -1019,26 +1011,32 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
                     && message.contains("the embedded ty database cache is poisoned")
                     && message.contains("rift.lsp.engine_refused_terminal")
                 {
-                    let uri = "rift://logs/level/ERROR";
-                    let logs = within(
-                        "upstream span panic record",
-                        all.read_resource(rmcp::model::ReadResourceRequestParams::new(uri)),
-                    )
+                    // The CLI reads persisted records directly; the drain may still hold
+                    // the just-produced panic record until its flush interval ends.
+                    within("upstream span panic record", async {
+                        loop {
+                            let logs =
+                                run_rift(root, &["server", "logs", "--level", "error"]).await?;
+                            require_success(&logs, "upstream span panic record")?;
+                            let records = String::from_utf8_lossy(&logs.stdout);
+                            if records
+                                .replace('\\', "/")
+                                .contains("tracing-opentelemetry-0.34.0/src/layer.rs:1137")
+                                && records.contains("payload=Span not found, this is a bug")
+                            {
+                                break TestResult::Ok(());
+                            }
+                            tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+                        }
+                    })
                     .await??;
-                    let records = resource_text(&logs, uri)?;
-                    if records
-                        .replace('\\', "/")
-                        .contains("tracing-opentelemetry-0.34.0/src/layer.rs:1137")
-                        && records.contains("payload=Span not found, this is a bug")
-                    {
-                        rift_tracing::warn!(
-                            expected_failure = "https://github.com/volarized/rift/issues/583",
-                            %error,
-                            "XFAIL: the upstream OpenTelemetry span panic poisoned the embedded ty database"
-                        );
-                        eprintln!("XFAIL https://github.com/volarized/rift/issues/583: {error}");
-                        continue 'cases;
-                    }
+                    rift_tracing::warn!(
+                        expected_failure = "https://github.com/volarized/rift/issues/583",
+                        %error,
+                        "XFAIL: the upstream OpenTelemetry span panic poisoned the embedded ty database"
+                    );
+                    eprintln!("XFAIL https://github.com/volarized/rift/issues/583: {error}");
+                    continue 'cases;
                 }
                 return Err(error);
             }

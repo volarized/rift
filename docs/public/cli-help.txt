@@ -21,7 +21,7 @@ Serve agents over stdio MCP by proxying this workspace's rift server
 Usage: rift mcp [OPTIONS]
 
 Options:
-      --output <MODE>  Forwards text and structured tool answers with `all`, and text alone with `text` [default: all] [possible values: all, text]
+      --output <MODE>  Forwards text and structured tool answers with `all`, and text alone with `text` [default: text] [possible values: all, text]
   -h, --help           Print help
 
 $ rift server --help

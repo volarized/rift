@@ -27,7 +27,6 @@ from rift_dev.corpus_assertions import (
     churn_answer,
     database_bytes,
     exact_degradation,
-    fields,
     language_counts,
     last_line_pattern,
     lexical_breach,
@@ -49,6 +48,7 @@ from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.log_records import (
     DATABASE_CLOSE,
     STAGE_ENDED,
+    Line,
     instant,
     stop_measurements,
 )
@@ -130,7 +130,7 @@ STARTUP_PUBLICATION = "the startup index publication"
 CONFIGURATION = (
     f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
     "[search.vector]\ndisabled = true\n"
-    "[logs]\npage_records = 5000\n"
+    "[logs]\n"
     'capture = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"\n'
 )
 SAMPLE_LANGUAGES = {
@@ -482,10 +482,10 @@ class Corpus:
                 await client.resource("rift://workspace")
                 workspace_map = await client.resource("rift://map")
                 found = await observed(
-                    client,
-                    "rift://logs/component/dependency",
+                    server,
+                    "dependency",
                     lambda rows: any(
-                        row.get("message") == CONTEXT_SPAN for row in rows
+                        row.operation == CONTEXT_SPAN and row.closes() for row in rows
                     ),
                 )
                 self.dependencies(found)
@@ -498,18 +498,16 @@ class Corpus:
                 await self.symbols(client, candidates)
                 await self.lexical_persistence(client)
                 await self.oversized(client)
-                await self.unparsed(client)
+                await self.unparsed(client, server)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
-                no_failed_builds(
-                    records(await client.resource("rift://logs/component/index"))
-                )
+                no_failed_builds(await logged(server, "index"))
             self.stop(server)
             self.record(
                 "stop", state="idle", process_gone=server.process.poll() is not None
             )
 
-    def dependencies(self, found: list[JsonObject]) -> None:
+    def dependencies(self, found: list[Line]) -> None:
         """Pin the resolver's visible manifest count separately from raw tree blobs."""
         count = self.visible_manifests()
         expected = (
@@ -518,23 +516,21 @@ class Corpus:
             else f"{count - 256} of {count} package.json manifests were not read: at most 256 are read per workspace"
         )
         exact_degradation(found, expected)
-        passes = [row for row in found if row.get("message") == CONTEXT_SPAN]
+        passes = [
+            row for row in found if row.operation == CONTEXT_SPAN and row.closes()
+        ]
         require(
             len(passes) == 1, f"startup read the dependency context {len(passes)} times"
         )
         require(
-            fields(passes[0]).get("span") == "closed",
-            "the dependency context span did not close",
-        )
-        require(
-            {"entries", "degraded"}.issubset(fields(passes[0])),
+            {"entries", "degraded"}.issubset(passes[0].fields("close")),
             "the dependency context lost named fields",
         )
         if self.pin.name == "fastapi":
             degraded = [
-                fields(row).get("reason")
+                row.fields(CONTEXT_DEGRADED).get("reason")
                 for row in found
-                if row.get("message") == CONTEXT_DEGRADED
+                if row.is_message(CONTEXT_DEGRADED)
             ]
             require(
                 degraded == [],
@@ -613,7 +609,7 @@ class Corpus:
             "oversized", path=path, bytes=len(data), pattern=token, offset=offset
         )
 
-    async def unparsed(self, client: Client) -> None:
+    async def unparsed(self, client: Client, server: Server) -> None:
         """Search the pinned file past `[providers.syntax] max_file` held as text.
 
         The provider refuses its source for its size alone, so under the default `split`
@@ -643,8 +639,8 @@ class Corpus:
             f"{path}: named by {named}, expected large_file_unparsed alone",
         )
         found = await observed(
-            client,
-            "rift://logs/component/index",
+            server,
+            "index",
             lambda rows: bool(build_records(rows, path)),
         )
         # One record per build that read the file; a rebuild of the whole tree reads it again.
@@ -858,9 +854,7 @@ class Corpus:
                 # startup budget before measuring reads against external writes.
                 await settled_local(client, "get_symbol", CHURN_REQUESTS["get_symbol"])
                 await self.churn(client)
-                no_failed_builds(
-                    records(await client.resource("rift://logs/component/index"))
-                )
+                no_failed_builds(await logged(server, "index"))
             self.stop(server)
             self.record("stop", state="after_churn", process_gone=True)
 
@@ -1014,9 +1008,7 @@ class Corpus:
                     bool(objects(answer, "results")),
                     "symlink root has no search results",
                 )
-                no_failed_builds(
-                    records(await client.resource("rift://logs/component/index"))
-                )
+                no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("symlink_root", reads=True)
 
@@ -1038,9 +1030,7 @@ class Corpus:
                         history.get("complete") is False,
                         "shallow history must report complete=false",
                     )
-                no_failed_builds(
-                    records(await client.resource("rift://logs/component/index"))
-                )
+                no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("shallow_history", complete=False, depth=1)
 
@@ -1100,11 +1090,12 @@ class Corpus:
                         )
                         await asyncio.sleep(POLL_SECONDS)
                     await observed(
-                        client,
-                        "rift://logs/component/index",
+                        server,
+                        "index",
                         lambda rows: any(
-                            row.get("message") == "index rebuild failed"
-                            and fields(row).get("error_code") == "limit_exceeded"
+                            row.is_message("index rebuild failed")
+                            and row.fields("index rebuild failed").get("error_code")
+                            == "limit_exceeded"
                             for row in rows
                         ),
                     )
@@ -1122,12 +1113,13 @@ class Corpus:
         with self.server() as server:
             async with server.connect() as client:
                 await observed(
-                    client,
-                    "rift://logs/component/search",
+                    server,
+                    "search",
                     lambda rows: any(
-                        row.get("message")
-                        == "the lexical commit failed; the next publication compares every "
-                        "file with the digests the store recorded"
+                        row.is_message(
+                            "the lexical commit failed; the next publication compares every "
+                            "file with the digests the store recorded"
+                        )
                         for row in rows
                     ),
                 )
@@ -1161,9 +1153,7 @@ class Corpus:
         with self.server() as server:
             async with server.connect() as client:
                 await client.call("search", {"query": "test", "limit": 1})
-                no_failed_builds(
-                    records(await client.resource("rift://logs/component/index"))
-                )
+                no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("stop", state="idle", process_gone=True)
         await self.stop_during_rebuild()
@@ -1281,13 +1271,20 @@ def objects(answer: JsonObject, key: str) -> list[JsonObject]:
     return [object_value(value, key) for value in array_value(answer.get(key), key)]
 
 
+async def logged(server: Server, component: str) -> list[Line]:
+    """Read persisted records through the bounded CLI command."""
+    arguments = ["server", "logs", "--tail", "all", "--component", component]
+    text = await asyncio.to_thread(server.read_logs, arguments)
+    return records(text)
+
+
 async def observed(
-    client: Client, uri: str, predicate: Callable[[list[JsonObject]], bool]
-) -> list[JsonObject]:
-    """Wait for the log drain under one deadline, including resource calls and polls."""
+    server: Server, component: str, predicate: Callable[[list[Line]], bool]
+) -> list[Line]:
+    """Wait for the log drain under one deadline, including CLI reads and polls."""
     async with asyncio.timeout(OBSERVATION_SECONDS):
         while True:
-            found = records(await client.resource(uri))
+            found = await logged(server, component)
             if predicate(found):
                 return found
             await asyncio.sleep(POLL_SECONDS)

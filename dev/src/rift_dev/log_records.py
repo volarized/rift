@@ -20,6 +20,7 @@ record for a failure window.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Iterator
 from datetime import datetime
@@ -48,6 +49,8 @@ CONTEXT_END = "  "
 NESTED_MARK = "↳ "
 # The marks a span close or a lifecycle record prints before its message.
 MARKS = "→✓✗"
+# Values containing these separators print as JSON strings in `LogLines`.
+QUOTED_VALUE_SEPARATORS = (" · ", ": ")
 # A span close: `close`, then its mark when the record states one.
 CLOSE = re.compile(r"^close(?: [✓✗])?(?:\s|$)")
 
@@ -213,14 +216,33 @@ def fields(text: str) -> dict[str, str]:
     """The `key=value` pairs in `text`.
 
     A value runs to the next ` key=` mark, so a value holding spaces, such as the
-    stage `SQLite worker shutdown`, stays whole.
+    stage `SQLite worker shutdown`, stays whole. Quoted values are JSON strings.
     """
     marks = list(FIELD_MARK.finditer(text))
     found: dict[str, str] = {}
     for index, mark in enumerate(marks):
         end = marks[index + 1].start() if index + 1 < len(marks) else len(text)
-        found[mark.group(1)] = text[mark.end() : end].strip()
+        value = text[mark.end() : end].strip()
+        found[mark.group(1)] = field_value(value)
     return found
+
+
+def field_value(value: str) -> str:
+    """Decode a JSON string only where `LogLines` quotes a separator.
+
+    Other values keep their bytes, including backslashes and malformed strings.
+    """
+    if not value.startswith('"'):
+        return value
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    if isinstance(decoded, str) and any(
+        separator in decoded for separator in QUOTED_VALUE_SEPARATORS
+    ):
+        return decoded
+    return value
 
 
 def number_or_text(value: str | None) -> int | str | None:

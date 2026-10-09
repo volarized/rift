@@ -13,6 +13,7 @@ from rift_dev.check_artifact import (
     symbol_hit,
     symbol_id,
 )
+from rift_dev.log_records import parse_line
 from rift_dev.nextest_run import retained_collector
 from rift_dev.rift_test_client import (
     Client,
@@ -31,7 +32,7 @@ from rift_dev.trace import TEST_CASE_KEY, resource_attribute
 
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
-RESOURCE_URIS = {"rift://map", "rift://workspace", "rift://logs"}
+RESOURCE_URIS = {"rift://map", "rift://workspace"}
 
 
 PYTHON_SOURCE = "def serve(port: int) -> int:\n    return port\n\n\ndef caller() -> int:\n    return serve(8080)\n"
@@ -107,11 +108,6 @@ async def check_resources(client: Client) -> None:
         "map has no languages",
     )
     string_value(orientation.get("revision"), "map.revision")
-    logs = await client.resource("rift://logs")
-    require(
-        bool(array_value(logs.get("records"), "logs.records")),
-        "startup recorded no logs",
-    )
 
 
 async def declaration_node(client: Client, name: str) -> str:
@@ -170,6 +166,11 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     await declaration_node(client, "beacon_one")
                     client.require_complete(READ_TOOLS)
                 server.stop()
+                logs = await asyncio.to_thread(server.read_records)
+                require(
+                    any(parse_line(line) is not None for line in logs.splitlines()),
+                    "startup recorded no logs",
+                )
             except BaseException as error:
                 for note in server.evidence():
                     error.add_note(note)
@@ -177,4 +178,5 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                 raise
             finally:
                 retain_collector(base, telemetry)
+            print(collector_line(telemetry), flush=True)
             print(collector_line(telemetry), flush=True)
