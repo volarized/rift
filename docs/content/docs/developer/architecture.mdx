@@ -153,9 +153,9 @@ A served workspace keeps three databases under `.rift`:
   record that names none reaches stderr alone
 
 Each database has its own connections and its own writes, so a long index write delays no log
-record and no other database's write. [`rift://logs`](/docs/mcp#resource-logs) and
-`rift server logs` read the metrics database alone, and answer while the index database is
-locked, missing, or refused.
+record and no other database's write. `rift server logs` reads the metrics database alone,
+with or without a running server, and answers while the index database is locked, missing, or
+refused.
 
 `rift server status` reports which of these states the workspace is in - a serving server with
 its port, pid, and version, a server still indexing, a stale `.rift/server.json`, or no server
@@ -512,7 +512,7 @@ A search that captures the publication before its transaction lands is ranked by
 matching alone and carries a `lexical_ranking_unavailable` warning naming the tree revision the
 store is still committing; the store's ranking joins the answer once the transaction ends. A
 transaction that refuses leaves the previous rows and stamp intact and is recorded in
-[`rift://logs`](/docs/mcp#resource-logs), and the next publication compares every file with
+[`rift server logs`](/docs/developer/implementation#server-logs), and the next publication compares every file with
 what the store recorded rather than applying its change on top of rows the store missed.
 
 The vector ranking's vectors live in the vectors database and are not part of that transaction.
@@ -536,7 +536,7 @@ bound, one holding a declaration the Contribution contract refuses, or one stand
 [`[source]`](/docs/developer/configuration#source) `declarations` capacity, is left out of the
 index: it answers no search or lookup, counts nowhere in
 [`rift://map`](/docs/mcp#resource-map), and is named in
-[`rift://logs`](/docs/mcp#resource-logs) with the bound it crossed or the field the
+[`rift server logs`](/docs/developer/implementation#server-logs) with the bound it crossed or the field the
 contract refused. One minified bundle therefore never blocks the workspace, and neither does
 a workspace declaring more than the index holds: the files that fit are served and the rest
 are reported. The [`[source]`](/docs/developer/configuration#source)

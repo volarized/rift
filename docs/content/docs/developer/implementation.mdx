@@ -67,7 +67,7 @@ the request, which closes its Streamable HTTP response stream, and the caller ge
 
 <VersionBadge version="v0.0.62" />
 
-`rift mcp` takes one `--output` choice: `all`, the default, or `text`. The proxy keeps the choice
+`rift mcp` takes one `--output` choice: `text`, the default, or `all`. The proxy keeps the choice
 for its lifetime, across upstream reconnects, so the tool listing it advertises stays stable. With
 `text`, the proxy removes `structuredContent` from each completed tool result, `outputSchema`
 from every tool on every `tools/list` page, and the `application/json` contents of a completed
@@ -117,14 +117,14 @@ runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP thro
 
 When the server builds a tool result, it renders compact text from the typed answer into
 `content` and serializes the same answer into `structuredContent`. Typed layout code renders every
-tool answer, every failure, and every resource as sections: a title at column 0 that counts its
+tool answer, every failure, and the workspace resource as sections: a title at column 0 that counts its
 entries, such as `2 results`, `1 warning`, or `2 errors`, with the entries indented under it. The
 text writer enforces a byte limit on each text and refuses one that crosses it.
 
-A resource read carries two contents for the requested URI: the compact text as `text/plain`, then
-the JSON body as `application/json`.
+A workspace resource read carries the compact text as `text/plain`, then the JSON body as
+`application/json`. A map read carries one `application/json` content under both output choices.
 
-Only `rift mcp` applies the output choice, so direct HTTP access to the server returns both
+Only `rift mcp` applies the output choice, so direct HTTP access returns both tool and workspace
 representations.
 
 Where the server converts a tool method's result, it classifies a Rift operating failure on the
@@ -502,7 +502,7 @@ that opens the file at the first vector operation, at most once, under the same 
 an open that fails leaves the handle unopened, and the next vector operation tries again.
 
 Each open stands alone. A refused index database emits a `database.open` warning and the server
-starts without it, while logs keep recording and `rift://logs` returns that warning.
+starts without it, while logs keep recording and `rift server logs` prints that warning.
 
 <VersionBadge version="v0.0.47" />
 
@@ -526,7 +526,7 @@ to `.rift/metrics` and keeps it for its life. One thread owns the only write con
 writers in the process never compete for the file, and the metrics database has no write turn
 and no lock file.
 
-Every log read, `rift://logs` and `rift server logs` alike, opens a `query_only` connection of
+`rift server logs` opens a `query_only` connection of
 its own through `LogReader`, which never creates the file or a table and never switches the
 journal mode. The file carries its schema version in `PRAGMA user_version`: a writer that finds another version drops
 `log_records` and creates it again, and a reader refuses.
@@ -694,7 +694,7 @@ The index database's tables:
   stored since the last batch still reaches the answer.
 The vectors database holds `semantic_vectors`, one row per embedding space and declaration
 digest. The metrics database holds `log_records`, the bounded server diagnostics
-`rift://logs` and `rift server logs` read.
+`rift server logs` reads.
 
 The index and vectors databases each apply a Toasty migration set numbered from 1 and record it
 in the file's own `__toasty_migrations` table.
@@ -756,7 +756,6 @@ The flags narrow what prints:
 - `--level` selects one severity
 - `--component` selects records from one component
 
-Agents read these records through [`rift://logs`](/docs/mcp#resource-logs).
 The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
 
 `rift-tracing` holds a record from its capture to its row. The `LogSink` layer publishes each
@@ -794,8 +793,7 @@ The byte accounting includes the publication envelope, record, shared ownership 
 string lengths. Bounded channel slots and allocator overhead sit outside that accounting.
 
 The [`[logs]`](/docs/developer/configuration#logs) keys `queue_records`, `flush_interval`,
-`retry_interval`, and `settle_timeout` configure queue capacity, partial-batch flushes, retained
-retries, and persisted-log settlement. Under repository serving, a routing drain sends records
+and `retry_interval` configure queue capacity, partial-batch flushes, and retained retries. Under repository serving, a routing drain sends records
 to one bounded consumer per admitted workspace, selected from the request span's `workspace`.
 Each consumer holds at most `min(queue_records, 256)` queued records and the same number in a
 batch, sharing a 1 MiB byte budget. At most 64 consumer budgets remain retained, including
@@ -885,7 +883,7 @@ stop records `standard error bytes discarded` with `stderr_limit` and the bytes 
 at `warn` when the count is not zero. A second `TracingRuntimeBuilder::install` in one process
 returns `InstallError` and leaves the installation in place untouched.
 
-Stderr, `rift server logs`, the text of `rift://logs`, and a failure window print a record
+Stderr, `rift server logs`, and a failure window print a record
 through one renderer, `LogLines` in `rift-tracing`. A message or a field value holding ` · ` or
 `: ` prints as a JSON string. A line holds the time in UTC with milliseconds, the level, the
 function, three spaces, the context, two spaces, the nested operation, and the message:

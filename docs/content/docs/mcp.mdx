@@ -10,7 +10,7 @@ import { AgentWorkflow } from "@/components/agent-workflow";
 import { ExampleProject } from "@/components/example-project";
 import { IconCard } from "@/components/icon-card";
 import { WorkspaceMapExample } from "@/components/workspace-map-example";
-import { BookOpenIcon, FileTextIcon, GearIcon } from "@phosphor-icons/react/ssr";
+import { BookOpenIcon, GearIcon } from "@phosphor-icons/react/ssr";
 
 The main interface for agents to work with rift is the Model Context Protocol, aka
 [MCP](https://modelcontextprotocol.io/specification/2026-07-28). The local `rift mcp` process is
@@ -1218,12 +1218,9 @@ indented under it. Warnings form their own section after the items:
   why the answer is empty.
 
 Compact text prints only what stands out, such as a requested `score`, a dependency origin, or a
-truncated history. Everything else is in the structured output, which by default `rift mcp` sends
-beside the text, so a program calling the tools can read every field as JSON.
-
-When the agent only needs the text, start `rift mcp --output=text`. It leaves out the structured
-output and the output schemas in the tool listing, which makes each response smaller. A resource read
-then returns its compact text without the JSON body.
+truncated history. `rift mcp` returns compact text by default. A program that needs every field as JSON starts
+`rift mcp --output=all`, which includes structured output and output schemas in the tool listing.
+The workspace resource then carries both compact text and JSON. The map always returns JSON.
 
 The [result content reference](/docs/developer/protocol/mcp#result-content) defines the form.
 
@@ -1312,19 +1309,15 @@ directives and the complete form.
 
 ## Resources
 
-When a result needs more context, the agent can read the local configuration or diagnostics
-through MCP resources:
+When a result needs more context, the agent can read the local configuration through MCP
+resources or diagnostics through [`rift server logs`](/docs/developer/implementation#server-logs).
+The CLI reads recorded diagnostics directly from storage, with or without a running server:
 
 <Cards>
 <IconCard id="resource-workspace" title="Workspace" href="/docs/developer/protocol/mcp#resource-workspace" icon={GearIcon}>
 
 `rift://workspace` shows accepted configuration and the source catalog, including which files
 and languages Rift serves.
-
-</IconCard>
-<IconCard id="resource-logs" title="Server logs" href="/docs/developer/protocol/mcp#resource-logs" icon={FileTextIcon}>
-
-`rift://logs` returns recorded diagnostics, newest first, including when the index is not ready.
 
 </IconCard>
 <IconCard title="MCP reference" href="/docs/developer/protocol/mcp" icon={BookOpenIcon}>
@@ -1334,11 +1327,7 @@ Complete tool examples, resource fields, limits, warnings, and failure behavior.
 </IconCard>
 </Cards>
 
-A resource read also comes as compact text, in the same form as a tool result:
-
-<Tabs items={["rift://workspace", "rift://logs"]}>
-
-<Tab value="rift://workspace">
+The workspace resource comes as compact text, in the same form as a tool result:
 
 **`rift://workspace`, compact text** of a workspace with one TypeScript language and one source file:
 
@@ -1352,27 +1341,11 @@ source:
 	src/view.tsx · typescript:tsx · 8a4d20bc
 ```
 
-</Tab>
-
-<Tab value="rift://logs">
-
-**`rift://logs`, compact text** of two records, newest first:
-
-```text
-2 records
-	2026-10-04 10:42:07.120 warn index index.build: file left out of the index · path src/deep.rs · reason syntax tree depth exceeds accepted limit 512
-	2026-10-04 10:41:58.317 info mcp -: MCP server starting · transport http
-```
-
-</Tab>
-
-</Tabs>
 
 - The workspace text starts with the digest of the accepted `rift.toml`, then lists each language
   with its include and exclude patterns, and each source file with its language and content
   digest.
-- Each log record shows its time in UTC, level, component, and operation, then its message and
-  fields; `-` stands for an empty component or operation.
+
 
 See [resource contents](/docs/developer/protocol/mcp#resource-contents) for the compact text and
 the JSON body a read carries.

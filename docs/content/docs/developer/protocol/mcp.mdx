@@ -68,47 +68,8 @@ or `stdlib/python`. Its version comes from the workspace's pins, or from a versi
 [`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"`, and the
 [dependency context](/docs/developer/architecture#standard-libraries) lists where each one is read.
 
-A read of `rift://map` answers the [two contents](#resource-contents) of a resource. The compact text has these parts:
-
-- the header `map <revision>`
-- directly below the header, the sections `languages`, `modules`, `hubs`, `entry points`, `docs`, `module relationships`, and `packages`, in that order, each a title such as `languages:` with its entries indented by one level; the server **MUST** omit a section that has no entry
-- a language entry as `language · N files · M symbols`, and a module entry as `path · N files · M symbols`
-- a child module one level deeper than its parent, written by its path relative to the parent when the parent's path is a prefix of it, and by its full path otherwise
-- a hub entry as `symbol · kind · N references`, and a module relationship as `from → to · N references`
-- a package entry as `name@version` or `name requirement`, followed by `(manager)`, with the availability added after the manager unless it is `canonical`
-- after the last section, when the map carries warnings, the section `N warnings`, or `1 warning`, with one line per warning as in a [tool result](#result-content)
-
-A count of 1 takes the singular, as in `1 file`. The map is always one page, so the text writes no `pagination`.
-
-The tabs below show the same map as compact text and as JSON:
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Request:** `rift://map`
-
-**Response, compact text:**
-
-```text
-map 3f9a1c2e
-languages:
-	rust · 191 files · 3204 symbols
-modules:
-	crates · 191 files · 3204 symbols
-		rift-server · 16 files · 418 symbols
-entry points:
-	rift://symbol/rust/crates/rift/src/main.rs/main
-docs:
-	README.md
-packages:
-	tokio@1.53.1 (cargo)
-	rust@1.98.1 (stdlib)
-```
-
-</Tab>
-
-<Tab value="json">
+A read of `rift://map` returns one `application/json` content under either
+[output selection](#result-content):
 
 **Request:** `rift://map`
 
@@ -154,9 +115,7 @@ packages:
 }
 ```
 
-</Tab>
 
-</ExampleTabs>
 
 ## Search
 
@@ -1766,7 +1725,7 @@ A `source_unavailable` warning names a file the index left out - bytes that are 
 a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
 lookup while every other file stays available. An answer carries at most eight of them, in
 project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
-and counts the rest, and `rift://logs` names each.
+and counts the rest. `rift server logs` names each omitted file.
 
 Text search answers can carry these warnings:
 
@@ -1854,14 +1813,15 @@ A completed tool result carries `content` with one text block of compact text. W
 
 A caller selects the representations when it starts the proxy with `rift mcp --output`:
 
-- `all` - the default. The proxy forwards `content` and `structuredContent`, lists `outputSchema`, and forwards every content of a resource read.
-- `text` - the proxy **MUST** omit `structuredContent` from each completed tool result and `outputSchema` from every tool on every `tools/list` page. The proxy **MUST** also omit the `application/json` contents of a completed resource read that holds another content, so the compact text of the [resource](#resource-contents) remains.
+- `all` - The proxy forwards `content` and `structuredContent`, lists `outputSchema`, and forwards every content of a resource read.
+- `text` - the default. The proxy **MUST** omit `structuredContent` from each completed tool result and `outputSchema` from every tool on every `tools/list` page. The proxy **MUST** also omit the `application/json` contents of a completed resource read that holds another content, so the compact text of the [resource](#resource-contents) remains.
 
 The proxy **MUST** keep its selection for its lifetime. A tool list that changes between pages or
 requests would break the caller's cache of the advertised tools.
 
-Direct HTTP access to `rift server` returns both representations, because only the proxy applies
-the selection. A resource read over direct HTTP therefore carries both contents.
+Direct HTTP access to `rift server` returns both tool representations, because only the proxy
+applies the selection. The workspace resource carries both contents over direct HTTP; the map
+carries one JSON content.
 
 The compact text of `search`, `get_symbol`, and `nodes` results follows one layout. The text lists what an agent reads to choose its next call and leaves the normal state of each field out, and the facts of one line are separated by ` · `. Under the `all` selection, `structuredContent` carries every field of the result, including each field the layout leaves implicit.
 
@@ -2347,148 +2307,14 @@ reaches the global API.
 
 ### Resource contents [#resource-contents]
 
-A read of a resource answers `contents` with two entries, both naming the requested `uri`. The first is compact text with `mimeType` `text/plain`, and the second is the JSON body with `mimeType` `application/json`. The server makes both from the same data.
+A read of `rift://map` answers `contents` with one JSON entry whose `mimeType` is
+`application/json`. A read of `rift://workspace` answers with two entries, both naming the
+requested `uri`: compact text with `mimeType` `text/plain`, then the JSON body with `mimeType`
+`application/json`. The server makes both workspace contents from the same data.
 
-The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves the compact text as the only content of a read.
+The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves compact text as the only content of a workspace read. The map remains JSON under both selections.
 
-The compact text of a resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
-
-### Server logs [#resource-logs]
-
-`rift://logs` reads the server's own diagnostics back, newest first. Events admitted by the
-`[logs] capture` filter enter a bounded queue and one task writes them to the metrics database
-at `.rift/metrics`, so an agent that met a refusal can ask what the server was doing without an
-operator reading its terminal. Under repository serving, each record goes to the store of the
-workspace its `workspace` field, or the request span around it, names; `rift://logs` answers that
-workspace's records alone. When the queue fills, the task drops later events and records the dropped count:
-
-| Resource | Content |
-| --- | --- |
-| `rift://logs` | every recorded diagnostic, newest first |
-| `rift://logs/level/{level}` | one severity: `trace`, `debug`, `info`, `warn`, or `error` |
-| `rift://logs/component/{component}` | one component's records, as its spans label them |
-
-A read answers the [two contents](#resource-contents) of a resource. The JSON content is an object carrying `uri`, `records`, and `record_count`, and an `unavailable` reason when the store could not be opened.
-
-Each record names its `identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`, `component`, `operation`, `message`, and the remaining `fields`. The `fields` are an object whose members keep the order they were recorded in, or the stored text as a string when it is not a JSON object. A span that closed carries the fields it recorded beside `elapsed_ms`, which is how long the work it wrapped took, `busy_ns` and `idle_ns`, the nanoseconds of it the span was entered and was not, `status.code`, `Ok` or `Error`, with `error.type` when the work did not complete, and `root_span` when it closed inside another span. A span and a record emitted through Rift carry `code.function.name`, the function that opened or emitted it, as display text.
-
-A record emitted inside a span carries two more `fields` members: `root_span` for the outermost span around it, and `nearest_span` for the span it was emitted in when that span is not the outermost. Each is an object holding the span's `name` and its `fields`, among them `component`, `operation`, and, on a tool call, the `request_id` and `tool` of the request. A record emitted outside every span carries neither. When a span's fields cross the server's bound, the object leaves out the members past it and carries their count as `fields_left_out`. A caller **MAY** relate the records of one request by the `request_id` of `root_span`; the order of records alone does not relate them, because a background task can record between two records of one request.
-
-The compact text has these parts:
-
-- the title `N records`, or `1 record`
-- directly below the title, one line for each record, indented by one level, in the order of the JSON `records`: the line `rift server logs` prints for a stored page, the time as `YYYY-MM-DD HH:MM:SS.mmmZ` in UTC from `recorded_at_ms`, the level, the function (the `code.function.name` of the outermost span around the record, else the record's own, else its `target`), the context of `component`, `operation`, and the other fields as `key=value`, and the message
-- an empty line between two groups, a group being the consecutive records of one request, of one root span, or of one function
-- a message or field value holding ` · ` or `: ` is written as a JSON string
-- when the store could not be opened, the section `1 warning` after `0 records`, with the line `unavailable: <reason>` indented by one level; a reason holding ` · ` or `: ` is quoted
-
-The text does not write `identity`. A `recorded_at_ms` before -9999-01-02 01:59:59 UTC or after 9999-12-30 22:00:00 UTC, which bounds the years -9999 to 9999, is written as its count. A read of a level or component template names the requested `uri` in both contents.
-
-The tabs below show a read of `rift://logs` that answers two records, the newer one with an `operation` and the older one without:
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Request:** `rift://logs`
-
-**Response, compact text:**
-
-```text
-2 records
-	2026-10-04 10:42:07.120Z WARN  rift_mcp::server   component=index operation=index.build path=src/deep.rs reason=syntax tree depth exceeds accepted limit 512  file left out of the index
-	2026-10-04 10:41:58.317Z INFO  rift_mcp::server   component=mcp transport=http                                                                                MCP server starting
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Request:** `rift://logs`
-
-**Response, JSON:**
-
-```json
-{
-  "record_count": 2,
-  "records": [
-    {
-      "component": "index",
-      "fields": {
-        "path": "src/deep.rs",
-        "reason": "syntax tree depth exceeds accepted limit 512"
-      },
-      "identity": 2,
-      "level": "warn",
-      "message": "file left out of the index",
-      "operation": "index.build",
-      "recorded_at_ms": 1791110527120,
-      "target": "rift_mcp::server"
-    },
-    {
-      "component": "mcp",
-      "fields": {
-        "transport": "http"
-      },
-      "identity": 1,
-      "level": "info",
-      "message": "MCP server starting",
-      "operation": "",
-      "recorded_at_ms": 1791110518317,
-      "target": "rift_mcp::http"
-    }
-  ],
-  "uri": "rift://logs"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-The read never waits on workspace readiness. A request that refuses because the index will not
-settle is exactly the request whose reason these records hold, so the log read answers while
-every workspace read is still refusing. The read reaches no connection or lock of the index
-database, so it answers while that database is locked, missing, or refused. A store that could
-not be opened answers with an empty set and an `unavailable` reason rather than a refusal:
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Request:** `rift://logs`
-
-**Response, compact text:**
-
-```text
-0 records
-1 warning
-	unavailable: the workspace log store could not be opened, so this run recorded nothing
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Request:** `rift://logs`
-
-**Response, JSON:**
-
-```json
-{
-  "record_count": 0,
-  "records": [],
-  "unavailable": "the workspace log store could not be opened, so this run recorded nothing",
-  "uri": "rift://logs"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-`[logs] page_records` bounds one read; `retention_records` bounds the store. Both are
-[workspace configuration](/docs/developer/configuration#logs).
+The compact text of the workspace resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
 
 ### Workspace [#resource-workspace]
 
@@ -2728,5 +2554,5 @@ A failure the proxy raises itself carries the same typed `ErrorData` as the JSON
 under code `-32000`: a `tools/call` whose `arguments` is not an object, a forwarded request that
 the server did not answer within the proxy's budget, and a server that is still building or
 failed to start. The caller **SHOULD** read `retry` from that `data` as it reads it from the
-first entry of an execution failure. A resource read refusal, such as an unknown `rift://logs`
-level, carries a code and a message and no `data`. A read whose compact text crosses the byte limit carries the typed `ErrorData` as `data`.
+first entry of an execution failure. A resource read refusal, such as an unknown resource URI,
+carries a code and a message and no `data`. A read whose compact text crosses the byte limit carries the typed `ErrorData` as `data`.
