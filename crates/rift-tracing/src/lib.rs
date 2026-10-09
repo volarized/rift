@@ -2,7 +2,7 @@
 //!
 //! A server whose index will not settle answers no read, and its diagnostics
 //! leave on stderr, where the agent asking the question cannot reach them. The
-//! rows here are what an agent reads back through `rift://logs` while that
+//! rows here are what an agent reads back through `rift server logs` while that
 //! index lane is still stuck, so the run explains itself without an operator
 //! copying a terminal.
 //!
@@ -72,7 +72,7 @@ mod traced;
 pub use capture::{
     LOG_QUEUE_RECORDS, LogSink, PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture,
 };
-pub use drain::{LOG_SETTLE_TIMEOUT, LogDrain, LogLane, RunningLogDrain, settle_for_read};
+pub use drain::{LogDrain, LogLane, RunningLogDrain};
 pub use flight::{OPERATIONS_IN_FLIGHT_MAX, publish_in_flight, warn_in_flight};
 pub use lock::{Acquire, Held, Lock, Refusal, lock};
 pub use measurement::{ClockRegression, PerformanceMeasurement};

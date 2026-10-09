@@ -926,7 +926,7 @@ impl ConfigurationState {
     }
 
     /// The `[logs]` table from the last acceptance, or the default table while
-    /// `rift.toml` is invalid. A `rift://logs` read is answered under this
+    /// `rift.toml` is invalid. A `rift server logs` read is answered under this
     /// table exactly when the file the read is meant to explain is the one that
     /// failed acceptance, so the default has to serve that case.
     pub(crate) fn logs_configuration(&self) -> LogsConfiguration {
@@ -2595,7 +2595,7 @@ pub(crate) async fn populate_search(
 /// The bound is the store's own, never a rebuild's: a rebuild hands its write to the lane
 /// when it publishes and does not wait for the transaction. The lane keeps waiting for a
 /// transaction past this deadline, because a second one would only queue behind it on
-/// the database's write turn, so the deadline bounds when `rift://logs` names the delay,
+/// the database's write turn, so the deadline bounds when `rift server logs` names the delay,
 /// and the transaction's own end decides what the store is owed. A transaction writing
 /// many units gets a longer deadline, derived by [`commit_deadline`].
 ///

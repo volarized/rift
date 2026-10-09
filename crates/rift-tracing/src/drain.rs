@@ -39,10 +39,6 @@ use crate::subscriptions::{LOG_SUBSCRIPTION_BYTES_MAX, RecordBudget};
 
 /// Wall-clock span the drain waits for more records before writing what it holds.
 pub(crate) const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
-/// Longest a `rift://logs` read waits for the drain to write through the sequence the
-/// sink had stamped when the read began. A read past this answers with what the store
-/// holds: a log read never fails, and never hangs, because the log drain is slow.
-pub const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Wall-clock span between two attempts at a batch the store refused.
 pub(crate) const LOG_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -52,7 +48,6 @@ pub(crate) struct LogDeliveryOptions {
     pub(crate) queue_records: usize,
     pub(crate) flush_interval: Duration,
     pub(crate) retry_interval: Duration,
-    pub(crate) settle_timeout: Duration,
 }
 
 impl Default for LogDeliveryOptions {
@@ -61,7 +56,6 @@ impl Default for LogDeliveryOptions {
             queue_records: crate::LOG_QUEUE_RECORDS,
             flush_interval: LOG_FLUSH_INTERVAL,
             retry_interval: LOG_WRITE_RETRY_INTERVAL,
-            settle_timeout: LOG_SETTLE_TIMEOUT,
         }
     }
 }
@@ -85,7 +79,7 @@ const WORKSPACE_FIELD_POINTERS: [&str; 3] = [
 
 /// One record on its way to the drain, under the sequence the sink stamped on it.
 ///
-/// The sequence is what a read waits on. A count cannot serve: a full queue drops the
+/// Shutdown waits on the accepted sequence. A count cannot serve: a full queue drops the
 /// newest record while older ones are still queued, so the number of records the drain
 /// has finished with says nothing about which ones.
 #[derive(Debug)]
@@ -109,10 +103,8 @@ struct LaneProgress {
 
 /// What the log lane has taken, and how far it has got.
 ///
-/// A `rift://logs` read stamps its target from `accepted` on entry and waits for the
-/// drain to write through it, so the read sees the records its own request produced
-/// rather than whatever the drain's timer had committed by then. Without it the drain's
-/// flush interval is a window in which a caller reads back its own missing diagnostic.
+/// A workspace consumer waits for the routing drain to write through `accepted` before
+/// shutdown ends its route, so queued diagnostics reach that workspace's store.
 #[derive(Debug)]
 pub(crate) struct LogSettlement {
     accepted: AtomicU64,
@@ -200,36 +192,6 @@ impl LogSettlement {
             }
         };
         let _ = tokio::time::timeout_at(deadline, reached).await;
-    }
-}
-
-/// Waits for the calling thread's log lane to write through what it has stamped, and,
-/// when the lane routes, for the consumer of `workspace` to write what it was handed.
-///
-/// Every `rift://logs` read calls this before it opens the store, naming the workspace
-/// root it serves as the `workspace` field spells it. The lane is the [`LogSink`] layer
-/// of the thread's current `tracing` dispatcher. A process can build more than one lane -
-/// under `cargo test` every test is a thread of one process and builds its own - and the
-/// dispatcher is what decides where a thread's records go. A process that records
-/// nothing - every command but the foreground server - installs no sink, and its log
-/// reads wait for nothing. Both waits share the accepted `[logs] settle_timeout`,
-/// [`LOG_SETTLE_TIMEOUT`] by default.
-///
-/// # Cancel safety
-///
-/// Dropping the future ends the wait and changes nothing.
-pub async fn settle_for_read(workspace: &str) {
-    let Some(settlement) = installed_settlement() else {
-        return;
-    };
-    let deadline = Instant::now() + settlement.options.settle_timeout;
-    settlement.settle_by(deadline).await;
-    let consumer = settlement
-        .routes
-        .get()
-        .and_then(|routes| routes.settlement_of(workspace));
-    if let Some(consumer) = consumer {
-        consumer.settle_by(deadline).await;
     }
 }
 
@@ -417,7 +379,7 @@ impl LogDrain {
         self.settlement.draining.store(false, Ordering::SeqCst);
     }
 
-    /// Waits for the accepted flush interval, a requesting read, or cancellation.
+    /// Waits for the accepted flush interval, shutdown, or cancellation.
     async fn wait_for_flush(&self, cancellation: &CancellationToken) -> FlushReady {
         tokio::select! {
             biased;
@@ -690,6 +652,7 @@ impl LogRoutes {
     }
 
     /// The lane of the consumer routed for `workspace`.
+    #[cfg(test)]
     fn settlement_of(&self, workspace: &str) -> Option<Arc<LogSettlement>> {
         self.consumers()
             .routes

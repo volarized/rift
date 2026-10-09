@@ -65,10 +65,6 @@ pub const LOGS_RETENTION_RECORDS_MIN: u64 = 100;
 pub const LOGS_RETENTION_RECORDS_MAX: u64 = 1_000_000;
 /// Records the log store keeps by default.
 const LOGS_RETENTION_RECORDS_DEFAULT: u64 = 50_000;
-/// Records one `rift://logs` read returns, at most.
-pub const LOGS_PAGE_RECORDS_MAX: u64 = 5_000;
-/// Records one `rift://logs` read returns by default.
-const LOGS_PAGE_RECORDS_DEFAULT: u64 = 500;
 /// Bytes `logs.capture` may hold, at most.
 pub const LOGS_CAPTURE_BYTES_MAX: usize = 512;
 /// The filter the log store captures under by default: the same targets the
@@ -93,9 +89,9 @@ pub const LOGS_STDERR_BYTES_DEFAULT: u64 = 1 << 20;
 pub const LOGS_QUEUE_RECORDS_MAX: u64 = 65_536;
 /// Records one log subscription keeps by default.
 pub const LOGS_QUEUE_RECORDS_DEFAULT: u64 = 4_096;
-/// Milliseconds a log delivery interval or settlement wait holds, at least.
+/// Milliseconds a log delivery interval holds, at least.
 pub const LOGS_DELIVERY_MS_MIN: u64 = 1;
-/// Milliseconds a log delivery interval or settlement wait holds, at most.
+/// Milliseconds a log delivery interval holds, at most.
 pub const LOGS_DELIVERY_MS_MAX: u64 = 3_600_000;
 /// Milliseconds the drain waits before writing a partial batch by default.
 pub const LOGS_FLUSH_INTERVAL_MS_DEFAULT: u64 = 250;
@@ -993,7 +989,7 @@ impl PortRange {
 
 /// The `[logs]` table bounds log delivery, retention, capture, and metric attribute sets.
 ///
-/// The server records diagnostics in `.rift/metrics`, where `rift://logs` reads them.
+/// The server records diagnostics in `.rift/metrics`, where `rift server logs` reads them.
 /// The table also bounds stall reports and standard error that is not a terminal.
 /// The server reads the table at startup, so a change applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -1003,9 +999,6 @@ pub struct LogsConfiguration {
     /// Records the store keeps before the oldest are dropped, 100 to 1000000.
     #[schemars(range(min = 100, max = 1_000_000))]
     pub retention_records: u64,
-    /// Records one `rift://logs` read returns at most, 1 to 5000.
-    #[schemars(range(min = 1, max = 5_000))]
-    pub page_records: u64,
     /// Records one log subscription holds before it drops and counts, 1 to 65536.
     #[schemars(range(min = 1, max = 65_536))]
     pub queue_records: u64,
@@ -1013,8 +1006,6 @@ pub struct LogsConfiguration {
     pub flush_interval: Duration,
     /// Wait before the drain retries a batch the store refused, 1ms to 1h.
     pub retry_interval: Duration,
-    /// Longest a persisted-log read waits for its records to be written, 1ms to 1h.
-    pub settle_timeout: Duration,
     /// Attribute sets one metric instrument holds before overflow, 1 to 65536.
     #[schemars(range(min = 1, max = 65_536))]
     pub cardinality_limit: u64,
@@ -1036,11 +1027,9 @@ impl Default for LogsConfiguration {
     fn default() -> Self {
         Self {
             retention_records: LOGS_RETENTION_RECORDS_DEFAULT,
-            page_records: LOGS_PAGE_RECORDS_DEFAULT,
             queue_records: LOGS_QUEUE_RECORDS_DEFAULT,
             flush_interval: Duration::from_millis(LOGS_FLUSH_INTERVAL_MS_DEFAULT),
             retry_interval: Duration::from_millis(LOGS_RETRY_INTERVAL_MS_DEFAULT),
-            settle_timeout: Duration::from_millis(LOGS_SETTLE_TIMEOUT_MS_DEFAULT),
             cardinality_limit: LOGS_CARDINALITY_LIMIT_DEFAULT,
             capture: LOGS_CAPTURE_DEFAULT.to_owned(),
             stall_delay: Duration::from_millis(LOGS_STALL_DELAY_MS_DEFAULT),
@@ -1058,12 +1047,6 @@ impl LogsConfiguration {
                 self.retention_records,
                 LOGS_RETENTION_RECORDS_MIN,
                 LOGS_RETENTION_RECORDS_MAX,
-            ),
-            (
-                "logs.page_records",
-                self.page_records,
-                1,
-                LOGS_PAGE_RECORDS_MAX,
             ),
             (
                 "logs.queue_records",
@@ -1090,12 +1073,6 @@ impl LogsConfiguration {
                 (
                     "logs.retry_interval",
                     self.retry_interval.milliseconds(),
-                    LOGS_DELIVERY_MS_MIN,
-                    LOGS_DELIVERY_MS_MAX,
-                ),
-                (
-                    "logs.settle_timeout",
-                    self.settle_timeout.milliseconds(),
                     LOGS_DELIVERY_MS_MIN,
                     LOGS_DELIVERY_MS_MAX,
                 ),
@@ -4366,7 +4343,7 @@ mod tests {
                 assert_eq!(configuration.validate(), Ok(()), "{field}={value}");
             }
         }
-        for field in ["flush_interval", "retry_interval", "settle_timeout"] {
+        for field in ["flush_interval", "retry_interval"] {
             for value in [0, LOGS_DELIVERY_MS_MAX + 1] {
                 let duration = Duration::from_millis(value);
                 let configuration = WorkspaceConfiguration {

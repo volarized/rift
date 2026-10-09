@@ -1480,7 +1480,7 @@ fn proxy_command(root: &Path, arguments: &[&str]) -> TokioChildProcessBuilder {
 
 /// One connected `rift mcp` child whose stderr is relayed onto the test's own.
 pub(crate) async fn proxy_client(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    proxy_client_with(root, &[]).await
+    proxy_client_with(root, &["--output", "all"]).await
 }
 
 /// One connected `rift mcp` child started with `arguments` after the
@@ -1502,7 +1502,7 @@ pub(crate) async fn proxy_client_with(
 pub(crate) async fn relayed_proxy_client(
     root: &Path,
 ) -> TestResult<(RunningService<RoleClient, ()>, RelayedStderr)> {
-    relayed_proxy_client_with(root, &[]).await
+    relayed_proxy_client_with(root, &["--output", "all"]).await
 }
 
 /// [`relayed_proxy_client`] with `arguments` after the `mcp` subcommand.
@@ -1732,18 +1732,6 @@ pub(crate) fn resource_json(
     Ok(serde_json::from_str(body)?)
 }
 
-/// The compact text of a resource read: its first content, which must be non-empty
-/// `text/plain` carrying `uri`.
-pub(crate) fn resource_text<'a>(answer: &'a ReadResourceResult, uri: &str) -> TestResult<&'a str> {
-    match resource_texts(answer, uri)?.first() {
-        Some((mime, text)) if *mime == RESOURCE_TEXT_MIME && !text.is_empty() => Ok(*text),
-        other => Err(format!(
-            "{uri}: the first content must be non-empty {RESOURCE_TEXT_MIME}: {other:?}"
-        )
-        .into()),
-    }
-}
-
 /// Reads map until workspace file preparation finishes, within fixture bound.
 pub(crate) async fn await_workspace_ready(
     client: &RunningService<RoleClient, ()>,
@@ -1766,39 +1754,6 @@ pub(crate) async fn await_workspace_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("workspace map remained in preparation: {body}").into());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Reads map until workspace file preparation finishes, judging by its compact text.
-///
-/// The text content arrives through a proxy of any `--output` mode, so this serves a
-/// `text` proxy too, which carries no JSON body. A warning line is `  <code>` (2 spaces)
-/// followed by a space, a colon, or the end of the line.
-pub(crate) async fn await_workspace_text(
-    client: &RunningService<RoleClient, ()>,
-) -> TestResult<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let answer = tokio::time::timeout_at(
-            deadline,
-            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
-        )
-        .await??;
-        let text = resource_text(&answer, "rift://map")?;
-        if !text.starts_with("map ") {
-            return Err(format!("the map text must open with `map `: {text}").into());
-        }
-        let preparing = text.lines().any(|line| {
-            line.strip_prefix("\tlocal_index_preparing")
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':']))
-        });
-        if !preparing {
-            return Ok(text.to_owned());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("workspace map remained in preparation: {text}").into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

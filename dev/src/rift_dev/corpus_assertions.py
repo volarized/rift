@@ -12,7 +12,7 @@ from contextlib import closing
 from pathlib import Path
 from urllib.parse import unquote
 
-from rift_dev.log_records import Line, closes_span, parse_line
+from rift_dev.log_records import Line, closes_span, lines, parse_line
 from rift_dev.rift_test_client import (
     Json,
     JsonObject,
@@ -183,18 +183,9 @@ def sample_symbols(
     raise AssertionError("symbol pool exhausted before the requested count")
 
 
-def records(answer: JsonObject) -> list[JsonObject]:
-    """Require complete log pages so a missing record cannot turn into a pass."""
-    require("unavailable" not in answer, f"log store unavailable: {answer}")
-    values = array_value(answer.get("records"), "log records")
-    require(
-        len(values) < 5000, "log page reached its bound; evidence may have been lost"
-    )
-    return [object_value(value, "log record") for value in values]
-
-
-def fields(record: JsonObject) -> JsonObject:
-    return object_value(record.get("fields"), "log fields")
+def records(text: str) -> list[Line]:
+    """Read CLI log records without reaching the server or its index."""
+    return list(lines(text))
 
 
 def number(value: object, context: str) -> int:
@@ -301,12 +292,12 @@ def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> lis
     return named
 
 
-def build_records(found: list[JsonObject], path: str) -> list[str]:
+def build_records(found: list[Line], path: str) -> list[str]:
     """The messages of the index-build records naming `path`, in page order."""
     return [
-        string_value(row.get("message"), "log message")
+        HELD_UNPARSED_RECORD if row.is_message(HELD_UNPARSED_RECORD) else row.rest
         for row in found
-        if row.get("operation") == "index.build" and fields(row).get("path") == path
+        if row.operation == "index.build" and row.label("path") == path
     ]
 
 
@@ -334,21 +325,23 @@ def lexical_breach(answer: JsonObject, maximum: int) -> int:
     return observed
 
 
-def no_failed_builds(found: list[JsonObject]) -> None:
-    failures = [
-        record for record in found if record.get("message") == "index rebuild failed"
-    ]
+def no_failed_builds(found: list[Line]) -> None:
+    failures = [record for record in found if record.is_message("index rebuild failed")]
     require(not failures, f"index build failed: {failures}")
 
 
-def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
+def exact_degradation(found: list[Line], expected: str | None) -> None:
     reasons = [
         (
-            string_value(fields(record).get("resolver"), "dependency resolver"),
-            string_value(fields(record).get("reason"), "dependency reason"),
+            string_value(
+                record.fields(CONTEXT_DEGRADED).get("resolver"), "dependency resolver"
+            ),
+            string_value(
+                record.fields(CONTEXT_DEGRADED).get("reason"), "dependency reason"
+            ),
         )
         for record in found
-        if record.get("message") == CONTEXT_DEGRADED
+        if record.is_message(CONTEXT_DEGRADED)
     ]
     drops = sorted(
         (resolver, reason)

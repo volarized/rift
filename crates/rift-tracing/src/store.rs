@@ -32,8 +32,8 @@ use crate::record::{LOG_BATCH_RECORDS_MAX, LOG_KIND, LogRecord};
 /// finds one refuses.
 pub const METRICS_SCHEMA_VERSION: i64 = 1;
 /// How long one metrics connection waits for another's lock before `SQLite` reports the
-/// database busy. One wait fits inside the settle wait of a `rift://logs` read, and it
-/// is compiled rather than configured, so a log read never inherits a search wait.
+/// database busy. The wait is compiled rather than configured, so a log read never
+/// inherits a search wait.
 pub const METRICS_BUSY_TIMEOUT_MS: u64 = 1_000;
 /// [`METRICS_BUSY_TIMEOUT_MS`] as the duration `rusqlite` takes.
 pub(crate) const METRICS_BUSY_TIMEOUT: Duration = Duration::from_millis(METRICS_BUSY_TIMEOUT_MS);

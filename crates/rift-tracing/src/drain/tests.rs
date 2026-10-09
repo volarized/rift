@@ -7,8 +7,8 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{
-    LOG_SETTLE_TIMEOUT, LOG_WORKSPACE_QUEUE_RECORDS, LOG_WRITE_RETRY_INTERVAL, LaneProgress,
-    LogRoutes, LogSettlement, RunningLogDrain, caused_by, workspace_of, write_retained,
+    LOG_WORKSPACE_QUEUE_RECORDS, LOG_WRITE_RETRY_INTERVAL, LaneProgress, LogRoutes, LogSettlement,
+    RunningLogDrain, caused_by, workspace_of, write_retained,
 };
 use crate::{LOG_QUEUE_RECORDS, LogDrain, LogQuery, LogRecord, LogStore, log_capture};
 
@@ -22,7 +22,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(4);
 const THREAD_WAIT_MAX: Duration = Duration::from_secs(10);
 
 #[tokio::test(start_paused = true)]
-async fn accepted_flush_interval_drives_batch_collection_and_reads_can_flush_early() {
+async fn accepted_flush_interval_drives_batch_collection_and_shutdown_can_flush_early() {
     let interval = Duration::from_millis(17);
     let (sink, drain) = crate::capture::log_capture_with(super::LogDeliveryOptions {
         flush_interval: interval,
@@ -44,28 +44,13 @@ async fn accepted_flush_interval_drives_batch_collection_and_reads_can_flush_ear
     assert_eq!(
         started.elapsed(),
         Duration::ZERO,
-        "a read requests an immediate flush"
+        "shutdown requests an immediate flush"
     );
     cancellation.cancel();
     assert!(matches!(
         drain.wait_for_flush(&cancellation).await,
         super::FlushReady::Cancelled
     ));
-}
-
-#[tokio::test(start_paused = true)]
-async fn accepted_settlement_timeout_bounds_the_dispatchers_unwritten_record() {
-    let timeout = Duration::from_millis(23);
-    let (sink, _drain) = crate::capture::log_capture_with(super::LogDeliveryOptions {
-        settle_timeout: timeout,
-        ..super::LogDeliveryOptions::default()
-    });
-    sink.settlement.draining.store(true, Ordering::SeqCst);
-    sink.send(record("unwritten"));
-    let _subscriber = tracing::subscriber::set_default(crate::capture::registry().with(sink));
-    let started = tokio::time::Instant::now();
-    super::settle_for_read("/workspace").await;
-    assert_eq!(started.elapsed(), timeout);
 }
 
 #[tokio::test(start_paused = true)]
@@ -109,12 +94,6 @@ fn settlement(accepted: u64, written_through: u64, draining: bool) -> LogSettlem
     }
 }
 
-/// One read's wait on `lane`, under the bound every `rift://logs` read keeps.
-async fn settle_for_read(lane: &LogSettlement) {
-    lane.settle_by(tokio::time::Instant::now() + LOG_SETTLE_TIMEOUT)
-        .await;
-}
-
 /// Drains what the queue currently holds, without a store.
 fn queued(drain: &mut LogDrain) -> Vec<LogRecord> {
     std::iter::from_fn(|| drain.try_recv_record().ok()).collect()
@@ -149,38 +128,41 @@ fn count(store: &LogStore) -> u64 {
         .expect("the count reads")
 }
 
-/// A process that installed no drain waits for nothing. Every command but the
-/// foreground server records through no lane, and a log read there must not pay the
-/// bound.
+/// Shutdown proceeds immediately when no drain is running.
 #[tokio::test(start_paused = true)]
-async fn a_read_waits_for_a_drain_that_is_not_running() {
+async fn a_lane_without_a_running_drain_settles_immediately() {
     let started = tokio::time::Instant::now();
-    settle_for_read(&settlement(4, 0, false)).await;
+    settlement(4, 0, false)
+        .settle_by(started + STOP_DEADLINE)
+        .await;
     assert_eq!(
         tokio::time::Instant::now(),
         started,
-        "a read with no drain behind it waits for nothing"
+        "a lane without a running drain waits for nothing"
     );
 }
 
-/// A settled queue costs a read nothing.
+/// Shutdown proceeds immediately once the lane is settled.
 #[tokio::test(start_paused = true)]
-async fn a_read_over_a_settled_queue_waits_for_nothing() {
+async fn a_settled_lane_waits_for_nothing() {
     let started = tokio::time::Instant::now();
-    settle_for_read(&settlement(4, 4, true)).await;
+    settlement(4, 4, true)
+        .settle_by(started + STOP_DEADLINE)
+        .await;
     assert_eq!(tokio::time::Instant::now(), started);
 }
 
-/// A drain that stops settling still lets the read through, at the bound. A log read
-/// never hangs because the log lane is stuck.
+/// A stalled lane releases shutdown at the caller's deadline.
 #[tokio::test(start_paused = true)]
-async fn a_read_past_the_settle_bound_still_answers() {
+async fn a_stalled_lane_releases_shutdown_at_its_deadline() {
     let started = tokio::time::Instant::now();
-    settle_for_read(&settlement(4, 1, true)).await;
+    settlement(4, 1, true)
+        .settle_by(started + STOP_DEADLINE)
+        .await;
     assert_eq!(
         tokio::time::Instant::now() - started,
-        LOG_SETTLE_TIMEOUT,
-        "the read answers at the bound"
+        STOP_DEADLINE,
+        "shutdown continues at its deadline"
     );
 }
 
@@ -258,10 +240,9 @@ async fn the_lane_finishes_with_exactly_the_records_it_took() {
     );
 }
 
-/// A read whose own record the full queue dropped still answers. The sequence it waits
-/// on never reaches the drain, so the lane's finished count is what releases it.
+/// A dropped record cannot hold shutdown after the lane finishes its accepted records.
 #[tokio::test(start_paused = true)]
-async fn a_dropped_record_does_not_hold_a_read() {
+async fn a_dropped_record_does_not_hold_shutdown() {
     let (sink, _drain) = log_capture();
     sink.settlement.draining.store(true, Ordering::SeqCst);
     for index in 0..=LOG_QUEUE_RECORDS {
@@ -275,19 +256,17 @@ async fn a_dropped_record_does_not_hold_a_read() {
     let settlement = Arc::clone(&sink.settlement);
     settlement.finish_written(LOG_QUEUE_RECORDS as u64, LOG_QUEUE_RECORDS as u64);
     let started = tokio::time::Instant::now();
-    settle_for_read(&settlement).await;
+    settlement.settle_by(started + STOP_DEADLINE).await;
     assert_eq!(
         tokio::time::Instant::now(),
         started,
-        "the lane finished with every record it took, so the read does not wait"
+        "the lane finished every record it took, so shutdown does not wait"
     );
 }
 
-/// A read waits for the sequence it stamped, not for a count. A full queue drops the
-/// newest record while older ones wait, so a lane that has finished with as many records
-/// as the read stamped can still be holding the read's own record.
+/// Shutdown waits for its accepted sequence when earlier records remain unwritten.
 #[tokio::test(start_paused = true)]
-async fn a_read_waits_for_its_own_sequence_not_for_a_count() {
+async fn shutdown_waits_for_its_accepted_sequence() {
     let lane = settlement(0, 0, true);
     lane.accepted.store(10, Ordering::SeqCst);
     lane.progress.send_modify(|progress| {
@@ -295,51 +274,11 @@ async fn a_read_waits_for_its_own_sequence_not_for_a_count() {
         progress.finished = 9;
     });
     let started = tokio::time::Instant::now();
-    settle_for_read(&lane).await;
+    lane.settle_by(started + STOP_DEADLINE).await;
     assert_eq!(
         tokio::time::Instant::now() - started,
-        LOG_SETTLE_TIMEOUT,
+        STOP_DEADLINE,
         "nine records finished with does not mean sequence ten was written"
-    );
-}
-
-/// A read waits for the lane its thread's dispatcher records into, found through the
-/// filtered, optional layer a serving process installs it as. A lane built later in the
-/// same process is not that lane, and a thread whose dispatcher holds no sink waits for
-/// nothing.
-#[tokio::test(start_paused = true)]
-async fn a_read_waits_for_the_lane_its_dispatcher_records_into() {
-    let (sink, _drain) = log_capture();
-    sink.settlement.draining.store(true, Ordering::SeqCst);
-    sink.send(record("the beacon engine did not start"));
-    let (_later_sink, _later_drain) = log_capture();
-
-    let started = tokio::time::Instant::now();
-    {
-        let _without_sink = tracing::subscriber::set_default(crate::capture::registry());
-        super::settle_for_read("/workspace").await;
-    }
-    assert_eq!(
-        tokio::time::Instant::now(),
-        started,
-        "a thread whose dispatcher holds no sink waits for nothing"
-    );
-
-    let subscriber = crate::capture::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::sink)
-                .with_filter(tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with(Some(
-            sink.with_filter(tracing_subscriber::EnvFilter::new("info")),
-        ));
-    let _with_sink = tracing::subscriber::set_default(subscriber);
-    super::settle_for_read("/workspace").await;
-    assert_eq!(
-        tokio::time::Instant::now() - started,
-        LOG_SETTLE_TIMEOUT,
-        "the read waits for its own lane's unwritten record, not the later lane"
     );
 }
 
@@ -720,9 +659,7 @@ fn a_record_names_the_workspace_its_fields_or_spans_carry() {
     }
 }
 
-/// Under a routing drain, each workspace's store holds the records that name it, from a
-/// span around them or from their own field, and no other workspace's; a read in a
-/// workspace waits for that workspace's consumer. A stopped consumer leaves the routes.
+/// A stopped routing consumer flushes its own records and leaves the routes.
 #[tokio::test]
 async fn a_routing_drain_writes_each_record_into_its_own_workspace_store() {
     let (sink, drain) = log_capture();
@@ -743,8 +680,9 @@ async fn a_routing_drain_writes_each_record_into_its_own_workspace_store() {
     });
     tracing::info!(workspace = "/second", "named by its own field");
     tracing::info!("named by nothing");
-    super::settle_for_read("/first").await;
-    super::settle_for_read("/second").await;
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    assert_eq!(first.stop(deadline).await, None);
+    assert_eq!(second.stop(deadline).await, None);
 
     let first_messages = stored_messages(&first_store);
     assert!(
@@ -761,20 +699,15 @@ async fn a_routing_drain_writes_each_record_into_its_own_workspace_store() {
         "the second store holds its own record alone"
     );
 
-    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
-    assert_eq!(first.stop(deadline).await, None);
     tracing::info!(workspace = "/first", "after the first consumer stopped");
-    super::settle_for_read("/first").await;
+    assert_eq!(router.stop(deadline).await, None);
     assert!(
         !stored_messages(&first_store).contains(&"after the first consumer stopped".to_owned()),
         "a stopped consumer receives nothing"
     );
-    assert_eq!(second.stop(deadline).await, None);
-    assert_eq!(router.stop(deadline).await, None);
 }
 
-/// A record that names no workspace, or a workspace with no consumer, reaches no store,
-/// and the routing lane still finishes with it, so no read waits on it.
+/// An unassigned record reaches no store and cannot hold shutdown.
 #[tokio::test]
 async fn a_record_with_no_workspace_reaches_no_store() {
     let (sink, drain) = log_capture();
@@ -792,7 +725,6 @@ async fn a_record_with_no_workspace_reaches_no_store() {
         workspace = "/unserved",
         "named by a workspace with no consumer"
     );
-    super::settle_for_read("/served").await;
 
     let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
     assert_eq!(consumer.stop(deadline).await, None);

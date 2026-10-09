@@ -22,9 +22,7 @@ use tracing_subscriber::util::{SubscriberInitExt as _, TryInitError};
 use tracing_subscriber::{EnvFilter, Layer};
 
 use crate::capture::{LOG_QUEUE_RECORDS, LogSink, log_capture_with};
-use crate::drain::{
-    LOG_FLUSH_INTERVAL, LOG_SETTLE_TIMEOUT, LOG_WRITE_RETRY_INTERVAL, LogDeliveryOptions, LogDrain,
-};
+use crate::drain::{LOG_FLUSH_INTERVAL, LOG_WRITE_RETRY_INTERVAL, LogDeliveryOptions, LogDrain};
 use crate::flight::{FlightLayer, FlightTable, StallReport, observe_active};
 use crate::metrics::{LOGS_CARDINALITY_LIMIT_DEFAULT, ObservationGuard};
 use crate::otlp::{self, OtlpExport};
@@ -190,7 +188,6 @@ impl TracingRuntime {
                 queue_records: LOG_QUEUE_RECORDS,
                 flush_interval: LOG_FLUSH_INTERVAL,
                 retry_interval: LOG_WRITE_RETRY_INTERVAL,
-                settle_timeout: LOG_SETTLE_TIMEOUT,
             },
             cardinality_limit: LOGS_CARDINALITY_LIMIT_DEFAULT,
         }
@@ -286,13 +283,6 @@ impl TracingRuntimeBuilder {
         self
     }
 
-    /// Sets the accepted `[logs] settle_timeout` bound before a log read.
-    /// The accepted range, 1 millisecond through 1 hour, is checked by [`Self::install`].
-    pub const fn settle_timeout(mut self, timeout: Duration) -> Self {
-        self.delivery.settle_timeout = timeout;
-        self
-    }
-
     /// Sets the accepted `[logs] cardinality_limit` for each metric instrument.
     /// The accepted range, 1 through 65,536, is checked by [`Self::install`].
     pub const fn cardinality_limit(mut self, limit: u32) -> Self {
@@ -368,7 +358,6 @@ impl TracingRuntimeBuilder {
         for (field, duration) in [
             ("logs.flush_interval", self.delivery.flush_interval),
             ("logs.retry_interval", self.delivery.retry_interval),
-            ("logs.settle_timeout", self.delivery.settle_timeout),
         ] {
             if !(Duration::from_millis(1)..=Duration::from_secs(3_600)).contains(&duration) {
                 return Err(out_of_range(field, format!("{duration:?}"), "1ms..=1h"));
@@ -596,7 +585,7 @@ mod tests {
                 assert_eq!(context.get("value"), Some(&limit.to_string()));
                 assert_eq!(context.get("range").map(String::as_str), Some("1..=65536"));
             }
-            let setters: [(&str, Setter); 3] = [
+            let setters: [(&str, Setter); 2] = [
                 (
                     "logs.flush_interval",
                     super::TracingRuntimeBuilder::flush_interval,
@@ -604,10 +593,6 @@ mod tests {
                 (
                     "logs.retry_interval",
                     super::TracingRuntimeBuilder::retry_interval,
-                ),
-                (
-                    "logs.settle_timeout",
-                    super::TracingRuntimeBuilder::settle_timeout,
                 ),
             ];
             for (field, setter) in setters {
@@ -643,7 +628,6 @@ mod tests {
             .cardinality_limit(1)
             .flush_interval(super::Duration::from_millis(1))
             .retry_interval(super::Duration::from_millis(1))
-            .settle_timeout(super::Duration::from_millis(1))
             .install()?;
         assert!(drain.is_none());
         runtime.shutdown().await?;
@@ -658,7 +642,6 @@ mod tests {
             .cardinality_limit(65_536)
             .flush_interval(super::Duration::from_secs(3_600))
             .retry_interval(super::Duration::from_secs(3_600))
-            .settle_timeout(super::Duration::from_secs(3_600))
             .install()?;
         assert!(drain.is_some());
         runtime.shutdown().await?;

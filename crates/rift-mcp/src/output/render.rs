@@ -29,15 +29,13 @@
 //! at one level and indent their further lines by two. Text an answer copies, such as source,
 //! keeps its own whitespace after the indent. No blank line separates two items or two sections.
 //! The hits a relationship walk reached are written as a tree; see the `walk` module.
-//! `nodes` answers, failures, and the three resources follow the same principles; see the
-//! `nodes`, `error`, `map`, `workspace`, and `logs` modules.
+//! `nodes` answers, failures, and workspace pages follow the same principles; see the
+//! `nodes`, `error`, and `workspace` modules.
 
 mod error;
 mod facts;
 mod inline;
 mod layout;
-mod logs;
-mod map;
 mod nodes;
 mod search;
 mod symbol;
@@ -46,7 +44,6 @@ mod warning;
 mod workspace;
 
 use rift_protocol::error::ErrorData;
-use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{GetSymbolResult, NodesResult};
 use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
@@ -55,7 +52,6 @@ use super::text::{OUTPUT_TEXT_BYTES_MAX, TextError, TextWriter};
 use layout::Page;
 
 pub(crate) use error::RegisteredFailure;
-pub(crate) use logs::{LogFields, LogLine, LogsPage};
 
 /// An answer that writes itself as text.
 pub(crate) trait Render {
@@ -127,21 +123,9 @@ impl Render for RegisteredFailure<'_> {
     }
 }
 
-impl Render for WorkspaceMap {
-    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        map::answer(out, self)
-    }
-}
-
 impl Render for WorkspaceResourcePage {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         workspace::answer(out, self)
-    }
-}
-
-impl Render for LogsPage<'_> {
-    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        logs::answer(out, self)
     }
 }
 

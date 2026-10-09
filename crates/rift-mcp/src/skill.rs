@@ -214,7 +214,7 @@ fn skill_markdown(form: SkillForm) -> String {
     rendered.push('\n');
     rendered.push_str("## When a call refuses\n\n");
     rendered.push_str(
-        "Read `rift://logs` when a refusal alone does not say why; it carries the \
+        "Read `rift server logs` when a refusal alone does not say why; it carries the \
          workspace's own recorded diagnostics.\n\n",
     );
     let _ = writeln!(

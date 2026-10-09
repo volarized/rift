@@ -93,8 +93,8 @@ name = "install_cli"
 path = "tests/install_cli.rs"
 
 [[test]]
-name = "logs_resource"
-path = "tests/logs_resource.rs"
+name = "logs_cli"
+path = "tests/logs_cli.rs"
 
 [[test]]
 name = "mcp_proxy"

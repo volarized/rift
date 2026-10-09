@@ -70,8 +70,7 @@ LOG_FILTER = "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info"
 # in its file next to the report.
 EVIDENCE_TAIL_BYTES = 256 * 1024
 # Newest persisted records `rift server logs` prints. A stop writes its `database.close`
-# and `stop stage ended` records last, so they are among the newest; the corpus
-# configuration keeps `page_records = 5000`, the same count.
+# and `stop stage ended` records last, so they are among the newest.
 RECORD_TAIL = 5000
 # The newest bytes of one records file. Older bytes are replaced by a line naming
 # how many were left out.
@@ -765,14 +764,15 @@ class Client:
     async def resource(self, uri: str) -> JsonObject:
         """Select the JSON document from the SDK resource envelope.
 
-        The envelope holds one or two contents for `uri`: exactly one
-        `application/json`, and when there are two, the other is `text/plain`.
+        The map carries one `application/json` content. The workspace also
+        carries its compact `text/plain` content.
         """
         async with asyncio.timeout(self.call_seconds):
             result = await self.session.read_resource(uri)
+        expected = 1 if uri == "rift://map" else 2
         require(
-            len(result.contents) in (1, 2),
-            f"{uri}: expected one or two resource contents",
+            len(result.contents) == expected,
+            f"{uri}: expected {expected} resource contents",
         )
         texts: list[types.TextResourceContents] = []
         for content in result.contents:
@@ -1119,7 +1119,7 @@ class Server:
         ):
             parameters = StdioServerParameters(
                 command=str(self.binary),
-                args=["mcp"],
+                args=["mcp", "--output", "all"],
                 cwd=str(self.root),
                 env=environment,
             )

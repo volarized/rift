@@ -3,7 +3,6 @@ use rift_protocol::documentation::{DocumentationContext, DocumentationHit};
 use rift_protocol::error::{
     ErrorCause, ErrorCode, ErrorData, ErrorPhase, LimitEvidence, RetryDirective,
 };
-use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
     Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeId,
@@ -3359,37 +3358,6 @@ fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "\t\trift://node/rust/lib.rs@2-7#cccccccc",
             "",
             "\t\tc",
-        ],
-    );
-}
-
-#[test]
-fn a_map_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
-    let map: WorkspaceMap = serde_json::from_value(json!({
-        "revision": "3f9a1c2e",
-        "modules": [
-            {"path": "src · a", "files": 1, "symbols": 1, "children": [
-                {"path": "src · a/b: c", "files": 1, "symbols": 1}
-            ]},
-            {"path": "a:b·c", "files": 1, "symbols": 1}
-        ],
-        "hubs": [{"symbol": A_ID, "kind": "x · y", "references": 1}],
-        "module_relationships": [{"from": "a: b", "to": "a:b·c", "references": 2}],
-        "pagination": {"page_index": 0, "total_pages": 1}
-    }))
-    .expect("the map fixture deserializes");
-    golden(
-        &map,
-        &[
-            "map 3f9a1c2e",
-            "modules:",
-            "\t\"src · a\" · 1 file · 1 symbol",
-            "\t\t\"b: c\" · 1 file · 1 symbol",
-            "\ta:b·c · 1 file · 1 symbol",
-            "hubs:",
-            "\trift://symbol/rust/a.rs/A · \"x · y\" · 1 reference",
-            "module relationships:",
-            "\t\"a: b\" → a:b·c · 2 references",
         ],
     );
 }
