@@ -12,13 +12,14 @@ workspace = true
 
 [features]
 default = ["collector"]
-collector = ["dep:ignore", "dep:rift-provider", "dep:rift-syntax", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
+collector = ["dep:ignore", "dep:rift-dependency", "dep:rift-provider", "dep:rift-syntax", "dep:semver", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
 archive = ["dep:flate2", "dep:rawzip", "dep:tar", "dep:zip"]
 parallel = ["dep:rayon"]
 
 [dependencies]
 ignore = { workspace = true, optional = true }
 rift-core.workspace = true
+rift-dependency = { workspace = true, optional = true }
 rift-error.workspace = true
 rift-protocol.workspace = true
 rift-provider = { workspace = true, optional = true }
@@ -26,6 +27,7 @@ rift-ranking.workspace = true
 rift-syntax = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+semver = { workspace = true, optional = true }
 sha2.workspace = true
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-json = { workspace = true, optional = true }

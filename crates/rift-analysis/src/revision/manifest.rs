@@ -37,9 +37,10 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 26] = [
+const ANALYZED_SOURCES: [&str; 27] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
+    "crates/rift-dependency/src",
     "crates/rift-history/src/repository.rs",
     "crates/rift-index/src",
     "crates/rift-mcp/src/server.rs",
