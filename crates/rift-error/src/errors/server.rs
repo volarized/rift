@@ -75,6 +75,19 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    read_symbol_alternatives_unavailable,
+    slug = "rift.server.read_symbol_alternatives_unavailable",
+    message = "closest alternatives unavailable at the work bound {work}; required {required} work units with {remaining} remaining",
+    action = "select a language, use a shorter exact name, or raise search.symbol_alternatives_work; search.symbol_alternatives_lowercase_work reserves {lowercase_work} work units per input byte",
+    fields = {
+        lowercase_work: required(unsigned),
+        remaining: required(unsigned),
+        required: required(unsigned),
+        work: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
     read_task,
     slug = "rift.server.read_task",
     message = "workspace read task failed: {operation}",

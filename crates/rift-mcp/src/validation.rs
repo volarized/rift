@@ -820,6 +820,9 @@ impl ConfigurationState {
             .and_then(|limits| limits.with_relationships(relationships_max))
             .and_then(|limits| limits.with_revision_tree_entries(revision_tree_entries_max))
             .and_then(|limits| limits.with_read_bounds(directory_depth_max, results_max))
+            .and_then(|limits| {
+                limits.with_symbol_alternatives_configuration(&self.search_configuration())
+            })
             .and_then(|limits| limits.with_syntax_configuration(&syntax))
             .map(|limits| limits.with_large_files(large_files))
     }
@@ -861,6 +864,14 @@ impl ConfigurationState {
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_configuration() != other.source_configuration()
             || self.search_configuration().results != other.search_configuration().results
+            || self.search_configuration().symbol_alternatives_work
+                != other.search_configuration().symbol_alternatives_work
+            || self
+                .search_configuration()
+                .symbol_alternatives_lowercase_work
+                != other
+                    .search_configuration()
+                    .symbol_alternatives_lowercase_work
             || self.text_inclusion() != other.text_inclusion()
             || self.language_file_selections() != other.language_file_selections()
             || self.dependencies_configuration() != other.dependencies_configuration()
@@ -882,6 +893,8 @@ impl ConfigurationState {
             "documentation": configuration.documentation,
             "lexical": configuration.search.lexical,
             "results": configuration.search.results,
+            "symbol_alternatives_work": configuration.search.symbol_alternatives_work,
+            "symbol_alternatives_lowercase_work": configuration.search.symbol_alternatives_lowercase_work,
             "languages": configuration.languages,
             "dependencies": configuration.dependencies,
             "syntax": configuration.providers.syntax,
@@ -10773,6 +10786,34 @@ pub(crate) mod tests {
         let after = super::ConfigurationState::accept(directory.path());
         assert!(after.accepted.is_ok());
         assert!(before.index_configuration_differs(&after));
+        Ok(())
+    }
+
+    #[test]
+    fn test_symbol_alternatives_bound_changes_rebuild_index_and_change_digest() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let before = super::ConfigurationState::accept(directory.path());
+        for written in [
+            "[search]\nsymbol_alternatives_work = 327\n",
+            "[search]\nsymbol_alternatives_lowercase_work = 24\n",
+        ] {
+            fs::write(directory.path().join("rift.toml"), written)?;
+            let after = super::ConfigurationState::accept(directory.path());
+            assert!(after.accepted.is_ok());
+            assert!(before.index_configuration_differs(&after));
+            assert_ne!(
+                before.index_configuration_digest(),
+                after.index_configuration_digest()
+            );
+            let limits = after.index_limits(rift_index::WorkspaceIndexLimits::default())?;
+            if written.contains("work = 327") {
+                assert_eq!(limits.symbol_alternatives_work_max(), 327);
+                assert_eq!(limits.symbol_alternatives_lowercase_work(), 12);
+            } else {
+                assert_eq!(limits.symbol_alternatives_work_max(), 16_777_216);
+                assert_eq!(limits.symbol_alternatives_lowercase_work(), 24);
+            }
+        }
         Ok(())
     }
 

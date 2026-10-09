@@ -1330,6 +1330,11 @@ message = "workspace index is unavailable during {operation}"
 action = "resend the same request after a short delay"
 fields = { operation = { type = "string" }, detail = { type = "string" } }
 
+[error.server.read_symbol_alternatives_unavailable]
+message = "closest alternatives unavailable at the work bound {work}; required {required} work units with {remaining} remaining"
+action = "select a language, use a shorter exact name, or raise search.symbol_alternatives_work; search.symbol_alternatives_lowercase_work reserves {lowercase_work} work units per input byte"
+fields = { work = { type = "unsigned" }, lowercase_work = { type = "unsigned" }, remaining = { type = "unsigned" }, required = { type = "unsigned" } }
+
 [error.server.read_engine_answer]
 message = "the addressed content exists but its bytes cannot be served: operation {operation}, detail {detail}"
 action = "read the request again once the engine has read the served revision"

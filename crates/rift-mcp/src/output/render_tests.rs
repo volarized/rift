@@ -733,6 +733,19 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
     let entry = |name: &str, selector: (&str, &str), availability: &str| json!({"manager": "cargo", "name": name, selector.0: selector.1, "availability": availability});
     vec![
         (
+            json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": [A_ID]}),
+            "symbol_not_found · name Beacpn · alternatives rift://symbol/rust/a.rs/A: no symbols available with this name",
+        ),
+        (
+            json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": []}),
+            "symbol_not_found · name Beacpn: no symbols available with this name",
+        ),
+        (
+            json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": [],
+                "detail": "closest alternatives unavailable at the work bound"}),
+            "symbol_not_found · name Beacpn: closest alternatives unavailable at the work bound",
+        ),
+        (
             json!({"code": "documentation", "warning": {
                 "source": {"source": {"kind": "project", "path": "docs/a.md"}},
                 "stage": "extract", "kind": "malformed_source", "count": 3}}),

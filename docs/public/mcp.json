@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. `packages` names package versions the lookup reads beside the\nworkspace's own, such as an upgrade target or a package the project does not use\nyet. Use `search` when the name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. `packages` names package versions the lookup reads beside the\nworkspace's own, such as an upgrade target or a package the project does not use\nyet. A name with no match carries `symbol_not_found`, naming the lookup and\nup to three closest project declaration identities. A `global` lookup carries\nno alternatives; `all` proposes project declarations alone. A closest ranking\npast its fixed work bound leaves alternatives empty and explains why in `detail`.\nUse `search` when\nthe name is not exactly known.",
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
@@ -1353,6 +1353,41 @@
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
+                "properties": {
+                  "alternatives": {
+                    "description": "Project declaration identities the caller can use to select another name.",
+                    "items": {
+                      "$ref": "#/$defs/SymbolId"
+                    },
+                    "maxItems": 3,
+                    "type": "array"
+                  },
+                  "code": {
+                    "const": "symbol_not_found",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why closest declarations could not be selected within the work bound.\nAbsent when every selected declaration was compared or scope is `global`.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The declaration name the caller requested.",
+                    "maxLength": 4096,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "name",
+                  "alternatives"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "Documentation collection or excerpt output omitted part of a selected source.",
@@ -3970,6 +4005,41 @@
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
+                "properties": {
+                  "alternatives": {
+                    "description": "Project declaration identities the caller can use to select another name.",
+                    "items": {
+                      "$ref": "#/$defs/SymbolId"
+                    },
+                    "maxItems": 3,
+                    "type": "array"
+                  },
+                  "code": {
+                    "const": "symbol_not_found",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why closest declarations could not be selected within the work bound.\nAbsent when every selected declaration was compared or scope is `global`.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The declaration name the caller requested.",
+                    "maxLength": 4096,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "name",
+                  "alternatives"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "Documentation collection or excerpt output omitted part of a selected source.",
@@ -6971,6 +7041,41 @@
           "ReadWarning": {
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
+                "properties": {
+                  "alternatives": {
+                    "description": "Project declaration identities the caller can use to select another name.",
+                    "items": {
+                      "$ref": "#/$defs/SymbolId"
+                    },
+                    "maxItems": 3,
+                    "type": "array"
+                  },
+                  "code": {
+                    "const": "symbol_not_found",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why closest declarations could not be selected within the work bound.\nAbsent when every selected declaration was compared or scope is `global`.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The declaration name the caller requested.",
+                    "maxLength": 4096,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "name",
+                  "alternatives"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "Documentation collection or excerpt output omitted part of a selected source.",

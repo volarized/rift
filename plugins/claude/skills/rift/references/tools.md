@@ -13,7 +13,12 @@ past the project tree: `global` answers from the public declarations the
 global index holds for the workspace's dependencies alone, `all` from both,
 project hits first. `packages` names package versions the lookup reads beside the
 workspace's own, such as an upgrade target or a package the project does not use
-yet. Use `search` when the name is not exactly known.
+yet. A name with no match carries `symbol_not_found`, naming the lookup and
+up to three closest project declaration identities. A `global` lookup carries
+no alternatives; `all` proposes project declarations alone. A closest ranking
+past its fixed work bound leaves alternatives empty and explains why in `detail`.
+Use `search` when
+the name is not exactly known.
 
 Parameters:
 

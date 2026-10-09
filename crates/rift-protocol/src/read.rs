@@ -11,6 +11,11 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Most characters a declaration lookup name carries.
+pub const SYMBOL_NAME_CHARACTERS_MAX: usize = 4096;
+/// Most project declarations proposed when a lookup finds no match.
+pub const SYMBOL_ALTERNATIVES_MAX: usize = 3;
+
 /// The ASCII punctuation an identity's path keeps literal: the RFC 3986 path set less its
 /// alphanumerics, spelled in the order a regular-expression character class takes, with `-`
 /// last. `rift_core::encode_path` escapes every other byte, and that crate's own test binds
@@ -1045,6 +1050,27 @@ pub const SOURCE_WARNINGS_MAX: usize = 8;
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
 pub enum ReadWarning {
+    /// The lookup found no declaration under its name, language, and scope.
+    /// `alternatives` names up to three project declarations, ordered by the smallest
+    /// case-insensitive Unicode Levenshtein distance to their short or qualified names.
+    /// Equal distances use qualified name, then project path order. Revision reads
+    /// use that revision's declarations. A `global` lookup carries no alternatives;
+    /// an `all` lookup proposes project declarations alone. If complete closest ranking
+    /// exceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`
+    /// carries the registered failure's message, recovery action, and observed work.
+    SymbolNotFound {
+        /// The declaration name the caller requested.
+        #[schemars(length(min = 1, max = 4096))]
+        name: String,
+        /// Project declaration identities the caller can use to select another name.
+        #[schemars(length(max = 3))]
+        alternatives: Vec<SymbolId>,
+        /// Why closest declarations could not be selected within the work bound.
+        /// Absent when every selected declaration was compared or scope is `global`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 4096))]
+        detail: Option<String>,
+    },
     /// Documentation collection or excerpt output omitted part of a selected source.
     Documentation {
         /// Bounded source identity, stage, failure label, and omitted count.

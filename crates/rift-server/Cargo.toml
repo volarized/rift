@@ -21,6 +21,7 @@ workspace = true
 lsp-types.workspace = true
 percent-encoding.workspace = true
 globset.workspace = true
+rapidfuzz.workspace = true
 rift-core.workspace = true
 rift-error.workspace = true
 rift-dependency.workspace = true
@@ -73,3 +74,7 @@ path = "tests/engine_pool.rs"
 [[test]]
 name = "local_index_oracle"
 path = "tests/local_index_oracle.rs"
+
+[[test]]
+name = "symbol_alternatives"
+path = "tests/symbol_alternatives.rs"

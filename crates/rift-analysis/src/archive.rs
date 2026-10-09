@@ -225,6 +225,9 @@ impl std::error::Error for ArchiveError {}
 /// toward both byte and member bounds before the tar library interprets them. A symbolic or
 /// hard link entry is skipped rather than refused: it never becomes a file, its target is
 /// never opened, and its path is carried in [`ArchiveFiles::skipped_links`].
+/// Repeated regular files retain one file when their normalized paths and bytes match.
+/// Repeated directories and links, conflicting bytes, and file-parent collisions are refused.
+/// Every repeated member consumes the same member, decompressed-byte, and work bounds.
 ///
 /// # Errors
 /// Returns [`ArchiveError`] when the digest, paths, member types, container, or bounds fail.
@@ -378,7 +381,10 @@ fn read_zip(
     }
     metadata.set(false);
     if declared_members.get() != Some(archive.len() as u64) {
-        return Err(ArchiveError::DuplicatePath);
+        // zip has already located any prepended bytes, including ZIP64 archives.
+        let offset = usize::try_from(archive.offset()).map_err(|_| ArchiveError::InvalidArchive)?;
+        let bytes = bytes.get(offset..).ok_or(ArchiveError::InvalidArchive)?;
+        return read_repeated_zip(bytes, root, limits, expanded_max, archive.into_inner());
     }
     if archive.len() > limits.members {
         return Err(ArchiveError::MemberLimit);
@@ -388,22 +394,201 @@ fn read_zip(
         let mut entry = archive
             .by_index(index)
             .map_err(|error| zip_entry_error(&error))?;
-        if entry.is_symlink() {
+        let directory = entry.is_dir();
+        if zip_member_kind(
+            directory,
+            entry.is_symlink(),
+            entry.unix_mode().unwrap_or(0),
+        )? == ArchiveMemberKind::Link
+        {
             let path = entry.name().to_owned();
             output.push_skipped_link(&path)?;
             continue;
-        }
-        let directory = entry.is_dir();
-        let file_type = entry.unix_mode().unwrap_or(0) & 0o170_000;
-        if ![0, 0o100_000, 0o040_000].contains(&file_type) || (file_type == 0o040_000 && !directory)
-        {
-            return Err(ArchiveError::UnsupportedEntry);
         }
         let path = entry.name().to_owned();
         let size = entry.size();
         output.push(&path, directory, size, &mut entry)?;
     }
     Ok(output.into_files_and_skipped_links())
+}
+
+/// Reads every central-directory member when zip's name index collapsed repeated names.
+///
+/// The existing metadata guard has already bounded the archive. Each original record and
+/// compressed payload also consumes its remaining work budget; retained files share tar's
+/// path, member-type, byte-comparison, and decompressed-byte acceptance.
+fn read_repeated_zip(
+    bytes: &[u8],
+    root: Option<&str>,
+    limits: ArchiveLimits,
+    expanded_max: usize,
+    mut work: ZipReadGuard<'_>,
+) -> Result<ArchiveContents, ArchiveError> {
+    let archive =
+        rawzip::ZipArchive::from_slice(bytes).map_err(|_| ArchiveError::InvalidArchive)?;
+    let expected = work
+        .declared_members
+        .get()
+        .ok_or(ArchiveError::InvalidArchive)?;
+    if archive.entries_hint() != expected {
+        return Err(ArchiveError::InvalidArchive);
+    }
+    let mut entries = archive.entries();
+    let mut output = ArchiveOutput::new(root, limits, expanded_max);
+    let mut count = 0_u64;
+    while let Some(entry) = entries
+        .next_entry()
+        .map_err(|_| ArchiveError::InvalidArchive)?
+    {
+        if count >= limits.members as u64 {
+            return Err(ArchiveError::MemberLimit);
+        }
+        count += 1;
+        let (path, kind) = repeated_zip_member_metadata(bytes, &entry, &mut work)?;
+        if entry.flags().is_encrypted() {
+            return Err(ArchiveError::UnsupportedEntry);
+        }
+        let local = archive
+            .get_entry(entry.wayfinder())
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        work.charge(local.data().len())?;
+        push_repeated_zip_member(&mut output, &entry, &local, &path, kind)?;
+    }
+    if count != expected {
+        return Err(ArchiveError::InvalidArchive);
+    }
+    Ok(output.into_files_and_skipped_links())
+}
+
+/// Fixed central-directory header bytes before its bounded name, extras, and comment.
+const ZIP_CENTRAL_HEADER_BYTES: usize = 46;
+/// Byte length of a ZIP32 end-of-central-directory record without a comment.
+const ZIP_FOOTER_BYTES: usize = 22;
+/// Central-directory byte-size field in a ZIP32 end-of-central-directory record.
+const ZIP_FOOTER_DIRECTORY_SIZE: std::ops::Range<usize> = 12..16;
+/// Local-header byte-offset field in a central-directory record.
+const ZIP_CENTRAL_LOCAL_OFFSET: std::ops::Range<usize> = 42..46;
+
+/// Reuses zip's name and member-type decoding for one original central record.
+///
+/// A writer supplies an empty stored local header and footer. The original central record
+/// points to that header, so `by_index_raw` exposes CP437, UTF-8, Unicode-extra names and Unix
+/// modes without decoding payloads. Its fixed header and three u16-length fields bound the
+/// record to 196,651 bytes; generated local header and footer add 57 bytes.
+fn repeated_zip_member_metadata(
+    bytes: &[u8],
+    entry: &rawzip::ZipFileHeaderRecord<'_>,
+    work: &mut ZipReadGuard<'_>,
+) -> Result<(String, ArchiveMemberKind), ArchiveError> {
+    let length = ZIP_CENTRAL_HEADER_BYTES
+        + entry.file_path().as_ref().len()
+        + entry.extra_fields().remaining_bytes().len()
+        + entry.comment().as_bytes().len();
+    work.charge(length)?;
+    let start = usize::try_from(entry.central_directory_offset())
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    let end = start
+        .checked_add(length)
+        .ok_or(ArchiveError::InvalidArchive)?;
+    let record = bytes.get(start..end).ok_or(ArchiveError::InvalidArchive)?;
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file("entry", options)
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    let generated = writer
+        .finish()
+        .map_err(|_| ArchiveError::InvalidArchive)?
+        .into_inner();
+    let template =
+        zip::ZipArchive::new(Cursor::new(&generated)).map_err(|_| ArchiveError::InvalidArchive)?;
+    let local_bytes = usize::try_from(template.central_directory_start())
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    let mut footer = generated[generated.len() - ZIP_FOOTER_BYTES..].to_vec();
+    footer[ZIP_FOOTER_DIRECTORY_SIZE].copy_from_slice(
+        &u32::try_from(length)
+            .map_err(|_| ArchiveError::InvalidArchive)?
+            .to_le_bytes(),
+    );
+    let mut metadata = Vec::with_capacity(local_bytes + length + footer.len());
+    metadata.extend_from_slice(&generated[..local_bytes]);
+    metadata.extend_from_slice(record);
+    metadata
+        [local_bytes + ZIP_CENTRAL_LOCAL_OFFSET.start..local_bytes + ZIP_CENTRAL_LOCAL_OFFSET.end]
+        .fill(0);
+    metadata.extend_from_slice(&footer);
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(metadata)).map_err(|_| ArchiveError::InvalidArchive)?;
+    let entry = archive
+        .by_index_raw(0)
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    let kind = zip_member_kind(
+        entry.is_dir(),
+        entry.is_symlink(),
+        entry.unix_mode().unwrap_or(0),
+    )?;
+    Ok((entry.name().to_owned(), kind))
+}
+
+enum ZipCompression {
+    Stored,
+    Deflate,
+}
+
+impl ZipCompression {
+    fn from_method(method: rawzip::CompressionMethod) -> Result<Self, ArchiveError> {
+        match method {
+            rawzip::CompressionMethod::STORE => Ok(Self::Stored),
+            rawzip::CompressionMethod::DEFLATE => Ok(Self::Deflate),
+            _ => Err(ArchiveError::InvalidArchive),
+        }
+    }
+}
+
+fn push_repeated_zip_member(
+    output: &mut ArchiveOutput<'_>,
+    entry: &rawzip::ZipFileHeaderRecord<'_>,
+    local: &rawzip::ZipSliceEntry<'_>,
+    path: &str,
+    kind: ArchiveMemberKind,
+) -> Result<(), ArchiveError> {
+    let compression = ZipCompression::from_method(entry.compression_method())?;
+    if kind == ArchiveMemberKind::Link {
+        return output.push_skipped_link(path);
+    }
+    let directory = kind == ArchiveMemberKind::Directory;
+    let size = entry.uncompressed_size_hint();
+    match compression {
+        ZipCompression::Stored => {
+            let mut reader = local.verifying_reader(local.data());
+            output.push(path, directory, size, &mut reader)
+        }
+        ZipCompression::Deflate => {
+            let decoder = flate2::bufread::DeflateDecoder::new(local.data());
+            let mut reader = local.verifying_reader(decoder);
+            output.push(path, directory, size, &mut reader)
+        }
+    }
+}
+
+fn zip_member_kind(
+    directory: bool,
+    symlink: bool,
+    mode: u32,
+) -> Result<ArchiveMemberKind, ArchiveError> {
+    if symlink {
+        return Ok(ArchiveMemberKind::Link);
+    }
+    let file_type = mode & 0o170_000;
+    if ![0, 0o100_000, 0o040_000].contains(&file_type) || (file_type == 0o040_000 && !directory) {
+        return Err(ArchiveError::UnsupportedEntry);
+    }
+    Ok(if directory {
+        ArchiveMemberKind::Directory
+    } else {
+        ArchiveMemberKind::File
+    })
 }
 
 /// zip 8.6 refuses to open an encrypted member without a password before the entry exists, so
@@ -435,6 +620,15 @@ struct ZipReadGuard<'a> {
 }
 
 impl ZipReadGuard<'_> {
+    fn charge(&mut self, bytes: usize) -> Result<(), ArchiveError> {
+        self.operation().map_err(|_| ArchiveError::WorkLimit)?;
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or(ArchiveError::WorkLimit)?;
+        Ok(())
+    }
+
     fn operation(&mut self) -> std::io::Result<()> {
         if self.remaining_operations == 0 || self.refused.get().is_some() {
             if self.refused.get().is_none() {
@@ -497,11 +691,18 @@ impl Seek for ZipReadGuard<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveMemberKind {
+    File,
+    Directory,
+    Link,
+}
+
 struct ArchiveOutput<'a> {
     root: Option<&'a str>,
     limits: ArchiveLimits,
     remaining: usize,
-    seen: BTreeMap<String, bool>,
+    seen: BTreeMap<String, ArchiveMemberKind>,
     files: BTreeMap<ProjectPath, Vec<u8>>,
     skipped_links: Vec<ProjectPath>,
 }
@@ -521,7 +722,8 @@ impl<'a> ArchiveOutput<'a> {
     /// Normalizes an archive path, registers it against paths already seen, and returns the
     /// path relative to the caller's exact archive root. Shared by regular members and
     /// skipped links, so both draw duplicate-path and root-mismatch refusals from one place.
-    fn accept_path(&mut self, path: &str, directory: bool) -> Result<String, ArchiveError> {
+    fn accept_path(&mut self, path: &str, kind: ArchiveMemberKind) -> Result<String, ArchiveError> {
+        let directory = kind == ArchiveMemberKind::Directory;
         if path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| part == "..")
         {
             return Err(ArchiveError::UnsafePath);
@@ -532,15 +734,18 @@ impl<'a> ArchiveOutput<'a> {
             .collect::<Vec<_>>()
             .join("/");
         let full = ProjectPath::new(normalized).map_err(|_| ArchiveError::UnsafePath)?;
-        if self
-            .seen
-            .insert(full.as_str().to_owned(), directory)
-            .is_some()
-        {
+        let previous = self.seen.insert(full.as_str().to_owned(), kind);
+        if previous.is_some_and(|previous| {
+            previous != ArchiveMemberKind::File || kind != ArchiveMemberKind::File
+        }) {
             return Err(ArchiveError::DuplicatePath);
         }
         for (separator, _) in full.as_str().match_indices('/') {
-            if self.seen.get(&full.as_str()[..separator]) == Some(&false) {
+            if self
+                .seen
+                .get(&full.as_str()[..separator])
+                .is_some_and(|kind| *kind != ArchiveMemberKind::Directory)
+            {
                 return Err(ArchiveError::DuplicatePath);
             }
         }
@@ -577,7 +782,12 @@ impl<'a> ArchiveOutput<'a> {
         size: u64,
         reader: &mut impl Read,
     ) -> Result<(), ArchiveError> {
-        let relative = self.accept_path(path, directory)?;
+        let kind = if directory {
+            ArchiveMemberKind::Directory
+        } else {
+            ArchiveMemberKind::File
+        };
+        let relative = self.accept_path(path, kind)?;
         let size = usize::try_from(size).map_err(|_| ArchiveError::MemberLimit)?;
         if size > self.limits.member_bytes {
             return Err(ArchiveError::MemberLimit);
@@ -604,14 +814,22 @@ impl<'a> ArchiveOutput<'a> {
             return Err(ArchiveError::InvalidArchive);
         }
         self.remaining -= size;
-        self.files.insert(path, content);
+        match self.files.entry(path) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(content);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &content => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(ArchiveError::DuplicatePath);
+            }
+        }
         Ok(())
     }
 
     /// Registers a symbolic or hard link entry's path without reading its target or content.
     /// The link never becomes a file and its target is never opened.
     fn push_skipped_link(&mut self, path: &str) -> Result<(), ArchiveError> {
-        let relative = self.accept_path(path, false)?;
+        let relative = self.accept_path(path, ArchiveMemberKind::Link)?;
         if relative.is_empty() {
             return Err(ArchiveError::UnsafePath);
         }
