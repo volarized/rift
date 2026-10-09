@@ -90,7 +90,20 @@ impl<'source> PackageSyntaxSource<'source> {
             .unwrap_or_default();
         let documentation = matches!(extension, "rst" | "txt" | "ipynb");
         let provider = (!documentation)
-            .then(|| rift_syntax::registry::provider_for_extension(extension))
+            .then(|| {
+                let cpp_header = package_language == &rift_syntax::ShippedLanguage::Cpp.language()
+                    && extension.eq_ignore_ascii_case("h");
+                let angular_template = package_language
+                    == &rift_syntax::ShippedLanguage::HtmlAngular.language()
+                    && rift_syntax::ShippedLanguage::Html
+                        .definition()
+                        .matches_extension(extension);
+                if cpp_header || angular_template {
+                    rift_syntax::registry::provider_for_language(package_language)
+                } else {
+                    rift_syntax::registry::provider_for_extension(extension)
+                }
+            })
             .flatten();
         let language = provider.map_or_else(
             || crate::analyzer::source_language(extension, package_language),

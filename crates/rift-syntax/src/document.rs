@@ -407,6 +407,16 @@ fn declaration_node_kinds(
 }
 
 impl SyntaxDocument {
+    /// Adds declarations omitted by documents merged into this document.
+    pub(crate) fn with_left_out_declarations(mut self, count: usize) -> Self {
+        let facts = Arc::make_mut(&mut self.facts);
+        facts.left_out_declarations = facts
+            .left_out_declarations
+            .checked_add(count)
+            .expect("merged omitted declaration count must fit usize");
+        self
+    }
+
     pub(crate) fn with_syntax_limits(mut self, limits: crate::SyntaxLimits) -> Self {
         Arc::make_mut(&mut self.facts).syntax_limits = Some(limits);
         self

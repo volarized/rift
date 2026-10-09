@@ -109,9 +109,13 @@ const REFERENCE_DEFINITIONS_MIN: usize = 10_000;
 /// so for them this shape checks linear extraction only.
 fn wide_line(language: &Language) -> &'static str {
     match language.name.as_str() {
-        "rust" | "javascript" | "typescript" | "json" => "// wide node comment line\n",
-        "python" | "yaml" | "toml" => "# wide node comment line\n",
+        "rust" | "javascript" | "typescript" | "json" | "jsonc" | "c" | "cpp" => {
+            "// wide node comment line\n"
+        }
+        "python" | "cython" | "yaml" | "toml" => "# wide node comment line\n",
         "markdown" => "***\n\n",
+        "html" | "vue" | "svelte" => "<!-- wide node comment line -->\n",
+        "css" => "/* wide node comment line */\n",
         name => panic!(
             "a registered provider has no wide node line: language={name}, dialect={:?}",
             language.dialect
@@ -128,7 +132,8 @@ fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
         "javascript" | "typescript" => {
             Some(("/** wide node doc line */\n", "function wide() {}\n"))
         }
-        "python" | "json" | "yaml" | "toml" | "markdown" => None,
+        "python" | "json" | "jsonc" | "yaml" | "toml" | "markdown" | "html" | "css" | "vue"
+        | "svelte" | "c" | "cpp" | "cython" => None,
         name => panic!(
             "a registered provider has no attached run entry: language={name}, dialect={:?}",
             language.dialect

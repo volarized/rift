@@ -1554,6 +1554,24 @@ pub enum PackageLanguage {
     /// TypeScript declarations exclude private and protected members. A TypeScript package
     /// ships its JavaScript builds beside its declaration files.
     TypeScript,
+    /// HTML elements and attributes are public declarations.
+    Html,
+    /// Angular template elements and attributes are public declarations.
+    HtmlAngular,
+    /// CSS selectors and properties are public declarations.
+    Css,
+    /// Vue elements and script declarations are public unless marked private or protected.
+    Vue,
+    /// Svelte elements and script declarations are public unless marked private or protected.
+    Svelte,
+    /// C declarations are public.
+    C,
+    /// C++ declarations are public.
+    Cpp,
+    /// Cython names without a leading underscore count.
+    Cython,
+    /// JSONC properties are public declarations.
+    Jsonc,
 }
 
 /// Rust container kinds whose private members a `pub` container exports: a trait's
@@ -1584,6 +1602,15 @@ impl PackageLanguage {
             ShippedLanguage::Rust => Some(Self::Rust),
             ShippedLanguage::Python => Some(Self::Python),
             ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => Some(Self::TypeScript),
+            ShippedLanguage::Html => Some(Self::Html),
+            ShippedLanguage::HtmlAngular => Some(Self::HtmlAngular),
+            ShippedLanguage::Css => Some(Self::Css),
+            ShippedLanguage::Vue => Some(Self::Vue),
+            ShippedLanguage::Svelte => Some(Self::Svelte),
+            ShippedLanguage::C => Some(Self::C),
+            ShippedLanguage::Cpp => Some(Self::Cpp),
+            ShippedLanguage::Cython => Some(Self::Cython),
+            ShippedLanguage::Jsonc => Some(Self::Jsonc),
             ShippedLanguage::JavaScript
             | ShippedLanguage::Markdown
             | ShippedLanguage::Json
@@ -1596,12 +1623,37 @@ impl PackageLanguage {
     pub(crate) const fn source_languages(self) -> &'static [ShippedLanguage] {
         match self {
             Self::Rust => &[ShippedLanguage::Rust],
-            Self::Python => &[ShippedLanguage::Python],
+            Self::Python => &[ShippedLanguage::Python, ShippedLanguage::Cython],
             Self::TypeScript => &[
                 ShippedLanguage::JavaScript,
                 ShippedLanguage::TypeScript,
                 ShippedLanguage::TypeScriptTsx,
+                ShippedLanguage::Html,
+                ShippedLanguage::Css,
+                ShippedLanguage::Vue,
+                ShippedLanguage::Svelte,
             ],
+            Self::Html | Self::HtmlAngular => &[ShippedLanguage::Html, ShippedLanguage::Css],
+            Self::Css => &[ShippedLanguage::Css],
+            Self::Vue => &[
+                ShippedLanguage::Vue,
+                ShippedLanguage::Html,
+                ShippedLanguage::Css,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+            ],
+            Self::Svelte => &[
+                ShippedLanguage::Svelte,
+                ShippedLanguage::Html,
+                ShippedLanguage::Css,
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+            ],
+            Self::C | Self::Cpp => &[ShippedLanguage::C, ShippedLanguage::Cpp],
+            Self::Cython => &[ShippedLanguage::Cython, ShippedLanguage::Python],
+            Self::Jsonc => &[ShippedLanguage::Jsonc],
         }
     }
 
@@ -1619,11 +1671,12 @@ impl PackageLanguage {
                     }),
                 _ => false,
             },
-            Self::Python => !symbol.name.starts_with('_'),
-            Self::TypeScript => !symbol
+            Self::Python | Self::Cython => !symbol.name.starts_with('_'),
+            Self::TypeScript | Self::Vue | Self::Svelte => !symbol
                 .visibility
                 .as_deref()
                 .is_some_and(|visibility| matches!(visibility, "private" | "protected")),
+            Self::Html | Self::HtmlAngular | Self::Css | Self::C | Self::Cpp | Self::Jsonc => true,
         }
     }
 }

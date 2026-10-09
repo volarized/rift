@@ -2,7 +2,7 @@
 //!
 //! Two publications are comparable only when the analyzer that produced them is the same,
 //! so the revision has to change whenever the analysis would. The manifest states what
-//! the analysis depends on - each shipped grammar's package version and checksum, and the
+//! the analysis depends on - each shipped grammar's package version, resolved source, and checksum, and the
 //! content digest of the extraction, normalization, identity, and document-builder source
 //! - and [`analyzer_revision`](crate::analyzer_revision) is the digest of that document.
 //!
@@ -32,11 +32,12 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 /// The source the analysis depends on, relative to the repository root. A directory
 /// stands for every `.rs` file below it, because a publication's content is decided by
 /// the whole crate: which node a grammar calls a declaration, which name it exports, and
-/// how a record is normalized and addressed.
+/// how a record is normalized and addressed. Vendored grammar inputs are named individually
+/// so generated C, headers, grammar metadata, and the package binding are also pinned.
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 12] = [
+const ANALYZED_SOURCES: [&str; 26] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
     "crates/rift-history/src/repository.rs",
@@ -49,6 +50,20 @@ const ANALYZED_SOURCES: [&str; 12] = [
     "crates/rift-ranking/src",
     "crates/rift-server/src/read.rs",
     "crates/rift-syntax/src",
+    "vendor/tree-sitter-angular/Cargo.toml",
+    "vendor/tree-sitter-angular/bindings/rust",
+    "vendor/tree-sitter-angular/grammar.js",
+    "vendor/tree-sitter-angular/src/grammar.json",
+    "vendor/tree-sitter-angular/src/node-types.json",
+    "vendor/tree-sitter-angular/src/parser.c",
+    "vendor/tree-sitter-angular/src/scanner.c",
+    "vendor/tree-sitter-angular/src/html.scanner.c",
+    "vendor/tree-sitter-angular/src/tag.h",
+    "vendor/tree-sitter-angular/src/html.tag.h",
+    "vendor/tree-sitter-angular/src/tree_sitter/alloc.h",
+    "vendor/tree-sitter-angular/src/tree_sitter/array.h",
+    "vendor/tree-sitter-angular/src/tree_sitter/parser.h",
+    "vendor/tree-sitter-angular/src/tree_sitter/html.parser.h",
 ];
 
 /// The extension every analyzed source file carries.
@@ -67,6 +82,8 @@ struct GrammarPin {
     version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     checksum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 
 /// One analyzed source file and the digest of its bytes.
@@ -209,6 +226,7 @@ fn grammar_pins(lockfile: &str) -> Vec<GrammarPin> {
                 name: String::new(),
                 version: String::new(),
                 checksum: None,
+                source: None,
             });
             continue;
         }
@@ -221,6 +239,8 @@ fn grammar_pins(lockfile: &str) -> Vec<GrammarPin> {
             pin.version = value;
         } else if let Some(value) = quoted_value(line, "checksum") {
             pin.checksum = Some(value);
+        } else if let Some(value) = quoted_value(line, "source") {
+            pin.source = Some(value);
         }
     }
     push_grammar(&mut pins, current);
@@ -381,6 +401,10 @@ mod tests {
             "crates/rift-syntax/src/rust.rs",
             "crates/rift-syntax/src/rust/attachment.rs",
             "crates/rift-syntax/src/typescript.rs",
+            "vendor/tree-sitter-angular/src/parser.c",
+            "vendor/tree-sitter-angular/src/scanner.c",
+            "vendor/tree-sitter-angular/src/node-types.json",
+            "vendor/tree-sitter-angular/bindings/rust/lib.rs",
         ] {
             assert!(
                 paths.contains(&expected),
@@ -431,10 +455,7 @@ checksum = \"def\"\n";
         .expect("the lockfile is written");
         for named in super::ANALYZED_SOURCES {
             let named_path = std::path::Path::new(named);
-            let path = if named_path
-                .extension()
-                .is_some_and(|extension| extension == "rs")
-            {
+            let path = if named_path.extension().is_some() {
                 root.path().join(named)
             } else {
                 root.path().join(named).join("probe.rs")
@@ -512,6 +533,40 @@ checksum = \"def\"\n";
             assert_ne!(previous, current, "{source} must invalidate local reuse");
             previous = current;
         }
+    }
+
+    #[test]
+    fn changed_vendored_grammar_inputs_change_analyzer_identity() {
+        let root = manifest_root("0.27.0");
+        let mut previous = super::render_analyzer_manifest(root.path()).expect("manifest");
+        for source in super::ANALYZED_SOURCES
+            .iter()
+            .filter(|source| source.starts_with("vendor/"))
+        {
+            let path = root.path().join(source);
+            let path = if path.is_dir() {
+                path.join("probe.rs")
+            } else {
+                path
+            };
+            std::fs::write(path, "changed grammar input").expect("changed vendor input");
+            let current = super::render_analyzer_manifest(root.path()).expect("manifest");
+            assert_ne!(previous, current, "{source} must invalidate syntax reuse");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn git_grammar_revision_is_pinned_independently_of_package_version() {
+        let lockfile = "[[package]]\nname = \"tree-sitter-cython\"\nversion = \"1.2.0\"\nsource = \"git+https://github.com/b0o/tree-sitter-cython#756a20c4\"\n";
+        let first = grammar_pins(lockfile);
+        let changed = grammar_pins(&lockfile.replace("756a20c4", "changed"));
+        assert_eq!(first[0].version, changed[0].version);
+        assert_ne!(first[0].source, changed[0].source);
+        assert_eq!(
+            first[0].source.as_deref(),
+            Some("git+https://github.com/b0o/tree-sitter-cython#756a20c4")
+        );
     }
 
     #[test]

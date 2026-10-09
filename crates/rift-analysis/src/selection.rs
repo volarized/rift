@@ -309,6 +309,63 @@ mod tests {
     }
 
     #[test]
+    fn native_and_web_package_sources_keep_case_and_refuse_unknown_extensions() {
+        let cases = [
+            (
+                PackageLanguage::TypeScript,
+                &[
+                    "index.TS",
+                    "client.VUE",
+                    "client.SVELTE",
+                    "client.HTML",
+                    "client.CSS",
+                ][..],
+            ),
+            (
+                PackageLanguage::Cpp,
+                &["client.H", "client.HPP", "client.CPP", "base.C"][..],
+            ),
+            (PackageLanguage::C, &["client.H", "client.C"][..]),
+            (
+                PackageLanguage::Cython,
+                &["client.PYX", "client.PXD", "client.PXI", "client.PY"][..],
+            ),
+            (
+                PackageLanguage::Python,
+                &["client.PY", "client.PYX", "client.PXD", "client.PXI"][..],
+            ),
+            (PackageLanguage::Jsonc, &["settings.JSONC"][..]),
+            (
+                PackageLanguage::HtmlAngular,
+                &["client.HTML", "client.CSS"][..],
+            ),
+            (
+                PackageLanguage::Vue,
+                &["client.VUE", "client.CSS", "client.TS"][..],
+            ),
+            (
+                PackageLanguage::Svelte,
+                &["client.SVELTE", "client.CSS", "client.TS"][..],
+            ),
+            (PackageLanguage::Html, &["client.HTML", "client.CSS"][..]),
+            (PackageLanguage::Css, &["client.CSS"][..]),
+        ];
+        for (language, expected) in cases {
+            let mut candidates = expected.to_vec();
+            candidates.extend([
+                "client.unknown",
+                "node_modules/client.CSS",
+                "target/client.CPP",
+            ]);
+            let files = selected(language, &[], &candidates);
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(names(files.source()), expected, "{language:?}");
+            assert!(files.documentation().is_empty());
+        }
+    }
+
+    #[test]
     fn test_an_invalid_exclude_pattern_is_refused() {
         let documentation = DocumentationSelection::new(&DocumentationConfiguration::default())
             .expect("the default documentation selection compiles");

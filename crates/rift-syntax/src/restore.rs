@@ -106,6 +106,14 @@ fn grammar(shipped: ShippedLanguage) -> &'static tree_sitter::Language {
     static JSON: OnceLock<tree_sitter::Language> = OnceLock::new();
     static YAML: OnceLock<tree_sitter::Language> = OnceLock::new();
     static TOML: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static HTML: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static ANGULAR: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static CSS: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static VUE: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static SVELTE: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static C: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static CPP: OnceLock<tree_sitter::Language> = OnceLock::new();
+    static CYTHON: OnceLock<tree_sitter::Language> = OnceLock::new();
     static PYTHON: OnceLock<tree_sitter::Language> = OnceLock::new();
 
     match shipped {
@@ -120,7 +128,17 @@ fn grammar(shipped: ShippedLanguage) -> &'static tree_sitter::Language {
             TSX.get_or_init(|| crate::TypeScriptDialect::Tsx.grammar())
         }
         ShippedLanguage::Markdown => MARKDOWN.get_or_init(crate::markdown::markdown_grammar),
-        ShippedLanguage::Json => JSON.get_or_init(crate::json::json_grammar),
+        ShippedLanguage::Json | ShippedLanguage::Jsonc => {
+            JSON.get_or_init(crate::json::json_grammar)
+        }
+        ShippedLanguage::Html => HTML.get_or_init(crate::html::html_grammar),
+        ShippedLanguage::HtmlAngular => ANGULAR.get_or_init(crate::web_component::angular_grammar),
+        ShippedLanguage::Css => CSS.get_or_init(crate::css::css_grammar),
+        ShippedLanguage::Vue => VUE.get_or_init(crate::web_component::vue_grammar),
+        ShippedLanguage::Svelte => SVELTE.get_or_init(crate::web_component::svelte_grammar),
+        ShippedLanguage::C => C.get_or_init(|| crate::native::grammar(shipped)),
+        ShippedLanguage::Cpp => CPP.get_or_init(|| crate::native::grammar(shipped)),
+        ShippedLanguage::Cython => CYTHON.get_or_init(|| crate::native::grammar(shipped)),
         ShippedLanguage::Yaml => YAML.get_or_init(crate::yaml::yaml_grammar),
         ShippedLanguage::Toml => TOML.get_or_init(crate::toml::toml_grammar),
         ShippedLanguage::Python => PYTHON.get_or_init(|| tree_sitter_python::LANGUAGE.into()),
@@ -141,7 +159,7 @@ impl SyntaxNames {
     /// Returns the provider's kind word when the provider defines it.
     #[must_use]
     pub fn symbol_kind(&self, name: &str) -> Option<&'static str> {
-        match self.shipped {
+        let base = match self.shipped {
             ShippedLanguage::Rust => crate::rust::restored_symbol_kind(name),
             ShippedLanguage::JavaScript => {
                 crate::ecmascript::restored_symbol_kind(crate::javascript::javascript_kinds(), name)
@@ -154,20 +172,71 @@ impl SyntaxNames {
                 crate::ecmascript::restored_symbol_kind(crate::TypeScriptDialect::Tsx.kinds(), name)
             }
             ShippedLanguage::Markdown => crate::markdown::restored_symbol_kind(name),
-            ShippedLanguage::Json => crate::json::restored_symbol_kind(name),
+            ShippedLanguage::Json | ShippedLanguage::Jsonc => {
+                crate::json::restored_symbol_kind(name)
+            }
+            ShippedLanguage::Html => {
+                crate::html::restored_symbol_kind(name).or_else(|| embedded_symbol_kind(name))
+            }
+            ShippedLanguage::Css => crate::css::restored_symbol_kind(name),
+            ShippedLanguage::HtmlAngular | ShippedLanguage::Vue | ShippedLanguage::Svelte => {
+                crate::web_component::restored_symbol_kind(name)
+                    .or_else(|| embedded_symbol_kind(name))
+            }
+            ShippedLanguage::C | ShippedLanguage::Cpp | ShippedLanguage::Cython => {
+                crate::native::restored_symbol_kind(name)
+            }
             ShippedLanguage::Yaml => crate::yaml::restored_symbol_kind(name),
             ShippedLanguage::Toml => crate::toml::restored_symbol_kind(name),
             ShippedLanguage::Python => crate::python::restored_symbol_kind(name),
-        }
+        };
+        base.or_else(|| match self.shipped {
+            ShippedLanguage::Html
+            | ShippedLanguage::HtmlAngular
+            | ShippedLanguage::Css
+            | ShippedLanguage::Vue
+            | ShippedLanguage::Svelte
+            | ShippedLanguage::JavaScript
+            | ShippedLanguage::TypeScript
+            | ShippedLanguage::TypeScriptTsx => crate::tailwind::restored_symbol_kind(name),
+            _ => None,
+        })
     }
 
     /// Returns a named grammar node kind, or `None` for an unknown spelling.
     #[must_use]
     pub fn node_kind(&self, name: &str) -> Option<&'static str> {
-        let id = self.grammar.id_for_node_kind(name, true);
-        self.grammar
-            .node_kind_for_id(id)
-            .filter(|kind| *kind == name)
+        let native = grammar_node_kind(self.grammar, name);
+        if native.is_some() {
+            return native;
+        }
+        self.embedded_languages()
+            .iter()
+            .find_map(|shipped| grammar_node_kind(grammar(*shipped), name))
+    }
+
+    fn embedded_languages(&self) -> &'static [ShippedLanguage] {
+        match self.shipped {
+            ShippedLanguage::Html
+            | ShippedLanguage::HtmlAngular
+            | ShippedLanguage::Vue
+            | ShippedLanguage::Svelte => &[
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::Css,
+            ],
+            ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => {
+                &[ShippedLanguage::HtmlAngular]
+            }
+            _ => &[],
+        }
+    }
+
+    fn accepts_embedded_language(&self, language: &Language) -> bool {
+        let Some(other) = Self::new(language) else {
+            return false;
+        };
+        self.embedded_languages().contains(&other.shipped)
     }
 
     pub(crate) fn grammar(&self) -> &'static tree_sitter::Language {
@@ -258,12 +327,15 @@ fn text(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
 
 fn validate_signature(
     signature: &rift_protocol::read::Signature,
+    names: &SyntaxNames,
     language: &Language,
     limits: SyntaxLimits,
 ) -> Result<(), RiftError> {
     text(&signature.display, limits)?;
     // The shared syntax walk emits source headers; semantic fields are derived later.
-    if signature.language != *language
+    let language_valid =
+        signature.language == *language || names.accepts_embedded_language(&signature.language);
+    if !language_valid
         || !signature.links.is_empty()
         || signature.receiver.is_some()
         || !signature.parameters.is_empty()
@@ -319,7 +391,7 @@ fn validate_symbol(
         text(&documentation.text, limits)?;
     }
     for signature in symbol.signatures.iter() {
-        validate_signature(signature, language, limits)?;
+        validate_signature(signature, names, language, limits)?;
     }
     ordered(symbol.documentation_ranges.iter().copied())?;
     Ok(())
@@ -529,4 +601,20 @@ impl SyntaxFacts {
         }
         Ok(Self::restored(parts, limits))
     }
+}
+
+fn embedded_symbol_kind(name: &str) -> Option<&'static str> {
+    crate::ecmascript::restored_symbol_kind(crate::javascript::javascript_kinds(), name)
+        .or_else(|| {
+            crate::ecmascript::restored_symbol_kind(
+                crate::TypeScriptDialect::TypeScript.kinds(),
+                name,
+            )
+        })
+        .or_else(|| crate::css::restored_symbol_kind(name))
+}
+
+fn grammar_node_kind(grammar: &'static tree_sitter::Language, name: &str) -> Option<&'static str> {
+    let id = grammar.id_for_node_kind(name, true);
+    grammar.node_kind_for_id(id).filter(|kind| *kind == name)
 }

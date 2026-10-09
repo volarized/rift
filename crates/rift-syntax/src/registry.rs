@@ -172,7 +172,9 @@ mod tests {
             source_file_extensions(),
             [
                 "rs", "js", "jsx", "mjs", "cjs", "ts", "mts", "cts", "tsx", "md", "markdown",
-                "mdx", "json", "yaml", "yml", "toml", "py", "pyi"
+                "mdx", "json", "yaml", "yml", "toml", "py", "pyi", "html", "htm", "css", "vue",
+                "svelte", "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "pyx",
+                "pxd", "pxi", "jsonc"
             ]
         );
     }

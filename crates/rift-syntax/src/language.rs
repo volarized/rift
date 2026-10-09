@@ -37,6 +37,24 @@ pub enum ShippedLanguage {
     Markdown,
     /// JSON.
     Json,
+    /// HTML elements, scripts, and styles.
+    Html,
+    /// Angular templates selected explicitly by their component context.
+    HtmlAngular,
+    /// CSS stylesheets.
+    Css,
+    /// Vue single-file components.
+    Vue,
+    /// Svelte components.
+    Svelte,
+    /// C implementation files and default headers.
+    C,
+    /// C++ implementation files and explicitly selected headers.
+    Cpp,
+    /// Cython sources, declarations, and includes.
+    Cython,
+    /// JSON with comments under an independent provider identity.
+    Jsonc,
     /// YAML.
     Yaml,
     /// TOML.
@@ -59,6 +77,15 @@ impl ShippedLanguage {
             Self::Yaml => ("yaml", None),
             Self::Toml => ("toml", None),
             Self::Python => ("python", None),
+            Self::Html => ("html", None),
+            Self::HtmlAngular => ("html", Some("angular")),
+            Self::Css => ("css", None),
+            Self::Vue => ("vue", None),
+            Self::Svelte => ("svelte", None),
+            Self::C => ("c", None),
+            Self::Cpp => ("cpp", None),
+            Self::Cython => ("cython", None),
+            Self::Jsonc => ("jsonc", None),
         };
         Language {
             name: name.to_owned(),
@@ -124,6 +151,15 @@ pub fn definitions() -> &'static [&'static dyn LanguageDefinition] {
         &YamlDefinition,
         &TomlDefinition,
         &PythonDefinition,
+        &HtmlDefinition,
+        &AngularDefinition,
+        &CssDefinition,
+        &VueDefinition,
+        &SvelteDefinition,
+        &CDefinition,
+        &CppDefinition,
+        &CythonDefinition,
+        &JsoncDefinition,
     ]
 }
 
@@ -379,5 +415,137 @@ mod tests {
             ShippedLanguage::TypeScript.language().identity_segment(),
             "typescript"
         );
+    }
+}
+
+#[derive(Debug)]
+struct HtmlDefinition;
+impl LanguageDefinition for HtmlDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Html
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["html", "htm"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::HtmlSyntaxProvider::default())
+    }
+}
+
+#[derive(Debug)]
+struct AngularDefinition;
+impl LanguageDefinition for AngularDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::HtmlAngular
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &[]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::web_component::AngularSyntaxProvider::default())
+    }
+}
+
+#[derive(Debug)]
+struct CssDefinition;
+impl LanguageDefinition for CssDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Css
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["css"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::CssSyntaxProvider::default())
+    }
+}
+
+#[derive(Debug)]
+struct VueDefinition;
+impl LanguageDefinition for VueDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Vue
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["vue"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::web_component::VueSyntaxProvider::default())
+    }
+}
+
+#[derive(Debug)]
+struct SvelteDefinition;
+impl LanguageDefinition for SvelteDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Svelte
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["svelte"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::web_component::SvelteSyntaxProvider::default())
+    }
+}
+
+#[derive(Debug)]
+struct CDefinition;
+impl LanguageDefinition for CDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::C
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["c", "h"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::native::NativeSyntaxProvider::new(ShippedLanguage::C))
+    }
+}
+
+#[derive(Debug)]
+struct CppDefinition;
+impl LanguageDefinition for CppDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Cpp
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::native::NativeSyntaxProvider::new(
+            ShippedLanguage::Cpp,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct CythonDefinition;
+impl LanguageDefinition for CythonDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Cython
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["pyx", "pxd", "pxi"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(crate::native::NativeSyntaxProvider::new(
+            ShippedLanguage::Cython,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct JsoncDefinition;
+impl LanguageDefinition for JsoncDefinition {
+    fn shipped(&self) -> ShippedLanguage {
+        ShippedLanguage::Jsonc
+    }
+    fn extensions(&self) -> &'static [&'static str] {
+        &["jsonc"]
+    }
+    fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
+        Box::new(JsonSyntaxProvider::with_language(
+            ShippedLanguage::Jsonc.language(),
+        ))
     }
 }
