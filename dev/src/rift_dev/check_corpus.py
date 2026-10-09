@@ -127,6 +127,8 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
+# `SYNTAX_FILE_BYTES_DEFAULT`; the corpus preserves the syntax provider's defaults.
+SYNTAX_FILE_BYTES = 4 << 20
 STARTUP_PUBLICATION = "the startup index publication"
 CONFIGURATION = (
     f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
@@ -496,7 +498,7 @@ class Corpus:
                     )
                 await self.symbols(client, candidates)
                 await self.lexical_persistence(client)
-                await self.oversized(client)
+                await self.oversized(client, server)
                 await self.unparsed(client, server)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
@@ -577,7 +579,7 @@ class Corpus:
             for path in candidates
         )
 
-    async def oversized(self, client: Client) -> None:
+    async def oversized(self, client: Client, server: Server) -> None:
         """Search the pinned oversized file past its first chunk under the default `split`.
 
         The file is past `[search.text] max_chunk`, so the index holds its text as chunks.
@@ -601,7 +603,31 @@ class Corpus:
             },
         )
         named = chunked_answer(answer, path, len(data), offset)
-        require(not named, f"{path}: named by {named} although split holds it whole")
+        if self.pin.name == "bun":
+            workspace = await client.resource("rift://workspace")
+            claimed = [
+                row
+                for row in objects(workspace, "languages")
+                if row.get("language") == "c"
+            ]
+            require(
+                len(claimed) == 1
+                and claimed[0].get("enabled") is True
+                and claimed[0].get("syntax") is True,
+                "Bun's pinned C source must have an enabled syntax provider",
+            )
+            require(
+                named == ["large_file_unparsed"],
+                f"{path}: named by {named}, expected large_file_unparsed alone",
+            )
+            found = await observed(
+                server, "index", lambda rows: bool(build_records(rows, path))
+            )
+            held_unparsed_records(found, path, len(data), SYNTAX_FILE_BYTES)
+        else:
+            require(
+                not named, f"{path}: named by {named} although split holds it whole"
+            )
         self.record(
             "oversized", path=path, bytes=len(data), pattern=token, offset=offset
         )
@@ -1273,6 +1299,44 @@ async def logged(server: Server, component: str) -> list[Line]:
     arguments = ["server", "logs", "--tail", "all", "--component", component]
     text = await asyncio.to_thread(server.read_logs, arguments)
     return records(text)
+
+
+def held_unparsed_records(
+    found: list[Line], path: str, size: int, maximum: int
+) -> None:
+    """Require a size refusal while the index retains the complete source text.
+
+    >>> from rift_dev.log_records import parse_line
+    >>> path = "src/jsc/bindings/sqlite/sqlite3.c"
+    >>> reason = f"Rust syntax analysis failed: cause source bytes 9508000 exceed accepted limit 4194304: path {path}; reduce source bytes below 4194304 and retry"
+    >>> line = parse_line(f'2026-10-09 17:50:00.852Z WARN rift_index::workspace::log_held_unparsed component=index operation=index.build path={path} reason="{reason}"  file held unparsed in the index')
+    >>> assert line is not None
+    >>> held_unparsed_records([line], path, 9508000, 4194304)
+    >>> held_unparsed_records([line], path, 9508000, 8388608)
+    Traceback (most recent call last):
+    ...
+    AssertionError: src/jsc/bindings/sqlite/sqlite3.c: size refusal must name 9508000 bytes and accepted limit 8388608
+    >>> held_unparsed_records([line], "other.c", 9508000, 4194304)
+    Traceback (most recent call last):
+    ...
+    AssertionError: other.c: expected held unparsed build records alone, received []
+    >>> held_unparsed_records([line], path, 9508001, 4194304)
+    Traceback (most recent call last):
+    ...
+    AssertionError: src/jsc/bindings/sqlite/sqlite3.c: size refusal must name 9508001 bytes and accepted limit 4194304
+    """
+    messages = build_records(found, path)
+    require(
+        bool(messages) and set(messages) == {HELD_UNPARSED_RECORD},
+        f"{path}: expected held unparsed build records alone, received {messages}",
+    )
+    expected = f"source bytes {size} exceed accepted limit {maximum}: path {path};"
+    for row in found:
+        if row.operation == "index.build" and row.label("path") == path:
+            require(
+                expected in row.label("reason"),
+                f"{path}: size refusal must name {size} bytes and accepted limit {maximum}",
+            )
 
 
 async def observed(
