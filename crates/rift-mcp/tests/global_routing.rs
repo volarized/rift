@@ -274,7 +274,13 @@ const CALLEE_WALK_BUDGET: &str = "5s";
 
 /// A module whose `counted` calls the standard library's `len`, the callee an outgoing
 /// walk asks the global API to name.
-const CALLEE_FILES: &[(&str, &str)] = &[("app.py", "def counted() -> int:\n    return len([1])\n")];
+const CALLEE_FILES: &[(&str, &str)] = &[
+    (
+        "pyproject.toml",
+        "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n",
+    ),
+    ("app.py", "def counted() -> int:\n    return len([1])\n"),
+];
 
 /// An outgoing walk from `caller` against a fixture holding `hold` past the request
 /// deadline: the walk answers well before the held answer would have arrived, the
@@ -343,7 +349,7 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         })
         .await?;
     let walk = json!({
-        "traversal": { "seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing" }
+        "traversal": { "seed": "rift://symbol/local/rust/walk/caller", "direction": "outgoing" }
     });
     let started = tokio::time::Instant::now();
     let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
@@ -428,7 +434,7 @@ async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
     files.push((".python-version", "3.12.3\n"));
     let (_directory, client, server_task) = served_workspace(&files, Some(configuration)).await?;
     let walk = json!({
-        "traversal": {"seed": "rift://symbol/python/app.py/counted", "direction": "outgoing"}
+        "traversal": {"seed": "rift://symbol/local/python/app/counted", "direction": "outgoing"}
     });
     let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
     assert_eq!(
@@ -2242,7 +2248,17 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
     );
     let source = global_api::CASE_SOURCE;
     let (_directory, client, server_task) =
-        served_workspace(&[("src/lib.rs", source)], Some(configuration)).await?;
+        served_workspace(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='case_pairs'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", source),
+            ],
+            Some(configuration),
+        )
+        .await?;
     for scope in ["local", "global", "all"] {
         for name in [
             "SearchHit",

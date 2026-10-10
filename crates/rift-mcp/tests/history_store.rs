@@ -28,6 +28,11 @@ const FILL_POLL: Duration = Duration::from_millis(50);
 /// file moved to `after.rs` without a byte changed.
 fn moved_workspace(root: &Path) -> TestResult {
     fs::write(root.join("rift.toml"), hermetic_search::HERMETIC_TABLES)?;
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='history_fixture'\nversion='0.1.0'\nedition='2024'\n\
+         [lib]\npath='before.rs'\n",
+    )?;
     fs::write(root.join("before.rs"), "pub fn travelled() {}\n")?;
     init(root);
     commit_all(root, "introduce travelled");
@@ -37,6 +42,11 @@ fn moved_workspace(root: &Path) -> TestResult {
     )?;
     commit_all(root, "grow travelled");
     git(root, &["mv", "before.rs", "after.rs"]);
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='history_fixture'\nversion='0.1.0'\nedition='2024'\n\
+         [lib]\npath='after.rs'\n",
+    )?;
     commit_all(root, "move travelled");
     Ok(())
 }
