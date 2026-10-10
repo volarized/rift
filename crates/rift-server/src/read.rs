@@ -3896,6 +3896,7 @@ pub fn compute() -> i32 {
     fn requested_packages_refuse_past_the_bound_and_name_a_malformed_entry() {
         let package = |name: &str| RequestedPackage {
             manager: "cargo".to_owned(),
+            registry: None,
             name: name.to_owned(),
             version: None,
         };
@@ -3933,6 +3934,7 @@ pub fn compute() -> i32 {
 
         let requested = [RequestedPackage {
             manager: "cargo".to_owned(),
+            registry: None,
             name: "serde".to_owned(),
             version: Some("1.0.228".to_owned()),
         }];
