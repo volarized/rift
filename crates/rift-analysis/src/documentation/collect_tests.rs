@@ -9,6 +9,17 @@ use rift_syntax::{
     SyntaxSource,
 };
 
+pub(super) fn canonical_symbol(language: &str, namespace: &str, qualified_name: &str) -> SymbolId {
+    let language = Language::from_identity_segment(language).expect("fixture language");
+    let identity = rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Local,
+        language,
+        vec![namespace.to_owned(), qualified_name.to_owned()],
+    )
+    .expect("fixture identity");
+    SymbolId::parse(&identity.wire_identity()).expect("canonical fixture symbol")
+}
+
 fn source(path: &str, text: &str) -> DocumentationSource {
     let (format, media_type) = match path.rsplit('.').next().expect("extension") {
         "md" => (DocumentationSourceFormat::Markdown, "text/markdown"),
@@ -151,8 +162,8 @@ fn incremental_collection_relinks_cached_candidates_after_declaration_changes() 
     let owner = source("lib.rs", "pub struct Compass;").identity;
     let rust = Language::from_identity_segment("rust").expect("Rust language");
     let python = Language::from_identity_segment("python").expect("Python language");
-    let rust_symbol = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
-    let python_symbol = SymbolId(rift_core::symbol_identity("python", "lib.rs", "Compass"));
+    let rust_symbol = canonical_symbol("rust", "lib.rs", "Compass");
+    let python_symbol = canonical_symbol("python", "lib.rs", "Compass");
     let rust_declaration = DocumentationDeclaration::new(
         &rust_symbol,
         &rust,
@@ -286,7 +297,7 @@ fn incremental_attached_comments_invalidate_when_syntax_facts_appear_or_disappea
         .find(|symbol| symbol.name == "Compass")
         .expect("Compass symbol");
     let language = syntax.language().clone();
-    let symbol = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
+    let symbol = canonical_symbol("rust", "lib.rs", "Compass");
     let owner = source("lib.rs", text).identity;
     let declaration = DocumentationDeclaration::new(
         &symbol,
@@ -379,8 +390,7 @@ fn package_input_at<'a>(
 }
 
 fn compass_collection(text: &str) -> (DocumentationCollection, rift_protocol::read::SymbolId) {
-    let symbol =
-        rift_protocol::read::SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
+    let symbol = canonical_symbol("rust", "lib.rs", "Compass");
     let owner = source("lib.rs", "pub struct Compass;").identity;
     let language = rift_protocol::read::Language::from_identity_segment("rust").expect("language");
     let declaration = DocumentationDeclaration::new(
@@ -399,8 +409,12 @@ fn compass_collection(text: &str) -> (DocumentationCollection, rift_protocol::re
 
 #[test]
 fn authored_declaration_links_resolve_without_selecting_or_fetching_code() {
-    let text = "Use [Compass](lib.rs#Compass), [address](rift://symbol/rust/lib.rs/Compass), and `Compass`.\n";
-    let (collection, symbol) = compass_collection(text);
+    let address = canonical_symbol("rust", "lib.rs", "Compass");
+    let text = format!(
+        "Use [Compass](lib.rs#Compass), [address]({}), and `Compass`.\n",
+        address.as_str()
+    );
+    let (collection, symbol) = compass_collection(&text);
     assert_eq!(collection.index().references.len(), 3);
     assert_eq!(collection.index().sources.len(), 1);
     for link in &collection.index().links {
@@ -919,11 +933,11 @@ fn attached_comment_blocks_keep_original_bytes_and_exact_symbol() {
         .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
         .expect("Rust syntax");
     let symbol = &syntax.symbols()[0];
-    let symbol_id = rift_protocol::read::SymbolId(rift_core::symbol_identity(
+    let symbol_id = canonical_symbol(
         &syntax.language().identity_segment(),
         path.as_str(),
         &symbol.qualified_name,
-    ));
+    );
     let identity = DocumentationContentIdentity {
         source: DocumentationSourceIdentity::Project {
             path: ProjectPath("src/lib.rs".to_owned()),
@@ -986,16 +1000,16 @@ fn attached_comment_blocks_keep_each_source_declaration() {
         .expect("second Rust syntax");
     let first_symbol = &first_syntax.symbols()[0];
     let second_symbol = &second_syntax.symbols()[0];
-    let first_symbol_id = SymbolId(rift_core::symbol_identity(
+    let first_symbol_id = canonical_symbol(
         &first_syntax.language().identity_segment(),
         first_path.as_str(),
         &first_symbol.qualified_name,
-    ));
-    let second_symbol_id = SymbolId(rift_core::symbol_identity(
+    );
+    let second_symbol_id = canonical_symbol(
         &second_syntax.language().identity_segment(),
         second_path.as_str(),
         &second_symbol.qualified_name,
-    ));
+    );
     let first_identity = source("src/first.rs", first_text).identity;
     let second_identity = source("src/second.rs", second_text).identity;
     let first_declaration = DocumentationDeclaration::new(
@@ -1065,11 +1079,11 @@ fn python_docstring_blocks_keep_exact_content_range_and_symbol() {
         .iter()
         .find(|symbol| symbol.qualified_name == "serve")
         .expect("function symbol");
-    let symbol_id = rift_protocol::read::SymbolId(rift_core::symbol_identity(
+    let symbol_id = canonical_symbol(
         &syntax.language().identity_segment(),
         path.as_str(),
         &symbol.qualified_name,
-    ));
+    );
     let identity = source("src/app.py", text).identity;
     let declaration = DocumentationDeclaration::new(
         &symbol_id,

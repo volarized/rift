@@ -1139,8 +1139,10 @@ mod tests {
         let owner = content_identity("lib.md");
         let rust = Language::from_identity_segment("rust").expect("Rust language");
         let python = Language::from_identity_segment("python").expect("Python language");
-        let rust_symbol = SymbolId(rift_core::symbol_identity("rust", "lib.md", "Compass"));
-        let python_symbol = SymbolId(rift_core::symbol_identity("python", "lib.md", "Compass"));
+        let rust_symbol =
+            super::super::collect_tests::canonical_symbol("rust", "lib.md", "Compass");
+        let python_symbol =
+            super::super::collect_tests::canonical_symbol("python", "lib.md", "Compass");
         let declarations =
             ambiguous_declarations(&owner, &rust_symbol, &python_symbol, &rust, &python);
         let initial = super::super::collect_documentation(&sources, &declarations[..1])
@@ -1230,16 +1232,13 @@ mod tests {
         let python_source = content_identity("src/python.py");
         let rust = Language::from_identity_segment("rust").expect("Rust language");
         let python = Language::from_identity_segment("python").expect("Python language");
-        let rust_symbol = SymbolId(rift_core::symbol_identity(
-            "rust",
-            "src/rust.rs",
-            "Client::open",
-        ));
-        let python_symbol = SymbolId(rift_core::symbol_identity(
+        let rust_symbol =
+            super::super::collect_tests::canonical_symbol("rust", "src/rust.rs", "Client::open");
+        let python_symbol = super::super::collect_tests::canonical_symbol(
             "python",
             "src/python.py",
             "Client::open",
-        ));
+        );
         let candidates = [
             candidate(&block_id, "open", 0, None),
             candidate(&block_id, "missing", 5, None),
