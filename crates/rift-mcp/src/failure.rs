@@ -263,9 +263,15 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             ],
         ),
         (
+            Code::ContentUnavailable,
+            Retry::OperatorAction,
+            &["rift.server.search_coverage_unavailable"],
+        ),
+        (
             Code::InternalError,
             Retry::OperatorAction,
             &[
+                "rift.analysis.package_artifact_invalid",
                 "rift.cli.update_binary_invalid",
                 "rift.cli.update_publish_copy_failed",
                 "rift.cli.update_publish_failed",
@@ -383,6 +389,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.core.contribution_too_much_evidence",
                 "rift.core.contribution_unbound_identity",
                 "rift.core.identity_invalid",
+                "rift.core.symbol_identity_invalid",
                 "rift.core.resolver_id_empty",
                 "rift.core.resolver_id_invalid_character",
                 "rift.core.resolver_id_too_long",
@@ -411,6 +418,8 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.ranking.query_quote_unterminated",
                 "rift.ranking.query_term_length",
                 "rift.server.read_invalid",
+                "rift.server.search_view_expired",
+                "rift.server.search_view_context",
             ],
         ),
         (
@@ -478,6 +487,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.history.revision_not_commit",
                 "rift.history.revision_unknown",
                 "rift.search.model_file_missing",
+                "rift.server.search_exact_release_unavailable",
             ],
         ),
         (
@@ -613,6 +623,55 @@ mod tests {
             assert!(
                 super::wire_guidance(slug).is_some(),
                 "unmapped error slug: {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_artifact_and_search_failures_keep_distinct_wire_guidance() {
+        use wire::{ErrorCode as Code, RetryDirective as Retry};
+        for (slug, code, retry) in [
+            (
+                "rift.core.symbol_identity_invalid",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+            (
+                "rift.analysis.package_artifact_invalid",
+                Code::InternalError,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_exact_release_unavailable",
+                Code::ResourceNotFound,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_coverage_unavailable",
+                Code::ContentUnavailable,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_view_expired",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+            (
+                "rift.server.search_view_context",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+        ] {
+            assert_eq!(super::wire_guidance(slug), Some((code, retry)), "{slug}");
+            assert!(errors::REGISTERED_SLUGS.contains(&slug), "{slug}");
+            assert_eq!(
+                super::WIRE_GUIDANCE
+                    .iter()
+                    .flat_map(|(_, _, slugs)| slugs.iter())
+                    .filter(|mapped| **mapped == slug)
+                    .count(),
+                1,
+                "{slug}",
             );
         }
     }

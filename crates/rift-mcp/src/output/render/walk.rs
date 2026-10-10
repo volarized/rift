@@ -303,6 +303,7 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         facets,
         to: _,
         evidence: _,
+        occurrence: _,
         derivation,
         confidence: _,
         extensions: _,
