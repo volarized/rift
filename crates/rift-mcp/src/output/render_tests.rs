@@ -110,6 +110,7 @@ fn symbol(id: Option<&str>, name: &str) -> Symbol {
         origin: SymbolOrigin {
             location: Some(SourceLocationKind::Project),
             package: None,
+            runtime: None,
             source_kind: SourceKind::Authored,
         },
         container: None,
@@ -576,6 +577,7 @@ fn warning_set() -> Vec<ReadWarning> {
         ReadWarning::PackageSubstituted {
             entry: PackageContextEntry {
                 manager: "cargo".to_owned(),
+                registry: Some("crates.io".to_owned()),
                 name: "serde".to_owned(),
                 version: Some("1.0.0".to_owned()),
                 requirement: None,
@@ -583,6 +585,7 @@ fn warning_set() -> Vec<ReadWarning> {
             },
             package: PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: "serde".to_owned(),
                 version: "1.0.1".to_owned(),
             },
@@ -885,7 +888,7 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
             "global_page_warning · warning_code unknown",
         ),
         (
-            json!({"code": "package_absent", "package": {"manager": "cargo", "name": "serde", "version": "1.0.0"}}),
+            json!({"code": "package_absent", "package": {"manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.0"}}),
             "package_absent · package serde@1.0.0 (cargo)",
         ),
         (
@@ -894,7 +897,7 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
         ),
         (
             json!({"code": "package_substituted", "entry": entry("serde", ("version", "1.0.0"), "canonical"),
-                "package": {"manager": "cargo", "name": "serde", "version": "1.0.1"}}),
+                "package": {"manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.1"}}),
             WARNING_LINES[2],
         ),
         (
@@ -972,7 +975,7 @@ fn a_warning_line_shows_one_line_per_payload_shape() {
             "detail": "left out of search"}),
         ),
         warning_line(&json!({"code": "package_absent",
-            "package": {"manager": "cargo", "name": "serde", "version": "1.0.0"}})),
+            "package": {"manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.0"}})),
         warning_line(&json!({"code": "package_requirement_absent", "entry":
             {"manager": "npm", "name": "left-pad", "requirement": "^1.3", "availability": "canonical"}})),
     ];
@@ -1295,7 +1298,7 @@ fn a_hit_without_a_place_or_matched_field_writes_no_facts_line() {
 
 #[test]
 fn a_dependency_hit_is_placed_by_its_unit() {
-    let unit = "rift://source/cargo/serde/lib.rs";
+    let unit = "rift://source/cargo/crates.io/serde@1.0.0/lib.rs";
     let with_line = SearchHit {
         unit: Some(source_unit(unit)),
         line: Some(3),
@@ -1311,10 +1314,10 @@ fn a_dependency_hit_is_placed_by_its_unit() {
         &[
             "2 results",
             "\t[1] struct A",
-            "\t\trift://source/cargo/serde/lib.rs:3 · name",
+            "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · name",
             "\t\trift://symbol/rust/a.rs/A",
             "\t[2] struct B",
-            "\t\trift://source/cargo/serde/lib.rs",
+            "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs",
             "\t\trift://symbol/rust/a.rs/B",
         ],
     );
@@ -1348,6 +1351,7 @@ fn the_score_follows_the_matched_fields_and_the_distance_is_not_written() {
 fn package(name: &str, version: &str) -> PackageIdentity {
     PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: name.to_owned(),
         version: version.to_owned(),
     }
@@ -1361,6 +1365,7 @@ fn origin(
     SymbolOrigin {
         location,
         package,
+        runtime: None,
         source_kind,
     }
 }
@@ -1391,7 +1396,9 @@ fn every_exceptional_fact_is_written_in_order() {
     let hit = SearchHit {
         score: Some(1.5),
         distance: Some(1),
-        unit: Some(source_unit("rift://source/cargo/serde/lib.rs")),
+        unit: Some(source_unit(
+            "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
+        )),
         line: Some(3),
         matched_by: vec![MatchedField::Relationship],
         ..search_hit(SearchHitTarget::Symbol {
@@ -1403,7 +1410,7 @@ fn every_exceptional_fact_is_written_in_order() {
         &[
             "1 result",
             "\tstruct A",
-            "\trift://source/cargo/serde/lib.rs:3 · relationship · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
+            "\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · relationship · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
             "\trift://symbol/rust/a.rs/A",
         ],
     );
@@ -1476,6 +1483,18 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
     assert_eq!(
         facts(origin(None, None, SourceKind::Synthetic)),
         "synthetic"
+    );
+    assert_eq!(
+        facts(SymbolOrigin {
+            location: Some(SourceLocationKind::Stdlib),
+            package: None,
+            runtime: Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "rustc".to_owned(),
+                version: "1.98.1".to_owned(),
+            }),
+            source_kind: SourceKind::Authored,
+        }),
+        "stdlib rustc@1.98.1"
     );
 }
 
@@ -2212,7 +2231,9 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
     let hit = SearchHit {
         score: Some(1.5),
         matched_by: vec![MatchedField::Relationship, MatchedField::Name],
-        unit: Some(source_unit("rift://source/cargo/serde/lib.rs")),
+        unit: Some(source_unit(
+            "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
+        )),
         line: Some(3),
         source: Some("struct Config {\n\n    a: u8,\n}".to_owned()),
         change: Some(SymbolChange {
@@ -2238,7 +2259,7 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
             "",
             "\t\t↳ constructs",
             "\t\t\tstruct Config",
-            "\t\t\tin rift://source/cargo/serde/lib.rs:3 · name · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
+            "\t\t\tin rift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · name · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
             "\t\t\tat rift://symbol/rust/src/lib.rs/Config",
             "\t\t\tSettings of a run.",
             "\t\t\tmoved · old/lib.rs → new/lib.rs",
@@ -2469,7 +2490,9 @@ fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
     };
     let by_unit = SearchHit {
         matched_by: vec![MatchedField::Path],
-        unit: Some(source_unit("rift://source/cargo/serde/lib.rs")),
+        unit: Some(source_unit(
+            "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
+        )),
         ..search_hit(SearchHitTarget::File {
             size: 0,
             languages: Vec::new(),
@@ -2486,7 +2509,7 @@ fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
             "\t[1] src/lib.rs:7 · content · score 3",
             "\t\tline one",
             "\t\tline two",
-            "\t[2] rift://source/cargo/serde/lib.rs · path",
+            "\t[2] rift://source/cargo/crates.io/serde@1.0.0/lib.rs · path",
             "\t[3]",
         ],
     );
@@ -2561,7 +2584,7 @@ fn a_documentation_hit_is_headed_by_its_heading_path() {
 fn a_documentation_hit_in_a_package_is_placed_by_its_source_unit() {
     let mut hit = documentation_hit();
     hit.block.source.source = rift_protocol::documentation::DocumentationSourceIdentity::Package {
-        unit: source_unit("rift://source/cargo/serde/README.md"),
+        unit: source_unit("rift://source/cargo/crates.io/serde@1.0.0/README.md"),
     };
     let answer = only_page(vec![SearchHit {
         matched_by: vec![MatchedField::Documentation],
@@ -2574,7 +2597,7 @@ fn a_documentation_hit_in_a_package_is_placed_by_its_source_unit() {
         &[
             "1 result",
             "\tGuide",
-            "\trift://source/cargo/serde/README.md:1 · documentation",
+            "\trift://source/cargo/crates.io/serde@1.0.0/README.md:1 · documentation",
         ],
     );
 }
@@ -3079,7 +3102,9 @@ fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() 
     anonymous.symbol.id = None;
     let mut dependency = symbol_hit_with_source(None);
     dependency.path = None;
-    dependency.unit = Some(source_unit("rift://source/cargo/serde/lib.rs"));
+    dependency.unit = Some(source_unit(
+        "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
+    ));
     dependency.line = 3;
     golden(
         &symbol_result(vec![anonymous, dependency], pagination(0, 1)),
@@ -3089,7 +3114,7 @@ fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() 
             "\t\ta.rs:1",
             "\t\t0..9",
             "\t[2] struct A",
-            "\t\trift://source/cargo/serde/lib.rs:3",
+            "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3",
             "\t\trift://symbol/rust/a.rs/A",
         ],
     );
@@ -3489,7 +3514,9 @@ fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
     ));
     let mut dependency = symbol_hit_with_source(None);
     dependency.path = None;
-    dependency.unit = Some(source_unit("rift://source/cargo/serde/lib.rs"));
+    dependency.unit = Some(source_unit(
+        "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
+    ));
     dependency.history = Some(history(
         vec![version(
             "cccccccc33",

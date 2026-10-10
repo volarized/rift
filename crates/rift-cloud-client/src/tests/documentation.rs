@@ -12,8 +12,7 @@ fn capabilities() -> Capabilities {
 }
 
 fn hit() -> Value {
-    let owner =
-        json!({"source":{"kind":"package","unit":"rift://source/cargo/demo@1.0.0/README.md"}});
+    let owner = json!({"source":{"kind":"package","unit":"rift://source/cargo/crates.io/demo@1.0.0/README.md"}});
     json!({
         "documentation_revision":"0123abcd",
         "block":{"identity":"1".repeat(64),"source":owner,"content_digest":"2".repeat(64),
@@ -50,7 +49,7 @@ fn stored_pages() -> (Value, Value) {
     current["documentation"]["block"]["identity"] = json!("6".repeat(64));
     current["documentation"]["source"]["origin"]["package"] = package_json("other");
     current["documentation"]["source"]["identity"]["source"]["unit"] =
-        json!("rift://source/cargo/other@1.0.0/README.md");
+        json!("rift://source/cargo/crates.io/other@1.0.0/README.md");
     current["documentation"]["block"]["source"] =
         current["documentation"]["source"]["identity"].clone();
     search["items"]

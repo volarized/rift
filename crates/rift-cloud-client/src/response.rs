@@ -94,6 +94,47 @@ pub(crate) async fn search(
     }
 }
 
+pub(crate) fn exact_symbol(
+    response: RawResponse,
+) -> Result<Parsed<rift_protocol::symbol_read::GetSymbolResult>, ClientError> {
+    let RawResponse { status, body, meta } = response;
+    if matches!(status.as_u16(), 200 | 404 | 503) && crate::is_media(&meta, "application/json") {
+        use rift_protocol::symbol_read::GetSymbolResult;
+        let value: GetSymbolResult =
+            serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
+                status: status.as_u16(),
+            })?;
+        if !matches!(
+            (status.as_u16(), &value),
+            (200, GetSymbolResult::Found { .. })
+                | (404, GetSymbolResult::Missing { .. })
+                | (503, GetSymbolResult::Unavailable { .. })
+        ) {
+            return Err(ClientError::InvalidResponse {
+                status: status.as_u16(),
+            });
+        }
+        return Ok(Parsed { value, meta });
+    }
+    if status == reqwest::StatusCode::OK {
+        return Err(ClientError::InvalidMediaType {
+            status: status.as_u16(),
+            content_type: meta.content_type,
+        });
+    }
+    if matches!(
+        status.as_u16(),
+        400 | 401 | 403 | 406 | 413 | 415 | 429 | 500 | 502 | 503 | 504
+    ) && crate::is_media(&meta, "application/problem+json")
+    {
+        let problem = serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
+            status: status.as_u16(),
+        })?;
+        return Err(http_error(meta, problem));
+    }
+    Err(unknown_http_error(meta))
+}
+
 pub(crate) async fn symbols(
     response: RawResponse,
 ) -> Result<Parsed<PackageSymbolPage>, ClientError> {

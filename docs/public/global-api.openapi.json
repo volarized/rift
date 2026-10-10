@@ -260,13 +260,15 @@
                         "manager": "cargo",
                         "name": "serde",
                         "availability": "canonical",
-                        "version": "1.0.219"
+                        "version": "1.0.219",
+                        "registry": "crates.io"
                       },
                       {
                         "manager": "npm",
                         "name": "typescript",
                         "availability": "canonical",
-                        "requirement": "^5.7.2"
+                        "requirement": "^5.7.2",
+                        "registry": "npmjs.org"
                       }
                     ]
                   }
@@ -279,13 +281,15 @@
                         "manager": "npm",
                         "name": "typescript",
                         "availability": "canonical",
-                        "requirement": "~5.7.2"
+                        "requirement": "~5.7.2",
+                        "registry": "npmjs.org"
                       },
                       {
                         "manager": "pypi",
                         "name": "sqlalchemy",
                         "availability": "canonical",
-                        "version": "2.0.30"
+                        "version": "2.0.30",
+                        "registry": "pypi.org"
                       }
                     ]
                   }
@@ -310,7 +314,8 @@
                         {
                           "manager": "cargo",
                           "name": "serde",
-                          "version": "1.0.219"
+                          "version": "1.0.219",
+                          "registry": "crates.io"
                         }
                       ],
                       "resolved_requirements": [
@@ -319,12 +324,14 @@
                             "manager": "npm",
                             "name": "typescript",
                             "availability": "canonical",
-                            "requirement": "^5.7.2"
+                            "requirement": "^5.7.2",
+                            "registry": "npmjs.org"
                           },
                           "package": {
                             "manager": "npm",
                             "name": "typescript",
-                            "version": "5.7.2"
+                            "version": "5.7.2",
+                            "registry": "npmjs.org"
                           }
                         }
                       ],
@@ -342,12 +349,14 @@
                             "manager": "npm",
                             "name": "typescript",
                             "availability": "canonical",
-                            "requirement": "~5.7.2"
+                            "requirement": "~5.7.2",
+                            "registry": "npmjs.org"
                           },
                           "package": {
                             "manager": "npm",
                             "name": "typescript",
-                            "version": "5.9.3"
+                            "version": "5.9.3",
+                            "registry": "npmjs.org"
                           }
                         },
                         {
@@ -355,12 +364,14 @@
                             "manager": "pypi",
                             "name": "sqlalchemy",
                             "availability": "canonical",
-                            "version": "2.0.30"
+                            "version": "2.0.30",
+                            "registry": "pypi.org"
                           },
                           "package": {
                             "manager": "pypi",
                             "name": "sqlalchemy",
-                            "version": "2.0.28"
+                            "version": "2.0.28",
+                            "registry": "pypi.org"
                           }
                         }
                       ],
@@ -575,7 +586,8 @@
                       {
                         "manager": "cargo",
                         "name": "serde",
-                        "version": "1.0.219"
+                        "version": "1.0.219",
+                        "registry": "crates.io"
                       }
                     ],
                     "phase": "precise"
@@ -597,7 +609,8 @@
                       {
                         "manager": "cargo",
                         "name": "serde",
-                        "version": "1.0.219"
+                        "version": "1.0.219",
+                        "registry": "crates.io"
                       }
                     ],
                     "phase": "precise",
@@ -625,7 +638,8 @@
                           "package": {
                             "manager": "cargo",
                             "name": "serde",
-                            "version": "1.0.219"
+                            "version": "1.0.219",
+                            "registry": "crates.io"
                           },
                           "symbol": {
                             "id": "rift://symbol/rust/cargo/serde@1.0.219/src/de.rs/ReadService",
@@ -637,12 +651,13 @@
                               "package": {
                                 "manager": "cargo",
                                 "name": "serde",
-                                "version": "1.0.219"
+                                "version": "1.0.219",
+                                "registry": "crates.io"
                               },
                               "source_kind": "authored"
                             }
                           },
-                          "unit": "rift://source/cargo/serde@1.0.219/src/de.rs",
+                          "unit": "rift://source/cargo/crates.io/serde@1.0.219/src/de.rs",
                           "range": {
                             "start": 0,
                             "end": 10
@@ -671,7 +686,8 @@
                           "package": {
                             "manager": "cargo",
                             "name": "serde",
-                            "version": "1.0.219"
+                            "version": "1.0.219",
+                            "registry": "crates.io"
                           },
                           "documentation": {
                             "block": {
@@ -679,7 +695,7 @@
                               "source": {
                                 "source": {
                                   "kind": "package",
-                                  "unit": "rift://source/cargo/serde@1.0.219/README.md"
+                                  "unit": "rift://source/cargo/crates.io/serde@1.0.219/README.md"
                                 }
                               },
                               "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -694,7 +710,7 @@
                               "identity": {
                                 "source": {
                                   "kind": "package",
-                                  "unit": "rift://source/cargo/serde@1.0.219/README.md"
+                                  "unit": "rift://source/cargo/crates.io/serde@1.0.219/README.md"
                                 }
                               },
                               "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -704,7 +720,8 @@
                                 "package": {
                                   "manager": "cargo",
                                   "name": "serde",
-                                  "version": "1.0.219"
+                                  "version": "1.0.219",
+                                  "registry": "crates.io"
                                 },
                                 "source_kind": "authored"
                               },
@@ -923,7 +940,8 @@
                       {
                         "manager": "cargo",
                         "name": "serde",
-                        "version": "1.0.219"
+                        "version": "1.0.219",
+                        "registry": "crates.io"
                       }
                     ]
                   }
@@ -949,7 +967,8 @@
                           "package": {
                             "manager": "cargo",
                             "name": "serde",
-                            "version": "1.0.219"
+                            "version": "1.0.219",
+                            "registry": "crates.io"
                           },
                           "symbol": {
                             "id": "rift://symbol/rust/cargo/serde@1.0.219/src/de.rs/ReadService",
@@ -961,12 +980,13 @@
                               "package": {
                                 "manager": "cargo",
                                 "name": "serde",
-                                "version": "1.0.219"
+                                "version": "1.0.219",
+                                "registry": "crates.io"
                               },
                               "source_kind": "authored"
                             }
                           },
-                          "unit": "rift://source/cargo/serde@1.0.219/src/de.rs",
+                          "unit": "rift://source/cargo/crates.io/serde@1.0.219/src/de.rs",
                           "range": {
                             "start": 0,
                             "end": 10
@@ -1173,7 +1193,8 @@
                       {
                         "manager": "cargo",
                         "name": "beacon",
-                        "version": "1.0.0"
+                        "version": "1.0.0",
+                        "registry": "crates.io"
                       }
                     ],
                     "include": [
@@ -1202,9 +1223,10 @@
                           "package": {
                             "manager": "cargo",
                             "name": "beacon",
-                            "version": "1.0.0"
+                            "version": "1.0.0",
+                            "registry": "crates.io"
                           },
-                          "unit": "rift://source/cargo/beacon@1.0.0/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
                           "range": {
                             "start": 24,
                             "end": 32
@@ -1222,7 +1244,8 @@
                                 "package": {
                                   "manager": "cargo",
                                   "name": "beacon",
-                                  "version": "1.0.0"
+                                  "version": "1.0.0",
+                                  "registry": "crates.io"
                                 },
                                 "source_kind": "authored"
                               }
@@ -1429,7 +1452,8 @@
                         "package": {
                           "manager": "cargo",
                           "name": "beacon",
-                          "version": "1.0.0"
+                          "version": "1.0.0",
+                          "registry": "crates.io"
                         },
                         "path": "src/lib.rs",
                         "line": 3,
@@ -1439,7 +1463,8 @@
                         "package": {
                           "manager": "cargo",
                           "name": "beacon",
-                          "version": "1.0.0"
+                          "version": "1.0.0",
+                          "registry": "crates.io"
                         },
                         "path": "src/lib.rs",
                         "line": 0,
@@ -1470,7 +1495,8 @@
                             "package": {
                               "manager": "cargo",
                               "name": "beacon",
-                              "version": "1.0.0"
+                              "version": "1.0.0",
+                              "registry": "crates.io"
                             },
                             "path": "src/lib.rs",
                             "line": 3,
@@ -1484,7 +1510,8 @@
                             "package": {
                               "manager": "cargo",
                               "name": "beacon",
-                              "version": "1.0.0"
+                              "version": "1.0.0",
+                              "registry": "crates.io"
                             },
                             "path": "src/lib.rs",
                             "line": 0,
@@ -1697,6 +1724,12 @@
             "maxLength": 4096,
             "type": "string"
           },
+          "registry": {
+            "description": "Canonical registry endpoint, including its path when that path identifies the registry.\nCredentials, query and fragment are never part of this owner.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
           "version": {
             "description": "Resolved package version.",
             "maxLength": 4096,
@@ -1705,6 +1738,7 @@
         },
         "required": [
           "manager",
+          "registry",
           "name",
           "version"
         ],
@@ -1831,6 +1865,10 @@
           "package": {
             "$ref": "#/components/schemas/PackageIdentity",
             "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/RuntimeIdentity",
+            "description": "Exact runtime or compiler release that owns a standard-library declaration.\nMutually exclusive with `package`."
           },
           "source_kind": {
             "$ref": "#/components/schemas/SourceKind",
@@ -2314,6 +2352,12 @@
             "maxLength": 4096,
             "type": "string"
           },
+          "registry": {
+            "description": "Accepted registry endpoint. Absent for a path, Git repository or direct URL source.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
           "requirement": {
             "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
             "maxLength": 4096,
@@ -2340,14 +2384,16 @@
           "path",
           "git",
           "private_registry",
-          "url"
+          "url",
+          "registry_unresolved"
         ],
         "x-enum-descriptions": [
           "The entry names a package a public registry serves, crates.io, npm, or the\nPython Package Index, or a standard library: `stdlib/rust`, `stdlib/node`, or\n`stdlib/python`.",
           "The entry names a path outside the workspace, or an archive at a path, that only\nthis machine can read.",
           "The entry names a git repository.",
           "The entry names a registry other than the public one its package manager reads.",
-          "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL."
+          "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL.",
+          "Accepted source evidence does not name the registry serving this entry."
         ]
       },
       "PublicationFormat": {
@@ -4039,6 +4085,29 @@
         "minLength": 64,
         "pattern": "^[0-9a-f]{64}$",
         "type": "string"
+      },
+      "RuntimeIdentity": {
+        "additionalProperties": false,
+        "description": "One exact runtime or compiler release.",
+        "properties": {
+          "runtime": {
+            "description": "Canonical runtime or compiler name.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "description": "Exact runtime or compiler version.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime",
+          "version"
+        ],
+        "type": "object"
       }
     },
     "headers": {

@@ -40,6 +40,7 @@ enum FixtureMode {
 #[derive(Clone)]
 enum OperationFixture {
     Valid,
+    ExactSymbol(serde_json::Value),
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
@@ -344,6 +345,15 @@ fn operation_response(
         return operation_search_response(mode, query, request_number);
     }
     if path.ends_with("/symbols") {
+        if let OperationFixture::ExactSymbol(value) = mode {
+            let mut response = json_response(value, None);
+            *response.status_mut() = match value["outcome"].as_str() {
+                Some("missing") => StatusCode::NOT_FOUND,
+                Some("unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::OK,
+            };
+            return response;
+        }
         return operation_symbol_response(mode, query);
     }
     if path.ends_with("/declarations") {
@@ -449,6 +459,7 @@ fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -
             if let Some(version) = entry["version"].as_str() {
                 available_exact.push(serde_json::json!({
                     "manager": entry["manager"],
+                    "registry": entry["registry"],
                     "name": entry["name"],
                     "version": version,
                 }));
@@ -479,8 +490,8 @@ fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -
         _ => serde_json::json!({
             "available_exact": [],
             "resolved_requirements": [{
-                "entry": {"availability":"canonical","manager":"cargo","name":"demo","requirement":"^1","version":null},
-                "package": {"manager":"cargo","name":"demo","version":"1.0.0"}
+                "entry": {"availability":"canonical","manager":"cargo","registry":"crates.io","name":"demo","requirement":"^1","version":null},
+                "package": {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}
             }],
             "missing_exact": [],
             "missing_requirements": []
@@ -681,7 +692,7 @@ fn problem_response(status: StatusCode) -> Response {
 }
 
 fn package_json(name: &str) -> serde_json::Value {
-    serde_json::json!({"manager":"cargo","name":name,"version":"1.0.0"})
+    serde_json::json!({"manager":"cargo","registry":"crates.io","name":name,"version":"1.0.0"})
 }
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
@@ -697,7 +708,7 @@ fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
 fn search_hit_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
         "package":package_json(package), "symbol":symbol_json(package, suffix),
-        "unit":format!("rift://source/cargo/{package}@1.0.0/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
+        "unit":format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
         "contributing_fields":["qualified_name"], "match_class":"qualified_exact"
     })
 }
@@ -723,7 +734,7 @@ fn invalid_search_page(mode: &OperationFixture) -> serde_json::Value {
         page["items"][0]["source"] = serde_json::json!("unexpected source");
     } else if matches!(mode, OperationFixture::InvalidSourceIdentity) {
         page["items"][0]["unit"] =
-            serde_json::json!("rift://source/cargo/other@1.0.0/src/first.rs");
+            serde_json::json!("rift://source/cargo/crates.io/other@1.0.0/src/first.rs");
     } else {
         page["items"][0]["match_class"] = serde_json::json!("substring");
     }
@@ -737,7 +748,7 @@ fn symbol_page_json(
     suffix: &str,
 ) -> serde_json::Value {
     serde_json::json!({
-        "items":[{"package":package_json(package),"symbol":symbol_json(package, suffix),"unit":format!("rift://source/cargo/{package}@1.0.0/src/{suffix}.rs"),"range":{"start":0,"end":4},"line":1,"match_class":"qualified_exact"}],
+        "items":[{"package":package_json(package),"symbol":symbol_json(package, suffix),"unit":format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"),"range":{"start":0,"end":4},"line":1,"match_class":"qualified_exact"}],
         "next_cursor":next, "warnings":[], "publication_format":"rift-package-index-v2",
         "analyzer_revision":analyzer, "corpus_revision":"corpus-v1"
     })
@@ -1133,6 +1144,7 @@ fn test_generated_values_allow_response_additions_and_reject_request_additions()
     let mut request = serde_json::json!({
         "availability": "canonical",
         "manager": "cargo",
+        "registry": "crates.io",
         "name": "demo",
         "requirement": "^1",
         "version": null,
@@ -1838,6 +1850,7 @@ fn resolution_request() -> PackageResolutionRequest {
         entries: vec![PackageContextEntry {
             availability: PackageAvailability::Canonical,
             manager: "cargo".to_owned(),
+            registry: Some("crates.io".to_owned()),
             name: "demo".to_owned(),
             requirement: Some("^1".to_owned()),
             version: None,
@@ -1848,6 +1861,7 @@ fn resolution_request() -> PackageResolutionRequest {
 fn package_request() -> PackageIdentity {
     PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: "demo".to_owned(),
         version: "1.0.0".to_owned(),
     }
@@ -1922,6 +1936,69 @@ async fn operation_client(mode: OperationFixture) -> (FixtureServer, GlobalClien
     let client = GlobalClient::new(server.config())
         .unwrap_or_else(|error| panic!("fixture client: {error:?}"));
     (server, client)
+}
+
+#[tokio::test]
+async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() {
+    use rift_protocol::read::SymbolId;
+    use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+    let id = SymbolId::parse("rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/Thing")
+        .expect("canonical fixture");
+    let request: GetSymbolParams =
+        serde_json::from_value(serde_json::json!({"id":id})).expect("request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    for answer in [
+        serde_json::json!({"outcome":"found","symbol":{"id":id,"language":"rust","name":"Thing","kind":"struct"},"view":view,"declarations":[],"warnings":[]}),
+        serde_json::json!({"outcome":"missing","symbol_not_found":{"id":id,"alternatives":[]},"view":view,"warnings":[]}),
+        serde_json::json!({"outcome":"unavailable","id":id,"reason":"exact_release","warnings":[]}),
+    ] {
+        let (server, client) = operation_client(OperationFixture::ExactSymbol(answer)).await;
+        assert!(matches!(
+            client
+                .get_symbol(&request)
+                .await
+                .expect("typed exact outcome"),
+            GetSymbolResult::Found { .. }
+                | GetSymbolResult::Missing { .. }
+                | GetSymbolResult::Unavailable { .. }
+        ));
+        let requests = server.state.request_log.lock().await;
+        let sent = requests
+            .iter()
+            .find(|sent| sent.path.ends_with("/symbols"))
+            .expect("symbol request");
+        assert_eq!(sent.method, reqwest::Method::POST);
+        assert_eq!(sent.path, "/rift/rest/v1/symbols");
+        assert_eq!(sent.query, None);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|sent| sent.path.ends_with("/symbols"))
+                .count(),
+            1
+        );
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("JSON request");
+        assert_eq!(body["id"], serde_json::to_value(&id).expect("ID"));
+        assert_eq!(body["declaration_limit"], 5);
+        assert_eq!(body["include"], serde_json::json!(["source"]));
+        for removed in [
+            "name",
+            "packages",
+            "language",
+            "scope",
+            "limit",
+            "page_index",
+        ] {
+            assert!(body.get(removed).is_none());
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|sent| sent.path.ends_with("/resolutions"))
+                .count(),
+            0
+        );
+    }
 }
 
 #[tokio::test]
@@ -2242,7 +2319,7 @@ fn test_symbol_lookup_accepts_padded_original_names() {
 fn test_symbol_lookup_refuses_unknown_match_class() {
     let hit: PackageSymbol = serde_json::from_value(serde_json::json!({
         "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
-        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
+        "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
         "line": 1, "match_class": "unknown"
     }))
     .expect("symbol hit fixture");
@@ -2258,7 +2335,7 @@ fn test_symbol_lookup_refuses_unknown_match_class() {
 
 /// Package analysis mints a package declaration's identity over its unit's resolver and key, so
 /// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
-/// `rift://source/cargo/demo@1.0.0/src/first.rs`. The package-relative spelling names a
+/// `rift://source/cargo/crates.io/demo@1.0.0/src/first.rs`. The package-relative spelling names a
 /// project file, and no producer mints it for a package declaration, so it is refused.
 #[test]
 fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
@@ -2289,7 +2366,7 @@ fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
 
     let symbol: PackageSymbol = serde_json::from_value(serde_json::json!({
         "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
-        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
+        "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
         "line": 1, "match_class": "qualified_exact"
     }))
     .expect("symbol hit fixture");
@@ -2298,6 +2375,42 @@ fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     assert_eq!(
         candidate.symbol_identity.0,
         "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo"
+    );
+}
+
+#[test]
+fn test_released_source_preserves_registry_owner_and_relative_path() {
+    let mut package: PackageIdentity =
+        serde_json::from_value(package_json("demo")).expect("package");
+    package.registry = "registry.example/releases".to_owned();
+    let owner = domain::package_identity(&package).owner().expect("owner");
+    let unit = rift_protocol::identity::released_source_identity(&owner, "src/first.rs")
+        .expect("source unit");
+    assert!(unit.contains("registry.example%2Freleases/"));
+    assert_eq!(
+        package_source_path(&package, &unit).expect("same owner"),
+        "src/first.rs"
+    );
+    package.registry = "crates.io".to_owned();
+    assert_eq!(
+        package_source_path(&package, &unit),
+        Err(ClientError::InvalidResponseField {
+            field: "source_identity"
+        })
+    );
+}
+
+#[test]
+fn test_package_selection_distinguishes_exact_registry_owners() {
+    let package: PackageIdentity = serde_json::from_value(package_json("demo")).expect("package");
+    let mut other = package.clone();
+    other.registry = "registry.example/releases".to_owned();
+    assert_eq!(validate_packages(&[package.clone(), other]), Ok(()));
+    assert_eq!(
+        validate_packages(&[package.clone(), package]),
+        Err(ClientError::InvalidRequest {
+            field: "duplicate_package"
+        })
     );
 }
 

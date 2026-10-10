@@ -178,7 +178,7 @@ impl PatternPageCheck<'_> {
     fn validate_hit(
         &self,
         hit: &PackagePatternHit,
-        packages: &HashSet<(String, String, String)>,
+        packages: &HashSet<(String, String, String, String)>,
     ) -> Result<(), ClientError> {
         super::validate_package_identity(&hit.package)
             .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;

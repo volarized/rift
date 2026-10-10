@@ -119,6 +119,15 @@
           "maxLength": 4096,
           "type": "string"
         },
+        "registry": {
+          "description": "Accepted defining registry endpoint. Absent when the registry is unresolved.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "requirement": {
           "description": "The version requirement this entry declares. Set this or `version`, never both.",
           "maxLength": 4096,

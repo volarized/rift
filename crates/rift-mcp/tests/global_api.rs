@@ -31,7 +31,7 @@ use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 pub(crate) const COLLECTED: (&str, &str, &str) = ("cargo", "demo", "1.0.0");
 
 /// The source unit every collected declaration lives in.
-pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/demo@1.0.0/src/lib.rs";
+pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
 
 /// The collected package's `src/lib.rs`.
 const COLLECTED_SOURCE: &str = "pub fn helper_beacon() {}\npub fn beacon() {}\n";
@@ -461,7 +461,7 @@ fn resolution(requested: &Value, python_collection: bool) -> Value {
                 available.push(package_value(*release));
             }
             (Value::String(version), None) => missing_exact.push(json!({
-                "manager": manager, "name": name, "version": version
+                "manager": manager, "registry": entry["registry"], "name": name, "version": version
             })),
             (_, None) => missing_requirements.push(entry.clone()),
             (_, Some(release)) => {
@@ -491,7 +491,12 @@ fn resolution(requested: &Value, python_collection: bool) -> Value {
 }
 
 fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
-    json!({"manager": manager, "name": name, "version": version})
+    let registry = match manager {
+        "cargo" => Some("crates.io"),
+        "pypi" => Some("pypi.org"),
+        _ => None,
+    };
+    json!({"manager": manager, "registry": registry, "name": name, "version": version})
 }
 
 /// The declaration answer for `request`: each position [`NAMED_POSITIONS`] lists names its
@@ -750,7 +755,7 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
     let range = declaration_range(source, declaration);
     let line = source[..range.start].matches('\n').count() + 1;
     let (manager, name, version) = COLLECTED;
-    let package = json!({"manager": manager, "name": name, "version": version});
+    let package = package_value((manager, name, version));
     let mut hit = json!({
         "package": package,
         "symbol": {

@@ -41,6 +41,10 @@ pub struct PackageIdentity {
     /// Package name in that ecosystem.
     #[validate(length(max = 4_096u64))]
     pub name: String,
+    /// Canonical registry endpoint, including its path when that path identifies the registry.
+    /// Credentials, query and fragment are never part of this owner.
+    #[validate(length(min = 1u64, max = 4_096u64))]
+    pub registry: String,
     /// Resolved package version.
     #[validate(length(max = 4_096u64))]
     pub version: String,
@@ -132,6 +136,8 @@ pub struct SymbolOrigin {
     pub location: Option<SourceLocationKind>,
     /// One package as its package manager identifies it.
     pub package: Option<PackageIdentity>,
+    /// One exact runtime or compiler release.
+    pub runtime: Option<RuntimeIdentity>,
     /// How source or a declaration came to exist.
     pub source_kind: SourceKind,
 }
@@ -753,6 +759,9 @@ pub struct PackageContextEntry {
     /// Package name in that ecosystem.
     #[validate(length(max = 4_096u64))]
     pub name: String,
+    /// Accepted registry endpoint. Absent for a path, Git repository or direct URL source.
+    #[validate(length(min = 1u64, max = 4_096u64))]
+    pub registry: Option<String>,
     /// The version requirement a manifest declares. Absent when a lockfile pins the
     /// version.
     #[validate(length(max = 4_096u64))]
@@ -785,6 +794,9 @@ pub enum PackageAvailability {
     /// wheel URL or an npm tarball URL.
     #[serde(rename = "url")]
     Url,
+    /// Accepted source evidence does not name the registry serving this entry.
+    #[serde(rename = "registry_unresolved")]
+    RegistryUnresolved,
 }
 impl core::fmt::Display for PackageAvailability {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -794,6 +806,7 @@ impl core::fmt::Display for PackageAvailability {
             Self::Git => write!(f, "git"),
             Self::PrivateRegistry => write!(f, "private_registry"),
             Self::Url => write!(f, "url"),
+            Self::RegistryUnresolved => write!(f, "registry_unresolved"),
         }
     }
 }
@@ -809,11 +822,19 @@ impl<'de> serde::Deserialize<'de> for PackageAvailability {
             "git" => Ok(PackageAvailability::Git),
             "private_registry" => Ok(PackageAvailability::PrivateRegistry),
             "url" => Ok(PackageAvailability::Url),
+            "registry_unresolved" => Ok(PackageAvailability::RegistryUnresolved),
             _ => {
                 Err(
                     serde::de::Error::unknown_variant(
                         &s,
-                        &["canonical", "path", "git", "private_registry", "url"],
+                        &[
+                            "canonical",
+                            "path",
+                            "git",
+                            "private_registry",
+                            "url",
+                            "registry_unresolved",
+                        ],
                     ),
                 )
             }
@@ -1960,6 +1981,15 @@ pub enum PackageSearchItem {
 }
 /// Full lowercase SHA-256 digest for documentation content and identity.
 pub type DocumentationDigest = String;
+/// One exact runtime or compiler release.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    /// Canonical runtime or compiler name.
+    pub runtime: String,
+    /// Exact runtime or compiler version.
+    pub version: String,
+}
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}

@@ -1183,6 +1183,12 @@
           "maxLength": 4096,
           "type": "string"
         },
+        "registry": {
+          "description": "Canonical registry endpoint, including its path when that path identifies the registry.\nCredentials, query and fragment are never part of this owner.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
         "version": {
           "description": "Resolved package version.",
           "maxLength": 4096,
@@ -1191,6 +1197,7 @@
       },
       "required": [
         "manager",
+        "registry",
         "name",
         "version"
       ],
@@ -1377,6 +1384,29 @@
       "maxLength": 1000,
       "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
       "type": "string"
+    },
+    "RuntimeIdentity": {
+      "additionalProperties": false,
+      "description": "One exact runtime or compiler release.",
+      "properties": {
+        "runtime": {
+          "description": "Canonical runtime or compiler name.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "version": {
+          "description": "Exact runtime or compiler version.",
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtime",
+        "version"
+      ],
+      "type": "object"
     },
     "Signature": {
       "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
@@ -1792,6 +1822,10 @@
         "package": {
           "$ref": "#/$defs/PackageIdentity",
           "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeIdentity",
+          "description": "Exact runtime or compiler release that owns a standard-library declaration.\nMutually exclusive with `package`."
         },
         "source_kind": {
           "$ref": "#/$defs/SourceKind",

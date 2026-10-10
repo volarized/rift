@@ -5,6 +5,7 @@ pub mod contract;
 mod declaration;
 mod pattern;
 mod response;
+mod symbol;
 
 use std::{
     collections::HashSet,
@@ -96,6 +97,9 @@ pub const DEPENDENCY_ENTRIES_MAX: usize = 20_000;
 pub const PACKAGE_MANAGER_CHARS_MAX: usize = 128;
 /// Most characters one package name carries, the contract's `maxLength`.
 pub const PACKAGE_NAME_CHARS_MAX: usize = 4_096;
+
+/// Most characters one canonical registry endpoint carries.
+pub const PACKAGE_REGISTRY_CHARS_MAX: usize = 4_096;
 /// Most characters one package version, or one version requirement, carries: the contract's
 /// `maxLength`.
 pub const PACKAGE_VERSION_CHARS_MAX: usize = 4_096;
@@ -1128,7 +1132,10 @@ impl GlobalClient {
                     response_bytes = response.body.len(),
                     "global response"
                 );
-                if should_retry(response.status, attempt, attempts) {
+                let exact_outcome = operation == contract::Endpoint::Symbols
+                    && response.status == StatusCode::SERVICE_UNAVAILABLE
+                    && is_media(&response.meta, "application/json");
+                if !exact_outcome && should_retry(response.status, attempt, attempts) {
                     rift_tracing::debug!(
                         operation = operation.operation_id(),
                         attempt,
@@ -1554,8 +1561,11 @@ fn validate_resolution_response(
     let expected: HashSet<_> = request.entries.iter().map(context_key).collect();
     let mut seen = HashSet::new();
     for package in &response.available_exact {
+        validate_package_identity(package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
         let key = (
             package.manager.clone(),
+            Some(package.registry.clone()),
             package.name.clone(),
             Some(package.version.clone()),
             None,
@@ -1567,8 +1577,11 @@ fn validate_resolution_response(
         }
     }
     for package in &response.missing_exact {
+        validate_package_identity(package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
         let key = (
             package.manager.clone(),
+            Some(package.registry.clone()),
             package.name.clone(),
             Some(package.version.clone()),
             None,
@@ -1580,6 +1593,8 @@ fn validate_resolution_response(
         }
     }
     for resolved in &response.resolved_requirements {
+        validate_package_identity(&resolved.package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
         if !resolved.answers_its_entry() {
             return Err(ClientError::InvalidResponseField {
                 field: "resolved_requirement",
@@ -1661,8 +1676,9 @@ impl ResolvedRequirement {
     /// version or an exact version at another one. An exact entry answered at its own version
     /// belongs in `available_exact`.
     fn answers_its_entry(&self) -> bool {
-        let names_the_package =
-            self.package.manager == self.entry.manager && self.package.name == self.entry.name;
+        let names_the_package = self.package.manager == self.entry.manager
+            && self.entry.registry.as_ref() == Some(&self.package.registry)
+            && self.package.name == self.entry.name;
         let selector_holds = match (&self.entry.version, &self.entry.requirement) {
             (None, Some(_)) => true,
             (Some(requested), None) => requested != &self.package.version,
@@ -1804,8 +1820,7 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
     validate_packages(&request.packages)
 }
 
-/// Checks one package identity against the contract's bounds, which count characters: a
-/// package name the resolution answered in any script reaches the read that names it.
+/// Checks contract character bounds and the validated exact defining registry owner.
 fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
     bounded_nonempty_characters(
         &package.manager,
@@ -1813,11 +1828,16 @@ fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientErro
         "package_manager",
     )?;
     bounded_nonempty_characters(&package.name, PACKAGE_NAME_CHARS_MAX, "package_name")?;
+    bounded_nonempty_characters(&package.registry, PACKAGE_REGISTRY_CHARS_MAX, "registry")?;
     bounded_nonempty_characters(
         &package.version,
         PACKAGE_VERSION_CHARS_MAX,
         "package_version",
-    )
+    )?;
+    domain::package_identity(package)
+        .owner()
+        .map(|_| ())
+        .map_err(|_| ClientError::InvalidRequest { field: "package" })
 }
 
 fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
@@ -1829,6 +1849,7 @@ fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
         validate_package_identity(package)?;
         if !seen.insert((
             package.manager.as_str(),
+            package.registry.as_str(),
             package.name.as_str(),
             package.version.as_str(),
         )) {
@@ -2135,7 +2156,7 @@ fn validate_hit_common(
     package: &PackageIdentity,
     symbol: &Symbol,
     location: HitLocation<'_>,
-    packages: Option<&HashSet<(String, String, String)>>,
+    packages: Option<&HashSet<(String, String, String, String)>>,
     source_bytes_max: usize,
 ) -> Result<String, ClientError> {
     validate_package_identity(package)
@@ -2164,23 +2185,19 @@ fn validate_hit_common(
     validate_symbol_identity(symbol, package, &source_path)
 }
 
-/// The package-relative path of `unit`, a file of `package`: its key after `name@version/`,
-/// under the package's manager as resolver.
+/// The package-relative path of `unit`, after its exact defining registry owner is validated.
 fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, ClientError> {
     let invalid = ClientError::InvalidResponseField {
         field: "source_identity",
     };
     let unit = rift_core::SourceUnitId::parse(unit).map_err(|_| invalid.clone())?;
-    if unit.resolver().as_str() != package.manager {
+    let owner = domain::package_identity(package)
+        .owner()
+        .map_err(|_| invalid.clone())?;
+    if unit.source_owner() != Some(&owner) {
         return Err(invalid);
     }
-    let package_prefix = format!("{}@{}/", package.name, package.version);
-    unit.key()
-        .as_str()
-        .strip_prefix(&package_prefix)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .ok_or(invalid)
+    Ok(unit.key().as_str().to_owned())
 }
 
 /// Checks that a package hit's symbol identity is the one its unit mints, and returns its
@@ -2338,17 +2355,27 @@ fn within_characters(value: &str, max: usize) -> bool {
     !value.is_empty() && value.chars().count() <= max
 }
 
-fn package_key(package: &PackageIdentity) -> (String, String, String) {
+fn package_key(package: &PackageIdentity) -> (String, String, String, String) {
     (
         package.manager.clone(),
+        package.registry.clone(),
         package.name.clone(),
         package.version.clone(),
     )
 }
 
-fn context_key(entry: &PackageContextEntry) -> (String, String, Option<String>, Option<String>) {
+fn context_key(
+    entry: &PackageContextEntry,
+) -> (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+) {
     (
         entry.manager.clone(),
+        entry.registry.clone(),
         entry.name.clone(),
         entry.version.clone(),
         entry.requirement.clone(),

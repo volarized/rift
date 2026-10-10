@@ -14,8 +14,7 @@ fn test_collection_documentation_source_uses_smaller_configured_and_advertised_b
         .supported_features
         .push("documentation_search".to_owned());
     capabilities.documentation_revision = Some("0123abcd".to_owned());
-    let owner =
-        json!({"source":{"kind":"package","unit":"rift://source/cargo/demo@1.0.0/README.md"}});
+    let owner = json!({"source":{"kind":"package","unit":"rift://source/cargo/crates.io/demo@1.0.0/README.md"}});
     let mut value = search_page_json("demo", None, "analyzer-v1", "first");
     value["documentation_revision"] = json!("0123abcd");
     value["items"] = json!([{

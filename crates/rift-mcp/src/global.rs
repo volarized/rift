@@ -393,7 +393,7 @@ pub(crate) struct CalleeDeclarations {
 /// One package position as a request carries it and its answer names it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CalleePosition {
-    package: (String, String, String),
+    package: (String, String, String, String),
     path: String,
     line: i64,
     character: i64,
@@ -410,7 +410,9 @@ impl CalleeDeclarations {
         Some(CalleeDeclaration {
             id: id.clone(),
             kind: kind.clone(),
-            package: protocol_package_identity(package),
+            origin: rift_protocol::read::SourceLocation::Dependency {
+                package: protocol_package_identity(package),
+            },
         })
     }
 }
@@ -446,6 +448,7 @@ pub(crate) async fn callee_declarations(
             let key = CalleePosition {
                 package: (
                     position.package.manager,
+                    position.package.registry,
                     position.package.name,
                     position.package.version,
                 ),
@@ -514,10 +517,11 @@ fn batched_positions(
         {
             continue;
         }
-        let (manager, name, version) = key.package;
+        let (manager, registry, name, version) = key.package;
         request.positions.push(PackagePosition {
             package: WirePackageIdentity {
                 manager,
+                registry,
                 name,
                 version,
             },
@@ -538,9 +542,11 @@ fn callee_package(
     match callee.package() {
         CalleePackage::Installed(package) => Some(WirePackageIdentity {
             manager: package.manager.clone(),
+            registry: package.registry.clone(),
             name: package.name.clone(),
             version: package.version.clone(),
         }),
+        CalleePackage::Runtime(_) => None,
         CalleePackage::StandardLibrary(_) => served
             .iter()
             .find(|release| {
@@ -564,6 +570,7 @@ fn callee_position(
     within_bound.then(|| CalleePosition {
         package: (
             package.manager.clone(),
+            package.registry.clone(),
             package.name.clone(),
             package.version.clone(),
         ),
@@ -1430,6 +1437,7 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
     WireContextEntry {
         availability: WireAvailability::Canonical,
         manager: entry.manager.clone(),
+        registry: entry.registry.clone(),
         name: entry.name.clone(),
         requirement: entry.requirement.clone(),
         version: entry.version.clone(),
@@ -1441,6 +1449,7 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
 fn protocol_context_entry(entry: WireContextEntry) -> PackageContextEntry {
     PackageContextEntry {
         manager: entry.manager,
+        registry: entry.registry,
         name: entry.name,
         version: entry.version,
         requirement: entry.requirement,
@@ -1495,6 +1504,7 @@ fn resolved_route(
 fn push_distinct_package(packages: &mut Vec<WirePackageIdentity>, candidate: WirePackageIdentity) {
     if packages.iter().any(|held| {
         held.manager == candidate.manager
+            && held.registry == candidate.registry
             && held.name == candidate.name
             && held.version == candidate.version
     }) {
@@ -1506,6 +1516,7 @@ fn push_distinct_package(packages: &mut Vec<WirePackageIdentity>, candidate: Wir
 fn protocol_package_identity(package: WirePackageIdentity) -> PackageIdentity {
     PackageIdentity {
         manager: package.manager,
+        registry: package.registry,
         name: package.name,
         version: package.version,
     }
@@ -2068,6 +2079,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn distinct_packages_keep_registry_owners() {
+        let package = |registry: &str| rift_cloud_client::PackageIdentity {
+            manager: "cargo".to_owned(),
+            registry: registry.to_owned(),
+            name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let public = package("crates.io");
+        let other = package("registry.example/releases");
+        let mut packages = Vec::new();
+        super::push_distinct_package(&mut packages, public.clone());
+        super::push_distinct_package(&mut packages, other.clone());
+        super::push_distinct_package(&mut packages, public.clone());
+        assert_eq!(packages, [public, other]);
+    }
+
     #[tokio::test]
     async fn resolution_request_cache_invalidates_on_limit_snapshot_and_requested_packages()
     -> Result<(), rift_cloud_client::ClientError> {
@@ -2113,6 +2141,7 @@ mod tests {
         );
         let requested = [rift_protocol::dependencies::RequestedPackage {
             manager: "cargo".to_owned(),
+            registry: Some("crates.io".to_owned()),
             name: "tokio".to_owned(),
             version: Some("1.0.0".to_owned()),
         }];
@@ -2359,6 +2388,7 @@ mod tests {
         // The operator's list stands in for a lockfile pinning `typescript`.
         let configured = [ConfiguredPackage {
             manager: "npm".to_owned(),
+            registry: Some("npmjs.org".to_owned()),
             name: "typescript".to_owned(),
             version: Some("5.9.3".to_owned()),
             requirement: None,
@@ -2508,6 +2538,7 @@ mod tests {
             .missing_exact
             .push(rift_protocol::read::PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: "absent".to_owned(),
                 version: "1.0.0".to_owned(),
             });
@@ -2564,7 +2595,12 @@ mod tests {
 
     fn position(name: &str, line: i64) -> super::CalleePosition {
         super::CalleePosition {
-            package: ("pypi".to_owned(), name.to_owned(), "1.0.0".to_owned()),
+            package: (
+                "pypi".to_owned(),
+                "pypi.org".to_owned(),
+                name.to_owned(),
+                "1.0.0".to_owned(),
+            ),
             path: format!("{name}/core.py"),
             line,
             character: 4,
@@ -2649,22 +2685,22 @@ mod tests {
                 "available_exact": [],
                 "resolved_requirements": [
                     {
-                        "entry": {"manager": "cargo", "name": "demo", "version": "1.0.3",
+                        "entry": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.3",
                                   "availability": "canonical"},
-                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.2"}
+                        "package": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.2"}
                     },
                     {
-                        "entry": {"manager": "npm", "name": "typescript", "requirement": "~5.7.2",
+                        "entry": {"manager": "npm", "registry": "npmjs.org", "name": "typescript", "requirement": "~5.7.2",
                                   "availability": "canonical"},
-                        "package": {"manager": "npm", "name": "typescript", "version": "5.9.3"}
+                        "package": {"manager": "npm", "registry": "npmjs.org", "name": "typescript", "version": "5.9.3"}
                     },
                     {
-                        "entry": {"manager": "npm", "name": "react", "requirement": "^19",
+                        "entry": {"manager": "npm", "registry": "npmjs.org", "name": "react", "requirement": "^19",
                                   "availability": "canonical"},
-                        "package": {"manager": "npm", "name": "react", "version": "19.1.0"}
+                        "package": {"manager": "npm", "registry": "npmjs.org", "name": "react", "version": "19.1.0"}
                     }
                 ],
-                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_exact": [{"manager": "cargo", "registry": "crates.io", "name": "absent", "version": "1.0.0"}],
                 "missing_requirements": [],
                 "warnings": [{
                     "code": "requirement_unsatisfied",
@@ -2692,8 +2728,9 @@ mod tests {
                 "package_substituted"
             ]
         );
-        let package = |manager: &str, name: &str, version: &str| PackageIdentity {
+        let package = |manager: &str, registry: &str, name: &str, version: &str| PackageIdentity {
             manager: manager.to_owned(),
+            registry: registry.to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         };
@@ -2705,22 +2742,28 @@ mod tests {
             route.warnings()[1..],
             [
                 substituted(
-                    PackageContextEntry::new(
-                        "cargo",
-                        "demo",
-                        PackageSelector::Version("1.0.3".to_owned()),
-                        PackageAvailability::Canonical,
-                    ),
-                    package("cargo", "demo", "1.0.2"),
+                    PackageContextEntry {
+                        registry: Some("crates.io".to_owned()),
+                        ..PackageContextEntry::new(
+                            "cargo",
+                            "demo",
+                            PackageSelector::Version("1.0.3".to_owned()),
+                            PackageAvailability::Canonical,
+                        )
+                    },
+                    package("cargo", "crates.io", "demo", "1.0.2"),
                 ),
                 substituted(
-                    PackageContextEntry::new(
-                        "npm",
-                        "typescript",
-                        PackageSelector::Requirement("~5.7.2".to_owned()),
-                        PackageAvailability::Canonical,
-                    ),
-                    package("npm", "typescript", "5.9.3"),
+                    PackageContextEntry {
+                        registry: Some("npmjs.org".to_owned()),
+                        ..PackageContextEntry::new(
+                            "npm",
+                            "typescript",
+                            PackageSelector::Requirement("~5.7.2".to_owned()),
+                            PackageAvailability::Canonical,
+                        )
+                    },
+                    package("npm", "npmjs.org", "typescript", "5.9.3"),
                 ),
             ]
         );
@@ -2744,9 +2787,9 @@ mod tests {
         .expect("disabled client");
         let resolution: rift_cloud_client::PackageResolutionResponse =
             serde_json::from_value(serde_json::json!({
-                "available_exact": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "available_exact": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
                 "resolved_requirements": [],
-                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_exact": [{"manager": "cargo", "registry": "crates.io", "name": "absent", "version": "1.0.0"}],
                 "missing_requirements": []
             }))
             .expect("resolution fixture");
@@ -2790,8 +2833,8 @@ mod tests {
         use rift_protocol::read::{Pagination, ReadWarning, SearchHit, SearchParams, SearchResult};
         use serde_json::json;
 
-        let unit = "rift://source/cargo/demo@1.0.0/src/lib.rs";
-        let package = json!({"manager": "cargo", "name": "demo", "version": "1.0.0"});
+        let unit = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+        let package = json!({"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"});
         let hit = |value: serde_json::Value| -> SearchHit {
             serde_json::from_value(value).expect("search hit fixture")
         };
@@ -2816,6 +2859,7 @@ mod tests {
         let matched = |start: u64| rift_cloud_client::PackagePatternMatch {
             package: rift_protocol::read::PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: "demo".to_owned(),
                 version: "1.0.0".to_owned(),
             },
