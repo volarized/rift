@@ -2941,13 +2941,19 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolOrigin": {
@@ -3233,7 +3239,7 @@
               {
                 "history": {
                   "complete": true,
-                  "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                  "symbol": "rift://symbol/local/rust/app/config/load_config",
                   "versions": [
                     {
                       "author": {
@@ -3279,7 +3285,7 @@
                     "callable",
                     "public"
                   ],
-                  "id": "rift://symbol/rust/src/config.rs/load_config",
+                  "id": "rift://symbol/local/rust/app/config/load_config",
                   "kind": "function",
                   "language": "rust",
                   "name": "load_config",
@@ -3293,7 +3299,7 @@
                             "end": 48,
                             "start": 42
                           },
-                          "symbol": "rift://symbol/rust/src/config.rs/Config"
+                          "symbol": "rift://symbol/local/rust/app/config/Config"
                         }
                       ],
                       "parameters": [
@@ -5306,13 +5312,19 @@
             "type": "string"
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SyntaxFramework": {
@@ -5895,7 +5907,7 @@
               {
                 "depth": 1,
                 "direction": "incoming",
-                "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+                "seed": "rift://symbol/local/rust/rift_server/read/ReadService"
               }
             ],
             "properties": {
@@ -5932,13 +5944,19 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "TraversalDirection": {
@@ -6044,7 +6062,7 @@
               "facets": [
                 "references"
               ],
-              "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "seed": "rift://symbol/local/rust/rift_server/read/ReadService"
             }
           },
           {
@@ -6055,7 +6073,7 @@
               "facets": [
                 "calls"
               ],
-              "seed": "rift://symbol/rust/crates/rift-server/src/engine_read.rs/resolve_symbol_callees"
+              "seed": "rift://symbol/local/rust/rift_server/engine_read/resolve_symbol_callees"
             }
           },
           {
@@ -9153,13 +9171,19 @@
             ]
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolOrigin": {
@@ -9420,7 +9444,7 @@
                       "callable",
                       "public"
                     ],
-                    "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "id": "rift://symbol/local/rust/app/config/load_config",
                     "kind": "function",
                     "language": "rust",
                     "name": "load_config",
@@ -9434,7 +9458,7 @@
                               "end": 48,
                               "start": 42
                             },
-                            "symbol": "rift://symbol/rust/src/config.rs/Config"
+                            "symbol": "rift://symbol/local/rust/app/config/Config"
                           }
                         ],
                         "parameters": [
