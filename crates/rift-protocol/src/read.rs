@@ -2143,6 +2143,34 @@ pub struct SymbolId(
     pub String,
 );
 
+impl SymbolId {
+    /// Parses one canonical logical symbol identity without lookup or I/O.
+    ///
+    /// # Errors
+    /// Returns the codec violation when ownership, hierarchy or encoding is invalid.
+    pub fn parse(value: &str) -> Result<Self, crate::identity::SymbolIdentityViolation> {
+        crate::identity::SymbolIdentity::parse(value).map(|identity| Self(identity.wire_identity()))
+    }
+
+    /// Builds a wire identifier from an already validated logical identity.
+    #[must_use]
+    pub fn from_identity(identity: &crate::identity::SymbolIdentity) -> Self {
+        Self(identity.wire_identity())
+    }
+
+    /// The canonical wire spelling of this identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Takes the canonical wire spelling of this identifier.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
 /// Where a symbol belongs and how its declaration came to exist. Source location and
 /// generation are separate: generated code can belong to the project or to a dependency.
 /// Absent from `Symbol` entirely when it says a project declaration, authored, with no

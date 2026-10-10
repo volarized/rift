@@ -13,6 +13,17 @@ pub const SYMBOL_ID_BYTES_MAX: usize = 8_192;
 /// Prefix shared by canonical symbol addresses.
 pub const SYMBOL_URI_PREFIX: &str = "rift://symbol/";
 
+/// Structural wire pattern. The codec also validates exact versions and canonical spelling.
+pub const SYMBOL_ID_PATTERN: &str = concat!(
+    r"^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/",
+    r"|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/",
+    r"|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)",
+    r"[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/",
+    r"(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+",
+    r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*",
+    r"(?:~[1-9][0-9]*\?rev=[0-9a-f]{64})?$"
+);
+
 /// Revision query selecting an occurrence's immutable source.
 const REVISION_QUERY_PREFIX: &str = "?rev=";
 
@@ -115,6 +126,28 @@ pub struct SymbolIdentity {
     language: Language,
     qualified_path: Vec<String>,
     occurrence: Option<SymbolOccurrence>,
+}
+
+impl schemars::JsonSchema for SymbolIdentity {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SymbolIdentity".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": SYMBOL_ID_BYTES_MAX,
+            "pattern": SYMBOL_ID_PATTERN,
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+                "rift://symbol/local/rust/app/parser/parse",
+                "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+                "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+                "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+            ]
+        })
+    }
 }
 
 /// A symbol identity outside its canonical wire form.
