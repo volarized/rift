@@ -35,6 +35,7 @@ EXPECTED_EDGES = {
     "rift -> rift-syntax",
     "rift -> rift-tracing",
     "rift-cloud-client -> rift-core",
+    "rift-cloud-client -> rift-error",
     "rift-cloud-client -> rift-protocol",
     "rift-cloud-client -> rift-ranking",
     "rift-cloud-client -> rift-tracing",
