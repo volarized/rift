@@ -2045,6 +2045,19 @@ impl JsonSchema for SourceUnitId {
             "minLength": 17,
             "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX,
             "pattern": crate::identity::SOURCE_UNIT_ID_PATTERN,
+            "allOf": [
+                {"anyOf": [
+                    {"pattern": crate::identity::GENERIC_SOURCE_UNIT_ID_PATTERN},
+                    {"pattern": crate::identity::RELEASED_SOURCE_UNIT_ID_PATTERN}
+                ]},
+                {
+                    "if": {"pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"},
+                    "then": {"pattern": crate::identity::RELEASED_SOURCE_UNIT_ID_PATTERN}
+                },
+                {"not": {"pattern": "/\\.{1,2}(?:/|$)"}},
+                {"not": {"pattern": "^rift://source/[^/]+/[A-Za-z]:"}},
+                {"not": {"pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/|stdlib/[^/]+@[^/]+/)[A-Za-z]:"}}
+            ],
             "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://source/project/src/lib.rs",

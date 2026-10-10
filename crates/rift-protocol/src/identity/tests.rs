@@ -146,8 +146,12 @@ fn test_source_unit_schema_preserves_owner_boundaries_and_relative_paths() {
         ("rift://source/project/src//lib.rs", false),
         ("rift://source/project/src/../lib.rs", false),
         ("rift://source/project/src%2Flib.rs", false),
+        ("rift://source/project/src%5Clib.rs", false),
         ("rift://source/project/src%2flib.rs", false),
         ("rift://source/project/src/%0A.rs", false),
+        ("rift://source/project/src/%7F.rs", false),
+        ("rift://source/project/.", false),
+        ("rift://source/stdlib/cpython@3.12.9/C:/sys.py", false),
         ("rift://source/project/C:/file.rs", false),
         ("rift://source/npm/npmjs.org/demo@1.0.0/file~2.ts", false),
     ] {
