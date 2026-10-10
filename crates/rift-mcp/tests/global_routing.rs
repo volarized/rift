@@ -2356,13 +2356,13 @@ async fn test_native_client_accepts_original_identifier_candidates() -> TestResu
     let page = client.search_packages(&request, 10, None).await?;
     assert_eq!(page.items.len(), 2);
     for name in ["SearchHit", "searchHit", "createProgram", "load_config"] {
-        request.query = name.to_owned();
-        request.terms = vec![QueryTerm {
+        request.query = Some(name.to_owned());
+        request.terms = Some(vec![QueryTerm {
             text: name.to_owned(),
             phrase: false,
             prefix: false,
-        }];
-        request.identifiers = vec![name.to_owned()];
+        }]);
+        request.identifiers = Some(vec![name.to_owned()]);
         let page = client.search_packages(&request, 1, None).await?;
         let hit = rift_cloud_client::PackageSearchCandidate::try_from(page.items[0].clone())?;
         let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit.hit else {
@@ -2382,21 +2382,25 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
     use rift_cloud_client::{PackageSearchRequest, PackageSearchRequestPhase, QueryTerm};
     let parsed = rift_ranking::ParsedQuery::parse(query)?;
     Ok(PackageSearchRequest {
-        query: query.to_owned(),
-        terms: parsed
-            .members()
-            .iter()
-            .map(|member| QueryTerm {
-                text: member.text().to_owned(),
-                phrase: member.is_phrase(),
-                prefix: false,
-            })
-            .collect(),
-        identifiers: parsed
-            .candidates()
-            .iter()
-            .map(|candidate| candidate.text().to_owned())
-            .collect(),
+        query: Some(query.to_owned()),
+        terms: Some(
+            parsed
+                .members()
+                .iter()
+                .map(|member| QueryTerm {
+                    text: member.text().to_owned(),
+                    phrase: member.is_phrase(),
+                    prefix: false,
+                })
+                .collect(),
+        ),
+        identifiers: Some(
+            parsed
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.text().to_owned())
+                .collect(),
+        ),
         include: Some(vec!["source".to_owned()]),
         packages: Some(vec![rift_cloud_client::PackageIdentity {
             manager: "cargo".to_owned(),
@@ -2404,8 +2408,10 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
             name: "demo".to_owned(),
             version: "1.0.0".to_owned(),
         }]),
-        phase: PackageSearchRequestPhase::Precise,
+        phase: Some(PackageSearchRequestPhase::Precise),
         target: None,
+        traversal: None,
+        view: None,
     })
 }
 

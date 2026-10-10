@@ -2,6 +2,7 @@
 
 mod cache;
 pub mod contract;
+mod failure;
 mod pattern;
 mod response;
 pub mod search;
@@ -10,7 +11,6 @@ mod symbol;
 
 use std::{
     collections::HashSet,
-    fmt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -27,6 +27,7 @@ use reqwest::{
     },
 };
 use rift_core::FileDigest;
+use rift_error::RiftError;
 use serde::Serialize;
 use tokio::{
     sync::{Mutex, RwLock, Semaphore},
@@ -61,20 +62,21 @@ pub use generated::{
     PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
     PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
     PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
-    PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
-    PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
-    PackageSymbolRequestInclude, Parameter,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
+    PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
-    PublicationFormat, QueryTerm, ResolvePackageContextRequest, ResolvePackageContextResponse,
-    ResolvedRequirement, SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery,
-    SearchPackagePatternsResponse, SearchPackagesRequest, SearchPackagesRequestQuery,
-    SearchPackagesResponse, Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId,
-    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin,
-    TypeBindingRole, TypeExpression, Warning, WarningCode,
+    PublicationFormat, QueryTerm, RelationshipFacet, ResolvePackageContextRequest,
+    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
+    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
+    SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal, Signature, SignatureLink,
+    SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    TextRange, TraversalDirection, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
+    Warning, WarningCode,
 };
 pub mod domain;
 pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
 pub use pattern::PATTERN_PAGE_FILES_MAX;
+pub use search::{PackageSearchItem, PackageSearchPage};
 
 /// Most positions one declaration request carries.
 pub const DECLARATION_POSITIONS_MAX: usize = rift_protocol::source_read::SOURCE_POSITIONS_MAX;
@@ -163,40 +165,6 @@ const DEFAULT_ENDPOINT: &str = "https://api.volar.sh/rift/rest";
 const RATE_LIMIT_LIMIT: &str = "ratelimit-limit";
 const RATE_LIMIT_REMAINING: &str = "ratelimit-remaining";
 const RATE_LIMIT_RESET: &str = "ratelimit-reset";
-/// Why global client construction failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigError {
-    /// Global access is disabled.
-    Disabled,
-    /// Endpoint is not an absolute base URL.
-    InvalidEndpoint,
-    /// Endpoint does not use HTTPS or loopback HTTP.
-    InvalidEndpointScheme,
-    /// Token environment variable name is invalid.
-    InvalidTokenEnvironment,
-    /// Token cannot form a bounded authorization header.
-    InvalidToken,
-    /// Named setting falls outside its accepted range.
-    OutOfRange(&'static str),
-    /// HTTP client construction failed.
-    HttpClient(String),
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Disabled => f.write_str("global client disabled"),
-            Self::InvalidEndpoint => f.write_str("endpoint must be an absolute base URL without user information, query, fragment, or trailing slash"),
-            Self::InvalidEndpointScheme => f.write_str("endpoint must use HTTPS except for loopback HTTP"),
-            Self::InvalidTokenEnvironment => f.write_str("token environment variable name is invalid"),
-            Self::InvalidToken => f.write_str("token cannot form a bounded authorization header"),
-            Self::OutOfRange(name) => write!(f, "{name} is outside configured bounds"),
-            Self::HttpClient(message) => write!(f, "building HTTP client failed: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
 
 /// Accepted global client settings.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -250,15 +218,17 @@ impl Default for Config {
 }
 
 impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
-    type Error = ConfigError;
+    type Error = RiftError;
 
     fn try_from(
         value: &rift_protocol::configuration::GlobalConfiguration,
     ) -> Result<Self, Self::Error> {
-        let attempts =
-            u32::try_from(value.attempts).map_err(|_| ConfigError::OutOfRange("attempts"))?;
-        let max_in_flight = usize::try_from(value.max_in_flight)
-            .map_err(|_| ConfigError::OutOfRange("max_in_flight"))?;
+        let attempts = u32::try_from(value.attempts).map_err(|source| {
+            failure::configuration_source("attempts", "outside configured bounds", source)
+        })?;
+        let max_in_flight = usize::try_from(value.max_in_flight).map_err(|source| {
+            failure::configuration_source("max_in_flight", "outside configured bounds", source)
+        })?;
         let config = Self {
             enabled: value.enabled,
             endpoint: value.endpoint.clone(),
@@ -267,12 +237,15 @@ impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
             request_timeout: Duration::from_millis(value.request_timeout.milliseconds()),
             attempts,
             max_in_flight,
-            max_request: usize::try_from(value.max_request.bytes())
-                .map_err(|_| ConfigError::OutOfRange("max_request"))?,
-            max_response: usize::try_from(value.max_response.bytes())
-                .map_err(|_| ConfigError::OutOfRange("max_response"))?,
-            max_source: usize::try_from(value.max_source.bytes())
-                .map_err(|_| ConfigError::OutOfRange("max_source"))?,
+            max_request: usize::try_from(value.max_request.bytes()).map_err(|source| {
+                failure::configuration_source("max_request", "outside configured bounds", source)
+            })?,
+            max_response: usize::try_from(value.max_response.bytes()).map_err(|source| {
+                failure::configuration_source("max_response", "outside configured bounds", source)
+            })?,
+            max_source: usize::try_from(value.max_source.bytes()).map_err(|source| {
+                failure::configuration_source("max_source", "outside configured bounds", source)
+            })?,
             capabilities_ttl: Duration::from_millis(value.capabilities_ttl.milliseconds()),
             resolution_ttl: Duration::from_millis(value.resolution_ttl.milliseconds()),
             failure_ttl: Duration::from_millis(value.failure_ttl.milliseconds()),
@@ -307,115 +280,6 @@ pub struct ResponseMeta {
     /// Rate limit reset time when present.
     pub rate_limit_reset: Option<String>,
 }
-
-/// One global client failure.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClientError {
-    /// Client settings are invalid.
-    Config(ConfigError),
-    /// Global access is disabled.
-    Disabled,
-    /// Credential settings or value are invalid.
-    CredentialConfiguration,
-    /// Encoded request body crossed its byte bound.
-    RequestBodyTooLarge {
-        /// Observed bytes.
-        bytes: usize,
-    },
-    /// Response body crossed its byte bound.
-    ResponseBodyTooLarge {
-        /// Observed bytes.
-        bytes: usize,
-    },
-    /// Total operation deadline elapsed.
-    Deadline,
-    /// Pending request was cancelled.
-    Cancelled,
-    /// Endpoint connection or response stream failed.
-    Connection,
-    /// Successful response carried another media type.
-    InvalidMediaType {
-        /// HTTP status code.
-        status: u16,
-        /// Received content type when readable.
-        content_type: Option<String>,
-    },
-    /// Response status or header is not accepted for the operation.
-    InvalidResponse {
-        /// HTTP status code, or zero before a response exists.
-        status: u16,
-    },
-    /// JSON response decoding failed.
-    Decode {
-        /// HTTP status code.
-        status: u16,
-    },
-    /// Request field broke a contract bound or relationship.
-    InvalidRequest {
-        /// Stable field name.
-        field: &'static str,
-    },
-    /// Response field broke a contract bound or relationship.
-    InvalidResponseField {
-        /// Stable field name.
-        field: &'static str,
-    },
-    /// The capabilities do not advertise the feature the operation needs, so the client
-    /// sent no request for it.
-    FeatureUnavailable {
-        /// The feature as the capabilities spell it, such as `patterns`.
-        feature: &'static str,
-    },
-    /// Endpoint returned a non-success response.
-    Http {
-        /// Bounded status and headers.
-        meta: Box<ResponseMeta>,
-        /// Problem Details value when the response carried a valid one.
-        problem: Option<Box<ProblemDetails>>,
-    },
-}
-
-impl fmt::Display for ClientError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Config(error) => error.fmt(f),
-            Self::Disabled => f.write_str("global client disabled"),
-            Self::CredentialConfiguration => f.write_str("global credential configuration invalid"),
-            Self::RequestBodyTooLarge { bytes } => {
-                write!(f, "request body exceeds bound: {bytes} bytes")
-            }
-            Self::ResponseBodyTooLarge { bytes } => {
-                write!(f, "response body exceeds bound: {bytes} bytes")
-            }
-            Self::Deadline => f.write_str("global request deadline elapsed"),
-            Self::Cancelled => f.write_str("global request cancelled"),
-            Self::Connection => f.write_str("global endpoint connection failed"),
-            Self::InvalidMediaType {
-                status,
-                content_type,
-            } => write!(
-                f,
-                "invalid response media type for status {status}: {content_type:?}"
-            ),
-            Self::InvalidResponse { status } => {
-                write!(f, "unsupported global response status: {status}")
-            }
-            Self::Decode { status } => {
-                write!(f, "global response decode failed for status {status}")
-            }
-            Self::InvalidRequest { field } => write!(f, "global request violates bound: {field}"),
-            Self::InvalidResponseField { field } => {
-                write!(f, "global response violates contract: {field}")
-            }
-            Self::FeatureUnavailable { feature } => {
-                write!(f, "global API does not advertise feature: {feature}")
-            }
-            Self::Http { meta, .. } => write!(f, "global endpoint returned HTTP {}", meta.status),
-        }
-    }
-}
-
-impl std::error::Error for ClientError {}
 
 /// Bounded REST client for global package data.
 #[derive(Clone)]
@@ -474,16 +338,18 @@ impl PreparedPackageResolutionRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request breaks a contract bound or the supported JSON
+    /// Returns [`RiftError`] when the request breaks a contract bound or the supported JSON
     /// body ceiling. The client applies its configured request bound before sending the bytes.
-    pub fn new(request: PackageResolutionRequest) -> Result<Self, ClientError> {
+    pub fn new(request: PackageResolutionRequest) -> Result<Self, RiftError> {
         validate_resolution_request(&request)?;
         Self::from_validated(request)
     }
 
-    fn from_validated(request: PackageResolutionRequest) -> Result<Self, ClientError> {
+    fn from_validated(request: PackageResolutionRequest) -> Result<Self, RiftError> {
         let maximum = usize::try_from(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX)
-            .map_err(|_| ClientError::Config(ConfigError::OutOfRange("max_request")))?;
+            .map_err(|source| {
+                failure::configuration_source("max_request", "outside configured bounds", source)
+            })?;
         let body = serialize_body(&request, maximum)?;
         let digest = FileDigest::of(&body);
         Ok(Self {
@@ -497,7 +363,7 @@ impl PreparedPackageResolutionRequest {
 /// The failure that marked the endpoint unavailable, which every request answers until
 /// `expires`, so a later read reports the class the first one met.
 struct CachedFailure {
-    error: ClientError,
+    error: RiftError,
     expires: Instant,
 }
 
@@ -520,6 +386,8 @@ pub struct PackageSearchPages {
     pub corpus_revision: String,
     /// Documentation revision shared by every page that returns documentation.
     pub documentation_revision: Option<String>,
+    /// Original captured view and expiry shared by every page.
+    pub view: rift_protocol::symbol_read::CapturedView,
     /// Cursor of the last page when the server stopped it at the response body bound. The
     /// assembly does not follow it; a caller **MAY** pass it to `search_packages`.
     pub next_cursor: Option<String>,
@@ -548,8 +416,8 @@ impl GlobalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when enabled settings or credentials are invalid.
-    pub fn new(config: Config) -> Result<Self, ConfigError> {
+    /// Returns [`RiftError`] when enabled settings or credentials are invalid.
+    pub fn new(config: Config) -> Result<Self, RiftError> {
         let token = if config.enabled {
             read_token(&config.token_env)?
         } else {
@@ -558,7 +426,7 @@ impl GlobalClient {
         Self::new_with_token(config, token)
     }
 
-    fn new_with_token(config: Config, token: Option<String>) -> Result<Self, ConfigError> {
+    fn new_with_token(config: Config, token: Option<String>) -> Result<Self, RiftError> {
         if config.enabled {
             validate_config(&config)?;
         }
@@ -578,14 +446,19 @@ impl GlobalClient {
         if let Some(value) = token.as_deref() {
             let mut headers = HeaderMap::new();
             let authorization = format!("Bearer {value}");
-            let header =
-                HeaderValue::from_str(&authorization).map_err(|_| ConfigError::InvalidToken)?;
+            let header = HeaderValue::from_str(&authorization).map_err(|error| {
+                failure::configuration_source(
+                    "token",
+                    "token cannot form a bounded authorization header",
+                    error,
+                )
+            })?;
             headers.insert(AUTHORIZATION, header);
             builder = builder.default_headers(headers);
         }
-        let http = builder
-            .build()
-            .map_err(|error| ConfigError::HttpClient(error.to_string()))?;
+        let http = builder.build().map_err(|error| {
+            failure::configuration_source("http client", "building HTTP client failed", error)
+        })?;
         let enabled = config.enabled;
         let max_in_flight = config.max_in_flight;
         let cache_entry_counts = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
@@ -618,289 +491,352 @@ impl GlobalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when access is disabled or no valid answer is available.
-    pub async fn get_capabilities(&self) -> Result<Capabilities, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        if let Some(failure) = self.recorded_failure().await {
-            return Err(failure);
-        }
-        let _flight = rift_tracing::lock(CAPABILITIES_FLIGHT_LOCK)
-            .acquire(self.inner.capabilities_flight.lock())
-            .await;
-        if let Some(cached) = self.inner.capabilities.read().await.as_ref()
-            && cached.expires > Instant::now()
-        {
-            return Ok(cached.value.clone());
-        }
-        let etag = self
-            .inner
-            .capabilities
-            .read()
-            .await
-            .as_ref()
-            .and_then(|value| value.etag.clone());
-        let response = self
-            .request(
-                contract::Endpoint::Capabilities,
-                None,
-                etag.as_deref(),
-                self.inner.config.max_response,
-            )
-            .await;
-        let result = match response {
-            Ok(raw) => match response::capabilities(raw).await {
-                Ok(response::ParsedCapabilities::NotModified(meta)) => {
-                    let mut cache = self.inner.capabilities.write().await;
-                    let Some(cached) = cache.as_mut() else {
-                        return Err(ClientError::InvalidResponse { status: 304 });
-                    };
-                    cached.expires =
-                        Instant::now() + bounded_capabilities_ttl(&self.inner.config, &meta);
-                    if meta.etag.is_some() {
-                        cached.etag = meta.etag;
-                    }
-                    Ok(cached.value.clone())
+    /// Returns [`RiftError`] when access is disabled or no valid answer is available.
+    pub async fn get_capabilities(&self) -> Result<Capabilities, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "get_capabilities",
+            async {
+                if !self.inner.enabled {
+                    return Err(failure::configuration_invalid(
+                        "enabled",
+                        "global client disabled",
+                    ));
                 }
-                Ok(response::ParsedCapabilities::Ok(parsed)) => {
-                    let response::Parsed { value, meta } = *parsed;
-                    validate_capabilities(&value)?;
-                    let ttl = bounded_capabilities_ttl(&self.inner.config, &meta);
-                    let cached = CachedCapabilities {
-                        value: value.clone(),
-                        etag: meta.etag,
-                        expires: Instant::now() + ttl,
-                    };
-                    let mut capabilities = self.inner.capabilities.write().await;
-                    *capabilities = Some(cached);
-                    self.inner.cache_entry_counts[cache::CAPABILITIES].store(1, Ordering::Relaxed);
-                    drop(capabilities);
-                    let mut failure = self.inner.failure.write().await;
-                    *failure = None;
-                    self.inner.cache_entry_counts[cache::FAILURE].store(0, Ordering::Relaxed);
-                    drop(failure);
-                    Ok(value)
+                if let Some(failure) = self.recorded_failure().await {
+                    return Err(failure);
                 }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        self.observed(result).await
+                let _flight = rift_tracing::lock(CAPABILITIES_FLIGHT_LOCK)
+                    .acquire(self.inner.capabilities_flight.lock())
+                    .await;
+                if let Some(cached) = self.inner.capabilities.read().await.as_ref()
+                    && cached.expires > Instant::now()
+                {
+                    return Ok(cached.value.clone());
+                }
+                let etag = self
+                    .inner
+                    .capabilities
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|value| value.etag.clone());
+                let response = self
+                    .request(
+                        contract::Endpoint::Capabilities,
+                        None,
+                        etag.as_deref(),
+                        self.inner.config.max_response,
+                    )
+                    .await;
+                let result = match response {
+                    Ok(raw) => match response::capabilities(raw).await {
+                        Ok(response::ParsedCapabilities::NotModified(meta)) => {
+                            let mut cache = self.inner.capabilities.write().await;
+                            let Some(cached) = cache.as_mut() else {
+                                return Err(failure::response_invalid(
+                                    "getCapabilities",
+                                    "status",
+                                    "unsupported global response status",
+                                    Some(304),
+                                ));
+                            };
+                            cached.expires = Instant::now()
+                                + bounded_capabilities_ttl(&self.inner.config, &meta);
+                            if meta.etag.is_some() {
+                                cached.etag = meta.etag;
+                            }
+                            Ok(cached.value.clone())
+                        }
+                        Ok(response::ParsedCapabilities::Ok(parsed)) => {
+                            let response::Parsed { value, meta } = *parsed;
+                            validate_capabilities(&value)?;
+                            let ttl = bounded_capabilities_ttl(&self.inner.config, &meta);
+                            let cached = CachedCapabilities {
+                                value: value.clone(),
+                                etag: meta.etag,
+                                expires: Instant::now() + ttl,
+                            };
+                            let mut capabilities = self.inner.capabilities.write().await;
+                            *capabilities = Some(cached);
+                            self.inner.cache_entry_counts[cache::CAPABILITIES]
+                                .store(1, Ordering::Relaxed);
+                            drop(capabilities);
+                            let mut failure = self.inner.failure.write().await;
+                            *failure = None;
+                            self.inner.cache_entry_counts[cache::FAILURE]
+                                .store(0, Ordering::Relaxed);
+                            drop(failure);
+                            Ok(value)
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                self.observed(result).await
+            }
+        )
+        .await
     }
 
     /// Resolves one canonical dependency context into exact package identities.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request or answer breaks the contract, or the endpoint is
+    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint is
     /// unavailable.
     pub async fn resolve_package_context(
         &self,
         request: &PackageResolutionRequest,
-    ) -> Result<PackageResolutionResponse, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        validate_resolution_request(request)?;
-        let capabilities = self.get_capabilities().await?;
-        validate_resolution_request_for_capabilities(request, &capabilities)?;
-        let prepared = PreparedPackageResolutionRequest::from_validated(request.clone())?;
-        validate_body_for_capabilities(
-            &prepared.body,
-            &capabilities,
-            self.inner.config.max_request,
-        )?;
-        self.resolve_prepared_package_context(&prepared).await
+    ) -> Result<PackageResolutionResponse, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "resolve_package_context",
+            async {
+                if !self.inner.enabled {
+                    return Err(failure::configuration_invalid(
+                        "enabled",
+                        "global client disabled",
+                    ));
+                }
+                validate_resolution_request(request)?;
+                let capabilities = self.get_capabilities().await?;
+                validate_resolution_request_for_capabilities(request, &capabilities)?;
+                let prepared = PreparedPackageResolutionRequest::from_validated(request.clone())?;
+                validate_body_for_capabilities(
+                    &prepared.body,
+                    &capabilities,
+                    self.inner.config.max_request,
+                )?;
+                self.resolve_prepared_package_context(&prepared).await
+            }
+        )
+        .await
     }
 
     /// Resolves one checked package request, reusing its retained bytes and digest.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when capabilities, the answer, or endpoint breaks the contract.
+    /// Returns [`RiftError`] when capabilities, the answer, or endpoint breaks the contract.
     pub async fn resolve_prepared_package_context(
         &self,
         prepared: &PreparedPackageResolutionRequest,
-    ) -> Result<PackageResolutionResponse, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        let capabilities = self.get_capabilities().await?;
-        validate_resolution_request_for_capabilities(&prepared.request, &capabilities)?;
-        validate_body_for_capabilities(
-            &prepared.body,
-            &capabilities,
-            self.inner.config.max_request,
-        )?;
-        if let Some(value) = self.inner.resolution.read().await.as_ref()
-            && value.analyzer_revision == capabilities.analyzer_revision
-            && value.corpus_revision == capabilities.corpus_revision
-            && value.request_digest == prepared.digest
-            && value.expires > Instant::now()
-        {
-            return Ok(value.value.clone());
-        }
-        let _flight = rift_tracing::lock(RESOLUTIONS_FLIGHT_LOCK)
-            .acquire(self.inner.resolutions_flight.lock())
-            .await;
-        if let Some(value) = self.inner.resolution.read().await.as_ref()
-            && value.analyzer_revision == capabilities.analyzer_revision
-            && value.corpus_revision == capabilities.corpus_revision
-            && value.request_digest == prepared.digest
-            && value.expires > Instant::now()
-        {
-            return Ok(value.value.clone());
-        }
-        let raw = match self
-            .request(
-                contract::Endpoint::Resolutions,
-                Some(prepared.body.to_vec()),
-                None,
-                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-            )
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => {
-                return self.observed(Err(error)).await;
+    ) -> Result<PackageResolutionResponse, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "resolve_prepared_package_context",
+            async {
+                if !self.inner.enabled {
+                    return Err(failure::configuration_invalid(
+                        "enabled",
+                        "global client disabled",
+                    ));
+                }
+                let capabilities = self.get_capabilities().await?;
+                validate_resolution_request_for_capabilities(&prepared.request, &capabilities)?;
+                validate_body_for_capabilities(
+                    &prepared.body,
+                    &capabilities,
+                    self.inner.config.max_request,
+                )?;
+                if let Some(value) = self.inner.resolution.read().await.as_ref()
+                    && value.analyzer_revision == capabilities.analyzer_revision
+                    && value.corpus_revision == capabilities.corpus_revision
+                    && value.request_digest == prepared.digest
+                    && value.expires > Instant::now()
+                {
+                    return Ok(value.value.clone());
+                }
+                let _flight = rift_tracing::lock(RESOLUTIONS_FLIGHT_LOCK)
+                    .acquire(self.inner.resolutions_flight.lock())
+                    .await;
+                if let Some(value) = self.inner.resolution.read().await.as_ref()
+                    && value.analyzer_revision == capabilities.analyzer_revision
+                    && value.corpus_revision == capabilities.corpus_revision
+                    && value.request_digest == prepared.digest
+                    && value.expires > Instant::now()
+                {
+                    return Ok(value.value.clone());
+                }
+                let raw = match self
+                    .request(
+                        contract::Endpoint::Resolutions,
+                        Some(prepared.body.to_vec()),
+                        None,
+                        active_response_body_bytes_max(
+                            &capabilities,
+                            self.inner.config.max_response,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        return self.observed(Err(error)).await;
+                    }
+                };
+                let response::Parsed { value, meta } = match response::resolution(raw).await {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return self.observed(Err(error)).await;
+                    }
+                };
+                if let Err(error) = validate_resolution_response(&prepared.request, &value) {
+                    return self.observed(Err(error)).await;
+                }
+                let ttl = bounded_resolution_ttl(&self.inner.config, &meta);
+                let mut resolution = self.inner.resolution.write().await;
+                *resolution = Some(CachedResolution {
+                    analyzer_revision: capabilities.analyzer_revision.clone(),
+                    corpus_revision: capabilities.corpus_revision.clone(),
+                    request_digest: prepared.digest,
+                    value: value.clone(),
+                    expires: Instant::now() + ttl,
+                });
+                self.inner.cache_entry_counts[cache::RESOLUTION].store(1, Ordering::Relaxed);
+                drop(resolution);
+                Ok(value)
             }
-        };
-        let response::Parsed { value, meta } = match response::resolution(raw).await {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return self.observed(Err(error)).await;
-            }
-        };
-        if let Err(error) = validate_resolution_response(&prepared.request, &value) {
-            return self.observed(Err(error)).await;
-        }
-        let ttl = bounded_resolution_ttl(&self.inner.config, &meta);
-        let mut resolution = self.inner.resolution.write().await;
-        *resolution = Some(CachedResolution {
-            analyzer_revision: capabilities.analyzer_revision.clone(),
-            corpus_revision: capabilities.corpus_revision.clone(),
-            request_digest: prepared.digest,
-            value: value.clone(),
-            expires: Instant::now() + ttl,
-        });
-        self.inner.cache_entry_counts[cache::RESOLUTION].store(1, Ordering::Relaxed);
-        drop(resolution);
-        Ok(value)
+        )
+        .await
     }
 
     /// Reads one package search page.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request or answer breaks the contract, or the endpoint is
+    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint is
     /// unavailable.
     pub async fn search_packages(
         &self,
         request: &PackageSearchRequest,
         limit: i64,
         cursor: Option<&str>,
-    ) -> Result<PackageSearchPage, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        validate_search_request(request)?;
-        validate_page(limit, cursor)?;
-        let capabilities = self.get_capabilities().await?;
-        validate_search_request_for_capabilities(request, limit, cursor, &capabilities)?;
-        let body = serialize_body(request, self.inner.config.max_request)?;
-        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-        let query = SearchPackagesRequestQuery {
-            limit: Some(limit),
-            cursor: cursor.map(str::to_owned),
-        };
-        let raw = match self
-            .request_with_query(
-                contract::Endpoint::Search,
-                body,
-                &query,
-                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-            )
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => {
+    ) -> Result<PackageSearchPage, RiftError> {
+        rift_tracing::traced!(component = "global", operation = "search_packages", async {
+            if !self.inner.enabled {
+                return Err(failure::configuration_invalid(
+                    "enabled",
+                    "global client disabled",
+                ));
+            }
+            validate_search_request(request)?;
+            validate_page(limit, cursor)?;
+            let capabilities = self.get_capabilities().await?;
+            validate_search_request_for_capabilities(request, limit, cursor, &capabilities)?;
+            let body = serialize_body(request, self.inner.config.max_request)?;
+            validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
+            let query = SearchPackagesRequestQuery {
+                limit: Some(limit),
+                cursor: cursor.map(str::to_owned),
+            };
+            let raw = match self
+                .request_with_query(
+                    contract::Endpoint::Search,
+                    body,
+                    &query,
+                    active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
+                )
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) => {
+                    return self.observed(Err(error)).await;
+                }
+            };
+            let response::Parsed { value: page, .. } = match response::search(raw) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return self.observed(Err(error)).await;
+                }
+            };
+            if let Err(error) = validate_search_page(
+                request,
+                &capabilities,
+                &page,
+                cursor,
+                self.inner.config.max_source,
+            ) {
                 return self.observed(Err(error)).await;
             }
-        };
-        let response::Parsed { value: page, .. } = match response::search(raw).await {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return self.observed(Err(error)).await;
-            }
-        };
-        if let Err(error) = validate_search_page(
-            request,
-            &capabilities,
-            &page,
-            cursor,
-            self.inner.config.max_source,
-        ) {
-            return self.observed(Err(error)).await;
-        }
-        Ok(page)
+            Ok(page)
+        })
+        .await
     }
 
     /// Reads one package symbol page.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request or answer breaks the contract, or the endpoint is
+    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint is
     /// unavailable.
     pub async fn list_package_symbols(
         &self,
         request: &PackageSymbolRequest,
         limit: i64,
         cursor: Option<&str>,
-    ) -> Result<PackageSymbolPage, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        validate_symbol_request(request)?;
-        validate_page(limit, cursor)?;
-        let capabilities = self.get_capabilities().await?;
-        validate_symbol_request_for_capabilities(request, limit, cursor, &capabilities)?;
-        let body = serialize_body(request, self.inner.config.max_request)?;
-        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-        let query = ListPackageSymbolsRequestQuery {
-            limit: Some(limit),
-            cursor: cursor.map(str::to_owned),
-        };
-        let raw = match self
-            .request_with_query(
-                contract::Endpoint::Symbols,
-                body,
-                &query,
-                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-            )
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => {
-                return self.observed(Err(error)).await;
+    ) -> Result<PackageSymbolPage, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "list_package_symbols",
+            async {
+                if !self.inner.enabled {
+                    return Err(failure::configuration_invalid(
+                        "enabled",
+                        "global client disabled",
+                    ));
+                }
+                validate_symbol_request(request)?;
+                validate_page(limit, cursor)?;
+                let capabilities = self.get_capabilities().await?;
+                validate_symbol_request_for_capabilities(request, limit, cursor, &capabilities)?;
+                let body = serialize_body(request, self.inner.config.max_request)?;
+                validate_body_for_capabilities(
+                    &body,
+                    &capabilities,
+                    self.inner.config.max_request,
+                )?;
+                let query = ListPackageSymbolsRequestQuery {
+                    limit: Some(limit),
+                    cursor: cursor.map(str::to_owned),
+                };
+                let raw = match self
+                    .request_with_query(
+                        contract::Endpoint::Symbols,
+                        body,
+                        &query,
+                        active_response_body_bytes_max(
+                            &capabilities,
+                            self.inner.config.max_response,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        return self.observed(Err(error)).await;
+                    }
+                };
+                let response::Parsed { value: page, .. } = match response::symbols(raw).await {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return self.observed(Err(error)).await;
+                    }
+                };
+                if let Err(error) = validate_symbol_page(
+                    request,
+                    &capabilities,
+                    &page,
+                    cursor,
+                    self.inner.config.max_source,
+                ) {
+                    return self.observed(Err(error)).await;
+                }
+                Ok(page)
             }
-        };
-        let response::Parsed { value: page, .. } = match response::symbols(raw).await {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return self.observed(Err(error)).await;
-            }
-        };
-        if let Err(error) = validate_symbol_page(
-            request,
-            &capabilities,
-            &page,
-            cursor,
-            self.inner.config.max_source,
-        ) {
-            return self.observed(Err(error)).await;
-        }
-        Ok(page)
+        )
+        .await
     }
 
     /// Reads package search pages through the active candidate bound, asking each page for the
@@ -911,68 +847,98 @@ impl GlobalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when any page is unavailable, changes revision, repeats an identity,
+    /// Returns [`RiftError`] when any page is unavailable, changes revision, repeats an identity,
     /// or repeats a cursor.
     pub async fn search_packages_pages(
         &self,
         request: &PackageSearchRequest,
         limit: i64,
-    ) -> Result<PackageSearchPages, ClientError> {
-        validate_search_request(request)?;
-        validate_page(limit, None)?;
-        let capabilities = self.get_capabilities().await?;
-        let limit = advertised_page_limit(limit, &capabilities);
-        validate_search_request_for_capabilities(request, limit, None, &capabilities)?;
-        let candidate_max = bounded_candidate_pool(&capabilities);
-        let mut cursor = None;
-        let mut hits = Vec::new();
-        let mut warnings = Vec::new();
-        let mut revisions = None;
-        let mut seen_identities = HashSet::new();
-        let mut seen_cursors = HashSet::new();
-        loop {
-            let page = self
-                .search_packages(request, limit, cursor.as_deref())
-                .await?;
-            if let Err(error) = validate_assembled_revision(
-                &mut revisions,
-                &page.analyzer_revision,
-                &page.corpus_revision,
-                page.documentation_revision.as_deref(),
-            ) {
-                return self.observed(Err(error)).await;
-            }
-            let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
-            extend_warnings(&mut warnings, page.warnings);
-            for hit in page.items {
-                let identity = search_hit_identity(&hit)?;
-                if !seen_identities.insert(identity) {
-                    return self
-                        .observed(Err(ClientError::InvalidResponseField {
-                            field: "duplicate_item",
-                        }))
-                        .await;
+    ) -> Result<PackageSearchPages, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "search_packages_pages",
+            async {
+                validate_search_request(request)?;
+                validate_page(limit, None)?;
+                let capabilities = self.get_capabilities().await?;
+                let limit = advertised_page_limit(limit, &capabilities);
+                validate_search_request_for_capabilities(request, limit, None, &capabilities)?;
+                let candidate_max = bounded_candidate_pool(&capabilities);
+                let mut cursor = None;
+                let mut hits = Vec::new();
+                let mut warnings = Vec::new();
+                let mut revisions = None;
+                let mut captured_view = None;
+                let mut captured_request = request.clone();
+                let mut seen_identities = HashSet::new();
+                let mut seen_cursors = HashSet::new();
+                loop {
+                    let page = self
+                        .search_packages(&captured_request, limit, cursor.as_deref())
+                        .await?;
+                    if let Some(view) = &captured_view {
+                        if view != &page.view {
+                            return self
+                                .observed(Err(failure::response_invalid(
+                                    "search_packages_pages",
+                                    "view",
+                                    "captured view changed between pages",
+                                    None,
+                                )))
+                                .await;
+                        }
+                    } else {
+                        captured_request.view = Some(page.view.id.as_str().to_owned());
+                        captured_view = Some(page.view.clone());
+                    }
+                    if let Err(error) = validate_assembled_revision(
+                        &mut revisions,
+                        &page.analyzer_revision,
+                        &page.corpus_revision,
+                        page.documentation_revision.as_deref(),
+                    ) {
+                        return self.observed(Err(error)).await;
+                    }
+                    let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
+                    extend_warnings(&mut warnings, page.warnings);
+                    for hit in page.items {
+                        let identity = search_hit_identity(&hit)?;
+                        if !seen_identities.insert(identity) {
+                            return self
+                                .observed(Err(failure::response_invalid(
+                                    "search_packages_pages",
+                                    "duplicate_item",
+                                    "field failed validation",
+                                    None,
+                                )))
+                                .await;
+                        }
+                        hits.push(hit);
+                        if hits.len() >= candidate_max {
+                            return search_pages(hits, warnings, revisions, captured_view, None);
+                        }
+                    }
+                    let Some(next) = page.next_cursor else {
+                        return search_pages(hits, warnings, revisions, captured_view, None);
+                    };
+                    if stopped {
+                        return search_pages(hits, warnings, revisions, captured_view, Some(next));
+                    }
+                    if !seen_cursors.insert(next.clone()) {
+                        return self
+                            .observed(Err(failure::response_invalid(
+                                "search_packages_pages",
+                                "cursor_progress",
+                                "field failed validation",
+                                None,
+                            )))
+                            .await;
+                    }
+                    cursor = Some(next);
                 }
-                hits.push(hit);
-                if hits.len() >= candidate_max {
-                    return Ok(search_pages(hits, warnings, revisions, None));
-                }
             }
-            let Some(next) = page.next_cursor else {
-                return Ok(search_pages(hits, warnings, revisions, None));
-            };
-            if stopped {
-                return Ok(search_pages(hits, warnings, revisions, Some(next)));
-            }
-            if !seen_cursors.insert(next.clone()) {
-                return self
-                    .observed(Err(ClientError::InvalidResponseField {
-                        field: "cursor_progress",
-                    }))
-                    .await;
-            }
-            cursor = Some(next);
-        }
+        )
+        .await
     }
 
     /// Reads package symbol pages through the active candidate bound, asking each page for the
@@ -983,70 +949,83 @@ impl GlobalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when any page is unavailable, changes revision, repeats an identity,
+    /// Returns [`RiftError`] when any page is unavailable, changes revision, repeats an identity,
     /// or repeats a cursor.
     pub async fn list_package_symbols_pages(
         &self,
         request: &PackageSymbolRequest,
         limit: i64,
-    ) -> Result<PackageSymbolPages, ClientError> {
-        validate_symbol_request(request)?;
-        validate_page(limit, None)?;
-        let capabilities = self.get_capabilities().await?;
-        let limit = advertised_page_limit(limit, &capabilities);
-        validate_symbol_request_for_capabilities(request, limit, None, &capabilities)?;
-        let candidate_max = bounded_candidate_pool(&capabilities);
-        let mut cursor = None;
-        let mut hits = Vec::new();
-        let mut warnings = Vec::new();
-        let mut revisions = None;
-        let mut seen_cursors = HashSet::new();
-        loop {
-            let page = self
-                .list_package_symbols(request, limit, cursor.as_deref())
-                .await?;
-            if let Err(error) = validate_assembled_revision(
-                &mut revisions,
-                &page.analyzer_revision,
-                &page.corpus_revision,
-                page.documentation_revision.as_deref(),
-            ) {
-                return self.observed(Err(error)).await;
-            }
-            let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
-            extend_warnings(&mut warnings, page.warnings);
-            for hit in page.items {
-                let identity = symbol_hit_identity(&hit);
-                if hits
-                    .iter()
-                    .any(|item: &PackageSymbol| symbol_hit_identity(item) == identity)
-                {
-                    return self
-                        .observed(Err(ClientError::InvalidResponseField {
-                            field: "duplicate_item",
-                        }))
-                        .await;
+    ) -> Result<PackageSymbolPages, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "list_package_symbols_pages",
+            async {
+                validate_symbol_request(request)?;
+                validate_page(limit, None)?;
+                let capabilities = self.get_capabilities().await?;
+                let limit = advertised_page_limit(limit, &capabilities);
+                validate_symbol_request_for_capabilities(request, limit, None, &capabilities)?;
+                let candidate_max = bounded_candidate_pool(&capabilities);
+                let mut cursor = None;
+                let mut hits = Vec::new();
+                let mut warnings = Vec::new();
+                let mut revisions = None;
+                let mut seen_cursors = HashSet::new();
+                loop {
+                    let page = self
+                        .list_package_symbols(request, limit, cursor.as_deref())
+                        .await?;
+                    if let Err(error) = validate_assembled_revision(
+                        &mut revisions,
+                        &page.analyzer_revision,
+                        &page.corpus_revision,
+                        page.documentation_revision.as_deref(),
+                    ) {
+                        return self.observed(Err(error)).await;
+                    }
+                    let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
+                    extend_warnings(&mut warnings, page.warnings);
+                    for hit in page.items {
+                        let identity = symbol_hit_identity(&hit);
+                        if hits
+                            .iter()
+                            .any(|item: &PackageSymbol| symbol_hit_identity(item) == identity)
+                        {
+                            return self
+                                .observed(Err(failure::response_invalid(
+                                    "list_package_symbols_pages",
+                                    "duplicate_item",
+                                    "field failed validation",
+                                    None,
+                                )))
+                                .await;
+                        }
+                        hits.push(hit);
+                        if hits.len() >= candidate_max {
+                            return Ok(symbol_pages(hits, warnings, revisions, None));
+                        }
+                    }
+                    let Some(next) = page.next_cursor else {
+                        return Ok(symbol_pages(hits, warnings, revisions, None));
+                    };
+                    if stopped {
+                        return Ok(symbol_pages(hits, warnings, revisions, Some(next)));
+                    }
+                    if !seen_cursors.insert(next.clone()) {
+                        return self
+                            .observed(Err(failure::response_invalid(
+                                "list_package_symbols_pages",
+                                "cursor_progress",
+                                "field failed validation",
+                                None,
+                            )))
+                            .await;
+                    }
+                    cursor = Some(next);
                 }
-                hits.push(hit);
-                if hits.len() >= candidate_max {
-                    return Ok(symbol_pages(hits, warnings, revisions, None));
-                }
             }
-            let Some(next) = page.next_cursor else {
-                return Ok(symbol_pages(hits, warnings, revisions, None));
-            };
-            if stopped {
-                return Ok(symbol_pages(hits, warnings, revisions, Some(next)));
-            }
-            if !seen_cursors.insert(next.clone()) {
-                return self
-                    .observed(Err(ClientError::InvalidResponseField {
-                        field: "cursor_progress",
-                    }))
-                    .await;
-            }
-            cursor = Some(next);
-        }
+        )
+        .await
     }
 
     async fn request_with_query<Q: Serialize + Sync + ?Sized>(
@@ -1055,7 +1034,7 @@ impl GlobalClient {
         body: Vec<u8>,
         query: &Q,
         response_body_bytes_max: usize,
-    ) -> Result<RawResponse, ClientError> {
+    ) -> Result<RawResponse, RiftError> {
         self.request_inner(
             operation,
             Some(body),
@@ -1072,7 +1051,7 @@ impl GlobalClient {
         body: Option<Vec<u8>>,
         etag: Option<&str>,
         response_body_bytes_max: usize,
-    ) -> Result<RawResponse, ClientError> {
+    ) -> Result<RawResponse, RiftError> {
         self.request_inner::<()>(operation, body, None, etag, response_body_bytes_max)
             .await
     }
@@ -1084,7 +1063,7 @@ impl GlobalClient {
         query: Option<&Q>,
         etag: Option<&str>,
         response_body_bytes_max: usize,
-    ) -> Result<RawResponse, ClientError> {
+    ) -> Result<RawResponse, RiftError> {
         let deadline = Instant::now() + self.inner.config.request_timeout;
         let attempts = self.inner.config.attempts;
         let span = rift_tracing::info_span!(
@@ -1115,7 +1094,7 @@ impl GlobalClient {
                 let response = match result {
                     Ok(Ok(response)) => response,
                     Ok(Err(error)) => {
-                        if error == ClientError::Connection
+                        if failure::retryable_connection(&error)
                             && attempt < attempts
                             && Instant::now() < deadline
                         {
@@ -1124,9 +1103,13 @@ impl GlobalClient {
                         record_request_span(&record, attempt, None);
                         return Err(error);
                     }
-                    Err(_) => {
+                    Err(source) => {
                         record_request_span(&record, attempt, None);
-                        return Err(ClientError::Deadline);
+                        return Err(failure::request_source(
+                            operation.operation_id(),
+                            "global request deadline elapsed",
+                            source,
+                        ));
                     }
                 };
                 rift_tracing::debug!(
@@ -1152,9 +1135,13 @@ impl GlobalClient {
                             record_request_span(&record, attempt, Some(&response));
                             return Ok(response);
                         }
-                        if timeout_at(deadline, sleep(delay)).await.is_err() {
+                        if let Err(source) = timeout_at(deadline, sleep(delay)).await {
                             record_request_span(&record, attempt, None);
-                            return Err(ClientError::Deadline);
+                            return Err(failure::request_source(
+                                operation.operation_id(),
+                                "global request deadline elapsed",
+                                source,
+                            ));
                         }
                     }
                     continue;
@@ -1173,13 +1160,11 @@ impl GlobalClient {
         query: Option<&Q>,
         etag: Option<&str>,
         response_body_bytes_max: usize,
-    ) -> Result<RawResponse, ClientError> {
-        let _permit = self
-            .inner
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| ClientError::Cancelled)?;
+    ) -> Result<RawResponse, RiftError> {
+        let _permit =
+            self.inner.permits.acquire().await.map_err(|error| {
+                failure::request_cancelled_source(operation.operation_id(), error)
+            })?;
         let url = make_url(&self.inner.endpoint, operation.path());
         let method = operation.method();
         let mut request = self
@@ -1200,9 +1185,17 @@ impl GlobalClient {
         }
         let mut response = request.send().await.map_err(|error| {
             if error.is_timeout() && error.is_connect() {
-                ClientError::Deadline
+                failure::request_source(
+                    operation.operation_id(),
+                    "global request deadline elapsed",
+                    error,
+                )
             } else {
-                ClientError::Connection
+                failure::request_source(
+                    operation.operation_id(),
+                    "global endpoint connection failed",
+                    error,
+                )
             }
         })?;
         let status = response.status();
@@ -1214,28 +1207,33 @@ impl GlobalClient {
                 meta,
             });
         }
-        if response
-            .content_length()
-            .is_some_and(|size| size > response_body_bytes_max as u64)
+        if let Some(size) = response.content_length()
+            && size > response_body_bytes_max as u64
         {
-            let bytes = match response.content_length() {
-                Some(size) => match usize::try_from(size) {
-                    Ok(value) => value,
-                    Err(_) => usize::MAX,
-                },
-                None => response_body_bytes_max.saturating_add(1),
-            };
-            return Err(ClientError::ResponseBodyTooLarge { bytes });
+            let bytes = usize::try_from(size).unwrap_or(usize::MAX);
+            return Err(failure::body_limit(
+                operation.operation_id(),
+                "response",
+                bytes,
+                response_body_bytes_max,
+            ));
         }
         let mut body_bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| ClientError::Connection)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            failure::request_source(
+                operation.operation_id(),
+                "global endpoint connection failed",
+                error,
+            )
+        })? {
             let next = body_bytes.len().saturating_add(chunk.len());
             if next > response_body_bytes_max {
-                return Err(ClientError::ResponseBodyTooLarge { bytes: next });
+                return Err(failure::body_limit(
+                    operation.operation_id(),
+                    "response",
+                    next,
+                    response_body_bytes_max,
+                ));
             }
             body_bytes.extend_from_slice(&chunk);
         }
@@ -1243,10 +1241,12 @@ impl GlobalClient {
             && status != StatusCode::NO_CONTENT
             && !is_media(&meta, "application/json")
         {
-            return Err(ClientError::InvalidMediaType {
-                status: status.as_u16(),
-                content_type: meta.content_type,
-            });
+            return Err(failure::response_invalid(
+                operation.operation_id(),
+                "content_type",
+                &format!("invalid response media type: {:?}", meta.content_type),
+                Some(status.as_u16()),
+            ));
         }
         Ok(RawResponse {
             status,
@@ -1257,7 +1257,7 @@ impl GlobalClient {
 
     /// Hands `result` back, first recording its failure as the one every request answers
     /// for `failure_ttl`.
-    async fn observed<T>(&self, result: Result<T, ClientError>) -> Result<T, ClientError> {
+    async fn observed<T>(&self, result: Result<T, RiftError>) -> Result<T, RiftError> {
         if let Err(error) = &result {
             let mut failure = self.inner.failure.write().await;
             *failure = Some(CachedFailure {
@@ -1271,7 +1271,7 @@ impl GlobalClient {
     }
 
     /// The failure the endpoint answers while it is marked unavailable.
-    async fn recorded_failure(&self) -> Option<ClientError> {
+    async fn recorded_failure(&self) -> Option<RiftError> {
         self.inner
             .failure
             .read()
@@ -1296,7 +1296,7 @@ fn record_request_span(
 }
 
 impl ResponseMeta {
-    fn from_headers(status: StatusCode, headers: &HeaderMap) -> Result<Self, ClientError> {
+    fn from_headers(status: StatusCode, headers: &HeaderMap) -> Result<Self, RiftError> {
         Ok(Self {
             status: status.as_u16(),
             content_type: header_text(headers, CONTENT_TYPE.as_str(), "content_type")?,
@@ -1315,60 +1315,9 @@ impl ResponseMeta {
     }
 }
 
-fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
-    if value.publication_format != PublicationFormat::RiftPackageIndexV2 {
-        return Err(ClientError::InvalidResponseField {
-            field: "publication_format",
-        });
-    }
-    if value.supported_package_managers.is_empty()
-        || value.supported_package_managers.len() > 3
-        || value
-            .supported_package_managers
-            .iter()
-            .any(|manager| !within_characters(manager, LABEL_CHARS_MAX))
-    {
-        return Err(ClientError::InvalidResponseField {
-            field: "supported_package_managers",
-        });
-    }
-    let required_features = ["resolutions", "search", "symbols"];
-    if value.supported_features.is_empty()
-        || value.supported_features.len() > 32
-        || value
-            .supported_features
-            .iter()
-            .any(|feature| !within_characters(feature, LABEL_CHARS_MAX))
-        || required_features.iter().any(|required| {
-            !value
-                .supported_features
-                .iter()
-                .any(|feature| feature == required)
-        })
-    {
-        return Err(ClientError::InvalidResponseField {
-            field: "supported_features",
-        });
-    }
-    if !within_characters(&value.analyzer_revision, LABEL_CHARS_MAX)
-        || !within_characters(&value.corpus_revision, LABEL_CHARS_MAX)
-    {
-        return Err(ClientError::InvalidResponseField { field: "revision" });
-    }
-    let documentation_supported = supports_feature(value, DOCUMENTATION_SEARCH_FEATURE)
-        || supports_feature(value, SYMBOL_DOCUMENTATION_FEATURE);
-    if documentation_supported
-        != value
-            .documentation_revision
-            .as_deref()
-            .is_some_and(valid_revision_digest)
-    {
-        return Err(ClientError::InvalidResponseField {
-            field: "documentation_revision",
-        });
-    }
+fn capabilities_bounds_valid(value: &Capabilities) -> bool {
     let bounds = &value.bounds;
-    let bounds_ok = usize::try_from(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX)
+    usize::try_from(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX)
         .is_ok_and(|maximum| positive_within(bounds.request_body_bytes_max, maximum))
         && usize::try_from(rift_protocol::configuration::GLOBAL_RESPONSE_BYTES_MAX)
             .is_ok_and(|maximum| positive_within(bounds.response_body_bytes_max, maximum))
@@ -1389,9 +1338,85 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
             .is_ok_and(|maximum| positive_within(bounds.source_bytes_max, maximum))
         && bounds.page_limit_min <= bounds.page_limit_max
         && bounds.page_limit_default >= bounds.page_limit_min
-        && bounds.page_limit_default <= bounds.page_limit_max;
-    if !bounds_ok {
-        return Err(ClientError::InvalidResponseField { field: "bounds" });
+        && bounds.page_limit_default <= bounds.page_limit_max
+}
+
+fn validate_capabilities(value: &Capabilities) -> Result<(), RiftError> {
+    if value.publication_format != PublicationFormat::RiftPackageIndexV2 {
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "publication_format",
+            "field failed validation",
+            None,
+        ));
+    }
+    if value.supported_package_managers.is_empty()
+        || value.supported_package_managers.len() > 3
+        || value
+            .supported_package_managers
+            .iter()
+            .any(|manager| !within_characters(manager, LABEL_CHARS_MAX))
+    {
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "supported_package_managers",
+            "field failed validation",
+            None,
+        ));
+    }
+    let required_features = ["resolutions", "search", "symbols"];
+    if value.supported_features.is_empty()
+        || value.supported_features.len() > 32
+        || value
+            .supported_features
+            .iter()
+            .any(|feature| !within_characters(feature, LABEL_CHARS_MAX))
+        || required_features.iter().any(|required| {
+            !value
+                .supported_features
+                .iter()
+                .any(|feature| feature == required)
+        })
+    {
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "supported_features",
+            "field failed validation",
+            None,
+        ));
+    }
+    if !within_characters(&value.analyzer_revision, LABEL_CHARS_MAX)
+        || !within_characters(&value.corpus_revision, LABEL_CHARS_MAX)
+    {
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "revision",
+            "field failed validation",
+            None,
+        ));
+    }
+    let documentation_supported = supports_feature(value, DOCUMENTATION_SEARCH_FEATURE)
+        || supports_feature(value, SYMBOL_DOCUMENTATION_FEATURE);
+    if documentation_supported
+        != value
+            .documentation_revision
+            .as_deref()
+            .is_some_and(valid_revision_digest)
+    {
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "documentation_revision",
+            "field failed validation",
+            None,
+        ));
+    }
+    if !capabilities_bounds_valid(value) {
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "bounds",
+            "field failed validation",
+            None,
+        ));
     }
     let known_fields = ["name", "qualified_name", "documentation", "signature"];
     if value.required_search_fields.len() != known_fields.len()
@@ -1402,9 +1427,12 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
                 .any(|field| field == required)
         })
     {
-        return Err(ClientError::InvalidResponseField {
-            field: "required_search_fields",
-        });
+        return Err(failure::response_invalid(
+            "validate_capabilities",
+            "required_search_fields",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
@@ -1426,9 +1454,13 @@ fn valid_revision_digest(value: &str) -> bool {
 fn validate_resolution_request_for_capabilities(
     request: &PackageResolutionRequest,
     capabilities: &Capabilities,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     if request.entries.len() > capabilities.dependency_entries_max() {
-        return Err(ClientError::InvalidRequest { field: "entries" });
+        return Err(failure::request_invalid(
+            "validate_resolution_request_for_capabilities",
+            "entries",
+            "field failed validation",
+        ));
     }
     Ok(())
 }
@@ -1438,7 +1470,7 @@ fn validate_search_request_for_capabilities(
     limit: i64,
     cursor: Option<&str>,
     capabilities: &Capabilities,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let target = request
         .target
         .as_ref()
@@ -1448,29 +1480,46 @@ fn validate_search_request_for_capabilities(
         PackageSearchRequestTarget::Documentation | PackageSearchRequestTarget::All
     ) && !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
     {
-        return Err(ClientError::FeatureUnavailable {
-            feature: DOCUMENTATION_SEARCH_FEATURE,
-        });
+        return Err(failure::configuration_invalid(
+            "feature",
+            &format!("global API does not advertise feature: {DOCUMENTATION_SEARCH_FEATURE}"),
+        ));
     }
     let bounds = &capabilities.bounds;
-    if request.query.len() > smaller_bound(bounds.query_bytes_max, QUERY_BYTES_MAX) {
-        return Err(ClientError::InvalidRequest { field: "query" });
+    if request
+        .query
+        .as_ref()
+        .is_some_and(|query| query.len() > smaller_bound(bounds.query_bytes_max, QUERY_BYTES_MAX))
+    {
+        return Err(failure::request_invalid(
+            "validate_search_request_for_capabilities",
+            "query",
+            "field failed validation",
+        ));
     }
-    if request.terms.len() > smaller_bound(bounds.query_terms_max, QUERY_TERMS_MAX)
-        || request.terms.iter().any(|term| {
+    let terms = request.terms.as_deref().unwrap_or_default();
+    if terms.len() > smaller_bound(bounds.query_terms_max, QUERY_TERMS_MAX)
+        || terms.iter().any(|term| {
             term.text.len() > smaller_bound(bounds.query_term_bytes_max, QUERY_TERM_BYTES_MAX)
         })
     {
-        return Err(ClientError::InvalidRequest { field: "terms" });
+        return Err(failure::request_invalid(
+            "validate_search_request_for_capabilities",
+            "terms",
+            "field failed validation",
+        ));
     }
-    if request.identifiers.len() > smaller_bound(bounds.identifiers_max, IDENTIFIERS_MAX)
-        || request.identifiers.iter().any(|identifier| {
+    let identifiers = request.identifiers.as_deref().unwrap_or_default();
+    if identifiers.len() > smaller_bound(bounds.identifiers_max, IDENTIFIERS_MAX)
+        || identifiers.iter().any(|identifier| {
             identifier.len() > smaller_bound(bounds.identifier_bytes_max, IDENTIFIER_BYTES_MAX)
         })
     {
-        return Err(ClientError::InvalidRequest {
-            field: "identifiers",
-        });
+        return Err(failure::request_invalid(
+            "validate_search_request_for_capabilities",
+            "identifiers",
+            "field failed validation",
+        ));
     }
     validate_read_bounds(
         request.packages.as_ref().map_or(0, Vec::len),
@@ -1485,19 +1534,24 @@ fn validate_symbol_request_for_capabilities(
     limit: i64,
     cursor: Option<&str>,
     capabilities: &Capabilities,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     if request
         .include
         .as_ref()
         .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation))
         && !supports_feature(capabilities, SYMBOL_DOCUMENTATION_FEATURE)
     {
-        return Err(ClientError::FeatureUnavailable {
-            feature: SYMBOL_DOCUMENTATION_FEATURE,
-        });
+        return Err(failure::configuration_invalid(
+            "feature",
+            &format!("global API does not advertise feature: {SYMBOL_DOCUMENTATION_FEATURE}"),
+        ));
     }
     if request.name.len() > smaller_bound(capabilities.bounds.query_bytes_max, QUERY_BYTES_MAX) {
-        return Err(ClientError::InvalidRequest { field: "name" });
+        return Err(failure::request_invalid(
+            "validate_symbol_request_for_capabilities",
+            "name",
+            "field failed validation",
+        ));
     }
     validate_read_bounds(request.packages.len(), limit, cursor, capabilities)
 }
@@ -1507,39 +1561,59 @@ fn validate_read_bounds(
     limit: i64,
     cursor: Option<&str>,
     capabilities: &Capabilities,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let bounds = &capabilities.bounds;
     if packages > smaller_bound(bounds.packages_max, PACKAGES_MAX) {
-        return Err(ClientError::InvalidRequest { field: "packages" });
+        return Err(failure::request_invalid(
+            "validate_read_bounds",
+            "packages",
+            "field failed validation",
+        ));
     }
     if limit < bounds.page_limit_min || limit > bounds.page_limit_max {
-        return Err(ClientError::InvalidRequest { field: "limit" });
+        return Err(failure::request_invalid(
+            "validate_read_bounds",
+            "limit",
+            "field failed validation",
+        ));
     }
     if cursor
         .is_some_and(|value| value.len() > smaller_bound(bounds.cursor_bytes_max, CURSOR_BYTES_MAX))
     {
-        return Err(ClientError::InvalidRequest { field: "cursor" });
+        return Err(failure::request_invalid(
+            "validate_read_bounds",
+            "cursor",
+            "field failed validation",
+        ));
     }
     Ok(())
 }
 
-fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(), ClientError> {
+fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(), RiftError> {
     if request.entries.len() > DEPENDENCY_ENTRIES_MAX {
-        return Err(ClientError::InvalidRequest { field: "entries" });
+        return Err(failure::request_invalid(
+            "validate_resolution_request",
+            "entries",
+            "field failed validation",
+        ));
     }
     let mut seen = HashSet::new();
     for entry in &request.entries {
         if entry.availability != PackageAvailability::Canonical {
-            return Err(ClientError::InvalidRequest {
-                field: "availability",
-            });
+            return Err(failure::request_invalid(
+                "validate_resolution_request",
+                "availability",
+                "field failed validation",
+            ));
         }
         bounded_nonempty_characters(&entry.manager, PACKAGE_MANAGER_CHARS_MAX, "manager")?;
         bounded_nonempty_characters(&entry.name, PACKAGE_NAME_CHARS_MAX, "name")?;
         if entry.version.is_some() == entry.requirement.is_some() {
-            return Err(ClientError::InvalidRequest {
-                field: "version_or_requirement",
-            });
+            return Err(failure::request_invalid(
+                "validate_resolution_request",
+                "version_or_requirement",
+                "field failed validation",
+            ));
         }
         if entry
             .version
@@ -1547,13 +1621,19 @@ fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(),
             .chain(&entry.requirement)
             .any(|selector| selector.chars().count() > PACKAGE_VERSION_CHARS_MAX)
         {
-            return Err(ClientError::InvalidRequest { field: "selector" });
+            return Err(failure::request_invalid(
+                "validate_resolution_request",
+                "selector",
+                "field failed validation",
+            ));
         }
         let key = context_key(entry);
         if !seen.insert(key) {
-            return Err(ClientError::InvalidRequest {
-                field: "duplicate_entry",
-            });
+            return Err(failure::request_invalid(
+                "validate_resolution_request",
+                "duplicate_entry",
+                "field failed validation",
+            ));
         }
     }
     Ok(())
@@ -1562,12 +1642,23 @@ fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(),
 fn validate_resolution_response(
     request: &PackageResolutionRequest,
     response: &PackageResolutionResponse,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let expected: HashSet<_> = request.entries.iter().map(context_key).collect();
     let mut seen = HashSet::new();
-    for package in &response.available_exact {
-        validate_package_identity(package)
-            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
+    for package in response
+        .available_exact
+        .iter()
+        .chain(&response.missing_exact)
+    {
+        validate_package_identity(package).map_err(|source| {
+            failure::response_source(
+                "validate_resolution_response",
+                "package",
+                "field failed validation",
+                None,
+                source,
+            )
+        })?;
         let key = (
             package.manager.clone(),
             Some(package.registry.clone()),
@@ -1576,40 +1667,40 @@ fn validate_resolution_response(
             None,
         );
         if !expected.contains(&key) || !seen.insert(key) {
-            return Err(ClientError::InvalidResponseField {
-                field: "resolution_accounting",
-            });
-        }
-    }
-    for package in &response.missing_exact {
-        validate_package_identity(package)
-            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
-        let key = (
-            package.manager.clone(),
-            Some(package.registry.clone()),
-            package.name.clone(),
-            Some(package.version.clone()),
-            None,
-        );
-        if !expected.contains(&key) || !seen.insert(key) {
-            return Err(ClientError::InvalidResponseField {
-                field: "resolution_accounting",
-            });
+            return Err(failure::response_invalid(
+                "validate_resolution_response",
+                "resolution_accounting",
+                "field failed validation",
+                None,
+            ));
         }
     }
     for resolved in &response.resolved_requirements {
-        validate_package_identity(&resolved.package)
-            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
+        validate_package_identity(&resolved.package).map_err(|source| {
+            failure::response_source(
+                "validate_resolution_response",
+                "package",
+                "field failed validation",
+                None,
+                source,
+            )
+        })?;
         if !resolved.answers_its_entry() {
-            return Err(ClientError::InvalidResponseField {
-                field: "resolved_requirement",
-            });
+            return Err(failure::response_invalid(
+                "validate_resolution_response",
+                "resolved_requirement",
+                "field failed validation",
+                None,
+            ));
         }
         let key = context_key(&resolved.entry);
         if !expected.contains(&key) || !seen.insert(key) {
-            return Err(ClientError::InvalidResponseField {
-                field: "resolution_accounting",
-            });
+            return Err(failure::response_invalid(
+                "validate_resolution_response",
+                "resolution_accounting",
+                "field failed validation",
+                None,
+            ));
         }
     }
     for entry in &response.missing_requirements {
@@ -1617,21 +1708,30 @@ fn validate_resolution_response(
             || entry.version.is_some()
             || entry.availability != PackageAvailability::Canonical
         {
-            return Err(ClientError::InvalidResponseField {
-                field: "missing_requirement",
-            });
+            return Err(failure::response_invalid(
+                "validate_resolution_response",
+                "missing_requirement",
+                "field failed validation",
+                None,
+            ));
         }
         let key = context_key(entry);
         if !expected.contains(&key) || !seen.insert(key) {
-            return Err(ClientError::InvalidResponseField {
-                field: "resolution_accounting",
-            });
+            return Err(failure::response_invalid(
+                "validate_resolution_response",
+                "resolution_accounting",
+                "field failed validation",
+                None,
+            ));
         }
     }
     if seen.len() != expected.len() {
-        return Err(ClientError::InvalidResponseField {
-            field: "resolution_accounting",
-        });
+        return Err(failure::response_invalid(
+            "validate_resolution_response",
+            "resolution_accounting",
+            "field failed validation",
+            None,
+        ));
     }
     validate_resolution_warnings(response)
 }
@@ -1639,10 +1739,15 @@ fn validate_resolution_response(
 /// Checks the resolution's warnings: bounded like page warnings, and each
 /// `requirement_unsatisfied` naming, through its `detail`, one requirement of
 /// `resolved_requirements` beside the version that answers it, at most once.
-fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<(), ClientError> {
+fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<(), RiftError> {
     let warnings = response.warnings.as_deref().unwrap_or_default();
     if warnings.len() > DEPENDENCY_ENTRIES_MAX || !warning_details_within_bound(warnings) {
-        return Err(ClientError::InvalidResponseField { field: "warnings" });
+        return Err(failure::response_invalid(
+            "validate_resolution_warnings",
+            "warnings",
+            "field failed validation",
+            None,
+        ));
     }
     let named: HashSet<String> = response
         .resolved_requirements
@@ -1657,9 +1762,12 @@ fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<
         let detail = warning.detail.as_deref();
         let names_a_requirement = detail.is_some_and(|detail| named.contains(detail));
         if !names_a_requirement || !seen.insert(detail) {
-            return Err(ClientError::InvalidResponseField {
-                field: "resolution_warning",
-            });
+            return Err(failure::response_invalid(
+                "validate_resolution_warnings",
+                "resolution_warning",
+                "field failed validation",
+                None,
+            ));
         }
     }
     Ok(())
@@ -1762,17 +1870,86 @@ impl PackageResolutionResponse {
     }
 }
 
-fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientError> {
-    bounded_nonempty_characters(&request.query, QUERY_BYTES_MAX, "query")?;
-    if request.terms.is_empty() || request.terms.len() > QUERY_TERMS_MAX {
-        return Err(ClientError::InvalidRequest { field: "terms" });
+fn validate_search_request(request: &PackageSearchRequest) -> Result<(), RiftError> {
+    if let Some(query) = request.query.as_deref() {
+        validate_search_lexical_request(request, query)?;
+    } else if request.traversal.is_none()
+        || request.terms.is_some()
+        || request.identifiers.is_some()
+        || request.phase.is_some()
+    {
+        return Err(failure::request_invalid(
+            "validate_search_request",
+            "query",
+            "field failed validation",
+        ));
     }
-    for term in &request.terms {
+    validate_search_traversal_request(request)?;
+    if let Some(view) = request.view.as_deref() {
+        rift_protocol::symbol_read::CapturedViewId::parse(view).map_err(|source| {
+            failure::request_invalid_source(
+                "validate_search_request",
+                "view",
+                "field failed validation",
+                source,
+            )
+        })?;
+    }
+    if request
+        .include
+        .as_ref()
+        .is_some_and(|values| values.len() > 1 || values.iter().any(|value| value != "source"))
+    {
+        return Err(failure::request_invalid(
+            "validate_search_request",
+            "include",
+            "field failed validation",
+        ));
+    }
+    validate_packages(request.packages.as_deref().unwrap_or_default())
+}
+
+fn validate_search_lexical_request(
+    request: &PackageSearchRequest,
+    query: &str,
+) -> Result<(), RiftError> {
+    bounded_nonempty_characters(query, QUERY_BYTES_MAX, "query")?;
+    let terms = request.terms.as_deref().ok_or_else(|| {
+        failure::request_invalid(
+            "validate_search_request",
+            "terms",
+            "field failed validation",
+        )
+    })?;
+    let identifiers = request.identifiers.as_deref().ok_or_else(|| {
+        failure::request_invalid(
+            "validate_search_request",
+            "identifiers",
+            "field failed validation",
+        )
+    })?;
+    let phase = request.phase.as_ref().ok_or_else(|| {
+        failure::request_invalid(
+            "validate_search_request",
+            "phase",
+            "field failed validation",
+        )
+    })?;
+    if terms.is_empty() || terms.len() > QUERY_TERMS_MAX {
+        return Err(failure::request_invalid(
+            "validate_search_request",
+            "terms",
+            "field failed validation",
+        ));
+    }
+    for term in terms {
         bounded_nonempty_characters(&term.text, QUERY_TERM_BYTES_MAX, "term")?;
         if term.phrase && term.prefix {
-            return Err(ClientError::InvalidRequest {
-                field: "phrase_prefix",
-            });
+            return Err(failure::request_invalid(
+                "validate_search_request",
+                "phrase_prefix",
+                "field failed validation",
+            ));
         }
         if term.prefix
             && term
@@ -1782,51 +1959,113 @@ fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientE
                 .count()
                 < 3
         {
-            return Err(ClientError::InvalidRequest { field: "prefix" });
+            return Err(failure::request_invalid(
+                "validate_search_request",
+                "prefix",
+                "field failed validation",
+            ));
         }
     }
-    if request.identifiers.len() > IDENTIFIERS_MAX
-        || request
-            .identifiers
+    if identifiers.len() > IDENTIFIERS_MAX
+        || identifiers
             .iter()
             .any(|value| value.is_empty() || value.len() > IDENTIFIER_BYTES_MAX)
     {
-        return Err(ClientError::InvalidRequest {
-            field: "identifiers",
-        });
+        return Err(failure::request_invalid(
+            "validate_search_request",
+            "identifiers",
+            "field failed validation",
+        ));
     }
-    if request
-        .include
-        .as_ref()
-        .is_some_and(|values| values.len() > 1 || values.iter().any(|value| value != "source"))
+    if matches!(phase, PackageSearchRequestPhase::Broad)
+        && terms.iter().filter(|term| !term.phrase).count() < 2
     {
-        return Err(ClientError::InvalidRequest { field: "include" });
-    }
-    validate_packages(request.packages.as_deref().unwrap_or_default())?;
-    if matches!(request.phase, PackageSearchRequestPhase::Broad)
-        && request.terms.iter().filter(|term| !term.phrase).count() < 2
-    {
-        return Err(ClientError::InvalidRequest {
-            field: "broad_phase",
-        });
+        return Err(failure::request_invalid(
+            "validate_search_request",
+            "broad_phase",
+            "field failed validation",
+        ));
     }
     Ok(())
 }
 
-fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientError> {
+fn validate_search_traversal_request(request: &PackageSearchRequest) -> Result<(), RiftError> {
+    let Some(traversal) = &request.traversal else {
+        return Ok(());
+    };
+    if request
+        .target
+        .as_ref()
+        .is_some_and(|target| target != &PackageSearchRequestTarget::Symbol)
+        || !(1..=rift_protocol::search::SEARCH_TRAVERSAL_DEPTH_MAX).contains(
+            &traversal
+                .depth
+                .unwrap_or(rift_protocol::search::SEARCH_TRAVERSAL_DEPTH_DEFAULT),
+        )
+        || traversal
+            .facets
+            .as_ref()
+            .is_some_and(|facets| facets.len() > rift_protocol::search::SEARCH_TRAVERSAL_FACETS_MAX)
+    {
+        return Err(failure::request_invalid(
+            "validate_search_request",
+            "traversal",
+            "field failed validation",
+        ));
+    }
+    let seed = traversal.seed.as_deref().ok_or_else(|| {
+        failure::request_invalid(
+            "validate_search_request",
+            "traversal.seed",
+            "field failed validation",
+        )
+    })?;
+    for (field, value) in [
+        ("traversal.seed", Some(seed)),
+        ("traversal.to", traversal.to.as_deref()),
+    ] {
+        let Some(value) = value else { continue };
+        let identity = rift_protocol::identity::SymbolIdentity::parse(value).map_err(|source| {
+            failure::request_invalid_source(
+                "validate_search_request",
+                field,
+                "field failed validation",
+                source,
+            )
+        })?;
+        if !matches!(
+            identity.owner(),
+            rift_protocol::identity::SymbolOwner::Package { .. }
+                | rift_protocol::identity::SymbolOwner::Runtime { .. }
+        ) {
+            return Err(failure::request_invalid(
+                "validate_search_request",
+                field,
+                "field failed validation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), RiftError> {
     bounded_nonempty_characters(&request.name, QUERY_BYTES_MAX, "name")?;
     if request
         .include
         .as_ref()
         .is_some_and(|values| values.len() > 2)
     {
-        return Err(ClientError::InvalidRequest { field: "include" });
+        return Err(failure::request_invalid(
+            "validate_symbol_request",
+            "include",
+            "field failed validation",
+        ));
     }
     validate_packages(&request.packages)
 }
 
 /// Checks contract character bounds and the validated exact defining registry owner.
-fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
+fn validate_package_identity(package: &PackageIdentity) -> Result<(), RiftError> {
     bounded_nonempty_characters(
         &package.manager,
         PACKAGE_MANAGER_CHARS_MAX,
@@ -1842,12 +2081,23 @@ fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientErro
     domain::package_identity(package)
         .owner()
         .map(|_| ())
-        .map_err(|_| ClientError::InvalidRequest { field: "package" })
+        .map_err(|source| {
+            failure::request_invalid_source(
+                "validate_package_identity",
+                "package",
+                "field failed validation",
+                source,
+            )
+        })
 }
 
-fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
+fn validate_packages(packages: &[PackageIdentity]) -> Result<(), RiftError> {
     if packages.len() > PACKAGES_MAX {
-        return Err(ClientError::InvalidRequest { field: "packages" });
+        return Err(failure::request_invalid(
+            "validate_packages",
+            "packages",
+            "field failed validation",
+        ));
     }
     let mut seen = HashSet::new();
     for package in packages {
@@ -1858,9 +2108,11 @@ fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
             package.name.as_str(),
             package.version.as_str(),
         )) {
-            return Err(ClientError::InvalidRequest {
-                field: "duplicate_package",
-            });
+            return Err(failure::request_invalid(
+                "validate_packages",
+                "duplicate_package",
+                "field failed validation",
+            ));
         }
     }
     Ok(())
@@ -1872,23 +2124,50 @@ fn advertised_page_limit(limit: i64, capabilities: &Capabilities) -> i64 {
     limit.min(capabilities.bounds.page_limit_max)
 }
 
-fn validate_page(limit: i64, cursor: Option<&str>) -> Result<(), ClientError> {
+fn validate_page(limit: i64, cursor: Option<&str>) -> Result<(), RiftError> {
     if !(PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&limit) {
-        return Err(ClientError::InvalidRequest { field: "limit" });
+        return Err(failure::request_invalid(
+            "validate_page",
+            "limit",
+            "field failed validation",
+        ));
     }
     if cursor.is_some_and(|value| value.is_empty() || value.len() > CURSOR_BYTES_MAX) {
-        return Err(ClientError::InvalidRequest { field: "cursor" });
+        return Err(failure::request_invalid(
+            "validate_page",
+            "cursor",
+            "field failed validation",
+        ));
     }
     Ok(())
 }
 
-fn validate_search_page(
+fn validate_search_page_metadata(
     request: &PackageSearchRequest,
     capabilities: &Capabilities,
     page: &PackageSearchPage,
-    cursor: Option<&str>,
-    source_bytes_max: usize,
-) -> Result<(), ClientError> {
+) -> Result<bool, RiftError> {
+    chrono::DateTime::parse_from_rfc3339(&page.view.expires_at).map_err(|source| {
+        failure::response_source(
+            "validate_search_page",
+            "view.expires_at",
+            "invalid captured view expiry",
+            None,
+            source,
+        )
+    })?;
+    if request
+        .view
+        .as_deref()
+        .is_some_and(|view| view != page.view.id.as_str())
+    {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "view",
+            "captured view does not match request",
+            None,
+        ));
+    }
     let target = request
         .target
         .as_ref()
@@ -1906,6 +2185,76 @@ fn validate_search_page(
         warnings: &page.warnings,
     }
     .validate(capabilities, documentation_requested)?;
+    Ok(documentation_requested)
+}
+
+fn validate_search_documentation_hit(
+    request: &PackageSearchRequest,
+    capabilities: &Capabilities,
+    hit: &generated::PackageDocumentationHit,
+    selection: Option<&HashSet<(String, String, String, String)>>,
+    source_bytes_max: usize,
+    documentation_requested: bool,
+    documentation_bytes: &mut usize,
+) -> Result<(), RiftError> {
+    validate_package_identity(&hit.package).map_err(|source| {
+        failure::response_source(
+            "validate_search_page",
+            "package",
+            "field failed validation",
+            None,
+            source,
+        )
+    })?;
+    if hit.source.is_some() && !includes_source(request.include.as_deref()) {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "source",
+            "field failed validation",
+            None,
+        ));
+    }
+    *documentation_bytes += hit.source.as_ref().map_or(0, String::len);
+    validate_documentation_source_bytes(
+        hit.source.as_ref().map_or(0, String::len),
+        smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
+    )?;
+    validate_documentation_bytes(*documentation_bytes)?;
+    if !documentation_requested
+        || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
+        || selection.is_some_and(|packages| !packages.contains(&package_key(&hit.package)))
+    {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "documentation",
+            "field failed validation",
+            None,
+        ));
+    }
+    if hit.contributing_fields.is_empty() {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "contributing_fields",
+            "field failed validation",
+            None,
+        ));
+    }
+    PackageSearchCandidate::try_from(PackageSearchItem::Documentation(Box::new(hit.clone())))?;
+    Ok(())
+}
+
+fn validate_search_page(
+    request: &PackageSearchRequest,
+    capabilities: &Capabilities,
+    page: &PackageSearchPage,
+    cursor: Option<&str>,
+    source_bytes_max: usize,
+) -> Result<(), RiftError> {
+    let documentation_requested = validate_search_page_metadata(request, capabilities, page)?;
+    let target = request
+        .target
+        .as_ref()
+        .unwrap_or(&PackageSearchRequestTarget::Symbol);
     let packages: HashSet<_> = request
         .packages
         .as_deref()
@@ -1920,10 +2269,20 @@ fn validate_search_page(
         match hit {
             PackageSearchItem::Search(hit) => {
                 if target == &PackageSearchRequestTarget::Documentation {
-                    return Err(ClientError::InvalidResponseField { field: "target" });
+                    return Err(failure::response_invalid(
+                        "validate_search_page",
+                        "target",
+                        "field failed validation",
+                        None,
+                    ));
                 }
                 if hit.source.is_some() && !includes_source(request.include.as_deref()) {
-                    return Err(ClientError::InvalidResponseField { field: "source" });
+                    return Err(failure::response_invalid(
+                        "validate_search_page",
+                        "source",
+                        "field failed validation",
+                        None,
+                    ));
                 }
                 let qualified_name = validate_hit_common(
                     &hit.package,
@@ -1939,46 +2298,131 @@ fn validate_search_page(
                 )?;
                 validate_search_match_class(request, hit, &qualified_name)?;
             }
-            PackageSearchItem::Documentation(hit) => {
-                validate_package_identity(&hit.package)
-                    .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
-                if hit.source.is_some() && !includes_source(request.include.as_deref()) {
-                    return Err(ClientError::InvalidResponseField { field: "source" });
-                }
-                documentation_bytes += hit.source.as_ref().map_or(0, String::len);
-                validate_documentation_source_bytes(
-                    hit.source.as_ref().map_or(0, String::len),
-                    smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
+            PackageSearchItem::Documentation(hit) => validate_search_documentation_hit(
+                request,
+                capabilities,
+                hit,
+                selection,
+                source_bytes_max,
+                documentation_requested,
+                &mut documentation_bytes,
+            )?,
+            PackageSearchItem::Symbol(hit) => {
+                validate_canonical_search_hit(
+                    request,
+                    capabilities,
+                    hit,
+                    selection,
+                    source_bytes_max,
                 )?;
-                validate_documentation_bytes(documentation_bytes)?;
-                if !documentation_requested
-                    || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
-                    || selection
-                        .is_some_and(|packages| !packages.contains(&package_key(&hit.package)))
-                {
-                    return Err(ClientError::InvalidResponseField {
-                        field: "documentation",
-                    });
-                }
-                if hit.contributing_fields.is_empty() {
-                    return Err(ClientError::InvalidResponseField {
-                        field: "contributing_fields",
-                    });
-                }
-                PackageSearchCandidate::try_from(PackageSearchItem::Documentation(hit.clone()))?;
             }
         }
         let key = search_hit_identity(hit)?;
         if !seen.insert(key) {
-            return Err(ClientError::InvalidResponseField {
-                field: "duplicate_item",
-            });
+            return Err(failure::response_invalid(
+                "validate_search_page",
+                "duplicate_item",
+                "field failed validation",
+                None,
+            ));
         }
     }
     if cursor.is_some() && page.items.is_empty() && page.next_cursor.as_deref() == cursor {
-        return Err(ClientError::InvalidResponseField {
-            field: "cursor_progress",
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "cursor_progress",
+            "field failed validation",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_search_hit(
+    request: &PackageSearchRequest,
+    capabilities: &Capabilities,
+    hit: &rift_protocol::read::SearchHit,
+    packages: Option<&HashSet<(String, String, String, String)>>,
+    source_bytes_max: usize,
+) -> Result<(), RiftError> {
+    let candidate =
+        PackageSearchCandidate::try_from(PackageSearchItem::Symbol(Box::new(hit.clone())))?;
+    if request.target.as_ref() == Some(&PackageSearchRequestTarget::Documentation) {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "target",
+            "field failed validation",
+            None,
+        ));
+    }
+    if let Some(packages) = packages {
+        let admitted = candidate.package.as_ref().is_some_and(|package| {
+            packages.contains(&(
+                package.manager.clone(),
+                package.registry.clone(),
+                package.name.clone(),
+                package.version.clone(),
+            ))
         });
+        if !admitted {
+            return Err(failure::response_invalid(
+                "validate_search_page",
+                "package",
+                "field failed validation",
+                None,
+            ));
+        }
+    }
+    if hit.source.as_ref().is_some_and(|source| {
+        !includes_source(request.include.as_deref())
+            || source.len() > smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max)
+    }) {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "source",
+            "field failed validation",
+            None,
+        ));
+    }
+    if hit.range.is_some() != hit.line.is_some()
+        || hit
+            .range
+            .as_ref()
+            .is_some_and(|range| range.end < range.start)
+        || hit.line == Some(0)
+        || hit.source.is_some() && hit.range.is_none()
+    {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "location",
+            "field failed validation",
+            None,
+        ));
+    }
+    let distance = hit
+        .traversal_path
+        .as_ref()
+        .map(|path| u64::try_from(path.len()))
+        .transpose()
+        .map_err(|source| {
+            failure::response_source(
+                "validate_search_page",
+                "traversal_path",
+                "field failed validation",
+                None,
+                source,
+            )
+        })?;
+    if hit.distance != distance
+        || distance
+            .is_some_and(|distance| distance > rift_protocol::search::SEARCH_TRAVERSAL_DEPTH_MAX)
+    {
+        return Err(failure::response_invalid(
+            "validate_search_page",
+            "traversal_path",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
@@ -1989,7 +2433,7 @@ fn validate_symbol_page(
     page: &PackageSymbolPage,
     cursor: Option<&str>,
     source_bytes_max: usize,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let documentation_requested = request
         .include
         .as_ref()
@@ -2008,19 +2452,32 @@ fn validate_symbol_page(
     let mut documentation_bytes = 0_usize;
     for hit in &page.items {
         if documentation_requested != hit.documentation.is_some() {
-            return Err(ClientError::InvalidResponseField {
-                field: "documentation",
-            });
+            return Err(failure::response_invalid(
+                "validate_symbol_page",
+                "documentation",
+                "field failed validation",
+                None,
+            ));
         }
         if hit.source.is_some() && !includes_symbol_source(request.include.as_deref()) {
-            return Err(ClientError::InvalidResponseField { field: "source" });
+            return Err(failure::response_invalid(
+                "validate_symbol_page",
+                "source",
+                "field failed validation",
+                None,
+            ));
         }
         if request
             .language
             .as_ref()
             .is_some_and(|language| language != &hit.symbol.language)
         {
-            return Err(ClientError::InvalidResponseField { field: "language" });
+            return Err(failure::response_invalid(
+                "validate_symbol_page",
+                "language",
+                "field failed validation",
+                None,
+            ));
         }
         let qualified_name = validate_hit_common(
             &hit.package,
@@ -2044,13 +2501,12 @@ fn validate_symbol_page(
                 )?;
                 validate_documentation_bytes(documentation_bytes)?;
             }
-            let symbol_id = hit
-                .symbol
-                .id
-                .as_deref()
-                .ok_or(ClientError::InvalidResponseField {
-                    field: "symbol_identity",
-                })?;
+            let symbol_id = hit.symbol.id.as_deref().ok_or(failure::response_invalid(
+                "validate_symbol_page",
+                "symbol_identity",
+                "field failed validation",
+                None,
+            ))?;
             let symbol_id = rift_protocol::read::SymbolId(symbol_id.to_owned());
             let protocol_context = crate::domain::protocol_documentation_context(context.clone())?;
             crate::domain::validate_documentation_context(
@@ -2060,29 +2516,45 @@ fn validate_symbol_page(
             )?;
         }
         if !seen.insert(symbol_hit_identity(hit)) {
-            return Err(ClientError::InvalidResponseField {
-                field: "duplicate_item",
-            });
+            return Err(failure::response_invalid(
+                "validate_symbol_page",
+                "duplicate_item",
+                "field failed validation",
+                None,
+            ));
         }
     }
     if cursor.is_some() && page.items.is_empty() && page.next_cursor.as_deref() == cursor {
-        return Err(ClientError::InvalidResponseField {
-            field: "cursor_progress",
-        });
+        return Err(failure::response_invalid(
+            "validate_symbol_page",
+            "cursor_progress",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
 
-fn validate_documentation_source_bytes(bytes: usize, maximum: usize) -> Result<(), ClientError> {
+fn validate_documentation_source_bytes(bytes: usize, maximum: usize) -> Result<(), RiftError> {
     if bytes > maximum {
-        return Err(ClientError::InvalidResponseField { field: "source" });
+        return Err(failure::response_invalid(
+            "validate_documentation_source_bytes",
+            "source",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
 
-fn validate_documentation_bytes(bytes: usize) -> Result<(), ClientError> {
+fn validate_documentation_bytes(bytes: usize) -> Result<(), RiftError> {
     if bytes > rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize {
-        return Err(ClientError::InvalidResponseField { field: "source" });
+        return Err(failure::response_invalid(
+            "validate_documentation_bytes",
+            "source",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
@@ -2101,16 +2573,24 @@ impl PageMetadata<'_> {
         &self,
         capabilities: &Capabilities,
         documentation_required: bool,
-    ) -> Result<(), ClientError> {
+    ) -> Result<(), RiftError> {
         if self.publication_format != &capabilities.publication_format {
-            return Err(ClientError::InvalidResponseField {
-                field: "publication_format",
-            });
+            return Err(failure::response_invalid(
+                "validate",
+                "publication_format",
+                "field failed validation",
+                None,
+            ));
         }
         if !within_characters(self.analyzer_revision, LABEL_CHARS_MAX)
             || self.corpus_revision != capabilities.corpus_revision
         {
-            return Err(ClientError::InvalidResponseField { field: "revision" });
+            return Err(failure::response_invalid(
+                "validate",
+                "revision",
+                "field failed validation",
+                None,
+            ));
         }
         match (
             self.documentation_revision,
@@ -2120,9 +2600,12 @@ impl PageMetadata<'_> {
                 if actual == expected && valid_revision_digest(actual) => {}
             (None, _) if !documentation_required => {}
             _ => {
-                return Err(ClientError::InvalidResponseField {
-                    field: "documentation_revision",
-                });
+                return Err(failure::response_invalid(
+                    "validate",
+                    "documentation_revision",
+                    "field failed validation",
+                    None,
+                ));
             }
         }
         if self.next_cursor.is_some_and(|value| {
@@ -2130,12 +2613,22 @@ impl PageMetadata<'_> {
                 || value.len()
                     > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
         }) {
-            return Err(ClientError::InvalidResponseField { field: "cursor" });
+            return Err(failure::response_invalid(
+                "validate",
+                "cursor",
+                "field failed validation",
+                None,
+            ));
         }
         if self.warnings.len() > smaller_bound(capabilities.bounds.warnings_max, WARNINGS_MAX)
             || !warning_details_within_bound(self.warnings)
         {
-            return Err(ClientError::InvalidResponseField { field: "warnings" });
+            return Err(failure::response_invalid(
+                "validate",
+                "warnings",
+                "field failed validation",
+                None,
+            ));
         }
         Ok(())
     }
@@ -2163,42 +2656,93 @@ fn validate_hit_common(
     location: HitLocation<'_>,
     packages: Option<&HashSet<(String, String, String, String)>>,
     source_bytes_max: usize,
-) -> Result<String, ClientError> {
-    validate_package_identity(package)
-        .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
+) -> Result<String, RiftError> {
+    validate_package_identity(package).map_err(|source| {
+        failure::response_source(
+            "validate_hit_common",
+            "package",
+            "field failed validation",
+            None,
+            source,
+        )
+    })?;
     if packages.is_some_and(|packages| !packages.contains(&package_key(package))) {
-        return Err(ClientError::InvalidResponseField { field: "package" });
+        return Err(failure::response_invalid(
+            "validate_hit_common",
+            "package",
+            "field failed validation",
+            None,
+        ));
     }
     if location.line < 1 || location.range.end < location.range.start {
-        return Err(ClientError::InvalidResponseField { field: "location" });
+        return Err(failure::response_invalid(
+            "validate_hit_common",
+            "location",
+            "field failed validation",
+            None,
+        ));
     }
     if location
         .source
         .is_some_and(|value| value.len() > source_bytes_max)
     {
-        return Err(ClientError::InvalidResponseField { field: "source" });
+        return Err(failure::response_invalid(
+            "validate_hit_common",
+            "source",
+            "field failed validation",
+            None,
+        ));
     }
     let source_path = package_source_path(package, location.unit)?;
     let Some(origin) = symbol.origin.as_ref() else {
-        return Err(ClientError::InvalidResponseField { field: "origin" });
+        return Err(failure::response_invalid(
+            "validate_hit_common",
+            "origin",
+            "field failed validation",
+            None,
+        ));
     };
     if origin.location != Some(SourceLocationKind::Dependency)
         || origin.package.as_ref() != Some(package)
     {
-        return Err(ClientError::InvalidResponseField { field: "origin" });
+        return Err(failure::response_invalid(
+            "validate_hit_common",
+            "origin",
+            "field failed validation",
+            None,
+        ));
     }
     validate_symbol_identity(symbol, package, &source_path)
 }
 
 /// The package-relative path of `unit`, after its exact defining registry owner is validated.
-fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, ClientError> {
-    let invalid = ClientError::InvalidResponseField {
-        field: "source_identity",
-    };
-    let unit = rift_core::SourceUnitId::parse(unit).map_err(|_| invalid.clone())?;
+fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, RiftError> {
+    let invalid = failure::response_invalid(
+        "package_source_path",
+        "source_identity",
+        "field failed validation",
+        None,
+    );
+    let unit = rift_core::SourceUnitId::parse(unit).map_err(|source| {
+        failure::response_source(
+            "package_source_path",
+            "source_identity",
+            "field failed validation",
+            None,
+            source,
+        )
+    })?;
     let owner = domain::package_identity(package)
         .owner()
-        .map_err(|_| invalid.clone())?;
+        .map_err(|source| {
+            failure::response_source(
+                "package_source_path",
+                "source_identity",
+                "field failed validation",
+                None,
+                source,
+            )
+        })?;
     if unit.source_owner() != Some(&owner) {
         return Err(invalid);
     }
@@ -2217,46 +2761,62 @@ fn validate_symbol_identity(
     symbol: &Symbol,
     package: &PackageIdentity,
     source_path: &str,
-) -> Result<String, ClientError> {
-    let id = symbol
-        .id
-        .as_deref()
-        .ok_or(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        })?;
+) -> Result<String, RiftError> {
+    let id = symbol.id.as_deref().ok_or(failure::response_invalid(
+        "validate_symbol_identity",
+        "symbol_identity",
+        "field failed validation",
+        None,
+    ))?;
     if id.len() > 8_192 || rift_core::SymbolId::new(id).is_err() {
-        return Err(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        });
+        return Err(failure::response_invalid(
+            "validate_symbol_identity",
+            "symbol_identity",
+            "field failed validation",
+            None,
+        ));
     }
     let address = id
         .strip_prefix("rift://symbol/")
-        .ok_or(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        })?;
-    let (language, remainder) =
-        address
-            .split_once('/')
-            .ok_or(ClientError::InvalidResponseField {
-                field: "symbol_identity",
-            })?;
+        .ok_or(failure::response_invalid(
+            "validate_symbol_identity",
+            "symbol_identity",
+            "field failed validation",
+            None,
+        ))?;
+    let (language, remainder) = address.split_once('/').ok_or(failure::response_invalid(
+        "validate_symbol_identity",
+        "symbol_identity",
+        "field failed validation",
+        None,
+    ))?;
     if language != symbol.language
         || rift_protocol::read::Language::from_identity_segment(language).is_err()
     {
-        return Err(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        });
+        return Err(failure::response_invalid(
+            "validate_symbol_identity",
+            "symbol_identity",
+            "field failed validation",
+            None,
+        ));
     }
     let (_, encoded_qualified_name) =
-        remainder
-            .rsplit_once('/')
-            .ok_or(ClientError::InvalidResponseField {
-                field: "symbol_identity",
-            })?;
+        remainder.rsplit_once('/').ok_or(failure::response_invalid(
+            "validate_symbol_identity",
+            "symbol_identity",
+            "field failed validation",
+            None,
+        ))?;
     let qualified_name = percent_decode_str(encoded_qualified_name)
         .decode_utf8()
-        .map_err(|_| ClientError::InvalidResponseField {
-            field: "symbol_identity",
+        .map_err(|source| {
+            failure::response_source(
+                "validate_symbol_identity",
+                "symbol_identity",
+                "field failed validation",
+                None,
+                source,
+            )
         })?;
     let unit_path = format!(
         "{}/{}@{}/{source_path}",
@@ -2264,9 +2824,12 @@ fn validate_symbol_identity(
     );
     let minted = rift_core::symbol_identity(language, &unit_path, &qualified_name) == id;
     if qualified_name.is_empty() || !minted {
-        return Err(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        });
+        return Err(failure::response_invalid(
+            "validate_symbol_identity",
+            "symbol_identity",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(qualified_name.into_owned())
 }
@@ -2278,10 +2841,12 @@ fn validate_search_match_class(
     request: &PackageSearchRequest,
     hit: &PackageSearchHit,
     qualified_name: &str,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let claimed = search_match_class(&hit.match_class)?;
     let expected = request
         .identifiers
+        .as_deref()
+        .unwrap_or_default()
         .iter()
         .filter_map(|candidate| {
             rift_ranking::identifier_match(candidate, &hit.symbol.name, qualified_name)
@@ -2289,9 +2854,12 @@ fn validate_search_match_class(
         .min()
         .map(rift_ranking::IdentifierMatch::class);
     if expected != claimed {
-        return Err(ClientError::InvalidResponseField {
-            field: "match_class",
-        });
+        return Err(failure::response_invalid(
+            "validate_search_match_class",
+            "match_class",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
@@ -2300,15 +2868,18 @@ fn validate_symbol_match_class(
     request: &PackageSymbolRequest,
     hit: &PackageSymbol,
     qualified_name: &str,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let actual = ranking_match_class(&hit.match_class)?;
     let expected =
         rift_ranking::identifier_match(request.name.trim(), &hit.symbol.name, qualified_name)
             .map(rift_ranking::IdentifierMatch::class);
     if expected != Some(actual) {
-        return Err(ClientError::InvalidResponseField {
-            field: "match_class",
-        });
+        return Err(failure::response_invalid(
+            "validate_symbol_match_class",
+            "match_class",
+            "field failed validation",
+            None,
+        ));
     }
     Ok(())
 }
@@ -2318,7 +2889,7 @@ fn validate_symbol_match_class(
 /// its body alone.
 fn search_match_class(
     value: &IdentifierMatchClass,
-) -> Result<Option<rift_ranking::IdentifierMatchClass>, ClientError> {
+) -> Result<Option<rift_ranking::IdentifierMatchClass>, RiftError> {
     match value {
         IdentifierMatchClass::Unknown => Ok(None),
         class => ranking_match_class(class).map(Some),
@@ -2327,7 +2898,7 @@ fn search_match_class(
 
 fn ranking_match_class(
     value: &IdentifierMatchClass,
-) -> Result<rift_ranking::IdentifierMatchClass, ClientError> {
+) -> Result<rift_ranking::IdentifierMatchClass, RiftError> {
     match value {
         IdentifierMatchClass::QualifiedExact => {
             Ok(rift_ranking::IdentifierMatchClass::QualifiedExact)
@@ -2335,9 +2906,12 @@ fn ranking_match_class(
         IdentifierMatchClass::NameExact => Ok(rift_ranking::IdentifierMatchClass::NameExact),
         IdentifierMatchClass::NamePrefix => Ok(rift_ranking::IdentifierMatchClass::NamePrefix),
         IdentifierMatchClass::Substring => Ok(rift_ranking::IdentifierMatchClass::Substring),
-        IdentifierMatchClass::Unknown => Err(ClientError::InvalidResponseField {
-            field: "match_class",
-        }),
+        IdentifierMatchClass::Unknown => Err(failure::response_invalid(
+            "ranking_match_class",
+            "match_class",
+            "field failed validation",
+            None,
+        )),
     }
 }
 
@@ -2347,11 +2921,15 @@ fn bounded_nonempty_characters(
     value: &str,
     max: usize,
     field: &'static str,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     if within_characters(value, max) {
         Ok(())
     } else {
-        Err(ClientError::InvalidRequest { field })
+        Err(failure::request_invalid(
+            "bounded_nonempty_characters",
+            field,
+            "field failed validation",
+        ))
     }
 }
 
@@ -2404,14 +2982,19 @@ fn validate_assembled_revision(
     analyzer_revision: &str,
     corpus_revision: &str,
     documentation_revision: Option<&str>,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     match revisions {
         Some((analyzer, corpus, documentation))
             if analyzer != analyzer_revision
                 || corpus != corpus_revision
                 || documentation.as_deref() != documentation_revision =>
         {
-            Err(ClientError::InvalidResponseField { field: "revision" })
+            Err(failure::response_invalid(
+                "validate_assembled_revision",
+                "revision",
+                "field failed validation",
+                None,
+            ))
         }
         Some(_) => Ok(()),
         None => {
@@ -2457,18 +3040,22 @@ fn search_pages(
     items: Vec<PackageSearchItem>,
     warnings: Vec<Warning>,
     revisions: Option<(String, String, Option<String>)>,
+    view: Option<rift_protocol::symbol_read::CapturedView>,
     next_cursor: Option<String>,
-) -> PackageSearchPages {
+) -> Result<PackageSearchPages, RiftError> {
     let (analyzer_revision, corpus_revision, documentation_revision) =
         assembled_revisions(revisions);
-    PackageSearchPages {
+    Ok(PackageSearchPages {
         items,
         warnings,
         analyzer_revision,
         corpus_revision,
         documentation_revision,
+        view: view.ok_or_else(|| {
+            failure::response_invalid("search_pages", "view", "captured view is absent", None)
+        })?,
         next_cursor,
-    }
+    })
 }
 
 fn symbol_pages(
@@ -2489,29 +3076,54 @@ fn symbol_pages(
     }
 }
 
-fn search_hit_identity(
-    hit: &PackageSearchItem,
-) -> Result<(String, String, String, String), ClientError> {
-    let (package, identity) = match hit {
+fn search_hit_identity(hit: &PackageSearchItem) -> Result<String, RiftError> {
+    match hit {
         PackageSearchItem::Search(hit) => {
-            let symbol_id = hit
-                .symbol
-                .id
-                .clone()
-                .unwrap_or_else(|| hit.symbol.name.clone());
-            (hit.package.clone(), format!("{}:{symbol_id}", hit.unit))
+            if let Some(id) = hit.symbol.id.as_deref() {
+                return rift_protocol::identity::SymbolIdentity::parse(id)
+                    .map(|identity| identity.wire_identity())
+                    .map_err(|source| {
+                        failure::response_source(
+                            "search_hit_identity",
+                            "symbol.id",
+                            "field failed validation",
+                            None,
+                            source,
+                        )
+                    });
+            }
+            serde_json::to_string(&(package_key(&hit.package), &hit.unit, &hit.symbol.name))
+                .map_err(|source| {
+                    failure::response_source(
+                        "search_hit_identity",
+                        "symbol_identity",
+                        "field failed validation",
+                        None,
+                        source,
+                    )
+                })
         }
         PackageSearchItem::Documentation(hit) => {
             let identity = rift_ranking::DocumentIdentity::for_documentation_block(
                 &hit.documentation.block.identity,
             )
-            .map_err(|_| ClientError::InvalidResponseField {
-                field: "documentation.identity",
+            .map_err(|source| {
+                failure::response_source(
+                    "search_hit_identity",
+                    "documentation.identity",
+                    "field failed validation",
+                    None,
+                    source,
+                )
             })?;
-            (hit.package.clone(), identity.as_str().to_owned())
+            Ok(identity.as_str().to_owned())
         }
-    };
-    Ok((package.manager, package.name, package.version, identity))
+        PackageSearchItem::Symbol(hit) => {
+            let candidate =
+                PackageSearchCandidate::try_from(PackageSearchItem::Symbol(hit.clone()))?;
+            Ok(candidate.identity.as_str().to_owned())
+        }
+    }
 }
 
 fn symbol_hit_identity(hit: &PackageSymbol) -> (String, String, String, String) {
@@ -2527,7 +3139,7 @@ fn symbol_hit_identity(hit: &PackageSymbol) -> (String, String, String, String) 
     )
 }
 
-fn validate_config(config: &Config) -> Result<(), ConfigError> {
+fn validate_config(config: &Config) -> Result<(), RiftError> {
     for (field, value, maximum) in [
         (
             "max_request",
@@ -2546,29 +3158,53 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
         ),
     ] {
         if value == 0 || u64::try_from(value).map_or(true, |value| value > maximum) {
-            return Err(ConfigError::OutOfRange(field));
+            return Err(failure::configuration_invalid(
+                field,
+                "outside configured bounds",
+            ));
         }
     }
     if !(Duration::from_millis(100)..=Duration::from_secs(30)).contains(&config.connect_timeout) {
-        return Err(ConfigError::OutOfRange("connect_timeout"));
+        return Err(failure::configuration_invalid(
+            "connect_timeout",
+            "outside configured bounds",
+        ));
     }
     if !(Duration::from_secs(1)..=Duration::from_mins(5)).contains(&config.request_timeout) {
-        return Err(ConfigError::OutOfRange("request_timeout"));
+        return Err(failure::configuration_invalid(
+            "request_timeout",
+            "outside configured bounds",
+        ));
     }
     if !(ATTEMPTS_MIN..=ATTEMPTS_MAX).contains(&config.attempts) {
-        return Err(ConfigError::OutOfRange("attempts"));
+        return Err(failure::configuration_invalid(
+            "attempts",
+            "outside configured bounds",
+        ));
     }
     if !(1..=32).contains(&config.max_in_flight) {
-        return Err(ConfigError::OutOfRange("max_in_flight"));
+        return Err(failure::configuration_invalid(
+            "max_in_flight",
+            "outside configured bounds",
+        ));
     }
     if !(Duration::from_mins(1)..=Duration::from_hours(24)).contains(&config.capabilities_ttl) {
-        return Err(ConfigError::OutOfRange("capabilities_ttl"));
+        return Err(failure::configuration_invalid(
+            "capabilities_ttl",
+            "outside configured bounds",
+        ));
     }
     if !(Duration::from_mins(1)..=Duration::from_hours(24)).contains(&config.resolution_ttl) {
-        return Err(ConfigError::OutOfRange("resolution_ttl"));
+        return Err(failure::configuration_invalid(
+            "resolution_ttl",
+            "outside configured bounds",
+        ));
     }
     if !(Duration::from_secs(1)..=Duration::from_hours(1)).contains(&config.failure_ttl) {
-        return Err(ConfigError::OutOfRange("failure_ttl"));
+        return Err(failure::configuration_invalid(
+            "failure_ttl",
+            "outside configured bounds",
+        ));
     }
     if config.token_env.is_empty()
         || config
@@ -2576,13 +3212,22 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
             .bytes()
             .any(|byte| !(byte == b'_' || byte.is_ascii_alphanumeric()))
     {
-        return Err(ConfigError::InvalidTokenEnvironment);
+        return Err(failure::configuration_invalid(
+            "token_env",
+            "token environment variable name is invalid",
+        ));
     }
     Ok(())
 }
 
-fn validate_endpoint(value: &str) -> Result<Url, ConfigError> {
-    let endpoint = Url::parse(value).map_err(|_| ConfigError::InvalidEndpoint)?;
+fn validate_endpoint(value: &str) -> Result<Url, RiftError> {
+    let endpoint = Url::parse(value).map_err(|error| {
+        failure::configuration_source(
+            "endpoint",
+            "endpoint must be an absolute base URL without user information, query, fragment, or trailing slash",
+            error,
+        )
+    })?;
     if endpoint.cannot_be_a_base()
         || endpoint.username() != ""
         || endpoint.password().is_some()
@@ -2591,12 +3236,18 @@ fn validate_endpoint(value: &str) -> Result<Url, ConfigError> {
         || endpoint.path().ends_with('/')
         || endpoint.host_str().is_none()
     {
-        return Err(ConfigError::InvalidEndpoint);
+        return Err(failure::configuration_invalid(
+            "endpoint",
+            "endpoint must be an absolute base URL without user information, query, fragment, or trailing slash",
+        ));
     }
     if endpoint.scheme() != "https"
         && !(endpoint.scheme() == "http" && endpoint.host_str().is_some_and(is_loopback))
     {
-        return Err(ConfigError::InvalidEndpointScheme);
+        return Err(failure::configuration_invalid(
+            "endpoint",
+            "endpoint must use HTTPS except for loopback HTTP",
+        ));
     }
     Ok(endpoint)
 }
@@ -2605,22 +3256,28 @@ fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
-fn read_token(name: &str) -> Result<Option<String>, ConfigError> {
+fn read_token(name: &str) -> Result<Option<String>, RiftError> {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidToken),
+        Err(std::env::VarError::NotUnicode(_)) => Err(failure::configuration_invalid(
+            "token",
+            "token cannot form a bounded authorization header",
+        )),
         Ok(value) => Ok(Some(value)),
     }
 }
 
-fn validate_token(value: String) -> Result<String, ConfigError> {
+fn validate_token(value: String) -> Result<String, RiftError> {
     if value.is_empty()
         || value.len() > 8 * 1024
         || value
             .bytes()
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
-        return Err(ConfigError::InvalidToken);
+        return Err(failure::configuration_invalid(
+            "token",
+            "token cannot form a bounded authorization header",
+        ));
     }
     Ok(value)
 }
@@ -2634,10 +3291,22 @@ fn make_url(endpoint: &Url, path: &str) -> Url {
 fn serialize_body<T: Serialize>(
     value: &T,
     request_body_bytes_max: usize,
-) -> Result<Vec<u8>, ClientError> {
-    let body = serde_json::to_vec(value).map_err(|_| ClientError::Decode { status: 0 })?;
+) -> Result<Vec<u8>, RiftError> {
+    let body = serde_json::to_vec(value).map_err(|error| {
+        failure::request_invalid_source(
+            "serialize_body",
+            "body",
+            "JSON serialization failed",
+            error,
+        )
+    })?;
     if body.len() > request_body_bytes_max {
-        return Err(ClientError::RequestBodyTooLarge { bytes: body.len() });
+        return Err(failure::body_limit(
+            "serialize_body",
+            "request",
+            body.len(),
+            request_body_bytes_max,
+        ));
     }
     Ok(body)
 }
@@ -2646,13 +3315,18 @@ fn validate_body_for_capabilities(
     body: &[u8],
     capabilities: &Capabilities,
     request_body_bytes_max: usize,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let maximum = smaller_bound(
         capabilities.bounds.request_body_bytes_max,
         request_body_bytes_max,
     );
     if body.len() > maximum {
-        return Err(ClientError::RequestBodyTooLarge { bytes: body.len() });
+        return Err(failure::body_limit(
+            "validate_body_for_capabilities",
+            "request",
+            body.len(),
+            maximum,
+        ));
     }
     Ok(())
 }
@@ -2661,7 +3335,7 @@ fn header_text(
     headers: &HeaderMap,
     name: impl reqwest::header::AsHeaderName,
     field: &'static str,
-) -> Result<Option<String>, ClientError> {
+) -> Result<Option<String>, RiftError> {
     let value = headers
         .get(name)
         .and_then(|value| value.to_str().ok())
@@ -2670,7 +3344,12 @@ fn header_text(
         .as_ref()
         .is_some_and(|value| value.len() > RESPONSE_HEADER_BYTES_MAX)
     {
-        return Err(ClientError::InvalidResponseField { field });
+        return Err(failure::response_invalid(
+            "header_text",
+            field,
+            "field failed validation",
+            None,
+        ));
     }
     Ok(value)
 }

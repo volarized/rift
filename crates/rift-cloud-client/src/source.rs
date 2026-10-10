@@ -1,3 +1,5 @@
+use rift_error::RiftError;
+
 use std::collections::HashSet;
 
 use rift_protocol::{
@@ -9,7 +11,7 @@ use rift_protocol::{
 };
 
 use crate::{
-    ClientError, GlobalClient, PACKAGES_MAX, active_response_body_bytes_max, contract, response,
+    GlobalClient, PACKAGES_MAX, active_response_body_bytes_max, contract, failure, response,
     serialize_body, smaller_bound, supports_feature, validate_body_for_capabilities,
 };
 
@@ -18,124 +20,167 @@ impl GlobalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request or answer breaks the contract, or the endpoint
+    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint
     /// is unavailable.
     pub async fn get_source(
         &self,
         request: &GetSourceParams,
-    ) -> Result<GetSourceResult, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        if !request.is_valid() {
-            return Err(ClientError::InvalidRequest { field: "unit" });
-        }
-        global_source_owner(request.unit.as_str(), request.view.as_ref())?;
-        let capabilities = self.get_capabilities().await?;
-        let body = serialize_body(request, self.inner.config.max_request)?;
-        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-        let raw = self
-            .request(
-                contract::Endpoint::Source,
-                Some(body),
-                None,
-                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-            )
-            .await;
-        let raw = self.observed(raw).await?;
-        let parsed = self.observed(response::exact_source(raw)).await?;
-        let bounded_source = match &parsed.value {
-            GetSourceResult::Found { source, .. } => {
-                source.text.len()
-                    <= smaller_bound(
-                        capabilities.bounds.source_bytes_max,
-                        self.inner.config.max_source,
-                    )
+    ) -> Result<GetSourceResult, RiftError> {
+        rift_tracing::traced!(component = "global", operation = "get_source", async {
+            if !self.inner.enabled {
+                return Err(failure::configuration_invalid(
+                    "enabled",
+                    "global client disabled",
+                ));
             }
-            _ => true,
-        };
-        if !bounded_source || !parsed.value.is_valid_for(request) {
-            return self
-                .observed(Err(ClientError::InvalidResponse {
-                    status: parsed.meta.status,
-                }))
+            if !request.is_valid() {
+                return Err(failure::request_invalid(
+                    "get_source",
+                    "unit",
+                    "field failed validation",
+                ));
+            }
+            global_source_owner(request.unit.as_str(), request.view.as_ref())?;
+            let capabilities = self.get_capabilities().await?;
+            let body = serialize_body(request, self.inner.config.max_request)?;
+            validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
+            let raw = self
+                .request(
+                    contract::Endpoint::Source,
+                    Some(body),
+                    None,
+                    active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
+                )
                 .await;
-        }
-        Ok(parsed.value)
+            let raw = self.observed(raw).await?;
+            let parsed = self.observed(response::exact_source(raw)).await?;
+            let bounded_source = match &parsed.value {
+                GetSourceResult::Found { source, .. } => {
+                    source.text.len()
+                        <= smaller_bound(
+                            capabilities.bounds.source_bytes_max,
+                            self.inner.config.max_source,
+                        )
+                }
+                _ => true,
+            };
+            if !bounded_source || !parsed.value.is_valid_for(request) {
+                return self
+                    .observed(Err(failure::response_invalid(
+                        "get_source",
+                        "body",
+                        "field failed validation",
+                        Some(parsed.meta.status),
+                    )))
+                    .await;
+            }
+            Ok(parsed.value)
+        })
+        .await
     }
 
     /// Names declarations holding source positions in one immutable selection.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request or answer breaks the contract, declaration lookup
+    /// Returns [`RiftError`] when the request or answer breaks the contract, declaration lookup
     /// is unavailable, or the endpoint is unavailable.
     pub async fn find_declarations(
         &self,
         request: &FindDeclarationsParams,
-    ) -> Result<FindDeclarationsResult, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        if !request.is_valid() {
-            return Err(ClientError::InvalidRequest { field: "positions" });
-        }
-        let mut owners = HashSet::new();
-        for position in &request.positions {
-            if let Some(owner) = global_source_owner(position.unit.as_str(), request.view.as_ref())?
-            {
-                owners.insert(owner);
+    ) -> Result<FindDeclarationsResult, RiftError> {
+        rift_tracing::traced!(
+            component = "global",
+            operation = "find_declarations",
+            async {
+                if !self.inner.enabled {
+                    return Err(failure::configuration_invalid(
+                        "enabled",
+                        "global client disabled",
+                    ));
+                }
+                if !request.is_valid() {
+                    return Err(failure::request_invalid(
+                        "find_declarations",
+                        "positions",
+                        "field failed validation",
+                    ));
+                }
+                let mut owners = HashSet::new();
+                for position in &request.positions {
+                    if let Some(owner) =
+                        global_source_owner(position.unit.as_str(), request.view.as_ref())?
+                    {
+                        owners.insert(owner);
+                    }
+                }
+                let capabilities = self.get_capabilities().await?;
+                if !supports_feature(&capabilities, "declarations") {
+                    return Err(failure::configuration_invalid(
+                        "feature",
+                        &format!("global API does not advertise feature: {}", "declarations"),
+                    ));
+                }
+                if owners.len() > smaller_bound(capabilities.bounds.packages_max, PACKAGES_MAX) {
+                    return Err(failure::request_invalid(
+                        "find_declarations",
+                        "positions",
+                        "field failed validation",
+                    ));
+                }
+                let body = serialize_body(request, self.inner.config.max_request)?;
+                validate_body_for_capabilities(
+                    &body,
+                    &capabilities,
+                    self.inner.config.max_request,
+                )?;
+                let raw = self
+                    .request(
+                        contract::Endpoint::Declarations,
+                        Some(body),
+                        None,
+                        active_response_body_bytes_max(
+                            &capabilities,
+                            self.inner.config.max_response,
+                        ),
+                    )
+                    .await;
+                let raw = self.observed(raw).await?;
+                let parsed = self.observed(response::source_declarations(raw)).await?;
+                if !parsed.value.is_valid_for(request)
+                    || !parsed.value.results.iter().all(|result| match result {
+                        DeclarationPositionResult::Found { id, .. } => {
+                            SymbolIdentity::parse(id.as_str()).is_ok_and(|identity| {
+                                matches!(
+                                    identity.owner(),
+                                    SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+                                )
+                            })
+                        }
+                        _ => true,
+                    })
+                {
+                    return self
+                        .observed(Err(failure::response_invalid(
+                            "find_declarations",
+                            "body",
+                            "field failed validation",
+                            Some(parsed.meta.status),
+                        )))
+                        .await;
+                }
+                Ok(parsed.value)
             }
-        }
-        let capabilities = self.get_capabilities().await?;
-        if !supports_feature(&capabilities, "declarations") {
-            return Err(ClientError::FeatureUnavailable {
-                feature: "declarations",
-            });
-        }
-        if owners.len() > smaller_bound(capabilities.bounds.packages_max, PACKAGES_MAX) {
-            return Err(ClientError::InvalidRequest { field: "positions" });
-        }
-        let body = serialize_body(request, self.inner.config.max_request)?;
-        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-        let raw = self
-            .request(
-                contract::Endpoint::Declarations,
-                Some(body),
-                None,
-                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-            )
-            .await;
-        let raw = self.observed(raw).await?;
-        let parsed = self.observed(response::source_declarations(raw)).await?;
-        if !parsed.value.is_valid_for(request)
-            || !parsed.value.results.iter().all(|result| match result {
-                DeclarationPositionResult::Found { id, .. } => SymbolIdentity::parse(id.as_str())
-                    .is_ok_and(|identity| {
-                        matches!(
-                            identity.owner(),
-                            SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
-                        )
-                    }),
-                _ => true,
-            })
-        {
-            return self
-                .observed(Err(ClientError::InvalidResponse {
-                    status: parsed.meta.status,
-                }))
-                .await;
-        }
-        Ok(parsed.value)
+        )
+        .await
     }
 }
 
 fn global_source_owner(
     unit: &str,
     view: Option<&rift_protocol::symbol_read::CapturedViewId>,
-) -> Result<Option<SymbolOwner>, ClientError> {
-    let (owner, _) = parse_source_unit_identity(unit)
-        .map_err(|_| ClientError::InvalidRequest { field: "unit" })?;
+) -> Result<Option<SymbolOwner>, RiftError> {
+    let (owner, _) = parse_source_unit_identity(unit)?;
     match owner {
         Some(owner @ (SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. })) => {
             Ok(Some(owner))
@@ -146,6 +191,10 @@ fn global_source_owner(
         {
             Ok(None)
         }
-        _ => Err(ClientError::InvalidRequest { field: "unit" }),
+        _ => Err(failure::request_invalid(
+            "global_source_owner",
+            "unit",
+            "field failed validation",
+        )),
     }
 }

@@ -1,3 +1,5 @@
+use rift_error::RiftError;
+
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
     read::{GetSymbolInclude, PAGE_LIMIT_MAX},
@@ -5,9 +7,9 @@ use rift_protocol::{
 };
 
 use crate::{
-    CURSOR_BYTES_MAX, ClientError, GlobalClient, SYMBOL_DOCUMENTATION_FEATURE,
-    active_response_body_bytes_max, contract, response, serialize_body, smaller_bound,
-    supports_feature, validate_body_for_capabilities,
+    CURSOR_BYTES_MAX, GlobalClient, SYMBOL_DOCUMENTATION_FEATURE, active_response_body_bytes_max,
+    contract, failure, response, serialize_body, smaller_bound, supports_feature,
+    validate_body_for_capabilities,
 };
 
 impl GlobalClient {
@@ -15,87 +17,112 @@ impl GlobalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the request or answer breaks the contract, or the endpoint
+    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint
     /// is unavailable.
     pub async fn get_symbol(
         &self,
         request: &GetSymbolParams,
-    ) -> Result<GetSymbolResult, ClientError> {
-        if !self.inner.enabled {
-            return Err(ClientError::Disabled);
-        }
-        validate_request(request)?;
-        let capabilities = self.get_capabilities().await?;
-        if request.include.contains(&GetSymbolInclude::Documentation)
-            && !supports_feature(&capabilities, SYMBOL_DOCUMENTATION_FEATURE)
-        {
-            return Err(ClientError::FeatureUnavailable {
-                feature: SYMBOL_DOCUMENTATION_FEATURE,
-            });
-        }
-        if request.declaration_cursor.as_ref().is_some_and(|cursor| {
-            cursor.len() > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
-        }) {
-            return Err(ClientError::InvalidRequest {
-                field: "declaration_cursor",
-            });
-        }
-        let body = serialize_body(request, self.inner.config.max_request)?;
-        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
-        let raw = match self
-            .request(
-                contract::Endpoint::Symbols,
-                Some(body),
-                None,
-                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
-            )
-            .await
-        {
-            Ok(raw) => raw,
-            Err(error) => return self.observed(Err(error)).await,
-        };
-        let response::Parsed { value, meta } = match response::exact_symbol(raw) {
-            Ok(parsed) => parsed,
-            Err(error) => return self.observed(Err(error)).await,
-        };
-        let source_bytes_max = smaller_bound(
-            capabilities.bounds.source_bytes_max,
-            self.inner.config.max_source,
-        );
-        if !valid_result(request, &value, source_bytes_max) {
-            return self
-                .observed(Err(ClientError::InvalidResponse {
-                    status: meta.status,
-                }))
-                .await;
-        }
-        Ok(value)
+    ) -> Result<GetSymbolResult, RiftError> {
+        rift_tracing::traced!(component = "global", operation = "get_symbol", async {
+            if !self.inner.enabled {
+                return Err(failure::configuration_invalid(
+                    "enabled",
+                    "global client disabled",
+                ));
+            }
+            validate_request(request)?;
+            let capabilities = self.get_capabilities().await?;
+            if request.include.contains(&GetSymbolInclude::Documentation)
+                && !supports_feature(&capabilities, SYMBOL_DOCUMENTATION_FEATURE)
+            {
+                return Err(failure::configuration_invalid(
+                    "feature",
+                    &format!(
+                        "global API does not advertise feature: {SYMBOL_DOCUMENTATION_FEATURE}"
+                    ),
+                ));
+            }
+            if request.declaration_cursor.as_ref().is_some_and(|cursor| {
+                cursor.len() > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
+            }) {
+                return Err(failure::request_invalid(
+                    "get_symbol",
+                    "declaration_cursor",
+                    "field failed validation",
+                ));
+            }
+            let body = serialize_body(request, self.inner.config.max_request)?;
+            validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
+            let raw = match self
+                .request(
+                    contract::Endpoint::Symbols,
+                    Some(body),
+                    None,
+                    active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
+                )
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) => return self.observed(Err(error)).await,
+            };
+            let response::Parsed { value, meta } = match response::exact_symbol(raw) {
+                Ok(parsed) => parsed,
+                Err(error) => return self.observed(Err(error)).await,
+            };
+            let source_bytes_max = smaller_bound(
+                capabilities.bounds.source_bytes_max,
+                self.inner.config.max_source,
+            );
+            if !valid_result(request, &value, source_bytes_max) {
+                return self
+                    .observed(Err(failure::response_invalid(
+                        "get_symbol",
+                        "body",
+                        "field failed validation",
+                        Some(meta.status),
+                    )))
+                    .await;
+            }
+            Ok(value)
+        })
+        .await
     }
 }
 
-fn validate_request(request: &GetSymbolParams) -> Result<(), ClientError> {
-    let identity = SymbolIdentity::parse(request.id.as_str())
-        .map_err(|_| ClientError::InvalidRequest { field: "id" })?;
+fn validate_request(request: &GetSymbolParams) -> Result<(), RiftError> {
+    let identity = SymbolIdentity::parse(request.id.as_str())?;
     if !matches!(
         identity.owner(),
         SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
     ) {
-        return Err(ClientError::InvalidRequest { field: "id" });
+        return Err(failure::request_invalid(
+            "validate_request",
+            "id",
+            "field failed validation",
+        ));
     }
     if request.rev.is_some() {
-        return Err(ClientError::InvalidRequest { field: "rev" });
+        return Err(failure::request_invalid(
+            "validate_request",
+            "rev",
+            "field failed validation",
+        ));
     }
     if !(1..=PAGE_LIMIT_MAX).contains(&request.declaration_limit) {
-        return Err(ClientError::InvalidRequest {
-            field: "declaration_limit",
-        });
+        return Err(failure::request_invalid(
+            "validate_request",
+            "declaration_limit",
+            "field failed validation",
+        ));
     }
     if request.declaration_cursor.as_ref().is_some_and(|cursor| {
         cursor.is_empty() || cursor.len() > CURSOR_BYTES_MAX || request.view.is_none()
     }) {
-        return Err(ClientError::InvalidRequest {
-            field: "declaration_cursor",
-        });
+        return Err(failure::request_invalid(
+            "validate_request",
+            "declaration_cursor",
+            "field failed validation",
+        ));
     }
     Ok(())
 }

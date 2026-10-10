@@ -202,9 +202,13 @@ async fn native_http_stored_documentation_refuses_foreign_origins_and_invalid_re
         *search.pointer_mut(pointer).expect("stored field") = replacement;
         let (_server, client) =
             operation_client(OperationFixture::Documentation { search, symbols }).await;
-        assert!(
-            matches!(client.search_packages(&mixed_search_request(), 20, None).await,
-            Err(ClientError::InvalidResponseField { field: actual }) if actual == field)
+        assert_registered_field(
+            &client
+                .search_packages(&mixed_search_request(), 20, None)
+                .await
+                .expect_err("stored documentation refusal"),
+            "rift.client.response_invalid",
+            field,
         );
     }
 }
@@ -269,10 +273,11 @@ fn request() -> PackageSearchRequest {
 
 fn refuses_search(value: Value, field: &'static str) {
     let value = serde_json::from_value(value).expect("generated page");
-    assert!(
-        matches!(validate_search_page(&request(), &capabilities(), &value, None, SOURCE_BYTES_MAX),
-        Err(ClientError::InvalidResponseField {field: actual}) if actual == field),
-        "expected {field}"
+    assert_registered_field(
+        &validate_search_page(&request(), &capabilities(), &value, None, SOURCE_BYTES_MAX)
+            .expect_err("documentation refusal"),
+        "rift.client.response_invalid",
+        field,
     );
 }
 
@@ -292,16 +297,18 @@ fn documentation_pages_validate_identity_fields_and_requested_source() {
     );
     let mut without_source = request();
     without_source.include = None;
-    assert!(matches!(
-        validate_search_page(
+    assert_registered_field(
+        &validate_search_page(
             &without_source,
             &capabilities(),
             &value,
             None,
-            SOURCE_BYTES_MAX
-        ),
-        Err(ClientError::InvalidResponseField { field: "source" })
-    ));
+            SOURCE_BYTES_MAX,
+        )
+        .expect_err("unrequested documentation source refusal"),
+        "rift.client.response_invalid",
+        "source",
+    );
     assert!(
         validate_search_page(
             &search_request(),
@@ -332,11 +339,11 @@ fn discovery_documentation_accepts_omitted_or_empty_package_selection() {
     let mut other = package_request();
     other.name = "other".to_owned();
     request.packages = Some(vec![other]);
-    assert_eq!(
-        validate_search_page(&request, &capabilities(), &value, None, SOURCE_BYTES_MAX),
-        Err(ClientError::InvalidResponseField {
-            field: "documentation"
-        })
+    assert_registered_field(
+        &validate_search_page(&request, &capabilities(), &value, None, SOURCE_BYTES_MAX)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "documentation",
     );
 }
 
@@ -473,10 +480,12 @@ fn symbol_source_requires_source_include() {
         .expect("requested symbol source");
 
     request.include = None;
-    assert!(matches!(
-        validate_symbol_page(&request, &capabilities(), &page, None, SOURCE_BYTES_MAX),
-        Err(ClientError::InvalidResponseField { field: "source" })
-    ));
+    assert_registered_field(
+        &validate_symbol_page(&request, &capabilities(), &page, None, SOURCE_BYTES_MAX)
+            .expect_err("unrequested symbol source refusal"),
+        "rift.client.response_invalid",
+        "source",
+    );
 }
 
 #[test]
@@ -484,12 +493,11 @@ fn documentation_capabilities_require_matching_revision() {
     for revision in [None, Some("invalid".to_owned())] {
         let mut value = capabilities();
         value.documentation_revision = revision;
-        assert!(matches!(
-            validate_capabilities(&value),
-            Err(ClientError::InvalidResponseField {
-                field: "documentation_revision"
-            })
-        ));
+        assert_registered_field(
+            &validate_capabilities(&value).expect_err("documentation revision refusal"),
+            "rift.client.response_invalid",
+            "documentation_revision",
+        );
     }
 }
 

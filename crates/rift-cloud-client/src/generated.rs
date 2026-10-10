@@ -21,21 +21,51 @@
 
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-static REGEX_FIND_DECLARATIONS_PARAMS_REV: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+static REGEX_COMMIT_HIT_REVISION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 regex::Regex::new("^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$").expect("invalid regex"));
-static REGEX_FIND_DECLARATIONS_PARAMS_VIEW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+static REGEX_DOCUMENTATION_BLOCK_CONTENT_DIGEST: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+regex::Regex::new("^[0-9a-f]{64}$").expect("invalid regex"));
+static REGEX_DOCUMENTATION_HIT_DOCUMENTATION_REVISION: std::sync::LazyLock<
+    regex::Regex,
+> = std::sync::LazyLock::new(|| {
+    regex::Regex::new("^[0-9a-f]{8}$").expect("invalid regex")
+});
+static REGEX_DOCUMENTATION_LICENSE_FILE_PATH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 {
-    regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
+    regex::Regex::new(
+            "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
+        )
         .expect("invalid regex")
 });
-static REGEX_GET_SOURCE_PARAMS_UNIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+static REGEX_PACKAGE_SEARCH_HIT_UNIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 {
     regex::Regex::new(
             "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
         )
         .expect("invalid regex")
 });
-static REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+static REGEX_PACKAGE_SEARCH_REQUEST_VIEW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+{
+    regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
+        .expect("invalid regex")
+});
+static REGEX_PARAMETER_NODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+{
+    regex::Regex::new(
+            "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+        )
+        .expect("invalid regex")
+});
+static REGEX_SYMBOL_CONTAINER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+{
+    regex::Regex::new(
+            "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+        )
+        .expect("invalid regex")
+});
+static REGEX_SYMBOL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+regex::Regex::new("^[A-Za-z][A-Za-z0-9._-]*$").expect("invalid regex"));
+static REGEX_SYMBOL_LANGUAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 regex::Regex::new("^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$").expect("invalid regex"));
 /// One package as its package manager identifies it.
 #[derive(
@@ -69,10 +99,23 @@ pub type SourceUnitId = String;
 pub type SymbolId = String;
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
 /// and is connected through Relationship.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(default)]
 pub struct Symbol {
     /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
     pub container: Option<String>,
     /// Whether language semantics confine this symbol to the document that declares it. The
     /// provider classifies locality from its language model; absent when `false`.
@@ -80,6 +123,7 @@ pub struct Symbol {
     pub document_local: Option<bool>,
     /// Doc comments attached to the declaration, with the markup format they were written
     /// in. Absent when empty.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub documentation: Option<Vec<Documentation>>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
@@ -91,10 +135,16 @@ pub struct Symbol {
     #[default(Some(Default::default()))]
     pub facets: Option<Vec<SymbolFacet>>,
     /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
     pub id: Option<String>,
     /// A provider-local kind preserving the construct name used by that language implementation.
+    #[validate(length(min = 1u64), regex(path = "REGEX_SYMBOL_KIND"))]
     pub kind: String,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    #[validate(length(max = 129u64), regex(path = "REGEX_SYMBOL_LANGUAGE"))]
     pub language: String,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`. Absent
     /// when empty.
@@ -102,20 +152,24 @@ pub struct Symbol {
     pub modifiers: Option<Vec<String>>,
     /// The human-readable name, as written in the source: `parseConfig`. Rendered
     /// signatures live in `signatures`.
+    #[validate(length(max = 4_096u64))]
     pub name: String,
     /// Where a symbol belongs and how its declaration came to exist. Source location and
     /// generation are separate: generated code can belong to the project or to a dependency.
     /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
     /// package.
+    #[validate(nested)]
     pub origin: Option<SymbolOrigin>,
     /// One entry per callable form, absent when empty. Where the language dispatches
     /// overloads separately they are separate symbols joined by the `overloads` edge;
     /// several entries here are alternative forms of one dispatch target, as
     /// `typing.overload` writes them.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub signatures: Option<Vec<Signature>>,
     /// The types this symbol carries, each tagged with the role it plays: a return type, a
     /// field type, a bound. Absent when empty.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub types: Option<Vec<TypeBinding>>,
     /// How widely the symbol is visible, in the language's own terms - `public`, `private`,
@@ -126,28 +180,42 @@ pub struct Symbol {
 /// generation are separate: generated code can belong to the project or to a dependency.
 /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
 /// package.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 pub struct SymbolOrigin {
     /// Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package
     /// ownership is the separate `package` field: a `project` declaration can carry one too,
     /// and `dependency` always does.
     pub location: Option<SourceLocationKind>,
     /// One package as its package manager identifies it.
+    #[validate(nested)]
     pub package: Option<PackageIdentity>,
     /// One exact runtime or compiler release.
+    #[validate(nested)]
     pub runtime: Option<RuntimeIdentity>,
     /// How source or a declaration came to exist.
     pub source_kind: SourceKind,
 }
 /// How source or a declaration came to exist.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum SourceKind {
     /// A person wrote it.
+    #[serde(rename = "authored")]
     #[default]
     Authored,
     /// A tool produced it from other source.
+    #[serde(rename = "generated")]
     Generated,
     /// The provider minted it without any source text.
+    #[serde(rename = "synthetic")]
     Synthetic,
 }
 impl core::fmt::Display for SourceKind {
@@ -183,18 +251,22 @@ impl<'de> serde::Deserialize<'de> for SourceKind {
 /// Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package
 /// ownership is the separate `package` field: a `project` declaration can carry one too,
 /// and `dependency` always does.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum SourceLocationKind {
     /// Owned by the current workspace.
+    #[serde(rename = "project")]
     #[default]
     Project,
     /// Owned by one resolved dependency. The ECMAScript built-ins, such as `Array`, belong
     /// to the npm `typescript` package, whose `lib.*.d.ts` files declare them.
+    #[serde(rename = "dependency")]
     Dependency,
     /// Installed with the language toolchain: `stdlib/rust`, `stdlib/node`, or
     /// `stdlib/python`.
+    #[serde(rename = "stdlib")]
     Stdlib,
     /// Outside the project, dependency graph, and standard library.
+    #[serde(rename = "external")]
     External,
 }
 impl core::fmt::Display for SourceLocationKind {
@@ -232,22 +304,33 @@ impl<'de> serde::Deserialize<'de> for SourceLocationKind {
 /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
 pub type Language = String;
 /// One block of documentation attached to a declaration, in the markup it was written in.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 pub struct Documentation {
     /// Which markup the text is written in, since whoever displays a doc comment is the one that
     /// renders it.
     pub format: DocumentationFormat,
     /// The body of the comment, with the comment syntax stripped.
+    #[validate(length(min = 1u64))]
     pub text: String,
 }
 /// Which markup the text is written in, since whoever displays a doc comment is the one that
 /// renders it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum DocumentationFormat {
     /// Plain text with no markup to render.
+    #[serde(rename = "plain")]
     #[default]
     Plain,
     /// Markdown as authored in the source.
+    #[serde(rename = "markdown")]
     Markdown,
 }
 impl core::fmt::Display for DocumentationFormat {
@@ -279,68 +362,98 @@ impl<'de> serde::Deserialize<'de> for DocumentationFormat {
 pub struct Extensions {}
 /// One portable category a symbol falls into. Kinds are language-specific; facets are
 /// shared, so a filter written once applies to every served language.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum SymbolFacet {
     /// A named scope that groups declarations.
+    #[serde(rename = "namespace")]
     #[default]
     Namespace,
     /// A compilation or import unit.
+    #[serde(rename = "module")]
     Module,
     /// Names a type.
+    #[serde(rename = "type")]
     TypeType,
     /// Holds a runtime value.
+    #[serde(rename = "value")]
     Value,
     /// Can be invoked.
+    #[serde(rename = "callable")]
     Callable,
     /// Belongs to a containing type.
+    #[serde(rename = "member")]
     Member,
     /// Owns members of its own.
+    #[serde(rename = "member_container")]
     MemberContainer,
     /// A declared input of a callable.
+    #[serde(rename = "parameter")]
     Parameter,
     /// A generic parameter a declaration abstracts over.
+    #[serde(rename = "type_parameter")]
     TypeParameter,
     /// Instances of it can be created.
+    #[serde(rename = "constructible")]
     Constructible,
     /// Other types can inherit from it.
+    #[serde(rename = "extensible")]
     Extensible,
     /// Other types can fulfil it.
+    #[serde(rename = "implementable")]
     Implementable,
     /// Expands at compile time.
+    #[serde(rename = "macro")]
     Macro,
     /// Exercises other code as a test.
+    #[serde(rename = "test")]
     Test,
     /// Decorates other declarations.
+    #[serde(rename = "annotation")]
     Annotation,
     /// Adds members to a type declared elsewhere.
+    #[serde(rename = "extension")]
     Extension,
     /// One case of an enumeration.
+    #[serde(rename = "variant")]
     Variant,
     /// A closed set of variants.
+    #[serde(rename = "enumeration")]
     Enumeration,
     /// Another name for an existing symbol.
+    #[serde(rename = "alias")]
     Alias,
     /// A member accessed like a field but backed by code.
+    #[serde(rename = "property")]
     Property,
     /// Declared without a complete implementation.
+    #[serde(rename = "abstract")]
     Abstract,
     /// Creates instances of its container.
+    #[serde(rename = "constructor")]
     Constructor,
     /// Belongs to the type rather than an instance.
+    #[serde(rename = "static")]
     Static,
     /// Its value can change after initialization.
+    #[serde(rename = "mutable")]
     Mutable,
     /// Visible outside its declaring scope.
+    #[serde(rename = "public")]
     Public,
     /// Marked as discouraged for new use.
+    #[serde(rename = "deprecated")]
     Deprecated,
     /// Where execution starts.
+    #[serde(rename = "entrypoint")]
     Entrypoint,
     /// Invoked through operator syntax.
+    #[serde(rename = "operator")]
     Operator,
     /// Runs asynchronously.
+    #[serde(rename = "async")]
     Async,
     /// Yields a sequence of values over time.
+    #[serde(rename = "generator")]
     Generator,
 }
 impl core::fmt::Display for SymbolFacet {
@@ -462,10 +575,20 @@ impl<'de> serde::Deserialize<'de> for SymbolFacet {
 pub type ExactKind = String;
 /// One callable form of a symbol: the text it renders as, the symbols that text points at,
 /// and its structure. Overloads are separate entries.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(default)]
 pub struct Signature {
     /// The signature as a reader sees it, in the language's own syntax.
+    #[validate(length(min = 1u64))]
     pub display: String,
     /// Effect keywords the declaration carries, in the language's own words: `async`,
     /// `unsafe`, `pure`. The spelling is preserved and never mapped onto a portable
@@ -477,24 +600,30 @@ pub struct Signature {
     /// implement.
     pub extensions: Option<serde_json::Value>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    #[validate(length(max = 129u64), regex(path = "REGEX_SYMBOL_LANGUAGE"))]
     pub language: String,
     /// Symbols named inside `display`, each with the byte range of `display` that names it,
     /// so a renderer can turn the rendered text into links. Absent when empty.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub links: Option<Vec<SignatureLink>>,
     /// Declared parameters, in source order. Absent when empty.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub parameters: Option<Vec<Parameter>>,
     /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
     /// may pass it. A receiver is one of these too, held in its own field because it has no
     /// position in the parameter list.
+    #[validate(nested)]
     pub receiver: Option<Parameter>,
     /// What the call yields, absent when empty. An array because a language may return
     /// several values, and because a declared and an inferred return are separate
     /// bindings.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub returns: Option<Vec<TypeBinding>>,
     /// Types this form declares it can raise. Absent when empty.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub throws: Option<Vec<TypeExpression>>,
     /// The generic parameters this form declares, each as the symbol that declares it.
@@ -505,7 +634,16 @@ pub struct Signature {
 /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
 /// may pass it. A receiver is one of these too, held in its own field because it has no
 /// position in the parameter list.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(default)]
 pub struct Parameter {
     /// The default value as written in the source. Absent where there is none.
@@ -521,11 +659,16 @@ pub struct Parameter {
     /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
     /// of the SHA-256 of the node's source bytes. The identity describes the node in the
     /// revision the response names.
+    #[validate(
+        length(min = 27u64, max = 8_192u64),
+        regex(path = "REGEX_PARAMETER_NODE")
+    )]
     pub node: Option<String>,
     /// Whether a call may leave it out.
     pub optional: bool,
     /// What it accepts, absent when empty. An array because a declared type and an
     /// inferred one are separate bindings.
+    #[validate(nested)]
     #[default(Some(Default::default()))]
     pub types: Option<Vec<TypeBinding>>,
     /// Whether it absorbs the arguments that follow - `*args`, `...rest`.
@@ -537,7 +680,15 @@ pub struct Parameter {
 /// revision the response names.
 pub type NodeId = String;
 /// One type a symbol carries, together with the role it plays for that symbol.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 pub struct TypeBinding {
     /// Where the type fact came from. A declared type and an inferred one can both be present
     /// and disagree, which is the interesting case.
@@ -548,35 +699,48 @@ pub struct TypeBinding {
     /// type with a declaration resolves to that symbol; a structural type - `string | null`,
     /// `{ a: string }` - has the spelling and nothing to resolve to.
     #[serde(rename = "type")]
+    #[validate(nested)]
     pub r#type: TypeExpression,
 }
 /// What this type is to the symbol that carries it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum TypeBindingRole {
     /// The type of the implicit first parameter.
+    #[serde(rename = "receiver")]
     #[default]
     Receiver,
     /// The type a parameter accepts.
+    #[serde(rename = "parameter")]
     Parameter,
     /// The type a call yields.
+    #[serde(rename = "return")]
     Return,
     /// The type a field holds.
+    #[serde(rename = "field")]
     Field,
     /// A constraint on a type parameter.
+    #[serde(rename = "bound")]
     Bound,
     /// The type of a collection's entries.
+    #[serde(rename = "element")]
     Element,
     /// The type a map is indexed by.
+    #[serde(rename = "key")]
     Key,
     /// The type of the failure a fallible result carries.
+    #[serde(rename = "error")]
     Error,
     /// The type an alias or wrapper stands for.
+    #[serde(rename = "underlying")]
     Underlying,
     /// The type a generator produces per step.
+    #[serde(rename = "yielded")]
     Yielded,
     /// The type awaiting the value resolves to.
+    #[serde(rename = "awaited")]
     Awaited,
     /// The type that tags which variant a value holds.
+    #[serde(rename = "discriminant")]
     Discriminant,
 }
 impl core::fmt::Display for TypeBindingRole {
@@ -642,14 +806,17 @@ impl<'de> serde::Deserialize<'de> for TypeBindingRole {
 }
 /// Where the type fact came from. A declared type and an inferred one can both be present
 /// and disagree, which is the interesting case.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum TypeBindingOrigin {
     /// Written in the source by the author.
+    #[serde(rename = "declared")]
     #[default]
     Declared,
     /// Worked out by the provider from usage.
+    #[serde(rename = "inferred")]
     Inferred,
     /// Required by the surrounding context.
+    #[serde(rename = "expected")]
     Expected,
 }
 impl core::fmt::Display for TypeBindingOrigin {
@@ -685,30 +852,58 @@ impl<'de> serde::Deserialize<'de> for TypeBindingOrigin {
 /// How a type is written in the source, plus the symbol that declares it when one does. A
 /// type with a declaration resolves to that symbol; a structural type - `string | null`,
 /// `{ a: string }` - has the spelling and nothing to resolve to.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 pub struct TypeExpression {
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
     /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
     /// implement.
     pub extensions: Option<serde_json::Value>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    #[validate(length(max = 129u64), regex(path = "REGEX_SYMBOL_LANGUAGE"))]
     pub language: String,
     /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
     pub resolved: Option<String>,
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
+    #[validate(length(min = 1u64))]
     pub source: String,
 }
 /// One symbol named inside a rendered signature, with the byte range of that rendering which
 /// names it.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 pub struct SignatureLink {
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
+    #[validate(nested)]
     pub range: TextRange,
     /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
     pub symbol: String,
 }
 /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -991,7 +1186,7 @@ pub struct PackageResolutionResponse {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// Structured package declaration search query.
+/// A lexical package declaration search or a bounded relationship walk.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -1003,15 +1198,22 @@ pub struct PackageResolutionResponse {
 )]
 #[serde(deny_unknown_fields)]
 pub struct PackageSearchRequest {
+    /// A bounded relationship walk starting at one symbol.
+    ///
+    /// From `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,
+    /// following `direction` and narrowed to `facets`; each reached symbol keeps the shortest
+    /// path the walk found to it.
+    #[validate(nested)]
+    pub traversal: Option<SearchTraversal>,
     /// Original query text.
     #[validate(length(min = 1u64, max = 4_096u64))]
-    pub query: String,
+    pub query: Option<String>,
     /// Ordered parsed query members.
     #[validate(length(min = 1u64, max = 32u64), nested)]
-    pub terms: Vec<QueryTerm>,
+    pub terms: Option<Vec<QueryTerm>>,
     /// Ordered extracted identifiers.
     #[validate(length(max = 16u64))]
-    pub identifiers: Vec<String>,
+    pub identifiers: Option<Vec<String>>,
     /// Optional fields to include.
     #[validate(length(max = 1u64))]
     pub include: Option<Vec<String>>,
@@ -1019,18 +1221,29 @@ pub struct PackageSearchRequest {
     #[validate(length(max = 20_000u64), nested)]
     pub packages: Option<Vec<PackageIdentity>>,
     /// Ranking phase to execute.
-    pub phase: PackageSearchRequestPhase,
+    pub phase: Option<PackageSearchRequestPhase>,
     /// Which package results may be returned. Omitted, symbol.
     pub target: Option<PackageSearchRequestTarget>,
+    /// A service-issued key for one immutable view in one serving context.
+    #[validate(
+        length(min = 3u64, max = 4_096u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
+    )]
+    pub view: Option<String>,
 }
 /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum IdentifierMatchClass {
+    #[serde(rename = "qualified_exact")]
     #[default]
     QualifiedExact,
+    #[serde(rename = "name_exact")]
     NameExact,
+    #[serde(rename = "name_prefix")]
     NamePrefix,
+    #[serde(rename = "substring")]
     Substring,
+    #[serde(rename = "unknown")]
     Unknown,
 }
 impl core::fmt::Display for IdentifierMatchClass {
@@ -1061,34 +1274,53 @@ impl<'de> serde::Deserialize<'de> for IdentifierMatchClass {
     }
 }
 /// One public package declaration returned by search.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 pub struct PackageSearchHit {
     /// One package as its package manager identifies it.
+    #[validate(nested)]
     pub package: PackageIdentity,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
     /// and is connected through Relationship.
+    #[validate(nested)]
     pub symbol: Symbol,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 17u64, max = 8_192u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
+    )]
     pub unit: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
+    #[validate(nested)]
     pub range: TextRange,
     /// One-based source line containing the declaration.
+    #[validate(range(min = 1i64, max = 9_007_199_254_740_991i64))]
     pub line: i64,
     /// Fields that contributed to ranking. `file_content` names a match inside the declaration, which the file's text holds.
+    #[validate(length(min = 1u64, max = 16u64))]
     pub contributing_fields: Vec<PackageSearchHitContributingField>,
     /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
+    #[validate(length(max = 67_108_864u64))]
     pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.
+/// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchPage {
     /// Ranked package declarations.
@@ -1105,6 +1337,8 @@ pub struct PackageSearchPage {
     pub corpus_revision: String,
     /// Documentation revision used for this page.
     pub documentation_revision: Option<String>,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: CapturedView,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1125,10 +1359,7 @@ pub struct PackageSymbolRequest {
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub name: String,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
-    #[validate(
-        length(max = 129u64),
-        regex(path = "REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE")
-    )]
+    #[validate(length(max = 129u64), regex(path = "REGEX_SYMBOL_LANGUAGE"))]
     pub language: Option<String>,
     /// Optional fields to include.
     #[validate(length(max = 2u64))]
@@ -1290,41 +1521,68 @@ pub struct ProblemDetails {
 /// reaches the wire.
 pub type Digest = String;
 /// Documentation metadata addressing bytes held by an existing content owner.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationBlock {
     /// Existing ranked documents intersecting this block, in source order.
+    #[validate(nested)]
     pub chunks: Option<Vec<DocumentationChunk>>,
     /// Full lowercase SHA-256 digest for documentation content and identity.
+    #[validate(
+        length(min = 64u64, max = 64u64),
+        regex(path = "REGEX_DOCUMENTATION_BLOCK_CONTENT_DIGEST")
+    )]
     pub content_digest: String,
     /// Headings owning the block, in increasing depth order.
+    #[validate(nested)]
     pub heading_path: Option<Vec<DocumentationHeading>>,
     /// Full lowercase SHA-256 digest for documentation content and identity.
+    #[validate(
+        length(min = 64u64, max = 64u64),
+        regex(path = "REGEX_DOCUMENTATION_BLOCK_CONTENT_DIGEST")
+    )]
     pub identity: String,
     /// The content a documentation block addresses.
     pub kind: DocumentationBlockKind,
     /// Authored code language, when supplied by the format.
     pub language: Option<String>,
     /// One-based line where the block starts.
+    #[validate(range(min = 0))]
     pub line: u64,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
+    #[validate(nested)]
     pub range: TextRange,
     /// One content owner: a regular source or decoded notebook cell.
     pub source: DocumentationContentIdentity,
     /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
     pub symbol: Option<String>,
 }
 /// The content a documentation block addresses.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum DocumentationBlockKind {
     /// Authored prose and its markup.
+    #[serde(rename = "prose")]
     #[default]
     Prose,
     /// Authored code without execution or inferred name resolution.
+    #[serde(rename = "code")]
     Code,
 }
 impl core::fmt::Display for DocumentationBlockKind {
@@ -1349,20 +1607,31 @@ impl<'de> serde::Deserialize<'de> for DocumentationBlockKind {
     }
 }
 /// A baseline search document intersecting one block.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationChunk {
     /// Existing symbol or text document identity.
+    #[validate(length(min = 1u64))]
     pub identity: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
+    #[validate(nested)]
     pub range: TextRange,
 }
 /// One content owner: a regular source or decoded notebook cell.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationContentIdentity {
     /// A selected cell addressed within its parent notebook.
@@ -1386,41 +1655,87 @@ pub struct DocumentationContext {
     pub warnings: Option<Vec<DocumentationWarning>>,
 }
 /// One heading in a block's ordered section path.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationHeading {
     /// Heading depth established by the format parser.
+    #[validate(range(min = 0))]
     pub level: u32,
     /// Heading identity, including the parser's duplicate-heading disambiguator.
+    #[validate(length(min = 1u64))]
     pub name: String,
 }
 /// One documentation block projected from its existing content owner.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationHit {
     /// Documentation metadata addressing bytes held by an existing content owner.
+    #[validate(nested)]
     pub block: DocumentationBlock,
     /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
     /// uses. The full digest is computed and compared internally; only this short form ever
     /// reaches the wire.
+    #[validate(
+        length(min = 1u64),
+        regex(path = "REGEX_DOCUMENTATION_HIT_DOCUMENTATION_REVISION")
+    )]
     pub documentation_revision: String,
     /// Source facts shared by every block belonging to one content owner.
+    #[validate(nested)]
     pub source: DocumentationSource,
 }
 /// License metadata supplied by the source adapter.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationLicense {
     /// Declared expression; collection does not infer a license from source text.
     pub expression: Option<String>,
     /// License files whose bytes the adapter verified.
+    #[validate(nested)]
     pub files: Option<Vec<DocumentationLicenseFile>>,
 }
 /// One license file's address and byte digest.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationLicenseFile {
     /// Full lowercase SHA-256 digest for documentation content and identity.
+    #[validate(
+        length(min = 64u64, max = 64u64),
+        regex(path = "REGEX_DOCUMENTATION_BLOCK_CONTENT_DIGEST")
+    )]
     pub digest: String,
     /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
     /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
@@ -1428,6 +1743,10 @@ pub struct DocumentationLicenseFile {
     /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
     /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
     /// fails the read that touches them with `content_unavailable`.
+    #[validate(
+        length(max = 1_000u64),
+        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
+    )]
     pub path: String,
 }
 /// An exact declaration reference authored inside standalone documentation.
@@ -1508,16 +1827,20 @@ pub struct DocumentationReferenceHit {
     pub reference: DocumentationReference,
 }
 /// Why the caller selected this source.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum DocumentationSelectionReason {
     /// Visible documentation in the captured workspace.
+    #[serde(rename = "workspace")]
     #[default]
     Workspace,
     /// Source selected from one exact package's acquired bytes.
+    #[serde(rename = "package_archive")]
     PackageArchive,
     /// Comment supplied by its declaration's syntax provider.
+    #[serde(rename = "attached_comment")]
     AttachedComment,
     /// Source supplied by a cloud resolver.
+    #[serde(rename = "cloud_resolver")]
     CloudResolver,
 }
 impl core::fmt::Display for DocumentationSelectionReason {
@@ -1558,50 +1881,79 @@ impl<'de> serde::Deserialize<'de> for DocumentationSelectionReason {
     }
 }
 /// Source facts shared by every block belonging to one content owner.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationSource {
     /// Exact content length in UTF-8 bytes.
+    #[validate(range(min = 0))]
     pub byte_length: u64,
     /// Full lowercase SHA-256 digest for documentation content and identity.
+    #[validate(
+        length(min = 64u64, max = 64u64),
+        regex(path = "REGEX_DOCUMENTATION_BLOCK_CONTENT_DIGEST")
+    )]
     pub content_digest: String,
     /// The selected source's format.
     pub format: DocumentationSourceFormat,
     /// One content owner: a regular source or decoded notebook cell.
     pub identity: DocumentationContentIdentity,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    #[validate(length(max = 129u64), regex(path = "REGEX_SYMBOL_LANGUAGE"))]
     pub language: Option<String>,
     /// License metadata supplied by the source adapter.
+    #[validate(nested)]
     pub license: Option<DocumentationLicense>,
     /// Media type supplied by the source adapter.
+    #[validate(length(min = 1u64))]
     pub media_type: String,
     /// Where a symbol belongs and how its declaration came to exist. Source location and
     /// generation are separate: generated code can belong to the project or to a dependency.
     /// Absent from `Symbol` entirely when it says a project declaration, authored, with no
     /// package.
+    #[validate(nested)]
     pub origin: SymbolOrigin,
     /// Original JSON string-token ranges for a decoded notebook cell, in source order.
+    #[validate(nested)]
     pub physical_ranges: Option<Vec<TextRange>>,
     /// Full lowercase SHA-256 digest for documentation content and identity.
+    #[validate(
+        length(min = 64u64, max = 64u64),
+        regex(path = "REGEX_DOCUMENTATION_BLOCK_CONTENT_DIGEST")
+    )]
     pub revision: String,
     /// Why the caller selected this source.
     pub selection: DocumentationSelectionReason,
 }
 /// The selected source's format.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum DocumentationSourceFormat {
     /// Markdown block and inline syntax.
+    #[serde(rename = "markdown")]
     #[default]
     Markdown,
     /// Recognized Markdown ranges inside MDX.
+    #[serde(rename = "mdx")]
     Mdx,
     /// Supported reStructuredText block and reference syntax.
+    #[serde(rename = "restructured_text")]
     RestructuredText,
     /// Plain text paragraphs.
+    #[serde(rename = "text")]
     Text,
     /// Selected markdown and code cells from a notebook.
+    #[serde(rename = "notebook")]
     Notebook,
     /// Documentation attached by a syntax provider.
+    #[serde(rename = "attached_comment")]
     AttachedComment,
 }
 impl core::fmt::Display for DocumentationSourceFormat {
@@ -1648,7 +2000,7 @@ impl<'de> serde::Deserialize<'de> for DocumentationSourceFormat {
     }
 }
 /// The selected source's canonical address.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum DocumentationSourceIdentity {
     /// A visible workspace file.
@@ -1792,7 +2144,7 @@ impl<'de> serde::Deserialize<'de> for DocumentationWarningKind {
     }
 }
 /// A selected cell addressed within its parent notebook.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct NotebookCell {
     /// The authored cell identifier or its position when no identifier exists.
@@ -1801,7 +2153,7 @@ pub struct NotebookCell {
     pub kind: NotebookCellKind,
 }
 /// The authored cell identifier or its position when no identifier exists.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum NotebookCellIdentity {
     /// A valid identifier stored in the notebook.
@@ -1827,12 +2179,14 @@ impl NotebookCellIdentity {
     }
 }
 /// The selected notebook cell's content kind.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum NotebookCellKind {
     /// Markdown source decoded from a markdown cell.
+    #[serde(rename = "markdown")]
     #[default]
     Markdown,
     /// Source decoded from a code cell, without execution.
+    #[serde(rename = "code")]
     Code,
 }
 impl core::fmt::Display for NotebookCellKind {
@@ -1864,42 +2218,582 @@ impl<'de> serde::Deserialize<'de> for NotebookCellKind {
 /// fails the read that touches them with `content_unavailable`.
 pub type ProjectPath = String;
 /// One documentation block returned by search.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(default)]
 pub struct PackageDocumentationHit {
     #[default("documentation".to_string())]
     pub target: String,
     /// One package as its package manager identifies it.
+    #[validate(nested)]
     pub package: PackageIdentity,
     /// One documentation block projected from its existing content owner.
+    #[validate(nested)]
     pub documentation: DocumentationHit,
     /// Fields that contributed to ranking.
+    #[validate(length(min = 1u64, max = 16u64))]
     pub contributing_fields: Vec<PackageDocumentationHitContributingField>,
     /// The block source excerpt when requested, bounded across the response page.
+    #[validate(length(max = 16_384u64))]
     pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
+/// One search hit. Its file, node, symbol, or commit payload carries the canonical identity.
+/// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchHit {
+    /// How one declaration differs between the two compared revisions, and where it lives on
+    /// each side.
+    #[validate(nested)]
+    pub change: Option<SymbolChange>,
+    /// Number of edges in `traversal_path`. It is present exactly when `traversal_path` is
+    /// present and equals its length.
+    #[validate(range(min = 1, max = 2))]
+    pub distance: Option<u64>,
+    /// What a search hit is. Tagged, so the payload correlation survives code generation.
+    pub hit: SearchHitTarget,
+    /// The 1-based source line where the hit begins, or absent with `range`.
+    #[validate(range(min = 1))]
+    pub line: Option<u64>,
+    /// Which indexed fields produced the match. Absent when empty.
+    #[default(Some(Default::default()))]
+    pub matched_by: Option<Vec<MatchedField>>,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    #[validate(
+        length(max = 1_000u64),
+        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
+    )]
+    pub path: Option<String>,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    #[validate(nested)]
+    pub range: Option<TextRange>,
+    /// The ranking value attached to this hit and used to merge duplicate hits.
+    /// Exact original identifier spelling ranks before this value under `relevance`.
+    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// and nowhere else.
+    pub score: Option<f64>,
+    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// hit's `range`; a caller that needs the range already has it there.
+    pub source: Option<String>,
+    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// including a hit also matched lexically.
+    #[validate(length(min = 1u64, max = 2u64), nested)]
+    pub traversal_path: Option<Vec<GraphHop>>,
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 17u64, max = 8_192u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
+    )]
+    pub unit: Option<String>,
+}
+/// A bounded relationship walk starting at one symbol.
+///
+/// From `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,
+/// following `direction` and narrowed to `facets`; each reached symbol keeps the shortest
+/// path the walk found to it.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchTraversal {
+    /// Hops the walk may take from `seed`. The server accepts 1 or 2. Omitted, 1.
+    #[validate(range(min = 1, max = 2))]
+    #[default(Some(1u64))]
+    pub depth: Option<u64>,
+    /// Which edge direction a search traversal walks from each visited symbol. A language
+    /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
+    /// `outgoing`.
+    pub direction: Option<TraversalDirection>,
+    /// Portable relationship facets eligible for the walk. Omitted or empty, every facet is
+    /// eligible.
+    #[validate(length(max = 29u64))]
+    pub facets: Option<Vec<RelationshipFacet>>,
+    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
+    pub seed: Option<String>,
+    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
+    pub to: Option<String>,
+}
+/// How one declaration differs between the two compared revisions, and where it lives on
+/// each side.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolChange {
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    #[validate(
+        length(max = 1_000u64),
+        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
+    )]
+    pub base_path: Option<String>,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    #[validate(
+        length(max = 1_000u64),
+        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
+    )]
+    pub head_path: Option<String>,
+    /// What the revision did to the symbol.
+    pub kind: SymbolVersionKind,
+}
+/// What a search hit is. Tagged, so the payload correlation survives code generation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum SearchHitTarget {
+    /// A documentation block projected from an existing text or symbol document.
+    #[default]
+    DocumentationHit(SearchHitTargetDocumentationHit),
+    /// A symbol hit: the declaration a provider resolved.
+    Symbol(SearchHitTargetSymbol),
+    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
+    NodeId(SearchHitTargetNodeId),
+    /// A file hit: one entry of the tree, whether or not any provider reads it.
+    Object(SearchHitTargetObject),
+    /// A commit hit: one commit the history store holds, matched by its message.
+    CommitHit(SearchHitTargetCommitHit),
+}
+impl SearchHitTarget {
+    /// A documentation block projected from an existing text or symbol document.
+    pub fn documentation(documentation: DocumentationHit) -> Self {
+        Self::DocumentationHit(SearchHitTargetDocumentationHit {
+            documentation,
+            ..Default::default()
+        })
+    }
+    /// A symbol hit: the declaration a provider resolved.
+    pub fn symbol(symbol: Symbol) -> Self {
+        Self::Symbol(SearchHitTargetSymbol {
+            symbol,
+            ..Default::default()
+        })
+    }
+    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
+    pub fn node_id(node: String) -> Self {
+        Self::NodeId(SearchHitTargetNodeId {
+            node,
+            ..Default::default()
+        })
+    }
+    /// A file hit: one entry of the tree, whether or not any provider reads it.
+    pub fn object(size: u64) -> Self {
+        Self::Object(SearchHitTargetObject {
+            size,
+            ..Default::default()
+        })
+    }
+    /// A commit hit: one commit the history store holds, matched by its message.
+    pub fn commit(commit: CommitHit) -> Self {
+        Self::CommitHit(SearchHitTargetCommitHit {
+            commit,
+            ..Default::default()
+        })
+    }
+}
+/// Which indexed field produced a search hit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum MatchedField {
+    /// A declaration's name, qualified name, or a term derived from them matched.
+    #[serde(rename = "name")]
+    #[default]
+    Name,
+    /// A rendered signature matched.
+    #[serde(rename = "signature")]
+    Signature,
+    /// An attached doc comment matched.
+    #[serde(rename = "documentation")]
+    Documentation,
+    /// The file's contents matched.
+    #[serde(rename = "content")]
+    Content,
+    /// The vector ranking placed the hit, and no indexed field carries the query's
+    /// literal bytes. A hit any other ranking placed names the field that carried it
+    /// instead.
+    #[serde(rename = "ranked")]
+    Ranked,
+    /// The project-relative path matched.
+    #[serde(rename = "path")]
+    Path,
+    /// A relationship traversal reached the hit.
+    #[serde(rename = "relationship")]
+    Relationship,
+    /// A comparison `change` named found the declaration changed.
+    #[serde(rename = "change")]
+    Change,
+}
+impl core::fmt::Display for MatchedField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Name => write!(f, "name"),
+            Self::Signature => write!(f, "signature"),
+            Self::Documentation => write!(f, "documentation"),
+            Self::Content => write!(f, "content"),
+            Self::Ranked => write!(f, "ranked"),
+            Self::Path => write!(f, "path"),
+            Self::Relationship => write!(f, "relationship"),
+            Self::Change => write!(f, "change"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for MatchedField {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "name" => Ok(MatchedField::Name),
+            "signature" => Ok(MatchedField::Signature),
+            "documentation" => Ok(MatchedField::Documentation),
+            "content" => Ok(MatchedField::Content),
+            "ranked" => Ok(MatchedField::Ranked),
+            "path" => Ok(MatchedField::Path),
+            "relationship" => Ok(MatchedField::Relationship),
+            "change" => Ok(MatchedField::Change),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "name",
+                            "signature",
+                            "documentation",
+                            "content",
+                            "ranked",
+                            "path",
+                            "relationship",
+                            "change",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// One auditable step in a search traversal. `relationship` retains source-node evidence and
+/// derivation; `direction` records how the walk followed it.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct GraphHop {
+    /// How one path step followed its directed relationship.
+    pub direction: HopDirection,
+    /// One directed edge between two symbols. Its evidence is the nodes it was read from, and
+    /// its derivation is how much the provider knew when it was read.
+    #[validate(nested)]
+    pub relationship: Relationship,
+}
+/// Which edge direction a search traversal walks from each visited symbol. A language
+/// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
+/// `outgoing`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum TraversalDirection {
+    /// Walks edges arriving at each visited symbol: the references a language engine
+    /// resolves to it, each hop carrying the `references` facet.
+    #[serde(rename = "incoming")]
+    #[default]
+    Incoming,
+    /// Walks edges leaving each visited symbol: the calls a language engine's call
+    /// hierarchy names for it, each hop carrying the `calls` facet.
+    #[serde(rename = "outgoing")]
+    Outgoing,
+}
+impl core::fmt::Display for TraversalDirection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Incoming => write!(f, "incoming"),
+            Self::Outgoing => write!(f, "outgoing"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for TraversalDirection {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "incoming" => Ok(TraversalDirection::Incoming),
+            "outgoing" => Ok(TraversalDirection::Outgoing),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["incoming", "outgoing"])),
+        }
+    }
+}
+/// One commit whose message matched a commit search, as the history store holds it.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct CommitHit {
+    /// The author one revision records, as committed: no `.mailmap` rewrites the name or the
+    /// address.
+    #[validate(nested)]
+    pub author: CommitAuthor,
+    /// The commit message, cut at `COMMIT_MESSAGE_BYTES_MAX` bytes on a character boundary.
+    #[validate(length(max = 4_096u64))]
+    pub message: String,
+    /// Whether the message ran past `COMMIT_MESSAGE_BYTES_MAX` bytes, so `message` holds
+    /// its first bytes alone.
+    pub message_truncated: bool,
+    /// The paths the commit changed against the commit it was compared with, in path order,
+    /// at most `COMMIT_PATHS_MAX`. A path `[source]` leaves out of the index, or a lockfile
+    /// `[search.text] excluded_lockfiles` names, is not listed.
+    #[validate(length(max = 32u64))]
+    pub paths: Vec<String>,
+    /// Whether the commit changed more paths than `paths` lists.
+    pub paths_truncated: bool,
+    /// Identity of one revision in the workspace's version-control history, spelled the way the
+    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
+    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
+    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
+    /// their identifiers.
+    #[validate(
+        length(min = 1u64, max = 128u64),
+        regex(path = "REGEX_COMMIT_HIT_REVISION")
+    )]
+    pub revision: String,
+    /// When the commit was committed, as RFC 3339 date-time carrying the recorded offset:
+    /// the committer time, not the author time.
+    #[validate(length(max = 64u64))]
+    pub timestamp: String,
+}
+/// How one path step followed its directed relationship.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum HopDirection {
+    /// The walk followed the edge from source to target.
+    #[serde(rename = "outgoing")]
+    #[default]
+    Outgoing,
+    /// The walk followed the edge against its direction, from target to source.
+    #[serde(rename = "incoming")]
+    Incoming,
+}
+impl core::fmt::Display for HopDirection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Outgoing => write!(f, "outgoing"),
+            Self::Incoming => write!(f, "incoming"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for HopDirection {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "outgoing" => Ok(HopDirection::Outgoing),
+            "incoming" => Ok(HopDirection::Incoming),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["outgoing", "incoming"])),
+        }
+    }
+}
+/// One directed edge between two symbols. Its evidence is the nodes it was read from, and
+/// its derivation is how much the provider knew when it was read.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct Relationship {
+    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
+    pub from: String,
+    /// A provider-local kind preserving the construct name used by that language implementation.
+    #[validate(length(min = 1u64), regex(path = "REGEX_SYMBOL_KIND"))]
+    pub kind: String,
+    /// Portable classification, so a query for `imports` finds local kinds such as `import`
+    /// and `use` alike.
+    #[validate(length(min = 1u64))]
+    pub facets: Vec<RelationshipFacet>,
+    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_SYMBOL_CONTAINER")
+    )]
+    pub to: String,
+    /// The nodes this edge was read from. Absent when empty.
+    #[default(Some(Default::default()))]
+    pub evidence: Option<Vec<String>>,
+    /// One byte range in a source-catalog unit.
+    #[validate(nested)]
+    pub occurrence: Option<SourceUnitSpan>,
+    /// How this edge was established. Every edge reaches Rift from a provider, and this field
+    /// records whether the provider resolved the edge semantically, read it from syntax, or
+    /// inferred it.
+    pub derivation: RelationshipDerivation,
+    /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
+    /// derivation.
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub confidence: Option<f64>,
+    /// Facts a provider carries that the model has no field for, under a reverse-domain key.
+    /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
+    /// implement.
+    pub extensions: Option<serde_json::Value>,
+}
+/// How this edge was established. Every edge reaches Rift from a provider, and this field
+/// records whether the provider resolved the edge semantically, read it from syntax, or
+/// inferred it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum RelationshipDerivation {
+    /// The provider resolved the edge semantically, so a consumer may act on it directly.
+    #[serde(rename = "resolution")]
+    #[default]
+    Resolution,
+    /// The edge was read from syntax alone, without semantic resolution.
+    #[serde(rename = "syntax")]
+    Syntax,
+    /// The edge is a guess, qualified by `confidence`.
+    #[serde(rename = "heuristic")]
+    Heuristic,
+}
+impl core::fmt::Display for RelationshipDerivation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Resolution => write!(f, "resolution"),
+            Self::Syntax => write!(f, "syntax"),
+            Self::Heuristic => write!(f, "heuristic"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for RelationshipDerivation {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "resolution" => Ok(RelationshipDerivation::Resolution),
+            "syntax" => Ok(RelationshipDerivation::Syntax),
+            "heuristic" => Ok(RelationshipDerivation::Heuristic),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &["resolution", "syntax", "heuristic"],
+                    ),
+                )
+            }
+        }
+    }
+}
 /// One symbol or documentation result.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
 pub enum PackageSearchItem {
-    /// One public package declaration returned by search.
     #[default]
-    Search(PackageSearchHit),
-    /// One documentation block returned by search.
-    Documentation(PackageDocumentationHit),
+    Variant0(PackageSearchItemVariant0),
+    Variant1(PackageSearchItemVariant1),
+    Variant2(PackageSearchItemVariant2),
+}
+impl PackageSearchItem {
+    pub fn variant2(hit: PackageSearchItemVariant2Hit) -> Self {
+        Self::Variant2(PackageSearchItemVariant2 {
+            hit,
+            ..Default::default()
+        })
+    }
 }
 /// Full lowercase SHA-256 digest for documentation content and identity.
 pub type DocumentationDigest = String;
 /// One exact runtime or compiler release.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeIdentity {
     /// Canonical runtime or compiler name.
+    #[validate(length(min = 1u64, max = 128u64))]
     pub runtime: String,
     /// Exact runtime or compiler version.
+    #[validate(length(min = 1u64, max = 4_096u64))]
     pub version: String,
 }
 /// The immutable serving view and the expiry promised by its owner.
@@ -1913,6 +2807,26 @@ pub struct CapturedView {
 }
 /// A service-issued key for one immutable view in one serving context.
 pub type CapturedViewId = String;
+/// The author one revision records, as committed: no `.mailmap` rewrites the name or the
+/// address.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct CommitAuthor {
+    /// The author's email address.
+    #[validate(length(min = 1u64))]
+    pub email: String,
+    /// The author's name.
+    #[validate(length(min = 1u64))]
+    pub name: String,
+}
 /// One submitted source position and its exact declaration outcome.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(untagged)]
@@ -1956,13 +2870,13 @@ pub struct FindDeclarationsParams {
     /// their identifiers.
     #[validate(
         length(min = 1u64, max = 128u64),
-        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_REV")
+        regex(path = "REGEX_COMMIT_HIT_REVISION")
     )]
     pub rev: Option<String>,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_VIEW")
+        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
     )]
     pub view: Option<String>,
 }
@@ -2001,19 +2915,19 @@ pub struct GetSourceParams {
     /// their identifiers.
     #[validate(
         length(min = 1u64, max = 128u64),
-        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_REV")
+        regex(path = "REGEX_COMMIT_HIT_REVISION")
     )]
     pub rev: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
-        regex(path = "REGEX_GET_SOURCE_PARAMS_UNIT")
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: String,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_VIEW")
+        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
     )]
     pub view: Option<String>,
 }
@@ -2560,66 +3474,95 @@ impl ReadWarning {
 }
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
 /// the `imports` facet, which lets one query cross languages.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum RelationshipFacet {
     /// The source contains the target within its scope.
+    #[serde(rename = "contains")]
     #[default]
     Contains,
     /// The source declares the target.
+    #[serde(rename = "declares")]
     Declares,
     /// The source adds to a declaration made elsewhere.
+    #[serde(rename = "augments")]
     Augments,
     /// The source mentions the target.
+    #[serde(rename = "references")]
     References,
     /// The source invokes the target.
+    #[serde(rename = "calls")]
     Calls,
     /// The source creates an instance of the target.
+    #[serde(rename = "constructs")]
     Constructs,
     /// The source reads the target's value.
+    #[serde(rename = "reads")]
     Reads,
     /// The source assigns to the target.
+    #[serde(rename = "writes")]
     Writes,
     /// The source brings the target into scope.
+    #[serde(rename = "imports")]
     Imports,
     /// The source exposes the target outside its unit.
+    #[serde(rename = "exports")]
     Exports,
     /// The source inherits from the target.
+    #[serde(rename = "extends")]
     Extends,
     /// The source fulfils the target's interface.
+    #[serde(rename = "implements")]
     Implements,
     /// The source is typed by the target.
+    #[serde(rename = "has_type")]
     HasType,
     /// The source replaces the target inherited from a supertype.
+    #[serde(rename = "overrides")]
     Overrides,
     /// The source is another name for the target.
+    #[serde(rename = "aliases")]
     Aliases,
     /// The source produces the target as generated code.
+    #[serde(rename = "generates")]
     Generates,
     /// The source requires the target to build or run.
+    #[serde(rename = "depends_on")]
     DependsOn,
     /// The source carries the target as an annotation.
+    #[serde(rename = "annotated_by")]
     AnnotatedBy,
     /// The source can raise the target.
+    #[serde(rename = "throws")]
     Throws,
     /// The source handles the target when raised.
+    #[serde(rename = "catches")]
     Catches,
     /// The source's type parameter is constrained by the target.
+    #[serde(rename = "bounded_by")]
     BoundedBy,
     /// The source applies concrete arguments to the generic target.
+    #[serde(rename = "instantiates")]
     Instantiates,
     /// The source is a specialization of the generic target.
+    #[serde(rename = "specializes")]
     Specializes,
     /// The source and target are separately dispatched forms of one name.
+    #[serde(rename = "overloads")]
     Overloads,
     /// The source incorporates the target as a mixin.
+    #[serde(rename = "mixes_in")]
     MixesIn,
     /// The source embeds the target within its own definition.
+    #[serde(rename = "embeds")]
     Embeds,
     /// The source exercises the target as a test.
+    #[serde(rename = "tests")]
     Tests,
     /// The source supplies configuration for the target.
+    #[serde(rename = "configures")]
     Configures,
     /// The source binds a name or value to the target.
+    #[serde(rename = "binds")]
     Binds,
 }
 impl core::fmt::Display for RelationshipFacet {
@@ -2772,12 +3715,20 @@ pub struct SourcePosition {
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
-        regex(path = "REGEX_GET_SOURCE_PARAMS_UNIT")
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: String,
 }
 /// One byte range in a source-catalog unit.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields)]
 pub struct SourceUnitSpan {
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -2785,8 +3736,13 @@ pub struct SourceUnitSpan {
     /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
+    #[validate(nested)]
     pub range: TextRange,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 17u64, max = 8_192u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
+    )]
     pub unit: String,
 }
 /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
@@ -2849,6 +3805,72 @@ impl<'de> serde::Deserialize<'de> for SymbolUnavailableReason {
                             "insufficient_coverage",
                             "view_expired",
                             "view_context",
+                        ],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// What the revision did to the symbol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum SymbolVersionKind {
+    /// The revision brought the symbol into existence.
+    #[serde(rename = "introduced")]
+    #[default]
+    Introduced,
+    /// The revision changed the implementation without touching the signature.
+    #[serde(rename = "body_changed")]
+    BodyChanged,
+    /// The revision changed the declared interface.
+    #[serde(rename = "signature_changed")]
+    SignatureChanged,
+    /// The revision relocated the declaration to another path.
+    #[serde(rename = "moved")]
+    Moved,
+    /// The revision deleted the declaration.
+    #[serde(rename = "removed")]
+    Removed,
+    /// The revision changed the annotations on the declaration.
+    #[serde(rename = "decorators_changed")]
+    DecoratorsChanged,
+}
+impl core::fmt::Display for SymbolVersionKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Introduced => write!(f, "introduced"),
+            Self::BodyChanged => write!(f, "body_changed"),
+            Self::SignatureChanged => write!(f, "signature_changed"),
+            Self::Moved => write!(f, "moved"),
+            Self::Removed => write!(f, "removed"),
+            Self::DecoratorsChanged => write!(f, "decorators_changed"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for SymbolVersionKind {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "introduced" => Ok(SymbolVersionKind::Introduced),
+            "body_changed" => Ok(SymbolVersionKind::BodyChanged),
+            "signature_changed" => Ok(SymbolVersionKind::SignatureChanged),
+            "moved" => Ok(SymbolVersionKind::Moved),
+            "removed" => Ok(SymbolVersionKind::Removed),
+            "decorators_changed" => Ok(SymbolVersionKind::DecoratorsChanged),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &[
+                            "introduced",
+                            "body_changed",
+                            "signature_changed",
+                            "moved",
+                            "removed",
+                            "decorators_changed",
                         ],
                     ),
                 )
@@ -3986,14 +5008,20 @@ impl<'de> serde::Deserialize<'de> for PackageSearchRequestTarget {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageSearchHitContributingField {
+    #[serde(rename = "name")]
     #[default]
     Name,
+    #[serde(rename = "qualified_name")]
     QualifiedName,
+    #[serde(rename = "documentation")]
     Documentation,
+    #[serde(rename = "signature")]
     Signature,
+    #[serde(rename = "file_content")]
     FileContent,
+    #[serde(rename = "unknown")]
     Unknown,
 }
 impl core::fmt::Display for PackageSearchHitContributingField {
@@ -4055,7 +5083,15 @@ impl<'de> serde::Deserialize<'de> for PackageSymbolRequestInclude {
     }
 }
 /// A visible workspace file.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentityProjectPath {
     #[default("project".to_string())]
@@ -4066,40 +5102,77 @@ pub struct DocumentationSourceIdentityProjectPath {
     /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
     /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
     /// fails the read that touches them with `content_unavailable`.
+    #[validate(
+        length(max = 1_000u64),
+        regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
+    )]
     pub path: String,
 }
 /// A source unit supplied by an exact package adapter.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentitySourceUnitId {
     #[default("package".to_string())]
     pub kind: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 17u64, max = 8_192u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
+    )]
     pub unit: String,
 }
 /// A valid identifier stored in the notebook.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject {
     /// Identifier accepted by the notebook format.
+    #[validate(length(min = 1u64))]
     pub id: String,
     #[default("authored".to_string())]
     pub kind: String,
 }
 /// The cell's zero-based position in its notebook.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject2 {
     /// Position among every cell, including unselected cells.
+    #[validate(range(min = 0))]
     pub index: u32,
     #[default("indexed".to_string())]
     pub kind: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageDocumentationHitContributingField {
+    #[serde(rename = "documentation")]
     #[default]
     Documentation,
+    #[serde(rename = "content")]
     Content,
+    #[serde(rename = "unknown")]
     Unknown,
 }
 impl core::fmt::Display for PackageDocumentationHitContributingField {
@@ -4126,6 +5199,200 @@ impl<'de> serde::Deserialize<'de> for PackageDocumentationHitContributingField {
             _ => Ok(PackageDocumentationHitContributingField::Unknown),
         }
     }
+}
+/// A documentation block projected from an existing text or symbol document.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchHitTargetDocumentationHit {
+    /// One documentation block projected from its existing content owner.
+    #[validate(nested)]
+    pub documentation: DocumentationHit,
+    #[default("documentation".to_string())]
+    pub target: String,
+}
+/// A symbol hit: the declaration a provider resolved.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchHitTargetSymbol {
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// and is connected through Relationship.
+    #[validate(nested)]
+    pub symbol: Symbol,
+    #[default("symbol".to_string())]
+    pub target: String,
+}
+/// A node hit: one place in a syntax tree, without its enclosing symbol record.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchHitTargetNodeId {
+    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
+    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
+    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
+    /// revision the response names.
+    #[validate(
+        length(min = 27u64, max = 8_192u64),
+        regex(path = "REGEX_PARAMETER_NODE")
+    )]
+    pub node: String,
+    #[default("node".to_string())]
+    pub target: String,
+}
+/// A file hit: one entry of the tree, whether or not any provider reads it.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchHitTargetObject {
+    /// Distinct `Language` values that read this file, sorted by name and dialect.
+    /// Absent when empty.
+    #[default(Some(Default::default()))]
+    pub languages: Option<Vec<String>>,
+    /// Size in bytes.
+    #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub size: u64,
+    #[default("file".to_string())]
+    pub target: String,
+}
+/// A commit hit: one commit the history store holds, matched by its message.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchHitTargetCommitHit {
+    /// One commit whose message matched a commit search, as the history store holds it.
+    #[validate(nested)]
+    pub commit: CommitHit,
+    #[default("commit".to_string())]
+    pub target: String,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackageSearchItemVariant0 {
+    /// One package as its package manager identifies it.
+    pub package: PackageIdentity,
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// and is connected through Relationship.
+    pub symbol: Symbol,
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    pub unit: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// One-based source line containing the declaration.
+    pub line: i64,
+    /// Fields that contributed to ranking. `file_content` names a match inside the declaration, which the file's text holds.
+    pub contributing_fields: Vec<PackageSearchHitContributingField>,
+    /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
+    pub match_class: IdentifierMatchClass,
+    /// Optional declaration source excerpt.
+    pub source: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(default)]
+pub struct PackageSearchItemVariant1 {
+    #[default("documentation".to_string())]
+    pub target: String,
+    /// One package as its package manager identifies it.
+    pub package: PackageIdentity,
+    /// One documentation block projected from its existing content owner.
+    pub documentation: DocumentationHit,
+    /// Fields that contributed to ranking.
+    pub contributing_fields: Vec<PackageDocumentationHitContributingField>,
+    /// The block source excerpt when requested, bounded across the response page.
+    pub source: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(default)]
+pub struct PackageSearchItemVariant2Hit {
+    #[default(Some("symbol".to_string()))]
+    pub target: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct PackageSearchItemVariant2 {
+    /// How one declaration differs between the two compared revisions, and where it lives on
+    /// each side.
+    pub change: Option<SymbolChange>,
+    /// Number of edges in `traversal_path`. It is present exactly when `traversal_path` is
+    /// present and equals its length.
+    pub distance: Option<u64>,
+    pub hit: PackageSearchItemVariant2Hit,
+    /// The 1-based source line where the hit begins, or absent with `range`.
+    pub line: Option<u64>,
+    /// Which indexed fields produced the match. Absent when empty.
+    #[default(Some(Default::default()))]
+    pub matched_by: Option<Vec<MatchedField>>,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    pub path: Option<String>,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: Option<TextRange>,
+    /// The ranking value attached to this hit and used to merge duplicate hits.
+    /// Exact original identifier spelling ranks before this value under `relevance`.
+    /// Present on the wire when `include` names `score`; comparable within one answer
+    /// and nowhere else.
+    pub score: Option<f64>,
+    /// The source text around the hit, requested with `include: ["source"]`. Covers the
+    /// hit's `range`; a caller that needs the range already has it there.
+    pub source: Option<String>,
+    /// Shortest relationship path to this hit, present when a traversal reached it,
+    /// including a hit also matched lexically.
+    pub traversal_path: Option<Vec<GraphHop>>,
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    pub unit: Option<String>,
 }
 /// An established declaration holds this exact position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]

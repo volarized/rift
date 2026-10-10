@@ -726,6 +726,8 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<SymbolId>();
     let _ = generator.subschema_for::<DocumentationHit>();
     let _ = generator.subschema_for::<DocumentationContext>();
+    let _ = generator.subschema_for::<rift_protocol::read::SearchHit>();
+    let _ = generator.subschema_for::<rift_protocol::read::SearchTraversal>();
     let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();

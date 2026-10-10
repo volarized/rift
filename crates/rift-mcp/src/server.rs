@@ -2686,7 +2686,7 @@ impl RiftMcp {
             rift_cloud_client::GlobalClient,
             Vec<rift_cloud_client::PackageIdentity>,
         ) -> Answer,
-        Answer: std::future::Future<Output = Result<T, rift_cloud_client::ClientError>>,
+        Answer: std::future::Future<Output = Result<T, RiftError>>,
     {
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
@@ -2695,7 +2695,7 @@ impl RiftMcp {
         .await
         {
             Ok(route) => route,
-            Err(_) => self.global.deadline_exceeded(read_context),
+            Err(source) => self.global.deadline_exceeded(read_context, source),
         };
         let (Some(client), false) = (route.client.clone(), route.remote_packages.is_empty()) else {
             return (route, T::default());
@@ -2708,8 +2708,14 @@ impl RiftMcp {
                     route.discard_remote(&error);
                     T::default()
                 }
-                Err(_) => {
-                    route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+                Err(source) => {
+                    route.discard_remote(
+                        &errors::client::request_failed()
+                            .operation("global read")
+                            .reason("global request deadline elapsed")
+                            .source(source)
+                            .error(),
+                    );
                     T::default()
                 }
             };
@@ -2873,7 +2879,7 @@ impl RiftMcp {
         .await
         {
             Ok(route) => route,
-            Err(_) => self.global.deadline_exceeded(&read_context),
+            Err(source) => self.global.deadline_exceeded(&read_context, source),
         };
         let Some(client) = route.client.clone() else {
             references.drop_package_callees();
@@ -2890,8 +2896,14 @@ impl RiftMcp {
                 route.discard_remote(&error);
                 references.drop_package_callees();
             }
-            Err(_) => {
-                route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+            Err(source) => {
+                route.discard_remote(
+                    &errors::client::request_failed()
+                        .operation("callee declarations")
+                        .reason("global request deadline elapsed")
+                        .source(source)
+                        .error(),
+                );
                 references.drop_package_callees();
             }
         }

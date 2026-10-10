@@ -542,7 +542,11 @@ fn page(items: &[Value], warnings: &Value) -> Value {
         "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
         "corpus_revision": "corpus-v1",
-        "documentation_revision": "0123abcd"
+        "documentation_revision": "0123abcd",
+        "view": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expires_at": "2026-10-10T10:05:00Z"
+        }
     })
 }
 

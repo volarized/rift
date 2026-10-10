@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use percent_encoding::percent_decode_str;
 use rift_cloud_client::{
-    ClientError, Config, ConfigError, DECLARATION_POSITIONS_MAX, GlobalClient, PACKAGES_MAX,
+    Config, DECLARATION_POSITIONS_MAX, GlobalClient, PACKAGES_MAX,
     PackageAvailability as WireAvailability, PackageContextEntry as WireContextEntry,
     PackageDeclarationRequestPositionEncoding, PackageIdentity as WirePackageIdentity,
     PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
@@ -154,7 +154,7 @@ pub(crate) struct GlobalRoute {
     pub(crate) missing_requirements: Vec<PackageContextEntry>,
     substituted: Vec<SubstitutedEntry>,
     pub(crate) state: RouteState,
-    unadvertised_feature: Option<&'static str>,
+    unadvertised_feature: Option<String>,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 }
 
@@ -208,10 +208,20 @@ impl GlobalState {
 
     /// The route of a read whose enclosing MCP request deadline expired before the
     /// global API answered.
-    pub(crate) fn deadline_exceeded(&self, read: &ReadContext<'_>) -> GlobalRoute {
+    pub(crate) fn deadline_exceeded(
+        &self,
+        read: &ReadContext<'_>,
+        source: tokio::time::error::Elapsed,
+    ) -> GlobalRoute {
         let route = GlobalRoute::unanswered(
             &read.context,
-            failure_state(&ClientError::Deadline),
+            failure_state(
+                &errors::client::request_failed()
+                    .operation("global route")
+                    .reason("global request deadline elapsed")
+                    .source(source)
+                    .error(),
+            ),
             Arc::clone(&self.observation),
         );
         route.record_observation();
@@ -249,7 +259,7 @@ impl GlobalState {
         }
         let client = match self.client(configuration).await {
             Ok(client) => client,
-            Err(error) => return unanswered(failure_state(&ClientError::Config(error))),
+            Err(error) => return unanswered(failure_state(&error)),
         };
         if let Err(error) = client.get_capabilities().await {
             return unanswered(failure_state(&error));
@@ -315,7 +325,7 @@ impl GlobalState {
             Err(error) => {
                 return GlobalRoute::unanswered(
                     context,
-                    failure_state(&ClientError::Config(error)),
+                    failure_state(&error),
                     Arc::clone(&self.observation),
                 );
             }
@@ -365,7 +375,7 @@ impl GlobalState {
             Arc<DependencyContext>,
             Arc<PreparedPackageResolutionRequest>,
         ),
-        ClientError,
+        RiftError,
     > {
         let mut held = self.prepared_resolution.lock().await;
         if let Some(cached) = held.as_ref()
@@ -393,10 +403,7 @@ impl GlobalState {
         Ok((context, prepared))
     }
 
-    async fn client(
-        &self,
-        configuration: &GlobalConfiguration,
-    ) -> Result<GlobalClient, ConfigError> {
+    async fn client(&self, configuration: &GlobalConfiguration) -> Result<GlobalClient, RiftError> {
         let config = Config::try_from(configuration)?;
         let credential = std::env::var_os(&config.token_env);
         let mut held = self.client.lock().await;
@@ -421,7 +428,7 @@ pub(crate) async fn package_symbols(
     client: &GlobalClient,
     params: &GetSymbolParams,
     packages: &[WirePackageIdentity],
-) -> Result<GlobalSymbolCandidates, ClientError> {
+) -> Result<GlobalSymbolCandidates, RiftError> {
     let request = PackageSymbolRequest {
         name: params.name.clone(),
         language: params
@@ -493,13 +500,13 @@ impl CalleeDeclarations {
 ///
 /// # Errors
 ///
-/// Returns [`ClientError`] when a request fails; nothing the earlier requests named is
+/// Returns [`RiftError`] when a request fails; nothing the earlier requests named is
 /// kept.
 pub(crate) async fn callee_declarations(
     client: &GlobalClient,
     callees: &[PackageCallee],
     _served: &[WirePackageIdentity],
-) -> Result<CalleeDeclarations, ClientError> {
+) -> Result<CalleeDeclarations, RiftError> {
     use rift_protocol::source_read::DeclarationPositionResult;
     let mut named = HashMap::new();
     let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
@@ -514,7 +521,11 @@ pub(crate) async fn callee_declarations(
             .as_ref()
             .is_some_and(|view| next_view.is_some_and(|next| next != view))
         {
-            return Err(ClientError::InvalidResponseField { field: "view" });
+            return errors::client::response_invalid()
+                .operation("callee declarations")
+                .field("view")
+                .violation("declaration pages returned different captured views")
+                .fail();
         }
         if selected.is_none() {
             selected = next_view.cloned();
@@ -668,7 +679,7 @@ pub(crate) async fn package_search(
     params: &SearchParams,
     query: &ParsedQuery,
     packages: &[WirePackageIdentity],
-) -> Result<GlobalSearchCandidates, ClientError> {
+) -> Result<GlobalSearchCandidates, RiftError> {
     if params.target == rift_protocol::read::SearchParamsTarget::File {
         return Ok(GlobalSearchCandidates::default());
     }
@@ -726,7 +737,7 @@ pub(crate) async fn package_patterns(
     client: &GlobalClient,
     params: &SearchParams,
     packages: &[WirePackageIdentity],
-) -> Result<GlobalPatternMatches, ClientError> {
+) -> Result<GlobalPatternMatches, RiftError> {
     let Some(pattern) = params.pattern.clone() else {
         return Ok(GlobalPatternMatches::default());
     };
@@ -810,27 +821,31 @@ fn search_request(
     phase: QueryPhase,
 ) -> PackageSearchRequest {
     PackageSearchRequest {
-        query: query.source().to_owned(),
-        terms: query
-            .members()
-            .iter()
-            .map(|member| QueryTerm {
-                text: member.text().to_owned(),
-                phrase: member.is_phrase(),
-                prefix: phase == QueryPhase::Broad && !member.is_phrase(),
-            })
-            .collect(),
-        identifiers: query
-            .candidates()
-            .into_iter()
-            .map(|candidate| candidate.text().to_owned())
-            .collect(),
+        query: Some(query.source().to_owned()),
+        terms: Some(
+            query
+                .members()
+                .iter()
+                .map(|member| QueryTerm {
+                    text: member.text().to_owned(),
+                    phrase: member.is_phrase(),
+                    prefix: phase == QueryPhase::Broad && !member.is_phrase(),
+                })
+                .collect(),
+        ),
+        identifiers: Some(
+            query
+                .candidates()
+                .into_iter()
+                .map(|candidate| candidate.text().to_owned())
+                .collect(),
+        ),
         include: includes_source(params).then(|| vec!["source".to_owned()]),
         packages: Some(packages.to_vec()),
-        phase: match phase {
+        phase: Some(match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,
-        },
+        }),
         // A commit search is refused past the `local` scope before any global request, so
         // it never reaches this mapping.
         target: match params.target {
@@ -842,6 +857,8 @@ fn search_request(
             }
             rift_protocol::read::SearchParamsTarget::All => Some(PackageSearchRequestTarget::All),
         },
+        traversal: None,
+        view: None,
     }
 }
 
@@ -1294,11 +1311,15 @@ impl GlobalRoute {
     /// A lane the global API's capabilities do not advertise is no failure of the
     /// service: the resolution's own warnings stand, and the read warns
     /// `capability_unavailable` naming the feature.
-    pub(crate) fn discard_remote(&mut self, error: &ClientError) {
+    pub(crate) fn discard_remote(&mut self, error: &RiftError) {
         self.client = None;
         self.remote_packages.clear();
-        if let ClientError::FeatureUnavailable { feature } = error {
-            self.unadvertised_feature = Some(feature);
+        if error.slug().as_str() == "rift.client.configuration_invalid"
+            && client_field(error, "field") == Some("feature")
+            && let Some(feature) = client_field(error, "violation")
+                .and_then(|value| value.strip_prefix("global API does not advertise feature: "))
+        {
+            self.unadvertised_feature = Some(feature.to_owned());
             return;
         }
         self.missing_exact.clear();
@@ -1351,7 +1372,11 @@ impl GlobalRoute {
                 });
         self.state_warning()
             .into_iter()
-            .chain(self.unadvertised_feature.map(unadvertised_feature_warning))
+            .chain(
+                self.unadvertised_feature
+                    .as_deref()
+                    .map(unadvertised_feature_warning),
+            )
             .chain(
                 degraded
                     .chain(unavailable)
@@ -1368,7 +1393,11 @@ impl GlobalRoute {
     pub(crate) fn service_warnings(&self) -> Vec<ReadWarning> {
         self.state_warning()
             .into_iter()
-            .chain(self.unadvertised_feature.map(unadvertised_feature_warning))
+            .chain(
+                self.unadvertised_feature
+                    .as_deref()
+                    .map(unadvertised_feature_warning),
+            )
             .collect()
     }
 
@@ -1432,7 +1461,7 @@ impl GlobalRoute {
 
 /// The warning a read carries when the global API's capabilities do not advertise
 /// `feature`, which the read needs for its package facts.
-fn unadvertised_feature_warning(feature: &'static str) -> ReadWarning {
+fn unadvertised_feature_warning(feature: &str) -> ReadWarning {
     ReadWarning::GlobalPageWarning {
         warning_code: GlobalPageWarningCode::CapabilityUnavailable,
         detail: Some(format!(
@@ -1597,53 +1626,66 @@ fn protocol_package_identity(package: WirePackageIdentity) -> PackageIdentity {
     }
 }
 
-fn failure_state(error: &ClientError) -> RouteState {
-    let (kind, class) = match error {
-        ClientError::Disabled => return RouteState::Disabled,
-        ClientError::Config(ConfigError::InvalidTokenEnvironment | ConfigError::InvalidToken)
-        | ClientError::CredentialConfiguration => (
-            FailureKind::Api,
-            GlobalFailureClass::CredentialConfiguration,
-        ),
-        ClientError::Deadline | ClientError::Cancelled => {
-            (FailureKind::Api, GlobalFailureClass::Timeout)
+fn client_field<'a>(error: &'a RiftError, key: &str) -> Option<&'a str> {
+    error.fields().iter().find_map(|field| {
+        if field.key() != key {
+            return None;
         }
-        ClientError::Connection => (FailureKind::Api, GlobalFailureClass::Connection),
-        ClientError::ResponseBodyTooLarge { .. } => {
+        match field.value() {
+            rift_error::ErrorValue::Display(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+fn failure_state(error: &RiftError) -> RouteState {
+    let (kind, class) = match error.slug().as_str() {
+        "rift.client.configuration_invalid" => match client_field(error, "field") {
+            Some("enabled") => return RouteState::Disabled,
+            Some("feature") => (FailureKind::Response, GlobalFailureClass::InvalidResponse),
+            Some("token" | "token_env") => (
+                FailureKind::Api,
+                GlobalFailureClass::CredentialConfiguration,
+            ),
+            _ => (FailureKind::Api, GlobalFailureClass::InvalidResponse),
+        },
+        "rift.client.request_cancelled" => (FailureKind::Api, GlobalFailureClass::Timeout),
+        "rift.client.request_failed" => {
+            if client_field(error, "reason") == Some("global request deadline elapsed") {
+                (FailureKind::Api, GlobalFailureClass::Timeout)
+            } else {
+                (FailureKind::Api, GlobalFailureClass::Connection)
+            }
+        }
+        "rift.client.body_limit" if client_field(error, "direction") == Some("response") => {
             (FailureKind::Response, GlobalFailureClass::ResponseTruncated)
         }
-        ClientError::InvalidResponseField {
-            field: "publication_format",
-        } => (
-            FailureKind::Publication,
-            GlobalFailureClass::PublicationFormat,
-        ),
-        ClientError::InvalidResponseField {
-            field: "corpus_revision" | "revision",
-        } => (FailureKind::Publication, GlobalFailureClass::CorpusRevision),
-        ClientError::InvalidResponseField {
-            field: "required_search_fields",
-        } => (
-            FailureKind::Publication,
-            GlobalFailureClass::RequiredFieldSet,
-        ),
-        ClientError::Http { meta, .. } if matches!(meta.status, 401 | 403) => {
+        "rift.client.response_invalid" => match client_field(error, "field") {
+            Some("publication_format") => (
+                FailureKind::Publication,
+                GlobalFailureClass::PublicationFormat,
+            ),
+            Some("corpus_revision" | "revision") => {
+                (FailureKind::Publication, GlobalFailureClass::CorpusRevision)
+            }
+            Some("required_search_fields") => (
+                FailureKind::Publication,
+                GlobalFailureClass::RequiredFieldSet,
+            ),
+            _ => (FailureKind::Response, GlobalFailureClass::InvalidResponse),
+        },
+        "rift.client.remote_permission_denied" => {
             (FailureKind::Api, GlobalFailureClass::Authentication)
         }
-        ClientError::Http { meta, .. } if matches!(meta.status, 429 | 503 | 504) => {
+        "rift.client.remote_unavailable"
+            if matches!(client_field(error, "status"), Some("429" | "503" | "504")) =>
+        {
             (FailureKind::Api, GlobalFailureClass::RetryExhausted)
         }
-        ClientError::Http { .. } => (FailureKind::Api, GlobalFailureClass::NonSuccessResponse),
-        ClientError::Config(_) => (FailureKind::Api, GlobalFailureClass::InvalidResponse),
-        ClientError::RequestBodyTooLarge { .. }
-        | ClientError::FeatureUnavailable { .. }
-        | ClientError::InvalidMediaType { .. }
-        | ClientError::InvalidResponse { .. }
-        | ClientError::Decode { .. }
-        | ClientError::InvalidRequest { .. }
-        | ClientError::InvalidResponseField { .. } => {
-            (FailureKind::Response, GlobalFailureClass::InvalidResponse)
+        "rift.client.remote_failed" | "rift.client.remote_unavailable" => {
+            (FailureKind::Api, GlobalFailureClass::NonSuccessResponse)
         }
+        _ => (FailureKind::Response, GlobalFailureClass::InvalidResponse),
     };
     RouteState::Unavailable { kind, class }
 }
@@ -1657,8 +1699,8 @@ mod tests {
         DocumentIdentity, FailureKind, GlobalRoute, RouteState, SearchHit, SearchHitTarget,
         ServiceState, failure_state, page_window, search_hit_key, search_request,
     };
-    use rift_cloud_client::{ClientError, ResponseMeta};
     use rift_dependency::DependencyContext;
+    use rift_error::RiftError;
     use rift_error::errors;
     use rift_protocol::read::GlobalFailureClass;
     use rift_ranking::{ParsedQuery, QueryPhase};
@@ -1667,45 +1709,59 @@ mod tests {
     #[test]
     fn client_failures_map_to_bounded_warning_classes() {
         assert_eq!(
-            failure_state(&ClientError::Connection),
+            failure_state(
+                &errors::client::request_failed()
+                    .operation("global read")
+                    .reason("global connection failed")
+                    .error()
+            ),
             super::RouteState::Unavailable {
                 kind: FailureKind::Api,
                 class: GlobalFailureClass::Connection,
             }
         );
         assert_eq!(
-            failure_state(&ClientError::InvalidResponseField {
-                field: "publication_format",
-            }),
+            failure_state(
+                &errors::client::response_invalid()
+                    .operation("global read")
+                    .field("publication_format")
+                    .violation("field failed validation")
+                    .status(200u16)
+                    .error()
+            ),
             super::RouteState::Unavailable {
                 kind: FailureKind::Publication,
                 class: GlobalFailureClass::PublicationFormat,
             }
         );
         assert_eq!(
-            failure_state(&ClientError::Http {
-                meta: Box::new(ResponseMeta {
-                    status: 401,
-                    content_type: None,
-                    etag: None,
-                    cache_control: None,
-                    www_authenticate: None,
-                    retry_after: None,
-                    rate_limit_limit: None,
-                    rate_limit_remaining: None,
-                    rate_limit_reset: None,
-                }),
-                problem: None,
-            }),
+            failure_state(
+                &errors::client::remote_permission_denied()
+                    .operation("global read")
+                    .status(401u16)
+                    .metadata(
+                        serde_json::json!({
+                            "status": 401, "content_type": null, "etag": null,
+                            "cache_control": null, "www_authenticate": null,
+                            "retry_after": null, "rate_limit_limit": null,
+                            "rate_limit_remaining": null, "rate_limit_reset": null,
+                        })
+                        .to_string()
+                    )
+                    .error()
+            ),
             super::RouteState::Unavailable {
                 kind: FailureKind::Api,
                 class: GlobalFailureClass::Authentication,
             }
         );
         assert_eq!(
-            failure_state(&ClientError::FeatureUnavailable {
-                feature: "patterns"
-            }),
+            failure_state(
+                &errors::client::configuration_invalid()
+                    .field("feature")
+                    .violation("global API does not advertise feature: patterns")
+                    .error()
+            ),
             super::RouteState::Unavailable {
                 kind: FailureKind::Response,
                 class: GlobalFailureClass::InvalidResponse,
@@ -1722,11 +1778,19 @@ mod tests {
         .expect("search fixture is valid");
         let query = ParsedQuery::parse("load config").expect("query fixture is valid");
         let precise = search_request(&params, &query, &[], QueryPhase::Precise);
-        assert_eq!(precise.query, "load config");
-        assert_eq!(precise.terms[0].text, "load");
-        assert!(!precise.terms[0].prefix);
+        assert_eq!(precise.query.as_deref(), Some("load config"));
+        let terms = precise.terms.as_ref().expect("lexical terms retained");
+        assert_eq!(terms[0].text, "load");
+        assert!(!terms[0].prefix);
         let broad = search_request(&params, &query, &[], QueryPhase::Broad);
-        assert!(broad.terms.iter().all(|term| term.prefix));
+        assert!(
+            broad
+                .terms
+                .as_ref()
+                .expect("lexical terms retained")
+                .iter()
+                .all(|term| term.prefix)
+        );
         assert_eq!(broad.include, Some(vec!["source".to_owned()]));
     }
 
@@ -1982,7 +2046,7 @@ mod tests {
             commit_hit,
         ];
         let expected = [
-            "rift://symbol/rust/src/config.rs/load_config",
+            "rift://symbol/local/rust/app/config/load_config",
             unit_identity.as_str(),
             "src/lib.rs",
             "rift://node/rust/src/lib.rs@0-10#dcbef6dd",
@@ -2055,7 +2119,7 @@ mod tests {
             "rift://symbol/rust/src/config.rs/{}",
             "a".repeat(rift_ranking::IDENTITY_BYTES_MAX)
         );
-        let placed = "rift://symbol/rust/src/config.rs/load_config";
+        let placed = "rift://symbol/local/rust/app/config/load_config";
         let with_unit = |hit: SearchHit, unit: &str| SearchHit {
             unit: Some(SourceUnitId(unit.to_owned())),
             ..hit
@@ -2136,7 +2200,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_bounded_resolution_shares_context_and_prepared_request()
-    -> Result<(), rift_cloud_client::ClientError> {
+    -> Result<(), RiftError> {
         let context = context_with_path_dependencies(7);
         let state = super::GlobalState::default();
         let read = read_context(&context);
@@ -2173,7 +2237,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolution_request_cache_invalidates_on_limit_snapshot_and_requested_packages()
-    -> Result<(), rift_cloud_client::ClientError> {
+    -> Result<(), RiftError> {
         let (recorder, _drain) = ScopedRecorder::builder()
             .install()
             .expect("the default filter parses");
@@ -2269,7 +2333,7 @@ mod tests {
 
     #[tokio::test]
     async fn replacing_resolution_request_releases_the_previous_bounded_context_and_bytes()
-    -> Result<(), rift_cloud_client::ClientError> {
+    -> Result<(), RiftError> {
         let context = context_with_path_dependencies(7);
         let state = super::GlobalState::default();
         let (bounded, prepared) = state
@@ -2655,9 +2719,12 @@ mod tests {
             GlobalRoute::unanswered(&context, RouteState::Available, Arc::new(Mutex::new(None)));
         assert!(available.service_warnings().is_empty());
         let mut unadvertised = available;
-        unadvertised.discard_remote(&ClientError::FeatureUnavailable {
-            feature: "declarations",
-        });
+        unadvertised.discard_remote(
+            &errors::client::configuration_invalid()
+                .field("feature")
+                .violation("global API does not advertise feature: declarations")
+                .error(),
+        );
         let codes: Vec<String> = unadvertised
             .service_warnings()
             .iter()
@@ -2741,6 +2808,20 @@ mod tests {
         );
     }
 
+    fn package(
+        manager: &str,
+        registry: &str,
+        name: &str,
+        version: &str,
+    ) -> rift_protocol::read::PackageIdentity {
+        rift_protocol::read::PackageIdentity {
+            manager: manager.to_owned(),
+            registry: registry.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        }
+    }
+
     /// Each substitution the resolution names warns `package_substituted` after the absent
     /// packages: an exact version answered at another release, and a requirement answered
     /// outside its range. A requirement answered inside its range warns nothing, and a
@@ -2750,7 +2831,7 @@ mod tests {
         use rift_protocol::dependencies::{
             PackageAvailability, PackageContextEntry, PackageSelector,
         };
-        use rift_protocol::read::{PackageIdentity, ReadWarning};
+        use rift_protocol::read::ReadWarning;
 
         let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
             enabled: false,
@@ -2806,12 +2887,6 @@ mod tests {
                 "package_substituted"
             ]
         );
-        let package = |manager: &str, registry: &str, name: &str, version: &str| PackageIdentity {
-            manager: manager.to_owned(),
-            registry: registry.to_owned(),
-            name: name.to_owned(),
-            version: version.to_owned(),
-        };
         let substituted = |entry, served| ReadWarning::PackageSubstituted {
             entry,
             package: served,
@@ -2846,7 +2921,12 @@ mod tests {
             ]
         );
 
-        route.discard_remote(&ClientError::Connection);
+        route.discard_remote(
+            &errors::client::request_failed()
+                .operation("global read")
+                .reason("global connection failed")
+                .error(),
+        );
         assert_eq!(warning_codes(&route), ["global_api_unavailable"]);
     }
 
@@ -2878,9 +2958,12 @@ mod tests {
             Arc::new(Mutex::new(None)),
         );
 
-        route.discard_remote(&ClientError::FeatureUnavailable {
-            feature: "patterns",
-        });
+        route.discard_remote(
+            &errors::client::configuration_invalid()
+                .field("feature")
+                .violation("global API does not advertise feature: patterns")
+                .error(),
+        );
 
         assert!(route.client.is_none());
         assert!(route.remote_packages.is_empty());

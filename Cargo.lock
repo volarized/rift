@@ -4615,6 +4615,7 @@ dependencies = [
  "reqwest",
  "rift-analysis",
  "rift-core",
+ "rift-error",
  "rift-protocol",
  "rift-ranking",
  "rift-tracing",

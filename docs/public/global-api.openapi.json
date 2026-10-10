@@ -674,7 +674,11 @@
                       "analyzer_revision": "2026-09-22",
                       "corpus_revision": "2026-09-22",
                       "next_cursor": "eyJwYWdlIjoyfQ",
-                      "documentation_revision": "0123abcd"
+                      "documentation_revision": "0123abcd",
+                      "view": {
+                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "expires_at": "2026-10-10T10:05:00Z"
+                      }
                     }
                   },
                   "documentation": {
@@ -742,7 +746,11 @@
                       "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "2026-09-22",
                       "corpus_revision": "2026-09-22",
-                      "documentation_revision": "0123abcd"
+                      "documentation_revision": "0123abcd",
+                      "view": {
+                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "expires_at": "2026-10-10T10:05:00Z"
+                      }
                     }
                   }
                 }
@@ -2961,7 +2969,7 @@
       },
       "PackageSearchRequest": {
         "additionalProperties": false,
-        "description": "Structured package declaration search query.",
+        "description": "A lexical package declaration search or a bounded relationship walk.",
         "properties": {
           "query": {
             "description": "Original query text.",
@@ -3024,15 +3032,81 @@
               "documentation",
               "all"
             ]
+          },
+          "traversal": {
+            "description": "A bounded relationship walk from an explicit canonical seed.",
+            "$ref": "#/components/schemas/SearchTraversal"
+          },
+          "view": {
+            "description": "A view returned by a preceding read. Expiry never selects latest implicitly.",
+            "$ref": "#/components/schemas/CapturedViewId"
           }
         },
-        "required": [
-          "query",
-          "terms",
-          "identifiers",
-          "phase"
+        "type": "object",
+        "oneOf": [
+          {
+            "required": [
+              "query",
+              "terms",
+              "identifiers",
+              "phase"
+            ]
+          },
+          {
+            "required": [
+              "traversal"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "query"
+                  ]
+                },
+                {
+                  "required": [
+                    "terms"
+                  ]
+                },
+                {
+                  "required": [
+                    "identifiers"
+                  ]
+                },
+                {
+                  "required": [
+                    "phase"
+                  ]
+                }
+              ]
+            }
+          }
         ],
-        "type": "object"
+        "allOf": [
+          {
+            "properties": {
+              "traversal": {
+                "required": [
+                  "seed"
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "required": [
+                "traversal"
+              ]
+            },
+            "then": {
+              "properties": {
+                "target": {
+                  "const": "symbol"
+                }
+              }
+            }
+          }
+        ]
       },
       "IdentifierMatchClass": {
         "description": "Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.",
@@ -3106,7 +3180,7 @@
       },
       "PackageSearchPage": {
         "additionalProperties": true,
-        "description": "One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.",
+        "description": "One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.",
         "properties": {
           "items": {
             "description": "Ranked package declarations.",
@@ -3150,6 +3224,9 @@
             "maxLength": 8,
             "pattern": "^[0-9a-f]{8}$",
             "description": "Documentation revision used for this page."
+          },
+          "view": {
+            "$ref": "#/components/schemas/CapturedView"
           }
         },
         "required": [
@@ -3157,7 +3234,8 @@
           "warnings",
           "publication_format",
           "analyzer_revision",
-          "corpus_revision"
+          "corpus_revision",
+          "view"
         ],
         "type": "object"
       },
@@ -4186,14 +4264,542 @@
         ],
         "type": "object"
       },
+      "SearchHit": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "required": [
+                  "range",
+                  "line"
+                ]
+              },
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "range"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "line"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "if": {
+              "properties": {
+                "hit": {
+                  "properties": {
+                    "target": {
+                      "enum": [
+                        "node",
+                        "file"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "range",
+                "line"
+              ]
+            }
+          }
+        ],
+        "description": "One search hit. Its file, node, symbol, or commit payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/SymbolChange",
+            "description": "How the declaration differs between the two sides `change` named, present when the\ncomparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`, and\n`source` read the head side, except for a removed declaration, which keeps its\nbase-side identity, path, range, and source - the head side no longer holds it. A\nchange hit carries no `score`, since a comparison ranks nothing."
+          },
+          "distance": {
+            "description": "Number of edges in `traversal_path`. It is present exactly when `traversal_path` is\npresent and equals its length.",
+            "format": "uint64",
+            "maximum": 2,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "hit": {
+            "$ref": "#/components/schemas/SearchHitTarget",
+            "description": "What was found. A symbol, a node, a file, a documentation block, or a commit -\nwhichever `target` allowed."
+          },
+          "line": {
+            "description": "The 1-based source line where the hit begins, or absent with `range`.",
+            "format": "uint64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "matched_by": {
+            "default": [],
+            "description": "Which indexed fields produced the match. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/MatchedField"
+            },
+            "type": "array"
+          },
+          "path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Project-relative path of the hit, present for a project file hit and for a symbol\nhit whose declaration belongs to the project. A hit in a dependency or\nstandard-library file carries `unit` in its place."
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Byte range of the hit within `path` or `unit`. Absent for a symbol whose source is\nunavailable or synthetic."
+          },
+          "score": {
+            "description": "The ranking value attached to this hit and used to merge duplicate hits.\nExact original identifier spelling ranks before this value under `relevance`.\nPresent on the wire when `include` names `score`; comparable within one answer\nand nowhere else.",
+            "format": "double",
+            "type": "number"
+          },
+          "source": {
+            "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `range`; a caller that needs the range already has it there.",
+            "type": "string"
+          },
+          "traversal_path": {
+            "description": "Shortest relationship path to this hit, present when a traversal reached it,\nincluding a hit also matched lexically.",
+            "items": {
+              "$ref": "#/components/schemas/GraphHop"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "type": "array"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "Source-catalog unit of a hit in a dependency or standard-library file: a\ndeclaration, or a `pattern` match. A hit in a file carries exactly one of `path` and\n`unit`; a commit hit carries neither."
+          }
+        },
+        "required": [
+          "hit"
+        ],
+        "type": "object"
+      },
+      "SearchTraversal": {
+        "additionalProperties": false,
+        "description": "A bounded relationship walk starting at one symbol.\n\nFrom `seed`, the server visits its neighbors, then their neighbors, up to `depth` hops,\nfollowing `direction` and narrowed to `facets`; each reached symbol keeps the shortest\npath the walk found to it.",
+        "examples": [
+          {
+            "depth": 1,
+            "direction": "incoming",
+            "seed": "rift://symbol/local/rust/rift_server/read/ReadService"
+          }
+        ],
+        "properties": {
+          "depth": {
+            "default": 1,
+            "description": "Hops the walk may take from `seed`. The server accepts 1 or 2. Omitted, 1.",
+            "format": "uint64",
+            "maximum": 2,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "direction": {
+            "$ref": "#/components/schemas/TraversalDirection",
+            "default": "incoming",
+            "description": "Which edges the walk follows from each visited symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. Omitted, `incoming`."
+          },
+          "facets": {
+            "description": "Portable relationship facets eligible for the walk. Omitted or empty, every facet is\neligible.",
+            "items": {
+              "$ref": "#/components/schemas/RelationshipFacet"
+            },
+            "maxItems": 29,
+            "type": "array"
+          },
+          "seed": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The declaration the walk starts at. The seed itself is never a hit."
+          },
+          "to": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "When set, the answer keeps only the hit whose walk reaches this symbol. That hit's\npath is the shortest one the walk found. A `to` the walk cannot reach within `depth`\nanswers empty, not refused."
+          }
+        },
+        "type": "object"
+      },
+      "SymbolChange": {
+        "additionalProperties": false,
+        "description": "How one declaration differs between the two compared revisions, and where it lives on\neach side.",
+        "properties": {
+          "base_path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Where the declaration lived at the base revision. Absent for a declaration the head\nrevision introduced."
+          },
+          "head_path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Where the declaration lives at the head revision. Absent for a declaration the head\nrevision removed."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SymbolVersionKind",
+            "description": "What the head revision did to the declaration."
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "SearchHitTarget": {
+        "description": "What a search hit is. Tagged, so the payload correlation survives code generation.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "A documentation block projected from an existing text or symbol document.",
+            "properties": {
+              "documentation": {
+                "$ref": "#/components/schemas/DocumentationHit",
+                "description": "Block, source, and collector revision answering this match."
+              },
+              "target": {
+                "const": "documentation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "documentation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A symbol hit: the declaration a provider resolved.",
+            "properties": {
+              "symbol": {
+                "$ref": "#/components/schemas/Symbol",
+                "description": "The declaration that matched."
+              },
+              "target": {
+                "const": "symbol",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "symbol"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A node hit: one place in a syntax tree, without its enclosing symbol record.",
+            "properties": {
+              "node": {
+                "$ref": "#/components/schemas/NodeId",
+                "description": "The syntax-tree node's identity in the captured source revision."
+              },
+              "target": {
+                "const": "node",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "node"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A file hit: one entry of the tree, whether or not any provider reads it.",
+            "properties": {
+              "languages": {
+                "default": [],
+                "description": "Distinct `Language` values that read this file, sorted by name and dialect.\nAbsent when empty.",
+                "items": {
+                  "$ref": "#/components/schemas/Language"
+                },
+                "type": "array"
+              },
+              "size": {
+                "description": "Size in bytes.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "target": {
+                "const": "file",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "size"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A commit hit: one commit the history store holds, matched by its message.",
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/CommitHit",
+                "description": "The commit that matched."
+              },
+              "target": {
+                "const": "commit",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "commit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MatchedField": {
+        "description": "Which indexed field produced a search hit.",
+        "type": "string",
+        "enum": [
+          "name",
+          "signature",
+          "documentation",
+          "content",
+          "ranked",
+          "path",
+          "relationship",
+          "change"
+        ],
+        "x-enum-descriptions": [
+          "A declaration's name, qualified name, or a term derived from them matched.",
+          "A rendered signature matched.",
+          "An attached doc comment matched.",
+          "The file's contents matched.",
+          "The vector ranking placed the hit, and no indexed field carries the query's\nliteral bytes. A hit any other ranking placed names the field that carried it\ninstead.",
+          "The project-relative path matched.",
+          "A relationship traversal reached the hit.",
+          "A comparison `change` named found the declaration changed."
+        ]
+      },
+      "GraphHop": {
+        "additionalProperties": false,
+        "description": "One auditable step in a search traversal. `relationship` retains source-node evidence and\nderivation; `direction` records how the walk followed it.",
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/HopDirection",
+            "description": "How the walk followed the directed relationship."
+          },
+          "relationship": {
+            "$ref": "#/components/schemas/Relationship",
+            "description": "The relationship followed for this step."
+          }
+        },
+        "required": [
+          "relationship",
+          "direction"
+        ],
+        "type": "object"
+      },
+      "TraversalDirection": {
+        "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
+        "type": "string",
+        "enum": [
+          "incoming",
+          "outgoing"
+        ],
+        "x-enum-descriptions": [
+          "Walks edges arriving at each visited symbol: the references a language engine\nresolves to it, each hop carrying the `references` facet.",
+          "Walks edges leaving each visited symbol: the calls a language engine's call\nhierarchy names for it, each hop carrying the `calls` facet."
+        ]
+      },
+      "CommitHit": {
+        "additionalProperties": false,
+        "description": "One commit whose message matched a commit search, as the history store holds it.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/CommitAuthor",
+            "description": "Who authored the commit, as the version control records it."
+          },
+          "message": {
+            "description": "The commit message, cut at `COMMIT_MESSAGE_BYTES_MAX` bytes on a character boundary.",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "message_truncated": {
+            "description": "Whether the message ran past `COMMIT_MESSAGE_BYTES_MAX` bytes, so `message` holds\nits first bytes alone.",
+            "type": "boolean"
+          },
+          "paths": {
+            "description": "The paths the commit changed against the commit it was compared with, in path order,\nat most `COMMIT_PATHS_MAX`. A path `[source]` leaves out of the index, or a lockfile\n`[search.text] excluded_lockfiles` names, is not listed.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectPath"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "paths_truncated": {
+            "description": "Whether the commit changed more paths than `paths` lists.",
+            "type": "boolean"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/RevisionId",
+            "description": "The commit id, as the workspace's version control spells it."
+          },
+          "timestamp": {
+            "description": "When the commit was committed, as RFC 3339 date-time carrying the recorded offset:\nthe committer time, not the author time.",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "message",
+          "message_truncated",
+          "author",
+          "timestamp",
+          "paths",
+          "paths_truncated"
+        ],
+        "type": "object"
+      },
+      "HopDirection": {
+        "description": "How one path step followed its directed relationship.",
+        "type": "string",
+        "enum": [
+          "outgoing",
+          "incoming"
+        ],
+        "x-enum-descriptions": [
+          "The walk followed the edge from source to target.",
+          "The walk followed the edge against its direction, from target to source."
+        ]
+      },
+      "Relationship": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol the edge starts at."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ExactKind",
+            "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
+          },
+          "facets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RelationshipFacet"
+            },
+            "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
+            "minItems": 1
+          },
+          "to": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeId"
+            },
+            "description": "The nodes this edge was read from. Absent when empty.",
+            "default": []
+          },
+          "occurrence": {
+            "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node.",
+            "$ref": "#/components/schemas/SourceUnitSpan"
+          },
+          "derivation": {
+            "$ref": "#/components/schemas/RelationshipDerivation",
+            "description": "How this edge was established."
+          },
+          "confidence": {
+            "type": "number",
+            "format": "double",
+            "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions",
+            "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty.",
+            "default": {}
+          }
+        },
+        "required": [
+          "from",
+          "kind",
+          "facets",
+          "to",
+          "derivation"
+        ],
+        "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read."
+      },
+      "RelationshipDerivation": {
+        "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
+        "type": "string",
+        "enum": [
+          "resolution",
+          "syntax",
+          "heuristic"
+        ],
+        "x-enum-descriptions": [
+          "The provider resolved the edge semantically, so a consumer may act on it directly.",
+          "The edge was read from syntax alone, without semantic resolution.",
+          "The edge is a guess, qualified by `confidence`."
+        ]
+      },
       "PackageSearchItem": {
         "description": "One symbol or documentation result.",
         "oneOf": [
           {
-            "$ref": "#/components/schemas/PackageSearchHit"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackageSearchHit"
+              },
+              {
+                "not": {
+                  "required": [
+                    "hit"
+                  ]
+                }
+              }
+            ]
           },
           {
-            "$ref": "#/components/schemas/PackageDocumentationHit"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackageDocumentationHit"
+              },
+              {
+                "not": {
+                  "required": [
+                    "hit"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SearchHit"
+              },
+              {
+                "properties": {
+                  "hit": {
+                    "properties": {
+                      "target": {
+                        "const": "symbol"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
           }
         ]
       },

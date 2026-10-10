@@ -26,12 +26,13 @@ async fn test_fixture_paged_reads_ask_for_the_advertised_page_limit() {
     }
 
     let (_server, client) = operation_client(OperationFixture::PageLimitMax(200)).await;
-    assert_eq!(
-        client
+    assert_registered_field(
+        &client
             .search_packages(&search_request(), PAGE_LIMIT_MAX, None)
-            .await,
-        Err(ClientError::InvalidRequest { field: "limit" }),
-        "one page asked past the advertised bound stays refused"
+            .await
+            .expect_err("one page asked past the advertised bound stays refused"),
+        "rift.client.request_invalid",
+        "limit",
     );
 }
 
@@ -43,10 +44,13 @@ async fn test_fixture_capabilities_accept_a_page_limit_up_to_the_client_bound() 
 
     for advertised in [PAGE_LIMIT_MAX + 1, 0] {
         let (_server, client) = operation_client(OperationFixture::PageLimitMax(advertised)).await;
-        assert_eq!(
-            client.get_capabilities().await,
-            Err(ClientError::InvalidResponseField { field: "bounds" }),
-            "{advertised}"
+        assert_registered_field(
+            &client
+                .get_capabilities()
+                .await
+                .expect_err("advertised page bound refusal"),
+            "rift.client.response_invalid",
+            "bounds",
         );
     }
 }
@@ -169,20 +173,17 @@ async fn test_fixture_symbol_page_assembly_refuses_what_search_assembly_refuses(
     ];
     for (mode, field) in refusals {
         let (server, client) = operation_client(mode).await;
-        let expected = Err(ClientError::InvalidResponseField { field });
-        assert_eq!(
-            client
-                .list_package_symbols_pages(&symbol_request(), 20)
-                .await
-                .map(|pages| pages.items.len()),
-            expected,
-        );
+        let error = client
+            .list_package_symbols_pages(&symbol_request(), 20)
+            .await
+            .expect_err("page assembly refusal");
+        assert_registered_field(&error, "rift.client.response_invalid", field);
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 3, "{field}");
-        assert_eq!(
-            client.get_capabilities().await.map(|_| 0),
-            expected,
-            "{field} is recorded"
-        );
+        let cached = client
+            .get_capabilities()
+            .await
+            .expect_err("recorded page refusal");
+        assert_eq!(cached.to_string(), error.to_string(), "{field} is recorded");
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 3, "{field}");
     }
 
@@ -190,7 +191,7 @@ async fn test_fixture_symbol_page_assembly_refuses_what_search_assembly_refuses(
     let pages = client
         .list_package_symbols_pages(&symbol_request(), 20)
         .await
-        .map(|pages| (pages.items.len(), pages.next_cursor));
-    assert_eq!(pages, Ok((1, None)));
+        .expect("candidate bound page");
+    assert_eq!((pages.items.len(), pages.next_cursor), (1, None));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }

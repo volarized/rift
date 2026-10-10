@@ -55,7 +55,7 @@ fn check(
     capabilities: &Capabilities,
     page: Value,
     cursor: Option<&str>,
-) -> Result<(), ClientError> {
+) -> Result<(), RiftError> {
     let page: PackagePatternPage = serde_json::from_value(page).expect("pattern page fixture");
     PatternPageCheck {
         request,
@@ -131,13 +131,13 @@ async fn test_fixture_pattern_pages_ask_for_the_advertised_page_limit() {
 #[tokio::test]
 async fn test_fixture_pattern_search_requires_the_advertised_capability() {
     let (server, client) = operation_client(OperationFixture::Valid).await;
-    assert_eq!(
-        client
+    assert_registered_field(
+        &client
             .search_package_patterns(&pattern_request(), 20, None)
-            .await,
-        Err(ClientError::FeatureUnavailable {
-            feature: "patterns"
-        })
+            .await
+            .expect_err("pattern feature refusal"),
+        "rift.client.configuration_invalid",
+        "feature",
     );
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
@@ -150,11 +150,13 @@ async fn test_fixture_pattern_search_requires_the_advertised_capability() {
         ..Config::default()
     })
     .expect("disabled client");
-    assert_eq!(
-        client
+    assert_registered_field(
+        &client
             .search_package_patterns(&pattern_request(), 20, None)
-            .await,
-        Err(ClientError::Disabled)
+            .await
+            .expect_err("disabled pattern client"),
+        "rift.client.configuration_invalid",
+        "enabled",
     );
 }
 
@@ -163,16 +165,21 @@ async fn test_fixture_pattern_failure_marks_the_endpoint_unavailable() {
     let (_server, client) = operation_client(OperationFixture::Patterns).await;
     let mut request = pattern_request();
     request.packages.as_mut().expect("selected packages")[0].name = "other".to_owned();
-    assert_eq!(
-        client.search_package_patterns(&request, 20, None).await,
-        Err(ClientError::InvalidResponseField { field: "package" })
+    assert_registered_field(
+        &client
+            .search_package_patterns(&request, 20, None)
+            .await
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "package",
     );
-    assert_eq!(
-        client
+    assert_registered_field(
+        &client
             .search_package_patterns(&pattern_request(), 20, None)
-            .await,
-        Err(ClientError::InvalidResponseField { field: "package" }),
-        "a refused page marks the endpoint unavailable, and a later request answers its failure"
+            .await
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "package",
     );
 }
 
@@ -183,18 +190,19 @@ fn test_the_pattern_bound_counts_characters_as_the_contract_does() {
     let mut request = pattern_request();
     request.pattern = "\u{e9}".repeat(SEARCH_PATTERN_CHARS_MAX);
     assert_eq!(request.pattern.len(), 2 * SEARCH_PATTERN_CHARS_MAX);
-    assert_eq!(validate_pattern_request(&request), Ok(()));
+    validate_pattern_request(&request).expect("validation accepted");
 
     request.pattern.push('\u{e9}');
-    assert_eq!(
-        validate_pattern_request(&request),
-        Err(ClientError::InvalidRequest { field: "pattern" })
+    assert_registered_field(
+        &validate_pattern_request(&request).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "pattern",
     );
 }
 
 #[test]
 fn test_pattern_requests_refuse_bounds_before_transport() {
-    assert_eq!(validate_pattern_request(&pattern_request()), Ok(()));
+    validate_pattern_request(&pattern_request()).expect("validation accepted");
     let cases = [
         (String::new(), "pattern"),
         ("x".repeat(SEARCH_PATTERN_CHARS_MAX + 1), "pattern"),
@@ -202,14 +210,15 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     for (pattern, field) in cases {
         let mut request = pattern_request();
         request.pattern = pattern;
-        assert_eq!(
-            validate_pattern_request(&request),
-            Err(ClientError::InvalidRequest { field })
+        assert_registered_field(
+            &validate_pattern_request(&request).expect_err("registered refusal"),
+            "rift.client.request_invalid",
+            field,
         );
     }
     let mut request = pattern_request();
     request.pattern = "x".repeat(SEARCH_PATTERN_CHARS_MAX);
-    assert_eq!(validate_pattern_request(&request), Ok(()));
+    validate_pattern_request(&request).expect("validation accepted");
 
     for include in [
         vec!["score".to_owned()],
@@ -217,23 +226,25 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     ] {
         let mut request = pattern_request();
         request.include = Some(include);
-        assert_eq!(
-            validate_pattern_request(&request),
-            Err(ClientError::InvalidRequest { field: "include" })
+        assert_registered_field(
+            &validate_pattern_request(&request).expect_err("registered refusal"),
+            "rift.client.request_invalid",
+            "include",
         );
     }
     let mut request = pattern_request();
     request.packages = Some(vec![package_request(), package_request()]);
-    assert_eq!(
-        validate_pattern_request(&request),
-        Err(ClientError::InvalidRequest {
-            field: "duplicate_package"
-        })
+    assert_registered_field(
+        &validate_pattern_request(&request).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "duplicate_package",
     );
     let capabilities = pattern_capabilities();
-    assert_eq!(
-        validate_pattern_request_for_capabilities(&pattern_request(), 0, None, &capabilities),
-        Err(ClientError::InvalidRequest { field: "limit" })
+    assert_registered_field(
+        &validate_pattern_request_for_capabilities(&pattern_request(), 0, None, &capabilities)
+            .expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "limit",
     );
 }
 
@@ -242,33 +253,33 @@ fn test_discovery_patterns_accept_omitted_or_empty_package_selection() {
     for packages in [None, Some(Vec::new())] {
         let mut request = pattern_request();
         request.packages = packages;
-        assert_eq!(validate_pattern_request(&request), Ok(()));
+        validate_pattern_request(&request).expect("validation accepted");
         let serialized = serde_json::to_value(&request).expect("pattern request");
         if request.packages.is_none() {
             assert!(serialized.get("packages").is_none());
         }
-        assert_eq!(
-            check(
-                &request,
-                &pattern_capabilities(),
-                pattern_page_json(None),
-                None
-            ),
-            Ok(())
-        );
+        check(
+            &request,
+            &pattern_capabilities(),
+            pattern_page_json(None),
+            None,
+        )
+        .expect("validation accepted");
     }
     let mut request = pattern_request();
     let mut other = package_request();
     other.name = "other".to_owned();
     request.packages = Some(vec![other]);
-    assert_eq!(
-        check(
+    assert_registered_field(
+        &check(
             &request,
             &pattern_capabilities(),
             pattern_page_json(None),
-            None
-        ),
-        Err(ClientError::InvalidResponseField { field: "package" })
+            None,
+        )
+        .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "package",
     );
 }
 
@@ -277,17 +288,14 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
     let request = pattern_request();
     let capabilities = pattern_capabilities();
     let base = || pattern_page_json(None);
-    assert_eq!(check(&request, &capabilities, base(), None), Ok(()));
+    check(&request, &capabilities, base(), None).expect("validation accepted");
 
     let mut without_declaration = base();
     without_declaration["items"][0]
         .as_object_mut()
         .expect("hit object")
         .remove("declaration");
-    assert_eq!(
-        check(&request, &capabilities, without_declaration, None),
-        Ok(())
-    );
+    check(&request, &capabilities, without_declaration, None).expect("validation accepted");
 
     let mutations: [PageEdit; 11] = [
         ("package", |page| {
@@ -329,9 +337,10 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
     for (field, mutate) in mutations {
         let mut page = base();
         mutate(&mut page);
-        assert_eq!(
-            check(&request, &capabilities, page, None),
-            Err(ClientError::InvalidResponseField { field })
+        assert_registered_field(
+            &check(&request, &capabilities, page, None).expect_err("registered refusal"),
+            "rift.client.response_invalid",
+            field,
         );
     }
 }
@@ -344,30 +353,30 @@ fn test_pattern_pages_refuse_past_their_bounds() {
     let mut sourced = pattern_page_json(None);
     sourced["items"][0]["source"] = json!("fn demo");
     sourced["items"][0]["declaration"]["source"] = json!("pub fn demo");
-    assert_eq!(
-        check(&request, &capabilities, sourced.clone(), None),
-        Ok(())
-    );
+    check(&request, &capabilities, sourced.clone(), None).expect("validation accepted");
     let mut tight = capabilities.clone();
     tight.bounds.source_bytes_max = 3;
-    assert_eq!(
-        check(&request, &tight, sourced.clone(), None),
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &check(&request, &tight, sourced.clone(), None).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
     // The declaration's source is bounded apart from the matched line's.
     tight.bounds.source_bytes_max = 8;
-    assert_eq!(
-        check(&request, &tight, sourced, None),
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &check(&request, &tight, sourced, None).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
 
     let request = pattern_request();
     let mut over_limit = pattern_page_json(None);
     over_limit["items"] =
         Value::Array((0..21).map(|start| pattern_hit_json(UNIT, start)).collect());
-    assert_eq!(
-        check(&request, &capabilities, over_limit, None),
-        Err(ClientError::InvalidResponseField { field: "items" })
+    assert_registered_field(
+        &check(&request, &capabilities, over_limit, None).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "items",
     );
 
     let files = |count: usize| {
@@ -391,27 +400,32 @@ fn test_pattern_pages_refuse_past_their_bounds() {
         cursor: None,
         source_bytes_max: SOURCE_BYTES_MAX,
     };
-    for (count, expected) in [
-        (PATTERN_PAGE_FILES_MAX, Ok(())),
-        (
-            PATTERN_PAGE_FILES_MAX + 1,
-            Err(ClientError::InvalidResponseField { field: "files" }),
-        ),
+    for (count, accepted) in [
+        (PATTERN_PAGE_FILES_MAX, true),
+        (PATTERN_PAGE_FILES_MAX + 1, false),
     ] {
         let mut page = files(count);
         for hit in &mut page.items {
             hit.declaration = None;
         }
-        assert_eq!(wide.validate(&page), expected, "{count} files");
+        let result = wide.validate(&page);
+        if accepted {
+            result.expect("exact file bound accepted");
+        } else {
+            assert_registered_field(
+                &result.expect_err("file bound refusal"),
+                "rift.client.response_invalid",
+                "files",
+            );
+        }
     }
 
     let mut stalled = pattern_page_json(None);
     stalled["items"] = json!([]);
-    assert_eq!(
-        check(&request, &capabilities, stalled, Some("next")),
-        Err(ClientError::InvalidResponseField {
-            field: "cursor_progress"
-        })
+    assert_registered_field(
+        &check(&request, &capabilities, stalled, Some("next")).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "cursor_progress",
     );
 }
 
@@ -462,31 +476,32 @@ fn test_a_pattern_match_converts_into_a_file_hit_and_its_declaration() {
 
     let mut outside = hit.clone();
     outside.size = 13;
-    assert_eq!(
-        PackagePatternMatch::try_from(&outside),
-        Err(ClientError::InvalidResponseField { field: "location" })
+    assert_registered_field(
+        &PackagePatternMatch::try_from(&outside).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "location",
     );
     let mut negative = hit.clone();
     negative.size = -1;
-    assert_eq!(
-        PackagePatternMatch::try_from(&negative),
-        Err(ClientError::InvalidResponseField { field: "location" })
+    assert_registered_field(
+        &PackagePatternMatch::try_from(&negative).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "location",
     );
     let mut foreign = hit;
     foreign.unit = "rift://source/cargo/crates.io/other@1.0.0/src/first.rs".to_owned();
-    assert_eq!(
-        PackagePatternMatch::try_from(&foreign),
-        Err(ClientError::InvalidResponseField {
-            field: "source_identity"
-        })
+    assert_registered_field(
+        &PackagePatternMatch::try_from(&foreign).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "source_identity",
     );
 
     let mut value = pattern_hit_json(UNIT, 10);
     value["declaration"]["symbol"]["origin"]["location"] = json!("project");
     let project: PackagePatternHit = serde_json::from_value(value).expect("pattern hit fixture");
-    assert_eq!(
-        PackagePatternMatch::try_from(&project),
-        Err(ClientError::InvalidResponseField { field: "origin" }),
-        "a declaration outside the package converts into no symbol hit"
+    assert_registered_field(
+        &PackagePatternMatch::try_from(&project).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "origin",
     );
 }

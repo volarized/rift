@@ -82,11 +82,13 @@ async fn test_fixture_declarations_answer_each_position_once() {
 #[tokio::test]
 async fn test_fixture_declarations_require_the_advertised_capability() {
     let (server, client) = operation_client(OperationFixture::Valid).await;
-    assert_eq!(
-        client.find_declarations(&declaration_request()).await,
-        Err(ClientError::FeatureUnavailable {
-            feature: "declarations"
-        })
+    assert_registered_field(
+        &client
+            .find_declarations(&declaration_request())
+            .await
+            .expect_err("feature refusal"),
+        "rift.client.configuration_invalid",
+        "feature",
     );
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
@@ -98,9 +100,13 @@ async fn test_fixture_declarations_require_the_advertised_capability() {
         ..Config::default()
     })
     .expect("disabled client");
-    assert_eq!(
-        client.find_declarations(&declaration_request()).await,
-        Err(ClientError::Disabled)
+    assert_registered_field(
+        &client
+            .find_declarations(&declaration_request())
+            .await
+            .expect_err("disabled client refusal"),
+        "rift.client.configuration_invalid",
+        "enabled",
     );
 }
 
@@ -109,13 +115,23 @@ async fn test_fixture_declaration_refusal_marks_the_endpoint_unavailable() {
     let (_server, client) = operation_client(OperationFixture::Declarations).await;
     let mut request = declaration_request();
     request.positions.truncate(1);
-    assert_eq!(
-        client.find_declarations(&request).await,
-        Err(ClientError::InvalidResponse { status: 200 })
+    let error = client
+        .find_declarations(&request)
+        .await
+        .expect_err("position answer refusal");
+    assert_registered_field(&error, "rift.client.response_invalid", "body");
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "status" && value == "200")
     );
+    let cached = client
+        .find_declarations(&declaration_request())
+        .await
+        .expect_err("recorded refusal");
     assert_eq!(
-        client.find_declarations(&declaration_request()).await,
-        Err(ClientError::InvalidResponse { status: 200 }),
+        cached.to_string(),
+        error.to_string(),
         "later requests retain the recorded failure"
     );
 }
@@ -137,10 +153,10 @@ async fn test_declaration_requests_refuse_positions_before_transport() {
             }
             _ => unreachable!(),
         }
-        assert_eq!(
-            client.find_declarations(&request).await,
-            Err(ClientError::InvalidRequest { field: "positions" }),
-            "{field}"
+        assert_registered_field(
+            &client.find_declarations(&request).await.expect_err(field),
+            "rift.client.request_invalid",
+            "positions",
         );
     }
     for unit in [
@@ -180,9 +196,13 @@ async fn test_declaration_requests_stay_within_the_advertised_package_bound() {
         "rift://source/cargo/registry.example/demo@1.0.0/src/first.rs",
     )
     .expect("distinct registry owner");
-    assert_eq!(
-        client.find_declarations(&request).await,
-        Err(ClientError::InvalidRequest { field: "positions" })
+    assert_registered_field(
+        &client
+            .find_declarations(&request)
+            .await
+            .expect_err("owner bound refusal"),
+        "rift.client.request_invalid",
+        "positions",
     );
     assert!(
         !server
@@ -235,9 +255,15 @@ async fn test_declaration_responses_carry_a_well_formed_kind_exactly_beside_a_de
     for value in [invalid_kind, missing_kind, absent_kind, malformed_id] {
         let (_server, client) =
             operation_client(OperationFixture::SourceDeclarations(value, StatusCode::OK)).await;
-        assert!(matches!(
-            client.find_declarations(&declaration_request()).await,
-            Err(ClientError::InvalidResponse { status: 200 } | ClientError::Decode { status: 200 })
-        ));
+        let error = client
+            .find_declarations(&declaration_request())
+            .await
+            .expect_err("declaration answer refusal");
+        assert_registered_field(&error, "rift.client.response_invalid", "body");
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "status" && value == "200")
+        );
     }
 }

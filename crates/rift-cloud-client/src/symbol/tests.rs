@@ -1,5 +1,5 @@
 use super::{valid_result, validate_request};
-use crate::ClientError;
+use rift_error::{ErrorValue, RiftError};
 use rift_protocol::{
     read::GetSymbolInclude,
     symbol_read::{GetSymbolParams, GetSymbolResult},
@@ -8,6 +8,23 @@ use serde_json::{Value, json};
 
 const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
 const OTHER_ID: &str = "rift://symbol/cargo/crates.io/tokio@1.49.0/rust/tokio/Beacon";
+
+fn error_field<'error>(error: &'error RiftError, key: &str) -> Option<&'error str> {
+    error.fields().iter().find_map(|field| {
+        if field.key() != key {
+            return None;
+        }
+        match field.value() {
+            ErrorValue::Display(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
+
+fn assert_request_field(error: &RiftError, field: &str) {
+    assert_eq!(error.slug().as_str(), "rift.client.request_invalid");
+    assert_eq!(error_field(error, "field"), Some(field));
+}
 
 fn request() -> GetSymbolParams {
     serde_json::from_value(json!({"id": ID})).expect("request")
@@ -101,32 +118,22 @@ fn request_rejects_local_owners_revision_and_unbound_continuation() {
         "id": "rift://symbol/local/rust/Beacon"
     }))
     .expect("local request");
-    assert!(matches!(
-        validate_request(&local),
-        Err(ClientError::InvalidRequest { field: "id" })
-    ));
+    assert_request_field(&validate_request(&local).expect_err("local owner"), "id");
     let mut request = request();
     request.declaration_cursor = Some("next".to_owned());
-    assert!(matches!(
-        validate_request(&request),
-        Err(ClientError::InvalidRequest {
-            field: "declaration_cursor"
-        })
-    ));
+    assert_request_field(
+        &validate_request(&request).expect_err("unbound cursor"),
+        "declaration_cursor",
+    );
     request.declaration_cursor = None;
     request.declaration_limit = 0;
-    assert!(matches!(
-        validate_request(&request),
-        Err(ClientError::InvalidRequest {
-            field: "declaration_limit"
-        })
-    ));
+    assert_request_field(
+        &validate_request(&request).expect_err("declaration bound"),
+        "declaration_limit",
+    );
     request.declaration_limit = 5;
     request.rev = Some(rift_protocol::read::RevisionId("main".to_owned()));
-    assert!(matches!(
-        validate_request(&request),
-        Err(ClientError::InvalidRequest { field: "rev" })
-    ));
+    assert_request_field(&validate_request(&request).expect_err("revision"), "rev");
 }
 
 #[test]
@@ -147,10 +154,13 @@ fn exact_response_refuses_legacy_hit_pages() {
         body: serde_json::to_vec(&json!({"items": [], "warnings": []})).expect("body"),
         meta,
     };
-    assert!(matches!(
-        crate::response::exact_symbol(response),
-        Err(ClientError::Decode { status: 200 })
-    ));
+    let error = crate::response::exact_symbol(response)
+        .err()
+        .expect("legacy page");
+    assert_eq!(error.slug().as_str(), "rift.client.response_invalid");
+    assert_eq!(error_field(&error, "status"), Some("200"));
+    assert_eq!(error_field(&error, "field"), Some("body"));
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[test]
@@ -184,9 +194,13 @@ fn exact_response_requires_status_to_match_outcome() {
             if status == expected {
                 assert!(result.is_ok(), "accepted status {status}");
             } else {
-                assert!(
-                    matches!(result, Err(ClientError::InvalidResponse { status: actual }) if actual == status)
+                let error = result.err().expect("outcome status mismatch");
+                assert_eq!(error.slug().as_str(), "rift.client.response_invalid");
+                assert_eq!(
+                    error_field(&error, "status"),
+                    Some(status.to_string().as_str())
                 );
+                assert_eq!(error_field(&error, "field"), Some("status"));
             }
         }
     }
@@ -210,8 +224,17 @@ fn exact_response_keeps_service_problem_separate_from_unavailable() {
             .expect("problem"),
             meta: crate::ResponseMeta::from_headers(status, &headers).expect("headers"),
         };
-        assert!(
-            matches!(crate::response::exact_symbol(response), Err(ClientError::Http { problem, .. }) if problem.is_some() == (media == "application/problem+json"))
-        );
+        let error = crate::response::exact_symbol(response)
+            .err()
+            .expect("remote failure");
+        assert_eq!(error.slug().as_str(), "rift.client.remote_unavailable");
+        assert_eq!(error_field(&error, "status"), Some("503"));
+        let problem = error_field(&error, "problem");
+        assert_eq!(problem.is_some(), media == "application/problem+json");
+        if let Some(problem) = problem {
+            let problem: Value = serde_json::from_str(problem).expect("problem evidence");
+            assert_eq!(problem["status"], 503);
+            assert_eq!(problem["detail"], "fixture problem");
+        }
     }
 }

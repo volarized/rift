@@ -40,18 +40,22 @@ fn test_collection_documentation_source_uses_smaller_configured_and_advertised_b
         &ConfigurationEnvironment::default(),
         "https://example.test",
     );
-    assert_eq!(
-        validate_search_page(&request, &capabilities, &page, None, config.max_source),
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &validate_search_page(&request, &capabilities, &page, None, config.max_source)
+            .expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
     let environment = ConfigurationEnvironment::from_variables([("RIFT_GLOBAL_MAX_SOURCE", "5b")]);
     let config = accepted_config(document, &environment, "https://example.test");
     validate_search_page(&request, &capabilities, &page, None, config.max_source)
         .expect("exact configured documentation source bound");
     capabilities.bounds.source_bytes_max = 4;
-    assert_eq!(
-        validate_search_page(&request, &capabilities, &page, None, config.max_source),
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &validate_search_page(&request, &capabilities, &page, None, config.max_source)
+            .expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
     capabilities.bounds.source_bytes_max = i64::try_from(SOURCE_BYTES_MAX).expect("source bound");
     capabilities
@@ -71,16 +75,20 @@ fn test_collection_documentation_source_uses_smaller_configured_and_advertised_b
     let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol context page");
     let mut request = symbol_request();
     request.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
-    assert_eq!(
-        validate_symbol_page(&request, &capabilities, &page, None, 1),
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &validate_symbol_page(&request, &capabilities, &page, None, 1)
+            .expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
     validate_symbol_page(&request, &capabilities, &page, None, config.max_source)
         .expect("exact configured documentation excerpt bound");
     capabilities.bounds.source_bytes_max = 4;
-    assert_eq!(
-        validate_symbol_page(&request, &capabilities, &page, None, config.max_source),
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &validate_symbol_page(&request, &capabilities, &page, None, config.max_source)
+            .expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
 }
 
@@ -107,15 +115,15 @@ fn test_collection_config_accepts_edges_and_refuses_outside_supported_bounds() {
         for value in [1, maximum] {
             let mut config = Config::default();
             set(&mut config, value);
-            assert_eq!(validate_config(&config), Ok(()), "{field}={value}");
+            validate_config(&config).expect("configuration bound accepted");
         }
         for value in [0, maximum + 1] {
             let mut config = Config::default();
             set(&mut config, value);
-            assert_eq!(
-                validate_config(&config),
-                Err(ConfigError::OutOfRange(field)),
-                "{field}={value}"
+            assert_registered_field(
+                &validate_config(&config).expect_err("configuration bound refusal"),
+                "rift.client.configuration_invalid",
+                field,
             );
         }
     }
@@ -128,11 +136,12 @@ fn test_collection_config_accepts_edges_and_refuses_outside_supported_bounds() {
         i64::try_from(GLOBAL_RESPONSE_BYTES_MAX).expect("response bound");
     capabilities.bounds.source_bytes_max =
         i64::try_from(GLOBAL_SOURCE_BYTES_MAX).expect("source bound");
-    assert_eq!(validate_capabilities(&capabilities), Ok(()));
+    validate_capabilities(&capabilities).expect("capability bounds accepted");
     capabilities.bounds.source_bytes_max += 1;
-    assert_eq!(
-        validate_capabilities(&capabilities),
-        Err(ClientError::InvalidResponseField { field: "bounds" })
+    assert_registered_field(
+        &validate_capabilities(&capabilities).expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "bounds",
     );
 }
 
@@ -167,9 +176,13 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     let mut search = search_request();
     search.include = Some(vec!["source".to_owned()]);
     let default = GlobalClient::new(server.config()).expect("default client");
-    assert_eq!(
-        default.search_packages(&search, 20, None).await,
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &default
+            .search_packages(&search, 20, None)
+            .await
+            .expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
 
     let document =
@@ -257,25 +270,33 @@ async fn test_collection_operations_use_smaller_advertised_and_configured_bounds
     let mut config = server.config();
     config.max_source = 2 << 20;
     let client = GlobalClient::new(config).expect("configured client");
-    assert_eq!(
-        client.search_packages(&search, 20, None).await,
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &client
+            .search_packages(&search, 20, None)
+            .await
+            .expect_err("configured bound refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
 
     let mut config = server.config();
     config.max_request = 1;
     let client = GlobalClient::new(config).expect("request bound client");
-    assert!(matches!(
-        client.search_packages(&search, 20, None).await,
-        Err(ClientError::RequestBodyTooLarge { .. })
-    ));
+    let error = client
+        .search_packages(&search, 20, None)
+        .await
+        .expect_err("request body bound refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.body_limit");
+    assert_eq!(error_text_field(&error, "direction"), "request");
     let mut config = server.config();
     config.max_response = 4096;
     let client = GlobalClient::new(config).expect("response bound client");
-    assert!(matches!(
-        client.search_packages(&search, 20, None).await,
-        Err(ClientError::ResponseBodyTooLarge { .. })
-    ));
+    let error = client
+        .search_packages(&search, 20, None)
+        .await
+        .expect_err("response body bound refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.body_limit");
+    assert_eq!(error_text_field(&error, "direction"), "response");
 }
 
 #[test]
