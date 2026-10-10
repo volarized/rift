@@ -1137,11 +1137,74 @@ pub enum SyntaxFramework {
     Tailwind,
 }
 
+/// The public field bound that omitted one retained object from a read answer.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(try_from = "ObjectUnavailableInput", deny_unknown_fields)]
+#[schemars(!try_from)]
+pub struct ObjectUnavailable {
+    /// Physical source unit, paired with `range`, or absent for a source-less object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<SourceUnitId>,
+    /// Original declaration range, paired with `unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<TextRange>,
+    /// Full original qualified name of the retained object.
+    pub qualified_name: String,
+    /// Public field whose bound the object crossed.
+    #[schemars(length(min = 1, max = 128))]
+    pub field: String,
+    /// Enforced public field bound.
+    #[schemars(range(min = 1_u64))]
+    pub bound: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectUnavailableInput {
+    #[serde(default, deserialize_with = "crate::index::warning::present")]
+    unit: (bool, Option<SourceUnitId>),
+    #[serde(default, deserialize_with = "crate::index::warning::present")]
+    range: (bool, Option<TextRange>),
+    qualified_name: String,
+    field: String,
+    bound: u64,
+}
+
+impl TryFrom<ObjectUnavailableInput> for ObjectUnavailable {
+    type Error = &'static str;
+
+    fn try_from(input: ObjectUnavailableInput) -> Result<Self, Self::Error> {
+        if input.unit.0 != input.range.0
+            || !crate::index::warning::object_is_valid(
+                input.unit.1.as_ref(),
+                input.range.1.as_ref(),
+                &input.field,
+                input.bound,
+            )
+        {
+            return Err(
+                "object_unavailable requires paired source unit and range and valid field bounds",
+            );
+        }
+        Ok(Self {
+            unit: input.unit.1,
+            range: input.range.1,
+            qualified_name: input.qualified_name,
+            field: input.field,
+            bound: input.bound,
+        })
+    }
+}
+
 /// One warning attached to a read result. The answer stands; the warning carries evidence
 /// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
+#[schemars(transform = schema::pair_identity_unresolved_source)]
 pub enum ReadWarning {
+    /// One object crossed a public field bound. Its original facts remain retained;
+    /// every other admitted object can answer.
+    ObjectUnavailable(ObjectUnavailable),
     /// Framework context could not be resolved for one source. Ordinary syntax stands;
     /// framework-specific facts whose context is missing are left out.
     FrameworkContextUnresolved {
@@ -3603,6 +3666,79 @@ mod retained_name_tests {
         }
         for name in ["", "bad\0name", "bad\u{000b}name", "bad\u{007f}name"] {
             assert!(!symbol_name_is_retained(name, usize::MAX));
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_unavailable_tests {
+    use super::*;
+    use schemars::schema_for;
+    use serde_json::json;
+
+    #[test]
+    fn unavailable_read_objects_pair_source_fields_in_serde_and_schema() {
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let validator = jsonschema::validator_for(&schema).expect("warning schema compiles");
+        for (fields, accepted) in [
+            (json!({}), true),
+            (json!({"unit":null,"range":null}), true),
+            (
+                json!({"unit":"rift://source/project/lib.rs","range":{"start":1,"end":8}}),
+                true,
+            ),
+            (json!({"unit":"rift://source/project/lib.rs"}), false),
+            (json!({"range":{"start":1,"end":8}}), false),
+            (json!({"unit":null}), false),
+            (json!({"range":null}), false),
+            (json!({"unit":null,"range":{"start":1,"end":8}}), false),
+            (
+                json!({"unit":"rift://source/project/lib.rs","range":null}),
+                false,
+            ),
+        ] {
+            let mut wire = json!({
+                "code":"object_unavailable", "qualified_name":"S".repeat(4097),
+                "field":"name", "bound":4096,
+            });
+            wire.as_object_mut()
+                .expect("warning object")
+                .extend(fields.as_object().expect("source fields").clone());
+            assert_eq!(validator.is_valid(&wire), accepted, "schema: {wire}");
+            let parsed = serde_json::from_value::<ReadWarning>(wire.clone());
+            assert_eq!(parsed.is_ok(), accepted, "serde: {wire}");
+            if let Ok(warning) = parsed {
+                let encoded = serde_json::to_value(&warning).expect("warning serializes");
+                assert_eq!(encoded["code"], "object_unavailable");
+                assert_eq!(encoded["qualified_name"], "S".repeat(4097));
+                assert!(validator.is_valid(&encoded));
+                assert_eq!(
+                    serde_json::from_value::<ReadWarning>(encoded).expect("warning roundtrip"),
+                    warning
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_read_objects_refuse_invalid_fields_and_source_ranges() {
+        for fields in [
+            json!({"field":""}),
+            json!({"field":"x".repeat(129)}),
+            json!({"bound":0}),
+            json!({"unit":"rift://source/project/lib.rs","range":{"start":8,"end":1}}),
+            json!({"unit":"rift://source/project/../lib.rs","range":{"start":1,"end":8}}),
+            json!({"unexpected":true}),
+        ] {
+            let mut wire = json!({"code":"object_unavailable", "qualified_name":"start",
+                "field":"name", "bound":4096});
+            wire.as_object_mut()
+                .expect("warning object")
+                .extend(fields.as_object().expect("source fields").clone());
+            assert!(
+                serde_json::from_value::<ReadWarning>(wire.clone()).is_err(),
+                "{wire}"
+            );
         }
     }
 }

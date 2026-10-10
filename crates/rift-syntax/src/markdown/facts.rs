@@ -110,6 +110,8 @@ pub struct MarkdownReferenceCandidate {
     pub range: ByteRange,
 }
 
+mod retained_size;
+
 /// Markdown structure and relationship facts from one syntax document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownFacts {

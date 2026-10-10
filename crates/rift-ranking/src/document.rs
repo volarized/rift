@@ -394,6 +394,8 @@ pub struct DocumentFields {
     file_content: Option<String>,
 }
 
+mod retained_size;
+
 impl DocumentFields {
     /// A document with no field filled.
     #[must_use]

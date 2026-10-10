@@ -299,6 +299,76 @@ fn write_current(lock: &RwLock<Arc<PublicationSet>>) -> RwLockWriteGuard<'_, Arc
     }
 }
 
+impl get_size2::GetSize for ProviderPublication {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.provider, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = rift_protocol::retained_sequence_material(
+            self.contributions.iter(),
+            std::mem::size_of_val(self.contributions.as_ref()),
+            tracker,
+            get_size2::GetSize::get_heap_size_with_tracker,
+        );
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for PublicationSet {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes =
+            rift_protocol::btree_material_bytes::<ProviderId, Arc<ProviderPublication>>(
+                self.publications.len(),
+            )
+            .saturating_add(
+                self.publications
+                    .len()
+                    .saturating_mul(2 * std::mem::size_of::<usize>()),
+            );
+        let (field, next) = rift_protocol::retained_map_material(
+            &self.publications,
+            tracker,
+            |publication, tracker| {
+                rift_protocol::retained_arc_material(
+                    publication,
+                    tracker,
+                    get_size2::GetSize::get_heap_size_with_tracker,
+                )
+            },
+        );
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, RwLock};
@@ -550,5 +620,127 @@ mod tests {
             "rift.provider.publication_contribution_limit"
         );
         assert_eq!(store.snapshot().contribution_count(), 2);
+    }
+
+    #[test]
+    fn retained_publication_and_graph_refuse_unmeasured_signature_material() {
+        use get_size2::GetSize;
+        use rift_core::{IndexRevision, SourceRevision, TreeRevision};
+        use rift_protocol::read::{ExtensionKey, ExtensionValue, Extensions, Signature};
+
+        let language = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        let signature = Signature {
+            display: "pub fn kept()".to_owned(),
+            links: Vec::new(),
+            language: language.clone(),
+            receiver: None,
+            parameters: Vec::new(),
+            returns: Vec::new(),
+            type_parameters: Vec::new(),
+            throws: Vec::new(),
+            effects: Vec::new(),
+            extensions: Extensions(std::collections::BTreeMap::from([(
+                ExtensionKey("example.org.fact".to_owned()),
+                ExtensionValue {
+                    version: 1,
+                    data: serde_json::json!({"held": "value"}),
+                },
+            )])),
+        };
+        let facts =
+            PortableSymbolFacts::new(language, "kept", "kept", ExactKind("function".to_owned()))
+                .signatures(vec![signature]);
+        let contribution = Contribution::builder(
+            ContributionKey::new(
+                provider("syntax"),
+                revision(1),
+                ProviderSymbolId::new("kept").expect("key"),
+            ),
+            SourceApplicability::Independent,
+            facts,
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+        )
+        .build()
+        .expect("admitted facts");
+        assert_eq!(contribution.get_size(), usize::MAX);
+        let limits = PublicationLimits::default();
+        let publication =
+            ProviderPublication::new(provider("syntax"), revision(1), vec![contribution], limits)
+                .expect("publication");
+        assert_eq!(publication.get_size(), usize::MAX);
+        let publications = Arc::new(
+            super::PublicationSet::empty(limits)
+                .replaced(publication)
+                .expect("set"),
+        );
+        assert_eq!(publications.get_heap_size(), usize::MAX);
+        let graph = crate::Normalizer::normalize(
+            IndexRevision::new(1).expect("revision"),
+            SourceRevision::new(1).expect("source"),
+            TreeRevision::new(1).expect("tree"),
+            &publications,
+            None,
+        )
+        .expect("normalized graph");
+        assert_eq!(graph.get_size(), usize::MAX);
+        assert_eq!(
+            graph.records().len(),
+            1,
+            "unmeasured material does not discard facts"
+        );
+    }
+
+    #[test]
+    fn retained_publication_measures_compacted_nonempty_json_material() {
+        use get_size2::GetSize;
+        use rift_protocol::read::{ExtensionKey, ExtensionValue, Extensions};
+
+        let namespaced = Extensions(std::collections::BTreeMap::from([(
+            ExtensionKey("example.org.fact".to_owned()),
+            ExtensionValue {
+                version: 1,
+                data: serde_json::json!({"first": {"nested": ["held", 1]}, "last": true}),
+            },
+        )]));
+        let contribution = Contribution::builder(
+            ContributionKey::new(
+                provider("syntax"),
+                revision(1),
+                ProviderSymbolId::new("kept").expect("key"),
+            ),
+            SourceApplicability::Independent,
+            PortableSymbolFacts::new(
+                Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                },
+                "kept",
+                "kept",
+                ExactKind("struct".to_owned()),
+            ),
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+        )
+        .namespaced(namespaced.clone())
+        .build()
+        .expect("compacted contribution");
+        assert_eq!(contribution.namespaced(), &namespaced);
+        assert_ne!(contribution.get_size(), usize::MAX);
+        assert_ne!(contribution.clone().get_size(), usize::MAX);
+        let limits = PublicationLimits::default();
+        let publication =
+            ProviderPublication::new(provider("syntax"), revision(1), vec![contribution], limits)
+                .expect("publication");
+        let set = super::PublicationSet::empty(limits)
+            .replaced(publication)
+            .expect("set");
+        assert_ne!(set.get_size(), usize::MAX);
+        assert!(
+            !set.publications().next().expect("provider").contributions()[0]
+                .namespaced()
+                .is_empty()
+        );
     }
 }

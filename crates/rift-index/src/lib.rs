@@ -18,6 +18,7 @@ mod relationship;
 mod revision;
 mod vector;
 mod workspace;
+pub use workspace::WorkspaceSymbolView;
 
 pub use capture::LastCapture;
 pub use change_set::{

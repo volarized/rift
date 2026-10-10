@@ -26,7 +26,10 @@ pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,
 };
-pub use read::{ReadService, ReadServiceBuild, accepted_limit, wire_digest};
+pub use read::{
+    LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accepted_limit,
+    wire_digest,
+};
 pub use rift_core::CapturedStream;
 pub use rift_error::RiftError;
 pub use rift_lsp::capabilities::PositionEncoding;

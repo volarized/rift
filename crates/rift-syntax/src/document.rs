@@ -12,6 +12,8 @@ use crate::markdown::MarkdownFacts;
 /// the `~N` suffix `SymbolId` advertises.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
+mod retained_size;
+
 /// Half-open UTF-8 byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteRange {

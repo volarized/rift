@@ -121,6 +121,8 @@ pub struct DocumentationLayer<'collection> {
     mapping_bound: usize,
 }
 
+mod retained_size;
+
 impl DocumentationLayer<'static> {
     /// Builds one layer over shared collections within accepted bounds.
     ///

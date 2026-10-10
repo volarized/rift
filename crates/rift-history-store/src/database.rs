@@ -777,6 +777,21 @@ pub struct StoreReads {
 }
 
 impl StoreReads {
+    /// Keeps reads on the snapshot established by the first SELECT until this connection closes.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] when SQLite refuses the read transaction.
+    pub fn begin_snapshot(&self) -> Result<(), RiftError> {
+        self.connection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(|source| {
+                errors::history_store::database()
+                    .operation("begin read snapshot")
+                    .detail(source)
+                    .error()
+            })
+    }
+
     /// The read connection, so a test reaches the tables directly.
     #[cfg(test)]
     pub(crate) const fn connection(&self) -> &Connection {
@@ -1049,6 +1064,29 @@ mod tests {
             moves: Vec::new(),
             declarations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn captured_read_transaction_keeps_rows_after_replacement_and_trim() -> TestResult {
+        let folder = tempfile::tempdir()?;
+        let store = HistoryStore::open(&StoreLocation::new(folder.path(), "snapshot"))?;
+        let mut filler = store.filler()?.ok_or("filler lock")?;
+        filler.write_batch(&[bare_commit("c1")])?;
+        let reads = store.reader().connect()?;
+        reads.begin_snapshot()?;
+        let original = reads.commit("c1")?.ok_or("captured commit")?;
+        let mut replacement = bare_commit("c1");
+        replacement.message = "Replacement".to_owned();
+        filler.write_batch(&[replacement])?;
+        filler.trim(&BTreeSet::new())?;
+        assert_eq!(
+            reads.commit("c1")?.ok_or("held commit")?.message,
+            original.message
+        );
+        assert!(store.reader().connect()?.commit("c1")?.is_none());
+        drop(reads);
+        assert!(store.reader().connect()?.commit("c1")?.is_none());
+        Ok(())
     }
 
     /// The count and sum of the histogram series `name` carries under exactly `labels`, or

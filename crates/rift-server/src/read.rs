@@ -32,6 +32,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::history::{StoredHistory, SymbolTimelines};
 
+mod canonical;
+pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
     /// Workspace root to index.
@@ -731,6 +734,14 @@ impl ReadService {
         &self.index
     }
 
+    /// Returns at most two established identities retained during this snapshot's capture.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid result limit.
+    pub fn canonical_examples(&self, limit: usize) -> Result<Vec<rift_core::SymbolId>, RiftError> {
+        self.index.canonical_examples(limit)
+    }
+
     /// Paths whose captured entry kinds decide the Python import roots.
     #[must_use]
     pub const fn build_path_requests(&self) -> &BTreeSet<ProjectPath> {
@@ -835,6 +846,7 @@ impl ReadService {
         packages: &[RequestedPackage],
     ) -> Result<Arc<DependencyContext>, RiftError> {
         validate_requested_packages(scope, rev.is_some(), packages)?;
+        self.validate_dependency_scope(scope, rev)?;
         if packages.is_empty() {
             return Ok(Arc::clone(&self.context));
         }
@@ -1142,15 +1154,30 @@ impl ReadService {
         let mut candidates = if params.scope == SearchScope::Global {
             Vec::new()
         } else {
-            self.index.symbols(&params.name, results_max)?
+            let mut candidates = self.index.symbols(&params.name, results_max)?;
+            candidates.extend(self.index.left_out_symbols(&params.name, results_max)?);
+            candidates
+                .sort_by_key(|matched| (matched.rank, matched.symbol.qualified_name.as_str()));
+            candidates.truncate(results_max);
+            candidates
         };
         let bound_reached = candidates.len() >= results_max;
         if let Some(language) = &params.language {
             candidates
                 .retain(|matched| language_selects(language, matched.file.syntax().language()));
         }
-        let absent = candidates.is_empty();
-        let (window, pagination) = page(candidates, params.page_index, limit);
+        let mut public_candidates = Vec::with_capacity(candidates.len());
+        let mut object_warnings = Vec::new();
+        for matched in candidates {
+            let assembled = wire_symbol(&self.index, matched)?;
+            if assembled.0.name_is_public() {
+                public_candidates.push((matched, assembled));
+            } else {
+                object_warnings.push(object_unavailable(matched));
+            }
+        }
+        let absent = public_candidates.is_empty() && object_warnings.is_empty();
+        let (window, pagination) = page(public_candidates, params.page_index, limit);
         let include_source = params.include.contains(&GetSymbolInclude::Source);
         let include_history = params.include.contains(&GetSymbolInclude::History);
         let include_documentation = params.include.contains(&GetSymbolInclude::Documentation);
@@ -1163,9 +1190,9 @@ impl ReadService {
         };
         let mut hits = Vec::with_capacity(window.len());
         let mut disagreements = Vec::new();
-        for matched in window {
+        for (matched, assembled) in window {
             let (mut hit, disagreement) =
-                self.project_hit(matched, include_source, timelines.as_mut())?;
+                Self::project_hit(matched, assembled, include_source, timelines.as_mut())?;
             disagreements.extend(disagreement);
             if include_documentation && let Some(symbol) = &hit.symbol.id {
                 hit.documentation = Some(rift_index::documentation_context_with_budget(
@@ -1178,6 +1205,7 @@ impl ReadService {
             hits.push(hit);
         }
         let mut warnings = self.warnings();
+        warnings.extend(object_warnings);
         warnings.extend(disagreements);
         if absent {
             warnings.push(self.symbol_not_found(params)?);
@@ -1249,12 +1277,12 @@ impl ReadService {
     /// One `get_symbol` hit from the project index, with the `symbol_disagreement`
     /// warning its assembly raised.
     fn project_hit(
-        &self,
         matched: SymbolMatch<'_>,
+        assembled: (Symbol, Option<ReadWarning>),
         include_source: bool,
         timelines: Option<&mut SymbolTimelines>,
     ) -> Result<(GetSymbolHit, Option<ReadWarning>), RiftError> {
-        let (symbol, disagreement) = wire_symbol(&self.index, matched)?;
+        let (symbol, disagreement) = assembled;
         let history = match (timelines, symbol.id.as_ref()) {
             (Some(timelines), Some(identity)) => Some(timelines.timeline(
                 language_provider(matched.file.syntax().language()),
@@ -1484,6 +1512,16 @@ pub(crate) fn wire_symbol(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
 ) -> Result<(Symbol, Option<ReadWarning>), RiftError> {
+    if !rift_core::is_portable_name(&matched.symbol.name)
+        || !rift_core::is_portable_name(&matched.symbol.qualified_name)
+    {
+        let placement = rift_syntax::DocumentPlacement::project_path(matched.file.path())?;
+        let facts = matched.symbol.facts(matched.file.syntax().language());
+        return Ok((
+            rift_provider::AssembledSymbol::wire_facts(&facts, placement.origin()),
+            None,
+        ));
+    }
     let readable = index.assembled_symbol(matched)?;
     let symbol = assembled_wire_symbol(&readable);
     let disagreement = symbol_disagreement_warning(readable.assembled());
@@ -1719,6 +1757,30 @@ fn unparsed_warning(unparsed: &[&WorkspaceIndexWarning]) -> Option<ReadWarning> 
         count = unparsed.len(),
     );
     Some(ReadWarning::LargeFileUnparsed { files, detail })
+}
+
+/// The public name bound omitted this retained physical declaration.
+pub(crate) fn object_unavailable(matched: SymbolMatch<'_>) -> ReadWarning {
+    object_unavailable_at(
+        &matched.symbol.qualified_name,
+        Some(source_unit_id(matched.file.path())),
+        Some(text_range(matched.symbol.range)),
+    )
+}
+
+pub(crate) fn object_unavailable_at(
+    qualified_name: &str,
+    unit: Option<SourceUnitId>,
+    range: Option<TextRange>,
+) -> ReadWarning {
+    ReadWarning::ObjectUnavailable(rift_protocol::read::ObjectUnavailable {
+        unit,
+        range,
+        qualified_name: qualified_name.to_owned(),
+        field: "name".to_owned(),
+        bound: u64::try_from(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+            .expect("the public name bound fits u64"),
+    })
 }
 
 /// Mints the project resolver's source-unit identity: the resolver name, then the
@@ -2108,6 +2170,7 @@ pub(crate) mod tests {
         );
         Ok(())
     }
+
     /// A read snapshot over `root` under `limits` and `languages`, built through the
     /// same entry point the server itself uses.
     fn reads_with(
@@ -3784,6 +3847,75 @@ pub fn compute() -> i32 {
         let root = directory.path();
         let service = ReadService::build(root, limits, &visibility, &text_inclusion, history)?;
         Ok((directory, service))
+    }
+
+    #[test]
+    fn raw_four_byte_names_answer_physical_reads_without_canonical_identity() -> TestResult {
+        let retained = "𐐀".repeat(3000);
+        let unavailable = "𐐀".repeat(4097);
+        let source = format!(
+            "/// Retained declaration.\npub fn {retained}() -> u8 {{ 1 }}\n\
+             /// Unavailable declaration.\npub fn {unavailable}() -> u8 {{ 2 }}\n\
+             pub fn finish() {{}}\n"
+        );
+        let (_directory, service) = project_fixture(&source)?;
+        let request = serde_json::from_value(json!({"name": retained, "include": ["source"]}))?;
+        let result = service.get_symbol(&request)?;
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.symbol.name, retained);
+        assert!(hit.symbol.id.is_none());
+        assert_eq!(hit.path, Some(ProjectPath("src/lib.rs".to_owned())));
+        assert!(hit.node.is_some());
+        assert!(
+            hit.source
+                .as_ref()
+                .is_some_and(|source| source.contains(&retained))
+        );
+        assert!(!hit.symbol.signatures.is_empty());
+        assert!(!hit.symbol.documentation.is_empty());
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::ObjectUnavailable(object)
+                if object.qualified_name == unavailable && object.bound == 4096
+        )));
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::SymbolNotFound { .. }))
+        );
+        let raw_address = format!(
+            "rift://symbol/local/rust/beacon/{}",
+            rift_core::encode_path(&retained),
+        );
+        let refused = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            Language::from_identity_segment("rust")?,
+            vec!["beacon".to_owned(), retained],
+        );
+        assert!(refused.is_err());
+        assert!(
+            serde_json::from_value::<rift_protocol::symbol_read::GetSymbolParams>(
+                json!({"id": raw_address})
+            )
+            .is_err()
+        );
+        let neighbor = service.get_symbol(&serde_json::from_value(json!({"name": "finish"}))?)?;
+        assert_eq!(neighbor.hits.len(), 1);
+        assert!(neighbor.hits[0].symbol.id.is_some());
+        let symbol = &neighbor.hits[0].symbol;
+        let mut edge = json!({
+            "from": symbol.id,
+            "to": symbol.id,
+            "kind": symbol.kind,
+            "facets": ["calls"],
+            "derivation": "syntax"
+        });
+        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge.clone()).is_ok());
+        edge["to"] = json!(raw_address);
+        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge).is_err());
+        Ok(())
     }
 
     /// One project holding `pub fn beacon` alone.

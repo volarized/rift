@@ -51,7 +51,7 @@ impl PresentationDisagreement {
 }
 
 /// Readable symbol assembled from one normalized record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AssembledSymbol {
     index_revision: IndexRevision,
     identity: Option<SymbolId>,
@@ -63,7 +63,24 @@ pub struct AssembledSymbol {
     references: Vec<crate::NormalizedReference>,
     relationships: Vec<crate::NormalizedRelationship>,
     namespaced: Vec<(ProviderId, Extensions)>,
+    namespaced_material_bytes: usize,
     disagreements: Vec<PresentationDisagreement>,
+}
+
+impl PartialEq for AssembledSymbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.index_revision == other.index_revision
+            && self.identity == other.identity
+            && self.resolution == other.resolution
+            && self.contributions == other.contributions
+            && self.facts == other.facts
+            && self.origin == other.origin
+            && self.container == other.container
+            && self.references == other.references
+            && self.relationships == other.relationships
+            && self.namespaced == other.namespaced
+            && self.disagreements == other.disagreements
+    }
 }
 
 impl AssembledSymbol {
@@ -270,6 +287,9 @@ impl SymbolAssembler {
                 selected_container,
             )
         });
+        let namespaced_material_bytes = contributions.iter().fold(0usize, |bytes, (_, value)| {
+            bytes.saturating_add(value.namespaced_material_bytes())
+        });
         let namespaced = contributions
             .iter()
             .map(|(key, contribution)| {
@@ -302,6 +322,7 @@ impl SymbolAssembler {
             references,
             relationships,
             namespaced,
+            namespaced_material_bytes,
             disagreements,
         })
     }
@@ -444,6 +465,89 @@ fn retain_difference(
 ) {
     if differs {
         disagreements.insert((key.clone(), field));
+    }
+}
+
+impl get_size2::GetSize for PresentationDisagreement {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.contribution, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for AssembledSymbol {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.identity, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.contributions, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.facts, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.origin, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.container, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.references, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        bytes = bytes
+            .saturating_add(self.namespaced_material_bytes)
+            .saturating_add(
+                self.namespaced
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(ProviderId, Extensions)>()),
+            );
+        for (provider, _) in &self.namespaced {
+            let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(provider, tracker);
+            bytes = bytes.saturating_add(field);
+            tracker = next;
+        }
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.disagreements, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
     }
 }
 
@@ -784,6 +888,9 @@ mod tests {
 
         assert!(assembled.facts().is_none());
         assert_eq!(assembled.namespaced(), &[(provider("git"), namespaced)]);
+        let bytes = get_size2::GetSize::get_heap_size(&assembled);
+        assert!(bytes > 0 && bytes < usize::MAX);
+        assert_eq!(assembled.clone(), assembled);
     }
 
     #[test]

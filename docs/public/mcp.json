@@ -1377,8 +1377,133 @@
             "type": "string"
           },
           "ReadWarning": {
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "oneOf": [
+                    {
+                      "required": [
+                        "unit",
+                        "range"
+                      ]
+                    },
+                    {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "unit"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "range"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ],
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One object crossed a public field bound. Its original facts remain retained;\nevery other admitted object can answer.",
+                "properties": {
+                  "bound": {
+                    "description": "Enforced public field bound.",
+                    "format": "uint64",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "object_unavailable",
+                    "type": "string"
+                  },
+                  "field": {
+                    "description": "Public field whose bound the object crossed.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "qualified_name": {
+                    "description": "Full original qualified name of the retained object.",
+                    "type": "string"
+                  },
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "Original declaration range, paired with `unit`."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Physical source unit, paired with `range`, or absent for a source-less object."
+                  }
+                },
+                "required": [
+                  "code",
+                  "qualified_name",
+                  "field",
+                  "bound"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
@@ -4155,8 +4280,133 @@
             "type": "string"
           },
           "ReadWarning": {
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "oneOf": [
+                    {
+                      "required": [
+                        "unit",
+                        "range"
+                      ]
+                    },
+                    {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "unit"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "range"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ],
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One object crossed a public field bound. Its original facts remain retained;\nevery other admitted object can answer.",
+                "properties": {
+                  "bound": {
+                    "description": "Enforced public field bound.",
+                    "format": "uint64",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "object_unavailable",
+                    "type": "string"
+                  },
+                  "field": {
+                    "description": "Public field whose bound the object crossed.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "qualified_name": {
+                    "description": "Full original qualified name of the retained object.",
+                    "type": "string"
+                  },
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "Original declaration range, paired with `unit`."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Physical source unit, paired with `range`, or absent for a source-less object."
+                  }
+                },
+                "required": [
+                  "code",
+                  "qualified_name",
+                  "field",
+                  "bound"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
@@ -7304,8 +7554,133 @@
             "type": "string"
           },
           "ReadWarning": {
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "oneOf": [
+                    {
+                      "required": [
+                        "unit",
+                        "range"
+                      ]
+                    },
+                    {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "unit"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "range"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ],
             "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
             "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One object crossed a public field bound. Its original facts remain retained;\nevery other admitted object can answer.",
+                "properties": {
+                  "bound": {
+                    "description": "Enforced public field bound.",
+                    "format": "uint64",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "object_unavailable",
+                    "type": "string"
+                  },
+                  "field": {
+                    "description": "Public field whose bound the object crossed.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "qualified_name": {
+                    "description": "Full original qualified name of the retained object.",
+                    "type": "string"
+                  },
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "Original declaration range, paired with `unit`."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Physical source unit, paired with `range`, or absent for a source-less object."
+                  }
+                },
+                "required": [
+                  "code",
+                  "qualified_name",
+                  "field",
+                  "bound"
+                ],
+                "type": "object"
+              },
               {
                 "additionalProperties": false,
                 "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",

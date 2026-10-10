@@ -820,6 +820,165 @@ impl UnionFind {
     }
 }
 
+impl get_size2::GetSize for AssociationCandidate {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.target, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for NormalizedReference {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.binding, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.targets, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for NormalizedRelationship {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.target, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.occurrence, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for NormalizedTarget {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        match self {
+            Self::Symbol(value) => get_size2::GetSize::get_heap_size_with_tracker(value, tracker),
+            Self::Contribution(value) => {
+                get_size2::GetSize::get_heap_size_with_tracker(value, tracker)
+            }
+        }
+    }
+}
+
+impl get_size2::GetSize for NormalizedGraph {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes = rift_protocol::btree_material_bytes::<ContributionReference, usize>(
+            self.records_by_contribution.len(),
+        )
+        .saturating_add(
+            rift_protocol::btree_material_bytes::<ContributionKey, usize>(
+                self.contribution_positions.len(),
+            ),
+        )
+        .saturating_add(2 * std::mem::size_of::<usize>());
+        let (field, next) = rift_protocol::retained_arc_material(
+            &self.publications,
+            tracker,
+            get_size2::GetSize::get_heap_size_with_tracker,
+        );
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.records, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.records_by_contribution, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.contribution_positions, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.candidates, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.references, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

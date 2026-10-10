@@ -4571,6 +4571,7 @@ name = "rift-analysis"
 version = "0.0.67"
 dependencies = [
  "flate2",
+ "get-size2",
  "ignore",
  "jsonschema",
  "percent-encoding",
@@ -4632,6 +4633,7 @@ dependencies = [
 name = "rift-core"
 version = "0.0.67"
 dependencies = [
+ "get-size2",
  "percent-encoding",
  "rift-error",
  "rift-protocol",
@@ -4714,6 +4716,7 @@ name = "rift-index"
 version = "0.0.67"
 dependencies = [
  "async-trait",
+ "get-size2",
  "ignore",
  "nix",
  "rayon",
@@ -4805,6 +4808,7 @@ dependencies = [
 name = "rift-protocol"
 version = "0.0.67"
 dependencies = [
+ "get-size2",
  "jsonschema",
  "pep440_rs",
  "percent-encoding",
@@ -4824,6 +4828,7 @@ dependencies = [
 name = "rift-provider"
 version = "0.0.67"
 dependencies = [
+ "get-size2",
  "rift-core",
  "rift-error",
  "rift-protocol",
@@ -4836,6 +4841,7 @@ name = "rift-ranking"
 version = "0.0.67"
 dependencies = [
  "data-encoding",
+ "get-size2",
  "regex",
  "regex-automata",
  "regex-syntax",
@@ -4888,6 +4894,8 @@ dependencies = [
 name = "rift-server"
 version = "0.0.67"
 dependencies = [
+ "chrono",
+ "get-size2",
  "globset",
  "ignore",
  "lsp-types",
@@ -4913,6 +4921,7 @@ dependencies = [
  "rusqlite",
  "schemars 1.2.2",
  "semver",
+ "serde",
  "serde_json",
  "serde_path_to_error",
  "sha2",
@@ -4931,6 +4940,7 @@ dependencies = [
 name = "rift-syntax"
 version = "0.0.67"
 dependencies = [
+ "get-size2",
  "rift-core",
  "rift-error",
  "rift-protocol",

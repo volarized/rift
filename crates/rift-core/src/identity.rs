@@ -171,6 +171,33 @@ macro_rules! define_id {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(Arc<str>);
 
+        impl get_size2::GetSize for $name {
+            fn get_size(&self) -> usize {
+                std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+            }
+
+            fn get_size_with_tracker<T: get_size2::GetSizeTracker>(
+                &self,
+                tracker: T,
+            ) -> (usize, T) {
+                let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+                (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+            }
+
+            fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+                &self,
+                tracker: T,
+            ) -> (usize, T) {
+                let (bytes, tracker) =
+                    get_size2::GetSize::get_heap_size_with_tracker(&self.0, tracker);
+                // ArcInner holds strong and weak counts in addition to its string.
+                (
+                    bytes.saturating_add(2 * std::mem::size_of::<usize>()),
+                    tracker,
+                )
+            }
+        }
+
         impl $name {
             /// Validates and constructs identity.
             ///
@@ -237,6 +264,21 @@ define_id!(ModelId, "Resolved embedding model identity.");
 /// Stable identity of one source resolver.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceResolverId(Arc<str>);
+
+impl get_size2::GetSize for SourceResolverId {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        rift_protocol::retained_arc_material(&self.0, tracker, |_, tracker| (0, tracker))
+    }
+}
 
 impl SourceResolverId {
     /// Validates canonical lowercase resolver identity.
@@ -557,6 +599,25 @@ define_revision!(ProviderRevision, "Provider fact revision.");
 define_revision!(CompositionRevision, "Provider composition revision.");
 define_revision!(IndexRevision, "Published index revision.");
 define_revision!(ModelRevision, "Resolved model revision.");
+
+impl get_size2::GetSize for SourceUnitId {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (resolver, tracker) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.resolver, tracker);
+        let (key, tracker) = get_size2::GetSize::get_heap_size_with_tracker(&self.key, tracker);
+        let (owner, tracker) = get_size2::GetSize::get_heap_size_with_tracker(&self.owner, tracker);
+        (resolver.saturating_add(key).saturating_add(owner), tracker)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1157,5 +1218,23 @@ mod tests {
         assert!(
             SourceUnitId::for_package(&package("cargo", "helper", "0.1.0\\beta"), &path).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_resolver_material_tests {
+    use super::SourceResolverId;
+    use get_size2::{GetSize, StandardTracker};
+
+    #[test]
+    fn retained_source_resolvers_charge_shared_allocation_once() {
+        let value = SourceResolverId::new("project").expect("validated source value");
+        let cloned = value.clone();
+        let (first, tracker) = value.get_heap_size_with_tracker(StandardTracker::new());
+        assert_eq!(first, value.0.len() + 2 * std::mem::size_of::<usize>());
+        let (second, tracker) = cloned.get_heap_size_with_tracker(tracker);
+        assert_eq!(second, 0, "one shared allocation is counted once");
+        let (total, _) = cloned.get_size_with_tracker(tracker);
+        assert_eq!(total, std::mem::size_of::<SourceResolverId>());
     }
 }

@@ -1,3 +1,6 @@
+mod symbol_view;
+pub use symbol_view::WorkspaceSymbolView;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
@@ -20,13 +23,14 @@ use rift_core::constants::{
     WORKSPACE_DECLARATIONS_MAX_DEFAULT, WORKSPACE_FILES_MAX_DEFAULT, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{
-    CompositionId, LanguageFileSelections, PortableSymbolFacts, ProjectPath, ProviderId,
-    SourceVisibility, SymbolId, TextFileInclusion, symbol_identity,
+    CompositionId, Contribution, LanguageFileSelections, PortableSymbolFacts, ProjectPath,
+    ProviderId, SourceVisibility, SymbolId, TextFileInclusion, symbol_identity,
 };
 use rift_error::{ErrorSlug, RiftError, ctx, errors};
 use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
 use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
 use rift_protocol::identity::SymbolOwner;
+use rift_protocol::read::Language;
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{
     SOURCE_DECLARATIONS_FIELD, SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD,
@@ -376,6 +380,19 @@ impl WorkspaceIndexLimits {
             large_files: strategy,
             ..self
         }
+    }
+}
+
+impl WorkspaceIndexLimits {
+    fn validate_result_limit(self, limit: usize) -> Result<(), RiftError> {
+        if limit == 0 || limit > self.results_max {
+            return errors::index::workspace_result_limit()
+                .field("results")
+                .observed(limit as u64)
+                .maximum(self.results_max as u64)
+                .fail();
+        }
+        Ok(())
     }
 }
 
@@ -2523,12 +2540,14 @@ pub struct WorkspaceIndex {
     _symbol_document_entry_count_reading: Option<rift_tracing::ObservationGuard>,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
-    semantics: WorkspaceSemantics,
+    semantics: Arc<WorkspaceSemantics>,
     documentation: Arc<DocumentationCollection>,
     /// The documentation layer over `documentation`, built by the first read that projects
     /// onto it; the next publication is a new index and builds its own.
     documentation_layer: OnceLock<Result<DocumentationLayer<'static>, RiftError>>,
-    symbol_declarations: OnceLock<Result<SymbolDeclarations, RiftError>>,
+    symbol_declarations: OnceLock<Result<Arc<SymbolDeclarations>, RiftError>>,
+    symbol_view: OnceLock<Result<Arc<WorkspaceSymbolView>, RiftError>>,
+    canonical_examples: Vec<SymbolId>,
     /// The held text files holding a line longer than `[search.text] max_chunk`, found by
     /// the first pattern search that asks; the next publication is a new index and finds
     /// its own.
@@ -2537,8 +2556,11 @@ pub struct WorkspaceIndex {
     warnings: Vec<WorkspaceIndexWarning>,
 }
 
+pub(crate) const CANONICAL_EXAMPLES_MAX: usize = 2;
+
 #[derive(Debug, Default)]
 struct SymbolDeclarations {
+    incomplete_languages: BTreeSet<String>,
     canonical: BTreeMap<SymbolId, Vec<(ProjectPath, usize)>>,
     provider: BTreeMap<String, Vec<(ProjectPath, usize)>>,
     objects: BTreeMap<SymbolId, usize>,
@@ -2815,12 +2837,12 @@ impl WorkspaceIndex {
             check_cancelled(cancelled)?;
             contents.build_with_frameworks((&root, &owner), &language, limits, previous, cancelled)
         })?;
-        let declarations = rift_tracing::traced!(
+        let (declarations, canonical_examples) = rift_tracing::traced!(
             component = "documentation",
             operation = "accepted_declarations",
             phase = "accepted_declarations",
             files = files.len(),
-            { accepted_declarations(&files, &semantics) }
+            { accepted_declarations(&files, &semantics, &owner) }
         );
         let (documentation, notebooks) = crate::documentation::build(
             &files,
@@ -2855,10 +2877,12 @@ impl WorkspaceIndex {
             _symbol_document_entry_count_reading: symbol_document_entry_count_reading,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
-            semantics,
+            semantics: Arc::new(semantics),
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
             symbol_declarations: OnceLock::new(),
+            symbol_view: OnceLock::new(),
+            canonical_examples,
             split_line_files: OnceLock::new(),
             notebooks,
             warnings,
@@ -2945,7 +2969,8 @@ impl WorkspaceIndex {
             Some(self.semantics.graph()),
         )?;
         check_cancelled(cancelled)?;
-        let declarations = accepted_declarations(&files, &semantics);
+        let (declarations, canonical_examples) =
+            accepted_declarations(&files, &semantics, &self.owner);
         check_cancelled(cancelled)?;
         let (documentation, notebooks) = crate::documentation::build(
             &files,
@@ -2981,10 +3006,12 @@ impl WorkspaceIndex {
             _symbol_document_entry_count_reading: symbol_document_entry_count_reading,
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
-            semantics,
+            semantics: Arc::new(semantics),
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
             symbol_declarations: OnceLock::new(),
+            symbol_view: OnceLock::new(),
+            canonical_examples,
             split_line_files: OnceLock::new(),
             notebooks,
             warnings,
@@ -3086,7 +3113,7 @@ impl WorkspaceIndex {
             limits,
             previous.map(|index| index.semantics.graph()),
         )?;
-        let declarations = accepted_declarations(&files, &semantics);
+        let (declarations, canonical_examples) = accepted_declarations(&files, &semantics, &owner);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
@@ -3120,10 +3147,12 @@ impl WorkspaceIndex {
             _symbol_document_entry_count_reading: symbol_document_entry_count_reading,
             text_inclusion,
             fingerprint,
-            semantics,
+            semantics: Arc::new(semantics),
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
             symbol_declarations: OnceLock::new(),
+            symbol_view: OnceLock::new(),
+            canonical_examples,
             split_line_files: OnceLock::new(),
             notebooks,
             warnings,
@@ -3233,7 +3262,7 @@ impl WorkspaceIndex {
         }
         let declarations = self
             .symbol_declarations
-            .get_or_init(|| self.build_symbol_declarations())
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
         for block in &self.documentation.index().blocks {
@@ -3626,13 +3655,13 @@ impl WorkspaceIndex {
 
     /// Returns normalized Contribution graph captured by this index.
     #[must_use]
-    pub const fn normalized_graph(&self) -> &NormalizedGraph {
+    pub fn normalized_graph(&self) -> &NormalizedGraph {
         self.semantics.graph()
     }
 
     /// Returns the symbol reference adjacency built from this index's normalized graph.
     #[must_use]
-    pub const fn relationships(&self) -> &RelationshipStore {
+    pub fn relationships(&self) -> &RelationshipStore {
         self.semantics.relationships()
     }
 
@@ -3682,6 +3711,38 @@ impl WorkspaceIndex {
         Ok(symbol_matches(self.files(), query, limit))
     }
 
+    /// Matches retained declarations omitted from the portable Contribution collection.
+    ///
+    /// These matches carry physical facts, without an established canonical identity.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] when the result limit exceeds the configured maximum.
+    pub fn left_out_symbols(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch<'_>>, RiftError> {
+        self.validate_result_limit(limit)?;
+        Ok(matching_symbols(self.files(), query, limit, true))
+    }
+
+    /// Samples established identities retained during this index's capture.
+    ///
+    /// The sample holds at most two unique identities owned by this index. It performs
+    /// no assembly, source reads, or canonical directory initialization.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid result limit.
+    pub fn canonical_examples(&self, limit: usize) -> Result<Vec<SymbolId>, RiftError> {
+        self.validate_result_limit(limit)?;
+        Ok(self
+            .canonical_examples
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     /// Finds physical declarations carrying one established canonical identity.
     ///
     /// The directory belongs to this immutable index and is built once from its
@@ -3695,38 +3756,6 @@ impl WorkspaceIndex {
         limit: usize,
     ) -> Result<Vec<SymbolMatch<'_>>, RiftError> {
         Ok(self.symbols_by_identity_page(identity, 0, limit)?.0)
-    }
-
-    /// Reads one bounded slice of the captured physical declaration directory.
-    ///
-    /// The returned count includes every binding in the same immutable directory.
-    /// An offset past that count returns an empty slice without changing the count.
-    ///
-    /// # Errors
-    /// Returns [`RiftError`] for an invalid result limit or failed symbol assembly.
-    pub fn symbols_by_identity_page(
-        &self,
-        identity: &SymbolId,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(Vec<SymbolMatch<'_>>, usize), RiftError> {
-        self.validate_result_limit(limit)?;
-        let declarations = self
-            .symbol_declarations
-            .get_or_init(|| self.build_symbol_declarations())
-            .as_ref()
-            .map_err(Clone::clone)?;
-        let Some(bindings) = declarations.canonical.get(identity) else {
-            return Ok((Vec::new(), 0));
-        };
-        let total = bindings.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let page = bindings[start..end]
-            .iter()
-            .filter_map(|(path, index)| self.declaration_match(path, *index))
-            .collect();
-        Ok((page, total))
     }
 
     /// Finds declarations by the provider-local key held in an index document.
@@ -3744,7 +3773,7 @@ impl WorkspaceIndex {
         self.validate_result_limit(limit)?;
         let declarations = self
             .symbol_declarations
-            .get_or_init(|| self.build_symbol_declarations())
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
         Ok(declarations
@@ -3777,7 +3806,7 @@ impl WorkspaceIndex {
     ) -> Result<Option<ReadableSymbol>, RiftError> {
         let declarations = self
             .symbol_declarations
-            .get_or_init(|| self.build_symbol_declarations())
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
         declarations
@@ -3785,6 +3814,30 @@ impl WorkspaceIndex {
             .get(identity)
             .map(|object| object.as_ref().cloned().map_err(Clone::clone))
             .transpose()
+    }
+
+    /// Returns a bounded page of physical declarations and the complete binding count.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid result limit or failed symbol assembly.
+    pub fn symbols_by_identity_page(
+        &self,
+        identity: &SymbolId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<SymbolMatch<'_>>, usize), RiftError> {
+        self.validate_result_limit(limit)?;
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let (bindings, total) = declarations.page(identity, offset, limit);
+        let page = bindings
+            .iter()
+            .filter_map(|(path, index)| self.declaration_match(path, *index))
+            .collect();
+        Ok((page, total))
     }
 
     fn declaration_facts(
@@ -3838,10 +3891,10 @@ impl WorkspaceIndex {
         })
     }
 
-    /// Reads a page of captured bindings and their complete normalized fact indices.
+    /// Returns a bounded page of captured declaration facts and the complete binding count.
     ///
     /// # Errors
-    /// Returns [`RiftError`] for an invalid result limit or failed captured assembly.
+    /// Returns [`RiftError`] for an invalid result limit or unavailable declaration facts.
     pub fn declarations_by_identity_page(
         &self,
         identity: &SymbolId,
@@ -3851,16 +3904,11 @@ impl WorkspaceIndex {
         self.validate_result_limit(limit)?;
         let declarations = self
             .symbol_declarations
-            .get_or_init(|| self.build_symbol_declarations())
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
             .as_ref()
             .map_err(Clone::clone)?;
-        let Some(bindings) = declarations.canonical.get(identity) else {
-            return Ok((Vec::new(), 0));
-        };
-        let total = bindings.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        let page = bindings[start..end]
+        let (bindings, total) = declarations.page(identity, offset, limit);
+        let page = bindings
             .iter()
             .map(|binding| {
                 declarations
@@ -3873,11 +3921,43 @@ impl WorkspaceIndex {
         Ok((page, total))
     }
 
+    /// Whether retained declarations establish exact identity coverage for this language.
+    ///
+    /// # Errors
+    /// Returns the captured provider failure if the immutable directory cannot be built.
+    pub fn identity_coverage_complete(&self, language: &Language) -> Result<bool, RiftError> {
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(self.warnings.is_empty()
+            && !declarations
+                .incomplete_languages
+                .contains(&language.identity_segment()))
+    }
+
     fn build_symbol_declarations(&self) -> Result<SymbolDeclarations, RiftError> {
         let mut declarations = SymbolDeclarations {
             objects: SymbolDeclarations::object_positions(self.semantics.graph().records()),
             ..SymbolDeclarations::default()
         };
+        for record in self.semantics.graph().records() {
+            if record.identity().is_none() {
+                for key in record.contributions() {
+                    if let Some(facts) = self
+                        .semantics
+                        .graph()
+                        .contribution(key)
+                        .and_then(Contribution::facts)
+                    {
+                        declarations
+                            .incomplete_languages
+                            .insert(facts.language().identity_segment());
+                    }
+                }
+            }
+        }
         for (identity, position) in &declarations.objects {
             let record = &self.semantics.graph().records()[*position];
             let object = self
@@ -3894,6 +3974,11 @@ impl WorkspaceIndex {
             declarations.assembled.insert(identity.clone(), object);
         }
         for file in self.files() {
+            if !file.syntax().left_out_symbols().is_empty() {
+                declarations
+                    .incomplete_languages
+                    .insert(file.syntax().language().identity_segment());
+            }
             let starts = rift_core::line::line_starts(file.source());
             for index in 0..file.syntax().symbols().len() {
                 let Some(matched) = self.declaration_match(file.path(), index) else {
@@ -4362,14 +4447,7 @@ impl WorkspaceIndex {
     }
 
     fn validate_result_limit(&self, limit: usize) -> Result<(), RiftError> {
-        if limit == 0 || limit > self.limits.results_max {
-            return errors::index::workspace_result_limit()
-                .field("results")
-                .observed(limit as u64)
-                .maximum(self.limits.results_max as u64)
-                .fail();
-        }
-        Ok(())
+        self.limits.validate_result_limit(limit)
     }
 }
 
@@ -4382,14 +4460,25 @@ pub fn symbol_matches<'a>(
     query: &str,
     limit: usize,
 ) -> Vec<SymbolMatch<'a>> {
+    matching_symbols(files, query, limit, false)
+}
+
+fn matching_symbols<'a>(
+    files: impl IntoIterator<Item = &'a IndexedFile>,
+    query: &str,
+    limit: usize,
+    left_out: bool,
+) -> Vec<SymbolMatch<'a>> {
     let identifier = IdentifierMatcher::new(query);
     let mut matches = files
         .into_iter()
         .flat_map(|file| {
-            file.syntax()
-                .symbols()
-                .iter()
-                .map(move |symbol| (file, symbol))
+            let symbols = if left_out {
+                file.syntax().left_out_symbols()
+            } else {
+                file.syntax().symbols()
+            };
+            symbols.iter().map(move |symbol| (file, symbol))
         })
         .filter_map(|(file, symbol)| {
             Some(SymbolMatch {
@@ -4779,12 +4868,13 @@ fn built_contents_with_owner(
 fn accepted_declarations(
     files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
     semantics: &WorkspaceSemantics,
-) -> Vec<crate::documentation::DeclarationFacts> {
+    owner: &SymbolOwner,
+) -> (Vec<crate::documentation::DeclarationFacts>, Vec<SymbolId>) {
     rift_tracing::traced!(
         component = "documentation",
         operation = "documentation.declarations",
         files = files.len(),
-        { crate::documentation::declarations(files, semantics) }
+        { crate::documentation::declarations(files, semantics, owner) }
     )
 }
 
@@ -6702,6 +6792,119 @@ mod tests {
             }
         }
         Some((field?, observed?, maximum?))
+    }
+
+    fn assert_original_binding_facts(
+        binding: &rift_protocol::symbol_read::SymbolDeclaration,
+        expected: SymbolMatch<'_>,
+        object: &ReadableSymbol,
+    ) {
+        assert_eq!(
+            binding.path.as_ref().expect("physical path").0,
+            expected.file.path().as_str()
+        );
+        assert_eq!(binding.range.start, expected.symbol.item_range.start);
+        assert_eq!(binding.range.end, expected.symbol.item_range.end);
+        assert_eq!(
+            binding
+                .signature_indices
+                .iter()
+                .map(|position| {
+                    object.facts().signatures_slice()
+                        [usize::try_from(*position).expect("signature position")]
+                    .clone()
+                })
+                .collect::<Vec<_>>(),
+            expected.symbol.signatures.as_ref()
+        );
+        assert_eq!(
+            binding
+                .documentation_indices
+                .iter()
+                .map(|position| {
+                    object.facts().documentation_blocks()
+                        [usize::try_from(*position).expect("documentation position")]
+                    .clone()
+                })
+                .collect::<Vec<_>>(),
+            expected.symbol.documentation.as_ref()
+        );
+    }
+
+    #[test]
+    fn canonical_binding_pages_keep_original_order_and_total() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+        )
+        .expect("captured package metadata");
+        fs::write(
+            root.path().join("index.js"),
+            "/** Implementation. */\nexport function open(path) {}\n",
+        )
+        .expect("implementation");
+        fs::write(root.path().join("index.d.ts"),
+            "/** First overload. */\nexport declare function open(path: string): void;\n/** Second overload. */\nexport declare function open(path: number): void;\n")
+            .expect("original overload declarations");
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("captured index");
+        let matched = index.symbols("open", 10).expect("physical declarations");
+        let object = index
+            .assembled_symbol(matched[0])
+            .expect("canonical object");
+        let identity = object.identity().expect("established identity");
+        let all = index
+            .symbols_by_identity(identity, 10)
+            .expect("all bindings");
+        assert_eq!(all.len(), 3);
+        assert_eq!(object.facts().signatures_slice().len(), 3);
+        assert_eq!(object.facts().documentation_blocks().len(), 3);
+        for (offset, expected) in all.iter().enumerate() {
+            let (page, total) = index
+                .symbols_by_identity_page(identity, offset, 1)
+                .expect("one immutable binding");
+            assert_eq!(total, 3);
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].file.path(), expected.file.path());
+            assert_eq!(page[0].symbol.item_range, expected.symbol.item_range);
+            assert_eq!(page[0].symbol.signatures, expected.symbol.signatures);
+            let (facts, count) = index
+                .declarations_by_identity_page(identity, offset, 1)
+                .expect("cached original fact positions");
+            assert_eq!(count, 3);
+            assert_original_binding_facts(&facts[0], *expected, &object);
+            assert_eq!(
+                index
+                    .assembled_symbol(page[0])
+                    .expect("same logical object")
+                    .identity(),
+                Some(identity)
+            );
+        }
+        for offset in [3, usize::MAX] {
+            let (page, total) = index
+                .symbols_by_identity_page(identity, offset, 1)
+                .expect("past final binding");
+            assert_eq!(total, 3);
+            assert!(page.is_empty());
+            let (facts, count) = index
+                .declarations_by_identity_page(identity, offset, 1)
+                .expect("past final cached declaration");
+            assert_eq!(count, 3);
+            assert!(facts.is_empty());
+        }
+        assert!(index.symbols_by_identity_page(identity, 0, 0).is_err());
+        assert!(
+            index
+                .symbols_by_identity_page(identity, 0, index.results_max() + 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -12053,6 +12256,44 @@ mod tests {
         );
     }
 
+    fn assert_canonical_physical_bindings(index: &WorkspaceIndex, id: &rift_core::SymbolId) {
+        let bindings = index.symbols_by_identity(id, 10).expect("exact bindings");
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].file.path().as_str(), "index.d.ts");
+        assert_eq!(bindings[1].file.path().as_str(), "index.js");
+        assert_eq!(bindings[0].file.syntax().language().name, "typescript");
+        assert_eq!(bindings[1].file.syntax().language().name, "javascript");
+        assert_eq!(
+            bindings[0]
+                .symbol
+                .signatures
+                .first()
+                .map(|signature| signature.display.as_str()),
+            Some("function open(path: string): void")
+        );
+        assert_eq!(
+            bindings[1]
+                .symbol
+                .signatures
+                .first()
+                .map(|signature| signature.display.as_str()),
+            Some("function open(path)")
+        );
+        assert_eq!(
+            index
+                .symbols_by_identity(id, 1)
+                .expect("bounded page")
+                .len(),
+            1
+        );
+        assert!(index.symbols_by_identity(id, 0).is_err());
+        assert!(
+            index
+                .symbols_by_identity(id, index.results_max() + 1)
+                .is_err()
+        );
+    }
+
     #[test]
     fn canonical_identity_directory_retains_physical_bindings_and_fixed_owner() {
         let root = tempfile::tempdir().expect("workspace");
@@ -12099,6 +12340,14 @@ mod tests {
         let named_id = identity(&named);
         assert_ne!(primary_id, named_id);
         assert_eq!(
+            primary.canonical_examples(2).expect("deduplicated sample"),
+            std::slice::from_ref(&primary_id)
+        );
+        assert_eq!(
+            named.canonical_examples(2).expect("named sample"),
+            std::slice::from_ref(&named_id)
+        );
+        assert_eq!(
             rift_protocol::identity::SymbolIdentity::parse(primary_id.as_str())
                 .expect("established logical identity")
                 .language()
@@ -12106,41 +12355,7 @@ mod tests {
             "javascript"
         );
         for (index, id) in [(&primary, &primary_id), (&named, &named_id)] {
-            let bindings = index.symbols_by_identity(id, 10).expect("exact bindings");
-            assert_eq!(bindings.len(), 2);
-            assert_eq!(bindings[0].file.path().as_str(), "index.d.ts");
-            assert_eq!(bindings[1].file.path().as_str(), "index.js");
-            assert_eq!(bindings[0].file.syntax().language().name, "typescript");
-            assert_eq!(bindings[1].file.syntax().language().name, "javascript");
-            assert_eq!(
-                bindings[0]
-                    .symbol
-                    .signatures
-                    .first()
-                    .map(|signature| signature.display.as_str()),
-                Some("function open(path: string): void")
-            );
-            assert_eq!(
-                bindings[1]
-                    .symbol
-                    .signatures
-                    .first()
-                    .map(|signature| signature.display.as_str()),
-                Some("function open(path)")
-            );
-            assert_eq!(
-                index
-                    .symbols_by_identity(id, 1)
-                    .expect("bounded page")
-                    .len(),
-                1
-            );
-            assert!(index.symbols_by_identity(id, 0).is_err());
-            assert!(
-                index
-                    .symbols_by_identity(id, index.results_max() + 1)
-                    .is_err()
-            );
+            assert_canonical_physical_bindings(index, id);
         }
         assert!(
             primary
@@ -12227,6 +12442,179 @@ mod tests {
             "rift.analysis.documentation_limit_exceeded"
         );
         assert_eq!(bounded.mapping_count(), original_count);
+    }
+
+    #[test]
+    fn canonical_examples_sample_captured_identities_without_directory_initialization() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )
+        .expect("captured metadata");
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn open() {}\npub fn close() {}\n",
+        )
+        .expect("source");
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("index");
+        assert!(index.symbol_declarations.get().is_none());
+        assert_eq!(index.canonical_examples(2).expect("cold sample").len(), 2);
+        assert!(index.symbol_declarations.get().is_none());
+        let matched = index.symbols("open", 1).expect("physical match")[0];
+        let readable = index.assembled_symbol(matched).expect("retained identity");
+        let identity = readable.identity().expect("canonical identity");
+        assert_eq!(
+            index
+                .symbols_by_identity(identity, 1)
+                .expect("initialize directory")
+                .len(),
+            1
+        );
+        let examples = index.canonical_examples(2).expect("captured sample");
+        assert_eq!(examples.len(), 2);
+        assert!(
+            examples
+                .windows(2)
+                .all(|pair| pair[0].as_str() < pair[1].as_str())
+        );
+        for identity in &examples {
+            let parsed = rift_protocol::identity::SymbolIdentity::parse(identity.as_str())
+                .expect("canonical sample");
+            assert_eq!(parsed.owner(), index.owner());
+            assert_eq!(
+                index
+                    .symbols_by_identity(identity, 1)
+                    .expect("physical sample")
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(
+            index.canonical_examples(1).expect("bounded sample"),
+            examples[..1]
+        );
+        assert!(index.canonical_examples(0).is_err());
+        assert!(index.canonical_examples(index.results_max() + 1).is_err());
+        let (_, foreign) = crate::documentation::declarations(
+            &index.files,
+            &index.semantics,
+            &SymbolOwner::NamedLocal {
+                name: "cloud".to_owned(),
+            },
+        );
+        assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn canonical_examples_deduplicate_bindings_and_keep_fewer_than_two() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+        )
+        .expect("captured package metadata");
+        fs::write(
+            root.path().join("index.js"),
+            "export function open(path) {}\n",
+        )
+        .expect("implementation");
+        fs::write(
+            root.path().join("index.d.ts"),
+            "export declare function open(path: string): void;\nexport declare function open(path: number): void;\n",
+        )
+        .expect("overloads");
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("captured index");
+        assert!(index.symbol_declarations.get().is_none());
+        let examples = index.canonical_examples(2).expect("cold first request");
+        assert_eq!(examples.len(), 1, "three bindings belong to one object");
+        assert!(index.symbol_declarations.get().is_none());
+        assert_eq!(index.symbols("open", 10).expect("bindings").len(), 3);
+        assert_eq!(
+            index
+                .symbols_by_identity(&examples[0], 10)
+                .expect("established bindings")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn canonical_identity_directory_does_not_promote_unproved_source_or_previous_view() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/lib.rs"), "pub fn open() {}\n").expect("source");
+        let build = || {
+            WorkspaceIndex::build(
+                root.path(),
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("index")
+        };
+        let previous = build();
+        let matched = previous.symbols("open", 1).expect("physical declaration");
+        let provider = symbol_identity("rust", "src/lib.rs", "open");
+        let retained = previous
+            .symbols_by_provider_identity(&provider, 1)
+            .expect("opaque provider identity");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].symbol.item_range, matched[0].symbol.item_range);
+        assert!(
+            previous
+                .assembled_symbol(matched[0])
+                .expect("retained facts")
+                .identity()
+                .is_none()
+        );
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )
+        .expect("captured root metadata");
+        let current = build();
+        let matched = current.symbols("open", 1).expect("current declaration");
+        let readable = current.assembled_symbol(matched[0]).expect("current facts");
+        let id = readable.identity().expect("current identity");
+        assert!(
+            current
+                .object_by_identity(id)
+                .expect("current object")
+                .is_some()
+        );
+        assert!(
+            previous
+                .object_by_identity(id)
+                .expect("unproved prior object")
+                .is_none()
+        );
+        assert_eq!(
+            current
+                .symbols_by_identity(id, 1)
+                .expect("current binding")
+                .len(),
+            1
+        );
+        assert!(
+            previous
+                .symbols_by_identity(id, 1)
+                .expect("unproved prior view")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -12317,184 +12705,6 @@ mod tests {
                 .object_by_identity(&missing)
                 .expect("exact miss")
                 .is_none()
-        );
-    }
-
-    fn assert_original_binding_facts(
-        binding: &rift_protocol::symbol_read::SymbolDeclaration,
-        expected: SymbolMatch<'_>,
-        object: &ReadableSymbol,
-    ) {
-        assert_eq!(
-            binding.path.as_ref().expect("physical path").0,
-            expected.file.path().as_str()
-        );
-        assert_eq!(binding.range.start, expected.symbol.item_range.start);
-        assert_eq!(binding.range.end, expected.symbol.item_range.end);
-        assert_eq!(
-            binding
-                .signature_indices
-                .iter()
-                .map(|position| {
-                    object.facts().signatures_slice()
-                        [usize::try_from(*position).expect("signature position")]
-                    .clone()
-                })
-                .collect::<Vec<_>>(),
-            expected.symbol.signatures.as_ref()
-        );
-        assert_eq!(
-            binding
-                .documentation_indices
-                .iter()
-                .map(|position| {
-                    object.facts().documentation_blocks()
-                        [usize::try_from(*position).expect("documentation position")]
-                    .clone()
-                })
-                .collect::<Vec<_>>(),
-            expected.symbol.documentation.as_ref()
-        );
-    }
-
-    #[test]
-    fn canonical_binding_pages_keep_original_order_and_total() {
-        let root = tempfile::tempdir().expect("workspace");
-        fs::write(
-            root.path().join("package.json"),
-            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
-        )
-        .expect("captured package metadata");
-        fs::write(
-            root.path().join("index.js"),
-            "/** Implementation. */\nexport function open(path) {}\n",
-        )
-        .expect("implementation");
-        fs::write(root.path().join("index.d.ts"),
-            "/** First overload. */\nexport declare function open(path: string): void;\n/** Second overload. */\nexport declare function open(path: number): void;\n")
-            .expect("original overload declarations");
-        let index = WorkspaceIndex::build(
-            root.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-        )
-        .expect("captured index");
-        let matched = index.symbols("open", 10).expect("physical declarations");
-        let object = index
-            .assembled_symbol(matched[0])
-            .expect("canonical object");
-        let identity = object.identity().expect("established identity");
-        let all = index
-            .symbols_by_identity(identity, 10)
-            .expect("all bindings");
-        assert_eq!(all.len(), 3);
-        assert_eq!(object.facts().signatures_slice().len(), 3);
-        assert_eq!(object.facts().documentation_blocks().len(), 3);
-        for (offset, expected) in all.iter().enumerate() {
-            let (page, total) = index
-                .symbols_by_identity_page(identity, offset, 1)
-                .expect("one immutable binding");
-            assert_eq!(total, 3);
-            assert_eq!(page.len(), 1);
-            assert_eq!(page[0].file.path(), expected.file.path());
-            assert_eq!(page[0].symbol.item_range, expected.symbol.item_range);
-            assert_eq!(page[0].symbol.signatures, expected.symbol.signatures);
-            let (facts, count) = index
-                .declarations_by_identity_page(identity, offset, 1)
-                .expect("cached original fact positions");
-            assert_eq!(count, 3);
-            assert_original_binding_facts(&facts[0], *expected, &object);
-            assert_eq!(
-                index
-                    .assembled_symbol(page[0])
-                    .expect("same logical object")
-                    .identity(),
-                Some(identity)
-            );
-        }
-        for offset in [3, usize::MAX] {
-            let (page, total) = index
-                .symbols_by_identity_page(identity, offset, 1)
-                .expect("past final binding");
-            assert_eq!(total, 3);
-            assert!(page.is_empty());
-            let (facts, count) = index
-                .declarations_by_identity_page(identity, offset, 1)
-                .expect("past final cached declaration");
-            assert_eq!(count, 3);
-            assert!(facts.is_empty());
-        }
-        assert!(index.symbols_by_identity_page(identity, 0, 0).is_err());
-        assert!(
-            index
-                .symbols_by_identity_page(identity, 0, index.results_max() + 1)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn canonical_identity_directory_does_not_promote_unproved_source_or_previous_view() {
-        let root = tempfile::tempdir().expect("workspace");
-        fs::create_dir(root.path().join("src")).expect("source directory");
-        fs::write(root.path().join("src/lib.rs"), "pub fn open() {}\n").expect("source");
-        let build = || {
-            WorkspaceIndex::build(
-                root.path(),
-                WorkspaceIndexLimits::default(),
-                &SourceVisibility::default(),
-                &TextFileInclusion::default(),
-            )
-            .expect("index")
-        };
-        let previous = build();
-        let matched = previous.symbols("open", 1).expect("physical declaration");
-        let provider = symbol_identity("rust", "src/lib.rs", "open");
-        let retained = previous
-            .symbols_by_provider_identity(&provider, 1)
-            .expect("opaque provider identity");
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].symbol.item_range, matched[0].symbol.item_range);
-        assert!(
-            previous
-                .assembled_symbol(matched[0])
-                .expect("retained facts")
-                .identity()
-                .is_none()
-        );
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[package]\nname='beacon'\nversion='1.0.0'\n",
-        )
-        .expect("captured root metadata");
-        let current = build();
-        let matched = current.symbols("open", 1).expect("current declaration");
-        let readable = current.assembled_symbol(matched[0]).expect("current facts");
-        let id = readable.identity().expect("current identity");
-        assert!(
-            current
-                .object_by_identity(id)
-                .expect("current object")
-                .is_some()
-        );
-        assert!(
-            previous
-                .object_by_identity(id)
-                .expect("unproved prior object")
-                .is_none()
-        );
-        assert_eq!(
-            current
-                .symbols_by_identity(id, 1)
-                .expect("current binding")
-                .len(),
-            1
-        );
-        assert!(
-            previous
-                .symbols_by_identity(id, 1)
-                .expect("unproved prior view")
-                .is_empty()
         );
     }
 

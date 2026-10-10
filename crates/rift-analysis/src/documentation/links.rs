@@ -25,6 +25,24 @@ pub struct DocumentationFragment {
     pub range: TextRange,
 }
 
+impl get_size2::GetSize for DocumentationFragment {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (source, tracker) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        let (name, tracker) = get_size2::GetSize::get_heap_size_with_tracker(&self.name, tracker);
+        (source.saturating_add(name), tracker)
+    }
+}
+
 /// Resolves bounded authored destinations against the accepted source set.
 ///
 /// `url::Url::join` handles relative URL references. Decoded paths then pass the
