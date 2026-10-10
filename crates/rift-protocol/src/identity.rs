@@ -621,6 +621,31 @@ pub fn valid_registration_name(value: &str) -> bool {
     valid_word(value) && !reserved
 }
 
+/// Parses the canonical local scope of a path-based operation.
+///
+/// Physical source paths remain relative to the selected project. A named scope
+/// selects its accepted registration; it does not change the source identity.
+///
+/// # Errors
+/// Returns the existing owner or length refusal for an invalid local scope.
+pub fn parse_local_scope(value: &str) -> Result<SymbolOwner, SymbolIdentityViolation> {
+    if value.len() > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    let owner = parse_owner(value, &mut std::iter::empty())?;
+    if !matches!(&owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }) {
+        return Err(SymbolIdentityViolation::Owner);
+    }
+    owner.validate()?;
+    if owner.wire_owner() != value {
+        return Err(SymbolIdentityViolation::Noncanonical);
+    }
+    Ok(owner)
+}
+
+#[cfg(test)]
+mod local_scope_tests;
+
 fn valid_manager(value: &str) -> bool {
     let reserved = ["local", "global", "all", "stdlib"].contains(&value);
     valid_word(value) && !reserved
