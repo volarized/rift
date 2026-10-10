@@ -18,6 +18,8 @@ pub enum PackageImportRootOrigin {
     PyModules,
     /// A statically captured Flit module selection.
     Flit,
+    /// A statically captured PDM package layout and build-path observations.
+    Pdm,
 }
 
 /// Original source prefix and established Python modules under that prefix.
@@ -94,7 +96,7 @@ impl PackageImportRoot {
     }
 }
 
-pub(super) fn validate_roots(roots: &[PackageImportRoot]) -> Result<(), RiftError> {
+pub(crate) fn validate_roots(roots: &[PackageImportRoot]) -> Result<(), RiftError> {
     if roots.len() > PACKAGE_IMPORT_ENTRIES_MAX {
         return invalid();
     }
