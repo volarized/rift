@@ -18,7 +18,19 @@ use rift_provider::{
 use rift_syntax::SyntaxLimits;
 use sha2::{Digest as _, Sha256};
 
+/// Original entry kind retained by a captured source inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveMemberKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic or hard link, whose target is not followed.
+    Link,
+}
+
 mod import_root;
+pub(crate) use import_root::validate_roots;
 #[cfg(feature = "collector")]
 mod namespace;
 
@@ -392,6 +404,13 @@ pub struct ExactPackageInput<'input> {
     artifact: Option<&'input PackageArtifact>,
     #[cfg(feature = "collector")]
     modules: &'input [NamespaceModule<'input>],
+    #[cfg(feature = "collector")]
+    build_paths: Option<
+        &'input std::collections::BTreeMap<
+            rift_protocol::read::ProjectPath,
+            Option<ArchiveMemberKind>,
+        >,
+    >,
     limits: ExactPackageLimits,
 }
 
@@ -426,6 +445,8 @@ impl<'input> ExactPackageInput<'input> {
             artifact: None,
             #[cfg(feature = "collector")]
             modules: &[],
+            #[cfg(feature = "collector")]
+            build_paths: None,
             limits,
         })
     }
@@ -454,6 +475,26 @@ impl<'input> ExactPackageInput<'input> {
     ) -> Result<Self, RiftError> {
         self.namespace_input().with_modules(modules)?;
         self.modules = modules;
+        Ok(self)
+    }
+
+    /// Adds captured build-path observations under the source count and byte bounds.
+    ///
+    /// An absent key is unknown. `None` records a verified missing path.
+    /// Archive observations require the complete admitted member inventory.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for invalid paths or exceeded bounds.
+    #[cfg(feature = "collector")]
+    pub fn with_build_paths(
+        mut self,
+        paths: &'input std::collections::BTreeMap<
+            rift_protocol::read::ProjectPath,
+            Option<ArchiveMemberKind>,
+        >,
+    ) -> Result<Self, RiftError> {
+        self.namespace_input().with_build_paths(paths)?;
+        self.build_paths = Some(paths);
         Ok(self)
     }
 
@@ -545,6 +586,10 @@ impl<'input> ExactPackageInput<'input> {
         )?;
         self.context_sources = sources;
         self.frameworks = frameworks;
+        #[cfg(feature = "collector")]
+        if let Some(paths) = self.build_paths {
+            self.namespace_input().with_build_paths(paths)?;
+        }
         Ok(self)
     }
 
@@ -713,6 +758,123 @@ mod tests {
     use rift_protocol::identity::{SourceDigest, SymbolOwner};
     use rift_protocol::read::RuntimeIdentity;
     use sha2::{Digest as _, Sha256};
+
+    #[cfg(feature = "collector")]
+    #[test]
+    fn released_build_paths_preserve_unknown_absence_and_member_kinds() {
+        use super::ArchiveMemberKind;
+        use rift_protocol::read::ProjectPath as ObservationPath;
+        use std::collections::BTreeMap;
+
+        let package = identity();
+        let owner = package.owner().expect("package owner");
+        let language = language();
+        let origin = origin(&package);
+        let path = ProjectPath::new("src/lib.rs").expect("source path");
+        let files = [PackageSource::new(&path, "source")];
+        let paths = BTreeMap::from([
+            (
+                ObservationPath(String::new()),
+                Some(ArchiveMemberKind::Directory),
+            ),
+            (
+                ObservationPath("src".to_owned()),
+                Some(ArchiveMemberKind::Directory),
+            ),
+            (
+                ObservationPath("src/lib.rs".to_owned()),
+                Some(ArchiveMemberKind::File),
+            ),
+            (
+                ObservationPath("hook.py".to_owned()),
+                Some(ArchiveMemberKind::Link),
+            ),
+            (ObservationPath("setup.py".to_owned()), None),
+        ]);
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(6, 64),
+        )
+        .expect("released input");
+        assert!(input.namespace_input().build_paths().is_none());
+        let captured = input.with_build_paths(&paths).expect("captured paths");
+        let view = captured.namespace_input();
+        assert_eq!(view.owner(), &owner);
+        assert_eq!(view.files()[0].path(), &path);
+        assert_eq!(view.build_paths(), Some(&paths));
+        assert_eq!(
+            view.build_paths()
+                .expect("observations")
+                .get(&ObservationPath("setup.py".to_owned())),
+            Some(&None)
+        );
+        assert!(
+            !view
+                .build_paths()
+                .expect("observations")
+                .contains_key(&ObservationPath("unknown.py".to_owned()))
+        );
+        let invalid = BTreeMap::from([(ObservationPath("../outside".to_owned()), None)]);
+        assert!(input.with_build_paths(&invalid).is_err());
+        assert!(input.namespace_input().build_paths().is_none());
+    }
+
+    #[cfg(feature = "collector")]
+    #[test]
+    fn released_build_path_bounds_survive_framework_setter_order() {
+        use rift_protocol::read::ProjectPath as ObservationPath;
+        use std::collections::BTreeMap;
+
+        let package = identity();
+        let owner = package.owner().expect("package owner");
+        let language = language();
+        let origin = origin(&package);
+        let path = ProjectPath::new("src/lib.rs").expect("source path");
+        let metadata_path = ProjectPath::new("Cargo.toml").expect("metadata path");
+        let files = [PackageSource::new(&path, "source")];
+        let metadata = [PackageSource::new(&metadata_path, "context")];
+        let paths = BTreeMap::from([(ObservationPath("src".to_owned()), None)]);
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(3, 16),
+        )
+        .expect("released input");
+        let first = input
+            .with_build_paths(&paths)
+            .expect("paths first")
+            .with_framework_context(&metadata, &[])
+            .expect("exact aggregate bounds");
+        let second = input
+            .with_framework_context(&metadata, &[])
+            .expect("context first")
+            .with_build_paths(&paths)
+            .expect("same aggregate bounds");
+        assert_eq!(
+            first.namespace_input().build_paths(),
+            second.namespace_input().build_paths()
+        );
+        for limits in [
+            ExactPackageLimits::new(2, 16),
+            ExactPackageLimits::new(3, 15),
+        ] {
+            let bounded = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
+                .expect("sources fit before additions");
+            let paths_first = bounded.with_build_paths(&paths).expect("initial paths fit");
+            assert!(paths_first.with_framework_context(&metadata, &[]).is_err());
+            let context_first = bounded
+                .with_framework_context(&metadata, &[])
+                .expect("initial context fits");
+            assert!(context_first.with_build_paths(&paths).is_err());
+            assert_eq!(paths_first.namespace_input().build_paths(), Some(&paths));
+            assert!(context_first.namespace_input().build_paths().is_none());
+        }
+    }
 
     #[test]
     fn captured_external_source_requires_original_path_digest_and_origin() {

@@ -73,9 +73,14 @@ pub(crate) fn declarations(
             if let Some(identity) =
                 crate::workspace::ReadableSymbol::assembled_by(semantics, &identity)
                     .and_then(|readable| readable.identity().cloned())
-                    .and_then(|identity| SymbolId::parse(identity.as_str()).ok())
+                    .and_then(|identity| {
+                        rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).ok()
+                    })
             {
-                declarations.push(DeclarationFacts::new(file, symbol, identity));
+                let mut declaration =
+                    DeclarationFacts::new(file, symbol, SymbolId(identity.wire_identity()));
+                declaration.language = identity.language().clone();
+                declarations.push(declaration);
             }
         }
     }
@@ -1147,6 +1152,19 @@ mod tests {
         serde_json::to_string(index).expect("public documentation serializes canonically");
     }
 
+    fn documentation_symbol(
+        language: rift_protocol::read::Language,
+        name: &str,
+    ) -> rift_protocol::read::SymbolId {
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            language,
+            vec![name.to_owned()],
+        )
+        .expect("established local fixture identity");
+        rift_protocol::read::SymbolId::parse(&identity.wire_identity()).expect("canonical identity")
+    }
+
     #[test]
     fn attached_documentation_matches_accepted_source_and_symbol() {
         let directory = tempfile::tempdir().expect("temporary workspace");
@@ -1177,18 +1195,15 @@ mod tests {
             .iter()
             .find(|symbol| symbol.qualified_name == "plain")
             .expect("plain declaration");
-        let canonical = |name: &str| {
-            let identity = rift_protocol::identity::SymbolIdentity::new(
-                rift_protocol::identity::SymbolOwner::Local,
-                file.syntax().language().clone(),
-                vec![name.to_owned()],
-            )
-            .expect("established local fixture identity");
-            rift_protocol::read::SymbolId::parse(&identity.wire_identity())
-                .expect("canonical identity")
-        };
+        let canonical = |name: &str| documentation_symbol(file.syntax().language().clone(), name);
         let accepted_facts = super::DeclarationFacts::new(file, accepted, canonical("accepted"));
         accepted_facts.validated().expect("canonical declaration");
+        let mut unrelated_language =
+            super::DeclarationFacts::new(file, accepted, canonical("accepted"));
+        unrelated_language.language =
+            rift_protocol::read::Language::from_identity_segment("javascript")
+                .expect("semantic language");
+        assert!(unrelated_language.validated().is_err());
         serde_json::to_string(&accepted_facts.symbol).expect("canonical public identity");
         let files = BTreeMap::from([(path.clone(), Arc::new(file.clone()))]);
         let (collection, _) = super::build(

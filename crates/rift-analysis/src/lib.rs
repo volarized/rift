@@ -2,6 +2,8 @@
 
 #[cfg(feature = "collector")]
 mod analyzer;
+#[cfg(feature = "collector")]
+pub use analyzer::namespace::python::build_paths;
 #[cfg(feature = "archive")]
 pub mod archive;
 mod chunk;
@@ -34,8 +36,8 @@ pub use framework::{FrameworkContext, ResolvedFramework};
 #[cfg(feature = "collector")]
 pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use input::{
-    ExactPackageInput, ExactPackageLimits, PACKAGE_IMPORT_BYTES_MAX, PACKAGE_IMPORT_ENTRIES_MAX,
-    PackageImportRoot, PackageImportRootOrigin, PackageSource,
+    ArchiveMemberKind, ExactPackageInput, ExactPackageLimits, PACKAGE_IMPORT_BYTES_MAX,
+    PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot, PackageImportRootOrigin, PackageSource,
 };
 #[cfg(feature = "collector")]
 pub use input::{NamespaceInput, NamespaceModule};

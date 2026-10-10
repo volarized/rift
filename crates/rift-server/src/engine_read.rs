@@ -231,38 +231,39 @@ pub fn uses_engine_references(
             .violation("not a symbol identity")
             .error()
     })?;
-    Ok(reachable_reference_source(
-        reads.relationships(),
-        &seed,
-        traversal,
-        |identity| reference_source(reads, engines, identity).is_some(),
-    ))
+    reachable_reference_source(reads.relationships(), &seed, traversal, |identity| {
+        Ok(reference_source(reads, engines, identity)?.is_some())
+    })
 }
 
 fn reachable_reference_source(
     store: &RelationshipStore,
     seed: &CoreSymbolId,
     traversal: &SearchTraversal,
-    has_source: impl Fn(&CoreSymbolId) -> bool,
-) -> bool {
-    if has_source(seed) {
-        return true;
+    has_source: impl Fn(&CoreSymbolId) -> Result<bool, RiftError>,
+) -> Result<bool, RiftError> {
+    if has_source(seed)? {
+        return Ok(true);
     }
     if traversal.depth == 1 {
-        return false;
+        return Ok(false);
     }
     let mut prior = traversal.clone();
     prior.depth -= 1;
-    walk_traversal_with_references(
+    let discovered = walk_traversal_with_references(
         store,
         seed,
         &prior,
         TRAVERSAL_NODES_MAX,
         &EngineReferences::default(),
     )
-    .discovered
-    .into_iter()
-    .any(|(identity, _)| has_source(&identity))
+    .discovered;
+    for (identity, _) in discovered {
+        if has_source(&identity)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The traversal a configured engine may answer for, with the declaration it starts at:
@@ -284,19 +285,24 @@ fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &Symb
     (current && symbols && served).then_some((traversal, seed))
 }
 
+type ReferenceSource<'source> = (
+    &'source EngineSlot,
+    &'source IndexedFile,
+    &'source SyntaxSymbol,
+);
+
 fn reference_source<'source>(
     reads: &'source ReadService,
     engines: &'source EnginePool,
     identity: &CoreSymbolId,
-) -> Option<(
-    &'source EngineSlot,
-    &'source IndexedFile,
-    &'source SyntaxSymbol,
-)> {
-    let (file, symbol) = resolve_graph_symbol(reads.index(), identity)?;
-    symbol.name_range?;
-    let slot = engines.engine_for(file.syntax().language())?;
-    Some((slot, file, symbol))
+) -> Result<Option<ReferenceSource<'source>>, RiftError> {
+    Ok(
+        resolve_graph_symbol(reads.index(), identity)?.and_then(|(file, symbol)| {
+            symbol.name_range?;
+            let slot = engines.engine_for(file.syntax().language())?;
+            Some((slot, file, symbol))
+        }),
+    )
 }
 
 /// Resolves incoming references or outgoing calls while retaining every indexed
@@ -585,6 +591,7 @@ fn call_hop(from: &SymbolId, to: SymbolId) -> GraphHop {
             kind: ExactKind(RelationshipFacet::Calls.as_ref().to_owned()),
             facets: vec![RelationshipFacet::Calls],
             evidence: Vec::new(),
+            occurrence: None,
             derivation: RelationshipDerivation::Resolution,
             confidence: None,
             extensions: Extensions::default(),
@@ -721,7 +728,7 @@ async fn resolve_symbol_callees(
     identity: &CoreSymbolId,
     walk: OutgoingWalk<'_>,
 ) -> Result<SymbolCallees, RiftError> {
-    let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
+    let Some((slot, file, symbol)) = reference_source(reads, engines, identity)? else {
         return Ok(SymbolCallees::NotServed);
     };
     let language = file.syntax().language().clone();
@@ -887,7 +894,7 @@ async fn resolve_symbol_references(
     identity: &CoreSymbolId,
     deadline: Instant,
 ) -> Result<SymbolReferences, RiftError> {
-    let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
+    let Some((slot, file, symbol)) = reference_source(reads, engines, identity)? else {
         return Ok(SymbolReferences::NotServed);
     };
     let language = file.syntax().language().clone();
@@ -1156,6 +1163,7 @@ fn map_references(
                 kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
                 facets: vec![RelationshipFacet::References],
                 evidence: Vec::new(),
+                occurrence: None,
                 derivation: RelationshipDerivation::Resolution,
                 confidence: None,
                 extensions: Extensions::default(),
@@ -1226,9 +1234,10 @@ fn project_declaration(
             .detail("an engine range ends before it starts")
             .fail();
     }
-    Ok(file
-        .enclosing_symbol(start, end)
-        .map(|symbol| symbol_id(file, symbol)))
+    let Some(symbol) = file.enclosing_symbol(start, end) else {
+        return Ok(None);
+    };
+    symbol_id(reads.index(), crate::search::declared(file, symbol))
 }
 
 /// Reads the exact name range retained by the syntax provider.
@@ -1641,7 +1650,7 @@ mod tests {
     /// `change`, and with `scope: "global"`.
     #[test]
     fn an_outgoing_walk_keeps_the_incoming_walk_refusals() {
-        let seed = "rift://symbol/rust/lib.rs/beacon";
+        let seed = crate::traversal::tests::graph_identity("beacon");
         for (extra, slug, context_key, context_value) in [
             (
                 json!({"rev": "main"}),
@@ -1683,12 +1692,32 @@ mod tests {
     }
 
     fn reads(root: &std::path::Path) -> Result<ReadService, crate::RiftError> {
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+        )
+        .map_err(|source| {
+            errors::index::workspace_filesystem()
+                .path(&manifest)
+                .source(source)
+                .error()
+        })?;
         ReadService::build(
             root,
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &TextFileInclusion::default(),
             HistoryConfiguration::default(),
+        )
+    }
+
+    fn python_module_metadata(root: &std::path::Path, modules: &str) -> std::io::Result<()> {
+        fs::write(
+            root.join("pyproject.toml"),
+            format!(
+                "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules={modules}\n"
+            ),
         )
     }
 
@@ -1763,7 +1792,10 @@ mod tests {
     #[test]
     fn reference_mapping_retains_cross_file_callers_and_deduplicates() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\nmod caller;\n",
+        )?;
         fs::write(
             directory.path().join("caller.rs"),
             "pub fn caller() { beacon(); beacon(); }\n",
@@ -1894,7 +1926,18 @@ mod tests {
         let reads = reads(directory.path())?;
         let configuration = serde_json::from_value(json!({"command":"/refused-engine"}))?;
         let engines = pool(directory.path(), "toml", configuration);
-        let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+        assert!(reads.get_symbol(&params)?.hits[0].symbol.id.is_none());
+        let language = rift_protocol::read::Language::from_identity_segment("toml")?;
+        let identity = |name: &str| {
+            rift_protocol::identity::SymbolIdentity::new(
+                rift_protocol::identity::SymbolOwner::Local,
+                language.clone(),
+                vec!["beacon".to_owned(), name.to_owned()],
+            )
+            .map(|identity| identity.wire_identity())
+        };
+        let target = rift_core::SymbolId::new(identity("beacon")?)?;
         let file = reads
             .index()
             .file(&ProjectPath::new("settings.toml")?)
@@ -1915,7 +1958,7 @@ mod tests {
             .await?,
             super::SymbolReferences::NotServed
         ));
-        let absent = rift_core::SymbolId::new("rift://symbol/toml/absent.toml/beacon")?;
+        let absent = rift_core::SymbolId::new(identity("absent")?)?;
         assert!(matches!(
             Box::pin(super::resolve_symbol_references(
                 &reads,
@@ -1940,6 +1983,7 @@ mod tests {
             directory.path().join("main.py"),
             "def beacon() -> int:\n    return 7\n\ndef caller() -> int:\n    return beacon()\n\ndef outer() -> int:\n    return caller()\n",
         )?;
+        python_module_metadata(directory.path(), "['main']")?;
         let reads = reads(directory.path())?;
         let configuration = serde_json::from_value(
             json!({"embedded":"ty","retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}}),
@@ -2044,6 +2088,7 @@ mod tests {
             directory.path().join("main.py"),
             "def beacon() -> int:\n    return 7\n\ndef caller() -> int:\n    return beacon()\n",
         )?;
+        python_module_metadata(directory.path(), "['main']")?;
         let reads = reads(directory.path())?;
         let target = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let prior = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
@@ -2178,6 +2223,7 @@ mod tests {
         let caller = "from helper import beacon\n\ndef caller() -> int:\n    return beacon()\n";
         fs::write(directory.path().join("helper.py"), declaration)?;
         fs::write(directory.path().join("main.py"), caller)?;
+        python_module_metadata(directory.path(), "['main','helper']")?;
         let reads = reads(directory.path())?;
         let configuration = serde_json::from_value(
             json!({"embedded":"ty","retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}}),
@@ -2326,6 +2372,7 @@ mod tests {
             directory.path().join("helper.py"),
             "def beacon() -> int:\n    return 7\n",
         )?;
+        python_module_metadata(directory.path(), "['helper']")?;
         let reads = ReadService::build_with_languages(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -2385,8 +2432,8 @@ mod tests {
     #[test]
     fn depth_two_reaches_engine_configured_caller_of_unconfigured_seed() -> TestResult {
         let store = crate::traversal::tests::call_graph_store();
-        let seed = rift_core::SymbolId::new("rift://symbol/rust/lib.rs/leaf")?;
-        let caller = rift_core::SymbolId::new("rift://symbol/rust/lib.rs/branch_a")?;
+        let seed = rift_core::SymbolId::new(crate::traversal::tests::graph_identity("leaf"))?;
+        let caller = rift_core::SymbolId::new(crate::traversal::tests::graph_identity("branch_a"))?;
         let mut traversal = request(&SymbolId(seed.as_str().to_owned()))
             .traversal
             .expect("traversal");
@@ -2394,16 +2441,25 @@ mod tests {
         let selected = |identity: &rift_core::SymbolId| identity == &caller;
         assert!(!selected(&seed));
         assert!(!super::reachable_reference_source(
-            &store, &seed, &traversal, selected
-        ));
+            &store,
+            &seed,
+            &traversal,
+            |identity| Ok(selected(identity))
+        )?);
         traversal.depth = 2;
         assert!(super::reachable_reference_source(
-            &store, &seed, &traversal, selected
-        ));
+            &store,
+            &seed,
+            &traversal,
+            |identity| Ok(selected(identity))
+        )?);
         traversal.facets = vec![rift_protocol::read::RelationshipFacet::References];
         assert!(!super::reachable_reference_source(
-            &store, &seed, &traversal, selected
-        ));
+            &store,
+            &seed,
+            &traversal,
+            |identity| Ok(selected(identity))
+        )?);
         Ok(())
     }
 
@@ -2506,7 +2562,7 @@ done
         let engines = method_engine(directory.path(), engine.path(), &steps)?;
         let beacon = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
-        let absent = rift_core::SymbolId::new("rift://symbol/rust/absent.rs/beacon")?;
+        let absent = rift_core::SymbolId::new(crate::traversal::tests::graph_identity("absent"))?;
         let mut references = EngineReferences::default();
         let mut requested = std::collections::BTreeSet::from([caller.clone()]);
         let (deadline, roots) = walk();
@@ -2691,6 +2747,7 @@ done
         let source =
             "def beacon() -> int:\n    return 7\n\ndef caller() -> int:\n    return beacon()\n";
         fs::write(directory.path().join("main.py"), source)?;
+        python_module_metadata(directory.path(), "['main']")?;
         let reads = reads(directory.path())?;
         let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
         let prior = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;

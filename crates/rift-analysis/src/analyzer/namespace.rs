@@ -7,8 +7,9 @@ use rift_protocol::identity::{SymbolIdentity, SymbolOccurrence};
 use rift_protocol::index::python_identifier_is_valid;
 use rift_syntax::SyntaxFacts;
 
-use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot};
+use crate::{ExactPackageInput, NamespaceInput, PackageImportRoot, PackageImportRootOrigin};
 
+pub(crate) mod python;
 mod rust;
 mod typescript;
 
@@ -102,22 +103,42 @@ pub(crate) fn prepare_context(
 ) -> PreparedNamespace {
     let mut prepared = typescript::prepare(input, selected);
     prepared.anchors.extend(rust::prepare(input, selected));
+    let mut roots = input.import_roots().to_vec();
+    for root in python::import_roots(input) {
+        if !roots.iter().any(|accepted| {
+            accepted.prefix() == root.prefix() && accepted.modules() == root.modules()
+        }) {
+            roots.push(root);
+        }
+    }
+    let roots_accepted = crate::input::validate_roots(&roots).is_ok();
     for file in selected {
         if file.syntax.language().name == "python" {
             prepared.anchors.insert(
                 file.path.as_str().to_owned(),
-                identity_anchors(input, file.syntax, file.path.as_str(), file.source),
+                if roots_accepted {
+                    identity_anchors_with_roots(
+                        input,
+                        file.syntax,
+                        file.path.as_str(),
+                        file.source,
+                        &roots,
+                    )
+                } else {
+                    BTreeMap::new()
+                },
             );
         }
     }
     prepared
 }
 
-pub(super) fn identity_anchors(
+fn identity_anchors_with_roots(
     input: &NamespaceInput<'_>,
     syntax: &SyntaxFacts,
     path: &str,
     source: &str,
+    roots: &[PackageImportRoot],
 ) -> BTreeMap<String, SymbolId> {
     if syntax.language().name != "python"
         || syntax.language().dialect.is_some()
@@ -126,7 +147,7 @@ pub(super) fn identity_anchors(
     {
         return BTreeMap::new();
     }
-    let Some(module) = python_module(path, input.import_roots()) else {
+    let Some(module) = python_module(path, roots) else {
         return BTreeMap::new();
     };
     let revision = crate::documentation::content_digest(source.as_bytes()).0;
@@ -252,9 +273,10 @@ fn python_module(path: &str, roots: &[PackageImportRoot]) -> Option<Vec<String>>
         let spelling = parts.join(".");
         if !root.modules().iter().any(|module| {
             spelling == *module
-                || spelling
-                    .strip_prefix(module.as_str())
-                    .is_some_and(|tail| tail.starts_with('.'))
+                || (root.origin() != PackageImportRootOrigin::PyModules
+                    && spelling
+                        .strip_prefix(module.as_str())
+                        .is_some_and(|tail| tail.starts_with('.')))
         }) {
             continue;
         }
@@ -354,6 +376,31 @@ mod tests {
             root(Some("alpha"), &["core"], PackageImportRootOrigin::Flit),
         ];
         assert_eq!(python_module("alpha/core.py", &roots), None);
+    }
+
+    #[test]
+    fn explicit_modules_do_not_establish_package_children() {
+        let modules = [root(None, &["main"], PackageImportRootOrigin::PyModules)];
+        assert_eq!(
+            python_module("main.py", &modules),
+            Some(vec!["main".to_owned()])
+        );
+        assert_eq!(
+            python_module("main.pyi", &modules),
+            Some(vec!["main".to_owned()])
+        );
+        assert_eq!(python_module("main/child.py", &modules), None);
+        for origin in [
+            PackageImportRootOrigin::Wheel,
+            PackageImportRootOrigin::Flit,
+            PackageImportRootOrigin::Pdm,
+        ] {
+            let packages = [root(None, &["main"], origin)];
+            assert_eq!(
+                python_module("main/child.py", &packages),
+                Some(vec!["main".to_owned(), "child".to_owned()])
+            );
+        }
     }
 
     #[test]

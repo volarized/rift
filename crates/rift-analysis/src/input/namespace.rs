@@ -7,7 +7,9 @@ use rift_protocol::identity::{
 use rift_protocol::read::Language;
 use rift_syntax::SyntaxLimits;
 
-use super::{ExactPackageInput, ExactPackageLimits, PackageImportRoot, PackageSource};
+use super::{
+    ArchiveMemberKind, ExactPackageInput, ExactPackageLimits, PackageImportRoot, PackageSource,
+};
 
 /// Captured owner, selected sources, and metadata used to place logical declarations.
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +23,8 @@ pub struct NamespaceInput<'input> {
     bytes_max: u64,
     syntax: SyntaxLimits,
     modules: &'input [NamespaceModule<'input>],
+    build_paths:
+        Option<&'input BTreeMap<rift_protocol::read::ProjectPath, Option<ArchiveMemberKind>>>,
 }
 
 impl<'input> NamespaceInput<'input> {
@@ -38,6 +42,7 @@ impl<'input> NamespaceInput<'input> {
             bytes_max: input.limits.bytes_max(),
             syntax: input.limits.syntax(),
             modules: input.modules,
+            build_paths: input.build_paths,
         }
     }
 
@@ -121,6 +126,7 @@ impl<'input> NamespaceInput<'input> {
             bytes_max,
             syntax,
             modules: &[],
+            build_paths: None,
         })
     }
 
@@ -145,6 +151,47 @@ impl<'input> NamespaceInput<'input> {
     #[must_use]
     pub const fn modules(self) -> &'input [NamespaceModule<'input>] {
         self.modules
+    }
+
+    /// Adds captured build-path observations under the input count and byte bounds.
+    ///
+    /// An absent key is unknown. `None` records a verified missing path; other values
+    /// retain the file type observed without following a symbolic link.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for invalid paths or exceeded bounds.
+    pub fn with_build_paths(
+        mut self,
+        paths: &'input BTreeMap<rift_protocol::read::ProjectPath, Option<ArchiveMemberKind>>,
+    ) -> Result<Self, RiftError> {
+        let count = self
+            .files
+            .len()
+            .checked_add(self.context_sources.len())
+            .and_then(|count| count.checked_add(paths.len()))
+            .ok_or_else(invalid)?;
+        self.validate_count(count)?;
+        let mut bytes = self
+            .files
+            .iter()
+            .chain(self.context_sources)
+            .try_fold(0_u64, |bytes, source| {
+                counted_bytes(bytes, source.text.len(), self.bytes_max)
+            })?;
+        for path in paths.keys() {
+            rift_core::ProjectPath::new(path.0.as_str()).map_err(|_| invalid())?;
+            bytes = counted_bytes(bytes, path.0.len(), self.bytes_max)?;
+        }
+        self.build_paths = Some(paths);
+        Ok(self)
+    }
+
+    /// Captured build-path observations, or no supplied observations.
+    #[must_use]
+    pub const fn build_paths(
+        self,
+    ) -> Option<&'input BTreeMap<rift_protocol::read::ProjectPath, Option<ArchiveMemberKind>>> {
+        self.build_paths
     }
 
     /// Logical owner selected before namespace placement.

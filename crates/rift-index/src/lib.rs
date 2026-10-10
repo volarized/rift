@@ -41,7 +41,7 @@ pub use rift_analysis::documentation::{
 pub use rift_analysis::documentation::{
     DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
 };
-pub use rift_analysis::{ForceIncludeReach, PathMatcher, PathVerdict};
+pub use rift_analysis::{ArchiveMemberKind, ForceIncludeReach, PathMatcher, PathVerdict};
 pub use rift_error::RiftError;
 pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
@@ -52,6 +52,7 @@ pub use workspace::{
     capture_digests_with_languages, capture_digests_with_languages_cancellable,
     capture_selected_paths_cancellable, capture_visible_digests_with_languages_cancellable,
     declaration_identity, relative_path, source_line_matches, symbol_matches, text_line_matches,
+    validate_project_owner,
 };
 
 /// Compile-time marker for index-layer ownership.
