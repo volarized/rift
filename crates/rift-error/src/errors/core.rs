@@ -336,6 +336,17 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    configuration_package_registry_invalid,
+    slug = "rift.core.configuration_package_registry_invalid",
+    message = "dependency package registry is not a canonical endpoint",
+    action = "correct the reported configuration field, then retry",
+    fields = {
+        field: optional(string),
+        package: optional(string),
+    },
+);
+
+__rift_error_definition!(
     configuration_package_selector_invalid,
     slug = "rift.core.configuration_package_selector_invalid",
     message = "dependency package has conflicting or missing version selector",

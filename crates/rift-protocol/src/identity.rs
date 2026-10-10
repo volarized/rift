@@ -539,6 +539,12 @@ fn valid_manager(value: &str) -> bool {
     valid_word(value) && !reserved
 }
 
+/// Whether an endpoint is canonical and within the defining registry byte bound.
+#[must_use]
+pub fn registry_endpoint_is_valid(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 4096 && valid_registry(value)
+}
+
 fn valid_registry(value: &str) -> bool {
     let Ok(url) = url::Url::parse(&format!("https://{value}")) else {
         return false;

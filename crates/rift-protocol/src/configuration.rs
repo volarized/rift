@@ -3219,6 +3219,13 @@ pub enum ConfigurationViolation {
         /// The rejected entry, spelled `<manager>/<name>`.
         package: String,
     },
+    /// A `dependencies.packages.registry` value is not a canonical registry endpoint.
+    PackageRegistryInvalid {
+        /// Configuration key carrying the registry.
+        field: &'static str,
+        /// The rejected entry, spelled `<manager>/<name>`.
+        package: String,
+    },
     /// A `logs.capture` value is not a tracing filter directive.
     LogCaptureInvalid {
         /// The rejected filter.
@@ -3337,7 +3344,8 @@ impl ConfigurationViolation {
             Self::FileNameInvalid { field, name } => {
                 vec![("field", (*field).to_owned()), ("name", name.clone())]
             }
-            Self::PackageSelectorInvalid { field, package } => {
+            Self::PackageSelectorInvalid { field, package }
+            | Self::PackageRegistryInvalid { field, package } => {
                 vec![("field", (*field).to_owned()), ("package", package.clone())]
             }
             Self::LogCaptureInvalid { capture, detail } => vec![

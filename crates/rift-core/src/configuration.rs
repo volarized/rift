@@ -15,9 +15,14 @@ use rift_protocol::configuration::{
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
 
-use rift_error::errors::core::configuration_port_selection_conflict;
+use rift_error::errors::core::{
+    configuration_package_registry_invalid, configuration_package_selector_invalid,
+    configuration_port_selection_conflict,
+};
 use rift_error::{ErrorContext, RiftError, errors};
-use rift_protocol::configuration::ConfigurationViolation::{self, PortSelectionConflict};
+use rift_protocol::configuration::ConfigurationViolation::{
+    self, PackageRegistryInvalid, PackageSelectorInvalid, PortSelectionConflict,
+};
 #[cfg(test)]
 use rift_protocol::configuration::UnitParseError;
 
@@ -388,9 +393,8 @@ pub fn configuration_violation_error(violation: &ConfigurationViolation) -> Rift
         ConfigurationViolation::FileNameInvalid { .. } => {
             build!(errors::core::configuration_file_name_invalid())
         }
-        ConfigurationViolation::PackageSelectorInvalid { .. } => {
-            build!(errors::core::configuration_package_selector_invalid())
-        }
+        PackageSelectorInvalid { .. } => build!(configuration_package_selector_invalid()),
+        PackageRegistryInvalid { .. } => build!(configuration_package_registry_invalid()),
         ConfigurationViolation::LogCaptureInvalid { .. } => {
             build!(errors::core::configuration_log_capture_invalid())
         }
@@ -768,6 +772,18 @@ mod tests {
                 message: "dependency package has conflicting or missing version selector",
                 evidence: &[
                     ("field", "dependencies.packages"),
+                    ("package", "cargo/serde"),
+                ],
+            },
+            Case {
+                violation: ConfigurationViolation::PackageRegistryInvalid {
+                    field: "dependencies.packages.registry",
+                    package: "cargo/serde".to_owned(),
+                },
+                slug: "rift.core.configuration_package_registry_invalid",
+                message: "dependency package registry is not a canonical endpoint",
+                evidence: &[
+                    ("field", "dependencies.packages.registry"),
                     ("package", "cargo/serde"),
                 ],
             },

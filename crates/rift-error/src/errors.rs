@@ -99,6 +99,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.core.configuration_lsp_name_invalid",
     "rift.core.configuration_malformed",
     "rift.core.configuration_oversized",
+    "rift.core.configuration_package_registry_invalid",
     "rift.core.configuration_package_selector_invalid",
     "rift.core.configuration_path_pattern_invalid",
     "rift.core.configuration_port_range_inverted",

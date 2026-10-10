@@ -121,13 +121,13 @@ pub struct PackageContextEntry {
     /// Package manager or ecosystem name.
     #[schemars(length(max = 128))]
     pub manager: String,
+    /// Package name in that ecosystem.
+    #[schemars(length(max = 4096))]
+    pub name: String,
     /// Accepted registry endpoint. Absent for a path, Git repository or direct URL source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 4096))]
     pub registry: Option<String>,
-    /// Package name in that ecosystem.
-    #[schemars(length(max = 4096))]
-    pub name: String,
     /// The exact version a lockfile pins. Absent when only a manifest names the package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
@@ -194,6 +194,10 @@ pub struct ConfiguredPackage {
     /// Package name in that ecosystem.
     #[schemars(length(max = 4096))]
     pub name: String,
+    /// Accepted defining registry endpoint. Absent when the registry is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub registry: Option<String>,
     /// The exact version this entry pins. Set this or `requirement`, never both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
@@ -230,11 +234,13 @@ impl ConfiguredPackage {
 #[schemars(extend("examples" = [
     {
         "manager": "cargo",
+        "registry": "crates.io",
         "name": "tokio",
         "version": "1.47.1"
     },
     {
         "manager": "npm",
+        "registry": "npmjs.org",
         "name": "zod"
     }
 ]))]
@@ -245,6 +251,10 @@ pub struct RequestedPackage {
     /// Package name in that ecosystem.
     #[schemars(length(min = 1, max = 4096))]
     pub name: String,
+    /// Accepted defining registry endpoint. Absent when the registry is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub registry: Option<String>,
     /// The exact version to read. Absent, the entry asks for the requirement `>=0`, which
     /// the global index answers from its newest collected release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,26 +292,39 @@ impl RequestedPackage {
                     value.is_none_or(|value| (1..=chars_max).contains(&value.chars().count()));
                 (!within_length).then_some(violation)
             })
+            .or_else(|| {
+                (!registry_valid(self.registry.as_deref()))
+                    .then_some(RequestedPackageViolation::RegistryInvalid)
+            })
     }
 
     /// The context entry this package goes out as: its exact `version`, or the
     /// requirement [`REQUIREMENT_ANY`] when it names none.
     ///
-    /// The entry is `canonical`: the request names a package by manager and name, which
-    /// is what a public registry answers for, and carries no source this machine could
-    /// classify otherwise.
+    /// A validated explicit registry establishes the owner. Absent or invalid registry
+    /// evidence leaves the entry `registry_unresolved`.
     #[must_use]
     pub fn context_entry(&self) -> PackageContextEntry {
         let selector = self.version.as_ref().map_or_else(
             || PackageSelector::Requirement(REQUIREMENT_ANY.to_owned()),
             |version| PackageSelector::Version(version.clone()),
         );
-        PackageContextEntry::new(
+        let registry = self
+            .registry
+            .as_ref()
+            .filter(|_| registry_valid(self.registry.as_deref()));
+        let mut entry = PackageContextEntry::new(
             &self.manager,
             &self.name,
             selector,
-            PackageAvailability::Canonical,
-        )
+            if registry.is_some() {
+                PackageAvailability::Canonical
+            } else {
+                PackageAvailability::RegistryUnresolved
+            },
+        );
+        entry.registry = registry.cloned();
+        entry
     }
 }
 
@@ -310,6 +333,8 @@ impl RequestedPackage {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum RequestedPackageViolation {
+    /// `registry` is not a canonical defining registry endpoint.
+    RegistryInvalid,
     /// `manager` is empty, or longer than [`PACKAGE_MANAGER_CHARS_MAX`] characters.
     ManagerLength,
     /// `name` is empty, or longer than [`PACKAGE_NAME_CHARS_MAX`] characters.
@@ -410,13 +435,27 @@ fn default_dependencies_command_timeout() -> Duration {
 /// The first configured package stating no single version selector, entries in list
 /// order.
 fn configured_package_violation(packages: &[ConfiguredPackage]) -> Option<ConfigurationViolation> {
-    packages
-        .iter()
-        .find(|package| package.violation().is_some())
-        .map(|package| ConfigurationViolation::PackageSelectorInvalid {
-            field: "dependencies.packages",
-            package: format!("{}/{}", package.manager, package.name),
-        })
+    packages.iter().find_map(|package| {
+        if package.violation().is_some() {
+            Some(ConfigurationViolation::PackageSelectorInvalid {
+                field: "dependencies.packages",
+                package: format!("{}/{}", package.manager, package.name),
+            })
+        } else if !registry_valid(package.registry.as_deref()) {
+            Some(ConfigurationViolation::PackageRegistryInvalid {
+                field: "dependencies.packages.registry",
+                package: format!("{}/{}", package.manager, package.name),
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// An absent registry carries no owner; an explicit endpoint must already be canonical.
+#[must_use]
+pub fn registry_valid(registry: Option<&str>) -> bool {
+    registry.is_none_or(crate::identity::registry_endpoint_is_valid)
 }
 
 #[cfg(test)]
@@ -437,6 +476,7 @@ mod tests {
         ConfiguredPackage {
             manager: manager.to_owned(),
             name: name.to_owned(),
+            registry: None,
             version: version.map(str::to_owned),
             requirement: requirement.map(str::to_owned),
         }
@@ -839,10 +879,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_explicit_registry_configuration_and_request_retain_owner() {
+        let configured: ConfiguredPackage = serde_json::from_value(json!({
+            "manager": "cargo", "registry": "crates.io", "name": "serde", "version": "1.0.228"
+        }))
+        .expect("explicit defining registry is accepted");
+        assert_eq!(
+            configured.selector(),
+            Some(PackageSelector::Version("1.0.228".to_owned()))
+        );
+        let requested: RequestedPackage = serde_json::from_value(json!({
+            "manager": "cargo", "registry": "registry.example/team/api", "name": "serde", "version": "1.0.228"
+        })).expect("explicit defining registry is accepted");
+        assert_eq!(
+            requested.context_entry().registry.as_deref(),
+            Some("registry.example/team/api")
+        );
+    }
+
+    #[test]
+    fn test_explicit_registry_bounds_and_programmatic_configuration_validation() {
+        let mut package = configured("cargo", "serde", Some("1.0.228"), None);
+        for invalid in [
+            "",
+            "user:secret@registry.example",
+            "REGISTRY.EXAMPLE",
+            "registry.example?token=secret",
+        ] {
+            package.registry = Some(invalid.to_owned());
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.dependencies.packages = vec![package.clone()];
+            let violation = configuration
+                .validate()
+                .expect_err("invalid registry is refused");
+            assert_eq!(
+                violation,
+                ConfigurationViolation::PackageRegistryInvalid {
+                    field: "dependencies.packages.registry",
+                    package: "cargo/serde".to_owned()
+                }
+            );
+            if !invalid.is_empty() {
+                assert!(
+                    !serde_json::to_string(&violation)
+                        .expect("violation")
+                        .contains(invalid)
+                );
+            }
+            let mut request = requested("cargo", "serde", Some("1.0.228"));
+            request.registry = Some(invalid.to_owned());
+            assert_eq!(
+                request.violation(),
+                Some(RequestedPackageViolation::RegistryInvalid)
+            );
+            let entry = request.context_entry();
+            assert_eq!(entry.availability, PackageAvailability::RegistryUnresolved);
+            assert!(entry.registry.is_none());
+        }
+        package.registry = Some(format!(
+            "registry.example/{}",
+            "a".repeat(4096 - "registry.example/".len())
+        ));
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.dependencies.packages = vec![package.clone()];
+        assert!(
+            configuration.validate().is_ok(),
+            "canonical endpoint at byte bound passes"
+        );
+        let mut request = requested("cargo", "serde", Some("1.0.228"));
+        request.registry = package.registry.clone();
+        assert_eq!(request.violation(), None);
+        package.registry.as_mut().expect("registry").push('a');
+        request.registry = package.registry.clone();
+        assert_eq!(
+            request.violation(),
+            Some(RequestedPackageViolation::RegistryInvalid)
+        );
+        configuration.dependencies.packages = vec![package];
+        assert!(configuration.validate().is_err(), "past byte bound refuses");
+        let entry = requested("cargo", "serde", None).context_entry();
+        assert_eq!(entry.availability, PackageAvailability::RegistryUnresolved);
+        assert!(entry.registry.is_none());
+    }
+
     fn requested(manager: &str, name: &str, version: Option<&str>) -> RequestedPackage {
         RequestedPackage {
             manager: manager.to_owned(),
             name: name.to_owned(),
+            registry: None,
             version: version.map(str::to_owned),
         }
     }
@@ -906,13 +1031,18 @@ mod tests {
     /// A requested package goes out canonical, at its exact version or as `>=0`.
     #[test]
     fn test_a_requested_package_goes_out_as_one_canonical_entry() {
+        let unresolved = |version: Option<&str>, requirement: Option<&str>| {
+            let mut entry = context_entry(version, requirement);
+            entry.availability = PackageAvailability::RegistryUnresolved;
+            entry
+        };
         assert_eq!(
             requested("cargo", "serde", Some("1.0.228")).context_entry(),
-            context_entry(Some("1.0.228"), None)
+            unresolved(Some("1.0.228"), None)
         );
         assert_eq!(
             requested("cargo", "serde", None).context_entry(),
-            context_entry(None, Some(REQUIREMENT_ANY))
+            unresolved(None, Some(REQUIREMENT_ANY))
         );
         assert_eq!(REQUIREMENT_ANY, ">=0");
     }
@@ -945,6 +1075,10 @@ mod tests {
     #[test]
     fn test_requested_package_violation_labels_match_serde() {
         for (violation, spelling) in [
+            (
+                RequestedPackageViolation::RegistryInvalid,
+                "registry_invalid",
+            ),
             (RequestedPackageViolation::ManagerLength, "manager_length"),
             (RequestedPackageViolation::NameLength, "name_length"),
             (RequestedPackageViolation::VersionLength, "version_length"),

@@ -364,6 +364,11 @@ message = 'dependency package has conflicting or missing version selector'
 action = "correct the reported configuration field, then retry"
 fields = { field = { type = "string", optional = true }, package = { type = "string", optional = true } }
 
+[error.core.configuration_package_registry_invalid]
+message = 'dependency package registry is not a canonical endpoint'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, package = { type = "string", optional = true } }
+
 [error.core.configuration_log_capture_invalid]
 message = 'logs.capture is not a tracing filter directive'
 action = "correct the reported configuration field, then retry"
