@@ -409,3 +409,48 @@ fn tailwind_screen_variant_keeps_version_and_escaped_configuration_unresolved() 
         }));
     }
 }
+
+#[test]
+fn pinned_nextjs_post_body_keeps_multiline_facts_with_tailwind() {
+    let text = include_str!("nextjs-post-body.module.css");
+    let path = ProjectPath::new("examples/cms-umbraco/components/post-body.module.css")
+        .expect("pinned Next path");
+    let source = SyntaxSource { path: &path, text };
+    let limits = SyntaxLimits::default();
+    let original = CssSyntaxProvider::default()
+        .analyze(source, limits)
+        .expect("CSS facts");
+    assert!(!original.has_errors());
+    let retained = original.facts().left_out_symbols();
+    assert!(retained.iter().any(
+        |symbol| symbol.name == ".content p,\n.content ul,\n.content ol,\n.content blockquote"
+    ));
+    let facts = tailwind_symbols(source, &original, 4, limits).expect("Tailwind facts");
+    assert!(facts.unresolved.is_empty());
+    let combined = append_framework_symbols(source, limits, &original, facts.symbols)
+        .expect("pinned multiline selectors and Tailwind facts remain admitted");
+    for symbol in retained {
+        assert!(
+            combined.facts().left_out_symbols().contains(symbol),
+            "original retained fact: {symbol:?}"
+        );
+    }
+    for symbol in original.symbols() {
+        assert!(
+            combined.symbols().contains(symbol),
+            "original portable fact: {symbol:?}"
+        );
+    }
+    assert!(
+        combined
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == "text-lg")
+    );
+    assert!(
+        combined
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == ".content a")
+    );
+}

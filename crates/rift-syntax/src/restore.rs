@@ -351,7 +351,7 @@ pub(crate) fn validate_symbols(
 
 fn retained_name(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
     text(value, limits)?;
-    if value.is_empty() || value.chars().any(char::is_control) {
+    if !rift_protocol::read::symbol_name_is_retained(value, limits.source_bytes_max()) {
         return errors::syntax::facts_name_invalid().fail();
     }
     Ok(())
@@ -568,7 +568,12 @@ fn validate_symbol_parents(
                 retained_name(container, limits)?;
                 // Duplicate suffixing changes qualified names but retains authored containers.
                 match positions.get(container).copied() {
-                    None => 1,
+                    None => {
+                        if container.chars().any(char::is_control) {
+                            return errors::syntax::facts_name_invalid().fail();
+                        }
+                        1
+                    }
                     Some(parent) => {
                         if parent >= position || !contains(symbols[parent].range, symbol.range) {
                             return Err(errors::syntax::facts_reference_invalid().error());

@@ -951,3 +951,60 @@ fn retained_namespace_export_bindings_resolve_original_container_facts() {
         "rift.syntax.facts_reference_invalid"
     );
 }
+
+#[test]
+fn retained_source_whitespace_roundtrips_without_portable_identity() {
+    for whitespace in ["\n", "\r", "\t", "\u{000c}"] {
+        let source = format!(
+            ".first,{whitespace}.second {{ color: red; }}\n.neighbor {{ display: block; }}\n"
+        );
+        let document = parsed(ShippedLanguage::Css, &source);
+        assert!(!document.has_errors());
+        let facts = document.facts();
+        let retained = facts
+            .left_out_symbols()
+            .iter()
+            .find(|symbol| symbol.kind == "selector")
+            .expect("original selector with source whitespace");
+        assert!(retained.name.contains(whitespace));
+        assert!(!rift_core::is_portable_name(&retained.name));
+        assert!(rift_protocol::read::symbol_name_is_retained(
+            &retained.name,
+            source.len()
+        ));
+        let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(facts))
+            .expect("original retained selectors and child containers restore");
+        assert_eq!(&restored, facts);
+        assert!(
+            restored
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == ".neighbor")
+        );
+        for control in ['\0', '\u{000b}', '\u{007f}'] {
+            let mut invalid = parts(facts);
+            invalid.left_out_symbols[0].name.push(control);
+            assert_eq!(
+                SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+                    .expect_err("non-whitespace controls remain refused")
+                    .slug()
+                    .as_str(),
+                "rift.syntax.facts_name_invalid"
+            );
+        }
+        let mut invalid = parts(facts);
+        invalid
+            .left_out_symbols
+            .iter_mut()
+            .find(|symbol| symbol.container.is_some())
+            .expect("original child container")
+            .container = Some("absent\nparent".to_owned());
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+                .expect_err("control-containing missing parent remains refused")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_name_invalid"
+        );
+    }
+}

@@ -2172,6 +2172,17 @@ pub struct Symbol {
     pub document_local: bool,
 }
 
+/// Whether an original name fits the retained byte bound, including source whitespace.
+/// Portable identities apply their separate control-character restriction.
+#[must_use]
+pub fn symbol_name_is_retained(name: &str, bytes_max: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= bytes_max
+        && !name.chars().any(|character| {
+            character.is_control() && !matches!(character, '\t' | '\n' | '\r' | '\u{000c}')
+        })
+}
+
 impl Symbol {
     /// Whether the name fits the public character bound.
     ///
@@ -2194,9 +2205,7 @@ impl Symbol {
     /// of public character bounds and portable identity admission.
     #[must_use]
     pub fn name_is_retained(&self, bytes_max: usize) -> bool {
-        !self.name.is_empty()
-            && self.name.len() <= bytes_max
-            && !self.name.chars().any(char::is_control)
+        symbol_name_is_retained(&self.name, bytes_max)
     }
 }
 
@@ -3572,6 +3581,28 @@ mod tests {
         ] {
             let parsed: SourceUnitId = serde_json::from_value(json!(id)).expect("deserialize");
             assert_eq!(serde_json::to_value(&parsed).expect("serialize"), json!(id));
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_name_tests {
+    use super::symbol_name_is_retained;
+
+    #[test]
+    fn retained_names_accept_source_whitespace_without_portable_identity() {
+        for whitespace in ['\t', '\n', '\r', '\u{000c}'] {
+            let name = format!(".first,{whitespace}.second");
+            assert!(symbol_name_is_retained(&name, name.len()));
+            assert!(!symbol_name_is_retained(&name, name.len() - 1));
+            let encoded = serde_json::to_vec(&name).expect("source spelling encodes");
+            assert_eq!(
+                serde_json::from_slice::<String>(&encoded).expect("source spelling decodes"),
+                name
+            );
+        }
+        for name in ["", "bad\0name", "bad\u{000b}name", "bad\u{007f}name"] {
+            assert!(!symbol_name_is_retained(name, usize::MAX));
         }
     }
 }
