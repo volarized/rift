@@ -36,6 +36,12 @@ RESOURCE_URIS = {"rift://map", "rift://workspace"}
 
 
 PYTHON_SOURCE = "def serve(port: int) -> int:\n    return port\n\n\ndef caller() -> int:\n    return serve(8080)\n"
+PYTHON_METADATA = """[build-system]
+requires=['setuptools==80.9.0']
+build-backend='setuptools.build_meta'
+[tool.setuptools]
+py-modules=['service']
+"""
 PYTHON_CONFIGURATION = """
 [languages.python.lsp]
 embedded = "ty"
@@ -142,6 +148,9 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
             newline="",
         )
         (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
+        (root / "pyproject.toml").write_text(
+            PYTHON_METADATA, encoding="utf-8", newline=""
+        )
         with (
             retained_collector(base) as telemetry,
             Server(

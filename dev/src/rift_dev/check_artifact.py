@@ -32,6 +32,11 @@ def lay_out_workspace(root: Path) -> None:
     """Use source-only files so language package resolution reaches no network."""
     (root / "rift.toml").write_text(CONFIGURATION, encoding="utf-8", newline="")
     (root / "lib.rs").write_text(SOURCE, encoding="utf-8", newline="")
+    (root / "Cargo.toml").write_text(
+        "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+        encoding="utf-8",
+        newline="",
+    )
     (root / "README.md").write_text("# Beacon\n", encoding="utf-8", newline="")
 
 
