@@ -1125,9 +1125,9 @@
           "description": "The declaration name, or the file name including its extension.",
           "type": "string"
         },
-        "package": {
-          "$ref": "#/$defs/PackageIdentity",
-          "description": "The package the document belongs to."
+        "owner": {
+          "$ref": "#/$defs/SymbolOwner",
+          "description": "Exact logical owner of the document."
         },
         "qualified_name": {
           "description": "The container-qualified name. Absent on a file document.",
@@ -1147,7 +1147,7 @@
         "kind",
         "unit",
         "language",
-        "package",
+        "owner",
         "content_digest",
         "name",
         "digest"
@@ -1867,6 +1867,102 @@
       ],
       "type": "object"
     },
+    "SymbolOwner": {
+      "description": "Defining owner of a logical symbol.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The project served by the current workspace.",
+          "properties": {
+            "kind": {
+              "const": "local",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An explicitly registered project in the current connection.",
+          "properties": {
+            "kind": {
+              "const": "named_local",
+              "type": "string"
+            },
+            "name": {
+              "description": "Accepted registration name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One exact release from its defining registry.",
+          "properties": {
+            "kind": {
+              "const": "package",
+              "type": "string"
+            },
+            "manager": {
+              "description": "Package manager or ecosystem name.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Canonical package name, including an npm scope when present.",
+              "type": "string"
+            },
+            "registry": {
+              "description": "Canonical registry authority and optional endpoint path.",
+              "type": "string"
+            },
+            "version": {
+              "description": "Exact release version.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "manager",
+            "registry",
+            "name",
+            "version"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Standard-library object owned by a runtime or compiler.",
+          "properties": {
+            "kind": {
+              "const": "runtime",
+              "type": "string"
+            },
+            "runtime": {
+              "description": "Canonical runtime or compiler name.",
+              "type": "string"
+            },
+            "version": {
+              "description": "Exact runtime or compiler version.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "runtime",
+            "version"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "TextRange": {
       "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
       "properties": {
@@ -2029,7 +2125,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "One package's analyzed source, as the analyzer publishes it.\n\n`Eq` is not derived: [`PackageSymbol`] is not `Eq`.",
+  "description": "One package or runtime owner's analyzed source, as the analyzer publishes it.\n\n`Eq` is not derived: [`PackageSymbol`] is not `Eq`.",
   "properties": {
     "analyzer_revision": {
       "$ref": "#/$defs/Digest",
@@ -2053,9 +2149,9 @@
       "minimum": 1,
       "type": "integer"
     },
-    "package": {
-      "$ref": "#/$defs/PackageIdentity",
-      "description": "The package as its manager identifies it."
+    "owner": {
+      "$ref": "#/$defs/SymbolOwner",
+      "description": "Exact defining package, runtime, or compiler owner."
     },
     "source_digest": {
       "$ref": "#/$defs/Digest",
@@ -2089,7 +2185,7 @@
   "required": [
     "format_revision",
     "analyzer_revision",
-    "package",
+    "owner",
     "source_digest",
     "units",
     "symbols",
