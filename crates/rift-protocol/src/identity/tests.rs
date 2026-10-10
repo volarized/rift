@@ -51,6 +51,103 @@ fn test_canonical_owners_round_trip_without_losing_hierarchy() {
 }
 
 #[test]
+fn test_registry_endpoint_preserves_path_and_refuses_credentials_and_selectors() {
+    for (input, expected) in [
+        ("https://REGISTRY.example:443/", "registry.example"),
+        (
+            "https://registry.example/npm/releases",
+            "registry.example/npm/releases",
+        ),
+        (
+            "https://registry.example:8443/npm",
+            "registry.example:8443/npm",
+        ),
+    ] {
+        assert_eq!(
+            super::canonical_registry_endpoint(input).expect("accepted endpoint"),
+            expected
+        );
+    }
+    for input in [
+        "http://registry.example",
+        "https://user:secret@registry.example/npm",
+        "https://registry.example/npm?token=secret",
+        "https://registry.example/npm#release",
+        "https://registry.example/\n",
+    ] {
+        assert!(
+            super::canonical_registry_endpoint(input).is_err(),
+            "invalid endpoint"
+        );
+    }
+    assert!(super::canonical_registry_endpoint(&"x".repeat(4097)).is_err());
+}
+
+#[test]
+fn test_package_owner_requires_registry_and_runtime_has_no_registry() {
+    use crate::read::{PackageIdentity, RuntimeIdentity};
+    let json = serde_json::json!({"manager":"cargo", "registry":"crates.io", "name":"demo", "version":"1.0.0"});
+    let package: PackageIdentity = serde_json::from_value(json.clone()).expect("package");
+    assert!(
+        matches!(package.owner().expect("owner"), SymbolOwner::Package { registry, .. } if registry == "crates.io")
+    );
+    let runtime = RuntimeIdentity {
+        runtime: "cpython".into(),
+        version: "3.12.9".into(),
+    };
+    assert!(matches!(
+        runtime.owner().expect("runtime"),
+        SymbolOwner::Runtime { .. }
+    ));
+    for registry in [
+        "",
+        "https://crates.io",
+        "user:secret@crates.io",
+        "crates.io?token=secret",
+    ] {
+        let mut invalid = json.clone();
+        invalid["registry"] = serde_json::json!(registry);
+        assert!(serde_json::from_value::<PackageIdentity>(invalid).is_err());
+    }
+    let mut absent = json;
+    absent.as_object_mut().expect("object").remove("registry");
+    assert!(serde_json::from_value::<PackageIdentity>(absent).is_err());
+}
+
+#[test]
+fn test_full_endpoint_width_obeys_final_encoded_identity_bound() {
+    let registry = format!(
+        "registry.example/{}",
+        "x".repeat(4096 - "registry.example/".len())
+    );
+    let owner = SymbolOwner::Package {
+        manager: "cargo".into(),
+        registry,
+        name: "demo".into(),
+        version: "1.0.0".into(),
+    };
+    owner.validate().expect("owner at endpoint bound");
+    let base =
+        SymbolIdentity::new(owner.clone(), language(), vec!["demo".into()]).expect("short path");
+    let remaining = super::SYMBOL_ID_BYTES_MAX - base.wire_identity().len();
+    let at = SymbolIdentity::new(
+        owner.clone(),
+        language(),
+        vec![format!("demo{}", "x".repeat(remaining))],
+    )
+    .expect("final width");
+    assert_eq!(at.wire_identity().len(), super::SYMBOL_ID_BYTES_MAX);
+    assert!(
+        SymbolIdentity::new(
+            owner,
+            language(),
+            vec![format!("demo{}", "x".repeat(remaining + 1))]
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn test_component_escaping_preserves_data_and_rejects_alternate_spellings() {
     let identity = SymbolIdentity::new(
         SymbolOwner::Local,

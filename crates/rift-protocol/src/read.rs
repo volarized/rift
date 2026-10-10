@@ -940,18 +940,104 @@ pub struct NodesResult {
 }
 
 /// One package as its package manager identifies it.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageIdentity {
     /// Package manager or ecosystem name.
     #[schemars(length(max = 128))]
     pub manager: String,
+    /// Canonical registry endpoint, including its path when that path identifies the registry.
+    /// Credentials, query and fragment are never part of this owner.
+    #[schemars(length(min = 1, max = 4096))]
+    pub registry: String,
     /// Package name in that ecosystem.
     #[schemars(length(max = 4096))]
     pub name: String,
     /// Resolved package version.
     #[schemars(length(max = 4096))]
     pub version: String,
+}
+
+/// One exact runtime or compiler release.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    /// Canonical runtime or compiler name.
+    #[schemars(length(min = 1, max = 128))]
+    pub runtime: String,
+    /// Exact runtime or compiler version.
+    #[schemars(length(min = 1, max = 4096))]
+    pub version: String,
+}
+
+impl PackageIdentity {
+    /// Validated defining registry owner of this exact package release.
+    ///
+    /// # Errors
+    /// Returns the violated owner or length bound.
+    pub fn owner(
+        &self,
+    ) -> Result<crate::identity::SymbolOwner, crate::identity::SymbolIdentityViolation> {
+        if self.manager.len() > 128
+            || self.registry.len() > 4096
+            || self.name.len() > 4096
+            || self.version.len() > 4096
+        {
+            return Err(crate::identity::SymbolIdentityViolation::Length);
+        }
+        let owner = crate::identity::SymbolOwner::Package {
+            manager: self.manager.clone(),
+            registry: self.registry.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+        };
+        owner.validate()?;
+        Ok(owner)
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            manager: String,
+            registry: String,
+            name: String,
+            version: String,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let package = Self {
+            manager: fields.manager,
+            registry: fields.registry,
+            name: fields.name,
+            version: fields.version,
+        };
+        package
+            .owner()
+            .map_err(|_| serde::de::Error::custom("package owner is invalid"))?;
+        Ok(package)
+    }
+}
+
+impl RuntimeIdentity {
+    /// Validated defining runtime or compiler owner of this exact release.
+    ///
+    /// # Errors
+    /// Returns the violated owner or length bound.
+    pub fn owner(
+        &self,
+    ) -> Result<crate::identity::SymbolOwner, crate::identity::SymbolIdentityViolation> {
+        if self.runtime.len() > 128 || self.version.len() > 4096 {
+            return Err(crate::identity::SymbolIdentityViolation::Length);
+        }
+        let owner = crate::identity::SymbolOwner::Runtime {
+            runtime: self.runtime.clone(),
+            version: self.version.clone(),
+        };
+        owner.validate()?;
+        Ok(owner)
+    }
 }
 
 /// Default `page_index` for a paginated request: the first page.
@@ -2185,6 +2271,10 @@ pub struct SymbolOrigin {
     /// for `project`. Absent for `stdlib`, `external`, and a synthetic declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<PackageIdentity>,
+    /// Exact runtime or compiler release that owns a standard-library declaration.
+    /// Mutually exclusive with `package`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeIdentity>,
     /// Whether the declaration is authored, generated, or synthetic.
     pub source_kind: SourceKind,
 }
@@ -2195,6 +2285,7 @@ fn default_symbol_origin() -> SymbolOrigin {
     SymbolOrigin {
         location: Some(SourceLocationKind::Project),
         package: None,
+        runtime: None,
         source_kind: SourceKind::Authored,
     }
 }
@@ -2688,7 +2779,7 @@ mod tests {
             "facets": ["type"],
             "origin": {
                 "location": "dependency",
-                "package": { "manager": "cargo", "name": "beacon-core", "version": "0.1.0" },
+                "package": { "manager": "cargo", "registry": "crates.io", "name": "beacon-core", "version": "0.1.0" },
                 "source_kind": "authored"
             }
         });
@@ -2986,6 +3077,7 @@ mod tests {
                 ReadWarning::PackageAbsent {
                     package: PackageIdentity {
                         manager: "cargo".to_owned(),
+                        registry: "crates.io".to_owned(),
                         name: "missing-helper".to_owned(),
                         version: "0.1.0".to_owned(),
                     },
@@ -2994,6 +3086,7 @@ mod tests {
                     "code": "package_absent",
                     "package": {
                         "manager": "cargo",
+                        "registry": "crates.io",
                         "name": "missing-helper",
                         "version": "0.1.0",
                     },
@@ -3028,6 +3121,7 @@ mod tests {
                     ),
                     package: PackageIdentity {
                         manager: "npm".to_owned(),
+                        registry: "registry.npmjs.org".to_owned(),
                         name: "typescript".to_owned(),
                         version: "5.9.3".to_owned(),
                     },
@@ -3042,6 +3136,7 @@ mod tests {
                     },
                     "package": {
                         "manager": "npm",
+                        "registry": "registry.npmjs.org",
                         "name": "typescript",
                         "version": "5.9.3",
                     },

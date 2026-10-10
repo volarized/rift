@@ -118,6 +118,10 @@ pub struct PackageContextEntry {
     /// Package manager or ecosystem name.
     #[schemars(length(max = 128))]
     pub manager: String,
+    /// Accepted registry endpoint. Absent for a path, Git repository or direct URL source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub registry: Option<String>,
     /// Package name in that ecosystem.
     #[schemars(length(max = 4096))]
     pub name: String,
@@ -150,6 +154,7 @@ impl PackageContextEntry {
         };
         Self {
             manager: manager.to_owned(),
+            registry: None,
             name: name.to_owned(),
             version,
             requirement,
@@ -437,6 +442,7 @@ mod tests {
     fn context_entry(version: Option<&str>, requirement: Option<&str>) -> PackageContextEntry {
         PackageContextEntry {
             manager: "cargo".to_owned(),
+            registry: None,
             name: "serde".to_owned(),
             version: version.map(str::to_owned),
             requirement: requirement.map(str::to_owned),
@@ -748,6 +754,7 @@ mod tests {
         let mut entries = [
             PackageContextEntry {
                 manager: "npm".to_owned(),
+                registry: None,
                 name: "typescript".to_owned(),
                 version: None,
                 requirement: Some("^5.9.0".to_owned()),

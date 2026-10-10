@@ -189,6 +189,7 @@ mod tests {
             }],
             packages: vec![PackageContextEntry {
                 manager: "cargo".to_owned(),
+                registry: None,
                 name: "tokio".to_owned(),
                 version: Some("1.53.1".to_owned()),
                 requirement: None,

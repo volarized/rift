@@ -345,7 +345,14 @@ impl SymbolOwner {
         }
     }
 
-    fn validate(&self) -> Result<(), SymbolIdentityViolation> {
+    /// Validates an owner before it enters a source or symbol identity.
+    ///
+    /// # Errors
+    /// Returns the violated owner or length bound.
+    pub fn validate(&self) -> Result<(), SymbolIdentityViolation> {
+        if self.input_bytes() > SYMBOL_ID_BYTES_MAX {
+            return Err(SymbolIdentityViolation::Length);
+        }
         let accepted = match self {
             Self::Local => true,
             Self::NamedLocal { name } => valid_registration_name(name),
@@ -355,12 +362,21 @@ impl SymbolOwner {
                 name,
                 version,
             } => {
-                valid_manager(manager)
+                manager.len() <= 128
+                    && registry.len() <= 4096
+                    && name.len() <= 4096
+                    && version.len() <= 4096
+                    && valid_manager(manager)
                     && valid_registry(registry)
                     && valid_package_name(manager, name)
                     && valid_version(manager, version)
             }
-            Self::Runtime { runtime, version } => valid_word(runtime) && canonical_semver(version),
+            Self::Runtime { runtime, version } => {
+                runtime.len() <= 128
+                    && version.len() <= 4096
+                    && valid_word(runtime)
+                    && canonical_semver(version)
+            }
         };
         if !accepted {
             return Err(SymbolIdentityViolation::Owner);
@@ -537,6 +553,43 @@ fn valid_registry(value: &str) -> bool {
         canonical
     };
     credentials_absent && selectors_absent && authority_present && canonical == value
+}
+
+/// Canonical registry authority and endpoint path from an accepted HTTPS URL.
+///
+/// Credentials and selectors are refused before an owner is produced. Resolver-specific
+/// aliases are handled by the resolver that accepted the source.
+///
+/// # Errors
+/// Returns an owner violation for an invalid endpoint, or a length violation at the bound.
+pub fn canonical_registry_endpoint(value: &str) -> Result<String, SymbolIdentityViolation> {
+    if value.is_empty() || value.len() > 4096 {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    let url = url::Url::parse(value).map_err(|_| SymbolIdentityViolation::Owner)?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+        || value.chars().any(char::is_control)
+    {
+        return Err(SymbolIdentityViolation::Owner);
+    }
+    let endpoint = url
+        .as_str()
+        .strip_prefix("https://")
+        .ok_or(SymbolIdentityViolation::Owner)?;
+    let endpoint = if url.path() == "/" {
+        endpoint.strip_suffix('/').unwrap_or(endpoint)
+    } else {
+        endpoint
+    };
+    if endpoint.len() > 4096 || !valid_registry(endpoint) {
+        return Err(SymbolIdentityViolation::Owner);
+    }
+    Ok(endpoint.to_owned())
 }
 
 fn valid_package_name(manager: &str, value: &str) -> bool {
