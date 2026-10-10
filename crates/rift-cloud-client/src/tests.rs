@@ -1539,7 +1539,7 @@ async fn operation_failure(
             .await
             .err(),
         Endpoint::Declarations => client
-            .find_package_declarations(&declaration::declaration_request())
+            .find_declarations(&declaration::declaration_request())
             .await
             .err(),
         Endpoint::Source => client
@@ -2109,6 +2109,88 @@ async fn exact_source_refuses_legacy_and_noncanonical_units_after_http() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn captured_custom_sources_retain_the_requested_view_and_coverage_refusal() {
+    use rift_protocol::source_read::{FindDeclarationsParams, GetSourceParams};
+    let unit = "rift://source/custom/src/lib.rs";
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let value = serde_json::json!({"outcome":"unavailable","unit":unit,"view":view,"reason":"insufficient_coverage"});
+    let request: GetSourceParams =
+        serde_json::from_value(serde_json::json!({"unit":unit,"view":view["id"]}))
+            .expect("captured custom source");
+    let (server, client) = operation_client(OperationFixture::ExactSource(
+        value.clone(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    ))
+    .await;
+    assert_eq!(
+        client.get_source(&request).await.expect("coverage refusal"),
+        serde_json::from_value(value).expect("source result")
+    );
+    assert!(
+        server
+            .state
+            .request_log
+            .lock()
+            .await
+            .iter()
+            .any(|request| request.path.ends_with("/source"))
+    );
+
+    let position = serde_json::json!({"unit":unit,"line":0,"character":0});
+    let request: FindDeclarationsParams = serde_json::from_value(
+        serde_json::json!({"position_encoding":"utf-16","positions":[position],"view":view["id"]}),
+    )
+    .expect("captured custom position");
+    let value = serde_json::json!({"results":[{"outcome":"unavailable","position":position,"view":view,"reason":"insufficient_coverage"}]});
+    let (server, client) = operation_client(OperationFixture::SourceDeclarations(
+        value.clone(),
+        StatusCode::OK,
+    ))
+    .await;
+    assert_eq!(
+        client
+            .find_declarations(&request)
+            .await
+            .expect("coverage refusal"),
+        serde_json::from_value(value).expect("position result")
+    );
+    let requests = server.state.request_log.lock().await;
+    let sent = requests
+        .iter()
+        .find(|request| request.path.ends_with("/declarations"))
+        .expect("custom position request");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sent.body).expect("body")["view"],
+        view["id"]
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path.ends_with("/resolutions"))
+    );
+}
+
+#[tokio::test]
+async fn captured_view_does_not_admit_project_sources_to_global_reads() {
+    use rift_protocol::source_read::{FindDeclarationsParams, GetSourceParams};
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let unit = "rift://source/project/src/lib.rs";
+    let source: GetSourceParams =
+        serde_json::from_value(serde_json::json!({"unit":unit,"view":"a".repeat(64)}))
+            .expect("project source");
+    assert_eq!(
+        client.get_source(&source).await,
+        Err(ClientError::InvalidRequest { field: "unit" })
+    );
+    let declarations: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-8","positions":[{"unit":unit,"line":0,"character":0}],"view":"a".repeat(64)})).expect("project position");
+    assert_eq!(
+        client.find_declarations(&declarations).await,
+        Err(ClientError::InvalidRequest { field: "unit" })
+    );
+    assert!(server.state.request_log.lock().await.is_empty());
 }
 
 #[tokio::test]

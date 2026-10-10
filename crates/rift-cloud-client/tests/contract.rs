@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use rift_cloud_client::contract::{self, ContractError};
 use rift_cloud_client::{
-    Capabilities, PackageDeclarationResponse, PackagePatternPage, PackageResolutionResponse,
-    PackageSearchCandidate, PackageSearchPage, PackageSymbolCandidate, PackageSymbolPage,
+    Capabilities, PackagePatternPage, PackageResolutionResponse, PackageSearchCandidate,
+    PackageSearchPage, PackageSymbolCandidate, PackageSymbolPage,
 };
 use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Map, Value, json};
@@ -221,17 +221,17 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "x-rift-page-files-max")?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["PackageDeclarationRequest"]["properties"]["positions"]["maxItems"] =
+    document["components"]["schemas"]["FindDeclarationsParams"]["properties"]["positions"]["maxItems"] =
         json!(10000);
     assert_invalid(
         &document,
-        "PackageDeclarationRequest/properties/positions/maxItems",
+        "FindDeclarationsParams/properties/positions/maxItems",
     )?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["PackagePosition"]["properties"]["character"]["maximum"] =
+    document["components"]["schemas"]["SourcePosition"]["properties"]["character"]["maximum"] =
         json!(65535);
-    assert_invalid(&document, "PackagePosition/properties/character/maximum")?;
+    assert_invalid(&document, "SourcePosition/properties/character/maximum")?;
 
     let mut document = contract()?;
     document["components"]["schemas"]["PackageIdentity"]["properties"]["name"]["maxLength"] =
@@ -376,14 +376,14 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;
         }
-        "#/components/schemas/PackageDeclarationResponse" => {
-            serde_json::from_value::<PackageDeclarationResponse>(value)?;
+        "#/components/schemas/FindDeclarationsResult" => {
+            serde_json::from_value::<rift_protocol::source_read::FindDeclarationsResult>(value)?;
         }
         "#/components/schemas/PackageResolutionRequest"
         | "#/components/schemas/PackageSearchRequest"
         | "#/components/schemas/PackageSymbolRequest"
         | "#/components/schemas/PackagePatternRequest"
-        | "#/components/schemas/PackageDeclarationRequest" => return Ok(false),
+        | "#/components/schemas/FindDeclarationsParams" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }
     Ok(true)

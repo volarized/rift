@@ -2,7 +2,6 @@
 
 mod cache;
 pub mod contract;
-mod declaration;
 mod pattern;
 mod response;
 mod source;
@@ -54,18 +53,16 @@ pub use generated::{
     DocumentationContentIdentity, DocumentationContext, DocumentationFormat, DocumentationHit,
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
-    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions,
-    FindPackageDeclarationsRequest, FindPackageDeclarationsResponse, GetCapabilitiesRequest,
+    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
     GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
     ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
-    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDeclarationRequest,
-    PackageDeclarationResponse, PackageDeclarationResult, PackageDocumentationHit,
+    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
     PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
-    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackagePosition,
-    PackageResolutionRequest, PackageResolutionResponse, PackageSearchHit,
-    PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage, PackageSearchRequest,
-    PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage,
-    PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
+    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
+    PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
+    PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
+    PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
+    PackageSymbolRequestInclude, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
     PublicationFormat, QueryTerm, ResolvePackageContextRequest, ResolvePackageContextResponse,
     ResolvedRequirement, SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery,
@@ -75,9 +72,14 @@ pub use generated::{
     TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
-pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
 pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
 pub use pattern::PATTERN_PAGE_FILES_MAX;
+
+/// Most positions one declaration request carries.
+pub const DECLARATION_POSITIONS_MAX: usize = rift_protocol::source_read::SOURCE_POSITIONS_MAX;
+
+/// Largest line or character one source position carries.
+pub const POSITION_COMPONENT_MAX: u64 = rift_protocol::source_read::SOURCE_POSITION_MAX;
 
 /// Default bound for bytes one encoded request body carries.
 // The 4 MiB configuration default fits a 32-bit usize.

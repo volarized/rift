@@ -14,7 +14,7 @@ use crate::{
 };
 
 impl GlobalClient {
-    /// Reads one physical source unit from its exact package or runtime release.
+    /// Reads one physical source unit from its exact release or admitted captured view.
     ///
     /// # Errors
     ///
@@ -27,9 +27,10 @@ impl GlobalClient {
         if !self.inner.enabled {
             return Err(ClientError::Disabled);
         }
-        if !request.is_valid() || global_source_owner(request.unit.as_str()).is_none() {
+        if !request.is_valid() {
             return Err(ClientError::InvalidRequest { field: "unit" });
         }
+        global_source_owner(request.unit.as_str(), request.view.as_ref())?;
         let capabilities = self.get_capabilities().await?;
         let body = serialize_body(request, self.inner.config.max_request)?;
         validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
@@ -79,14 +80,13 @@ impl GlobalClient {
         if !request.is_valid() {
             return Err(ClientError::InvalidRequest { field: "positions" });
         }
-        let owners = request
-            .positions
-            .iter()
-            .map(|position| {
-                global_source_owner(position.unit.as_str())
-                    .ok_or(ClientError::InvalidRequest { field: "unit" })
-            })
-            .collect::<Result<HashSet<_>, _>>()?;
+        let mut owners = HashSet::new();
+        for position in &request.positions {
+            if let Some(owner) = global_source_owner(position.unit.as_str(), request.view.as_ref())?
+            {
+                owners.insert(owner);
+            }
+        }
         let capabilities = self.get_capabilities().await?;
         if !supports_feature(&capabilities, "declarations") {
             return Err(ClientError::FeatureUnavailable {
@@ -130,12 +130,22 @@ impl GlobalClient {
     }
 }
 
-fn global_source_owner(unit: &str) -> Option<SymbolOwner> {
-    let (owner, _) = parse_source_unit_identity(unit).ok()?;
-    owner.filter(|owner| {
-        matches!(
-            owner,
-            SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
-        )
-    })
+fn global_source_owner(
+    unit: &str,
+    view: Option<&rift_protocol::symbol_read::CapturedViewId>,
+) -> Result<Option<SymbolOwner>, ClientError> {
+    let (owner, _) = parse_source_unit_identity(unit)
+        .map_err(|_| ClientError::InvalidRequest { field: "unit" })?;
+    match owner {
+        Some(owner @ (SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. })) => {
+            Ok(Some(owner))
+        }
+        None if view.is_some()
+            && rift_protocol::read::SourceUnitId::parse(unit)
+                .is_ok_and(|unit| !unit.is_project()) =>
+        {
+            Ok(None)
+        }
+        _ => Err(ClientError::InvalidRequest { field: "unit" }),
+    }
 }

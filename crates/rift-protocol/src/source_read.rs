@@ -281,8 +281,9 @@ impl FindDeclarationsResult {
                         Some(view) == selected && view_matches(view, request.view.as_ref())
                     })
                     && match result {
-                        DeclarationPositionResult::Found { id, .. } => {
+                        DeclarationPositionResult::Found { id, kind, .. } => {
                             SymbolId::parse(id.as_str()).is_ok()
+                                && ExactKind::try_from(kind.0.clone()).is_ok()
                         }
                         _ => true,
                     }
@@ -295,8 +296,7 @@ fn selectors_valid(view: Option<&CapturedViewId>, rev: Option<&RevisionId>) -> b
 }
 
 fn source_valid(unit: &SourceUnitId, rev: Option<&RevisionId>) -> bool {
-    SourceUnitId::parse(unit.as_str()).is_ok()
-        && (rev.is_none() || unit.as_str().starts_with("rift://source/project/"))
+    SourceUnitId::parse(unit.as_str()).is_ok() && (rev.is_none() || unit.is_project())
 }
 
 fn range_valid(range: &TextRange) -> bool {

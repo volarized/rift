@@ -41,6 +41,8 @@ fn source_selectors_require_project_history_and_refuse_legacy_owners() {
     for value in [
         RUNTIME,
         "rift://source/custom/src/lib.rs",
+        "rift://source/project2/src/lib.rs",
+        "rift://source/cargo2/src/lib.rs",
         "rift://source/npm/npmjs.org/@scope/demo@1.0.0/index.ts",
     ] {
         request.unit = unit(value);
@@ -233,6 +235,15 @@ fn position_results_share_view_without_conflating_physical_and_logical_owner() {
         warnings: Vec::new(),
     };
     assert!(result.is_valid_for(&request));
+    let DeclarationPositionResult::Found { kind, .. } = &mut result.results[0] else {
+        panic!("found fixture")
+    };
+    *kind = ExactKind("9function".to_owned());
+    assert!(!result.is_valid_for(&request));
+    let DeclarationPositionResult::Found { kind, .. } = &mut result.results[0] else {
+        panic!("found fixture")
+    };
+    *kind = ExactKind("class".to_owned());
     result.results.swap(0, 1);
     assert!(!result.is_valid_for(&request));
     result.results.swap(0, 1);

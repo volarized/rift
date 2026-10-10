@@ -2854,7 +2854,11 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.global.route(&configuration, &read_context)),
+            Box::pin(self.global.callee_route(
+                &configuration,
+                &read_context,
+                references.package_callees(),
+            )),
         )
         .await
         {

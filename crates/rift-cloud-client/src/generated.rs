@@ -21,18 +21,18 @@
 
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-static REGEX_GET_SOURCE_PARAMS_REV: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+static REGEX_FIND_DECLARATIONS_PARAMS_REV: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 regex::Regex::new("^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$").expect("invalid regex"));
+static REGEX_FIND_DECLARATIONS_PARAMS_VIEW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+{
+    regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
+        .expect("invalid regex")
+});
 static REGEX_GET_SOURCE_PARAMS_UNIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 {
     regex::Regex::new(
             "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
         )
-        .expect("invalid regex")
-});
-static REGEX_GET_SOURCE_PARAMS_VIEW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-{
-    regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
         .expect("invalid regex")
 });
 static REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
@@ -1292,74 +1292,6 @@ pub struct PackagePatternPage {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// Positions in files of exact package versions, each to name a declaration for.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    validator::Validate,
-    oas3_gen_support::Default
-)]
-#[serde(deny_unknown_fields)]
-pub struct PackageDeclarationRequest {
-    /// How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.
-    pub position_encoding: PositionEncoding,
-    /// Positions to answer, each at most once.
-    #[validate(length(min = 1u64, max = 1_000u64), nested)]
-    pub positions: Vec<PackagePosition>,
-}
-/// One position in one file of an exact package version.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    validator::Validate,
-    oas3_gen_support::Default
-)]
-#[serde(deny_unknown_fields)]
-pub struct PackagePosition {
-    /// One package as its package manager identifies it.
-    #[validate(nested)]
-    pub package: PackageIdentity,
-    /// Path of the file below the package root, using forward slashes, as in `src/lib.rs`.
-    #[validate(length(min = 1u64, max = 1_000u64))]
-    pub path: String,
-    /// Zero-based line of the position.
-    #[validate(range(min = 0i64, max = 2_147_483_647i64))]
-    pub line: i64,
-    /// Zero-based offset within the line, counted as `position_encoding` states.
-    #[validate(range(min = 0i64, max = 2_147_483_647i64))]
-    pub character: i64,
-}
-/// One submitted position and the declaration holding it, named by the identity package analysis mints in the position's package: `rift://symbol/<language>/<manager>/<name>@<version>/<path>/<qualified name>`.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-pub struct PackageDeclarationResult {
-    /// One position in one file of an exact package version.
-    pub position: PackagePosition,
-    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
-    /// stable qualified name for the declaration. No shipped provider puts the file path into a
-    /// qualified name, so a declaration moved to another file keeps its qualified name while its
-    /// identity names the new path. A `~N` suffix separates declarations the qualified name
-    /// alone cannot, such as overloads that dispatch separately.
-    pub declaration: Option<String>,
-    /// A provider-local kind preserving the construct name used by that language implementation.
-    pub kind: Option<String>,
-    /// Additional properties not defined in the schema.
-    #[serde(flatten)]
-    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
-}
-/// One result per submitted position. A result without `declaration` names a position no declaration holds.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-pub struct PackageDeclarationResponse {
-    /// Results, one per submitted position.
-    pub results: Vec<PackageDeclarationResult>,
-    /// Additional properties not defined in the schema.
-    #[serde(flatten)]
-    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
-}
 /// RFC 9457 problem details for an application error.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct ProblemDetails {
@@ -2009,6 +1941,18 @@ pub struct CapturedView {
 }
 /// A service-issued key for one immutable view in one serving context.
 pub type CapturedViewId = String;
+/// One submitted source position and its exact declaration outcome.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum DeclarationPositionResult {
+    /// An established declaration holds this exact position.
+    #[default]
+    Object(DeclarationPositionResultObject),
+    /// Complete captured coverage contains no declaration at this position.
+    Object2(DeclarationPositionResultObject2),
+    /// Presence or absence cannot be established at this exact position.
+    Object3(DeclarationPositionResultObject3),
+}
 /// A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.
 pub type Duration = String;
 /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
@@ -2016,6 +1960,49 @@ pub type Duration = String;
 /// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
 /// whatever schema its implementation generated from.
 pub type FileId = String;
+/// Finds declarations holding positions in one immutable selection.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct FindDeclarationsParams {
+    /// How a language engine counts characters within a source line.
+    pub position_encoding: PositionEncoding,
+    /// Positions to answer once, retaining request order.
+    #[validate(length(min = 1u64, max = 1_000u64), nested)]
+    pub positions: Vec<SourcePosition>,
+    /// Identity of one revision in the workspace's version-control history, spelled the way the
+    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
+    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
+    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
+    /// their identifiers.
+    #[validate(
+        length(min = 1u64, max = 128u64),
+        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_REV")
+    )]
+    pub rev: Option<String>,
+    /// A service-issued key for one immutable view in one serving context.
+    #[validate(
+        length(min = 3u64, max = 4_096u64),
+        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_VIEW")
+    )]
+    pub view: Option<String>,
+}
+/// One answer per submitted position, retaining one shared captured selection.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct FindDeclarationsResult {
+    /// Exact outcomes in request order.
+    pub results: Vec<DeclarationPositionResult>,
+    /// Typed read warnings, including explicit partial coverage.
+    pub warnings: Option<Vec<ReadWarning>>,
+}
 /// Reads a source unit or a byte range without requiring a semantic symbol.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -2042,7 +2029,7 @@ pub struct GetSourceParams {
     /// their identifiers.
     #[validate(
         length(min = 1u64, max = 128u64),
-        regex(path = "REGEX_GET_SOURCE_PARAMS_REV")
+        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_REV")
     )]
     pub rev: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
@@ -2054,7 +2041,7 @@ pub struct GetSourceParams {
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_GET_SOURCE_PARAMS_VIEW")
+        regex(path = "REGEX_FIND_DECLARATIONS_PARAMS_VIEW")
     )]
     pub view: Option<String>,
 }
@@ -2198,6 +2185,38 @@ impl<'de> serde::Deserialize<'de> for GlobalPageWarningCode {
             "result_truncated" => Ok(GlobalPageWarningCode::ResultTruncated),
             "unknown" => Ok(GlobalPageWarningCode::Unknown),
             _ => Ok(GlobalPageWarningCode::Unknown),
+        }
+    }
+}
+/// How a language engine counts characters within a source line.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum PositionEncoding {
+    /// UTF-8 bytes.
+    #[serde(rename = "utf-8")]
+    #[default]
+    Utf8,
+    /// UTF-16 code units.
+    #[serde(rename = "utf-16")]
+    Utf16,
+}
+impl core::fmt::Display for PositionEncoding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Utf8 => write!(f, "utf-8"),
+            Self::Utf16 => write!(f, "utf-16"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for PositionEncoding {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "utf-8" => Ok(PositionEncoding::Utf8),
+            "utf-16" => Ok(PositionEncoding::Utf16),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["utf-8", "utf-16"])),
         }
     }
 }
@@ -2760,6 +2779,31 @@ pub struct SourceExcerpt {
     /// The source bytes returned by the request.
     pub text: String,
 }
+/// One exact position in a project, package or runtime source unit.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePosition {
+    /// Zero-based offset counted using the request's position encoding.
+    #[validate(range(min = 0_u64, max = 2_147_483_647_u64))]
+    pub character: u64,
+    /// Zero-based source line.
+    #[validate(range(min = 0_u64, max = 2_147_483_647_u64))]
+    pub line: u64,
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 17u64, max = 8_192u64),
+        regex(path = "REGEX_GET_SOURCE_PARAMS_UNIT")
+    )]
+    pub unit: String,
+}
 /// One byte range in a source-catalog unit.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
@@ -2773,6 +2817,8 @@ pub struct SourceUnitSpan {
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
 }
+/// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+pub type SymbolIdentity = String;
 /// Why an exact selection cannot establish presence or definite absence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum SymbolUnavailableReason {
@@ -3567,112 +3613,112 @@ pub enum SearchPackagePatternsResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Names, for each position in a file of an exact package version, the smallest declaration whose range holds it. A position in a type stub, such as a `.pyi` or `.d.ts` file, answers the declaration the stub describes: the module's declaration when the stub pairs with a module file. A position answers no declaration when the global index holds no release at that exact version, no file at that path, or no declaration holding the position. The server **MUST NOT** answer from another version, and **MUST NOT** move a position past its line or the text, or one inside a character, to a neighboring one.
+/// Finds declarations holding source positions in one immutable selection. Answers each position once, retaining request order and one shared captured view. A position in a type stub may name a declaration with a proved runtime or package owner. Complete captured coverage with no declaration returns missing; unavailable coverage returns unavailable. The server MUST NOT answer from another version, and MUST NOT move a position past its line or the text, or one inside a character, to a neighboring one.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
-pub struct FindPackageDeclarationsRequest {
-    /// Positions in package files.
+pub struct FindDeclarationsRequest {
+    /// Source positions to answer in one captured selection.
     #[validate(nested)]
-    pub body: PackageDeclarationRequest,
+    pub body: FindDeclarationsParams,
 }
-impl FindPackageDeclarationsRequest {
+impl FindDeclarationsRequest {
     /// Parse the HTTP response into the response enum.
     pub async fn parse_response(
         req: reqwest::Response,
-    ) -> anyhow::Result<FindPackageDeclarationsResponse> {
+    ) -> anyhow::Result<FindDeclarationsResponse> {
         let status = req.status();
         if status == http::StatusCode::OK {
             let data = oas3_gen_support::Diagnostics::<
-                PackageDeclarationResponse,
+                FindDeclarationsResult,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::Ok(data));
+            return Ok(FindDeclarationsResponse::Ok(data));
         }
         if status == http::StatusCode::BAD_REQUEST {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::BadRequest(data));
+            return Ok(FindDeclarationsResponse::BadRequest(data));
         }
         if status == http::StatusCode::UNAUTHORIZED {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::Unauthorized(data));
+            return Ok(FindDeclarationsResponse::Unauthorized(data));
         }
         if status == http::StatusCode::FORBIDDEN {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::Forbidden(data));
+            return Ok(FindDeclarationsResponse::Forbidden(data));
         }
         if status == http::StatusCode::NOT_ACCEPTABLE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::NotAcceptable(data));
+            return Ok(FindDeclarationsResponse::NotAcceptable(data));
         }
         if status == http::StatusCode::PAYLOAD_TOO_LARGE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::ContentTooLarge(data));
+            return Ok(FindDeclarationsResponse::ContentTooLarge(data));
         }
         if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::UnsupportedMediaType(data));
+            return Ok(FindDeclarationsResponse::UnsupportedMediaType(data));
         }
         if status == http::StatusCode::TOO_MANY_REQUESTS {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::TooManyRequests(data));
+            return Ok(FindDeclarationsResponse::TooManyRequests(data));
         }
         if status == http::StatusCode::INTERNAL_SERVER_ERROR {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::InternalServerError(data));
+            return Ok(FindDeclarationsResponse::InternalServerError(data));
         }
         if status == http::StatusCode::BAD_GATEWAY {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::BadGateway(data));
+            return Ok(FindDeclarationsResponse::BadGateway(data));
         }
         if status == http::StatusCode::SERVICE_UNAVAILABLE {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::ServiceUnavailable(data));
+            return Ok(FindDeclarationsResponse::ServiceUnavailable(data));
         }
         if status == http::StatusCode::GATEWAY_TIMEOUT {
             let data = oas3_gen_support::Diagnostics::<
                 ProblemDetails,
             >::json_with_diagnostics(req)
                 .await?;
-            return Ok(FindPackageDeclarationsResponse::GatewayTimeout(data));
+            return Ok(FindDeclarationsResponse::GatewayTimeout(data));
         }
         let _ = req.bytes().await?;
-        return Ok(FindPackageDeclarationsResponse::Unknown);
+        return Ok(FindDeclarationsResponse::Unknown);
     }
 }
-/// Response types for findPackageDeclarations
+/// Response types for findDeclarations
 #[derive(Debug, Clone)]
-pub enum FindPackageDeclarationsResponse {
-    ///200: One answer per submitted position.
-    Ok(PackageDeclarationResponse),
+pub enum FindDeclarationsResponse {
+    ///200: Ordered outcomes for every submitted position in one captured view.
+    Ok(FindDeclarationsResult),
     ///400: Request JSON, query parameters, or field relationships are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
@@ -4036,36 +4082,6 @@ impl<'de> serde::Deserialize<'de> for PackageSymbolRequestInclude {
         }
     }
 }
-/// How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
-pub enum PositionEncoding {
-    #[serde(rename = "utf-8")]
-    #[default]
-    Utf8,
-    #[serde(rename = "utf-16")]
-    Utf16,
-}
-impl core::fmt::Display for PositionEncoding {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Utf8 => write!(f, "utf-8"),
-            Self::Utf16 => write!(f, "utf-16"),
-        }
-    }
-}
-impl<'de> serde::Deserialize<'de> for PositionEncoding {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_ascii_lowercase().as_str() {
-            "utf-8" => Ok(PositionEncoding::Utf8),
-            "utf-16" => Ok(PositionEncoding::Utf16),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["utf-8", "utf-16"])),
-        }
-    }
-}
 /// A visible workspace file.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
@@ -4138,6 +4154,45 @@ impl<'de> serde::Deserialize<'de> for PackageDocumentationHitContributingField {
             _ => Ok(PackageDocumentationHitContributingField::Unknown),
         }
     }
+}
+/// An established declaration holds this exact position.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeclarationPositionResultObject {
+    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    pub id: String,
+    /// A provider-local kind preserving the construct name used by that language implementation.
+    pub kind: String,
+    #[default("found".to_string())]
+    pub outcome: String,
+    /// One exact position in a project, package or runtime source unit.
+    pub position: SourcePosition,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: CapturedView,
+}
+/// Complete captured coverage contains no declaration at this position.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeclarationPositionResultObject2 {
+    #[default("missing".to_string())]
+    pub outcome: String,
+    /// One exact position in a project, package or runtime source unit.
+    pub position: SourcePosition,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: CapturedView,
+}
+/// Presence or absence cannot be established at this exact position.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeclarationPositionResultObject3 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
+    /// One exact position in a project, package or runtime source unit.
+    pub position: SourcePosition,
+    /// Why an exact selection cannot establish presence or definite absence.
+    pub reason: SymbolUnavailableReason,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: Option<CapturedView>,
 }
 /// The selected unit exists, including when its requested range is empty.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]

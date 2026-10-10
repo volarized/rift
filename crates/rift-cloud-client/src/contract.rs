@@ -93,7 +93,7 @@ impl Endpoint {
             Self::Search => "searchPackages",
             Self::Symbols => "listPackageSymbols",
             Self::Patterns => "searchPackagePatterns",
-            Self::Declarations => "findPackageDeclarations",
+            Self::Declarations => "findDeclarations",
             Self::Source => "getSource",
         }
     }
@@ -408,12 +408,12 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
         ("PackageSymbolPage", "items", page_items_max),
         ("PackagePatternPage", "items", page_items_max),
         (
-            "PackageDeclarationRequest",
+            "FindDeclarationsParams",
             "positions",
             crate::DECLARATION_POSITIONS_MAX,
         ),
         (
-            "PackageDeclarationResponse",
+            "FindDeclarationsResult",
             "results",
             crate::DECLARATION_POSITIONS_MAX,
         ),
@@ -473,9 +473,9 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     let cursor = parameter_schema(spec, "Cursor")?;
     expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
     for property in ["line", "character"] {
-        let schema = property_schema(spec, "PackagePosition", property)?;
+        let schema = property_schema(spec, "SourcePosition", property)?;
         expect_bound(
-            &format!("PackagePosition/properties/{property}/maximum"),
+            &format!("SourcePosition/properties/{property}/maximum"),
             schema.maximum,
             serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
         )?;

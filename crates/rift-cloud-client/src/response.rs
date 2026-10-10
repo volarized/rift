@@ -1,9 +1,8 @@
 //! Generated response decoding after bounded body collection.
 
 use crate::{
-    Capabilities, ClientError, FindPackageDeclarationsRequest, FindPackageDeclarationsResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, ListPackageSymbolsRequest,
-    ListPackageSymbolsResponse, PackageDeclarationResponse, PackagePatternPage,
+    Capabilities, ClientError, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    ListPackageSymbolsRequest, ListPackageSymbolsResponse, PackagePatternPage,
     PackageResolutionResponse, PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
     ResolvePackageContextRequest, ResolvePackageContextResponse, ResponseMeta,
     SearchPackagePatternsRequest, SearchPackagePatternsResponse, SearchPackagesRequest,
@@ -211,33 +210,6 @@ pub(crate) async fn patterns(
         | SearchPackagePatternsResponse::ServiceUnavailable(problem)
         | SearchPackagePatternsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
         SearchPackagePatternsResponse::Unknown => Err(unknown_http_error(meta)),
-    }
-}
-
-pub(crate) async fn declarations(
-    response: RawResponse,
-) -> Result<Parsed<PackageDeclarationResponse>, ClientError> {
-    let (response, meta) = generated_response(response)?;
-    let status = meta.status;
-    let response = FindPackageDeclarationsRequest::parse_response(response)
-        .await
-        .map_err(|_| ClientError::Decode { status })?;
-    match response {
-        FindPackageDeclarationsResponse::Ok(value) => Ok(Parsed { value, meta }),
-        FindPackageDeclarationsResponse::BadRequest(problem)
-        | FindPackageDeclarationsResponse::Unauthorized(problem)
-        | FindPackageDeclarationsResponse::Forbidden(problem)
-        | FindPackageDeclarationsResponse::NotAcceptable(problem)
-        | FindPackageDeclarationsResponse::ContentTooLarge(problem)
-        | FindPackageDeclarationsResponse::UnsupportedMediaType(problem)
-        | FindPackageDeclarationsResponse::TooManyRequests(problem)
-        | FindPackageDeclarationsResponse::InternalServerError(problem)
-        | FindPackageDeclarationsResponse::BadGateway(problem)
-        | FindPackageDeclarationsResponse::ServiceUnavailable(problem)
-        | FindPackageDeclarationsResponse::GatewayTimeout(problem) => {
-            Err(http_error(meta, problem))
-        }
-        FindPackageDeclarationsResponse::Unknown => Err(unknown_http_error(meta)),
     }
 }
 
