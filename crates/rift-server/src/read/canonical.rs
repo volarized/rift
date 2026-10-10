@@ -174,10 +174,34 @@ impl LocalSymbolViews {
         self.capture_at(input, SystemTime::now())
     }
 
+    /// Captures a view only when the caller also admits its bounded response.
+    ///
+    /// The callback runs after material admission while the store is locked. It
+    /// must not call this store. Refusal removes only the newly captured view.
+    ///
+    /// # Errors
+    /// Returns a registered read failure or the callback's registered error.
+    pub fn capture_with(
+        &self,
+        input: LocalSymbolViewInput,
+        admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
+    ) -> Result<Option<CapturedView>, RiftError> {
+        self.capture_with_at(input, SystemTime::now(), admit)
+    }
+
     fn capture_at(
         &self,
         input: LocalSymbolViewInput,
         now: SystemTime,
+    ) -> Result<Option<CapturedView>, RiftError> {
+        self.capture_with_at(input, now, |_| Ok(true))
+    }
+
+    fn capture_with_at(
+        &self,
+        input: LocalSymbolViewInput,
+        now: SystemTime,
+        admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
     ) -> Result<Option<CapturedView>, RiftError> {
         let mut state = self
             .state
@@ -210,6 +234,17 @@ impl LocalSymbolViews {
             state.views.remove(&id);
             return Ok(None);
         }
+        match admit(&view) {
+            Ok(true) => {}
+            Ok(false) => {
+                state.views.remove(&id);
+                return Ok(None);
+            }
+            Err(error) => {
+                state.views.remove(&id);
+                return Err(error);
+            }
+        }
         Ok(Some(view))
     }
 
@@ -222,6 +257,51 @@ impl LocalSymbolViews {
         hash.update(self.service_key);
         hash.update(state.serial.to_be_bytes());
         Ok(format!("{:x}", hash.finalize()))
+    }
+
+    /// Returns the retained view selected by a complete service-issued key.
+    ///
+    /// The inner result carries an unavailable reason for expired views, changed
+    /// contexts, or an index that is preparing. Success preserves the original expiry.
+    ///
+    /// # Errors
+    /// Returns the registered read error when the view key is malformed or oversized.
+    pub fn captured_view(
+        &self,
+        id: &str,
+        root: &Path,
+        owner: &SymbolOwner,
+    ) -> Result<Result<CapturedView, SymbolUnavailableReason>, RiftError> {
+        let id = CapturedViewId::parse(id)?;
+        Ok(self.captured_view_at(&id, root, owner, SystemTime::now()))
+    }
+
+    fn captured_view_at(
+        &self,
+        id: &CapturedViewId,
+        root: &Path,
+        owner: &SymbolOwner,
+        now: SystemTime,
+    ) -> Result<CapturedView, SymbolUnavailableReason> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire(now);
+        let Some(held) = state.views.get(id.as_str()) else {
+            return Err(if state.expired.contains(id.as_str()) {
+                SymbolUnavailableReason::ViewExpired
+            } else {
+                SymbolUnavailableReason::ViewContext
+            });
+        };
+        if held.material.index.root() != root || held.material.index.owner() != owner {
+            return Err(SymbolUnavailableReason::ViewContext);
+        }
+        if !held.ready {
+            return Err(SymbolUnavailableReason::IndexPreparing);
+        }
+        Ok(held.view.clone())
     }
 
     /// Reads only an issued view or continuation belonging to the expected root and owner.
@@ -367,6 +447,27 @@ fn unavailable(
 }
 
 impl ReadService {
+    /// Captures immutable search, source, graph and documentation material without history.
+    ///
+    /// # Errors
+    /// Returns the original captured index or read failure.
+    pub fn local_search_view_input(&self, ready: bool) -> Result<LocalSymbolViewInput, RiftError> {
+        let (index, metadata) = self.local_view_material()?;
+        Ok(local_view_input(index, metadata, None, ready))
+    }
+
+    fn local_view_material(
+        &self,
+    ) -> Result<(Arc<rift_index::WorkspaceSymbolView>, Vec<u8>), RiftError> {
+        let index = self.index.symbol_view()?;
+        let metadata = serde_json::to_vec(&CapturedMetadata {
+            revision: self.revision.clone(),
+            warnings: self.warnings(),
+        })
+        .map_err(|error| material_error("capture read metadata", &error))?;
+        Ok((index, metadata))
+    }
+
     /// Captures immutable read material and the requested bounded history before admission.
     ///
     /// # Errors
@@ -377,12 +478,7 @@ impl ReadService {
         ready: bool,
     ) -> Result<LocalSymbolViewInput, RiftError> {
         let key = rift_core::SymbolId::new(request.id.as_str())?;
-        let index = self.index.symbol_view()?;
-        let metadata = serde_json::to_vec(&CapturedMetadata {
-            revision: self.revision.clone(),
-            warnings: self.warnings(),
-        })
-        .map_err(|error| material_error("capture read metadata", &error))?;
+        let (index, metadata) = self.local_view_material()?;
         let history = if ready && request.include.contains(&GetSymbolInclude::History) {
             let (bindings, _) = self.index.symbols_by_identity_page(&key, 0, 1)?;
             match bindings.first().copied() {
@@ -408,24 +504,7 @@ impl ReadService {
         } else {
             None
         };
-        let material = Arc::new(LocalSymbolMaterial {
-            index,
-            metadata: Arc::from(metadata),
-            history,
-        });
-        let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
-            .saturating_add(4 * std::mem::size_of::<usize>())
-            .saturating_add(material.metadata.len())
-            .saturating_add(material.history.as_ref().map_or(0, |(id, bytes)| {
-                id.capacity()
-                    .saturating_add(bytes.len())
-                    .saturating_add(2 * std::mem::size_of::<usize>())
-            }));
-        Ok(LocalSymbolViewInput {
-            material,
-            ready,
-            retained_bytes,
-        })
+        Ok(local_view_input(index, metadata, history, ready))
     }
 }
 
@@ -590,6 +669,32 @@ impl LocalSymbolMaterial {
                 .map_err(|error| material_error("decode captured history", &error)),
             _ => Ok(None),
         }
+    }
+}
+
+fn local_view_input(
+    index: Arc<rift_index::WorkspaceSymbolView>,
+    metadata: Vec<u8>,
+    history: Option<(String, Arc<[u8]>)>,
+    ready: bool,
+) -> LocalSymbolViewInput {
+    let material = Arc::new(LocalSymbolMaterial {
+        index,
+        metadata: Arc::from(metadata),
+        history,
+    });
+    let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
+        .saturating_add(4 * std::mem::size_of::<usize>())
+        .saturating_add(material.metadata.len())
+        .saturating_add(material.history.as_ref().map_or(0, |(id, bytes)| {
+            id.capacity()
+                .saturating_add(bytes.len())
+                .saturating_add(2 * std::mem::size_of::<usize>())
+        }));
+    LocalSymbolViewInput {
+        material,
+        ready,
+        retained_bytes,
     }
 }
 

@@ -87,6 +87,41 @@ fn captured_input(reads: &ReadService) -> LocalSymbolViewInput {
 }
 
 #[test]
+fn search_view_input_retains_nonempty_material_and_truthful_history_coverage() {
+    let (_directory, reads, id) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [8; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let input = reads
+        .local_search_view_input(true)
+        .expect("captured search material");
+    assert!(input.ready);
+    assert!(input.material.history.is_none());
+    assert!(!input.material.index.index_documents().is_empty());
+    let view = store
+        .capture_at(input, now)
+        .expect("search view admission")
+        .expect("view");
+    let mut params = request(id, view.id);
+    params.include = vec![GetSymbolInclude::Source, GetSymbolInclude::Documentation];
+    assert!(matches!(
+        store
+            .resolve_at(&params, reads.index.root(), reads.index.owner(), now)
+            .expect("same captured read material"),
+        GetSymbolResult::Found { .. }
+    ));
+    params.include.push(GetSymbolInclude::History);
+    assert!(matches!(
+        store
+            .resolve_at(&params, reads.index.root(), reads.index.owner(), now)
+            .expect("history coverage"),
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::InsufficientCoverage,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn captured_nonempty_material_refuses_uncaptured_history_without_live_lookup() {
     let (directory, reads, id) = fixture(true);
     let store = LocalSymbolViews::new(1 << 20, [9; 32]);
@@ -309,6 +344,59 @@ fn local_view_admission_refuses_material_overflow_without_retaining_authority() 
 }
 
 #[test]
+fn local_view_response_refusal_keeps_only_prior_authority() {
+    let (_directory, reads, _) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [13; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let first = capture(&store, &reads, now);
+    let first_charge = store.state.lock().expect("store").material_bytes();
+    let refused = store
+        .capture_with_at(captured_input(&reads), now, |_| Ok(false))
+        .expect("response admission refusal");
+    assert!(refused.is_none());
+    let failed = store.capture_with_at(captured_input(&reads), now, |_| {
+        Err(invalid("view", "response exceeds its byte bound"))
+    });
+    assert!(failed.is_err());
+    let state = store.state.lock().expect("store");
+    assert_eq!(state.views.len(), 1);
+    assert!(state.views.contains_key(first.id.as_str()));
+    assert_eq!(state.material_bytes(), first_charge);
+}
+
+#[test]
+fn local_view_response_admission_runs_only_after_material_admission() {
+    let (_directory, reads, _) = fixture(true);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let tiny = LocalSymbolViews::new(1, [14; 32]);
+    assert!(
+        tiny.capture_with_at(captured_input(&reads), now, |_| {
+            panic!("material refusal must precede response admission")
+        })
+        .expect("material refusal")
+        .is_none()
+    );
+    let store = LocalSymbolViews::new(1 << 20, [15; 32]);
+    let mut response_view = None;
+    let captured = store
+        .capture_with_at(captured_input(&reads), now, |view| {
+            response_view = Some(view.clone());
+            Ok(true)
+        })
+        .expect("response admission")
+        .expect("captured view");
+    assert_eq!(response_view, Some(captured.clone()));
+    assert!(
+        store
+            .state
+            .lock()
+            .expect("store")
+            .views
+            .contains_key(captured.id.as_str())
+    );
+}
+
+#[test]
 fn canonical_missing_requires_complete_identity_coverage() {
     for metadata in [true, false] {
         let (_directory, reads, _) = fixture(metadata);
@@ -337,4 +425,73 @@ fn canonical_missing_requires_complete_identity_coverage() {
             ));
         }
     }
+}
+
+#[test]
+fn captured_view_keeps_original_expiry_and_refuses_changed_context() {
+    let (_directory, reads, _) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [10; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let view = capture(&store, &reads, now);
+    for elapsed in [0, 1, 899] {
+        assert_eq!(
+            store.captured_view_at(
+                &view.id,
+                reads.index.root(),
+                reads.index.owner(),
+                now + Duration::from_secs(elapsed),
+            ),
+            Ok(view.clone()),
+        );
+    }
+    let foreign = SymbolOwner::NamedLocal {
+        name: "cloud".to_owned(),
+    };
+    assert_eq!(
+        store.captured_view_at(&view.id, reads.index.root(), &foreign, now),
+        Err(SymbolUnavailableReason::ViewContext),
+    );
+    let other_root = tempfile::tempdir().expect("foreign root");
+    assert_eq!(
+        store.captured_view_at(&view.id, other_root.path(), reads.index.owner(), now),
+        Err(SymbolUnavailableReason::ViewContext),
+    );
+    assert_eq!(
+        store.captured_view_at(
+            &view.id,
+            reads.index.root(),
+            reads.index.owner(),
+            now + VIEW_LIFETIME,
+        ),
+        Err(SymbolUnavailableReason::ViewExpired),
+    );
+    assert!(
+        store
+            .captured_view("bad", reads.index.root(), reads.index.owner())
+            .is_err()
+    );
+}
+
+#[test]
+fn captured_view_refuses_unknown_keys_and_preparing_indices() {
+    let (_directory, reads, _) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [11; 32]);
+    let foreign_store = LocalSymbolViews::new(1 << 20, [12; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let other = capture(&foreign_store, &reads, now);
+    assert_eq!(
+        store.captured_view_at(&other.id, reads.index.root(), reads.index.owner(), now),
+        Err(SymbolUnavailableReason::ViewContext),
+    );
+    let input = reads
+        .local_search_view_input(false)
+        .expect("captured preparing material");
+    let view = store
+        .capture_at(input, now)
+        .expect("admission")
+        .expect("view");
+    assert_eq!(
+        store.captured_view_at(&view.id, reads.index.root(), reads.index.owner(), now),
+        Err(SymbolUnavailableReason::IndexPreparing),
+    );
 }
