@@ -435,9 +435,13 @@ fn validate_origin(source: &DocumentationSource) -> Result<(), RiftError> {
         Some(SourceLocationKind::Project | SourceLocationKind::Dependency)
     );
     let package_required = origin.location == Some(SourceLocationKind::Dependency);
+    let runtime_location = origin.location == Some(SourceLocationKind::Stdlib);
     if !(authored_location || synthetic_location)
         || (origin.package.is_some() && !package_location)
         || (package_required && origin.package.is_none())
+        || (origin.runtime.is_some() && !runtime_location)
+        || (runtime_location && origin.runtime.is_none())
+        || (origin.package.is_some() && origin.runtime.is_some())
     {
         return errors::analysis::documentation_origin_invalid()
             .field("origin")
@@ -452,7 +456,10 @@ fn validate_origin(source: &DocumentationSource) -> Result<(), RiftError> {
                 .fail()
         }
         DocumentationSourceIdentity::Package { .. }
-            if origin.location != Some(SourceLocationKind::Dependency) =>
+            if !matches!(
+                origin.location,
+                Some(SourceLocationKind::Dependency | SourceLocationKind::Stdlib)
+            ) =>
         {
             errors::analysis::documentation_origin_invalid()
                 .field("origin.location")
@@ -498,24 +505,26 @@ fn validate_package_origin(
             .field("source.unit")
             .error()
     })?;
-    let Some(package) = &source.origin.package else {
-        return errors::analysis::documentation_origin_invalid()
-            .field("origin.package")
-            .fail();
+    let owner = match (&source.origin.package, &source.origin.runtime) {
+        (Some(package), None) => package.owner(),
+        (None, Some(runtime)) => runtime.owner(),
+        _ => {
+            return errors::analysis::documentation_origin_invalid()
+                .field("origin")
+                .fail();
+        }
     };
-    let key_prefix = format!("{}@{}/", package.name, package.version);
-    let manager_matches = parsed.resolver().as_str() == package.manager;
-    let package_matches = parsed.key().as_str().starts_with(&key_prefix);
-    if !manager_matches || !package_matches {
+    let owner = owner.map_err(|_| {
+        errors::analysis::documentation_origin_invalid()
+            .field("origin")
+            .error()
+    })?;
+    if parsed.source_owner() != Some(&owner) {
         return errors::analysis::documentation_origin_invalid()
-            .field("origin.package")
+            .field("origin")
             .fail();
     }
-    let path = parsed
-        .key()
-        .as_str()
-        .strip_prefix(&key_prefix)
-        .unwrap_or_default();
+    let path = parsed.key().as_str();
     ProjectPath::new(path).map_err(|_| {
         errors::analysis::documentation_identity_invalid()
             .field("source.unit")
@@ -873,7 +882,7 @@ mod tests {
     fn package_source(text: &str) -> DocumentationSource {
         let mut record = source("README.md", text);
         record.identity.source = DocumentationSourceIdentity::Package {
-            unit: SourceUnitId("rift://source/cargo/beacon@1.0.0/README.md".to_owned()),
+            unit: SourceUnitId("rift://source/cargo/crates.io/beacon@1.0.0/README.md".to_owned()),
         };
         record.origin = SymbolOrigin {
             location: Some(SourceLocationKind::Dependency),
@@ -903,6 +912,77 @@ mod tests {
         let mut changed = record;
         changed.origin.source_kind = SourceKind::Synthetic;
         assert_eq!(violation(changed, "a"), DocumentationViolation::Origin);
+    }
+
+    #[test]
+    fn test_released_documentation_checks_full_owner_and_notebook_source_path() {
+        let mut record = package_source("cell");
+        let package = record.origin.package.as_mut().expect("package");
+        package.registry = "registry.example:8443/team/api".to_owned();
+        record.identity.source = DocumentationSourceIdentity::Package {
+            unit: SourceUnitId(
+                "rift://source/cargo/registry.example:8443%2Fteam%2Fapi/beacon@1.0.0/guide.ipynb"
+                    .to_owned(),
+            ),
+        };
+        record.format = DocumentationSourceFormat::Notebook;
+        record.media_type = "application/x-ipynb+json".to_owned();
+        record.identity.cell = Some(NotebookCell {
+            identity: NotebookCellIdentity::Authored {
+                id: "cell-1".to_owned(),
+            },
+            kind: NotebookCellKind::Markdown,
+        });
+        record.physical_ranges = vec![TextRange { start: 20, end: 26 }];
+        assert!(DocumentationInput::new(record.clone(), "cell").is_ok());
+        let mut other_registry = record.clone();
+        other_registry
+            .origin
+            .package
+            .as_mut()
+            .expect("package")
+            .registry = "crates.io".to_owned();
+        assert_eq!(
+            violation(other_registry, "cell"),
+            DocumentationViolation::Origin
+        );
+        let mut wrong_path = record.clone();
+        wrong_path.identity.source = DocumentationSourceIdentity::Package {
+            unit: SourceUnitId("rift://source/cargo/registry.example:8443%2Fteam%2Fapi/beacon@1.0.0/../guide.ipynb".to_owned()),
+        };
+        assert_eq!(
+            violation(wrong_path, "cell"),
+            DocumentationViolation::Identity
+        );
+
+        let mut runtime = record.clone();
+        runtime.identity.source = DocumentationSourceIdentity::Package {
+            unit: SourceUnitId("rift://source/stdlib/cpython@3.12.9/guide.ipynb".to_owned()),
+        };
+        runtime.origin.location = Some(SourceLocationKind::Stdlib);
+        runtime.origin.package = None;
+        runtime.origin.runtime = Some(rift_protocol::read::RuntimeIdentity {
+            runtime: "cpython".to_owned(),
+            version: "3.12.9".to_owned(),
+        });
+        assert!(DocumentationInput::new(runtime.clone(), "cell").is_ok());
+        let mut package_as_runtime = runtime.clone();
+        package_as_runtime.origin.package = record.origin.package.clone();
+        assert_eq!(
+            violation(package_as_runtime, "cell"),
+            DocumentationViolation::Origin
+        );
+        let mut wrong_runtime = runtime;
+        wrong_runtime
+            .origin
+            .runtime
+            .as_mut()
+            .expect("runtime")
+            .version = "3.13.0".to_owned();
+        assert_eq!(
+            violation(wrong_runtime, "cell"),
+            DocumentationViolation::Origin
+        );
     }
 
     #[test]
