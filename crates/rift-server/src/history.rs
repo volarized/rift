@@ -27,7 +27,7 @@ use rift_protocol::read::{
 };
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol};
 
-use crate::read::{RiftError, project_path, symbol_id};
+use crate::read::{RiftError, project_path};
 
 /// One parse cache key: the path selects the provider and symbol space, the
 /// blob id the exact committed bytes.
@@ -314,10 +314,11 @@ impl SymbolTimelines {
         &mut self,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
+        identity: SymbolId,
     ) -> Result<SymbolHistory, RiftError> {
         match &mut self.source {
-            TimelineSource::Store(stored) => stored.timeline(matched),
-            TimelineSource::Walk(walked) => walked.timeline(provider, matched),
+            TimelineSource::Store(stored) => stored.timeline(matched, identity),
+            TimelineSource::Walk(walked) => walked.timeline(provider, matched, identity),
         }
     }
 }
@@ -375,8 +376,11 @@ impl StoredTimelines {
     /// when it meets a commit the store does not hold, a boundary, or the
     /// `max_revisions` bound first, nor when the store holds no commit to
     /// start at, as a `selective` store holding no release yet does.
-    fn timeline(&self, matched: SymbolMatch<'_>) -> Result<SymbolHistory, RiftError> {
-        let symbol = symbol_id(matched.file, matched.symbol);
+    fn timeline(
+        &self,
+        matched: SymbolMatch<'_>,
+        symbol: SymbolId,
+    ) -> Result<SymbolHistory, RiftError> {
         let Some(start) = self.start.clone() else {
             return Ok(timeline_answer(symbol, Vec::new(), false));
         };
@@ -462,6 +466,7 @@ impl WalkedTimelines {
         &mut self,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
+        identity: SymbolId,
     ) -> Result<SymbolHistory, RiftError> {
         let path = matched.file.path();
         let Self {
@@ -517,11 +522,7 @@ impl WalkedTimelines {
                 },
             });
         }
-        Ok(timeline_answer(
-            symbol_id(matched.file, matched.symbol),
-            versions,
-            complete,
-        ))
+        Ok(timeline_answer(identity, versions, complete))
     }
 }
 
@@ -739,6 +740,8 @@ mod tests {
             signatures: Arc::from([]),
             documentation: Arc::from([]),
             documentation_ranges: Vec::new(),
+            module_path: None,
+            python_overload: None,
         };
         SymbolShape::from_source(source, &symbol)
     }
@@ -943,6 +946,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         rift_history::fixture::init(directory.path());
         fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        fs::write(
             directory.path().join("lib.rs"),
             "pub fn beacon_one() {}\npub fn beacon_two() {}\n",
         )?;
@@ -960,6 +967,15 @@ mod tests {
             HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
+    }
+
+    fn timeline_identity(
+        service: &ReadService,
+        matched: rift_index::SymbolMatch<'_>,
+    ) -> TestResult<rift_protocol::read::SymbolId> {
+        let assembled = service.index().assembled_symbol(matched)?;
+        let identity = assembled.identity().ok_or("fixture identity absent")?;
+        Ok(rift_protocol::read::SymbolId(identity.as_str().to_owned()))
     }
 
     #[test]
@@ -980,7 +996,11 @@ mod tests {
                 .symbols(name, 5)
                 .map_err(|error| error.to_string())?;
             let timeline = timelines
-                .timeline(&provider, matches[0])
+                .timeline(
+                    &provider,
+                    matches[0],
+                    timeline_identity(&service, matches[0])?,
+                )
                 .map_err(|error| error.to_string())?;
             assert_eq!(
                 timeline.versions.len(),
@@ -1059,7 +1079,11 @@ mod tests {
             .symbols("beacon_one", 5)
             .map_err(|error| error.to_string())?;
         let timeline = timelines
-            .timeline(&RustSyntaxProvider::default(), matches[0])
+            .timeline(
+                &RustSyntaxProvider::default(),
+                matches[0],
+                timeline_identity(service, matches[0])?,
+            )
             .map_err(|error| error.to_string())?;
         Ok(timeline)
     }
@@ -1185,7 +1209,11 @@ mod tests {
             .symbols(name, 5)
             .map_err(|error| error.to_string())?;
         let timeline = timelines
-            .timeline(&RustSyntaxProvider::default(), matches[0])
+            .timeline(
+                &RustSyntaxProvider::default(),
+                matches[0],
+                timeline_identity(service, matches[0])?,
+            )
             .map_err(|error| error.to_string())?;
         Ok(timeline)
     }
@@ -1266,11 +1294,13 @@ mod tests {
         let root = directory.path();
         rift_history::fixture::init(root);
         fs::write(root.join("before.rs"), "pub fn travelled() {}\n")?;
+        crate::read::tests::captured_rust_library(root, "before.rs")?;
         rift_history::fixture::commit_all(root, "introduce travelled");
         let grown = "pub fn travelled() { let _grown = 1; }\n";
         fs::write(root.join("before.rs"), grown)?;
         rift_history::fixture::commit_all(root, "grow travelled");
         rift_history::fixture::git(root, &["mv", "before.rs", "after.rs"]);
+        crate::read::tests::captured_rust_library(root, "after.rs")?;
         rift_history::fixture::commit_all(root, "move travelled");
         let service = current(root)?;
         let folder = tempfile::tempdir()?;
@@ -1335,10 +1365,12 @@ mod tests {
         rift_history::fixture::init(root);
         let introduced = "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n";
         fs::write(root.join("from.rs"), introduced)?;
+        crate::read::tests::captured_rust_library(root, "from.rs")?;
         rift_history::fixture::commit_all(root, "introduce travelled");
         fs::remove_file(root.join("from.rs"))?;
         let moved = "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n";
         fs::write(root.join("to.rs"), moved)?;
+        crate::read::tests::captured_rust_library(root, "to.rs")?;
         rift_history::fixture::commit_all(root, "move travelled");
         let service = current(root)?;
         let folder = tempfile::tempdir()?;

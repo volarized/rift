@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use rift_core::{SourceVisibility, SymbolId, TextFileInclusion, symbol_identity};
+use rift_core::{SourceVisibility, SymbolId, TextFileInclusion};
 use rift_index::DatabaseName;
 use rift_index::{
     DatabasePool, LexicalIndexLimits, LexicalSearchIndex, LexicalStamp, PathChanges,
@@ -34,6 +34,10 @@ const SOURCE_B: &str = "pub struct Beacon;\npub fn new() {}\n";
 const README_B: &str = "See [new](src/lib.rs#new).\n";
 
 fn write_tree_a(root: &Path) -> TestResult {
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+    )?;
     fs::create_dir_all(root.join("src"))?;
     fs::write(root.join("src/lib.rs"), SOURCE_A)?;
     fs::write(root.join("src/removed.rs"), "pub struct Removed;\n")?;
@@ -165,14 +169,16 @@ fn symbol_facts(root: &Path) -> TestResult<(BTreeSet<SymbolId>, BTreeSet<String>
     let mut ids = BTreeSet::new();
     let mut names = BTreeSet::new();
     for file in index.files() {
-        let language = file.syntax().language().identity_segment();
         for symbol in file.syntax().symbols() {
             names.insert(symbol.name.clone());
-            ids.insert(SymbolId::new(symbol_identity(
-                &language,
-                file.path().as_str(),
-                &symbol.qualified_name,
-            ))?);
+            let matched = rift_index::SymbolMatch {
+                file,
+                symbol,
+                rank: rift_ranking::IdentifierMatchClass::QualifiedExact.into(),
+            };
+            if let Some(identity) = index.assembled_symbol(matched)?.identity() {
+                ids.insert(identity.clone());
+            }
         }
     }
     Ok((ids, names))
@@ -331,7 +337,18 @@ fn symbol_page_validation_rejects_incomplete_or_invalid_misses() -> TestResult {
     unavailable[0]["detail"] =
         serde_json::json!("closest alternatives unavailable at the work bound");
     let mut unknown = wire["warnings"].clone();
-    unknown[0]["alternatives"][0] = serde_json::json!("rift://symbol/rust/src/lib.rs/Unknown");
+    unknown[0]["alternatives"][0] = serde_json::json!(
+        rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            rift_protocol::read::Language {
+                name: "rust".to_owned(),
+                dialect: None
+            },
+            vec!["beacon".to_owned(), "Unknown".to_owned()],
+        )
+        .expect("canonical unknown fixture identity")
+        .wire_identity()
+    );
     let mut repeated = wire["warnings"].clone();
     repeated[0]["alternatives"][1] = repeated[0]["alternatives"][0].clone();
     let mut oversized = wire["warnings"].clone();
