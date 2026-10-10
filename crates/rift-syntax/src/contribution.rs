@@ -424,9 +424,7 @@ mod tests {
     /// and the container reference embeds the same identity path.
     #[test]
     fn test_add_document_placed_files_declarations_under_the_supplied_unit_and_path() {
-        use rift_core::{
-            ContributionOrigin, SourceKind, SourceLocation, SourceUnitId,
-        };
+        use rift_core::{ContributionOrigin, SourceKind, SourceLocation, SourceUnitId};
         use rift_protocol::read::PackageIdentity;
 
         use super::DocumentPlacement;
