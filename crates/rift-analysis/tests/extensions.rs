@@ -167,7 +167,7 @@ fn assert_package_syntax(
     assert!(
         fresh
             .publication()
-            .symbols
+            .objects
             .iter()
             .any(|symbol| symbol.name == "open")
     );

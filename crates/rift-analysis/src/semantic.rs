@@ -399,14 +399,36 @@ mod tests {
     #[test]
     fn syntax_graph_assembles_existing_symbol_identity() {
         let document = document();
-        let semantics = WorkspaceSemantics::build([&document], 1, 7, None)
-            .expect("semantics")
-            .semantics;
-        let identity = "rift://symbol/rust/src/lib.rs/beacon";
-        let assembled = semantics.assembled(identity).expect("assembled symbol");
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            document.language().clone(),
+            vec!["fixture".to_owned(), "beacon".to_owned()],
+        )
+        .expect("canonical fixture identity");
+        let identity = rift_core::SymbolId::new(identity.wire_identity()).expect("fixture symbol");
+        let placement = DocumentPlacement::project(&document)
+            .expect("physical project placement")
+            .with_identity_anchors(std::collections::BTreeMap::from([(
+                "beacon".to_owned(),
+                identity.clone(),
+            )]));
+        let semantics = WorkspaceSemantics::build_placed(
+            &[PlacedDocument {
+                document: &document,
+                placement,
+            }],
+            1,
+            7,
+            None,
+        )
+        .expect("semantics")
+        .semantics;
+        let assembled = semantics
+            .assembled("rift://symbol/rust/src/lib.rs/beacon")
+            .expect("assembled symbol");
         assert_eq!(
             assembled.identity().map(rift_core::SymbolId::as_str),
-            Some(identity)
+            Some(identity.as_str())
         );
         assert_eq!(assembled.index_revision().get(), 7);
         assert_eq!(semantics.graph().records().len(), 1);
