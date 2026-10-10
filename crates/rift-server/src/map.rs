@@ -457,6 +457,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::read::ReadService;
+    use crate::traversal::tests::graph_identity;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -490,6 +491,10 @@ mod tests {
     /// map as neither hub nor module relationship.
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -607,7 +612,7 @@ mod tests {
                 Ok(
                     Contribution::builder(key, applicability()?, facts, origin()?)
                         .source(binding(path, *range)?)
-                        .identity_anchor(SymbolId::new(*identity)?)
+                        .identity_anchor(SymbolId::new(graph_identity(symbol))?)
                         .build()?,
                 )
             })
@@ -619,11 +624,11 @@ mod tests {
     fn fact_less_contributions(definitions: &[Definition<'_>]) -> TestResult<Vec<Contribution>> {
         definitions
             .iter()
-            .map(|(symbol, identity, path, range)| {
+            .map(|(symbol, _identity, path, range)| {
                 let key = contribution_key(symbol)?;
                 Ok(Contribution::fact_builder(key, applicability()?, origin()?)
                     .source(binding(path, *range)?)
-                    .identity_anchor(SymbolId::new(*identity)?)
+                    .identity_anchor(SymbolId::new(graph_identity(symbol))?)
                     .build()?)
             })
             .collect()
@@ -894,9 +899,9 @@ mod tests {
         assert_eq!(
             ranked,
             [
-                ("rift://symbol/rust/src/lib.rs/use_alpha", 2),
-                ("rift://symbol/rust/src/lib.rs/alpha", 1),
-                ("rift://symbol/rust/src/lib.rs/beta", 1),
+                (graph_identity("use_alpha").as_str(), 2),
+                (graph_identity("alpha").as_str(), 1),
+                (graph_identity("beta").as_str(), 1),
             ],
             "twice-referenced use_alpha ranks first; alpha and beta tie at one reference each \
              and sort by identity"
@@ -952,7 +957,8 @@ mod tests {
             "a record with no portable facts never ranks as a hub: hubs={hubs:?}"
         );
         assert_eq!(
-            hubs[0].symbol.0, "rift://symbol/rust/src/lib.rs/callee_00",
+            hubs[0].symbol.0,
+            graph_identity("callee_00"),
             "the twice-referenced ghost would rank first were it assemblable; the ranked \
              callees follow in identity order"
         );
@@ -968,7 +974,7 @@ mod tests {
                 .iter()
                 .map(|id| id.0.as_str())
                 .collect::<Vec<_>>(),
-            ["rift://symbol/rust/src/lib.rs/main"]
+            [graph_identity("main").as_str()]
         );
         Ok(())
     }
@@ -1057,7 +1063,7 @@ mod tests {
     #[test]
     fn hubs_skip_a_resolved_target_whose_record_carries_no_portable_facts() -> TestResult {
         let graph = fact_less_target_graph()?;
-        let ghost = SymbolId::new(GHOST_IDENTITY)?;
+        let ghost = SymbolId::new(graph_identity("ghost"))?;
         assert!(
             resolved_targets(&graph).contains(&ghost),
             "the ghost target must resolve to an established identity so the skip arm runs"
